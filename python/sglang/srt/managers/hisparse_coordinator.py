@@ -747,6 +747,70 @@ class HiSparseCoordinator:
             layer_num=layer_num,
             max_num_req_slots=max_num_req_slots,
         )
+        # HS_PATCH: knobs and geometry log
+        self._hs_anchor_copy_blocks = envs.SGLANG_HISPARSE_ANCHOR_COPY_BLOCKS.get()
+        self._hs_stats_every = envs.SGLANG_HISPARSE_STATS_EVERY.get()
+        self._hs_step = 0
+        if self._hs_anchor_copy_blocks > 0 and not self.enable_prefetch:
+            logger.warning(
+                "HS_PATCH: SGLANG_HISPARSE_ANCHOR_COPY_BLOCKS needs the shared-index "
+                "prefetch (miss plan buffers); ignored"
+            )
+            self._hs_anchor_copy_blocks = 0
+        try:
+            dev_alloc = self.token_to_kv_pool_allocator.hisparse_attn_allocator
+            logger.info(
+                "HiSparse geometry: device pool %d tokens, logical/host pool %d tokens, "
+                "host pool bytes %.1f GiB (item %d B x %d layers), top_k %d, device buffer %d (+%d page), "
+                "layers %d, prefetch %s (%d anchors), prefetch blocks %d, anchor copy blocks %d, "
+                "swap_in_block_size %d, skip_io %s",
+                dev_alloc.size,
+                self.token_to_kv_pool_allocator.size_full,
+                self.mem_pool_host.size * self.item_size_bytes * layer_num / 2**30,
+                self.item_size_bytes,
+                layer_num,
+                self.top_k,
+                self.device_buffer_size,
+                self.page_size,
+                layer_num,
+                self.enable_prefetch,
+                len(self._prefetch_groups) if self.enable_prefetch else 0,
+                getattr(self, "_prefetch_copy_blocks", 0),
+                self._hs_anchor_copy_blocks,
+                self.swap_in_block_size,
+                self.skip_io,
+            )
+        except Exception as e:  # logging only
+            logger.warning("HiSparse geometry log failed: %r", e)
+        # HS_PATCH v4: persistent host-slot -> buffer-slot map per anchor group (needs the shared-index prefetch
+        # so that skip layers share the anchor's buffer; DSA MLA pools only)
+        self._hs_map = None
+        self._hs_map_init = None
+        self._hs_group_of_layer = {}
+        if (
+            envs.SGLANG_HISPARSE_HOST_MAP.get()
+            and self.enable_prefetch
+            and not self.is_dsv4_hisparse
+            and not self.is_m3_hisparse
+            and not _is_xpu
+        ):
+            anchors = [
+                l for l in range(layer_num) if not self._is_shared_index_layer[l]
+            ]
+            self._hs_group_of_layer = {l: i for i, l in enumerate(anchors)}
+            n_slots = int(self.mem_pool_host.size) + self.page_size + 1
+            self._hs_map = torch.full(
+                (len(anchors), n_slots), -1, dtype=torch.int16, device=device
+            )
+            self._hs_map_init = torch.zeros(
+                (len(anchors), max_num_req_slots), dtype=torch.int8, device=device
+            )
+            logger.info(
+                "HiSparse host map: %d anchor groups x %d host slots, %.1f MiB",
+                len(anchors),
+                n_slots,
+                self._hs_map.numel() * 2 / 2**20,
+            )
 
     def _init_shared_index_prefetch(
         self,
@@ -783,7 +847,9 @@ class HiSparseCoordinator:
 
         # Small fixed grid for the copy-only kernel: low SM footprint so the
         # copies overlap compute with little contention.
-        self._prefetch_copy_blocks = 4
+        self._prefetch_copy_blocks = max(
+            1, envs.SGLANG_HISPARSE_PREFETCH_BLOCKS.get()
+        )  # HS_PATCH (upstream: 4)
         max_group_size = max(len(g) for g in self._prefetch_groups.values())
         self.prefetch_stream = device_module.Stream()
         self._prefetch_events = [device_module.Event() for _ in range(max_group_size)]
@@ -995,6 +1061,10 @@ class HiSparseCoordinator:
         )
         self.spec_swap.allocate_scratch(req.kv.req_pool_idx)
         self.spec_swap.reset(req.kv.req_pool_idx)
+        if (
+            self._hs_map_init is not None
+        ):  # HS_PATCH v4: the kernel rebuilds this request's map on first use
+            self._hs_map_init[:, req.kv.req_pool_idx] = 0
 
     def _grow_device_buffers(
         self,
@@ -1119,6 +1189,7 @@ class HiSparseCoordinator:
         seq_lens_cpu: torch.Tensor,
         req_pool_indices_cpu: torch.Tensor,
     ) -> None:
+        self._hs_maybe_log_stats(seq_lens_cpu)  # HS_PATCH
         self._eager_backup_previous_token(
             seq_lens, req_pool_indices, seq_lens_cpu, req_pool_indices_cpu
         )
@@ -1391,6 +1462,8 @@ class HiSparseCoordinator:
             req.kv.req_pool_idx,
             self.req_to_host_pool_allocated_len[req.kv.req_pool_idx],
         )
+        if self._hs_map is not None and host_indices.numel() > 0:  # HS_PATCH v4
+            self._hs_map[:, host_indices] = -1
         if host_indices.numel() > 0:
             self.mem_pool_host.free(host_indices)
         self.req_to_host_pool[req.kv.req_pool_idx, :] = -1
@@ -1455,6 +1528,12 @@ class HiSparseCoordinator:
             req.kv.req_pool_idx,
             self.req_to_host_pool_allocated_len[req.kv.req_pool_idx],
         )
+        if (
+            self._hs_map is not None and host_indices.numel() > 0
+        ):  # HS_PATCH v4: its host slots will be reused
+            self._hs_map[:, host_indices] = -1
+        if self._hs_map_init is not None:
+            self._hs_map_init[:, req_pool_idx] = 0
         if host_indices.numel() > 0:
             self.mem_pool_host.free(host_indices)
 
@@ -1469,6 +1548,40 @@ class HiSparseCoordinator:
         self.spec_swap.clear_scratch(req_pool_idx)
         self._skip_first_backup[req.kv.req_pool_idx] = False
 
+    def _hs_maybe_log_stats(self, seq_lens_cpu) -> None:
+        """HS_PATCH: every SGLANG_HISPARSE_STATS_EVERY decode steps, log the misses per request of the last
+        anchor layer that ran (its plan is in _miss_count; one sync per sample)."""
+        if self._hs_stats_every <= 0 or not self.enable_prefetch:
+            return
+        self._hs_step += 1
+        if self._hs_step % self._hs_stats_every:
+            return
+        bs = int(seq_lens_cpu.numel())
+        if bs == 0:
+            return
+        long_mask = seq_lens_cpu > self.device_buffer_size
+        n_long = int(long_mask.sum())
+        mc = self._miss_count[:bs].to("cpu")
+        if n_long:
+            mcl = mc[long_mask].float()
+            logger.info(
+                "HiSparse stats: step %d, bs %d (%d long), misses/req of top_k %d: mean %.1f, min %d, max %d, "
+                "hit rate %.3f, miss bytes/layer %.2f MB",
+                self._hs_step,
+                bs,
+                n_long,
+                self.top_k,
+                mcl.mean().item(),
+                int(mcl.min()),
+                int(mcl.max()),
+                1.0 - mcl.mean().item() / self.top_k,
+                mcl.sum().item() * self.item_size_bytes / 1e6,
+            )
+        else:
+            logger.info(
+                "HiSparse stats: step %d, bs %d, no long request yet", self._hs_step, bs
+            )
+
     def _run_swap_in_kernel(
         self,
         req_pool_indices: torch.Tensor,
@@ -1476,6 +1589,7 @@ class HiSparseCoordinator:
         top_k_result: torch.Tensor,
         layer_id: int,
         record_plan: bool = False,
+        plan_only: bool = False,
     ) -> torch.Tensor:
         """Run the full plan+IO swap-in kernel for one layer; return its slot table.
 
@@ -1510,7 +1624,16 @@ class HiSparseCoordinator:
             if self.is_dsv4_hisparse
             else load_cache_to_device_buffer_mla
         )
-        skip_io_kwargs = {} if _is_xpu else dict(skip_io=self.skip_io)
+        skip_io_kwargs = (
+            {} if _is_xpu else dict(skip_io=self.skip_io or plan_only)
+        )  # HS_PATCH
+        if (
+            self._hs_map is not None and layer_id in self._hs_group_of_layer
+        ):  # HS_PATCH v4
+            g = self._hs_group_of_layer[layer_id]
+            skip_io_kwargs.update(
+                host_map=self._hs_map[g], map_init=self._hs_map_init[g]
+            )
         swap_in_fn(
             top_k_tokens=top_k_result,
             device_buffer_tokens=self.req_device_buffer_tokens[layer_id],
@@ -1622,13 +1745,29 @@ class HiSparseCoordinator:
         # Anchor: swap in synchronously (recording the plan), then prefetch the
         # skip layers' copies on the side stream.
         group = self._prefetch_groups.get(layer_id)
+        # HS_PATCH: plan-only anchor + wide planned copy on the compute stream
+        wide = self._hs_anchor_copy_blocks > 0 and top_k_result.ndim == 2
         anchor_locs = self._run_swap_in_kernel(
             req_pool_indices,
             compressed_seq_lens,
             top_k_result,
             layer_id,
-            record_plan=group is not None,
+            record_plan=(group is not None) or wide,
+            plan_only=wide,
         )
+        if wide:
+            copy_cache_planned_mla(
+                miss_src=self._miss_src[:num_reqs],
+                miss_dst=self._miss_dst[:num_reqs],
+                miss_count=self._miss_count[:num_reqs],
+                num_real_reqs=self.num_real_reqs,
+                host_cache=self.mem_pool_host.kv_buffer[layer_id],
+                device_buffer=self.mem_pool_device.kv_buffer[layer_id],
+                item_size_bytes=self.item_size_bytes,
+                num_blocks=self._hs_anchor_copy_blocks,
+                is_dsv4_layout=self.is_dsv4_hisparse,
+                skip_io=self.skip_io,
+            )
         if group:
             # Fork: the prefetch stream must observe the anchor's plan (produced
             # on the current stream) before replaying it.

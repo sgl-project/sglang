@@ -784,6 +784,12 @@ class Envs:
     # Kill-switch for the shared-index (IndexShare) swap-in prefetch
     # (auto-enabled for GLM-5.2-style DSA); set True to A/B synchronous swap-in.
     SGLANG_DISABLE_HISPARSE_PREFETCH = EnvBool(False)
+    # HiSparse swap-in: grid of the skip layers' prefetch copy, wide planned copy for anchor layers (0: off),
+    # hit-rate log every N decode steps (0: off), persistent host-slot -> buffer-slot map (needs prefetch).
+    SGLANG_HISPARSE_PREFETCH_BLOCKS = EnvInt(4)
+    SGLANG_HISPARSE_ANCHOR_COPY_BLOCKS = EnvInt(0)
+    SGLANG_HISPARSE_STATS_EVERY = EnvInt(0)
+    SGLANG_HISPARSE_HOST_MAP = EnvBool(False)
     SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS = EnvBool(True)
     # Decode batches between SWA out-of-window evictions.
     SGLANG_SWA_EVICTION_INTERVAL = EnvInt(128)

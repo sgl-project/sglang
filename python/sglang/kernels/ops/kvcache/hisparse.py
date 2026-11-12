@@ -361,6 +361,8 @@ def _load_cache_to_device_buffer_mla(
     skip_io: bool,
     device_locs: torch.Tensor | None,
     host_binding: torch.Tensor | None,
+    host_map: torch.Tensor | None = None,
+    map_init: torch.Tensor | None = None,
 ) -> None:
     assert hot_buffer_size >= num_top_k, (
         f"hot_buffer_size ({hot_buffer_size}) must be >= num_top_k ({num_top_k})"
@@ -446,6 +448,8 @@ def _load_cache_to_device_buffer_mla(
         miss_src,
         miss_dst,
         miss_count,
+        host_map if host_map is not None else empty,  # HS_PATCH v4
+        map_init if map_init is not None else empty,
     )
 
 
@@ -472,6 +476,8 @@ def load_cache_to_device_buffer_mla(
     skip_io: bool = False,
     device_locs: torch.Tensor | None = None,
     host_binding: torch.Tensor | None = None,
+    host_map: torch.Tensor | None = None,
+    map_init: torch.Tensor | None = None,
 ) -> None:
     """Generic MLA hisparse swap-in: device + host both linear (stride=item_size_bytes).
 
@@ -514,6 +520,8 @@ def load_cache_to_device_buffer_mla(
         miss_dst=miss_dst,
         miss_count=miss_count,
         skip_io=skip_io,
+        host_map=host_map,
+        map_init=map_init,
     )
 
 
@@ -593,6 +601,8 @@ def load_blocks_to_device_buffer_mha(
         empty,
         empty,
         empty,
+        empty,  # host_map
+        empty,  # map_init
     )
 
 
