@@ -20,6 +20,7 @@ from sglang.srt.speculative.dspark_components import dspark_draft_sampler as ds
 from sglang.srt.speculative.dspark_components.dspark_draft import (
     DraftBlockProposer,
     DraftNoise,
+    draft_markov_block,
     sample_draft_block,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -188,6 +189,38 @@ class TestFusedGreedyEligibility(CustomTestCase):
 
 
 class TestMarkovCandidates(CustomTestCase):
+    def test_block_preserves_candidate_logits_with_padded_rows(self):
+        torch.manual_seed(13)
+        head = VanillaMarkov(vocab_size=11, draft_vocab_size=7, markov_rank=5)
+        head.logit_scale = -0.5
+        mapping = torch.tensor([8, 5, 9, 1, 7, 3, 6])
+        head.configure_target_vocab(11, mapping - torch.arange(7))
+        head.configure_candidates(3)
+        base = torch.randn(3, 4, 7)
+        for greedy in (False, True):
+            tokens, logits = draft_markov_block(
+                markov_head=head,
+                base_logits=base,
+                anchor_tokens=torch.tensor([2, 4, 99999]),
+                draft_hidden=None,
+                step_temperatures=torch.tensor([0.7, 1.2, 0.0]),
+                noise=DraftNoise(key=3, offset=torch.zeros(1, dtype=torch.int64)),
+                tp_sync=SimpleNamespace(sync=lambda site, tokens: tokens),
+                greedy_draft=greedy,
+                num_valid=torch.tensor(2),
+            )
+            previous = torch.tensor([2, 4, 0])
+            for step in range(4):
+                expected = head.candidate_logits(previous, base[:, step])
+                if greedy:
+                    torch.testing.assert_close(tokens[:, step], expected.argmax(-1))
+                else:
+                    torch.testing.assert_close(logits[:, step], expected)
+                    self.assertTrue(
+                        expected.gather(1, tokens[:, step, None]).isfinite().all()
+                    )
+                previous = tokens[:, step]
+
     def test_union_preserves_scores_and_target_ids(self):
         """Overlapping sets must not double bias or double the proposal mass."""
         head = VanillaMarkov(vocab_size=8, draft_vocab_size=4, markov_rank=1).to(
@@ -212,6 +245,16 @@ class TestMarkovCandidates(CustomTestCase):
                 expected[0, target_ids] = torch.tensor(scores)
                 self.assertEqual(logits.dtype, torch.float32)
                 torch.testing.assert_close(logits, expected)
+                self.assertEqual(head.candidate_biases.dtype, torch.float32)
+                torch.testing.assert_close(
+                    head.candidate_logits(prev, base, base.topk(2, sorted=False)),
+                    expected,
+                )
+
+        # Cached scores are authoritative for static IDs, including overlap.
+        head.candidate_biases[2] = torch.where(head.candidate_ids[2] == 0, 20.0, 10.0)
+        expected[0, target_ids] = torch.tensor([26, 1, -torch.inf, 11])
+        torch.testing.assert_close(head.candidate_logits(prev, base), expected)
 
         head.logit_scale = 0
         head.refresh_candidates()
@@ -231,10 +274,12 @@ class TestMarkovCandidates(CustomTestCase):
 
     def test_disabled_and_full_vocabulary_candidates_use_dense_path(self):
         head = VanillaMarkov(vocab_size=4, markov_rank=1)
+        head.configure_candidates(2)
         for topk in (0, 4, 5):
             with self.subTest(topk=topk):
                 head.configure_candidates(topk)
                 self.assertIsNone(head.candidate_ids)
+                self.assertIsNone(head.candidate_biases)
                 self.assertIsNone(
                     head.candidate_logits(torch.tensor([0]), torch.zeros(1, 4))
                 )
@@ -271,6 +316,7 @@ class TestDraftWeightUpdates(CustomTestCase):
 
         model.markov_head.configure_candidates(2)
         candidate_ptr = model.markov_head.candidate_ids.data_ptr()
+        bias_ptr = model.markov_head.candidate_biases.data_ptr()
         for index, (name, param) in enumerate(model.named_parameters(), start=1):
             with self.subTest(weight=name):
                 weights[name] = torch.full_like(param, index)
@@ -282,6 +328,16 @@ class TestDraftWeightUpdates(CustomTestCase):
                 torch.testing.assert_close(model.draft_id_to_target_id, mapping)
                 self.assertEqual(
                     model.markov_head.candidate_ids.data_ptr(), candidate_ptr
+                )
+                self.assertEqual(
+                    model.markov_head.candidate_biases.data_ptr(), bias_ptr
+                )
+                expected_bias = (
+                    model.markov_head.markov_w1.weight.float()
+                    @ model.markov_head.markov_w2.weight.float().T
+                ).gather(1, model.markov_head.candidate_ids)
+                torch.testing.assert_close(
+                    model.markov_head.candidate_biases, expected_bias
                 )
         torch.testing.assert_close(
             model.markov_head.candidate_ids, torch.tensor([[3, 2]]).expand(4, -1)
@@ -303,6 +359,11 @@ class TestDraftWeightUpdates(CustomTestCase):
             model.markov_head.candidate_ids, torch.tensor([[0, 1]]).expand(4, -1)
         )
         self.assertEqual(model.markov_head.candidate_ids.data_ptr(), candidate_ptr)
+        self.assertEqual(model.markov_head.candidate_biases.data_ptr(), bias_ptr)
+        expected_bias = (updated @ weights["markov_head.markov_w2.weight"].T).gather(
+            1, model.markov_head.candidate_ids
+        )
+        torch.testing.assert_close(model.markov_head.candidate_biases, expected_bias)
 
         with self.assertRaisesRegex(ValueError, "Changing DSpark d2t"):
             model.load_weights([("d2t", mapping + 1)])

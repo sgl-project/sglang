@@ -215,6 +215,7 @@ class VanillaMarkov(BaseDSparkMarkovHead):
         self.register_buffer("draft_id_to_target_id", None, persistent=False)
         self.register_buffer("_target_token_ids", None, persistent=False)
         self.register_buffer("candidate_ids", None, persistent=False)
+        self.register_buffer("candidate_biases", None, persistent=False)
         self.candidate_topk = 0
         self.markov_rank = int(markov_rank)
         if self.markov_rank <= 0:
@@ -248,23 +249,28 @@ class VanillaMarkov(BaseDSparkMarkovHead):
         self.candidate_topk = topk if 0 < topk < self.draft_vocab_size else 0
         if not self.candidate_topk:
             self.candidate_ids = None
+            self.candidate_biases = None
             return
         self.candidate_ids = torch.empty(
             (self.markov_w1.num_embeddings, topk),
             dtype=torch.int64,
             device=self.markov_w1.weight.device,
         )
+        self.candidate_biases = torch.empty_like(
+            self.candidate_ids, dtype=torch.float32
+        )
         self.refresh_candidates()
 
     @torch.no_grad()
     def refresh_candidates(self) -> None:
-        """Rebuild IDs in place so captured graphs retain the same table."""
+        """Rebuild IDs and scaled biases in place for captured graphs."""
         if getattr(self, "candidate_ids", None) is None:
             return
         if self.logit_scale == 0:
             self.candidate_ids.copy_(
                 torch.arange(self.candidate_topk, device=self.candidate_ids.device)
             )
+            self.candidate_biases.zero_()
             return
         w2 = self.markov_w2.weight.float().T
         # Bound the projection workspace; never materialize [Vprev, Vdraft].
@@ -272,42 +278,54 @@ class VanillaMarkov(BaseDSparkMarkovHead):
         for start in range(0, self.markov_w1.num_embeddings, chunk):
             stop = start + chunk
             bias = self.markov_w1.weight[start:stop].float() @ w2
-            ids = bias.topk(
+            values, ids = bias.topk(
                 self.candidate_topk, dim=-1, largest=self.logit_scale > 0
-            ).indices
+            )
             self.candidate_ids[start:stop].copy_(ids)
+            self.candidate_biases[start:stop].copy_(values.mul_(self.logit_scale))
 
     def candidate_logits(
-        self, prev_tokens: torch.Tensor, base_logits: torch.Tensor
+        self,
+        prev_tokens: torch.Tensor,
+        base_logits: torch.Tensor,
+        base_candidates: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> Optional[torch.Tensor]:
         """Return the candidate proposal in target vocabulary, before temperature."""
         if getattr(self, "candidate_ids", None) is None:
             return None
-        base_ids = base_logits.topk(self.candidate_topk, dim=-1, sorted=False).indices
-        static_ids = self.candidate_ids[prev_tokens]
-        ids = torch.cat((base_ids, static_ids), dim=-1)
-        scores = base_logits.gather(-1, ids).float()
+        if base_candidates is None:
+            base_candidates = base_logits.topk(
+                self.candidate_topk, dim=-1, sorted=False
+            )
+        base_values, base_ids = base_candidates
+        base_scores = base_values.float()
         if self.logit_scale != 0:
             prev = self.get_prev_embeddings(prev_tokens).float()
-            weights = self.markov_w2.weight[ids].float()
+            weights = self.markov_w2.weight[base_ids].float()
             bias = (weights * prev[:, None, :]).sum(dim=-1)
-            scores = scores + self.logit_scale * bias
+            base_scores = base_scores + self.logit_scale * bias
+        static_ids = self.candidate_ids[prev_tokens]
+        static_scores = (
+            base_logits.gather(-1, static_ids).float()
+            + self.candidate_biases[prev_tokens]
+        )
+        ids = torch.cat((base_ids, static_ids), dim=-1)
         target_ids = ids
         if self.draft_id_to_target_id is not None:
             target_ids = ids + self.draft_id_to_target_id[ids]
-        finite = torch.isfinite(scores).any(dim=-1, keepdim=True)
-        scores = torch.where(finite, scores, -torch.inf)
         logits = torch.full(
             (base_logits.shape[0], self.target_vocab_size),
             -torch.inf,
             dtype=torch.float32,
             device=base_logits.device,
         )
-        # Each set has unique IDs. Separate writes give their overlap one score,
-        # instead of treating a duplicated candidate as extra probability mass.
+        # Each set has unique IDs. The cached bias wins on overlap, matching
+        # the fused walk without giving duplicated candidates extra mass.
         k = self.candidate_topk
-        logits.scatter_(-1, target_ids[:, :k], scores[:, :k])
-        logits.scatter_(-1, target_ids[:, k:], scores[:, k:])
+        logits.scatter_(-1, target_ids[:, :k], base_scores)
+        logits.scatter_(-1, target_ids[:, k:], static_scores)
+        finite = torch.isfinite(logits.gather(-1, target_ids)).any(dim=-1, keepdim=True)
+        logits.masked_fill_(~finite, -torch.inf)
         # A row without finite candidates is a point mass at its lowest target ID.
         fallback = target_ids.amin(dim=-1, keepdim=True)
         logits.scatter_(

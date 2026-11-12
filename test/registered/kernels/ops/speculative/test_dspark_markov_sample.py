@@ -7,6 +7,7 @@ import unittest
 import torch
 
 from sglang.kernels.ops.speculative.dspark.markov_sample import MarkovSampleStep
+from sglang.kernels.ops.speculative.dspark.markov_topk import markov_walk_topk
 from sglang.test.test_utils import CustomTestCase
 
 DEVICE = torch.device("cuda")
@@ -30,6 +31,75 @@ def _call(impl, *, base, bias, temps, step_dtype, offset=7, step=2, **kwargs):
 
 
 class TestMarkovSampleStep(CustomTestCase):
+    def test_topk_walk_matches_dense_candidate_proposal(self):
+        # Non-power-of-two K/rank exercise masked lanes; each row walks four
+        # dependent steps. Static cache entries override live overlap scores.
+        for dtype, scale, mapped, rank in (
+            (torch.bfloat16, 1.0, False, 129),
+            (torch.float16, -1.0, True, 65),
+            (torch.float32, -0.0, True, 5),
+        ):
+            with self.subTest(dtype=dtype, scale=scale, mapped=mapped, rank=rank):
+                g = torch.Generator().manual_seed(19)
+                batch, steps, vocab, target_vocab, k = 3, 4, 7, 11, 3
+                w1 = torch.randint(-2, 3, (target_vocab, rank), generator=g).to(dtype)
+                w2 = torch.randint(-2, 3, (vocab, rank), generator=g).to(dtype)
+                w1[[0, 1, 3, 6]] = 0
+                correction = scale * (w1.float() @ w2.float().T)
+                biases, ids = correction.topk(k, dim=-1)
+                biases[2, 0] += 100  # Distinguish the cache from recomputing W1/W2.
+                base = torch.randint(-4, 5, (batch, steps, vocab), generator=g).to(
+                    dtype
+                )
+                base[0, :, ids[2, 0]] = 10  # Cache/live overlap.
+                base[1] = -torch.inf
+                base[2] = 0  # Ties choose the lowest target ID, not draft ID.
+                base[0, -1, 0] = torch.nan
+                target_ids = (
+                    torch.tensor([8, 5, 9, 1, 7, 3, 6])
+                    if mapped
+                    else torch.arange(vocab)
+                )
+                d2t = target_ids - torch.arange(vocab) if mapped else None
+                anchor = torch.tensor([2, 4, 6])
+                values, base_ids = base.topk(k, dim=-1, sorted=False)
+                expected = torch.empty(batch, steps, dtype=torch.int64)
+                prev = anchor
+                for step in range(steps):
+                    scores = base[:, step].float() + correction[prev]
+                    scores.scatter_(
+                        1,
+                        ids[prev],
+                        base[:, step].float().gather(1, ids[prev]) + biases[prev],
+                    )
+                    mask = torch.zeros(batch, vocab, dtype=torch.bool)
+                    mask.scatter_(1, base_ids[:, step], True)
+                    mask.scatter_(1, ids[prev], True)
+                    scores.masked_fill_(~mask, -torch.inf)
+                    logits = torch.full((batch, target_vocab), -torch.inf)
+                    logits[:, target_ids] = scores
+                    prev = logits.argmax(-1)
+                    fallback = (
+                        target_ids.expand(batch, -1)
+                        .masked_fill(~mask, target_vocab)
+                        .amin(-1)
+                    )
+                    prev = torch.where(scores.isfinite().any(-1), prev, fallback)
+                    expected[:, step] = prev
+                actual = markov_walk_topk(
+                    base_logits=base.to(DEVICE),
+                    base_values=values.to(DEVICE),
+                    base_ids=base_ids.to(DEVICE),
+                    markov_ids=ids.to(DEVICE),
+                    markov_biases=biases.to(DEVICE),
+                    w1=w1.to(DEVICE),
+                    w2=w2.to(DEVICE),
+                    anchor_tokens=anchor.to(DEVICE),
+                    d2t=None if d2t is None else d2t.to(DEVICE),
+                    scale=scale,
+                )
+                torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
+
     def test_triton_matches_torch_reference(self):
         g = torch.Generator(device=DEVICE).manual_seed(0)
         rows, padded, width = 64, 9000, 8990

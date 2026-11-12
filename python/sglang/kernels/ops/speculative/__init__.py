@@ -64,6 +64,14 @@ register_kernel(
 )
 register_kernel(
     KernelSpec(
+        op="speculative.markov_walk_topk",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.speculative.dspark.markov_topk:markov_walk_topk",
+        capabilities=CUDA_ONLY,
+    )
+)
+register_kernel(
+    KernelSpec(
         op="speculative.pack_verify_mask_into",
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.speculative.pack_verify_mask:pack_verify_mask_into",

@@ -12,6 +12,10 @@ from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
     MarkovGreedyStep,
 )
 from sglang.kernels.ops.speculative.dspark.markov_sample import MarkovSampleStep
+from sglang.kernels.ops.speculative.dspark.markov_topk import (
+    can_fuse_markov_walk,
+    markov_walk_topk,
+)
 from sglang.srt.configs.draft_parallel import DraftParallelSpec, DraftTPExecution
 from sglang.srt.environ import envs
 from sglang.srt.lora.layers import unwrap_lora_layer
@@ -21,6 +25,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     enable_num_token_non_padded,
 )
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.draft_parallel import resolve_draft_parallel_layout
 from sglang.srt.speculative.draft_worker_common import make_draft_input_v2
@@ -215,9 +220,12 @@ def _draft_step(
     step: int,
     logits_out: Optional[torch.Tensor],
     sharded_accept: bool,
+    base_candidates: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
     if getattr(markov_head, "candidate_ids", None) is not None:
-        base_logits = markov_head.candidate_logits(prev_tokens, base_logits)
+        base_logits = markov_head.candidate_logits(
+            prev_tokens, base_logits, base_candidates
+        )
         bias = torch.zeros_like(base_logits[:1]).expand_as(base_logits)
     else:
         if logits_out is None and len(prev_tokens) == 1:
@@ -297,6 +305,38 @@ def draft_markov_block(
         # Padded graph rows must not index the predecessor table with stale IDs.
         active = torch.arange(bs, device=base_logits.device) < num_valid
         prev_tokens = torch.where(active, prev_tokens, 0)
+    base_candidates = None
+    if getattr(markov_head, "candidate_ids", None) is not None:
+        base_candidates = base_logits.topk(
+            markov_head.candidate_topk, dim=-1, sorted=False
+        )
+        if (
+            greedy_draft
+            and markov_head.vocab_shard is None
+            and can_fuse_markov_walk(
+                markov_head.markov_w1.weight,
+                markov_head.markov_w2.weight,
+                base_logits,
+                markov_head.candidate_topk,
+            )
+            # The fused walk skips per-step TP synchronization.
+            and get_parallel().tp_size == 1
+        ):
+            return (
+                markov_walk_topk(
+                    base_logits=base_logits,
+                    base_values=base_candidates.values,
+                    base_ids=base_candidates.indices,
+                    markov_ids=markov_head.candidate_ids,
+                    markov_biases=markov_head.candidate_biases,
+                    w1=markov_head.markov_w1.weight,
+                    w2=markov_head.markov_w2.weight,
+                    anchor_tokens=prev_tokens,
+                    d2t=markov_head.draft_id_to_target_id,
+                    scale=markov_head.logit_scale,
+                ),
+                None,
+            )
     draft_tokens = []
     for step in range(gamma):
         prev_tokens, state = _draft_step(
@@ -310,6 +350,14 @@ def draft_markov_block(
             step=step,
             logits_out=None if greedy_draft else logits_out[:, step],
             sharded_accept=sharded_accept,
+            base_candidates=(
+                None
+                if base_candidates is None
+                else (
+                    base_candidates.values[:, step],
+                    base_candidates.indices[:, step],
+                )
+            ),
         )
         prev_tokens = tp_sync.sync(SpecTpSyncSite.DSPARK_DRAFT, prev_tokens)
         draft_tokens.append(prev_tokens)
