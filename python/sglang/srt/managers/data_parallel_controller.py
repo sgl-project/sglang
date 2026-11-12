@@ -147,7 +147,7 @@ class DPBudget:
         estimated_tokens: int = 0,
         estimated_input_tokens: int = 0,
         estimated_output_tokens: int = 0,
-        eligible_ranks: Optional[List[int]] = None,
+        eligible_ranks: list[int] | None = None,
     ):
         ranks = (
             eligible_ranks if eligible_ranks is not None else range(self.num_dp_ranks)
