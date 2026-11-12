@@ -74,7 +74,7 @@ def _is_byte_level_tokenizer(tokenizer) -> bool:
         _BYTE_DECODER = _build_byte_decoder()
     try:
         vocab_size = len(tokenizer.get_vocab())
-        # Added tokens are stored verbatim even in byte-level BPE (DeepSeek's ids 0-2).
+        # Added tokens are stored verbatim even in byte-level BPE, e.g. DeepSeek's <｜begin▁of▁sentence｜>.
         added_ids = getattr(tokenizer, "added_tokens_decoder", {})
         # Sample a few tokens to check if all chars are byte-decodable.
         sample_ids = [0, 1, 2, 3, vocab_size // 2, vocab_size - 2]
