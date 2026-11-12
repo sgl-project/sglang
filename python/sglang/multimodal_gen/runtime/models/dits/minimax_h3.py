@@ -101,6 +101,10 @@ from sglang.multimodal_gen.runtime.layers.linear import (
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
 )
+from sglang.multimodal_gen.runtime.layers.quantization.convrot_int8_jit import (
+    apply_convrot_int8_swiglu_output,
+    convrot_int8_fuses_swiglu_output,
+)
 from sglang.multimodal_gen.runtime.layers.usp import (
     _ring_attention_varlen,
     _usp_all_gather,
@@ -1723,6 +1727,15 @@ class MiniMaxH3MLP(nn.Module):
                 del hidden, chunk
                 torch.mps.synchronize()
                 torch.mps.empty_cache()
+            return out
+        if (
+            isinstance(x, torch.Tensor)
+            and x.dtype == torch.bfloat16
+            and convrot_int8_fuses_swiglu_output(self.fc1)
+            and not _accepts_mxfp8_input(self.fc2)
+        ):
+            hidden = apply_convrot_int8_swiglu_output(self.fc1, x)
+            out, _ = self.fc2(hidden)
             return out
         hidden, _ = self.fc1(x)
         if _accepts_mxfp8_input(self.fc2) and can_use_silu_mul_mxfp8(hidden):

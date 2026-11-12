@@ -96,6 +96,33 @@ def test_image_deployment_has_no_cfg_parallel():
     assert not deployment.auto_enable_cfg_parallel
 
 
+@pytest.mark.parametrize("quantization", ["fp8", "mxfp8", "convrot_int8"])
+@pytest.mark.parametrize("component", [None, "transformer", "text_encoder"])
+def test_image_config_accepts_online_linear_quantization(quantization, component):
+    override = (
+        {"quantization": quantization}
+        if component is None
+        else {"component_quantizations": {component: quantization}}
+    )
+    MiniMaxH3ImagePipelineConfig().validate_server_args(normalized_args(**override))
+
+
+@pytest.mark.parametrize("online", [None, False])
+def test_image_convrot_uses_native_adaln(online):
+    args = normalized_args(quantization="convrot_int8", minimax_h3_adaln_online=online)
+    MiniMaxH3ImagePipelineConfig().validate_server_args(args)
+    assert args.minimax_h3_adaln_online is False
+
+
+def test_image_convrot_rejects_online_adaln_rebuild():
+    args = normalized_args(
+        component_quantizations={"transformer": "convrot_int8"},
+        minimax_h3_adaln_online=True,
+    )
+    with pytest.raises(ValueError, match="--minimax-h3-adaln-online false"):
+        MiniMaxH3ImagePipelineConfig().validate_server_args(args)
+
+
 @pytest.mark.parametrize(
     "override",
     [
@@ -148,6 +175,8 @@ def test_image_config_rejects_unsupported_parallel_layouts(override, match):
         {"use_fsdp_inference": True},
         {"quantization": "nvfp4"},
         {"component_quantizations": {"video_vae": "fp8"}},
+        {"component_quantizations": {"video_vae": "convrot_int8"}},
+        {"quantization": "convrot_int4"},
         {"lora_path": "adapter.safetensors"},
         {"component_precisions": {"video_vae": "bf16"}},
         {"component_precisions": {"audio_vae": "fp32"}},
