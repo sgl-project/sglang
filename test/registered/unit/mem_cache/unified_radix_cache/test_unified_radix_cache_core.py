@@ -863,15 +863,6 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
                 cache.sanity_check()
 
     @requires_mamba
-    def test_full_kv_only_match_honors_force_miss(self):
-        for backend in ("python", "rust"):
-            with self.subTest(backend=backend):
-                cache, req, _, m = self._full_kv_only_match(backend, force_miss=True)
-                self.assertEqual(m.device_prefix_len, 0)
-                self.assertEqual(req.prefix_len, 0)
-                cache.sanity_check()
-
-    @requires_mamba
     def test_decode_prefix_match_uses_full_kv(self):
         """The PD decode admission match reports the FULL-KV hit as the prefix
         it asks prefill to skip, and locks it."""

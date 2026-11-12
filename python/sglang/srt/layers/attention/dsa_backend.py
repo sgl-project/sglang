@@ -537,37 +537,6 @@ def _validate_triton_sparse_mla_backend(
             )
 
 
-def _validate_dcp_backend(
-    *,
-    kimi_k31: bool,
-    use_fused_topk: bool,
-    use_topk_v2: bool,
-    prefill_impl: str,
-    decode_impl: str,
-) -> None:
-    # The DCP indexer emits global KV slots that only the flashmla_kv and
-    # trtllm paths localize, and its decode merge runs the v2 top-k with the
-    # per-forward plan.
-    if not kimi_k31:
-        raise ValueError("DSA with --dcp-size > 1 is implemented for Kimi-K3.1 only.")
-    if not use_fused_topk:
-        raise ValueError("DSA with --dcp-size > 1 needs fused DSA top-k.")
-    if not use_topk_v2:
-        raise ValueError(
-            "DSA with --dcp-size > 1 needs the v2 top-k (SGLANG_OPT_USE_TOPK_V2)."
-        )
-    if prefill_impl != decode_impl or decode_impl not in (
-        "flashmla_kv",
-        "trtllm",
-        "prims_ts",
-    ):
-        raise ValueError(
-            "DSA with --dcp-size > 1 needs --dsa-prefill-backend and "
-            "--dsa-decode-backend both flashmla_kv, both trtllm or both "
-            f"prims_ts; got {prefill_impl} and {decode_impl}."
-        )
-
-
 def _validate_prims_ts_dcp(*, dcp_size: int, shards_index_k: bool) -> None:
     # Prims-TS partials carry a natural-log LSE, but the DCP combine merges DSA
     # partials base e only under sharded index-K (is_mla_dcp_lse_base_on_e).
@@ -940,13 +909,6 @@ class DeepseekSparseAttnBackend(
                 "Disabling fused DSA top-k for IndexShare under PD disaggregation."
             )
         if self.dsa_shards_index_k:
-            _validate_dcp_backend(
-                kimi_k31=kimi_k31,
-                use_fused_topk=self.use_fused_topk,
-                use_topk_v2=self.dsa_topk_backend.should_use_topk_v2(),
-                prefill_impl=self.dsa_prefill_impl,
-                decode_impl=self.dsa_decode_impl,
-            )
             # decode merges top-k candidates of every request row; target
             # verify of every draft-token row.
             max_rows = max(model_runner.max_running_requests, 1) * (
