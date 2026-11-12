@@ -600,6 +600,39 @@ fn bounds_refuse_without_losing_active_metadata_and_reclaim_only_unreferenced_hi
 }
 
 #[test]
+fn content_insertion_reclaims_unused_material_at_either_limit() {
+    for node_limit in [true, false] {
+        let mut config = limits();
+        if node_limit {
+            config.max_content_nodes = 2;
+        } else {
+            config.max_token_material_bytes = 32;
+        }
+        let mut index = SessionIndex::new(config);
+        let root = register(&mut index, "root", None, 4, Some(vec![1, 2, 3, 4]));
+        let hold = index.content(&root).unwrap();
+        let unused = register(&mut index, "unused", None, 4, Some(vec![9; 4]));
+        // The parent is live only through the insertion's own reference.
+        drop(hold);
+        let leaf = register(&mut index, "child", Some(&root), 8, Some(vec![5, 6, 7, 8]));
+        assert!(index.content(&unused).is_none());
+        let prefix = index.resolve(Selector::Prefix {
+            content: leaf,
+            start_token: 0,
+            end_token: 8,
+        });
+        assert_eq!(
+            index
+                .materialize(prefix.known_scope()[0].scope())
+                .unwrap()
+                .token_ids,
+            Some(vec![1, 2, 3, 4, 5, 6, 7, 8])
+        );
+        assert_eq!(index.usage().token_material_bytes, 32);
+    }
+}
+
+#[test]
 fn material_request_resource_and_tombstone_limits_fail_atomically() {
     let mut config = limits();
     config.max_sessions = 2;

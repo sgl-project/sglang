@@ -417,8 +417,15 @@ impl SessionIndex {
             }
             return self.add_material(key, suffix_tokens);
         }
-        // Do not evict a supplied parent while making room for its child.
-        self.collect_garbage();
+        let available_material = self.limits.max_token_material_bytes - self.material_bytes;
+        if self.contents.len() >= self.limits.max_content_nodes
+            || suffix_tokens.as_ref().is_some_and(|tokens| {
+                tokens.len() > available_material / std::mem::size_of::<u32>()
+            })
+        {
+            // The local Arc keeps the parent alive if this insertion needs space.
+            self.collect_garbage();
+        }
         if self.contents.len() >= self.limits.max_content_nodes {
             return Err(IndexError::Capacity("content_nodes"));
         }
