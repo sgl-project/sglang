@@ -34,6 +34,7 @@ def flashinfer_cutedsl_moe_masked(
     down_signals: Optional[torch.Tensor] = None,
     down_start_event: Optional[torch.cuda.Event] = None,
     activation: str = "silu",
+    swiglu_limit: Optional[float] = None,
 ):
     """
     Perform masked Mixture-of-Experts computation with FlashInfer's CuteDSL
@@ -163,6 +164,11 @@ def flashinfer_cutedsl_moe_masked(
 
     # Activation + NVFP4 quantization of the GEMM2 input.
     if gated:
+        if swiglu_limit is not None:
+            # The fused kernel below takes no limit, so clamp its input in place.
+            gate, up = gateup_output.permute(2, 0, 1).chunk(2, dim=-1)
+            gate.clamp_(max=swiglu_limit)
+            up.clamp_(min=-swiglu_limit, max=swiglu_limit)
         # Fused silu(gate) * up + quantize; halves 2*n -> n.
         diq, diq_sf = silu_and_mul_scaled_nvfp4_experts_quantize(
             gateup_output.permute(2, 0, 1),
