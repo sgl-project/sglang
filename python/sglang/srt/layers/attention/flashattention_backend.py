@@ -37,6 +37,7 @@ from sglang.srt.layers.cp.base import (
     CPAttentionBackendKind,
     get_cp_strategy,
     is_cp_sharded_padded,
+    is_interleave,
 )
 from sglang.srt.layers.cp.utils import (
     get_cp_sharded_padded_cache_transfer_indices,
@@ -135,6 +136,7 @@ class FlashAttentionMetadata:
     # Page table, the index of KV Cache Tables/Blocks
     page_table: torch.Tensor = None
     dcp_prefix_rows: Optional[torch.Tensor] = None
+    dcp_interleave_kv_lens: Optional[torch.Tensor] = None
     # Page table for Sliding Window Attention
     swa_page_table: torch.Tensor = None
 
@@ -1530,6 +1532,15 @@ class FlashAttentionBackend(AttentionBackend):
             forward_batch.req_pool_indices,
             parallel.attn_dcp_rank : prefix_len : parallel.attn_dcp_size,
         ].flatten()
+        interleave_kv_lens = None
+        if is_interleave() and is_cp_active(forward_batch):
+            strategy = get_cp_strategy()
+            assert strategy is not None
+            interleave_kv_lens = (
+                strategy.local_q_indices(extend_len, forward_batch)
+                .to(torch.int32)
+                .add_(prefix_len + 1)
+            )
         seq_lens = forward_batch.seq_lens.to(torch.int32)
         self.forward_metadata = FlashAttentionMetadata(
             cache_seqlens_int32=seq_lens,
@@ -1541,6 +1552,7 @@ class FlashAttentionBackend(AttentionBackend):
             cu_seqlens_k=torch.nn.functional.pad(seq_lens, (1, 0)),
             page_table=page_table[:, :num_pages],
             dcp_prefix_rows=self.runner_ids.translate_dcp_read_ids(slots),
+            dcp_interleave_kv_lens=interleave_kv_lens,
         )
 
     def _assemble_dcp_prefill_kv(self, forward_batch, layer, k, k_rope, cp_active):
@@ -2155,7 +2167,8 @@ class FlashAttentionBackend(AttentionBackend):
                     q_nope = q_all[:, :, : layer.v_head_dim]
                     q_rope = q_all[:, :, layer.v_head_dim :]
 
-                if cp_active:
+                interleave_kv_lens = metadata.dcp_interleave_kv_lens
+                if cp_active and interleave_kv_lens is None:
                     # MLA CP: q is rank-local zigzag-split; run the
                     # absorbed-MLA kernel twice (prev/next halves) against
                     # the full latent KV pool through the selected strategy.
@@ -2201,12 +2214,25 @@ class FlashAttentionBackend(AttentionBackend):
                         attention_backend=CPAttentionBackendKind.FLASH_ATTENTION,
                     )
                 else:
+                    live_rows = (
+                        interleave_kv_lens.numel()
+                        if interleave_kv_lens is not None
+                        else max_seqlen_q
+                    )
                     padded_rows = 0
-                    if dcp_prefill_kv is not None and q_nope.shape[0] > max_seqlen_q:
-                        # Short extends can skip zigzag while the FFN still
-                        # needs rows padded for its attention-TP collective.
-                        padded_rows = q_nope.shape[0] - max_seqlen_q
-                        q_nope, q_rope = q_nope[:max_seqlen_q], q_rope[:max_seqlen_q]
+                    if dcp_prefill_kv is not None and q_nope.shape[0] > live_rows:
+                        # Attention only consumes live Q rows, but the FFN
+                        # still needs the original padded row layout.
+                        padded_rows = q_nope.shape[0] - live_rows
+                        q_nope, q_rope = q_nope[:live_rows], q_rope[:live_rows]
+                    if interleave_kv_lens is not None:
+                        # Batch the interleaved queries as one-token sequences
+                        # that share KV pages but have distinct causal bounds.
+                        q_nope, q_rope = q_nope.unsqueeze(1), q_rope.unsqueeze(1)
+                        cache_seqlens = interleave_kv_lens
+                        page_table = page_table.expand(live_rows, -1)
+                        cu_seqlens_q = cu_seqlens_k = None
+                        max_seqlen_q = 1
                     result = self.flash_attn_with_kvcache(
                         q=q_rope,
                         k_cache=k_rope_cache,
@@ -2258,6 +2284,8 @@ class FlashAttentionBackend(AttentionBackend):
                         )
                     else:
                         o = result
+                        if interleave_kv_lens is not None:
+                            o = o.squeeze(1)
                         if padded_rows > 0:
                             o = torch.nn.functional.pad(o, (0, 0, 0, 0, 0, padded_rows))
 

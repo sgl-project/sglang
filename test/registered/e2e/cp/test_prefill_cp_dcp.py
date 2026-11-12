@@ -5,6 +5,8 @@ before starting the distributed server. Set SGLANG_TEST_PCP_DCP_MODEL to "dummy"
 for config-only smoke testing, or to a DeepSeek dense MLA checkpoint path or
 model ID to test pretrained weights. These modes skip the single-GPU reference.
 With eight GPUs the test uses TP8/PCP4/DCP4 and the tiny model includes a MoE layer.
+Four-GPU runs default to interleave, other runs to zigzag. Set
+SGLANG_TEST_PCP_DCP_STRATEGY to override the strategy.
 """
 
 import math
@@ -84,6 +86,10 @@ class TestPrefillCpDcp(CustomTestCase):
         if cls.parallel_size not in (2, 4, 8):
             raise RuntimeError("Set CUDA_VISIBLE_DEVICES to exactly 2, 4 or 8 GPUs")
         cls.cp_size = 4 if cls.parallel_size == 8 else cls.parallel_size
+        cls.cp_strategy = os.environ.get(
+            "SGLANG_TEST_PCP_DCP_STRATEGY",
+            "interleave" if cls.parallel_size == 4 else "zigzag",
+        )
         with_moe = cls.parallel_size == 8
         majors = {
             torch.cuda.get_device_capability(i)[0] for i in range(cls.parallel_size)
@@ -132,13 +138,14 @@ class TestPrefillCpDcp(CustomTestCase):
                 str(cls.cp_size),
                 "--enable-prefill-cp",
                 "--cp-strategy",
-                "zigzag",
+                cls.cp_strategy,
                 "--prefill-attention-backend",
                 cls.prefill_backend,
                 "--decode-attention-backend",
                 "flashinfer",
                 "--chunked-prefill-size",
-                "128",
+                # The second interleaved chunk starts on an odd position.
+                "127" if cls.cp_strategy == "interleave" else "128",
                 # Exercise dispatch/combine for the tiny MoE's hidden size.
                 *(
                     ["--deepep-mode", "normal"]
@@ -217,7 +224,7 @@ class TestPrefillCpDcp(CustomTestCase):
 
     def test_short_prefill_fallback(self):
         prompt = [17]
-        # The one-token prefill is too short for zigzag. Every decode step
+        # The one-token prefill is too short for CP. Every decode step
         # still has to use the sharded layout established by that fallback.
         output = self._generate(prompt)["output_token_logprobs"]
         self._assert_decode_matches_prefill(prompt, output)
@@ -230,13 +237,14 @@ class TestPrefillCpDcp(CustomTestCase):
         for field in ("attn_cp_size", "dcp_size"):
             self.assertEqual(info[field], self.cp_size, field)
         self.assertTrue(info["enable_prefill_cp"])
+        self.assertEqual(info["cp_strategy"], self.cp_strategy)
         self.assertEqual(info["dcp_comm_backend"], "ag_ar")
         self.assertEqual(info["prefill_attention_backend"], self.prefill_backend)
         self.assertEqual(info["decode_attention_backend"], "flashinfer")
 
     def test_chunked_prefill_and_radix_hit(self):
-        # Two full chunks and an unaligned tail. The last chunk takes the
-        # ordinary extend fallback but must read the earlier sharded chunks.
+        # Two full chunks and a short tail. Under interleave, the second
+        # chunk's Q and persistent KV are assigned to different ranks.
         cold = self._generate(LONG_PROMPT)
         warm = self._generate(LONG_PROMPT)
         self.assertGreaterEqual(warm["cached_tokens"], 128)

@@ -1,7 +1,7 @@
 import sys
 import unittest
 from types import ModuleType, SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import PropertyMock, patch
 
 import torch
 
@@ -10,6 +10,7 @@ import sglang.srt.speculative.spec_utils as spec_utils
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention import flashattention_backend as flashattention_module
 from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
+from sglang.srt.layers.cp.interleave import InterleaveCPStrategy
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
 from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -202,6 +203,53 @@ class TestFlashAttentionDraftWidth(CustomTestCase):
 
 
 class TestFlashAttentionGraphMetadata(CustomTestCase):
+    def test_dcp_interleave_respects_causal_bounds_after_an_unaligned_prefix(self):
+        backend = FlashAttentionBackend.__new__(FlashAttentionBackend)
+        backend.page_size = 2
+        backend.req_to_token = torch.arange(10).unsqueeze(0)
+        backend.dcp_prefill_workspace = SimpleNamespace(
+            page_table=torch.arange(5, dtype=torch.int32).unsqueeze(0)
+        )
+        backend.runner_ids = SimpleNamespace(translate_dcp_read_ids=lambda ids: ids)
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            batch_size=1,
+            input_ids=torch.arange(5),
+            extend_prefix_lens_cpu=[5],
+            extend_seq_lens_cpu=[5],
+            extend_seq_lens=torch.tensor([5]),
+            seq_lens=torch.tensor([10]),
+            req_pool_indices=torch.tensor([0]),
+        )
+        for rank, visible in enumerate(([6, 8, 10], [7, 9])):
+            with (
+                self.subTest(rank=rank),
+                patch.object(
+                    InterleaveCPStrategy,
+                    "cp_rank",
+                    new_callable=PropertyMock,
+                    return_value=rank,
+                ),
+                patch.object(flashattention_module, "is_interleave", return_value=True),
+                patch.object(flashattention_module, "is_cp_active", return_value=True),
+                patch.object(
+                    flashattention_module,
+                    "get_cp_strategy",
+                    return_value=InterleaveCPStrategy(cp_size=2),
+                ),
+                patch.object(
+                    flashattention_module,
+                    "get_parallel",
+                    return_value=SimpleNamespace(attn_dcp_rank=rank, attn_dcp_size=2),
+                ),
+            ):
+                backend._init_dcp_prefill_metadata(batch)
+                metadata = backend.forward_metadata
+                self.assertEqual(metadata.dcp_interleave_kv_lens.tolist(), visible)
+                self.assertEqual(
+                    metadata.dcp_prefix_rows.tolist(), list(range(rank, 5, 2))
+                )
+
     def test_full_prefill_swa_buffer_uses_capture_token_capacity(self):
         backend = FlashAttentionBackend.__new__(FlashAttentionBackend)
         backend.full_cg_prefill_metadata = None

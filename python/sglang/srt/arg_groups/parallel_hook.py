@@ -318,12 +318,11 @@ def handle_combined_context_parallelism(server_args: Any):
         or not use_mla_backend(server_args)
         or attention_backends_of(cfg) != (prefill_backend, "flashinfer")
         or cfg.kv_cache_dtype not in ("bf16", "bfloat16")
-        or cfg.cp_strategy != "zigzag"
         or cfg.dcp_comm_backend != "ag_ar"
     ):
         raise ValueError(
             "Combined prefill CP and DCP requires native DeepSeek dense MLA "
-            f"with zigzag, --prefill-attention-backend {prefill_backend}, "
+            f"with --prefill-attention-backend {prefill_backend}, "
             "--decode-attention-backend flashinfer, BF16 KV cache, and "
             "--dcp-comm-backend ag_ar (the default for this combination)."
         )
