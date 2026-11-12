@@ -261,9 +261,18 @@ Validation entry points:
 ```bash
 python -m pytest python/sglang/multimodal_gen/test/unit/test_minimax_h3_prepared_sage.py python/sglang/multimodal_gen/test/unit/test_cake_sage_a2a_kernels.py -q
 torchrun --standalone --nproc_per_node=4 test/manual/attention/test_h3_prepared_sage_ulysses.py
+H3_BENCH_RESULT=result.json torchrun --standalone --nproc_per_node=4 test/manual/attention/bench_h3_prepared_sage_ulysses.py
 ```
 
 The distributed check exercises strided QKV views, nonaligned shards, live
 tails, mixed query masks, persistent receive buffers and the output gather. It
 compares fused and unfused glue exactly; full H3 generation still needs a
 separate validation run.
+
+The benchmark uses H3's 56 heads, D=128 and a 37,765-token live sequence with
+strided QKV views and mixed dense/sparse query rows. It checks exact output
+agreement, warms both arms, then alternates fused/unfused measurements over
+six trials of ten calls. Reported latency is the median of the maximum-rank
+CUDA event time per trial. It measures prepared attention with the same
+quantized-operand estimator; it does not compare BF16 routing or establish an
+end-to-end model speedup. Run on otherwise idle GPUs.
