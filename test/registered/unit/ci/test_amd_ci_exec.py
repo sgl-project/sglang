@@ -59,8 +59,8 @@ class TestAmdCiExec(CustomTestCase):
         return result, calls
 
     def test_failure_cannot_be_hidden_by_a_successful_retry(self):
-        """A crash, invocation error, or test failure must keep its first status."""
-        for exit_code in (1, 2, 125, 126, 127, 134, 137, 139, 143, 255):
+        """Test-runner errors and crashes must not disappear after an offline retry."""
+        for exit_code in (1, 2, 3, 4, 5, 6, 125, 126, 127, 134, 137, 139, 143, 255):
             with self.subTest(exit_code=exit_code):
                 result, calls = self._run_wrapper(first_exit=exit_code)
                 self.assertEqual(result.returncode, exit_code, result.stdout)

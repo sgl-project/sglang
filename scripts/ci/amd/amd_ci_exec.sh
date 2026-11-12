@@ -80,9 +80,9 @@ fi
 
 echo "First attempt failed with exit code $FIRST_EXIT_CODE"
 
-# Offline mode cannot repair test/usage failures (1/2), Docker or command
+# Offline mode cannot repair pytest failures (1-6), Docker or command
 # invocation errors (125-127), signal exits (128+), or the suite's exit 255.
-if [[ "$FIRST_EXIT_CODE" -eq 1 || "$FIRST_EXIT_CODE" -eq 2 || "$FIRST_EXIT_CODE" -ge 125 ]]; then
+if [[ "$FIRST_EXIT_CODE" -le 6 || "$FIRST_EXIT_CODE" -ge 125 ]]; then
   echo "Exit code $FIRST_EXIT_CODE is not eligible for an offline retry"
   exit $FIRST_EXIT_CODE
 fi
