@@ -1,0 +1,110 @@
+name: Release sgl-router Docker Image
+
+# `router-v<version>` tags in sgl-project/sglang: publish
+# lmsysorg/sgl-router:v<version> (and :latest) from docker/sgl-router.Dockerfile.
+# The router is versioned on its own track, separate from SGLang's `v*` tags,
+# which start the SGLang PyPI and Docker releases. Release steps:
+# sgl-router/README.md ("Releases and versions").
+
+on:
+  push:
+    tags:
+      - "router-v[0-9]+.*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to build (without the router-v prefix, e.g. 0.1.0); must match sgl-router/Cargo.toml"
+        required: true
+        type: string
+      ref:
+        description: "Branch, tag, or commit to build (e.g. router-v0.1.0 or main)"
+        required: false
+        type: string
+        default: "main"
+      image_repo:
+        description: "Docker Hub repo to push to. Use lmsysorg/sglang-staging for testing."
+        required: false
+        type: string
+        default: "lmsysorg/sgl-router"
+      push_latest:
+        description: "Also move the :latest tag to this build"
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-sgl-router-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      version: ${{ steps.resolve.outputs.version }}
+      ref: ${{ steps.resolve.outputs.ref }}
+      tags: ${{ steps.resolve.outputs.tags }}
+    steps:
+      - name: Resolve version and ref
+        id: resolve
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_REF: ${{ inputs.ref }}
+          INPUT_PUSH_LATEST: ${{ inputs.push_latest }}
+        run: |
+          if [[ "$EVENT_NAME" == "push" ]]; then
+            version=${REF_NAME#router-v}
+            ref=$REF_NAME
+            push_latest=true
+          else
+            version=${INPUT_VERSION#router-v}
+            version=${version#v}
+            ref=$INPUT_REF
+            push_latest=$INPUT_PUSH_LATEST
+          fi
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.+][0-9A-Za-z.]+)?$ ]]; then
+            echo "::error::Invalid version '$version' (expected X.Y.Z, optionally with a pre-release suffix)"
+            exit 1
+          fi
+          tags="v${version}"
+          # A pre-release (0.2.0-rc1) never moves :latest, even on a tag push.
+          if [[ "$push_latest" == "true" && "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            tags="${tags} latest"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          echo "tags=$tags" >> "$GITHUB_OUTPUT"
+          echo "Building sgl-router $version from $ref with tags: $tags"
+
+      - name: Checkout the release ref
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.resolve.outputs.ref }}
+          persist-credentials: false
+
+      - name: Match the tag to the crate version
+        env:
+          VERSION: ${{ steps.resolve.outputs.version }}
+        run: |
+          # First `version = "..."` after [package]; the [workspace] table above it has none.
+          crate_version=$(sed -n '/^\[package\]/,/^\[/{s/^version *= *"\([^"]*\)".*/\1/p;}' sgl-router/Cargo.toml | head -n1)
+          if [[ "$VERSION" != "$crate_version" ]]; then
+            echo "::error::Releasing $VERSION, but sgl-router/Cargo.toml is at $crate_version. Bump the crate (and Cargo.lock) first."
+            exit 1
+          fi
+          echo "sgl-router/Cargo.toml is at $crate_version"
+
+  publish:
+    needs: verify
+    uses: ./.github/workflows/_sgl-router-docker.yml
+    with:
+      image_repo: ${{ inputs.image_repo || 'lmsysorg/sgl-router' }}
+      tags: ${{ needs.verify.outputs.tags }}
+      ref: ${{ needs.verify.outputs.ref }}
+    secrets: inherit
