@@ -567,6 +567,7 @@ POSITIONAL_FIELD_ORDER = (
     "speculative_dflash_draft_kv_ring",
     "media_url_timeout",
     "allow_local_media_files",
+    "layernorm_sp_min_tokens",
     "paged_experts_host_memory_gb",
     "_max_running_requests_explicitly_set",
 )
