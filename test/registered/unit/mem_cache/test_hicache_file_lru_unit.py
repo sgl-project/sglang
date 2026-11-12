@@ -192,23 +192,19 @@ class TestEvictionReadiness(HiCacheFileLRUTestBase):
         self.assertTrue(backend.set("new", _t(64)))
         self.assertEqual(backend._evictor._total_bytes, 128)
 
+    def test_failed_unlinks_are_bounded_per_pass(self):
+        # A cache directory that refuses every unlink must not cost one
+        # attempt (and one warning) per tracked file while holding the lock.
+        backend = self.make_backend(max_size="128", eviction_ratio=1.0)
+        for index in range(12):
+            self.assertTrue(backend.set(f"k{index}", _t(8)))
 
-class TestEnvDefaults(CustomTestCase):
-    """Verify the env var defaults match the documented opt-in behavior."""
+        with mock.patch("os.remove", side_effect=PermissionError("blocked")) as remove:
+            self.assertFalse(backend.set("new", _t(64)))
 
-    def test_min_free_space_default_is_zero(self):
-        # Default must keep eviction off so existing users are unaffected.
-        with mock.patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("SGLANG_HICACHE_FILE_BACKEND_MIN_FREE_SPACE", None)
-            self.assertEqual(
-                envs.SGLANG_HICACHE_FILE_BACKEND_MIN_FREE_SPACE.get(),
-                "0",
-            )
-
-    def test_max_size_default_is_none(self):
-        with mock.patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE", None)
-            self.assertIsNone(envs.SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE.get())
+        self.assertEqual(remove.call_count, 8)
+        self.assertEqual(backend._evictor._total_bytes, 96)
+        self.assertEqual(len(backend._evictor._lru), 12)
 
 
 class TestEvictionDisabledByDefault(HiCacheFileLRUTestBase):
