@@ -4,6 +4,7 @@ import importlib.util
 import os
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -12,6 +13,44 @@ requires_cpu_runtime = pytest.mark.skipif(
     or importlib.util.find_spec("sglang") is None,
     reason="requires the SGLang CPU test environment",
 )
+
+
+def environment_defaults_owner(monkeypatch):
+    for key in (
+        "SGLANG_SIMULATOR_BOOTSTRAP",
+        "SGLANG_USE_CPU_ENGINE",
+        "SGLANG_TIMEOUT_KEEP_ALIVE",
+    ):
+        monkeypatch.delenv(key, raising=False)
+    path = Path(__file__).resolve().parents[1] / "src/usercustomize.py"
+    spec = importlib.util.spec_from_file_location("cpu_environment_defaults_test", path)
+    owner = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(owner)
+    return owner
+
+
+@pytest.mark.parametrize(
+    "bootstrap,cpu", [(False, False), (True, False), (False, True), (True, True)]
+)
+def test_http_lifetime_default_requires_explicit_cpu_simulation(
+    monkeypatch, bootstrap, cpu
+):
+    owner = environment_defaults_owner(monkeypatch)
+    monkeypatch.setenv("SGLANG_SIMULATOR_BOOTSTRAP", "1" if bootstrap else "0")
+    monkeypatch.setenv("SGLANG_USE_CPU_ENGINE", "1" if cpu else "0")
+    enabled = bootstrap and cpu
+    assert owner.configure_cpu_simulation_environment() is enabled
+    assert os.environ.get("SGLANG_TIMEOUT_KEEP_ALIVE") == ("3600" if enabled else None)
+
+
+@pytest.mark.parametrize("seconds", ["5", "120"])
+def test_explicit_cpu_http_lifetime_is_preserved(monkeypatch, seconds):
+    owner = environment_defaults_owner(monkeypatch)
+    monkeypatch.setenv("SGLANG_SIMULATOR_BOOTSTRAP", "1")
+    monkeypatch.setenv("SGLANG_USE_CPU_ENGINE", "1")
+    monkeypatch.setenv("SGLANG_TIMEOUT_KEEP_ALIVE", seconds)
+    assert owner.configure_cpu_simulation_environment() is True
+    assert os.environ["SGLANG_TIMEOUT_KEEP_ALIVE"] == seconds
 
 
 def run_python(code, *, bootstrap=False, cpu=False):
