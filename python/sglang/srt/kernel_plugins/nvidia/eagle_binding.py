@@ -174,6 +174,13 @@ class LinearPrefillView(msgspec.Struct, frozen=True):
     output: Optional[torch.Tensor] = None
 
 
+class EaglePreparationView(msgspec.Struct, frozen=True):
+    """The pools a build's prepare reads, before any capture."""
+
+    mamba: Optional[MambaPoolBuffers]  # None for a model without GDN layers
+    num_request_rows: int  # request-table rows, row 0 pads
+
+
 class EagleDraftLoopIO(msgspec.Struct, frozen=True):
     num_requests: int
     num_steps: int
@@ -305,6 +312,15 @@ class EagleBinding:
             state_checkpoint_cu_starts=meta.state_checkpoint_cu_starts,
             num_state_checkpoints=meta.num_state_checkpoints,
             state_checkpoint_every_n_tokens=meta.state_checkpoint_every_n_tokens,
+        )
+
+    def preparation_view(self, model_runner: Any) -> EaglePreparationView:
+        """The pools as a build's prepare sees them, sealed as a forward's are."""
+        backend = model_runner.attn_backend
+        linear = split_backend(backend)[1]
+        return EaglePreparationView(
+            mamba=None if linear is None else self._read("mamba", self._mamba, backend),
+            num_request_rows=model_runner.req_to_token_pool.req_to_token.shape[0],
         )
 
     def assert_live(self) -> None:

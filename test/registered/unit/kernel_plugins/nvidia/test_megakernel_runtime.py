@@ -24,6 +24,7 @@ from _fakes import (  # noqa: E402
     DRAFT,
     ISA,
     SPEC,
+    FakeBuilt,
     Lm,
     batch,
     server_args,
@@ -363,6 +364,30 @@ class TestMegakernelRuntime(CustomTestCase):
         self.assertIsInstance(lm.context.binding, Mock)
         with self.assertRaisesRegex(ValueError, "binding 'nope' is not one of"):
             self._install_spec(replace(SPEC, binding="nope"), tokens=1)
+
+    def test_a_build_keeping_its_own_state_is_wired_to_the_state_storage(self):
+        from sglang.srt.mem_cache.kv.state_storage import StateStorage
+
+        class OwnStateBuilt(FakeBuilt):
+            state_bytes_per_slot = state_bytes_per_request_row = 0
+            keeps_draft_ssm = tracks_decode_state = backs_up_state = False
+
+            def reset_state_slots(self, slots, request_rows):
+                pass
+
+        own = replace(SPEC, build=lambda m, hf, ctx: OwnStateBuilt(ctx.widths))
+        for spec, keeps_own_state in ((SPEC, False), (own, True)):
+            with self.subTest(keeps_own_state=keeps_own_state):
+                lm = self._install_spec(spec, tokens=1)
+                state = StateStorage.empty("state")
+                runner = SimpleNamespace(
+                    model=lm, token_to_kv_pool_allocator=SimpleNamespace(state=state)
+                )
+                binding.prepare_megakernel(runner)
+                expected = binding.built_megakernel(lm) if keeps_own_state else None
+                self.assertIs(state.own_state, expected)
+                self.assertEqual(state.tracks_decode_state, not keeps_own_state)
+                self.assertEqual(state.backs_up_state, not keeps_own_state)
 
     def test_offered_entries_reach_sglang_only_when_every_rank_offers_them(self):
         registry.register(architecture="EagleDraft", path="_fakes:EAGLE_DRAFT")

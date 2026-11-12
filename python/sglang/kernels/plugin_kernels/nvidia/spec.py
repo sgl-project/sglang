@@ -507,6 +507,25 @@ class RecurrentCommitIO(msgspec.Struct, frozen=True):
 
 
 @runtime_checkable
+class SupportsStateSlotReset(Protocol):
+    """A target build keeping recurrent state of its own beside the state pool,
+    allocated in its prepare and charged to the pool's budget per slot and per
+    request-table row. reset_state_slots(slots, request_rows) runs on the forward
+    stream before each target extend and when a slot is newly bound. False flags
+    drop the per-draft SSM scratch, decode-time checkpoints and host backups."""
+
+    state_bytes_per_slot: int
+    state_bytes_per_request_row: int
+    keeps_draft_ssm: bool
+    tracks_decode_state: bool
+    backs_up_state: bool
+
+    def reset_state_slots(
+        self, slots: torch.Tensor, request_rows: torch.Tensor
+    ) -> None: ...
+
+
+@runtime_checkable
 class SupportsRecurrentCommit(Protocol):
     """A target build committing a chain verify's recurrent state on the current
     stream. True: SGLang commits only its per-request side states (PLE); False:

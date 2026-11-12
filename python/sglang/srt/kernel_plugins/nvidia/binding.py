@@ -37,6 +37,7 @@ from sglang.kernels.plugin_kernels.nvidia.spec import (
     PostVerifyStrategy,
     SpeculativeRuntimeHooks,
     Step,
+    SupportsStateSlotReset,
     find_spec,
     registered_architectures,
     spec_registered,
@@ -1336,6 +1337,15 @@ def prepare_megakernel(model_runner: ModelRunner) -> None:
         installed.prepare(
             installed.built, installed.binding.preparation_view(model_runner)
         )
+    own_state = megakernel_state(model_runner.model)
+    if own_state is not None:
+        model_runner.token_to_kv_pool_allocator.state.own_state = own_state
+
+
+def megakernel_state(model: torch.nn.Module) -> Optional[SupportsStateSlotReset]:
+    """The installed build when it keeps recurrent state of its own, else None."""
+    built = built_megakernel(model)
+    return built if isinstance(built, SupportsStateSlotReset) else None
 
 
 def bind_speculative_runtime_hooks(
