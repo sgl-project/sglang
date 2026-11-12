@@ -144,6 +144,7 @@ def _hybrid(pool=None, full=_trtllm):
             mamba_cache_indices=torch.zeros(2, dtype=torch.int32),
             query_start_loc=torch.zeros(3, dtype=torch.int32),
             mamba_track_indices=None,
+            replayssm_ring_indices=None,
         ),
         verify_intermediate_state_indices=torch.arange(2, dtype=torch.int32),
         pad_slot_id=-1,
@@ -331,7 +332,7 @@ class TestEagleBinding(CustomTestCase):
                     built=built, original=original, binding=binding
                 )
                 forward = dispatch.wrapped()
-                batch = SimpleNamespace(batch_size=2)
+                batch = SimpleNamespace(batch_size=2, mamba_track_mask=None)
                 ids = torch.zeros(2, dtype=torch.int64)
                 check = runtime._CaptureCheck(
                     spec=SimpleNamespace(name="eagle"), dispatch=dispatch
@@ -413,6 +414,20 @@ class TestEagleBinding(CustomTestCase):
             if owner in members:
                 self.assertIn(attr, members[owner], name)
 
+    def test_the_gdn_step_view_holds_the_forwards_state_slots_and_track_mask(self):
+        """PLE and GDN track writes go to the forward's resolved slots (the request
+        table may be reused meanwhile), for the requests its track mask selects."""
+        backend = _hybrid()
+        gdn = backend.linear_attn_backend
+        gdn.forward_metadata.mamba_track_indices = torch.tensor([5, 6])
+        forward_batch = SimpleNamespace(mamba_track_mask=torch.tensor([True, False]))
+        with patch.object(eb, "get_attn_backend", return_value=backend):
+            view = eb.EagleBinding(model=torch.nn.Module()).forward_view(forward_batch)
+        slots = gdn.forward_state_slots(2, track_ids=torch.zeros(2))
+        self.assertEqual(view.gdn.state_indices.data_ptr(), slots.working.data_ptr())
+        self.assertEqual(view.gdn.track_indices.data_ptr(), slots.track.data_ptr())
+        self.assertIs(view.gdn.track_mask, forward_batch.mamba_track_mask)
+
     def test_a_backend_with_its_own_views_supplies_the_step_and_pool_data(self):
         """A sparse full-attention backend hands a megakernel its own metadata and
         pool buffers; the binding forwards them without reading their fields."""
@@ -444,7 +459,9 @@ class TestEagleBinding(CustomTestCase):
         qsa.forward_metadata = None
         qsa.init_forward_metadata = lambda fb: setattr(qsa, "forward_metadata", fb.m)
         with patch.object(eb, "get_attn_backend", return_value=backend):
-            later = binding.forward_view(SimpleNamespace(m="eager"))
+            later = binding.forward_view(
+                SimpleNamespace(m="eager", mamba_track_mask=None)
+            )
         self.assertEqual(later.attn.metadata, "eager")
         self.assertIs(later.attn.mtp_indices, shared.indices)
         self.assertIs(later.attn.mtp_captured_len, shared.captured_len)

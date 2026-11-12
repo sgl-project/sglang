@@ -121,6 +121,9 @@ class AttnStepMetadata(msgspec.Struct, frozen=True):
 
 
 class GdnStepMetadata(msgspec.Struct, frozen=True):
+    """state_indices and track_indices are the forward's resolved state slots (its
+    forward_state_slots): the request table may already be reused while it runs."""
+
     # [bs] mamba slot per request (conv and temporal rows), pad_slot_id if padded
     state_indices: torch.Tensor
     query_start_loc: torch.Tensor  # [bs + 1] int32
@@ -128,6 +131,8 @@ class GdnStepMetadata(msgspec.Struct, frozen=True):
     intermediate_indices: torch.Tensor
     pad_slot_id: int
     track_indices: Optional[torch.Tensor]  # [bs] track slot per request
+    # [bs] bool: the requests whose state this step checkpoints to its track slot
+    track_mask: Optional[torch.Tensor] = None
 
 
 class LayerStateView(msgspec.Struct, frozen=True):
@@ -314,7 +319,7 @@ class EagleBinding:
         full, linear = split_backend(backend)
         return EagleForwardView(
             attn=attn_step_view(full, forward_batch),
-            gdn=None if linear is None else gdn_step_metadata(linear),
+            gdn=None if linear is None else gdn_step_metadata(linear, forward_batch),
             kv=self._read("kv", self._kv, backend),
             mamba=None if linear is None else self._read("mamba", self._mamba, backend),
             parts=self._read("parts", self._parts, backend),
@@ -436,7 +441,9 @@ def attn_step_metadata(backend: Any) -> AttnStepMetadata:
     )
 
 
-def gdn_step_metadata(backend: Any) -> GdnStepMetadata:
+def gdn_step_metadata(
+    backend: Any, forward_batch: Optional[Any] = None
+) -> GdnStepMetadata:
     """A GDN backend's metadata of the current target verify step."""
     metadata = backend.forward_metadata
     return GdnStepMetadata(
@@ -447,6 +454,7 @@ def gdn_step_metadata(backend: Any) -> GdnStepMetadata:
         intermediate_indices=backend.verify_intermediate_state_indices,
         pad_slot_id=backend.pad_slot_id,
         track_indices=metadata.mamba_track_indices,
+        track_mask=None if forward_batch is None else forward_batch.mamba_track_mask,
     )
 
 
