@@ -48,18 +48,20 @@ Flux and Qwen do not separate CFG caches and do not implement TeaCache yet (see 
 
 ## Configuration
 
-TeaCache is configured via `TeaCacheParams` in the sampling parameters:
+TeaCache is configured via `TeaCacheParams` in the sampling parameters. Start from the matching model's calibrated parameters; this example changes the threshold for `Wan-AI/Wan2.1-T2V-1.3B-Diffusers` while preserving its coefficients and skip window:
 
-```python
-from sglang.multimodal_gen.configs.sample.teacache import TeaCacheParams
+```python Configuration
+from dataclasses import replace
+from sglang.multimodal_gen.configs.sample.wan import WanT2V_1_3B_SamplingParams
 
-params = TeaCacheParams(
-    teacache_thresh=0.1,           # Threshold for accumulated L1 distance
-    coefficients=[c4, c3, c2, c1, c0],  # degree-4 polynomial, highest power first
+params = replace(
+    WanT2V_1_3B_SamplingParams().teacache_params,
+    teacache_thresh=0.1,
 )
+sampling_params_kwargs = {"enable_teacache": True, "teacache_params": params}
 ```
 
-`--enable-teacache` / `enable_teacache` use the model's built-in `TeaCacheParams`. Custom params can only be passed from Python, via `sampling_params_kwargs={"enable_teacache": True, "teacache_params": TeaCacheParams(...)}`.
+`--enable-teacache` / `enable_teacache` use the model's built-in `TeaCacheParams`. To customize them from Python, pass `sampling_params_kwargs` to `DiffGenerator.generate()`.
 
 ### Parameters
 

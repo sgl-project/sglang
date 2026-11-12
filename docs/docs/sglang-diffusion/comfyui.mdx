@@ -7,7 +7,7 @@ The [ComfyUI SGLDiffusion plugin](https://github.com/sgl-project/sglang/tree/mai
 
 **Server mode** talks to a standalone `sglang serve` process over HTTP. ComfyUI sends prompts and receives images or video. This is the same path as the [OpenAI-compatible API](/docs/sglang-diffusion/api/openai_api).
 
-**Integrated mode** keeps ComfyUI's CLIP, VAE, and sampler loop. SGLang loads only the DiT and runs one forward per sampler step. The worker starts the native Flux / Qwen-Image / Qwen-Image-2.1 / Z-Image / MiniMax-H3 pipeline with `comfyui_mode` enabled (a `ServerArgs` field the plugin sets; there is no CLI flag). A single-file ComfyUI `.safetensors` (or a GGUF overlay) is loaded through a checkpoint spec. Each `apply_model` call is translated by a per-model adapter.
+**Integrated mode** keeps ComfyUI's CLIP, VAE, and sampler loop. SGLang loads only the DiT and runs one forward per sampler step. The worker starts the native Flux / Qwen-Image / Qwen-Image-2.1 / Z-Image / LTX-2 / MiniMax-H3 pipeline with `comfyui_mode` enabled (a `ServerArgs` field the plugin sets; there is no CLI flag). A single-file ComfyUI `.safetensors` (or a GGUF overlay) is loaded through a checkpoint spec. Each `apply_model` call is translated by a per-model adapter.
 
 Integrated mode does not ship a separate `comfyui_*` pipeline class per model.
 
@@ -25,7 +25,7 @@ Example workflows live next to the plugin under `workflows/`.
 2. Set `num_gpus`, `tp_size`, `model_type`, or compile flags with `SGLDiffusion Options`.
 3. Connect the loaded model to a standard ComfyUI sampler.
 
-Supported integrated-mode families: Flux, Qwen-Image, Qwen-Image-2.1, Z-Image, MiniMax-H3 (plus FastH3 and VDN-H3 through `SGLDiffusion Native Model Loader`). Qwen-Image edit is experimental.
+Supported integrated-mode families: Flux, Qwen-Image, Qwen-Image-2.1, Z-Image, LTX-2.5 / LTX-2.3, MiniMax-H3 (plus FastH3 and VDN-H3 through `SGLDiffusion Native Model Loader`). Qwen-Image edit is experimental.
 
 ## How a sampler step reaches the worker
 
