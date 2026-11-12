@@ -115,8 +115,8 @@ def _transfer_queue(decode_reqs):
     queue._clean_hicache_prefetch_resources = MagicMock()
     queue._commit_transfer_to_req = MagicMock()
     queue._record_transfer_failure = MagicMock()
+    queue.request_retirer = leaving_retirer()
     queue.scheduler = SimpleNamespace(
-        request_retirer=leaving_retirer(),
         enable_decode_hicache=False,
         enable_hisparse=False,
         metrics_reporter=SimpleNamespace(enable_metrics=False),
@@ -159,7 +159,7 @@ class TestPopTransferredFollowsConsensusOutcome(CustomTestCase):
         self.assertEqual(outcomes, {"s": False, "f": True})
         self.assertEqual(list(queue.queue.items()), [not_yet_agreed])
         queue._commit_transfer_to_req.assert_called_once_with(admitted)
-        queue.scheduler.request_retirer.release.assert_called_once_with(
+        queue.request_retirer.release.assert_called_once_with(
             failed_elsewhere.req, checkpoint=False
         )
         queue._record_transfer_failure.assert_called_once_with(

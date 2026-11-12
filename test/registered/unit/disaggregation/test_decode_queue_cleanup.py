@@ -290,7 +290,8 @@ class TestDecodeHiCacheRestoreGate(CustomTestCase):
             queue._clean_hicache_prefetch_resources = MagicMock()
             queue._commit_transfer_to_req = MagicMock()
             queue._record_transfer_failure = MagicMock()
-            scheduler = MagicMock(request_retirer=leaving_retirer())
+            queue.request_retirer = leaving_retirer()
+            scheduler = MagicMock()
             scheduler.enable_decode_hicache = True
             scheduler.enable_hisparse = False
             scheduler.metrics_reporter.enable_metrics = False
@@ -333,7 +334,7 @@ class TestDecodeHiCacheRestoreGate(CustomTestCase):
         self.assertEqual(queue.move_transferred(IndexedReqList(ListKind.WAITING)), [])
         self.assertEqual(list(queue.queue.items()), [decode_req])
         mock_prepare_abort.assert_not_called()
-        queue.scheduler.request_retirer.release.assert_not_called()
+        queue.request_retirer.release.assert_not_called()
 
 
 class _PollingReceiver:

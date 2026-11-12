@@ -659,7 +659,6 @@ class PrefillAdder:
         dllm_config: Optional[DllmConfig] = None,
         waiting_queue_len: int = 0,
         prefill_tile_block_m: int = 64,
-        request_retirer: Optional[RequestRetirer] = None,
         kv_awaiting_transfer: bool = False,
     ):
         self.page_size = page_size
@@ -677,7 +676,6 @@ class PrefillAdder:
         if is_cp_sharded_padded():
             self.logical_page_size *= get_cp_strategy().cp_size
         self.running_batch = running_batch
-        self.request_retirer = request_retirer
         # Finished prefills hold KV until decode pulls it (PD prefill).
         self.kv_awaiting_transfer = kv_awaiting_transfer
         self.new_token_ratio = new_token_ratio
@@ -1993,7 +1991,7 @@ class PrefillAdder:
         )
         self._account_prefill_cache_admission(req, admission.prefix_len)
 
-    def preempt_to_schedule(self, req: Req) -> bool:
+    def preempt_to_schedule(self, req: Req, request_retirer: RequestRetirer) -> bool:
         """
         Preempt running requests to serve the new request if the priority threshold is met and token count sum is verified.
         Returns True if preemption was committed, and the new request can be scheduled.
@@ -2064,7 +2062,7 @@ class PrefillAdder:
                 self.running_batch.release_req(
                     i,
                     len(self.running_batch.reqs) - release_counter,
-                    self.request_retirer,
+                    request_retirer,
                 )
             else:
                 keep_indices.append(i)

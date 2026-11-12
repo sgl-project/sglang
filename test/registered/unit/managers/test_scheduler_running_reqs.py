@@ -384,7 +384,7 @@ class TestRunningReqsHooks(CustomTestCase):
             def budget_state(self):
                 return AddReqResult.CONTINUE
 
-            def preempt_to_schedule(self, req):
+            def preempt_to_schedule(self, req, request_retirer):
                 self.preempt_list.append(self.running_batch.reqs.pop(0))
                 return True
 

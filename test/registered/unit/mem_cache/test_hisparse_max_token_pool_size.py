@@ -120,8 +120,8 @@ def _make_prealloc_queue(
     queue.scheduler = SimpleNamespace(
         enable_hisparse=enable_hisparse,
         tp_worker=tp_worker,
-        request_retirer=SimpleNamespace(retire_unadmitted=MagicMock()),
     )
+    queue.request_retirer = SimpleNamespace(retire_unadmitted=MagicMock())
     return queue
 
 
@@ -156,7 +156,7 @@ class TestCheckIfReqExceedKvCapacity(CustomTestCase):
         req = _make_req("hisparse-long", prompt_len=2048)
 
         self.assertFalse(queue._check_if_req_exceed_kv_capacity(req))
-        queue.scheduler.request_retirer.retire_unadmitted.assert_not_called()
+        queue.request_retirer.retire_unadmitted.assert_not_called()
 
     def test_hisparse_rejects_beyond_host_backed_size(self):
         """Requests longer than host-backed capacity are still aborted."""
@@ -168,7 +168,7 @@ class TestCheckIfReqExceedKvCapacity(CustomTestCase):
         req = _make_req("hisparse-too-long", prompt_len=5000)
 
         self.assertTrue(queue._check_if_req_exceed_kv_capacity(req))
-        queue.scheduler.request_retirer.retire_unadmitted.assert_called_once_with(req)
+        queue.request_retirer.retire_unadmitted.assert_called_once_with(req)
         # prepare_abort sets finished_reason to a BAD_REQUEST FINISH_ABORT.
         self.assertIsNotNone(req.finished_reason)
 
@@ -183,7 +183,7 @@ class TestCheckIfReqExceedKvCapacity(CustomTestCase):
         req = _make_req("non-hisparse-too-long", prompt_len=2048)
 
         self.assertTrue(queue._check_if_req_exceed_kv_capacity(req))
-        queue.scheduler.request_retirer.retire_unadmitted.assert_called_once_with(req)
+        queue.request_retirer.retire_unadmitted.assert_called_once_with(req)
 
     def test_rebootstrap_input_len_used_for_capacity(self):
         """Rebootstrap requests carry both prompt and emitted output_ids; the

@@ -906,6 +906,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.send_abort_output = MagicMock()
         scheduler.beam_coordinator = MagicMock()
         scheduler.init_request_retirer()
+        prealloc_queue.request_retirer = scheduler.request_retirer
         scheduler.enable_continuous_input_polling = False
         scheduler.pause_state = PauseState()
         scheduler.pause_state.pause()
@@ -936,6 +937,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.init_request_retirer()
         prealloc_queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
         prealloc_queue.scheduler = scheduler
+        prealloc_queue.request_retirer = scheduler.request_retirer
         prealloc_queue.retracted_queue = IndexedReqList(
             ListKind.PD_RETRACTED, abort=prealloc_queue._abort_retracted
         )
