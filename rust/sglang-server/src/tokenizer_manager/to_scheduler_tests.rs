@@ -1428,7 +1428,7 @@ fn retirement_control_fences_delayed_intake_request_locally() {
 
     let (tx, mut rx) = mpsc::channel(8);
     let control = Request {
-        rid: Rid::new(),
+        rid: Rid::from("corr"),
         state: RequestState::Queued,
         sink: ResponseSink::Local(tx),
         kind: RequestKind::Control(Box::new(ControlRequest::CancellationRetirementReq(

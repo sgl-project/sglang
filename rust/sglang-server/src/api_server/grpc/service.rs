@@ -1590,6 +1590,10 @@ mod tests {
         assert!(retired.success);
         assert!(retired.retirement_confirmed);
 
+        let error = stream_error(stream.next().await.unwrap().unwrap());
+        assert_eq!(error.error.unwrap().code, 499);
+        assert!(stream.next().await.is_none());
+
         // Positive proof notifies CancelledError via Local cleanup only.
         assert!(matches!(
             harness.abort_rx.try_recv(),
@@ -1598,7 +1602,7 @@ mod tests {
         assert!(harness.abort_rx.try_recv().is_err());
 
         // Public RID reuse must not receive the prior Local abort.
-        let mut reused = harness
+        let reused = harness
             .service
             .generate(Request::new(ids_request(&[1], Some("retire-me"))))
             .await
@@ -1620,7 +1624,7 @@ mod tests {
             .service
             .core()
             .set_cancel_retirement_receipts_enabled(true);
-        let mut stream = harness
+        let stream = harness
             .service
             .generate(Request::new(ids_request(&[1], Some("zero-rx"))))
             .await
@@ -1724,7 +1728,7 @@ mod tests {
             .service
             .core()
             .set_cancel_retirement_receipts_enabled(true);
-        let mut stream = harness
+        let stream = harness
             .service
             .generate(Request::new(ids_request(&[1], Some("expire-me"))))
             .await
@@ -1819,7 +1823,7 @@ mod tests {
         for (i, which) in cases.iter().enumerate() {
             let public = format!("bad-id-{i}");
             let op = format!("op-bad-id-{i}");
-            let mut stream = harness
+            let stream = harness
                 .service
                 .generate(Request::new(ids_request(&[1], Some(&public))))
                 .await
