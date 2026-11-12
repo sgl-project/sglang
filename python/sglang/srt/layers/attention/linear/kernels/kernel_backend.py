@@ -55,6 +55,11 @@ class LinearAttnKernelBase(ABC):
         **kwargs,
     ) -> tuple: ...
 
+    def extend_reads_strided_qkv(self, q: torch.Tensor, k: torch.Tensor) -> bool:
+        """Whether extend() reads these q / k split views (and the matching v)
+        without copying them, so the caller can skip its own contiguous split."""
+        return False
+
     def target_verify(
         self,
         A_log: torch.Tensor,

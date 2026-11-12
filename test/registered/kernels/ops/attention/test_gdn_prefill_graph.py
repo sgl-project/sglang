@@ -5,9 +5,11 @@ One bucket is captured once, then replayed for batches of different shapes:
 several sequences, cached prefixes, padding past the batch, chunk-aligned and
 unaligned prefix-cache snapshots, and a batch without tracking. Each replay must
 match the eager path bit for bit on the output, the conv / SSM state pools and
-the track slots, for FP32 and BF16 SSM states.
+the track slots, for FP32 and BF16 SSM states, at a narrow layout and at one
+wider than the fused q / k / v split.
 """
 
+import itertools
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -38,7 +40,7 @@ NUM_SLOTS = 48
 CHUNK = 64
 
 
-def _layer():
+def _layer(heads, v_heads):
     g = torch.Generator(device="cuda").manual_seed(7)
 
     def randn(*shape, dtype=torch.bfloat16, scale=0.2):
@@ -46,20 +48,20 @@ def _layer():
 
     return SimpleNamespace(
         layer_id=0,
-        num_q_heads=HEADS,
-        num_k_heads=HEADS,
-        num_v_heads=V_HEADS,
+        num_q_heads=heads,
+        num_k_heads=heads,
+        num_v_heads=v_heads,
         head_q_dim=HEAD_DIM,
         head_k_dim=HEAD_DIM,
         head_v_dim=HEAD_DIM,
-        q_dim=HEADS * HEAD_DIM,
-        k_dim=HEADS * HEAD_DIM,
-        v_dim=V_HEADS * HEAD_DIM,
-        conv_weights=randn(DIM, CONV),
+        q_dim=heads * HEAD_DIM,
+        k_dim=heads * HEAD_DIM,
+        v_dim=v_heads * HEAD_DIM,
+        conv_weights=randn((2 * heads + v_heads) * HEAD_DIM, CONV),
         bias=None,
         activation="silu",
-        A_log=randn(V_HEADS, dtype=torch.float32),
-        dt_bias=randn(V_HEADS, dtype=torch.float32),
+        A_log=randn(v_heads, dtype=torch.float32),
+        dt_bias=randn(v_heads, dtype=torch.float32),
     )
 
 
@@ -143,23 +145,25 @@ def _batch(extend_lens, prefix_lens, track=None):
 
 @unittest.skipUnless(torch.cuda.is_available(), "needs a GPU")
 class TestGDNPrefillGraph(CustomTestCase):
-    def _setup(self, ssm_dtype):
-        self.layer = _layer()
+    def _setup(self, ssm_dtype, heads=HEADS, v_heads=V_HEADS):
+        self.layer = _layer(heads, v_heads)
+        self.dim = (2 * heads + v_heads) * HEAD_DIM
+        self.v_heads = v_heads
         g = torch.Generator(device="cuda").manual_seed(11)
         self.conv_pool = (
-            torch.randn(NUM_SLOTS, DIM, CONV - 1, generator=g, device="cuda") * 0.3
+            torch.randn(NUM_SLOTS, self.dim, CONV - 1, generator=g, device="cuda") * 0.3
         ).to(torch.bfloat16)
         self.ssm_pool = (
             torch.randn(
-                NUM_SLOTS, V_HEADS, HEAD_DIM, HEAD_DIM, generator=g, device="cuda"
+                NUM_SLOTS, v_heads, HEAD_DIM, HEAD_DIM, generator=g, device="cuda"
             )
             * 0.05
         ).to(ssm_dtype)
         self.backend = _backend(self.conv_pool, self.ssm_pool)
         # Static inputs the captured graph reads.
-        self.mixed = torch.zeros(BUCKET, DIM, device="cuda", dtype=torch.bfloat16)
-        self.a = torch.zeros(BUCKET, V_HEADS, device="cuda", dtype=torch.bfloat16)
-        self.b = torch.zeros(BUCKET, V_HEADS, device="cuda", dtype=torch.bfloat16)
+        self.mixed = torch.zeros(BUCKET, self.dim, device="cuda", dtype=torch.bfloat16)
+        self.a = torch.zeros(BUCKET, v_heads, device="cuda", dtype=torch.bfloat16)
+        self.b = torch.zeros(BUCKET, v_heads, device="cuda", dtype=torch.bfloat16)
 
     def _fill(self, meta, batch):
         with patch(
@@ -223,9 +227,9 @@ class TestGDNPrefillGraph(CustomTestCase):
                 self.conv_pool[row + 1].zero_()
                 self.ssm_pool[row + 1].zero_()
         # Garbage past the batch must not leak into anything.
-        self.mixed.copy_(torch.randn(BUCKET, DIM, generator=g, device="cuda"))
-        self.a.copy_(torch.randn(BUCKET, V_HEADS, generator=g, device="cuda"))
-        self.b.copy_(torch.randn(BUCKET, V_HEADS, generator=g, device="cuda"))
+        self.mixed.copy_(torch.randn(BUCKET, self.dim, generator=g, device="cuda"))
+        self.a.copy_(torch.randn(BUCKET, self.v_heads, generator=g, device="cuda"))
+        self.b.copy_(torch.randn(BUCKET, self.v_heads, generator=g, device="cuda"))
 
         # Eager reference on cloned pools.
         ref_conv, ref_ssm = self.conv_pool.clone(), self.ssm_pool.clone()
@@ -264,11 +268,16 @@ class TestGDNPrefillGraph(CustomTestCase):
             ([200, 11], [0, 0], None),
             ([1], [900], None),
         ]
-        for ssm_dtype in (torch.float32, torch.bfloat16):
-            self._setup(ssm_dtype)
+        # 16 / 48 heads (10240 q+k+v columns) is wider than the fused split, so
+        # the captured and the eager extend both read the split views in place.
+        layouts = [(HEADS, V_HEADS), (16, 48)]
+        for (heads, v_heads), ssm_dtype in itertools.product(
+            layouts, (torch.float32, torch.bfloat16)
+        ):
+            self._setup(ssm_dtype, heads=heads, v_heads=v_heads)
             meta, graph, out = self._capture()
             for i, (lens, prefixes, track) in enumerate(cases):
-                with self.subTest(ssm_dtype=ssm_dtype, case=i):
+                with self.subTest(heads=heads, ssm_dtype=ssm_dtype, case=i):
                     self._check_replay(
                         meta,
                         graph,
@@ -278,6 +287,37 @@ class TestGDNPrefillGraph(CustomTestCase):
                         track=track,
                         seed=100 + i,
                     )
+
+    def test_eager_padded_rows_stay_zero(self):
+        """DP attention pads input_ids and extend_num_tokens past the batch's
+        real tokens but not the sequence lengths. The eager extend must keep
+        those rows zero, and its real rows must match the unpadded extend."""
+        self._setup(torch.float32)
+        lens, prefixes, num_rows = [37, 100], [0, 64], 160
+        total = sum(lens)
+        g = torch.Generator(device="cuda").manual_seed(5)
+        mixed = torch.randn(num_rows, DIM, generator=g, device="cuda")
+        a = torch.randn(num_rows, V_HEADS, generator=g, device="cuda")
+        b = torch.randn(num_rows, V_HEADS, generator=g, device="cuda")
+        mixed, a, b = (t.to(torch.bfloat16) for t in (mixed, a, b))
+        outs = {}
+        for rows in (total, num_rows):
+            backend = _backend(self.conv_pool.clone(), self.ssm_pool.clone())
+            batch = _batch(lens, prefixes)
+            batch.extend_num_tokens = rows
+            backend.init_forward_metadata(batch)
+            # Rows nothing stores would show as NaN instead of zero.
+            with patch.object(
+                torch,
+                "empty_like",
+                side_effect=lambda t, **kw: torch.full_like(t, float("nan"), **kw),
+            ):
+                outs[rows] = backend.forward_extend(
+                    self.layer, batch, mixed[:rows], a[:rows], b[:rows]
+                )
+        padded = outs[num_rows]
+        self.assertTrue(torch.equal(padded[:, :total], outs[total]))
+        self.assertTrue(bool((padded[:, total:] == 0).all()), "padded rows not zero")
 
 
 if __name__ == "__main__":

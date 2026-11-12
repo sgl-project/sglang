@@ -14,12 +14,18 @@ from sglang.kernels.ops.attention.fla.cumsum import chunk_local_cumsum
 from sglang.kernels.ops.attention.fla.index import (
     prepare_chunk_indices,
 )
-from sglang.kernels.ops.attention.fla.l2norm import l2norm_fwd
+from sglang.kernels.ops.attention.fla.l2norm import (
+    l2norm_fwd,
+    l2norm_fwd_strided,
+    l2norm_fwd_strided_supported,
+)
 from sglang.kernels.ops.attention.fla.utils import (
     SUPPRESS_LEVEL,
     autocast_custom_fwd,
+    custom_device_ctx,
     input_guard,
     is_intel,
+    is_nvidia,
 )
 
 if is_intel:
@@ -47,6 +53,7 @@ def chunk_gated_delta_rule_fwd(
     inplace_update: bool = True,
     chunk_offsets: torch.LongTensor | None = None,
     o_chunk_indices: torch.LongTensor | None = None,
+    no_padding_rows: bool = False,
     out: Optional[torch.Tensor] = None,
     output_indices: Optional[torch.Tensor] = None,
 ):
@@ -85,6 +92,7 @@ def chunk_gated_delta_rule_fwd(
         scale=scale,
         cu_seqlens=cu_seqlens,
         chunk_indices=o_chunk_indices,
+        no_padding_rows=no_padding_rows,
         out=out,
         output_indices=output_indices,
     )
@@ -113,6 +121,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
         inplace_update: bool = True,
         chunk_indices: Optional[torch.LongTensor] = None,
         chunk_offsets: Optional[torch.LongTensor] = None,
+        no_padding_rows: bool = False,
         out: Optional[torch.Tensor] = None,
         output_indices: Optional[torch.Tensor] = None,
     ):
@@ -123,12 +132,7 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             q = l2norm_fwd(q)
             k = l2norm_fwd(k)
 
-        # Caller-built tables (CUDA-graph capture) also serve chunk_fwd_o; without
-        # them chunk_fwd_o derives its own for its token-count dependent chunk size.
-        o_chunk_indices = chunk_indices
-        if chunk_indices is None and cu_seqlens is not None:
-            chunk_indices = prepare_chunk_indices(cu_seqlens, CHUNK_SIZE)
-        g, o, A, w, h, v_new = chunk_gated_delta_rule_fwd(
+        return _chunk_gated_delta_rule_fwd_normalized(
             q=q,
             k=k,
             v=v,
@@ -138,14 +142,82 @@ class ChunkGatedDeltaRuleFunction(torch.autograd.Function):
             initial_state=initial_state,
             initial_state_indices=initial_state_indices,
             cu_seqlens=cu_seqlens,
-            chunk_indices=chunk_indices,
             inplace_update=inplace_update,
+            chunk_indices=chunk_indices,
             chunk_offsets=chunk_offsets,
-            o_chunk_indices=o_chunk_indices,
+            no_padding_rows=no_padding_rows,
             out=out,
             output_indices=output_indices,
         )
-        return o.to(q.dtype), h
+
+
+def _chunk_gated_delta_rule_fwd_normalized(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    g: torch.Tensor,
+    beta: torch.Tensor,
+    scale: float,
+    initial_state: torch.Tensor,
+    initial_state_indices: torch.Tensor,
+    cu_seqlens: Optional[torch.LongTensor],
+    inplace_update: bool,
+    chunk_indices: Optional[torch.LongTensor],
+    chunk_offsets: Optional[torch.LongTensor],
+    no_padding_rows: bool,
+    out: Optional[torch.Tensor],
+    output_indices: Optional[torch.Tensor],
+):
+    # Caller-built tables (CUDA-graph capture) also serve chunk_fwd_o; without
+    # them chunk_fwd_o derives its own for its token-count dependent chunk size.
+    o_chunk_indices = chunk_indices
+    if chunk_indices is None and cu_seqlens is not None:
+        chunk_indices = prepare_chunk_indices(cu_seqlens, CHUNK_SIZE)
+    g, o, A, w, h, v_new = chunk_gated_delta_rule_fwd(
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        scale=scale,
+        initial_state=initial_state,
+        initial_state_indices=initial_state_indices,
+        cu_seqlens=cu_seqlens,
+        chunk_indices=chunk_indices,
+        inplace_update=inplace_update,
+        chunk_offsets=chunk_offsets,
+        o_chunk_indices=o_chunk_indices,
+        no_padding_rows=no_padding_rows,
+        out=out,
+        output_indices=output_indices,
+    )
+    return o.to(q.dtype), h
+
+
+def chunk_gated_delta_rule_reads_strided_qk(q: torch.Tensor, k: torch.Tensor) -> bool:
+    """Whether chunk_gated_delta_rule with use_qk_l2norm_in_kernel reads these
+    q / k views (and a matching v) without copying them. NVIDIA only: the
+    bitwise match with the copy path is verified there."""
+    return (
+        is_nvidia
+        and l2norm_fwd_strided_supported(q)
+        and l2norm_fwd_strided_supported(k)
+    )
+
+
+def _chunk_gated_delta_rule_strided_qkv(q, k, v, **kwargs):
+    """ChunkGatedDeltaRuleFunction.forward with use_qk_l2norm_in_kernel for
+    row-strided q / k / v views, without input_guard's contiguous copies of
+    them: q / k are normalized from the views and v is read in place. The
+    other tensors get the guard's .contiguous()."""
+    kwargs = {
+        key: t.contiguous() if isinstance(t, torch.Tensor) else t
+        for key, t in kwargs.items()
+    }
+    with custom_device_ctx(q.device.index):
+        return _chunk_gated_delta_rule_fwd_normalized(
+            q=l2norm_fwd_strided(q), k=l2norm_fwd_strided(k), v=v, **kwargs
+        )
 
 
 @torch.compiler.disable
@@ -164,6 +236,7 @@ def chunk_gated_delta_rule(
     inplace_update: bool = True,
     chunk_indices: Optional[torch.LongTensor] = None,
     chunk_offsets: Optional[torch.LongTensor] = None,
+    no_padding_rows: bool = False,
     out: Optional[torch.Tensor] = None,
     output_indices: Optional[torch.Tensor] = None,
 ):
@@ -196,6 +269,9 @@ def chunk_gated_delta_rule(
             Default: `False`.
         inplace_update (Optional[bool]):
             Whether to write final states back to `initial_state`. Default: `True`.
+        no_padding_rows (Optional[bool]):
+            Whether every token row belongs to a sequence of `cu_seqlens`. Rows that
+            do not are zero in `o`, which costs a fill of `o`. Default: `False`.
         out, output_indices (Optional[torch.Tensor]):
             Inference-only contiguous output buffer and one destination per input token.
             The caller supplies unique, in-range destinations and initializes unmapped
@@ -298,6 +374,29 @@ def chunk_gated_delta_rule(
             )
     if scale is None:
         scale = k.shape[-1] ** -0.5
+    if (
+        use_qk_l2norm_in_kernel
+        and not (q.is_contiguous() and k.is_contiguous() and v.is_contiguous())
+        and chunk_gated_delta_rule_reads_strided_qk(q=q, k=k)
+    ):
+        o, h = _chunk_gated_delta_rule_strided_qkv(
+            q=q,
+            k=k,
+            v=v,
+            g=g,
+            beta=beta,
+            scale=scale,
+            initial_state=initial_state,
+            initial_state_indices=initial_state_indices,
+            cu_seqlens=cu_seqlens,
+            inplace_update=inplace_update,
+            chunk_indices=chunk_indices,
+            chunk_offsets=chunk_offsets,
+            no_padding_rows=no_padding_rows,
+            out=out,
+            output_indices=output_indices,
+        )
+        return o, None, h
     o, h = ChunkGatedDeltaRuleFunction.apply(
         q,
         k,
@@ -312,6 +411,7 @@ def chunk_gated_delta_rule(
         inplace_update,
         chunk_indices,
         chunk_offsets,
+        no_padding_rows,
         out,
         output_indices,
     )
