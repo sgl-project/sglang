@@ -12,7 +12,7 @@ from sglang.srt.batch_overlap import prefill_mbo
 from sglang.srt.batch_overlap.operations_strategy import OperationsStrategy
 from sglang.srt.environ import envs
 from sglang.srt.layers.layer_boundary.residual.mhc import MHCState
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -330,7 +330,11 @@ class TestEagerSharedReadIntegration(CustomTestCase):
             device="cpu",
             device_timer=None,
         )
-        runner = SimpleNamespace(model_runner=model_runner, enable_pdmux=True)
+        runner = SimpleNamespace(
+            model_runner=model_runner,
+            enable_pdmux=True,
+            load_batch=lambda loaded, *_: calls.append("load") or loaded,
+        )
         publish = Mock(side_effect=lambda *a: calls.append("publish"))
         with (
             patch.object(eager_runner, "is_cp_active", return_value=False),
@@ -354,7 +358,9 @@ class TestEagerSharedReadIntegration(CustomTestCase):
         ):
             actual = eager_runner.EagerRunner._execute_extend(runner, batch)
         self.assertIs(actual, output)
-        self.assertEqual(calls, ["metadata", "split", "resolve", "publish", "forward"])
+        self.assertEqual(
+            calls, ["load", "metadata", "split", "resolve", "publish", "forward"]
+        )
         self.assertIs(publish.call_args.args[1], shared_read_ends)
 
 

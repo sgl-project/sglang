@@ -75,7 +75,7 @@ def end_forward() -> None:
 
 
 def _split_tokens(forward_batch: ForwardBatch) -> Optional[int]:
-    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+    from sglang.srt.model_executor.forward_mode import ForwardMode
 
     if _child_backends is None or forward_batch.forward_mode != ForwardMode.EXTEND:
         return None
