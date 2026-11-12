@@ -570,5 +570,6 @@ POSITIONAL_FIELD_ORDER = (
     "paged_experts_host_memory_gb",
     "_max_running_requests_explicitly_set",
     "layernorm_sp_min_tokens",
+    "indexer_kv_cache_dtype",
 )
 # fmt: on
