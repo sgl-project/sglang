@@ -326,18 +326,20 @@ low-latency path may abort with SIGSEGV instead of a readable error.
 
 ### Solution
 
-Point `ASCEND_CUSTOM_OPP_PATH` at the DeepEP vendor directory before launching. Adjust the Python
-path to match your environment:
+If your DeepEP build does not register its vendor directory automatically, add it to
+`ASCEND_CUSTOM_OPP_PATH` before launching, preserving any other registered custom operators.
+Run this with the Python environment used by SGLang:
 
 ```bash
-export ASCEND_CUSTOM_OPP_PATH=$(python3 -c "import deep_ep, os; print(os.path.join(os.path.dirname(deep_ep.__file__), 'vendors', 'hwcomputing'))")
+DEEP_EP_VENDOR_PATH=$(python3 -c "import deep_ep, os; print(os.path.join(os.path.dirname(deep_ep.__file__), 'vendors', 'hwcomputing'))")
+export ASCEND_CUSTOM_OPP_PATH="${DEEP_EP_VENDOR_PATH}${ASCEND_CUSTOM_OPP_PATH:+:${ASCEND_CUSTOM_OPP_PATH}}"
 ```
 
 ## 10. DeepEP assertion failures when the per-rank token count grows
 
 ### Error message
 
-```text highlight=1,4
+```text
 Failed: Assertion error ... deep_ep.cpp:102 error message or error code is 'topk_idx.size(0) <= round * per_round_tokens'
 ```
 
