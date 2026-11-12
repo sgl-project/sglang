@@ -106,6 +106,10 @@ _is_cpu = is_cpu()
 # Below this image count the per-image loop beats the vectorized path (which has a
 # fixed setup cost; measured crossover ~6 on H20); both give the same result.
 _VECTORIZED_VL_POS_EMBED_MIN_IMAGES = 6
+# Keep the four bilinear embedding planes bounded for large images. The
+# row-wise sum is independent, so chunking preserves the operation order while
+# avoiding a temporary [4, num_patches, hidden_dim] allocation.
+_VIT_POS_EMBED_CHUNK_SIZE = 16_384
 
 
 def _resolve_vision_parallel_group(
@@ -593,6 +597,22 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             ) - 0.5
             return idx.clamp_(0, side - 1)
 
+    def _blend_pos_embed_chunks(
+        self, indices: torch.Tensor, weights: torch.Tensor
+    ) -> torch.Tensor:
+        """Blend four position-embedding planes without a large temporary."""
+        num_patches = indices.shape[1]
+        hidden_dim = self.pos_embed.embedding_dim
+        combined = torch.empty(
+            (num_patches, hidden_dim), dtype=self.dtype, device=self.device
+        )
+        for start in range(0, num_patches, _VIT_POS_EMBED_CHUNK_SIZE):
+            end = min(start + _VIT_POS_EMBED_CHUNK_SIZE, num_patches)
+            embeds = self.pos_embed(indices[:, start:end])
+            embeds.mul_(weights[:, start:end])
+            combined[start:end] = embeds.sum(dim=0)
+        return combined
+
     def fast_pos_embed_interpolate_from_list(self, grid_thw):
         num_grid_per_side = self.num_grid_per_side
         m_size = self.spatial_merge_size
@@ -640,9 +660,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             weights = torch.stack([w00, w01, w10, w11], dim=0).reshape(4, -1, 1)
             weights = weights.to(dtype=self.dtype)
 
-            embeds = self.pos_embed(indices)
-            embeds *= weights
-            combined = embeds.sum(dim=0)
+            combined = self._blend_pos_embed_chunks(indices, weights)
 
             combined = combined.reshape(
                 h // m_size, m_size, w // m_size, m_size, hidden_dim
@@ -751,8 +769,7 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
             dim=0,
         )
         weights = torch.stack([w00, w01, w10, w11], dim=0).to(dtype=dtype)
-        embeds = self.pos_embed(indices) * weights[:, :, None]
-        base_embeds = embeds.sum(dim=0)  # [total_hw, C]
+        base_embeds = self._blend_pos_embed_chunks(indices, weights[:, :, None])
 
         # --- 2. temporal repeat (gather) ---
         out_image_id = torch.repeat_interleave(
