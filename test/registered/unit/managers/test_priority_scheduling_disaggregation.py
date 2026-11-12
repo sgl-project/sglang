@@ -543,6 +543,7 @@ class TestDecodePreallocQueuePriority(CustomTestCase):
         queue.queue = decode_queue(ListKind.PD_PREALLOC, decode_reqs)
         queue.retracted_queue = []
         queue.num_reserved_decode_tokens = 0
+        queue.draft_kv_ring = None
         # `move_preallocated` credits this counter; `__new__` skips the __init__
         # that seeds it.
         queue._num_published_destinations = 0
