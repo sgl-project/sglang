@@ -122,6 +122,89 @@ class TestHybridLayerIds(CustomTestCase):
         self.assertFalse(is_layer_types_hybrid_swa_model(["Gemma4ForCausalLM"], config))
         self.assertTrue(is_layer_types_hybrid_swa_model(["Gemma3ForCausalLM"], config))
 
+    def test_lfm3_layer_schedule(self):
+        # layer_types shared by LFM3-1.7B / LFM3-VL-2B / LFM3-Omni-2B / LFM3-Audio-2B.
+        layer_types = [
+            "conv",
+            "conv",
+            "full_attention",
+            "conv",
+            "sliding_attention",
+            "conv",
+            "full_attention",
+            "conv",
+            "sliding_attention",
+            "conv",
+            "full_attention",
+            "conv",
+            "sliding_attention",
+            "conv",
+            "full_attention",
+            "conv",
+            "sliding_attention",
+            "conv",
+            "full_attention",
+            "conv",
+            "sliding_attention",
+            "conv",
+            "full_attention",
+            "conv",
+        ]
+        config = SimpleNamespace(
+            num_hidden_layers=24, sliding_window=256, layer_types=layer_types
+        )
+        swa = [4, 8, 12, 16, 20]
+        full = [2, 6, 10, 14, 18, 22]
+        for architecture in (
+            "Lfm3ForCausalLM",
+            "Lfm3VlForConditionalGeneration",
+            "Lfm3OmniForConditionalGeneration",
+            "Lfm3AudioForConditionalGeneration",
+        ):
+            with self.subTest(architecture=architecture):
+                self.assertTrue(is_hybrid_swa_model([architecture], config))
+                self.assertFalse(
+                    is_layer_types_hybrid_swa_model([architecture], config)
+                )
+                self.assertEqual(
+                    get_hybrid_layer_ids([architecture], config), (swa, full)
+                )
+
+    def test_lfm3_conv_layers_are_in_neither_pool(self):
+        layer_types = ["conv", "full_attention", "sliding_attention"] * 2
+        config = SimpleNamespace(
+            num_hidden_layers=6, sliding_window=256, layer_types=layer_types
+        )
+        swa, full = get_hybrid_layer_ids(["Lfm3VlForConditionalGeneration"], config)
+        conv = [i for i, kind in enumerate(layer_types) if kind == "conv"]
+        self.assertEqual(conv, [0, 3])
+        self.assertFalse(set(swa) & set(full))
+        self.assertFalse(set(swa) & set(conv))
+        self.assertFalse(set(full) & set(conv))
+        self.assertEqual(sorted(swa + full), [1, 2, 4, 5])
+
+    def test_lfm3_rejects_malformed_layer_types(self):
+        architecture = "Lfm3VlForConditionalGeneration"
+        cases = {
+            "missing": (24, None),
+            "short": (24, ["conv", "full_attention", "sliding_attention"]),
+            "unknown kind": (
+                3,
+                ["conv", "full_attention", "linear_attention"],
+            ),
+            "no sliding layer": (2, ["conv", "full_attention"]),
+        }
+        for name, (num_hidden_layers, layer_types) in cases.items():
+            with self.subTest(name):
+                config = SimpleNamespace(
+                    num_hidden_layers=num_hidden_layers,
+                    sliding_window=256,
+                    layer_types=layer_types,
+                )
+                self.assertTrue(is_hybrid_swa_model([architecture], config))
+                with self.assertRaises(ValueError):
+                    get_hybrid_layer_ids([architecture], config)
+
 
 class TestEmbeddingGemmaConfig(CustomTestCase):
     def test_detects_bidirectional_gemma3_text_config(self):
