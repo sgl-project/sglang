@@ -97,6 +97,9 @@ def load_cache_to_device_buffer_spec_mla(
     miss_count: torch.Tensor | None = None,
     device_locs: torch.Tensor | None = None,
     host_binding: torch.Tensor | None = None,
+    resident: torch.Tensor | None = None,
+    req_to_token: torch.Tensor | None = None,
+    full_to_device: torch.Tensor | None = None,
 ) -> None:
     """Resolve all speculative steps and swap unique misses in one launch pair.
 
@@ -219,6 +222,9 @@ def load_cache_to_device_buffer_spec_mla(
         miss_count,
         device_locs if device_locs is not None else empty_device,
         host_binding if host_binding is not None else empty_device,
+        resident if resident is not None else empty_device,  # HS_SPECRES
+        req_to_token if req_to_token is not None else empty_device,
+        full_to_device if full_to_device is not None else empty_device,
     )
 
 
@@ -361,6 +367,11 @@ def _load_cache_to_device_buffer_mla(
     skip_io: bool,
     device_locs: torch.Tensor | None,
     host_binding: torch.Tensor | None,
+    host_map: torch.Tensor | None = None,
+    map_init: torch.Tensor | None = None,
+    resident: torch.Tensor | None = None,
+    req_to_token: torch.Tensor | None = None,
+    full_to_device: torch.Tensor | None = None,
 ) -> None:
     assert hot_buffer_size >= num_top_k, (
         f"hot_buffer_size ({hot_buffer_size}) must be >= num_top_k ({num_top_k})"
@@ -446,6 +457,11 @@ def _load_cache_to_device_buffer_mla(
         miss_src,
         miss_dst,
         miss_count,
+        host_map if host_map is not None else empty,  # HS_PATCH v4
+        map_init if map_init is not None else empty,
+        resident if resident is not None else empty,  # HS_RESIDENT
+        req_to_token if req_to_token is not None else empty,
+        full_to_device if full_to_device is not None else empty,
     )
 
 
@@ -472,6 +488,11 @@ def load_cache_to_device_buffer_mla(
     skip_io: bool = False,
     device_locs: torch.Tensor | None = None,
     host_binding: torch.Tensor | None = None,
+    host_map: torch.Tensor | None = None,
+    map_init: torch.Tensor | None = None,
+    resident: torch.Tensor | None = None,
+    req_to_token: torch.Tensor | None = None,
+    full_to_device: torch.Tensor | None = None,
 ) -> None:
     """Generic MLA hisparse swap-in: device + host both linear (stride=item_size_bytes).
 
@@ -514,6 +535,11 @@ def load_cache_to_device_buffer_mla(
         miss_dst=miss_dst,
         miss_count=miss_count,
         skip_io=skip_io,
+        host_map=host_map,
+        map_init=map_init,
+        resident=resident,
+        req_to_token=req_to_token,
+        full_to_device=full_to_device,
     )
 
 
@@ -593,6 +619,11 @@ def load_blocks_to_device_buffer_mha(
         empty,
         empty,
         empty,
+        empty,  # host_map
+        empty,  # map_init
+        empty,  # resident
+        empty,  # req_to_token
+        empty,  # full_to_device
     )
 
 

@@ -784,6 +784,35 @@ class Envs:
     # Kill-switch for the shared-index (IndexShare) swap-in prefetch
     # (auto-enabled for GLM-5.2-style DSA); set True to A/B synchronous swap-in.
     SGLANG_DISABLE_HISPARSE_PREFETCH = EnvBool(False)
+    # HiSparse swap-in: grid of the skip layers' prefetch copy, wide planned copy for anchor layers (0: off),
+    # hit-rate log every N decode steps (0: off), persistent host-slot -> buffer-slot map (needs prefetch).
+    SGLANG_HISPARSE_PREFETCH_BLOCKS = EnvInt(4)
+    SGLANG_HISPARSE_ANCHOR_COPY_BLOCKS = EnvInt(0)
+    SGLANG_HISPARSE_STATS_EVERY = EnvInt(0)
+    SGLANG_HISPARSE_HOST_MAP = EnvBool(False)
+    # HiSparse: no index-K cache for layers that reuse an anchor's top-k.
+    SGLANG_HISPARSE_ELIDE_INDEX_K = EnvBool(False)
+    # HiSparse: translate the KV write locations once per forward instead of per layer.
+    SGLANG_HISPARSE_TRANSLATE_ONCE = EnvBool(False)
+    # HiSparse: keep a long request's whole KV in the device pool while it fits; demote it on demand.
+    SGLANG_HISPARSE_RESIDENT = EnvBool(False)
+    # HiSparse: resident requests back up to host when demoted, not every step.
+    SGLANG_HISPARSE_LAZY_BACKUP = EnvBool(False)
+    # HiSparse: residency under speculative decoding (needs LAZY_BACKUP).
+    SGLANG_HISPARSE_SPEC_RESIDENT = EnvBool(False)
+    # HiSparse: lend the unused index-K reservation to the device KV pool; logical pages kept mapped above use.
+    SGLANG_HISPARSE_ELASTIC = EnvBool(False)
+    SGLANG_HISPARSE_ELASTIC_HEADROOM = EnvInt(4096)
+    # HiSparse: resident requests keep no host copy (a demotion copies the whole request); host pool tokens per
+    # rank (0: as many as logical tokens); host slots the admission count leaves for growth.
+    SGLANG_HISPARSE_EXCLUSIVE = EnvBool(False)
+    SGLANG_HISPARSE_HOST_TOKENS = EnvInt(0)
+    SGLANG_HISPARSE_EXCL_HOST_MARGIN = EnvInt(65536)
+    # HiSparse decode top-k through the paged v2 kernel. Opt-in: its exactness against torch.topk is under test.
+    SGLANG_HISPARSE_FAST_TOPK = EnvBool(False)
+    # HiSparse: a decode graph for all-resident batches (needs RESIDENT and FAST_TOPK); its page table in one kernel.
+    SGLANG_HISPARSE_RESIDENT_GRAPH = EnvBool(False)
+    SGLANG_HISPARSE_FUSED_PAGE_TABLE = EnvBool(False)
     SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS = EnvBool(True)
     # Decode batches between SWA out-of-window evictions.
     SGLANG_SWA_EVICTION_INTERVAL = EnvInt(128)

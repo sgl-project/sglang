@@ -143,8 +143,10 @@ def _should_elide_dsa_index_k(*, is_draft_worker: bool) -> bool:
     # The NPU HiCache host pool has no compact index-K layout.
     if _is_npu and memory_config.enable_hierarchical_cache:
         return False
+    from sglang.srt.environ import envs  # HS_CAP
+
     return (
-        not memory_config.enable_hisparse
+        (not memory_config.enable_hisparse or envs.SGLANG_HISPARSE_ELIDE_INDEX_K.get())
         and not is_draft_worker
         and not memory_config.enable_unified_cache_external_linker
     )
