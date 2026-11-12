@@ -35,6 +35,7 @@ from sglang.srt.managers.schedule_batch import set_mamba_track_indices_from_reqs
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.decl import STATE_PART
 from sglang.srt.runtime_context import (
+    get_context,
     get_exec,
     get_parallel,
     get_spec,
@@ -209,7 +210,11 @@ def spec_softmax(
     shape, and they round differently, so one row can get different bits in
     different batches.
     """
-    if not get_exec().deterministic.enable_deterministic_inference:
+    # Standalone draft and verify calls can run before the server publishes its config.
+    if (
+        not get_context().is_config_namespace_published("exec")
+        or not get_exec().deterministic.enable_deterministic_inference
+    ):
         return sampling_softmax(logits, temperatures, rows_per_request=rows_per_request)
     if temperatures is not None:
         if rows_per_request > 1:
