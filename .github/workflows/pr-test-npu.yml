@@ -244,9 +244,8 @@ jobs:
           overwrite: true
           if-no-files-found: warn
 
-  # Collect the shared CPU suite's coverage alongside the NPU baseline. The
-  # suite is large, so use the same 18-way fanout as its regular PR stage;
-  # each shard uploads disjoint per-test coverage directories for setup-covstub.
+  # Collect coverage for CPU-registered tests under unit/npu alongside the
+  # NPU baseline. This scoped set is small enough to run in one job.
   base-a-test-cpu-cov:
     needs: [set-image-config]
     if: ${{ inputs.coverage_mode == true }}
@@ -255,10 +254,6 @@ jobs:
     env:
       SGLANG_IS_IN_CI: true
       HF_HOME: ${{ github.workspace }}/.hf-cache
-    strategy:
-      fail-fast: false
-      matrix:
-        part: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
     steps:
       - name: Free disk space
         run: |
@@ -295,7 +290,6 @@ jobs:
         with:
           workspaces: rust
           shared-key: "sglang-grpc-cpu"
-          save-if: ${{ matrix.part == 0 }}
 
       - name: Install dependencies
         timeout-minutes: 30
@@ -309,8 +303,8 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ github.workspace }}/.hf-cache
-          key: hf-cpu-${{ matrix.part }}-${{ github.run_id }}
-          restore-keys: hf-cpu-${{ matrix.part }}-
+          key: hf-cpu-npu-cov-${{ github.run_id }}
+          restore-keys: hf-cpu-npu-cov-
 
       - name: Run test with coverage
         timeout-minutes: 120
@@ -319,8 +313,9 @@ jobs:
           cd test
           python3 ../scripts/ci/npu/precise-test/list_tests.py \
             --hw cpu --suite base-a-test-cpu \
-            --auto-partition-id ${{ matrix.part }} --auto-partition-size 18 \
-            -o /tmp/selected_tests.txt
+            -o /tmp/base_a_cpu_tests.txt
+          grep '/test/registered/unit/npu/' /tmp/base_a_cpu_tests.txt \
+            > /tmp/selected_tests.txt || test "$?" -eq 1
           echo "Selected test files:"
           cat /tmp/selected_tests.txt
           if [ -s /tmp/selected_tests.txt ]; then
@@ -331,7 +326,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: coverage-outputs-base-a-test-cpu-${{ matrix.part }}
+          name: coverage-outputs-base-a-test-cpu
           path: /tmp/precise-test/
           retention-days: 1
           overwrite: true
@@ -962,12 +957,11 @@ jobs:
           name: coverage-outputs-base-a-test-npu
           path: /tmp/base-a-coverage
 
-      - name: Collect base-a CPU coverage artifacts
+      - name: Collect base-a CPU coverage artifact
         uses: actions/download-artifact@v4
         with:
-          pattern: coverage-outputs-base-a-test-cpu-*
+          name: coverage-outputs-base-a-test-cpu
           path: /tmp/base-a-cpu-coverage
-          merge-multiple: true
 
       - name: Merge base-a coverage and earlier attempts into shared run dir
         shell: bash
