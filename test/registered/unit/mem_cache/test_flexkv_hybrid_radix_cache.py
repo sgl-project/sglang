@@ -636,6 +636,7 @@ def _make_layerwise_restore(loaded=4):
     cache._inner_cache = MagicMock()
     cache.token_to_kv_pool_allocator = MagicMock()
     cache.flexkv_connector = MagicMock()
+    del cache.flexkv_connector.sync_load_ready
     cache.flexkv_connector.enable_layerwise = True
     cache.flexkv_connector.start_load_kv_layerwise.return_value = (loaded, 0)
     cache.device = torch.device("cpu")

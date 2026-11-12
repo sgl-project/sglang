@@ -188,6 +188,7 @@ def _make_cache(page_size=4):
     cache.__dict__.update(base_cache.__dict__)
     cache._mode = FlexKVRadixCache.match_prefix.__globals__["FlexKVMode"].IP
     cache.flexkv_connector = MagicMock()
+    del cache.flexkv_connector.sync_load_ready
     cache.store_stream = MagicMock()
     cache._load_markers = {}
     cache._defer_duplicate_restores = False

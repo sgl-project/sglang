@@ -221,7 +221,15 @@ class FlexKVHybridRadixCache(FlexKVCacheLifecycleMixin, BasePrefixCache):
             return self._empty_indices(), req.last_node
 
         device_indices = self._alloc_restore_slots(req, params.host_hit_length)
-        if device_indices is None:
+        ready = device_indices is not None
+        sync_ready = getattr(self.flexkv_connector, "sync_load_ready", None)
+        if callable(sync_ready):
+            # Agree after the FULL/SWA allocation retry and before registering
+            # a lease or entering either synchronous or layerwise restore.
+            ready = sync_ready(ready)
+        if not ready:
+            if device_indices is not None:
+                self.token_to_kv_pool_allocator.free(device_indices)
             self.flexkv_connector.release_pending(
                 _request_key(req.cache_request_handle)
             )
