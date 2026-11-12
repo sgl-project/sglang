@@ -546,6 +546,11 @@ class SchedulePolicy:
 
     def waiting_queue_prefix_matched(self, waiting_queue: List[Req]) -> bool:
         policy = self._determine_active_policy(waiting_queue)
+        if policy == CacheAwarePolicy.UNIBOOST and not self.tree_cache.disable:
+            # Frontier-K matches only the top-K requests; deeper ones are unmatched.
+            topk = self.uniboost_match_topk
+            if 0 < topk < len(waiting_queue):
+                return self.tree_cache.supports_fast_match_prefix()
         return (
             isinstance(policy, CacheAwarePolicy)
             or self.tree_cache.supports_fast_match_prefix()

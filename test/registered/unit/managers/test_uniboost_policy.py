@@ -345,6 +345,18 @@ class TestUniboostFrontierK(UniboostTestBase):
             q[:] = pol.calc_priority(q)
         self.assertEqual(calls, [50])
 
+    def test_prefix_matched_only_when_whole_queue_is_matched(self):
+        # Beyond the frontier, load reporting must fall back to the hit rate.
+        with envs.SGLANG_UNIBOOST_MATCH_TOPK.override(8):
+            pol = make_policy(tree_cache=FakeEnabledTreeCache())
+        self.assertTrue(pol.waiting_queue_prefix_matched(self.queue(8)))
+        self.assertFalse(pol.waiting_queue_prefix_matched(self.queue(9)))
+        with envs.SGLANG_UNIBOOST_MATCH_TOPK.override(0):
+            pol = make_policy(tree_cache=FakeEnabledTreeCache())
+        self.assertTrue(pol.waiting_queue_prefix_matched(self.queue(50)))
+        # Without a prefix cache every match is trivially 0 and exact.
+        self.assertTrue(make_policy().waiting_queue_prefix_matched(self.queue(50)))
+
     def test_disabled_tree_cache_never_matches(self):
         pol = make_policy()  # disabled cache; topk default
         with patch("sglang.srt.managers.schedule_policy.match_kv_cache") as m:
