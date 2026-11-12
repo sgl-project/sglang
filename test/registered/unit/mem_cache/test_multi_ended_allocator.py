@@ -20,6 +20,7 @@ suite runs on CPU apart from the cases that skip themselves without CUDA.
 
 from types import SimpleNamespace
 
+from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.tree_slots import index_slots, tree_slots_of
@@ -29,9 +30,10 @@ from sglang.test.unified_allocator_fixtures import (
     arena_of,
     build_paged_band_pair,
     build_window_chain,
-    chain_snapshot,
+    hold_band,
+    largest_take,
+    release_band,
     stand_in_views,
-    token_ends,
 )
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
@@ -58,7 +60,6 @@ from sglang.srt.mem_cache.kv.alloc.band import (
 )
 from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
-from sglang.srt.mem_cache.kv.alloc.pricing import ends_fit
 from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
 from sglang.srt.mem_cache.kv.layout.mla import MLASubPoolSpec
 from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
@@ -71,13 +72,12 @@ from sglang.srt.mem_cache.unified_memory_pool import (
 )
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.runtime_context import (
-    get_disagg,
-    get_memory,
     get_parallel,
     publish,
     reset_context,
 )
 from sglang.srt.server_args import ServerArgs
+from sglang.test.token_demand import demand_windows, token_demand
 
 _DEV = "cpu"
 
@@ -569,118 +569,14 @@ class TestWindowChainAllocator(unittest.TestCase):
     def _build(self, **kwargs):
         return build_window_chain(**kwargs)
 
-    def test_reclaim_plan_matches_exhaustive_page_targets(self):
-        page_size = 4
-        _, allocator, _ = self._build(
-            n_full_slots=40, n_swa_slots=24, page_size=page_size
-        )
-        allocator.lazy_compaction = True
-        for sub_pool in (allocator.full_attn_allocator, allocator.swa_attn_allocator):
-            sub_pool.lazy_compaction = True
-            sub_pool.pin_sources = (lambda: True,)
-        live = allocator.alloc(16)
-        self.assertIsNotNone(live)
-        allocator.free(live[4:8])
-        allocator.free_swa(live[8:12])
-
-        for compacted in (False, True):
-            for sub_pool in (
-                allocator.full_attn_allocator,
-                allocator.swa_attn_allocator,
-            ):
-                sub_pool.pin_sources = (lambda: not compacted,)
-            for full_evictable, swa_evictable in ((0, 0), (7, 5), (12, 8), (100, 100)):
-                max_full = min(12, full_evictable) // page_size
-                max_swa = min(8, swa_evictable) // page_size
-                for full_pages in range(9):
-                    for swa_pages in range(9):
-                        feasible = [
-                            (full * page_size, swa * page_size)
-                            for swa in range(max_swa + 1)
-                            for full in range(max_full + 1)
-                            if ends_fit(
-                                chain_snapshot(allocator),
-                                token_ends(allocator),
-                                full_pages,
-                                swa_pages,
-                                full_reclaim_pages=full,
-                                swa_reclaim_pages=swa,
-                                compacted=compacted,
-                            )
-                        ]
-                        with self.subTest(
-                            compacted=compacted,
-                            evictable=(full_evictable, swa_evictable),
-                            pages=(full_pages, swa_pages),
-                        ):
-                            self.assertEqual(
-                                allocator.reclaim_plan(
-                                    full_pages * page_size,
-                                    swa_pages * page_size,
-                                    full_evictable_tokens=full_evictable,
-                                    swa_evictable_tokens=swa_evictable,
-                                ),
-                                feasible[0] if feasible else None,
-                            )
-                            # ``prefer_swa`` flips the lexicographic order:
-                            # least FULL reclaim first, then least SWA.
-                            self.assertEqual(
-                                allocator.reclaim_plan(
-                                    full_pages * page_size,
-                                    swa_pages * page_size,
-                                    full_evictable_tokens=full_evictable,
-                                    swa_evictable_tokens=swa_evictable,
-                                    prefer_swa=True,
-                                ),
-                                min(feasible) if feasible else None,
-                            )
-
-    def test_evict_to_free_tokens_prefers_swa_reclaim_on_storage_or_decode(self):
-        """The default quota order spends FULL prefix to keep the sliding
-        window. With a HiCache storage backend attached, or while serving as
-        the decode side of a PD pair, the FULL prefix is the one worth keeping,
-        so the allocator asks the planner for SWA-first quotas. Hierarchical
-        cache alone (no storage backend) keeps the default. Pins the planner
-        argument per configuration, so a predicate that degrades to one branch
-        is caught."""
-        _, allocator, _ = self._build(page_size=4)
-        tree_cache = MagicMock()
-        tree_cache.supports_prefix_sharing.return_value = True
-        tree_cache.full_evictable_size.return_value = 8
-        tree_cache.window_evictable_size.return_value = 8
-        allocator.reclaim_plan = MagicMock(return_value=(0, 0))
-        cases = (
-            ({}, None, False),
-            ({"enable_hierarchical_cache": True}, None, False),
-            (
-                {"enable_hierarchical_cache": True, "hicache_storage_backend": "file"},
-                None,
-                True,
-            ),
-            ({}, "decode", True),
-        )
-        for memory, role, prefer_swa in cases:
-            with self.subTest(memory=memory, role=role):
-                with contextlib.ExitStack() as stack:
-                    stack.enter_context(get_memory().override(**memory))
-                    if role is not None:
-                        stack.enter_context(
-                            get_disagg().override(disaggregation_mode=role)
-                        )
-                    allocator.evict_to_free_tokens(tree_cache, 4)
-                self.assertEqual(
-                    allocator.reclaim_plan.call_args.kwargs["prefer_swa"], prefer_swa
-                )
-
     def test_restore_swa_without_allocating_more_full(self):
         _, allocator, _ = self._build(page_size=4)
         indices = allocator.alloc(8)
         full_before = allocator.translate_kv_indices_for_transfer(indices).clone()
         allocator.free_swa(indices)
 
-        self.assertEqual(allocator.reclaim_plan(0, 8), (0, 0))
-        self.assertTrue(allocator.can_reserve(0, 8))
-        self.assertTrue(allocator.ensure_capacity(0, 8))
+        self.assertTrue(allocator.admits(KVDemand(0, demand_windows(allocator, 0, 8))))
+        self.assertTrue(allocator.ensure_capacity(token_demand(allocator, 0, 8)))
         allocator.swa_attn_allocator.alloc_with_virtual((indices // 4).unique())
         self.assertTrue(
             torch.equal(
@@ -704,7 +600,7 @@ class TestWindowChainAllocator(unittest.TestCase):
         swa_allocator = allocator.swa_attn_allocator
         swa_pages = 2
         full_pages = (
-            allocator._policy._empty_shared_gap_bytes
+            allocator.full_attn_allocator._current_gap_bytes()
             - swa_pages * swa_allocator.entry_bytes_per_page
         ) // full_allocator.entry_bytes_per_page
         packed_bytes = (
@@ -718,22 +614,32 @@ class TestWindowChainAllocator(unittest.TestCase):
         self.assertLessEqual(
             swa_pages, swa_allocator.num_pages - swa_allocator.min_page_index
         )
-        self.assertLessEqual(packed_bytes, allocator._policy._empty_shared_gap_bytes)
+        self.assertLessEqual(
+            packed_bytes, allocator.full_attn_allocator._current_gap_bytes()
+        )
         self.assertGreater(
             packed_bytes + full_allocator.entry_bytes_per_page,
-            allocator._policy._empty_shared_gap_bytes,
+            allocator.full_attn_allocator._current_gap_bytes(),
         )
         self.assertTrue(
-            allocator.can_reserve(
-                full_pages * page_size,
-                swa_pages * page_size,
+            allocator.admits(
+                KVDemand(
+                    full_pages * page_size,
+                    demand_windows(
+                        allocator, full_pages * page_size, swa_pages * page_size
+                    ),
+                ),
                 empty_pool=True,
             )
         )
         self.assertFalse(
-            allocator.can_reserve(
-                full_pages * page_size + 1,
-                swa_pages * page_size,
+            allocator.admits(
+                KVDemand(
+                    full_pages * page_size + 1,
+                    demand_windows(
+                        allocator, full_pages * page_size + 1, swa_pages * page_size
+                    ),
+                ),
                 empty_pool=True,
             )
         )
@@ -765,22 +671,31 @@ class TestWindowChainAllocator(unittest.TestCase):
             reservation_swa_with_tail // page_size
         ) * swa_allocator.entry_bytes_per_page
         self.assertLessEqual(
-            reservation_bytes, allocator._policy._empty_shared_gap_bytes
+            reservation_bytes, allocator.full_attn_allocator._current_gap_bytes()
         )
         self.assertGreater(
-            reservation_bytes_with_tail, allocator._policy._empty_shared_gap_bytes
+            reservation_bytes_with_tail,
+            allocator.full_attn_allocator._current_gap_bytes(),
         )
         self.assertTrue(
-            allocator.can_reserve(
-                reservation_full_tokens,
-                reservation_swa_tokens,
+            allocator.admits(
+                KVDemand(
+                    reservation_full_tokens,
+                    demand_windows(
+                        allocator, reservation_full_tokens, reservation_swa_tokens
+                    ),
+                ),
                 empty_pool=True,
             )
         )
         self.assertFalse(
-            allocator.can_reserve(
-                reservation_full_tokens,
-                reservation_swa_with_tail,
+            allocator.admits(
+                KVDemand(
+                    reservation_full_tokens,
+                    demand_windows(
+                        allocator, reservation_full_tokens, reservation_swa_with_tail
+                    ),
+                ),
                 empty_pool=True,
             )
         )
@@ -1180,10 +1095,16 @@ class TestJointLRUEviction(unittest.TestCase):
 
     @staticmethod
     def _block_compaction(allocator):
+        # A fixed page forbids the moves compaction needs.
         allocator.lazy_compaction = True
         for sub_pool in (allocator.full_attn_allocator, allocator.swa_attn_allocator):
             sub_pool.lazy_compaction = True
-            sub_pool.pin_sources = (lambda: True,)
+            sub_pool.fix_pages("blocked", [sub_pool.min_page_index])
+
+    @staticmethod
+    def _unblock_compaction(allocator):
+        for sub_pool in (allocator.full_attn_allocator, allocator.swa_attn_allocator):
+            sub_pool.unfix_pages("blocked")
 
     @staticmethod
     def _params(allocator, num_tokens=0, window_tokens=0):
@@ -1238,6 +1159,52 @@ class TestJointLRUEviction(unittest.TestCase):
         self.assertEqual(allocator.full_attn_allocator.allocated_count(), 0)
         self.assertEqual(allocator.swa_attn_allocator.allocated_count(), 0)
 
+    def test_allocation_reclaim_takes_the_joint_order_and_stops_at_the_first_fit(
+        self,
+    ):
+        # The order a plain eviction of everything takes.
+        full_cache, full_allocator = self._tree()
+        full_order = self._record_victims(full_cache)
+        full_cache.evict(self._params(full_allocator, 12, 12))
+
+        cache, allocator = self._tree()
+        owner = allocator.full_attn_allocator.sub_pool_name
+        pages = 1
+        while allocator.units_fit({owner: pages}):
+            pages += 1
+        demand = {owner: pages}
+        victims = self._record_victims(cache)
+        # Whether the demand already fit when each victim was taken.
+        fit_before = []
+        select = cache.tree_core.next_joint_eviction_victim
+
+        def checked():
+            fit_before.append(allocator.fits_after_frees(demand))
+            return select()
+
+        cache.tree_core.next_joint_eviction_victim = checked
+        self.assertTrue(cache.reclaim(demand))
+        # The joint order, stopped at the first victim after which it fits.
+        self.assertTrue(victims)
+        self.assertLess(len(victims), len(full_order))
+        self.assertEqual(victims, full_order[: len(victims)])
+        self.assertEqual(fit_before, [False] * len(victims))
+
+    def test_a_window_slot_named_by_its_length_keeps_the_joint_order(self):
+        # Unified pools name a window's tree slot by its length, not SWA.
+        orders = []
+        for window_slot in (None, "WINDOW_4"):
+            cache, allocator = self._cache(window_slot=window_slot)
+            self.assertTrue(cache.evicts_by_joint_lru)
+            self._insert(cache, allocator, [1, 2, 3, 4])
+            self._insert(cache, allocator, list(range(1, 11)))
+            self._insert(cache, allocator, [20, 21])
+            self._match(cache, list(range(1, 11)))
+            victims = self._record_victims(cache)
+            cache.evict(self._params(allocator, 12, 12))
+            orders.append([(int(ct != self.FULL), key) for ct, key in victims])
+        self.assertEqual(orders[0], orders[1])
+
     def test_joint_walk_strips_leaf_swa_and_the_next_legacy_walk_collapses(self):
         cache, allocator = self._tree()
         victims = self._record_victims(cache)
@@ -1255,21 +1222,6 @@ class TestJointLRUEviction(unittest.TestCase):
         self.assertEqual(len(victims), 4, "no joint walk with compaction blocked")
         # The legacy SWA walk evicts the whole SWA leaf, Full included.
         self.assertIsNone(self._node(cache, [30, 31]))
-
-    def test_a_window_slot_named_by_its_length_keeps_the_joint_order(self):
-        # Unified pools name a window's tree slot by its length, not SWA.
-        orders = []
-        for window_slot in (None, "WINDOW_4"):
-            cache, allocator = self._cache(window_slot=window_slot)
-            self.assertTrue(cache.evicts_by_joint_lru)
-            self._insert(cache, allocator, [1, 2, 3, 4])
-            self._insert(cache, allocator, list(range(1, 11)))
-            self._insert(cache, allocator, [20, 21])
-            self._match(cache, list(range(1, 11)))
-            victims = self._record_victims(cache)
-            cache.evict(self._params(allocator, 12, 12))
-            orders.append([(int(ct != self.FULL), key) for ct, key in victims])
-        self.assertEqual(orders[0], orders[1])
 
     def test_dispatch_needs_joint_lru_and_unblocked_compaction(self):
         for policy, blocked, joint in (
@@ -1316,8 +1268,7 @@ class TestJointLRUEviction(unittest.TestCase):
 
         # Reopened, the joint walk picks the victims of the same tree whose
         # match ran with the gate open.
-        for sub_pool in (allocator.full_attn_allocator, allocator.swa_attn_allocator):
-            sub_pool.pin_sources = ()
+        self._unblock_compaction(allocator)
         victims = self._record_victims(cache)
         cache.evict(self._params(allocator, 12, 12))
         open_cache, open_allocator = self._tree()
@@ -1634,11 +1585,11 @@ class TestPagedBand(unittest.TestCase):
             )
             * self.PAGE_SIZE
         )
-        self.assertEqual(allocator.available_size(), expected)
+        self.assertEqual(largest_take(allocator), expected)
         # The joint cost is heavier than either single-side cost, so the joint
         # budget can never exceed either sub-pool's own available_size.
         self.assertLessEqual(
-            allocator.available_size(),
+            largest_take(allocator),
             min(fa.available_size(), sa.available_size()),
         )
 
@@ -2832,38 +2783,18 @@ class TestChainFrontierWalk(unittest.TestCase):
         t2.high_peer = ma
         ma.bind_low_peer(t2)
         self.assertEqual(fa._current_gap_bytes(), t2_lo - fa._byte_high_frontier())
-        self.assertIs(fa._growth_side_neighbor(), t2)
         self.assertEqual(ma._current_gap_bytes(), ma._byte_low_frontier() - t2_hi)
-        self.assertIs(ma._growth_side_neighbor(), t2)
         t2.transparent = True
-        self.assertIs(fa._growth_side_neighbor(), ma)
         self.assertEqual(
             fa._current_gap_bytes(),
             ma._byte_low_frontier() - fa._byte_high_frontier(),
         )
 
-    def test_drainable_credit_reads_walked_neighbor(self):
-        _, fa, ma = self._build_pair()
-        stub = _ChainStub(low_byte=64, high_byte=128, transparent=True)
-        fa.bind_high_peer(stub)
-        stub.low_peer = fa
-        stub.high_peer = ma
-        ma.bind_low_peer(stub)
-
-        # Walked-through to the far end: its holes are credited iff lazy.
-        self.assertEqual(fa._peer_drainable_hole_bytes(), 0)  # ma not lazy
-        ma.lazy_compaction = True
-        ma._free_phys_pages = torch.arange(3, dtype=torch.int64)
-        self.assertEqual(fa._peer_drainable_hole_bytes(), 3 * ma.entry_bytes_per_page)
-        # Opaque non-lazy middle blocks the far end's credit.
-        stub.transparent = False
-        self.assertEqual(fa._peer_drainable_hole_bytes(), 0)
-
 
 class TestFloatBand(CustomTestCase):
     """Holes-first float middle: midpoint placement, in-place hole recycling,
     larger-gap extension, boundary absorption with park-on-empty transparency,
-    and the on-demand movers `make_room` and `compact_holes`."""
+    and the planned move `relocate_into`."""
 
     def setUp(self):
         # The code under test reads its config from the bags.
@@ -3093,84 +3024,10 @@ class TestFloatBand(CustomTestCase):
         self.assertEqual(fla.available_size(), max(gap_low, gap_high) + 2)
         del da
 
-    def test_make_room_boundary_relocation(self):
-        _, _, fla, da, kv = self._build_tri()
-        v = fla.alloc(6)
-        self._stamp(fla, kv, v)
-        epp = fla.entry_bytes_per_page
-        _, gap_high = fla._gap_pages()
-        ask = (gap_high + 3) * epp  # 3 pages beyond the current high gap
-        opened = fla.make_room(side="high", min_bytes=ask)
-        self.assertGreaterEqual(opened, ask)
-        # Cost min(L_live, G): moved exactly the 3 boundary pages, not 6.
-        moved = sum(int(s.numel()) for s, _, _ in fla._inverse_history)
-        self.assertEqual(moved, 3)
-        self._check_float_state(fla, kv)
-        # The opened space is real: the full end can now take it.
-        self.assertGreaterEqual(da.available_size(), 3)
-
-    def test_make_room_leapfrog_cost_bounded_by_live(self):
-        _, _, fla, _, kv = self._build_tri()
-        v = fla.alloc(2)  # tiny live mass
-        self._stamp(fla, kv, v)
-        epp = fla.entry_bytes_per_page
-        _, gap_high = fla._gap_pages()
-        ask = (gap_high + 10) * epp  # demand >> live
-        opened = fla.make_room(side="high", min_bytes=ask)
-        self.assertGreaterEqual(opened, ask)
-        moved = sum(int(s.numel()) for s, _, _ in fla._inverse_history)
-        self.assertEqual(moved, 2)  # min(L_live, G) == L_live
-        self._check_float_state(fla, kv)
-
-    def test_joint_relief_translates_donor_bytes_to_float_grid(self):
-        from sglang.srt.mem_cache.kv.alloc.band import _float_open_short_side
-
-        specs = [
-            _make_mha_spec("low", "up", layer_num=1, head_num=1, head_dim=128),
-            _make_mha_spec("middle", "float", layer_num=1, head_num=1, head_dim=96),
-            _make_mha_spec("high", "down", layer_num=1, head_num=1, head_dim=32),
-        ]
-        arena = arena_of(specs, total_bytes=1792, device="cpu")
-        low = Band(arena=arena, sub_pool_name="low", device="cpu", is_id_owner=True)
-        middle = FloatBand(
-            arena=arena, sub_pool_name="middle", device="cpu", is_id_owner=True
-        )
-        high = Band(arena=arena, sub_pool_name="high", device="cpu", is_id_owner=True)
-        low.bind_high_peer(middle)
-        middle.bind_low_peer(low)
-        middle.bind_high_peer(high)
-        high.bind_low_peer(middle)
-        kv = FakeKVCache(arena, "middle")
-        self.assertIsNotNone(high.alloc(1))
-        v = middle.alloc(1)
-        self._stamp(middle, kv, v)
-        middle._relocate_to_positions([int(middle.ids.virtual_to_physical[v][0])], [2])
-        self.assertEqual(middle._region_bounds_pages(), (2, 4))
-        # Raw frontiers are 512/1664, while the float's own grid is 384.
-        # The requested 512-byte low gap needs only 384 aligned float bytes.
-        _float_open_short_side(middle, {low: 1, middle: 0, high: 1})
-        self.assertEqual(int(middle.ids.virtual_to_physical[v][0]), 3)
-        self._check_float_state(middle, kv)
-        self.assertIsNotNone(high.alloc(1))
-        self.assertIsNotNone(low.alloc(1))
-
-    def test_make_room_leapfrog_preserves_opposite_gap(self):
-        for side in ("low", "high"):
-            with self.subTest(side=side):
-                _, _, fla, _, kv = self._build_tri()
-                v = fla.alloc(1)
-                self._stamp(fla, kv, v)
-                epp = fla.entry_bytes_per_page
-                before = dict(zip(("low", "high"), fla._gap_pages()))
-                ask = (before[side] + 2) * epp
-                self.assertEqual(fla.make_room(side=side, min_bytes=ask), ask)
-                after = dict(zip(("low", "high"), fla._gap_pages()))
-                other = "high" if side == "low" else "low"
-                self.assertEqual(after[other], before[other] - 2)
-                self.assertGreater(after[other], 0)
-                self._check_float_state(fla, kv)
-
-    def test_interior_pack_preserves_payload_with_mixed_move_directions(self):
+    def test_relocate_into_keeps_inside_pages_and_moves_the_rest(self):
+        """A planned float move: live pages already inside the target block
+        stay where they are, the others are copied into its free pages, in
+        both directions at once, and every page keeps its bytes."""
         _, _, fla, _, kv = self._build_tri()
         v = fla.alloc(13)
         self._stamp(fla, kv, v)
@@ -3179,88 +3036,27 @@ class TestFloatBand(CustomTestCase):
         keep = (physical == start) | (physical >= start + 8)
         fla.free(v[~keep])
         live = sorted(int(x) for x in physical[keep].tolist())
-        final = list(range(start + 6, start + 12))
-        self.assertTrue(any(d < src for src, d in zip(live, final)))
-        self.assertTrue(any(d > src for src, d in zip(live, final)))
-        fla._relocate_to_positions(live, final)
+        first, end = start + 6, start + 12
+        inside = [p for p in live if first <= p < end]
+        self.assertTrue(any(p < first for p in live))
+        self.assertTrue(any(p >= end for p in live))
+        moved = fla.relocate_into(first, end)
+        self.assertEqual(moved, len(live) - len(inside))
+        self.assertEqual((fla.low_wm_page, fla.high_wm_page), (first, end))
+        for p in inside:
+            self.assertNotEqual(int(fla.ids.physical_to_virtual[p]), -1)
         self._check_float_state(fla, kv)
-        torch.testing.assert_close(
-            fla.ids.virtual_to_physical[v[keep]],
-            torch.tensor(final, dtype=physical.dtype, device=physical.device),
-        )
 
-    def test_make_room_impossible_leaves_state_unchanged(self):
-        _, _, fla, _, kv = self._build_tri(n_float=8)
-        v = fla.alloc(6)
-        self._stamp(fla, kv, v)
+    def test_relocate_into_never_leaves_a_fixed_page_behind(self):
+        """A held page stays put: a block that would leave one behind is
+        refused before any page moves."""
+        _, _, fla, _, kv = self._build_tri()
+        vs = [fla.alloc(2) for _ in range(4)]
+        for v in vs:
+            self._stamp(fla, kv, v)
+        fla.free(vs[1])
         lo, hi = fla._region_bounds_pages()
-        epp = fla.entry_bytes_per_page
-        snapshot = (
-            fla.low_wm_page,
-            fla.high_wm_page,
-            fla._hole_pages(),
-            len(fla._inverse_history),
-        )
-        opened = fla.make_room(side="high", min_bytes=(hi - lo) * epp)
-        self.assertLess(opened, (hi - lo) * epp)
-        self.assertEqual(
-            snapshot,
-            (
-                fla.low_wm_page,
-                fla.high_wm_page,
-                fla._hole_pages(),
-                len(fla._inverse_history),
-            ),
-        )
-        self._check_float_state(fla, kv)
-
-    def test_make_room_uses_far_holes_before_far_gap(self):
-        _, _, fla, _, kv = self._build_tri()
-        va = fla.alloc(2)
-        vb = fla.alloc(2)
-        vc = fla.alloc(2)
-        for v in (va, vb, vc):
-            self._stamp(fla, kv, v)
-        lo_before = fla.low_wm_page
-        fla.free(self._interior_block(fla, (va, vb, vc)))  # 2 interior holes
-        self.assertEqual(fla._hole_pages(), 2)
-        epp = fla.entry_bytes_per_page
-        _, gap_high = fla._gap_pages()
-        opened = fla.make_room(side="high", min_bytes=(gap_high + 2) * epp)
-        self.assertGreaterEqual(opened, (gap_high + 2) * epp)
-        # The two holes absorbed the two moved pages: low side untouched.
-        self.assertEqual(fla.low_wm_page, lo_before)
-        self.assertEqual(fla._hole_pages(), 0)
-        self._check_float_state(fla, kv)
-
-    def test_compact_holes_ordered_pack(self):
-        _, _, fla, _, kv = self._build_tri()
-        vs = [fla.alloc(2) for _ in range(4)]
-        for v in vs:
-            self._stamp(fla, kv, v)
-        fla.free(vs[1])  # interleaved holes
-        span_before = fla._span_pages()
-        moved = fla.compact_holes(retreat_side="high")
-        self.assertEqual(fla._hole_pages(), 0)
-        self.assertEqual(fla._span_pages(), span_before - 2)
-        self.assertGreater(moved, 0)
-        self._check_float_state(fla, kv)
-
-    def test_on_demand_movers_honor_pins(self):
-        """`make_room` / `compact_holes` relocate live pages just as `_flush`
-        does, so a closed move gate must stop them too: the shortfall ladder
-        reaches `make_room` while a host transfer or RDMA still addresses the
-        float's physical pages, and an ungated mover copies KV out from under
-        it. A blocked ask reports what is open now and leaves state untouched.
-        """
-        _, _, fla, _, kv = self._build_tri()
-        vs = [fla.alloc(2) for _ in range(4)]
-        for v in vs:
-            self._stamp(fla, kv, v)
-        fla.free(vs[1])  # an interior hole `compact_holes` would pack
-        epp = fla.entry_bytes_per_page
-        _, gap_high = fla._gap_pages()
-        ask = (gap_high + 2) * epp
+        live = fla._live_pages()
 
         def snapshot():
             return (
@@ -3270,15 +3066,14 @@ class TestFloatBand(CustomTestCase):
                 len(fla._inverse_history),
             )
 
-        fla.pin_sources = (lambda: True,)
+        hold_band(fla)
         before = snapshot()
-        self.assertLess(fla.make_room(side="high", min_bytes=ask), ask)
-        self.assertEqual(fla.compact_holes(retreat_side="high"), 0)
+        with self.assertRaises(AssertionError):
+            fla.relocate_into(hi - live, hi)
         self.assertEqual(snapshot(), before)
         self._check_float_state(fla, kv)
-
-        fla.pin_sources = ()
-        self.assertGreaterEqual(fla.make_room(side="high", min_bytes=ask), ask)
+        release_band(fla)
+        self.assertGreater(fla.relocate_into(hi - live, hi), 0)
         self._check_float_state(fla, kv)
 
 
@@ -3462,6 +3257,7 @@ class TestDcpWidening(unittest.TestCase):
         cache.tree_components = (ComponentType.FULL, ComponentType.MAMBA)
         index_slots(cache, cache.tree_components)
         cache.is_swa_enabled = False
+        cache.is_mamba_enabled = True
         cache.cache_controller = None
         cache.metrics_collector = None
         allocator.state = SimpleNamespace(slots=mamba_slot_allocator)
@@ -3500,55 +3296,22 @@ class TestDcpWidening(unittest.TestCase):
         cache._evict_device_leaf = MagicMock(side_effect=evict_leaf)
         return cache, walk
 
-    def test_mamba_slot_cost_is_in_the_same_units_as_available_size(self):
-        """Admission charges the state-slot cost against a budget
-        fed by `available_size()`. Both are bytes/entry_bytes conversions, so
-        both carry `dcp_size`; if only the budget widens, every Mamba state is
-        under-reserved by that factor and a batch is admitted whose later
-        allocations cross the shared byte frontier."""
+    def test_mamba_admission_counts_slots_under_dcp(self):
+        """Admission charges state in slots, not DCP-widened tokens: whatever
+        number of slots it admits, the slot take succeeds at every DCP width."""
         for page_size in (1, 8):
-            with self._dcp(1):
-                base = self._build_composite(page_size=page_size)
-                base_cost = base.admission_rules().state_slot_cost
-                base_avail = base.available_size()
-                self.assertGreater(base_cost, 0)
-            for dcp_size in (2, 4):
-                with self._dcp(dcp_size):
-                    a = self._build_composite(page_size=page_size)
-                    self.assertEqual(a.available_size(), base_avail * dcp_size)
-                    mamba_bytes = a.mamba_allocator.entry_bytes_per_page
-                    full_entry = a.full_attn_allocator.entry_bytes
-                    cost = a.admission_rules().state_slot_cost
-                    # A widened token is `full_entry / dcp_size` bytes, so the
-                    # reservation covers the slot...
-                    self.assertGreaterEqual(cost * full_entry, mamba_bytes * dcp_size)
-                    # ...and stays tight (rounds up by less than one token).
-                    self.assertLess((cost - 1) * full_entry, mamba_bytes * dcp_size)
-                    # The un-scaled cost -- the bug -- would not have covered it.
-                    self.assertLess(base_cost * full_entry, mamba_bytes * dcp_size)
+            for dcp_size in (1, 2, 4):
+                with self.subTest(page_size=page_size, dcp_size=dcp_size):
+                    with self._dcp(dcp_size):
+                        a = self._build_composite(page_size=page_size)
+                        admitted = 0
+                        while a.admits(KVDemand(0, {}, admitted + 1)):
+                            admitted += 1
+                        self.assertGreater(admitted, 0)
+                        self.assertIsNotNone(a.alloc_state_slots(admitted))
+                        self.assertFalse(a.admits(KVDemand(0, {}, 1)))
 
-    def test_mamba_donor_recheck_bound_is_aggregate_and_dcp_widened(self):
-        missing_slots = 7
-        for dcp_size in (1, 2, 4):
-            with self.subTest(dcp_size=dcp_size), self._dcp(dcp_size):
-                allocator = self._build_composite(page_size=1)
-                allocator.mamba_allocator.schedulable_available_size = MagicMock(
-                    return_value=3
-                )
-
-                bound = allocator.full_tokens_before_mamba_recheck(3 + missing_slots)
-
-                mamba_bytes = allocator.mamba_allocator.entry_bytes_per_page
-                full_bytes = allocator.full_attn_allocator.entry_bytes
-                minimum_missing_bytes = (missing_slots - 1) * mamba_bytes + 1
-                expected = -(-minimum_missing_bytes * dcp_size // full_bytes)
-                self.assertEqual(bound, expected)
-                self.assertLessEqual(
-                    bound,
-                    missing_slots * allocator.admission_rules().state_slot_cost,
-                )
-
-    def test_full_donor_flushes_paged_free_group_without_closing_it(self):
+    def test_deferred_full_frees_flush_without_closing_the_group(self):
         with self._dcp(2):
             allocator = self._build_composite(page_size=2)
             full_indices = allocator.alloc(8)
@@ -3559,9 +3322,7 @@ class TestDcpWidening(unittest.TestCase):
             allocator.free_segment(full_indices, start_pos=0)
             self.assertTrue(allocator.free_page_reps_group)
 
-            donor = allocator.mamba_full_cache_donor()
-            self.assertIsNotNone(donor)
-            donor.flush_deferred_full_frees()
+            allocator.flush_deferred_full_frees()
 
             self.assertEqual(allocator.free_group, [])
             self.assertEqual(allocator.free_page_reps_group, [])
@@ -3571,7 +3332,7 @@ class TestDcpWidening(unittest.TestCase):
             self.assertEqual(allocator.verify_byte_accounting(), [])
             allocator.free_group_end()
 
-    def test_full_donor_reaches_real_capacity_across_supported_layouts(self):
+    def test_state_target_is_funded_by_full_cache_across_layouts(self):
         cases = (
             (1, 1, True, False),
             # Paged layout with grouped frees.
@@ -3594,9 +3355,13 @@ class TestDcpWidening(unittest.TestCase):
                     page_size=page_size,
                     lazy_compaction=lazy_compaction,
                 )
+                # Wired as production wires it: the chain takes and prices slots.
                 mamba_slots = UnifiedMambaSlotAllocator(
                     allocator.mamba_allocator,
                     device=_DEV,
+                    take=allocator.alloc_state_slots,
+                    fits=allocator.state_slots_fit,
+                    estimate=allocator.estimated_state_slots_available,
                 )
 
                 # Fill Full to its page-granular frontier, then consume any
@@ -3610,11 +3375,11 @@ class TestDcpWidening(unittest.TestCase):
                         break
                     full_leaves.append(indices)
                 self.assertTrue(full_leaves)
-                residual_mamba = mamba_slots.schedulable_available_size()
+                residual_mamba = largest_take(allocator, allocator.sub_pool_roles()[2])
                 if residual_mamba:
                     self.assertIsNotNone(mamba_slots.alloc(residual_mamba))
                 self.assertGreater(mamba_slots.available_size(), 0)
-                self.assertEqual(mamba_slots.schedulable_available_size(), 0)
+                self.assertFalse(mamba_slots.slots_fit(1))
                 self.assertIsNone(mamba_slots.alloc(1))
 
                 gap_before = allocator.mamba_allocator._current_gap_bytes()
@@ -3629,7 +3394,7 @@ class TestDcpWidening(unittest.TestCase):
                 if grouped_free:
                     allocator.free_group_begin()
 
-                result = cache.evict_for_alloc(EvictParams(mamba_num=1))
+                result = cache.evict_for_alloc(KVDemand(state_slots=1))
 
                 self.assertEqual(walk["freed_leaves"], expected_leaves)
                 self.assertEqual(
@@ -3637,7 +3402,7 @@ class TestDcpWidening(unittest.TestCase):
                     expected_leaves * allocator.page_size,
                 )
                 self.assertEqual(result.mamba_num_evicted, 0)
-                self.assertGreaterEqual(mamba_slots.schedulable_available_size(), 1)
+                self.assertTrue(mamba_slots.slots_fit(1))
                 allocated_mamba = mamba_slots.alloc(1)
                 self.assertIsNotNone(allocated_mamba)
                 self.assertEqual(allocator.verify_byte_accounting(), [])
@@ -3646,15 +3411,19 @@ class TestDcpWidening(unittest.TestCase):
                     self.assertEqual(allocator.free_page_reps_group, [])
                     allocator.free_group_end()
 
-    def test_full_donor_batches_urgent_compaction_for_large_shortfall(self):
+    def test_state_target_batches_urgent_compaction_for_large_shortfall(self):
         with self._dcp(1):
             allocator = self._build_composite(
                 page_size=1,
                 lazy_compaction=True,
             )
+            # Wired as production wires it: the chain takes and prices slots.
             mamba_slots = UnifiedMambaSlotAllocator(
                 allocator.mamba_allocator,
                 device=_DEV,
+                take=allocator.alloc_state_slots,
+                fits=allocator.state_slots_fit,
+                estimate=allocator.estimated_state_slots_available,
             )
 
             full_leaves = []
@@ -3663,7 +3432,7 @@ class TestDcpWidening(unittest.TestCase):
                 if indices is None:
                     break
                 full_leaves.append(indices)
-            residual_mamba = mamba_slots.schedulable_available_size()
+            residual_mamba = largest_take(allocator, allocator.sub_pool_roles()[2])
             if residual_mamba:
                 self.assertIsNotNone(mamba_slots.alloc(residual_mamba))
 
@@ -3673,13 +3442,54 @@ class TestDcpWidening(unittest.TestCase):
             full.flush_for_allocation = MagicMock(wraps=original_flush)
             allocator.free_group_begin()
 
-            result = cache.evict_for_alloc(EvictParams(mamba_num=4))
+            result = cache.evict_for_alloc(KVDemand(state_slots=4))
 
             self.assertGreater(walk["freed_leaves"], 1)
             self.assertEqual(result.num_tokens_evicted, walk["freed_leaves"])
-            self.assertEqual(full.flush_for_allocation.call_count, 1)
-            self.assertGreaterEqual(mamba_slots.schedulable_available_size(), 4)
+            # The walk's stop is a layout search: no victim compacts the band.
+            self.assertEqual(full.flush_for_allocation.call_count, 0)
+            self.assertTrue(mamba_slots.slots_fit(4))
             self.assertIsNotNone(mamba_slots.alloc(4))
+            # The take lays the chain out once for every freed leaf.
+            self.assertLessEqual(full.flush_for_allocation.call_count, 1)
+            self.assertEqual(allocator.verify_byte_accounting(), [])
+            allocator.free_group_end()
+
+    def test_state_reclaim_inside_a_free_group_returns_queued_frees_first(self):
+        """Regression: a state reclaim inside an open free group returns the queued
+        owner frees first, so the component's retry finds a slot."""
+        with self._dcp(1):
+            allocator = self._build_composite(page_size=1, lazy_compaction=True)
+            mamba_slots = UnifiedMambaSlotAllocator(
+                allocator.mamba_allocator,
+                device=_DEV,
+                take=allocator.alloc_state_slots,
+                fits=allocator.state_slots_fit,
+                estimate=allocator.estimated_state_slots_available,
+            )
+            full_leaves = []
+            while True:
+                indices = allocator.alloc(1)
+                if indices is None:
+                    break
+                full_leaves.append(indices)
+            residual_mamba = largest_take(allocator, allocator.sub_pool_roles()[2])
+            if residual_mamba:
+                self.assertIsNotNone(mamba_slots.alloc(residual_mamba))
+            self.assertIsNone(mamba_slots.alloc(1))
+            # Nothing the cache could evict: only the queued frees make room.
+            cache, walk = self._build_donor_cache(allocator, mamba_slots, [])
+            allocator.free_group_begin()
+            for indices in full_leaves:
+                allocator.free(indices)
+            self.assertTrue(allocator.free_group)
+
+            # The component's path: a take, its own reclaim, a retry.
+            result = cache.evict_for_alloc(KVDemand(state_slots=1))
+
+            self.assertEqual(result.num_tokens_evicted, 0)
+            self.assertEqual(walk["freed_leaves"], 0)
+            self.assertIsNotNone(mamba_slots.alloc(1))
             self.assertEqual(allocator.verify_byte_accounting(), [])
             allocator.free_group_end()
 

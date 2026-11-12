@@ -22,8 +22,11 @@ _DEFAULT_HIGH_WATERMARK = 80.0
 _DEFAULT_LOW_WATERMARK = 70.0
 _RANK_SUFFIX_RE = re.compile(r"_(\d+)_(\d+)$")
 _KV_SUFFIXES = ("_k", "_v")
+# The well-known pools, and the window sub-pools, which go by their window's
+# length (`kv/decl.py::window_sub_pool_name`: ``window`` or ``window_<n>``).
 _POOL_NAME_PATTERN = "|".join(
-    sorted((re.escape(pool.value) for pool in PoolName), key=len, reverse=True)
+    [r"window(?:_\d+)?"]
+    + sorted((re.escape(pool.value) for pool in PoolName), key=len, reverse=True)
 )
 _HYBRID_COMPONENT_SUFFIX_RE = re.compile(
     rf"_(?:{_POOL_NAME_PATTERN})(?:_(?:temporal|conv_\d+|[kv]|\d+))?$"
