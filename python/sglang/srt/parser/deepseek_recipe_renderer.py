@@ -6,6 +6,7 @@ from __future__ import annotations
 import copy
 import functools
 import json
+import logging
 from types import ModuleType
 from typing import Any, Optional, Union
 
@@ -14,6 +15,8 @@ DEEPSEEK_RECIPE_INSTALL_HINT = (
     "reference encoder and parser; wheels for Linux and macOS). Install it with "
     "`pip install deepseek-recipe`."
 )
+
+logger = logging.getLogger(__name__)
 
 MODEL_NAMES = {"dsv4": "DeepSeek-V4-Pro", "dsv41": "DeepSeek-V4.1-Flash"}
 # The checkpoint tokenizer's image token; recipe's bundled tokenizer spells it <｜image｜>.
@@ -110,6 +113,20 @@ class DeepSeekRecipe:
         recipe = load_deepseek_recipe()
         self.model = MODEL_NAMES[chat_encoding_spec]
         self.hf_tokenizer = tokenizer
+        self._fast_prompt_tokenizer = None
+        if type(tokenizer).__module__.partition(".")[0] == "fastokens":
+            from fastokens import Tokenizer
+
+            if hasattr(Tokenizer, "encode_segments"):
+                self._fast_prompt_tokenizer = Tokenizer.from_json_str(
+                    tokenizer.to_str()
+                )
+                logger.info("DeepSeek recipe prompt encoder: fastokens segmented")
+            else:
+                logger.warning(
+                    "deepseek-recipe prompt acceleration requires fastokens.encode_segments; "
+                    "using the reference prompt tokenizer"
+                )
         self.special_tokens = recipe.SpecialTokens(image=IMAGE_TOKEN)
         self._options = recipe.ConversionOptions().with_special_tokens(
             self.special_tokens
@@ -146,6 +163,22 @@ class DeepSeekRecipe:
     ) -> list[int]:
         """Prompt ids for `body` (see `pre_normalize`); a request recipe rejects
         raises ValueError. `image_urls` receives the images in placeholder order."""
+        conversation = self.convert(body, effort_budget=effort_budget)
+        prompt_ids = self.encode_conversation(conversation, effort_budget=effort_budget)
+        if image_urls is not None:
+            rendered = self._encoding.render_conversation(conversation)
+            image_urls.extend(
+                source.url or source.data_url for source in rendered.image_sources
+            )
+        if task is not None:
+            prompt_ids = self._attach_task(prompt_ids, task, body["thinking"])
+        return prompt_ids
+
+    def convert(
+        self, body: dict[str, Any], *, effort_budget: Optional[int] = None
+    ) -> Any:
+        """Convert `body` to recipe's `Conversation`; invalid requests raise ValueError.
+        Pass the same `effort_budget` to `encode_conversation`."""
         recipe = load_deepseek_recipe()
         normalized = pre_normalize(body)
         normalized["model"] = self.model
@@ -155,16 +188,31 @@ class DeepSeekRecipe:
             converted = recipe.ChatCompletionRequest(normalized).convert(self._options)
         except recipe.ConversionError as error:
             raise ValueError(_error_message(error.body)) from error
-        prompt_ids = self._encoding.encode(converted.conversation)
-        if image_urls is not None:
-            rendered = self._encoding.render_conversation(converted.conversation)
-            image_urls.extend(
-                source.url or source.data_url for source in rendered.image_sources
-            )
-        if effort_budget is not None and body["thinking"]:
+        return converted.conversation
+
+    def encode_conversation(
+        self, conversation: Any, *, effort_budget: Optional[int] = None
+    ) -> list[int]:
+        """Encode a recipe `Conversation`, including a prefix of its messages."""
+        if self._fast_prompt_tokenizer is None:
+            prompt_ids = self._encoding.encode(conversation)
+        else:
+            rendered = self._encoding.render_conversation(conversation)
+            prompt = rendered.prompt
+            segments = []
+            cursor = 0
+            # Recipe distinguishes control tokens from identical spellings in
+            # user text. Its Python ranges use code-point offsets, not bytes.
+            for start, end in rendered.special_ranges:
+                if start > cursor:
+                    segments.append((prompt[cursor:start], False))
+                segments.append((prompt[start:end], True))
+                cursor = end
+            if cursor < len(prompt):
+                segments.append((prompt[cursor:], False))
+            prompt_ids = self._fast_prompt_tokenizer.encode_segments(segments).ids
+        if effort_budget is not None and conversation.thinking_mode:
             prompt_ids = self._replace_effort_budget(prompt_ids, effort_budget)
-        if task is not None:
-            prompt_ids = self._attach_task(prompt_ids, task, body["thinking"])
         return prompt_ids
 
     def parse_start(
