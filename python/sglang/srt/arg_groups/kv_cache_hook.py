@@ -851,6 +851,45 @@ def handle_page_major_kv_layout(server_args: Any):
         }
     backends = set(attention_backends_of(resolved_view(server_args)))
     backends.discard(None)
+    if "aiter" in backends and not use_mla_backend(server_args):
+        # Only the ordinary unified-attention reader consumes the arena's
+        # translated page table. Other AITER routes still read virtual ids.
+        assert not model_config.has_asymmetric_kv and not model_config.is_hybrid_swa, (
+            "--enable-unified-memory with aiter requires full MHA attention "
+            "with equal K/V head dimensions and no sliding-window layers."
+        )
+        assert cfg.page_size == 1, (
+            "--enable-unified-memory with aiter requires --page-size 1."
+        )
+        # Auto is checked against the actual query/KV dtypes by the backend.
+        assert cfg.dtype in ("auto", "bfloat16") and cfg.kv_cache_dtype in (
+            "auto",
+            "bf16",
+            "bfloat16",
+        ), "--enable-unified-memory with aiter requires BF16 query and KV dtypes."
+        assert cfg.speculative_algorithm is None, (
+            "--enable-unified-memory with aiter does not support speculative decoding."
+        )
+        assert (
+            not cfg.enable_hierarchical_cache and cfg.disaggregation_mode == "null"
+        ), (
+            "--enable-unified-memory with aiter does not support HiCache or "
+            "PD disaggregation."
+        )
+        assert cfg.dcp_size == cfg.attn_cp_size == 1 and not cfg.enable_prefill_cp, (
+            "--enable-unified-memory with aiter does not support context parallelism."
+        )
+        assert not cfg.enable_deterministic_inference, (
+            "--enable-unified-memory with aiter does not support deterministic inference."
+        )
+        assert (
+            cfg.cuda_graph_config is None
+            or cfg.cuda_graph_config.prefill.backend == Backend.DISABLED
+        ), (
+            "--enable-unified-memory with aiter requires "
+            "--cuda-graph-backend-prefill disabled."
+        )
+        allowed_full.add("aiter")
     assert backends <= allowed_full, (
         "--enable-page-major-kv-layout: the resolved attention backends "
         f"{sorted(backends)} are not in the allowed set "

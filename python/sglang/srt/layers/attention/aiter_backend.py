@@ -419,12 +419,12 @@ def _kv_cache_is_vectorized_5d(pool) -> bool:
 
 
 def _require_untranslated_storage(*pools) -> None:
-    """This backend reads a pool's K/V as dense ``(pages, page_size, H, D)``
-    caches, gathers their indices straight from the request table, and maps
+    """The legacy routes read a pool's K/V as dense ``(pages, page_size, H, D)``
+    caches, gather their indices straight from the request table, and map
     window layers through a static full -> window slot table. A pool whose
     views take physical write ids (the unified pool, or a draft fused into it)
     needs translated indices and strided entry views, for full and window
-    layers alike, so the backend cannot read it."""
+    layers alike, so these routes cannot read it."""
     for pool in pools:
         if pool is not None and pool.requires_physical_write_loc:
             raise ValueError(
@@ -646,6 +646,7 @@ class AiterAttnBackend(AttentionBackend):
     # Set in __init__; declared here for tests that build the backend without it
     # (test_aiter_fp8_kv_scales_paths.py).
     deterministic_prefill_max_q: Optional[int] = None
+    use_unified_memory: bool = False
 
     def __init__(
         self,
@@ -825,9 +826,37 @@ class AiterAttnBackend(AttentionBackend):
         self.kv_cache_is_vectorized_5d = _kv_cache_is_vectorized_5d(
             model_runner.token_to_kv_pool
         )
-        _require_untranslated_storage(model_runner.token_to_kv_pool, self.swa_kv_pool)
+        self.use_unified_memory = self.token_to_kv_pool.requires_physical_write_loc
+        if self.use_unified_memory:
+            if (
+                not self.runner_ids.reads_are_translated
+                or self.runner_ids.is_fused_draft
+                or self.use_mla
+                or self.use_sliding_window_kv_pool
+                or self.kv_cache_is_vectorized_5d
+                or self.page_size != 1
+                or self.input_dtype != torch.bfloat16
+                or self.kv_cache_dtype != torch.bfloat16
+                or self.head_dim != self.v_head_dim
+            ):
+                raise ValueError(
+                    "AITER unified memory requires translated full MHA, BF16 Q/K/V, "
+                    "equal K/V head dimensions and page size 1; window, MLA, "
+                    "vectorized and fused-draft caches are not supported."
+                )
+            from sglang.kernels.ops.kvcache.kvcache import can_use_store_cache
 
-        if self.use_sliding_window_kv_pool:
+            row_bytes = self.num_kv_head * self.head_dim * 2
+            if not can_use_store_cache(row_bytes, row_bytes):
+                raise RuntimeError(
+                    "AITER unified memory requires the JIT KV writer to preserve "
+                    "the reserved sink. Fix the store_cache build/load failure "
+                    "before enabling this backend."
+                )
+        else:
+            _require_untranslated_storage(self.token_to_kv_pool, self.swa_kv_pool)
+
+        if self.use_sliding_window_kv_pool or self.use_unified_memory:
             self.use_triton_unified_attention = True
         else:
             self.use_triton_unified_attention = get_bool_env_var(
@@ -1668,6 +1697,7 @@ class AiterAttnBackend(AttentionBackend):
         seq_lens: torch.Tensor,
         req_pool_indices: torch.Tensor,
         max_kv_len: int,
+        plan: Optional[IterationIds] = None,
     ):
         """Build the 2D block page_table (+ SWA translation) that
         unified_attention needs for a plain extend/prefill batch. Mirrors the
@@ -1689,12 +1719,22 @@ class AiterAttnBackend(AttentionBackend):
 
         BLOCK_SIZE = 1024
         grid = (bs, triton.cdiv(max_blocks, BLOCK_SIZE))
+        req_to_token = self.req_to_token
+        row_stride = req_to_token.stride(0)
+        if self.use_unified_memory:
+            src = self.runner_ids.read_table(plan, rows=bs)
+            assert src.is_translated and src.entry_page_size == 1 and src.v2p is None
+            req_to_token, req_pool_indices, row_stride = (
+                src.ids,
+                src.row_ids,
+                src.row_stride,
+            )
         scatter_req_to_token_to_page_table_kernel[grid](
-            self.req_to_token,
+            req_to_token,
             req_pool_indices,
             seq_lens,
             page_table,
-            self.req_to_token.stride(0),
+            row_stride,
             page_table.stride(0),
             swa_page_table,
             swa_slot_mapping,
@@ -1733,7 +1773,11 @@ class AiterAttnBackend(AttentionBackend):
         else:
             max_kv_len = int(forward_batch.seq_lens_cpu.max().item())
             page_table, swa_page_table = self._build_extend_unified_page_table(
-                bs, forward_batch.seq_lens, forward_batch.req_pool_indices, max_kv_len
+                bs,
+                forward_batch.seq_lens,
+                forward_batch.req_pool_indices,
+                max_kv_len,
+                plan=forward_batch.iteration_ids if self.use_unified_memory else None,
             )
 
             # Build cu_seqlens_q from this batch's extend lengths. The standard
@@ -2702,6 +2746,7 @@ class AiterAttnBackend(AttentionBackend):
             spec_info=forward_batch.spec_info,
             seq_lens_cpu=seq_lens_cpu,
             verify_tokens_per_req=verify_tokens_per_req,
+            plan=forward_batch.iteration_ids if self.use_unified_memory else None,
         )
         if in_capture and forward_batch.forward_mode.is_decode():
             self.forward_metadata.decode_num_partitions = (
@@ -2799,15 +2844,32 @@ class AiterAttnBackend(AttentionBackend):
                         bs, max_kv_len, dtype=torch.int32, device=self.device
                     )
 
+                    req_to_token = self.req_to_token
+                    req_pool_indices = forward_batch.req_pool_indices
+                    row_stride = req_to_token.stride(0)
+                    if self.use_unified_memory:
+                        src = self.runner_ids.read_table(
+                            forward_batch.iteration_ids, rows=bs
+                        )
+                        assert (
+                            src.is_translated
+                            and src.entry_page_size == 1
+                            and src.v2p is None
+                        )
+                        req_to_token, req_pool_indices, row_stride = (
+                            src.ids,
+                            src.row_ids,
+                            src.row_stride,
+                        )
                     create_flashmla_kv_indices_triton[
                         (bs, get_num_kv_index_blocks_flashmla(max_kv_len, 1))
                     ](
-                        self.req_to_token,
-                        forward_batch.req_pool_indices,
+                        req_to_token,
+                        req_pool_indices,
                         forward_batch.seq_lens,
                         None,
                         kv_indices,
-                        self.req_to_token.stride(0),
+                        row_stride,
                         max_kv_len,
                         1,
                     )
@@ -3706,6 +3768,7 @@ class AiterAttnBackend(AttentionBackend):
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
         verify_tokens_per_req: Optional[int],
+        plan: Optional[IterationIds] = None,
     ):
         num_kv_splits = None
         # num_kv_splits_indptr = None
@@ -3782,7 +3845,16 @@ class AiterAttnBackend(AttentionBackend):
                     if self.use_sliding_window_kv_pool:
                         swa_page_table = self.cuda_graph_swa_page_table
 
-                    if spec_info is not None:
+                    if self.use_unified_memory:
+                        self.runner_ids.copy_page_table(plan, out=kv_indices)
+                        table = self.runner_ids.read_table(
+                            plan, rows=kv_indices.shape[0]
+                        )
+                        # The producer clears interior tails and padded rows. Only
+                        # columns beyond its width can retain old ids. Never clear
+                        # the live prefix: it may be this plan's cached table.
+                        kv_indices[:, table.ids.shape[1] :].zero_()
+                    elif spec_info is not None:
                         self._build_unified_page_table_from_spec(
                             spec_info,
                             bs,

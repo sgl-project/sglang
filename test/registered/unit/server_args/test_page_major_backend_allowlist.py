@@ -34,13 +34,13 @@ import unittest
 from types import SimpleNamespace
 
 import msgspec
-
 from sglang.srt.arg_groups.kv_cache_hook import (
     ASYMMETRIC_KV_BACKENDS,
     draft_rows_refusal,
     handle_page_major_kv_layout,
 )
 from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.model_executor.cuda_graph_config import Backend, CudaGraphConfig
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -55,7 +55,9 @@ def _accepts(
     linear_decode: str | None = None,
     linear_prefill: str | None = None,
     has_asymmetric_kv: bool = False,
+    is_hybrid_swa: bool = False,
     draft_backend: str | None = None,
+    **overrides,
 ) -> bool:
     """Run just `handle_page_major_kv_layout` against a minimal stand-in, since
     ServerArgs' real constructor pulls in a model config."""
@@ -73,6 +75,11 @@ def _accepts(
         "linear_attn_prefill_backend": linear_prefill,
         "mamba_backend": "triton",
         "speculative_draft_attention_backend": draft_backend,
+        "page_size": 1,
+        "cuda_graph_config": CudaGraphConfig.from_dict(
+            {"prefill": {"backend": Backend.DISABLED}}
+        ),
+        **overrides,
     }.items():
         msgspec.Struct.__setattr__(sa, name, value)
     setattr(
@@ -81,6 +88,7 @@ def _accepts(
         SimpleNamespace(
             attention_arch=AttentionArch.MLA if use_mla else AttentionArch.MHA,
             has_asymmetric_kv=has_asymmetric_kv,
+            is_hybrid_swa=is_hybrid_swa,
             head_dim=192 if has_asymmetric_kv else 128,
             v_head_dim=128,
             swa_head_dim=128,
@@ -107,8 +115,6 @@ class TestPageMajorBackendAllowlist(unittest.TestCase):
     PER_LAYER_VIEW_MHA_BACKENDS = ("fa3", "fa4", "flashinfer", "trtllm_mha")
     # MLA-family kernels that must never leak into the MHA arm.
     MLA_ONLY_BACKENDS = ("trtllm_mla", "cutedsl_mla", "flashmla")
-    # No virtual-to-physical id wiring anywhere: must stay rejected until they get one.
-    UNWIRED_BACKENDS = ("aiter",)
 
     def test_explicit_flashinfer_gdn_prefill_matches_the_default(self):
         """Pinning the automatically selected GDN prefill backend must not
@@ -228,13 +234,44 @@ class TestPageMajorBackendAllowlist(unittest.TestCase):
                     f"{backend} must stay rejected without --enable-unified-memory",
                 )
 
-    def test_unwired_backends_always_rejected(self):
-        for backend in self.UNWIRED_BACKENDS:
-            for use_mla in (True, False):
-                self.assertFalse(
-                    _accepts(backend, use_mla=use_mla),
-                    f"{backend} has no virtual-to-physical id wiring and must be rejected",
-                )
+    def test_aiter_full_mha_bf16_page_one(self):
+        self.assertTrue(_accepts("aiter", use_mla=False))
+        self.assertTrue(
+            _accepts("aiter", use_mla=False, dtype="bfloat16", kv_cache_dtype="bf16")
+        )
+        # Judge both resolved phases, including a mixed-backend configuration.
+        self.assertTrue(
+            _accepts("triton", use_mla=False, decode_attention_backend="aiter")
+        )
+
+    def test_aiter_rejects_unimplemented_arena_contracts(self):
+        cases = [
+            {"use_mla": True},
+            {"has_asymmetric_kv": True},
+            {"is_hybrid_swa": True},
+            {"unified": False},
+            {"page_size": 16},
+            {"dtype": "float16"},
+            {"kv_cache_dtype": "fp8_e4m3"},
+            {"speculative_algorithm": "EAGLE"},
+            {"enable_hierarchical_cache": True},
+            {"disaggregation_mode": "decode"},
+            {"dcp_size": 2},
+            {"attn_cp_size": 2},
+            {"enable_prefill_cp": True},
+            {"enable_deterministic_inference": True},
+        ]
+        for backend in (Backend.FULL, Backend.BREAKABLE):
+            cases.append(
+                {
+                    "cuda_graph_config": CudaGraphConfig.from_dict(
+                        {"prefill": {"backend": backend}}
+                    )
+                }
+            )
+        for case in cases:
+            with self.subTest(case=case):
+                self.assertFalse(_accepts("aiter", **{"use_mla": False, **case}))
 
     def test_helion_linear_attention_is_kda_only(self):
         for phase in ("decode", "prefill"):

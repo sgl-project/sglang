@@ -62,6 +62,7 @@ Page-major entries make each layer's rows strided, so only backends audited for 
 | Layers | Page-major allow-list |
 |---|---|
 | MHA full and sliding-window attention | `triton`, `fa3`, `fa4`, `flashinfer`, `trtllm_mha` |
+| MHA full attention with equal K/V head dims, BF16 query/KV, page size 1, no window layers | `aiter` on AMD ROCm; see [AITER configuration](#aiter-configuration) |
 | MHA with asymmetric K/V head dims | `triton`, `fa3`, `fa4` |
 | MLA full attention | `triton`, `fa3`, `trtllm_mla`, `flashinfer`, `cutedsl_mla`, `flashmla` |
 | Linear attention, decode | `triton`, `flashinfer`; also `cutedsl` and `helion` on MLA (KDA) hybrids |
@@ -70,11 +71,11 @@ Page-major entries make each layer's rows strided, so only backends audited for 
 
 `fa3` and `fa4` still refuse two kinds of model when the backend is built: local-attention models, such as Llama 4, whose default backend on SM90 is `fa3` (`FlashAttentionBackend._maybe_init_local_attn_builder`), and models that decode with prefill-aware SWA (`FlashAttentionBackend.__init__`).
 
-If the FULL prefill CUDA-graph backend is configured with an attention backend other than `fa3` or `fa4`, it is disabled with a warning; decode capture and the other prefill graph backends are unaffected.
+The AITER arena path rejects prefill graphs. For other attention backends except `fa3` and `fa4`, the FULL prefill CUDA-graph backend is disabled with a warning; decode capture and the other prefill graph backends are unaffected.
 
 ## Quick start
 
-Platform: NVIDIA CUDA. On other platforms, read [Known limitations](#known-limitations) first.
+Platform: NVIDIA CUDA. For AMD ROCm, see [AITER configuration](#aiter-configuration); for other platforms, read [Known limitations](#known-limitations) first.
 
 ```bash
 python3 -m sglang.launch_server \
@@ -84,6 +85,27 @@ python3 -m sglang.launch_server \
 ```
 
 `MODEL_PATH` is a Hugging Face repo id or local path of a supported hybrid model.
+
+### AITER configuration
+
+On AMD ROCm Linux, the AITER arena path uses unified attention for ordinary BF16 full-attention layers. It requires page size 1 and equal K/V head dimensions. Use an AITER build containing the strided-cache address-span fix [ROCm/aiter#6661](https://github.com/ROCm/aiter/pull/6661). The SGLang HIP KV writer must compile and load successfully; this path refuses the fallback writer because it can overwrite the reserved padding sink.
+
+For Qwen3.5-4B on one GPU (TP1), disable online MXFP4 conversion to keep its GDN projections in BF16:
+
+```bash
+SGLANG_USE_AITER=1 SGLANG_ROCM_GDN_ONLINE_MXFP4=0 \
+python3 -m sglang.launch_server \
+  --model-path Qwen/Qwen3.5-4B \
+  --tp 1 \
+  --enable-unified-memory \
+  --attention-backend aiter \
+  --dtype bfloat16 --kv-cache-dtype bf16 \
+  --page-size 1 \
+  --linear-attn-backend triton --mamba-ssm-dtype float32 \
+  --cuda-graph-backend-prefill disabled
+```
+
+The arena selects AITER unified attention automatically; `SGLANG_USE_AITER_UNIFIED_ATTN` is not required. Decode can use eager execution or full CUDA-graph replay. This AITER path does not support MLA, sliding-window layers, asymmetric K/V dimensions, FP8 KV, speculative decoding, HiCache, context parallelism, PD disaggregation, deterministic inference or prefill graphs. These restrictions apply even where the general unified-memory feature table below lists support.
 
 ## Flags and environment variables
 
