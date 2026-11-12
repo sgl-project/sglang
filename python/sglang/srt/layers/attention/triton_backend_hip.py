@@ -4,6 +4,7 @@ DSpark draft's block-anchored windows and the one-launch verify indptrs."""
 import functools
 
 import torch
+import triton
 
 from sglang.kernels.ops.attention.metadata import verify_indptrs
 from sglang.kernels.ops.attention.score_mod import relative_bias_score_mod
@@ -173,10 +174,34 @@ def init_full_cg_extend_metadata(backend, forward_batch, in_capture):
     )
 
 
-def check_full_cg_extend(backend, rel_bias, sinks, layer):
-    """Full-graph prefill is built for the relative-bias extend kernel only: the
-    generic extend kernels size their grids from host-side lengths, which a graph
-    would freeze at capture."""
+def decode_split_bound(backend, num_token, window=None):
+    """Most KV splits a length-based decode launch takes: one wave of programs for
+    num_token rows, and with window no more than the window's keys need."""
+    group = backend.num_head // backend.num_kv_head
+    head_tiles = (
+        backend.num_head
+        if group == 1
+        else triton.cdiv(backend.num_head, min(16, group))
+    )
+    bound = backend.device_core_count // max(1, num_token * head_tiles)
+    bound = max(1, min(backend.max_kv_splits, bound))
+    if window is not None:
+        bound = min(bound, triton.cdiv(window + 1, backend.decode_split_min_tokens))
+    return bound
+
+
+def check_extend(backend, rel_bias, sinks, layer, gate_sink):
+    """gate_sink is applied only by the split-KV relative-bias verify kernel, and
+    full-graph prefill is built for the relative-bias extend kernel only: the generic
+    extend kernels size their grids from host-side lengths, which a graph would
+    freeze at capture."""
+    if gate_sink is not None and not (
+        takes_rel_extend(backend, rel_bias, sinks, layer)
+        and backend.forward_metadata.max_extend_len <= rel_verify_max_extend()
+    ):
+        raise NotImplementedError(
+            "gate_sink is applied only by the split-KV relative-bias verify kernel"
+        )
     bufs = getattr(backend, "full_cg_extend_buffers", None)
     if (
         bufs is not None

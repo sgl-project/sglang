@@ -375,10 +375,11 @@ class TritonAttnBackend(AttentionBackend):
                 self.max_context_len + self.split_tile_size - 1
             ) // self.split_tile_size
 
-        # cdiv(kv_len, N) decode splits per request, bounded by _decode_split_bound
+        # ROCm: cdiv(kv_len, N) decode splits per request (triton_backend_hip)
         self.decode_split_min_tokens = (
             0
-            if self.use_mla
+            if not _is_hip
+            or self.use_mla
             or self.enable_deterministic
             or self.static_kv_splits
             or self.split_tile_size is not None
@@ -458,19 +459,6 @@ class TritonAttnBackend(AttentionBackend):
             self.dllm_attention = DllmFlashAttention(self)
             self.supports_prefill_cuda_graph_max_context_size = True
 
-    def _decode_split_bound(self, num_token: int, window: Optional[int] = None) -> int:
-        """Most KV splits a length-based decode launch takes: one wave of programs
-        for num_token rows, and with window no more than the window's keys need."""
-        group = self.num_head // self.num_kv_head
-        head_tiles = (
-            self.num_head if group == 1 else triton.cdiv(self.num_head, min(16, group))
-        )
-        bound = self.device_core_count // max(1, num_token * head_tiles)
-        bound = max(1, min(self.max_kv_splits, bound))
-        if window is not None:
-            bound = min(bound, triton.cdiv(window + 1, self.decode_split_min_tokens))
-        return bound
-
     def get_num_kv_splits(
         self,
         num_kv_splits: torch.Tensor,
@@ -515,7 +503,7 @@ class TritonAttnBackend(AttentionBackend):
                 seq_lens,
                 num_seq,
                 num_group,
-                self._decode_split_bound(num_token),
+                triton_backend_hip.decode_split_bound(self, num_token),
                 MIN_TOKENS=self.decode_split_min_tokens,
                 MAX_NUM_SEQ=SCHEDULE_SEQ,
             )
@@ -1765,15 +1753,7 @@ class TritonAttnBackend(AttentionBackend):
         applied in the relative-bias split-KV reduction; the output is then in q's
         dtype."""
         if _is_hip:
-            triton_backend_hip.check_full_cg_extend(self, rel_bias, sinks, layer)
-        if gate_sink is not None and not (
-            triton_backend_hip.takes_rel_extend(self, rel_bias, sinks, layer)
-            and self.forward_metadata.max_extend_len
-            <= triton_backend_hip.rel_verify_max_extend()
-        ):
-            raise NotImplementedError(
-                "gate_sink is applied only by the split-KV relative-bias verify kernel"
-            )
+            triton_backend_hip.check_extend(self, rel_bias, sinks, layer, gate_sink)
         score_mod, aux_tensors = triton_backend_hip.rel_bias_score_mod(
             rel_bias, score_mod, aux_tensors
         )
@@ -2658,7 +2638,9 @@ class TritonAttnBackend(AttentionBackend):
             ):
                 window = layer.sliding_window_size
                 num_kv_splits = self.forward_metadata.window_num_kv_splits
-            max_kv_splits = self._decode_split_bound(q.shape[0], window)
+            max_kv_splits = triton_backend_hip.decode_split_bound(
+                self, q.shape[0], window
+            )
             attn_logits = attn_logits[:, :, :max_kv_splits]
             attn_lse = attn_lse[:, :, :max_kv_splits]
         self.decode_attention_fwd(
