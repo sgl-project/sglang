@@ -945,10 +945,7 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
     Consumed by ModelRunner's `is_draft_worker` override (one backend for all
     draft modes).
     """
-    from sglang.srt.speculative.dflash_utils import (
-        is_dflash_mla_draft_config,
-        parse_dflash_draft_config,
-    )
+    from sglang.srt.speculative.dflash_utils import is_dflash_mla_draft_config
 
     cfg = resolving_view(server_args)
 
@@ -966,8 +963,7 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
                 and cfg.speculative_draft_attention_backend is None
             ):
                 return False
-            draft_hf_config = _load_draft_hf_config(cfg)
-            return parse_dflash_draft_config(draft_hf_config=draft_hf_config).is_mla
+            return is_dflash_mla_draft_config(_load_draft_hf_config(cfg))
         return backend in supported_draft_backends
 
     def get_fallback_backend() -> str:
@@ -1072,6 +1068,7 @@ def _resolve_dflash_mla_draft_window(server_args: ServerArgs) -> None:
         is_dflash_mla_draft_config,
         resolve_mla_draft_compact_window,
     )
+
     cfg = resolving_view(server_args)
     window_size = cfg.speculative_draft_window_size
     if window_size is None:
@@ -1134,7 +1131,7 @@ def _resolve_dflash_draft_kv_ring(server_args: ServerArgs) -> None:
 def _reject_dflash_sliding_mla_draft_window(server_args: ServerArgs) -> None:
     from sglang.srt.speculative.dflash_utils import (
         get_dflash_layer_types,
-        parse_dflash_draft_config,
+        is_dflash_mla_draft_config,
     )
 
     cfg = resolving_view(server_args)
@@ -1145,7 +1142,7 @@ def _reject_dflash_sliding_mla_draft_window(server_args: ServerArgs) -> None:
     ):
         return
     draft_hf_config = _load_draft_hf_config(cfg)
-    if not parse_dflash_draft_config(draft_hf_config=draft_hf_config).is_mla:
+    if not is_dflash_mla_draft_config(draft_hf_config):
         return
     layer_types = get_dflash_layer_types(draft_hf_config)
     if layer_types and "sliding_attention" in layer_types:
