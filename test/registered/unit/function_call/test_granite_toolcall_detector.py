@@ -119,6 +119,75 @@ class TestGraniteToolCallDetector(CustomTestCase):
         self.assertEqual(normal, "")
         self.assertEqual(calls[0].name, "get_weather")
 
+    def test_mixed_string_unions_keep_structured_values(self):
+        """A string-or-object/array parameter must return a JSON payload as a
+        native object/array, in both modes, and leave real strings alone."""
+        location = {
+            "type": "object",
+            "properties": {"city": {"type": "string"}},
+            "required": ["city"],
+        }
+        cases = [
+            (
+                {"anyOf": [{"type": "string"}, location]},
+                '{"city":"Paris"}',
+                {"city": "Paris"},
+            ),
+            (
+                {"oneOf": [{"type": "string"}, {"type": "array", "items": location}]},
+                '[{"city":"Paris"}]',
+                [{"city": "Paris"}],
+            ),
+            (
+                {"anyOf": [{"type": "string"}, {"$ref": "#/$defs/Location"}]},
+                '{"city":"Paris"}',
+                {"city": "Paris"},
+            ),
+            (
+                {"anyOf": [{"type": "string"}, {"$ref": "#/$defs/Location"}]},
+                '{"city":123}',
+                '{"city":123}',
+            ),
+            (
+                {"anyOf": [{"type": "string"}, location]},
+                "Paris, France",
+                "Paris, France",
+            ),
+        ]
+        for schema, raw, expected in cases:
+            tools = [
+                Tool(
+                    function=Function(
+                        name="record",
+                        parameters={
+                            "type": "object",
+                            "properties": {"value": schema},
+                            "$defs": {"Location": location},
+                        },
+                    )
+                )
+            ]
+            text = (
+                "<tool_call><function=record><parameter=value>"
+                f"{raw}</parameter></function></tool_call>"
+            )
+            for chunk_size in (0, 1, 7):
+                with self.subTest(schema=schema, raw=raw, chunk_size=chunk_size):
+                    parser = FunctionCallParser(tools, "granite_toolcall_parser")
+                    if chunk_size == 0:
+                        _, calls = parser.parse_non_stream(text)
+                    else:
+                        calls = []
+                        for offset in range(0, len(text), chunk_size):
+                            calls.extend(
+                                parser.parse_stream_chunk(
+                                    text[offset : offset + chunk_size]
+                                )[1]
+                            )
+                        calls.extend(parser.parse_stream_end()[1])
+                    arguments = json.loads("".join(c.parameters for c in calls))
+                    self.assertEqual(arguments, {"value": expected})
+
 
 if __name__ == "__main__":
     import unittest

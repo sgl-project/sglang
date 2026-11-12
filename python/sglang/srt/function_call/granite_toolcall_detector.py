@@ -17,7 +17,7 @@ same standalone, or with ``granite_thinking_parser`` / ``nemotron_3``.
 import json
 import logging
 import re
-from typing import Any, List, Optional
+from typing import Any, List, Optional, Tuple
 
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
@@ -27,6 +27,7 @@ from sglang.srt.function_call.core_types import (
     _GetInfoFunc,
 )
 from sglang.srt.function_call.utils import (
+    convert_string_union_value,
     get_schema_properties,
     infer_type_from_json_schema,
     safe_literal_eval,
@@ -78,10 +79,13 @@ class GraniteToolCallDetector(BaseFormatDetector):
     # ------------------------------------------------------------------
     # Schema helpers
     # ------------------------------------------------------------------
-    def _lookup_param_schema(self, func_name: str, tools: Optional[List[Tool]]) -> dict:
-        """Return the ``{param: schema}`` mapping declared for ``func_name``."""
+    def _lookup_param_schema(
+        self, func_name: str, tools: Optional[List[Tool]]
+    ) -> Tuple[dict, dict]:
+        """Return the ``{param: schema}`` mapping declared for ``func_name`` and
+        the schema enclosing it."""
         if tools is None:
-            return {}
+            return {}, {}
         for tool in tools:
             try:
                 tool_type = tool.type
@@ -94,15 +98,15 @@ class GraniteToolCallDetector(BaseFormatDetector):
                 try:
                     schema = fn.parameters
                 except AttributeError:
-                    return {}
+                    return {}, {}
                 if not isinstance(schema, dict):
-                    return {}
+                    return {}, {}
                 props = get_schema_properties(schema)
                 if props or "properties" in schema:
-                    return props
-                return schema
+                    return props, schema
+                return schema, schema
         logger.warning(f"Tool '{func_name}' is not defined in the tools list.")
-        return {}
+        return {}, {}
 
     @staticmethod
     def _declared_type(schema: Any) -> str:
@@ -111,7 +115,14 @@ class GraniteToolCallDetector(BaseFormatDetector):
             return "string"
         return str(inferred).strip().lower()
 
-    def _coerce(self, raw: str, name: str, schema_map: dict, func_name: str) -> Any:
+    def _coerce(
+        self,
+        raw: str,
+        name: str,
+        schema_map: dict,
+        func_name: str,
+        root_schema: Optional[dict] = None,
+    ) -> Any:
         """Convert the raw text of a parameter using the tool's JSON schema."""
         if raw.lower() == "null":
             return None
@@ -127,7 +138,9 @@ class GraniteToolCallDetector(BaseFormatDetector):
         kind = self._declared_type(schema_map[name])
 
         if kind in _STRING_TYPES:
-            return raw
+            return convert_string_union_value(
+                value=raw, schema=schema_map[name], root_schema=root_schema
+            )
 
         if kind.startswith(_INT_PREFIXES):
             try:
@@ -209,7 +222,9 @@ class GraniteToolCallDetector(BaseFormatDetector):
 
                     split = body.index(">")
                     func_name = body[:split]
-                    schema_map = self._lookup_param_schema(func_name, tools)
+                    schema_map, root_schema = self._lookup_param_schema(
+                        func_name, tools
+                    )
 
                     args = {}
                     for chunk in self._param_block_re.findall(body[split + 1 :]):
@@ -222,6 +237,7 @@ class GraniteToolCallDetector(BaseFormatDetector):
                             pname,
                             schema_map,
                             func_name,
+                            root_schema,
                         )
 
                     calls.append(
@@ -327,8 +343,12 @@ class GraniteToolCallDetector(BaseFormatDetector):
                     )
                     self._args_open = True
 
-                schema_map = self._lookup_param_schema(self._active_func, tools)
-                typed = self._coerce(value, pname, schema_map, self._active_func)
+                schema_map, root_schema = self._lookup_param_schema(
+                    self._active_func, tools
+                )
+                typed = self._coerce(
+                    value, pname, schema_map, self._active_func, root_schema
+                )
                 piece = f"{json.dumps(pname)}: {json.dumps(typed, ensure_ascii=False)}"
                 if self._params_emitted > 0:
                     piece = f", {piece}"
