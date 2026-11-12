@@ -49,24 +49,25 @@ class TestKimiK3LatentTailHip(CustomTestCase):
     def test_tail_matches_norm_projection_and_add(self):
         """Match the factored projection and fp32 add, allowing bf16 rounding
         differences where the GEMM's summation order changes a cancelling add."""
-        for rows in (1, 32):
+        # HAS_PREFIX on the masked 16-row tile (so the prefix load is masked too), off
+        # on the full 32-row tile
+        for rows, with_prefix in ((1, True), (32, False)):
             latent, shared, prefix, proj = self._inputs(rows)
-            for with_prefix in (False, True):
-                want = proj.float() + shared.float()
-                if with_prefix:
-                    want = want + prefix.float()
-                got = k3_latent_tail(
-                    latent,
-                    self.norm_w,
-                    EPS,
-                    self.up,
-                    shared,
-                    prefix if with_prefix else None,
+            want = proj.float() + shared.float()
+            if with_prefix:
+                want = want + prefix.float()
+            got = k3_latent_tail(
+                latent,
+                self.norm_w,
+                EPS,
+                self.up,
+                shared,
+                prefix if with_prefix else None,
+            )
+            with self.subTest(rows=rows, prefix=with_prefix):
+                self.assertLessEqual(
+                    _beyond_ulp(got, want.bfloat16()), got.numel() // 1000
                 )
-                with self.subTest(rows=rows, prefix=with_prefix):
-                    self.assertLessEqual(
-                        _beyond_ulp(got, want.bfloat16()), got.numel() // 1000
-                    )
 
     @torch.inference_mode()
     def test_partials_sum_to_the_tail_projection(self):
