@@ -34,6 +34,7 @@ from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.dbrx import ReplicatedLinear
+from sglang.srt.models.deepseek_v2 import _is_hip
 from sglang.srt.models.deepseek_v4 import (
     DEEPSEEK_V4_STACKED_PARAMS_MAPPING,
     DeepseekV4DecoderLayer,
@@ -672,6 +673,13 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
+        # The SGLang target sets this before its own weight postprocess. The
+        # ATOM target replaces that class, so the draft has to set it itself
+        # before its wkv linears are shuffled for the CK fp8 GEMM.
+        if _is_hip:
+            from sglang.srt.layers.quantization.fp8_utils import set_force_ck_w8a8
+
+            set_force_ck_w8a8(True)
         self.config = config
         self.quant_config = quant_config
         self.num_fused_shared_experts = (
