@@ -28,7 +28,7 @@ Their input tensors therefore do not require a VMM-backed caching allocator.
 """
 
 import logging
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import List, NamedTuple, Optional, Tuple
 
 import torch
@@ -45,6 +45,11 @@ from sglang.kernels.ops.communication.all_reduce import (
     PushPlane,
     custom_all_reduce,
     get_all_reduce_module,
+)
+from sglang.srt.distributed.device_communicators.gated_transfer import (
+    Link,
+    background_transfers_pending,
+    paused_background_transfers,
 )
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
 from sglang.srt.environ import envs
@@ -236,6 +241,7 @@ class CustomAllReduceV2:
         # (nbytes, dtype) -> (module, algo name, multicast) or None, for
         # eager calls under `_eager_plans_config`; rebuilt when config changes.
         self._eager_plans: dict = {}
+        self._pause_warmed = set()
         self._eager_plans_config = None
         # On a multi-node (MNNVL) group the symm-mem workspace plane works
         # across nodes, but graph zero-copy input registration (cudaIpc /
@@ -547,7 +553,19 @@ class CustomAllReduceV2:
             module, algo_name, use_multicast = plan
             if module is None:
                 return self._hier.all_reduce(input)
+            key = (input.dtype, nbytes, algo_name, use_multicast)
+            if self._can_pause(key):
+                # The original FFI entry point allocates internally. Supply an
+                # output before closing the gate, so allocator misses cannot
+                # synchronize the device while a background stream is parked.
+                out = torch.empty_like(input, memory_format=torch.contiguous_format)
+                with paused_background_transfers(Link.NVLINK):
+                    module.all_reduce_into(
+                        self.obj, input, out, algo_name, None, use_multicast
+                    )
+                return out
             out = module.all_reduce(self.obj, input, algo_name, None, use_multicast)
+            self._pause_warmed.add(key)
             return out if isinstance(out, torch.Tensor) else torch.from_dlpack(out)
         if self.override_algo is not None:
             # TODO: enhance this override pattern
@@ -561,12 +579,33 @@ class CustomAllReduceV2:
         if use_hier:
             return self._hier.all_reduce(input)
         graph_params = self._allocate_graph_row(input, nbytes) if use_graph else None
-        return custom_all_reduce(
-            self.obj,
-            input,
-            algo=algo,
-            graph_params=graph_params,
-            use_multicast=use_multicast,
+        key = (input.dtype, nbytes, algo.algo_name, use_multicast)
+        pause = not use_graph and self._can_pause(key)
+        out = (
+            torch.empty_like(input, memory_format=torch.contiguous_format)
+            if pause
+            else None
+        )
+        with paused_background_transfers(Link.NVLINK) if pause else nullcontext():
+            result = custom_all_reduce(
+                self.obj,
+                input,
+                algo=algo,
+                graph_params=graph_params,
+                use_multicast=use_multicast,
+                out=out,
+            )
+        if not use_graph:
+            self._pause_warmed.add(key)
+        return result
+
+    def _can_pause(self, key) -> bool:
+        # First use may trigger lazy module loading. The unpaused path warms
+        # exactly the same algorithm, even if no background transfer exists.
+        return (
+            not _is_hip
+            and key in self._pause_warmed
+            and background_transfers_pending(Link.NVLINK)
         )
 
     def _allocate_graph_row(self, input: torch.Tensor, nbytes: int) -> torch.Tensor:

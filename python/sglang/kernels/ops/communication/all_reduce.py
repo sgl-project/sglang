@@ -237,7 +237,10 @@ def get_all_reduce_module(dtype: torch.dtype, world_size: int) -> Module:
         "custom_all_reduce",
         *args,
         cuda_files=["distributed/custom_all_reduce.cuh"],
-        cuda_wrappers=[("all_reduce", f"AllReduceKernel<{args}>::run")],
+        cuda_wrappers=[
+            ("all_reduce", f"AllReduceKernel<{args}>::run"),
+            ("all_reduce_into", f"AllReduceKernel<{args}>::run_into"),
+        ],
     )
 
 
@@ -249,9 +252,17 @@ def custom_all_reduce(
     *,
     graph_params: torch.Tensor | None = None,
     use_multicast: bool = False,
+    out: torch.Tensor | None = None,
 ) -> torch.Tensor:
     module = get_all_reduce_module(input.dtype, comm.world_size)
-    result = module.all_reduce(comm, input, algo.algo_name, graph_params, use_multicast)
+    if out is None:
+        result = module.all_reduce(
+            comm, input, algo.algo_name, graph_params, use_multicast
+        )
+    else:
+        result = module.all_reduce_into(
+            comm, input, out, algo.algo_name, graph_params, use_multicast
+        )
     # Already a torch.Tensor once tvm-ffi loads torch's DLPack exchange API;
     # re-wrapping it is a pure round trip (~15 us per call on GB300).
     if isinstance(result, torch.Tensor):

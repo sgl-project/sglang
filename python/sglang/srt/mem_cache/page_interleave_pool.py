@@ -36,10 +36,11 @@ scratch slot laid out ``[prefix region | chunk region | trash page]``:
   PyTorch symmetric-memory buffer, and ``MulticastAllGather`` copies each
   rank's block to its place on every rank through the buffer's multicast
   mapping: copy-engine chunks (zero SMs) on the pool's own ``TransferChain``,
-  each behind the NVLink transfer gate, so a foreground
-  ``paused_background_transfers(Link.NVLINK)`` bracket stops the gather at
-  the next chunk boundary. Every rank carves the same offsets, because a
-  multicast copy lands at the same offset in every rank's buffer.
+  optionally behind the NVLink transfer gate. With
+  ``SGLANG_ENABLE_KV_SHARD_GATHER_PAUSE``, forward all-gathers and all-reduces
+  stop the gather at the next chunk boundary for their duration. Every rank
+  carves the same offsets, because a multicast copy lands at the same offset
+  in every rank's buffer.
   Otherwise the prefix is NCCL-allgathered on the side stream, with a
   dedicated ``PyNcclCommunicator``.
 - The chunk region is staged locally on the compute stream where the write
@@ -342,7 +343,9 @@ class PageInterleaveKVPoolMixin:
             for slot_offsets in offsets
         ]
         with torch.cuda.device(device):
-            chain = TransferChain(Link.NVLINK)
+            chain = TransferChain(
+                Link.NVLINK if envs.SGLANG_ENABLE_KV_SHARD_GATHER_PAUSE.get() else None
+            )
         try:
             # Named by the cpu_group, like the other symmetric-memory users.
             self._multicast_gather = MulticastAllGather(

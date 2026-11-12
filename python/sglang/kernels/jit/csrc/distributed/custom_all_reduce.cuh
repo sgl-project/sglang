@@ -37,6 +37,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <optional>
 #include <string>
 
 // Kept out of sgl_kernel/utils.cuh: every JIT build's cache key covers that
@@ -441,7 +442,36 @@ struct AllReduceKernel {
       const std::string algo,
       const tvm::ffi::Optional<TensorView> graph_params_opt,
       const bool use_multicast) {
+    return run_impl(comm_ref, in, algo, graph_params_opt, use_multicast, std::nullopt);
+  }
+
+  // The foreground pause bracket must not cover a caching-allocator miss.
+  static Tensor run_into(
+      const CommunicatorRef comm_ref,
+      const Tensor in,
+      const Tensor out,
+      const std::string algo,
+      const tvm::ffi::Optional<TensorView> graph_params_opt,
+      const bool use_multicast) {
+    return run_impl(comm_ref, in, algo, graph_params_opt, use_multicast, out);
+  }
+
+ private:
+  static Tensor run_impl(
+      const CommunicatorRef comm_ref,
+      const Tensor in,
+      const std::string algo,
+      const tvm::ffi::Optional<TensorView> graph_params_opt,
+      const bool use_multicast,
+      const tvm::ffi::Optional<Tensor> output_opt) {
     using namespace host;
+    if (output_opt.has_value()) {
+      const auto& out = output_opt.value();
+      CHECK_HOST(out.IsContiguous() && is_type<T>(out.dtype()) && out.device() == in.device());
+      CHECK_HOST(out.numel() == in.numel() && reinterpret_cast<intptr_t>(out.data_ptr()) % 16 == 0)
+          << "output size or alignment mismatch";
+      CHECK_HOST(!graph_params_opt.has_value()) << "preallocated output is supported in eager mode only";
+    }
     const auto& comm = *comm_ref.get();
     CHECK_HOST(algo == "1shot_pull" || algo == "2shot_pull" || algo == "1shot_push" || algo == "2shot_push") << algo;
     CHECK_HOST(comm.get_world_size() == kWorldSize) << comm.get_world_size();
@@ -460,7 +490,7 @@ struct AllReduceKernel {
       const auto& push = comm.get_push_obj();
       const auto two_shot = algo == "2shot_push";
       const auto chunk_vecs = div_ceil(num_vecs, kWorldSize);
-      Tensor out = ffi::empty_like(in);
+      Tensor out = output_opt.has_value() ? output_opt.value() : ffi::empty_like(in);
       const auto params = PushParams{
           .input = in.data_ptr(),
           .output = out.data_ptr(),
@@ -493,7 +523,7 @@ struct AllReduceKernel {
     const auto graph_params = use_graph ? graph_params_opt.value().data_ptr() : nullptr;
     // only 2shot pull + graph mode forces inplace implementation
     const auto is_inplace = use_graph && algo == "2shot_pull";
-    Tensor out = is_inplace ? in : ffi::empty_like(in);
+    Tensor out = is_inplace ? in : (output_opt.has_value() ? output_opt.value() : ffi::empty_like(in));
     const auto params = PullParams{
         .output = out.data_ptr(),
         .num_vecs = num_vecs,

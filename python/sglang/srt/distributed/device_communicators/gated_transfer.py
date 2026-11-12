@@ -763,6 +763,28 @@ def paused_background_transfers(links: Link) -> Union[_PausedTransfers, nullcont
     return _PausedTransfers(links)
 
 
+def background_transfers_pending(links: Link) -> bool:
+    """Whether an eager bracket would pause a busy gate on this device.
+
+    Callers can prepare an output before pausing while preserving their usual
+    allocation path when no transfer is pending. This is a hint, not a lease:
+    a transfer may finish or another thread may pause it before the bracket.
+    """
+    if torch.compiler.is_compiling() or not _gates:
+        return False
+    device = None
+    for gate in _gates:
+        if not gate.link & links or gate._pause_thread is not None or not gate.busy():
+            continue
+        if device is None:
+            if torch.cuda.is_current_stream_capturing():
+                return False
+            device = torch.cuda.current_device()
+        if gate.device == device:
+            return True
+    return False
+
+
 # ---- copy chunks ----------------------------------------------------------------
 
 

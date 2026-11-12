@@ -20,6 +20,8 @@ import itertools
 import logging
 import multiprocessing
 import os
+import threading
+import time
 from multiprocessing.context import SpawnProcess
 from typing import List
 
@@ -31,6 +33,7 @@ import sglang.srt.distributed.parallel_state as ps
 from sglang.kernels.jit.utils import cache_once, get_ci_test_range
 from sglang.kernels.ops.communication.all_reduce import (
     AllReduceAlgo,
+    custom_all_reduce,
     get_all_reduce_module,
 )
 from sglang.srt.distributed.comm_cleanup import register_comm_cleanup
@@ -194,6 +197,127 @@ def test_custom_all_reduce(
     use_graph: bool,
 ) -> None:
     _check_custom_all_reduce(size, dtype, algo, use_graph, _init_comm_once())
+
+
+@pytest.mark.parametrize("algo", TEST_ALGOS)
+@pytest.mark.parametrize("dtype", TEST_DTYPES)
+@torch.inference_mode()
+def test_custom_all_reduce_preallocated_output(dtype: torch.dtype, algo: AllReduceAlgo):
+    """Foreground pause callers can provide storage before entering the kernel."""
+    nccl_group = _init_nccl_group_once()
+    comm = _init_comm_once()
+    device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
+    inp = torch.randint(0, 16, (1024,), dtype=dtype, device=device)
+    expected = inp.clone()
+    dist.all_reduce(expected, group=nccl_group)
+    output = torch.empty_like(inp)
+    result = custom_all_reduce(comm.obj, inp, algo, out=output)
+    assert result.data_ptr() == output.data_ptr()
+    torch.testing.assert_close(result, expected, atol=0, rtol=0)
+
+    # Invalid output storage is rejected before any rank enters communication.
+    with pytest.raises(Exception, match="output size"):
+        custom_all_reduce(comm.obj, inp, algo, out=output[:512])
+
+
+@cache_once
+def _init_pause_chain_once():
+    from sglang.srt.distributed.device_communicators.gated_transfer import (
+        Link,
+        TransferChain,
+    )
+
+    return TransferChain(Link.NVLINK)
+
+
+@pytest.mark.parametrize("algo", [None, *TEST_ALGOS])
+@pytest.mark.skipif(
+    torch.version.cuda is None, reason="NVLink transfer gate requires CUDA"
+)
+@torch.inference_mode()
+def test_custom_all_reduce_pauses_pending_transfer(algo):
+    """A warmed custom collective completes while its background chain is blocked."""
+    comm = _init_comm_once()
+    comm.override_algo = algo
+    _check_all_reduce_pauses_pending_transfer(comm)
+
+
+@pytest.mark.skipif(
+    torch.version.cuda is None, reason="NVLink transfer gate requires CUDA"
+)
+@torch.inference_mode()
+def test_legacy_custom_all_reduce_pauses_pending_transfer():
+    from sglang.srt.distributed.device_communicators.custom_all_reduce import (
+        CustomAllreduce,
+    )
+
+    group = _init_cpu_group_once()
+    device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
+    comm = CustomAllreduce(group, device)
+    if comm.disabled:
+        pytest.skip("legacy custom all-reduce unavailable")
+    register_comm_cleanup(comm)
+    _check_all_reduce_pauses_pending_transfer(comm)
+
+
+def _check_all_reduce_pauses_pending_transfer(comm):
+    from cuda.bindings import driver as cu
+
+    from sglang.srt.utils.cuda_vmm_utils import check_drv
+
+    nccl_group = _init_nccl_group_once()
+    inp = torch.full(
+        (1024,), dist.get_rank() + 1, dtype=torch.bfloat16, device=comm.device
+    )
+    expected = inp.clone()
+    dist.all_reduce(expected, group=nccl_group)
+    stream = torch.cuda.current_stream()
+    comm.custom_all_reduce(inp)  # First use may load a kernel: it must not pause.
+    done = torch.cuda.Event()
+    done.record(stream)
+    torch.cuda.synchronize()
+    chain = _init_pause_chain_once()
+    blocker = torch.zeros(1, dtype=torch.int32, pin_memory=True)
+
+    def block(transfer_stream):
+        check_drv(
+            cu.cuStreamWaitValue32(
+                transfer_stream.cuda_stream, blocker.data_ptr(), 1, 1
+            ),
+            "custom all-reduce test blocker",
+        )
+
+    # Release even if an accidental device synchronization blocks the call's
+    # host thread; the test then fails instead of stranding the GPU worker.
+    timeout = threading.Event()
+
+    def release_on_timeout():
+        timeout.set()
+        blocker[0] = 1
+
+    timer = threading.Timer(10, release_on_timeout)
+    timer.start()
+    ticket = chain.run([block])
+    pauses, forced = chain._gate._seq, chain._gate.forced_opens
+    try:
+        result = comm.custom_all_reduce(inp)
+        done.record(stream)
+        deadline = time.monotonic() + 5
+        while not done.query() and time.monotonic() < deadline:
+            time.sleep(0.001)
+        assert done.query(), "foreground all-reduce waited on the background transfer"
+        assert not timeout.is_set(), "collective synchronized with a parked transfer"
+        assert not chain.query(ticket)
+        assert chain._gate._seq == pauses + 1
+        assert chain._gate.word() == 0
+        assert chain._gate.forced_opens == forced
+    finally:
+        blocker[0] = 1
+        timer.cancel()
+        timer.join()
+        chain.wait(ticket)
+        torch.cuda.synchronize()
+    torch.testing.assert_close(result, expected, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize("use_graph", USE_GRAPH_OPTIONS)

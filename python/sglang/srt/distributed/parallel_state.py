@@ -46,6 +46,10 @@ from torch.distributed import Backend, ProcessGroup
 
 from sglang.srt import platforms
 from sglang.srt.compilation.compilation_config import register_split_op
+from sglang.srt.distributed.device_communicators.gated_transfer import (
+    Link,
+    paused_background_transfers,
+)
 from sglang.srt.distributed.utils import (
     all_gather_single,
     reduce_scatter_single,
@@ -782,7 +786,8 @@ class GroupCoordinator:
         ):
             self.debug_check_symmetric_mempool(self, {"input": input_}, "all_reduce")
             with pynccl_comm.change_state(enable=True):
-                pynccl_comm.all_reduce(input_)
+                with paused_background_transfers(Link.NVLINK):
+                    pynccl_comm.all_reduce(input_)
                 return input_
 
         if self._can_use_flashinfer_allreduce(input_):
@@ -1075,15 +1080,22 @@ class GroupCoordinator:
             out = qr_comm.quick_all_reduce(input_)
         elif outplace_all_reduce_method == "torch_symm_mem":
             assert not torch_symm_mem_comm.disabled
-            out = torch_symm_mem_comm.all_reduce(input_)
+            out = torch.empty_like(input_)
+            with paused_background_transfers(Link.NVLINK):
+                out = torch_symm_mem_comm.all_reduce(input_, out=out)
         elif outplace_all_reduce_method == "pymscclpp":
             assert not pymscclpp_comm.disabled
-            out = pymscclpp_comm.all_reduce(input_)
+            with paused_background_transfers(Link.NVLINK):
+                out = pymscclpp_comm.all_reduce(input_)
         elif outplace_all_reduce_method == "pcie_ipc":
             return self.pcie_ipc_comm.pcie_ipc_all_reduce(input_)
         elif outplace_all_reduce_method == "pynccl":
+            # Allocate before closing the gate: an allocator cache miss can
+            # synchronize the device and wait on the paused background copy.
+            out = torch.empty_like(input_)
             with pynccl_comm.change_state(enable=True):
-                out = pynccl_comm.outplace_all_reduce(input_)
+                with paused_background_transfers(Link.NVLINK):
+                    out = pynccl_comm.outplace_all_reduce(input_, out)
         assert out is not None
         return out
 
@@ -1091,15 +1103,18 @@ class GroupCoordinator:
         pynccl_comm = self.get_available_pynccl_comm()
         torch_symm_mem_comm = self.torch_symm_mem_comm
         if pynccl_comm is not None and not pynccl_comm.disabled:
-            pynccl_comm.all_reduce(input_)
+            with paused_background_transfers(Link.NVLINK):
+                pynccl_comm.all_reduce(input_)
         elif (
             torch_symm_mem_comm is not None
             and not torch_symm_mem_comm.disabled
             and torch_symm_mem_comm.should_torch_symm_mem_allreduce(input_)
         ):
-            torch_symm_mem_comm.all_reduce(input_, out=input_)
+            with paused_background_transfers(Link.NVLINK):
+                torch_symm_mem_comm.all_reduce(input_, out=input_)
         else:
-            torch.distributed.all_reduce(input_, group=self.device_group)
+            with paused_background_transfers(Link.NVLINK):
+                torch.distributed.all_reduce(input_, group=self.device_group)
 
     def reduce_scatter_along_dim(
         self, input_: torch.Tensor, dim: int = -1
@@ -1351,7 +1366,8 @@ class GroupCoordinator:
         if pymscclpp_comm is not None and pymscclpp_comm.should_mscclpp_allgather(
             output, input
         ):
-            pymscclpp_comm.all_gather(output, input)
+            with paused_background_transfers(Link.NVLINK):
+                pymscclpp_comm.all_gather(output, input)
             return
 
         pynccl_comm = self.get_available_pynccl_comm()
@@ -1362,9 +1378,11 @@ class GroupCoordinator:
                 self, {"output": output}, "all_gather_into_tensor"
             )
             with pynccl_comm.change_state(enable=True):
-                pynccl_comm.all_gather(output, input)
+                with paused_background_transfers(Link.NVLINK):
+                    pynccl_comm.all_gather(output, input)
         else:
-            all_gather_single(output, input, group=self.device_group)
+            with paused_background_transfers(Link.NVLINK):
+                all_gather_single(output, input, group=self.device_group)
 
     def _has_aiter_custom_all_gather(self) -> bool:
         if self._deterministic_collectives_enabled():
@@ -1416,9 +1434,10 @@ class GroupCoordinator:
 
         if output_tensor_list is not None:
             # TODO(ch-wan): support other backends
-            return torch.distributed.all_gather(
-                output_tensor_list, input_, group=self.device_group
-            )
+            with paused_background_transfers(Link.NVLINK):
+                return torch.distributed.all_gather(
+                    output_tensor_list, input_, group=self.device_group
+                )
 
         assert -input_.dim() <= dim < input_.dim(), (
             f"Invalid dim ({dim}) for input tensor with shape {input_.size()}"
@@ -1523,10 +1542,15 @@ class GroupCoordinator:
                 output_list.append(output_tensor)
                 size_list.append(s)
 
-            pynccl_comm.group_start()
-            for i, inp in enumerate(input_):
-                pynccl_comm.all_gather(output_list[i], inp, sizes=size_list[i])
-            pynccl_comm.group_end()
+            # NCCL enqueues grouped collectives at group_end, so keep the
+            # gate closed until the entire group has been submitted.
+            with paused_background_transfers(Link.NVLINK):
+                pynccl_comm.group_start()
+                try:
+                    for i, inp in enumerate(input_):
+                        pynccl_comm.all_gather(output_list[i], inp, sizes=size_list[i])
+                finally:
+                    pynccl_comm.group_end()
 
             return output_list
 

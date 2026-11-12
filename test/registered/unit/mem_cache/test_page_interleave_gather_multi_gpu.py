@@ -59,6 +59,7 @@ from sglang.srt.distributed import (
     init_distributed_environment,
     initialize_model_parallel,
 )
+from sglang.srt.distributed.device_communicators.gated_transfer import Link
 from sglang.srt.distributed.device_communicators.multicast_all_gather import (
     _multicast_address,
     has_multicast_support,
@@ -764,6 +765,9 @@ def _run_multicast_mla(rank, world, port):
     pool, req_to_token, prefix_len, seq_len = _run_mla(
         rank, world, port, multicast=True
     )
+    assert pool._multicast_gather.chain.link == (
+        Link.NVLINK if envs.SGLANG_ENABLE_KV_SHARD_GATHER_PAUSE.get() else None
+    )
     activity = _gather_gpu_activity(pool, req_to_token, prefix_len, seq_len)
     nccl_kernels = sorted({name for name in activity if "nccl" in name.lower()})
     assert not nccl_kernels, f"gather ran NCCL kernels: {nccl_kernels}"
@@ -883,7 +887,12 @@ class TestPageInterleaveMulticastGather(CustomTestCase):
             )
 
     def test_gather_issues_no_nccl_kernels(self):
-        self._spawn(_run_multicast_mla, 29817)
+        for pause in (False, True):
+            with (
+                self.subTest(pause=pause),
+                envs.SGLANG_ENABLE_KV_SHARD_GATHER_PAUSE.override(pause),
+            ):
+                self._spawn(_run_multicast_mla, 29817)
 
     def test_cross_node_group_keeps_nccl_gather(self):
         self._spawn(_run_cross_node_mla, 29818)
