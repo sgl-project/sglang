@@ -56,7 +56,7 @@ already set — the table then serves as a checklist of what the script set and 
 | --- | --- | --- |
 | [`SGLANG_NPU_USE_MLAPO=1`](#deepseek-specific-npu-optimizations) | DeepSeek-style MLA | Fuses MLA pre-processing into one kernel; unsupported layouts fall back to the unfused path |
 | [`SGLANG_USE_FIA_NZ=1`](#deepseek-specific-npu-optimizations) | DeepSeek-style MLA | Stores the KV cache in the FIA NZ layout for more efficient access; independent of MLAPO |
-| [`SGLANG_NPU_USE_MULTI_STREAM=1`](#deepseek-specific-npu-optimizations) | DeepSeek-style MoE (set by the DeepSeek R1, GLM-5.1/5.2, and Kimi K2.6 best practices) | Runs shared and routed experts concurrently on separate NPU streams |
+| [`SGLANG_NPU_USE_MULTI_STREAM=1`](#deepseek-specific-npu-optimizations) | MoE models with shared experts — the DeepSeek, GLM, Qwen-MoE, and LongCat code paths all read it (set by the DeepSeek R1, DeepSeek V4-Flash, GLM-5.1/5.2, and Kimi K2.6 best practices) | Runs shared and routed experts concurrently on separate NPU streams |
 | [`SGLANG_USE_AG_AFTER_QLORA=1`](#deepseek-specific-npu-optimizations) + `--enable-attn-tp-input-scattered` | Model with `q_lora_rank`; practically prefill-only | Delays the attention all-gather until after the low-rank Q projection, so fewer bytes are gathered |
 | [`SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`](#speculative-decoding) | Speculative decoding on, no LoRA | Overlaps speculative batch preparation with other work instead of serializing it |
 | [`--enable-dp-lm-head`](#parallelism) | Attention DP on | Shards the LM head vocabulary instead of all-gathering logits across DP ranks |
@@ -785,8 +785,8 @@ architectures.
     <tr>
       <td>`SGLANG_NPU_USE_MULTI_STREAM=1`</td>
       <td>Runs shared experts and routed experts concurrently on separate NPU streams, overlapping shared-expert compute
-      with expert dispatch.</td>
-      <td>on (DeepSeek R1, GLM-5.1/5.2, Kimi K2.6)</td>
+      with expert dispatch. The switch is not DeepSeek-only: the GLM, Qwen-MoE, and LongCat code paths read it too.</td>
+      <td>on (DeepSeek R1, DeepSeek V4-Flash, GLM-5.1/5.2, Kimi K2.6)</td>
     </tr>
     <tr>
       <td>`SGLANG_USE_AG_AFTER_QLORA=1`</td>
