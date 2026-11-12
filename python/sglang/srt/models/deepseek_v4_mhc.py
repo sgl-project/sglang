@@ -774,7 +774,11 @@ def mega_closed_seam(hc: HcSubLayer, state: HcState, extend: bool) -> HcState:
         norm_eps=hc.norm.variance_epsilon,
         out_dtype="bf16",
     )
-    stats = (next_pre, post_mix.squeeze(-1), comb)
+    if post_mix.ndim == 3:
+        post_mix = post_mix.squeeze(-1)
+    if next_pre.ndim == 3:
+        next_pre = next_pre.squeeze(-1)
+    stats = (next_pre, post_mix, comb)
     opened = HcState(residual, state.pre, HcNormed(normalized), stats)
     state.release()
     return opened
