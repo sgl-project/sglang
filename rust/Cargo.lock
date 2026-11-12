@@ -3991,6 +3991,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "sglang-engine"
+version = "0.1.0"
+dependencies = [
+ "thiserror 2.0.19",
+]
+
+[[package]]
 name = "sglang-grpc"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,10 @@
+[package]
+name = "sglang-engine"
+description = "Rust offline Engine API and runtime lifecycle"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+thiserror = { workspace = true }
