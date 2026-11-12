@@ -92,7 +92,9 @@ class TestOpenAIBackend(CustomTestCase):
         )
         s = SimpleNamespace(text_="p")
 
-        decision = backend.select(s, choices=["ab", "ac"], temperature=0.0, choices_method=None)
+        decision = backend.select(
+            s, choices=["ab", "ac"], temperature=0.0, choices_method=None
+        )
         self.assertEqual(decision.decision, "ac")
         self.assertEqual(backend.token_usage.prompt_tokens, 5 + 10 + 11)
         self.assertEqual(backend.token_usage.completion_tokens, 3 + 1 + 1)
