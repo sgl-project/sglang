@@ -19,7 +19,7 @@ from sglang.srt.model_executor.runner_utils.forward_batch import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=3, suite="base-a-test-cpu")
+register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 
 
 @contextmanager
@@ -28,7 +28,6 @@ def recording_capture():
     graph = bcg.BreakableCUDAGraph()
     capture = SimpleNamespace(
         cuda_graph=graph,
-        _barrier_fn=None,
         _end_current_segment=lambda: events.append("end"),
         _begin_new_segment=lambda: events.append("begin"),
     )
@@ -42,15 +41,17 @@ def recording_capture():
 def test_method_replay_reads_current_batch_and_preserves_output_address(monkeypatch):
     class Layer:
         @bcg.eager_on_graph
-        def _eager_scale(self, x):
-            return x * get_forward_batch().scale
+        def _eager_scale(self, x, out):
+            out.copy_(x * get_forward_batch().scale)
 
     layer = Layer()
     x = torch.tensor([2.0])
+    output = torch.zeros(1)
     with set_forward_batch(SimpleNamespace(scale=3)):
         with recording_capture() as (graph, events):
-            output = layer._eager_scale(x)
+            assert layer._eager_scale(x, output) is None
     assert events == ["end", "begin"]
+    assert output.item() == 0
     pointer = output.data_ptr()
     # Exercise the public, argument-free replay API between two segments.
     graph._segments = [
@@ -69,22 +70,22 @@ def test_method_replay_reads_current_batch_and_preserves_output_address(monkeypa
         graph.replay()
 
 
-def test_method_capture_stub_and_real_replay():
+def test_method_on_capture_and_real_replay():
     calls = []
 
     class Layer:
-        def _capture_stub(self, x):
+        def _on_capture(self, x, out):
             calls.append("stub")
-            return torch.zeros_like(x)
 
-        @bcg.eager_on_graph(capture_stub=_capture_stub)
-        def _eager_scale(self, x):
+        @bcg.eager_on_graph(on_capture=_on_capture)
+        def _eager_scale(self, x, out):
             calls.append("real")
-            return x * get_forward_batch().scale
+            out.copy_(x * get_forward_batch().scale)
 
     layer = Layer()
+    output = torch.zeros(2)
     with recording_capture() as (graph, _):
-        output = layer._eager_scale(torch.ones(2))
+        layer._eager_scale(torch.ones(2), output)
     assert calls == ["stub"]
     with set_forward_batch(SimpleNamespace(scale=7)):
         graph._break_fns[0]()
@@ -94,16 +95,31 @@ def test_method_capture_stub_and_real_replay():
 
 def test_plain_callable_and_eager_passthrough():
     @bcg.eager_on_graph
-    def increment(x):
-        return x + 1
+    def increment(x, out):
+        out.copy_(x + 1)
 
-    assert increment(torch.tensor(2)).item() == 3
+    output = torch.tensor(0)
+    increment(torch.tensor(2), output)
+    assert output.item() == 3
     x = torch.tensor(3)
     with recording_capture() as (graph, _):
-        output = increment(x)
+        increment(x, output)
     x.fill_(9)
     graph._break_fns[0]()
     assert output.item() == 10
+
+
+def test_a_break_returning_a_value_fails():
+    @bcg.eager_on_graph
+    def increment(x):
+        return x + 1
+
+    with pytest.raises(AssertionError, match="must return None"):
+        increment(torch.tensor(2))
+    with recording_capture() as (graph, _):
+        increment(torch.tensor(2))
+    with pytest.raises(AssertionError, match="must return None"):
+        graph._break_fns[0]()
 
 
 def test_replay_does_not_retain_capture_or_serving_batches():
@@ -111,14 +127,14 @@ def test_replay_does_not_retain_capture_or_serving_batches():
         scale = 3
 
     @bcg.eager_on_graph
-    def scale(x):
-        return x * get_forward_batch().scale
+    def scale(x, out):
+        out.copy_(x * get_forward_batch().scale)
 
     batch = Batch()
     capture_ref = weakref.ref(batch)
     with set_forward_batch(batch):
         with recording_capture() as (graph, _):
-            scale(torch.ones(2))
+            scale(torch.ones(2), torch.zeros(2))
     del batch
     gc.collect()
     assert capture_ref() is None
@@ -136,9 +152,13 @@ def test_replay_does_not_retain_capture_or_serving_batches():
     "decorator", [bcg.eager_on_graph(True), bcg.eager_on_graph(enable=True)]
 )
 def test_legacy_decorator_replays(decorator):
-    increment = decorator(lambda x: x + 1)
+    @decorator
+    def increment(x, out):
+        out.copy_(x + 1)
+
+    output = torch.tensor(0)
     with recording_capture() as (graph, _):
-        output = increment(torch.tensor(2))
+        increment(torch.tensor(2), output)
     graph._break_fns[0]()
     assert output.item() == 3
 
@@ -176,26 +196,27 @@ def test_run_eager_binds_instance_and_keeps_one_outer_break():
             self.scale = scale
 
         def stub(self, x, *, offset=0):
-            raise AssertionError("run_eager must bypass the capture stub")
+            raise AssertionError("run_eager must bypass on_capture")
 
-        @bcg.eager_on_graph(capture_stub=stub)
+        @bcg.eager_on_graph(on_capture=stub)
         def inner(self, x, *, offset=0):
             calls.append(self.scale)
             return x * self.scale + offset
 
         @bcg.eager_on_graph
-        def outer(self, x):
-            return self.inner.run_eager(x, offset=1)
+        def outer(self, x, out):
+            out.copy_(self.inner.run_eager(x, offset=1))
 
     first, second = Layer(2), Layer(5)
+    output = torch.zeros(1)
     with recording_capture() as (graph, events):
-        output = first.outer(torch.ones(1))
+        first.outer(torch.ones(1), output)
     assert events == ["end", "begin"]
     assert len(graph._break_fns) == 1
-    assert output.item() == 3
+    assert calls == [] and output.item() == 0
     assert second.inner.run_eager(torch.ones(1), offset=1).item() == 6
     graph._break_fns[0]()
-    assert calls == [2, 5, 2]
+    assert calls == [5, 2]
     assert output.item() == 3
 
 

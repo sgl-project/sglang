@@ -30,16 +30,13 @@ from sglang.srt.managers.mm_utils import (
     pad_mm_token_pairs,
     pad_mm_tokens,
 )
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalInputs,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.models.ernie45_vl import Ernie4_5_VLMoeForConditionalGeneration
+from sglang.srt.multimodal.modality import Modality
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 def _bundled_item(grid_key=None, grid=None, feature_len=10, num_images=2):

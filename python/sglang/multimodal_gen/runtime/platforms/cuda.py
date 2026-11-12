@@ -429,7 +429,8 @@ class _VMOBAAttentionBackendResolver(_CudaAttentionBackendResolver):
     @classmethod
     def resolve(cls, platform) -> str:
         try:
-            from kernel.attn.vmoba_attn.vmoba import moba_attn_varlen  # noqa: F401
+            # the in-tree VMoBA runs on FlashAttention 2's varlen kernels
+            import flash_attn.flash_attn_interface  # noqa: F401
 
             from sglang.multimodal_gen.runtime.layers.attention.backends.vmoba import (  # noqa: F401
                 VMOBAAttentionBackend,
@@ -438,7 +439,9 @@ class _VMOBAAttentionBackendResolver(_CudaAttentionBackendResolver):
             return "sglang.multimodal_gen.runtime.layers.attention.backends.vmoba.VMOBAAttentionBackend"
         except ImportError as e:
             logger.error("Failed to import Video MoBA Attention backend: %s", str(e))
-            raise ImportError("Video MoBA Attention backend is not installed. ") from e
+            raise ImportError(
+                "Video MoBA Attention backend requires flash-attn >= 2.7.1."
+            ) from e
 
 
 class _SubBlockSparseAttentionBackendResolver(_CudaAttentionBackendResolver):
@@ -521,11 +524,8 @@ class _FlashAttentionBackendResolver(_CudaAttentionBackendResolver):
 
     @classmethod
     def resolve(cls, platform) -> AttentionBackendEnum:
-        if platform.is_sm120():
-            logger.info(
-                "FlashAttention is not supported on SM12.x in this build; falling back to Torch SDPA."
-            )
-            return AttentionBackendEnum.TORCH_SDPA
+        # Explicit FA requests use the native FA4 preparation on Blackwell.
+        # The SM12.x default remains SDPA in _resolve_default_attn_backend.
         return AttentionBackendEnum.FA
 
 

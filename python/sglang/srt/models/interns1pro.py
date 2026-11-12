@@ -9,6 +9,7 @@ from sglang.srt.distributed.utils import get_group_rank_size
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.lora.layers import unwrap_lora_layer
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
@@ -17,7 +18,6 @@ from sglang.srt.models.qwen3_vl_moe import (
     Qwen3MoeLLMModel,
     Qwen3VLMoeForConditionalGeneration,
 )
-from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
 
