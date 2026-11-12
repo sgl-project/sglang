@@ -329,7 +329,7 @@ jobs:
 
   nightly-acc-4-npu-a5:
     name: nightly-acc-4-npu-a5
-    if: false # TEMP: only the perf in8k case reruns
+    if: false # TEMP: only the perf in8k case reruns (retry after npu-smi -9005)
 
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
