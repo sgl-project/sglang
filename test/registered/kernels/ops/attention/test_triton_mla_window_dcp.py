@@ -12,10 +12,8 @@ from sglang.kernels.ops.attention.dcp_kernels import dcp_lse_combine_triton
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.layers.attention.triton_draft_hip import MlaDcpWindowVerify
+from sglang.srt.layers.dcp.layout import is_mla_dcp_lse_base_on_e
 from sglang.srt.model_executor.forward_mode import ForwardMode
-from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mla import (
-    is_mla_dcp_lse_base_on_e,
-)
 from sglang.srt.speculative.dflash_draft_ring import (
     DFlashDraftKVRing,
     draft_kv_ring_pool_rows,

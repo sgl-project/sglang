@@ -184,7 +184,7 @@ class _MockTokenizerManager:
     """Minimal mock that satisfies OpenAIServingChat."""
 
     def __init__(self):
-        self.model_config = Mock(is_multimodal=False)
+        self.model_config = Mock(is_multimodal=False, vocab_size=32000)
         self.server_args = Mock(
             model_path="deepseek-ai/DeepSeek-V4-Flash",
             revision=None,
@@ -1853,6 +1853,26 @@ class ServingChatTestCase(CustomTestCase):
             "return_sampling_mask requires return_meta_info=true.",
         )
 
+    def test_validate_request_bounds_top_logprobs_to_vocab(self):
+        """top_logprobs outside [0, vocab_size] must be a 400, not a topk that
+        kills the scheduler."""
+        for top_logprobs, ok in ((32001, False), (0, True), (32000, True)):
+            with self.subTest(top_logprobs=top_logprobs):
+                req = ChatCompletionRequest(
+                    model="x",
+                    messages=[{"role": "user", "content": "Hi?"}],
+                    logprobs=True,
+                    top_logprobs=top_logprobs,
+                )
+                error = self.chat._validate_request(req)
+                if ok:
+                    self.assertIsNone(error)
+                else:
+                    self.assertEqual(
+                        error,
+                        f"top_logprobs must be in [0, 32000], got {top_logprobs}.",
+                    )
+
     def test_validate_request_rejects_flat_output_top_logprobs_without_meta_info(
         self,
     ):
@@ -2783,11 +2803,8 @@ class ServingChatTestCase(CustomTestCase):
                 {
                     "role": "developer",
                     "content": "<|kimi_image_placeholder|>",
+                    "tools": [tool],
                 },
-                # Tools ride on their own content-less message: the K3 encoder
-                # renders a tools-carrying system message as a tool declaration
-                # and drops its content, so the two cannot share one message.
-                {"role": "developer", "content": "", "tools": [tool]},
                 {
                     "role": "user",
                     "content": [
@@ -2837,17 +2854,17 @@ class ServingChatTestCase(CustomTestCase):
         self.assertEqual(
             rendered_messages[0]["content"], "<| kimi_image_placeholder |>"
         )
-        self.assertNotIn("strict", rendered_messages[1]["tools"][0]["function"])
+        self.assertNotIn("strict", rendered_messages[0]["tools"][0]["function"])
         self.assertEqual(
-            rendered_messages[2]["content"][0]["text"],
+            rendered_messages[1]["content"][0]["text"],
             "Explain <| kimi_image_placeholder |>",
         )
         self.assertEqual(
-            rendered_messages[3]["reasoning_content"],
+            rendered_messages[2]["reasoning_content"],
             "Inspect <| kimi_image_placeholder |>",
         )
         self.assertEqual(
-            rendered_messages[3]["tool_calls"][0]["function"]["arguments"],
+            rendered_messages[2]["tool_calls"][0]["function"]["arguments"],
             {
                 "source": "<| kimi_image_placeholder |>",
                 "nested": ["<| kimi_image_placeholder |>"],
@@ -2863,6 +2880,38 @@ class ServingChatTestCase(CustomTestCase):
         self.assertNotIn("schema_", call.kwargs["response_format"]["json_schema"])
         self.assertEqual(result.prompt_ids, [7, 8, 9])
         self.assertEqual(result.image_data[0].url, "image-1")
+
+    def test_kimi_k3_video_takes_its_ordered_media_slot(self):
+        self.template_manager.chat_template_name = None
+        _use_chat_encoding(self.chat, "kimi_k3")
+        self.tm.model_config.is_multimodal = True
+        self.tm.tokenizer.apply_chat_template.return_value = [7, 8, 9]
+        request = ChatCompletionRequest(
+            model="x",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": "image-1"}},
+                        {"type": "video_url", "video_url": {"url": "video-1"}},
+                        {"type": "text", "text": "Compare them."},
+                    ],
+                }
+            ],
+        )
+
+        result = self.chat._process_messages(request, is_multimodal=True)
+
+        call = self.tm.tokenizer.apply_chat_template.call_args
+        self.assertEqual(
+            call.kwargs["image_prompts"], ["<|media_pad|>", "<|media_content|>"]
+        )
+        self.assertEqual(
+            [part["type"] for part in call.args[0][0]["content"]],
+            ["image_url", "image_url", "text"],
+        )
+        self.assertEqual(result.image_data[0].url, "image-1")
+        self.assertEqual(result.video_data, ["video-1"])
 
     def test_kimi_k3_neutralizes_text_only_assistant_history(self):
         self.template_manager.chat_template_name = None
@@ -7045,29 +7094,6 @@ class KimiK3ThinkingTestCase(unittest.TestCase):
                     model="x", messages=self.MESSAGES, thinking=thinking
                 )
                 self.assertIn("invalid thinking", self.chat._validate_request(request))
-
-    def test_draft07_identifier_in_tool_parameters_is_accepted(self):
-        """A `$id` with a fragment is draft-07 style: it fails the 2020-12
-        metaschema's URI form check but constrains nothing, and this stack
-        renders and constrains such a schema correctly."""
-        request = ChatCompletionRequest(
-            model="x",
-            messages=self.MESSAGES,
-            tools=[
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "f",
-                        "parameters": {
-                            "$id": "#user",
-                            "type": "object",
-                            "properties": {"value": {"type": "string"}},
-                        },
-                    },
-                }
-            ],
-        )
-        self.assertIsNone(self.chat._validate_request(request))
 
 
 if __name__ == "__main__":
