@@ -1750,6 +1750,16 @@ class UnifiedRadixCache(BasePrefixCache):
                     req, leaf=result.last_device_node
                 )
 
+        # After the last prefill chunk, decode retires the request's own window, so
+        # the rest of the forward must enter the tree now to keep a window at its end.
+        if (
+            not is_finished
+            and result.swa_branch_inserted
+            and effective_cache_len < len(token_ids)
+            and up_to >= len(req.origin_input_ids)
+        ):
+            self.checkpoint_into_tree(req, up_to=up_to, **kwargs)
+
     @rank_consensus(same_params=["req.rid"])
     def advance_unpublished_req(self, req: Req) -> None:
         assert not self.supports_mamba()
