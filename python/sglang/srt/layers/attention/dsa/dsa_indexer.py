@@ -14,6 +14,11 @@ from sglang.kernels.ops.attention.dsa.fp8_fused_writer_hip import (
     fused_fp8_writer_geometry_supported,
     prepare_aiter_rope_caches,
 )
+from sglang.kernels.ops.attention.dsa.litetopk_prefill import (
+    fp8_indexer_topk,
+    is_fp8_indexer_supported,
+)
+from sglang.kernels.ops.attention.topk_page_table import topk_page_table_transform_
 from sglang.kernels.ops.kvcache.dsa_fused_store_index_cache import (
     can_use_dsa_fused_store,
     fused_store_index_k_cache,
@@ -29,7 +34,10 @@ from sglang.srt.layers.attention.dsa.dsa_dcp_sharded import (
     dcp_gather_request_rows,
     dcp_local_topk,
 )
-from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import BaseIndexerMetadata
+from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import (
+    BaseIndexerMetadata,
+    DSAIndexerMetadata,
+)
 from sglang.srt.layers.attention.dsa.dsa_npu_indexer import DSANPUIndexerMixin
 from sglang.srt.layers.attention.dsa.dsa_prefill_cuda_graph import (
     GRAPH_WEIGHTS_PROJ_LORA_ERROR,
@@ -37,11 +45,13 @@ from sglang.srt.layers.attention.dsa.dsa_prefill_cuda_graph import (
     bcg_dsa_indexer_prefill_split,
     pcg_dsa_indexer_prefill_split,
 )
+from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
 from sglang.srt.layers.attention.dsa.paged_mqa_logits_backend import (
     DSAPagedMQALogitsBackend,
 )
 from sglang.srt.layers.attention.dsa.utils import (
     aiter_can_use_preshuffle_paged_mqa,
+    fp8_mqa_logits_bf16,
     gfx950_fused_indexer_runtime_ok,
     gfx950_model_shape_supported,
     hadamard_preserved,
@@ -51,6 +61,7 @@ from sglang.srt.layers.attention.dsa.utils import (
     resolve_fp8_paged_mqa_logits_fn,
     resolve_num_sms,
     resolve_paged_mqa_logits_metadata_fn,
+    use_bf16_indexer_logits,
 )
 from sglang.srt.layers.attention.graph_variants import DSA_DENSE
 from sglang.srt.layers.attention.mqa_logits_utils import (
@@ -461,6 +472,17 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if config is not None:
             self.num_init_tokens = getattr(config, "index_init_tokens", 0)
             self.num_local_tokens = getattr(config, "index_local_tokens", 0)
+        # Prefill top-k from the sampled-threshold fp8 indexer (kernels/ops/attention/dsa/litetopk_prefill): 32 or 64
+        # index heads, a supported top-k and no forced init / local tokens.
+        self.use_prefill_lite_topk = (
+            envs.SGLANG_OPT_USE_PREFILL_LITE_TOPK.get()
+            and envs.SGLANG_DSA_FUSE_TOPK.get()
+            and is_fp8_indexer_supported()
+            and self.n_heads in (32, 64)
+            and self.index_topk in (512, 1024, 2048)
+            and self.num_init_tokens == 0
+            and self.num_local_tokens == 0
+        )
         if dsa_shards_index_k() and (self.num_init_tokens or self.num_local_tokens):
             raise ValueError(
                 "DSA with --dcp-size > 1 does not support index_init_tokens / "
@@ -1318,6 +1340,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         ke: torch.Tensor,
     ) -> torch.Tensor:
         q_padded, w_padded, _ = self._pad_heads_for_deep_gemm(q_fp8, weights)
+        if use_bf16_indexer_logits():
+            return fp8_mqa_logits_bf16(q_padded, kv_fp8, w_padded, ks, ke)
         return resolve_fp8_mqa_logits_fn()(
             q_padded,
             kv_fp8,
@@ -1741,12 +1765,32 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         k_scale = k_scale.view(torch.float32).squeeze(-1)
         kv_fp8 = (k_fp8, k_scale)
+        bf16_logits = use_bf16_indexer_logits()
 
         # Check if we need to chunk to avoid OOM
         seq_lens_expanded = metadata.get_seqlens_expanded()
         token_to_batch_idx = metadata.get_token_to_batch_idx()
         q_offset = ks.shape[0]
         k_offset = k_fp8.shape[0]
+        # Short contexts keep the dense path: with fewer than ~8 x topk keys the sampled filter keeps most keys
+        # and loses to DeepGEMM logits + top-k (measured on B200 / B300).
+        if (
+            self.use_prefill_lite_topk
+            and max_seq_len >= 8 * self.index_topk
+            and isinstance(metadata, DSAIndexerMetadata)
+            and not metadata.force_unfused_topk
+        ):
+            self._prefill_lite_topk(
+                q_fp8[:q_offset],
+                weights[:q_offset],
+                k_fp8,
+                k_scale,
+                ks,
+                ke,
+                metadata,
+                topk_result[:q_offset],
+            )
+            return topk_result
         # Every DCP rank holds the whole index K: score 1/W of the rows each, then
         # all-gather the top-k.
         split = _is_hip and getattr(metadata, "dcp_size", 1) > 1
@@ -1766,7 +1810,10 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         need_chunk, logits_budget_bytes = mqa_logits_should_chunk(
             num_rows=row_hi - row_lo,
             num_cols=k_offset,
-            get_budget_bytes=lambda: self._get_mqa_logits_budget_bytes(device_index),
+            get_budget_bytes=lambda: (
+                self._get_mqa_logits_budget_bytes(device_index)
+                * (2 if bf16_logits else 1)
+            ),
             rocm=_is_hip,
         )
 
@@ -1899,6 +1946,41 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             if topk_dst is not topk_result:
                 topk_result[:q_offset] = topk_dst[:q_offset]
         return topk_result
+
+    def _prefill_lite_topk(
+        self,
+        q_fp8: torch.Tensor,
+        weights: torch.Tensor,
+        k_fp8: torch.Tensor,
+        k_scale: torch.Tensor,
+        ks: torch.Tensor,
+        ke: torch.Tensor,
+        metadata: DSAIndexerMetadata,
+        out: torch.Tensor,
+    ) -> None:
+        # The indexer always scores the ragged (gathered) index K, so rows of one request share KV tiles;
+        # only the emitted indices differ: RAGGED adds the KV offsets, PAGED maps through the page table.
+        # topk_indices_offset is set exactly for RAGGED.
+        offsets = metadata.attn_metadata.topk_indices_offset
+        fp8_indexer_topk(
+            q_fp8,
+            weights,
+            k_fp8,
+            k_scale,
+            ks,
+            ke,
+            self.index_topk,
+            out_offsets=None if offsets is None else offsets[: out.shape[0]],
+            out=out,
+        )
+        if metadata.topk_transform_method == TopkTransformMethod.PAGED:
+            # Through the compact page table (as topk v2 PAGED does): no page_size=1 table needed.
+            topk_page_table_transform_(
+                out,
+                metadata.get_page_table_64(),
+                metadata.get_token_to_batch_idx()[: out.shape[0]],
+                metadata.attn_metadata.page_size,
+            )
 
     @staticmethod
     def _dcp_gather_index_k(
