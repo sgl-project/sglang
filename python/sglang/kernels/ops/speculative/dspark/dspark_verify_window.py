@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Optional
+
 import msgspec
 import torch
 import triton
@@ -23,7 +25,7 @@ class RaggedVerifyWindow(msgspec.Struct, frozen=True):
     verify_ids: torch.Tensor
     # Each packed lane's flat position in the `[bs, verify_num_draft_tokens]`
     # verify window, -1 on a padded lane.
-    window_index: torch.Tensor
+    window_index: Optional[torch.Tensor]
 
 
 class BuildRaggedVerifyWindow:
