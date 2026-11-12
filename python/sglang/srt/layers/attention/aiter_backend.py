@@ -828,6 +828,12 @@ class AiterAttnBackend(AttentionBackend):
         )
         self.use_unified_memory = self.token_to_kv_pool.requires_physical_write_loc
         if self.use_unified_memory:
+            if not envs.SGLANG_ENABLE_AITER_UNIFIED_MEMORY.get():
+                raise RuntimeError(
+                    "AITER unified memory is experimental and disabled by default. "
+                    "Set SGLANG_ENABLE_AITER_UNIFIED_MEMORY=1 only with an AITER "
+                    "build containing https://github.com/ROCm/aiter/pull/6661."
+                )
             if (
                 not self.runner_ids.reads_are_translated
                 or self.runner_ids.is_fused_draft

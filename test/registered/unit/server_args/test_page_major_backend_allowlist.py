@@ -34,12 +34,14 @@ import unittest
 from types import SimpleNamespace
 
 import msgspec
+
 from sglang.srt.arg_groups.kv_cache_hook import (
     ASYMMETRIC_KV_BACKENDS,
     draft_rows_refusal,
     handle_page_major_kv_layout,
 )
 from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, CudaGraphConfig
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -234,15 +236,29 @@ class TestPageMajorBackendAllowlist(unittest.TestCase):
                     f"{backend} must stay rejected without --enable-unified-memory",
                 )
 
+    def test_aiter_arena_requires_explicit_opt_in(self):
+        with envs.SGLANG_ENABLE_AITER_UNIFIED_MEMORY.override(False):
+            envs.SGLANG_ENABLE_AITER_UNIFIED_MEMORY.clear()
+            self.assertFalse(_accepts("aiter", use_mla=False))
+        with envs.SGLANG_ENABLE_AITER_UNIFIED_MEMORY.override("0"):
+            self.assertFalse(_accepts("aiter", use_mla=False))
+            self.assertFalse(
+                _accepts("triton", use_mla=False, decode_attention_backend="aiter")
+            )
+            self.assertTrue(_accepts("triton", use_mla=False))
+
     def test_aiter_full_mha_bf16_page_one(self):
-        self.assertTrue(_accepts("aiter", use_mla=False))
-        self.assertTrue(
-            _accepts("aiter", use_mla=False, dtype="bfloat16", kv_cache_dtype="bf16")
-        )
-        # Judge both resolved phases, including a mixed-backend configuration.
-        self.assertTrue(
-            _accepts("triton", use_mla=False, decode_attention_backend="aiter")
-        )
+        with envs.SGLANG_ENABLE_AITER_UNIFIED_MEMORY.override("1"):
+            self.assertTrue(_accepts("aiter", use_mla=False))
+            self.assertTrue(
+                _accepts(
+                    "aiter", use_mla=False, dtype="bfloat16", kv_cache_dtype="bf16"
+                )
+            )
+            # Judge both resolved phases, including a mixed-backend configuration.
+            self.assertTrue(
+                _accepts("triton", use_mla=False, decode_attention_backend="aiter")
+            )
 
     def test_aiter_rejects_unimplemented_arena_contracts(self):
         cases = [
@@ -269,9 +285,10 @@ class TestPageMajorBackendAllowlist(unittest.TestCase):
                     )
                 }
             )
-        for case in cases:
-            with self.subTest(case=case):
-                self.assertFalse(_accepts("aiter", **{"use_mla": False, **case}))
+        with envs.SGLANG_ENABLE_AITER_UNIFIED_MEMORY.override(True):
+            for case in cases:
+                with self.subTest(case=case):
+                    self.assertFalse(_accepts("aiter", **{"use_mla": False, **case}))
 
     def test_helion_linear_attention_is_kda_only(self):
         for phase in ("decode", "prefill"):

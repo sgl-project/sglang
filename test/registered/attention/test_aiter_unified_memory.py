@@ -5,7 +5,10 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
+
+from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_amd_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
@@ -14,9 +17,14 @@ _HEADS, _KV_HEADS, _DIM = 16, 4, 256
 _DTYPE = torch.bfloat16
 
 
+@unittest.skipUnless(
+    envs.SGLANG_ENABLE_AITER_UNIFIED_MEMORY.get(),
+    "requires SGLANG_ENABLE_AITER_UNIFIED_MEMORY=1 and AITER with ROCm/aiter#6661",
+)
 @unittest.skipUnless(torch.cuda.is_available() and torch.version.hip, "requires ROCm")
-class TestAiterUnifiedMemory(unittest.TestCase):
+class TestAiterUnifiedMemory(CustomTestCase):
     def setUp(self):
+        super().setUp()
         from sglang.srt.configs.model_config import AttentionArch
         from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
         from sglang.srt.layers.radix_attention import RadixAttention
@@ -92,9 +100,7 @@ class TestAiterUnifiedMemory(unittest.TestCase):
             token_to_kv_pool_allocator=self.alloc,
             req_to_token_pool=self.bundle.req_to_token_pool,
         )
-        # Exercise construction and automatic arena routing with no env opt-in.
-        from sglang.srt.environ import envs
-
+        # The arena selects unified attention without the legacy dispatch override.
         self.enterContext(envs.SGLANG_USE_AITER_UNIFIED_ATTN.override(False))
         self.backend = AiterAttnBackend(self.runner)
         self.assertTrue(self.backend.use_triton_unified_attention)

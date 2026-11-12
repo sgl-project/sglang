@@ -10,12 +10,18 @@ from typing import ClassVar
 # Triton/FA3/FlashInfer classes as additional tests in this module.
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from registered.page_major import test_page_major_qwen_hybrid as _qwen_recipe
+
+from sglang.srt.environ import envs
 from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 
 register_amd_ci(est_time=300, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 
+@unittest.skipUnless(
+    envs.SGLANG_ENABLE_AITER_UNIFIED_MEMORY.get(),
+    "requires SGLANG_ENABLE_AITER_UNIFIED_MEMORY=1 and AITER with ROCm/aiter#6661",
+)
 @unittest.skipUnless(is_hip(), "AMD ROCm required")
 class TestUnifiedQwenHybridAiter(_qwen_recipe.TestUnifiedQwenHybridTriton):
     # Exercise automatic unified-attention dispatch for the arena.

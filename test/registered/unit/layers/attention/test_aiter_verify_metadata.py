@@ -7,6 +7,7 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention import aiter_backend
 from sglang.srt.mem_cache.kv.router import PlainPoolRouter
 from sglang.srt.model_executor.forward_mode import ForwardMode
@@ -144,8 +145,9 @@ class _MHAPool:
         return torch.empty(1, 1, 8, 128)
 
 
-def _init_mha_backend(kv_cache_layout):
+def _init_mha_backend(kv_cache_layout, *, physical_write_loc=False):
     pool = _MHAPool(kv_cache_layout)
+    pool.requires_physical_write_loc = physical_write_loc
     model_config = SimpleNamespace(
         dtype=torch.bfloat16,
         is_multimodal=False,
@@ -186,6 +188,26 @@ def _init_mha_backend(kv_cache_layout):
 class TestAiterDecodeWorkspace(CustomTestCase):
     """Only paged_attention_ragged reads workspace_buffer; a SHUFFLE 5D pool decodes
     through pa_decode_gluon, so it must not allocate it."""
+
+    def test_static_pool_is_unaffected_by_arena_opt_in(self):
+        for enabled in (False, True):
+            with (
+                self.subTest(enabled=enabled),
+                envs.SGLANG_ENABLE_AITER_UNIFIED_MEMORY.override(enabled),
+                envs.SGLANG_USE_AITER_UNIFIED_ATTN.override(False),
+            ):
+                backend = _init_mha_backend("nhd")
+                self.assertFalse(backend.use_unified_memory)
+                self.assertFalse(backend.use_triton_unified_attention)
+
+    def test_arena_constructor_requires_explicit_opt_in(self):
+        with (
+            envs.SGLANG_ENABLE_AITER_UNIFIED_MEMORY.override(False),
+            self.assertRaisesRegex(
+                RuntimeError, "SGLANG_ENABLE_AITER_UNIFIED_MEMORY=1"
+            ),
+        ):
+            _init_mha_backend("nhd", physical_write_loc=True)
 
     def test_allocated_only_for_paged_ragged_decode(self):
         allocated = {

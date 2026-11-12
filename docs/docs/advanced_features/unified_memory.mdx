@@ -62,7 +62,7 @@ Page-major entries make each layer's rows strided, so only backends audited for 
 | Layers | Page-major allow-list |
 |---|---|
 | MHA full and sliding-window attention | `triton`, `fa3`, `fa4`, `flashinfer`, `trtllm_mha` |
-| MHA full attention with equal K/V head dims, BF16 query/KV, page size 1, no window layers | `aiter` on AMD ROCm; see [AITER configuration](#aiter-configuration) |
+| MHA/GQA full attention with equal K/V head dims, BF16 query/KV, page size 1, no window layers | Experimental `aiter` on AMD ROCm, disabled by default; see [AITER configuration](#aiter-configuration) |
 | MHA with asymmetric K/V head dims | `triton`, `fa3`, `fa4` |
 | MLA full attention | `triton`, `fa3`, `trtllm_mla`, `flashinfer`, `cutedsl_mla`, `flashmla` |
 | Linear attention, decode | `triton`, `flashinfer`; also `cutedsl` and `helion` on MLA (KDA) hybrids |
@@ -88,12 +88,15 @@ python3 -m sglang.launch_server \
 
 ### AITER configuration
 
-On AMD ROCm Linux, the AITER arena path uses unified attention for ordinary BF16 full-attention layers. It requires page size 1 and equal K/V head dimensions. Use an AITER build containing the strided-cache address-span fix [ROCm/aiter#6661](https://github.com/ROCm/aiter/pull/6661). The SGLang HIP KV writer must compile and load successfully; this path refuses the fallback writer because it can overwrite the reserved padding sink.
+On AMD ROCm Linux, the AITER arena path uses unified attention for ordinary BF16 MHA/GQA full-attention layers. GQA is included in SGLang's MHA branch: query heads may share KV heads. MLA uses compressed latent KV and is not supported by this adapter. This path requires page size 1 and equal K/V head dimensions. Use an AITER build containing the strided-cache address-span fix [ROCm/aiter#6661](https://github.com/ROCm/aiter/pull/6661). The SGLang HIP KV writer must compile and load successfully; this path refuses the fallback writer because it can overwrite the reserved padding sink.
+
+This experimental path is disabled by default. Set `SGLANG_ENABLE_AITER_UNIFIED_MEMORY=1` only after installing an AITER build containing the fix; the flag does not check the installed AITER revision. The opt-in remains necessary until the fixed dependency is qualified in the default CI image. Static-pool AITER and other unified-memory backends do not use this flag.
 
 For Qwen3.5-4B on one GPU (TP1), disable online MXFP4 conversion to keep its GDN projections in BF16:
 
 ```bash
-SGLANG_USE_AITER=1 SGLANG_ROCM_GDN_ONLINE_MXFP4=0 \
+SGLANG_USE_AITER=1 SGLANG_ENABLE_AITER_UNIFIED_MEMORY=1 \
+SGLANG_ROCM_GDN_ONLINE_MXFP4=0 \
 python3 -m sglang.launch_server \
   --model-path Qwen/Qwen3.5-4B \
   --tp 1 \
@@ -112,6 +115,7 @@ The arena selects AITER unified attention automatically; `SGLANG_USE_AITER_UNIFI
 | Flag or variable | Effect under unified memory |
 |---|---|
 | `--enable-unified-memory` | Builds the arena, the per-sub-pool views and one allocator over all of them. Implies `--enable-page-major-kv-layout`. |
+| `SGLANG_ENABLE_AITER_UNIFIED_MEMORY` | Opts into the experimental AITER arena reader; defaults to `0`. Requires an AITER build containing [ROCm/aiter#6661](https://github.com/ROCm/aiter/pull/6661). |
 | `--mem-fraction-static` | The arena's byte budget comes from the static memory fraction, as for separate pools. If the arena cannot hold the floor of one request at batch size 1 (its window rows, its state slots and the sink), startup fails and names the terms (`kv/sizing.py::check_bs1_floor`). Whether a whole request fits, its full-attention tokens included, is checked at the memory clip and at admission. |
 | `--max-total-tokens` | Sizes the arena: its bytes are the smallest budget, within the measured one, whose sizing gives at least that many full-attention tokens, with windows and state sized by the same rules. It sizes the full-attention target; it does not cap how far full attention can grow into the arena at run time. |
 | `--max-running-requests` | Bounds the concurrency the sizing solves for. The result is also capped at half the full-attention tokens. |

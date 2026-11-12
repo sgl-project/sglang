@@ -852,6 +852,11 @@ def handle_page_major_kv_layout(server_args: Any):
     backends = set(attention_backends_of(resolved_view(server_args)))
     backends.discard(None)
     if "aiter" in backends and not use_mla_backend(server_args):
+        assert envs.SGLANG_ENABLE_AITER_UNIFIED_MEMORY.get(), (
+            "AITER unified memory is experimental and disabled by default. "
+            "Set SGLANG_ENABLE_AITER_UNIFIED_MEMORY=1 only with an AITER build "
+            "containing https://github.com/ROCm/aiter/pull/6661."
+        )
         # Only the ordinary unified-attention reader consumes the arena's
         # translated page table. Other AITER routes still read virtual ids.
         assert not model_config.has_asymmetric_kv and not model_config.is_hybrid_swa, (
