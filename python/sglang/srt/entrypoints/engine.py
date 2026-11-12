@@ -1995,7 +1995,7 @@ def _set_envs_and_config(server_args: ServerArgs):
             os.environ["NCCL_GRAPH_MIXING_SUPPORT"] = "0"
     # Gated transfers park streams; give foreground work more hardware queues
     # when pausing is enabled, and preserve an explicit user setting.
-    if envs.SGLANG_ENABLE_KV_SHARD_GATHER_PAUSE.get():
+    if cfg.enable_kv_cache_sharding and envs.SGLANG_ENABLE_KV_SHARD_GATHER_PAUSE.get():
         os.environ.setdefault("CUDA_DEVICE_MAX_CONNECTIONS", "32")
     else:
         os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "8"

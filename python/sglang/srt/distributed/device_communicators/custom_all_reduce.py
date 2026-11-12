@@ -4,7 +4,7 @@
 
 import ctypes
 import logging
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 from functools import partial
 from typing import Any, List, Optional, Union
 
@@ -17,10 +17,6 @@ from sglang.srt.distributed.device_communicators.cuda_wrapper import CudaRTLibra
 from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import (
     can_use_custom_all_reduce_with_nvlink,
     is_weak_contiguous,
-)
-from sglang.srt.distributed.device_communicators.gated_transfer import (
-    Link,
-    paused_background_transfers,
 )
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
@@ -71,7 +67,6 @@ class CustomAllreduce:
         are in the same node.
         """
         self._IS_CAPTURING = False
-        self._pause_warmed = set()
         self.disabled = True  # This can be modified in-place by context manager in piecewise cuda graph runner
         self.original_disabled = True  # To store the original state
         self.use_amd_deterministic_impl = _use_amd_deterministic_impl()
@@ -294,22 +289,12 @@ class CustomAllreduce:
     def _all_reduce_impl(self, inp: torch.Tensor, registered: bool):
         out = torch.empty_like(inp)
         if not _is_hip:  # CUDA-like
-            # A first launch may load a CUDA module and synchronize. Let each
-            # launch signature run once before pausing an in-flight transfer.
-            key = (inp.dtype, inp.numel(), registered)
-            pause = (
-                paused_background_transfers(Link.NVLINK)
-                if _is_cuda and key in self._pause_warmed
-                else nullcontext()
-            )
-            with pause:
-                if registered:
-                    ops.all_reduce(self._ptr, inp, out, 0, 0)
-                else:
-                    ops.all_reduce(
-                        self._ptr, inp, out, self.buffer_ptrs[self.rank], self.max_size
-                    )
-            self._pause_warmed.add(key)
+            if registered:
+                ops.all_reduce(self._ptr, inp, out, 0, 0)
+            else:
+                ops.all_reduce(
+                    self._ptr, inp, out, self.buffer_ptrs[self.rank], self.max_size
+                )
         elif self.use_amd_deterministic_impl:
             inp_size = inp.numel() * inp.element_size()
             if inp_size <= self.max_size:

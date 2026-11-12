@@ -1,7 +1,7 @@
-"""Forward collectives close the NVLink gate only while submitting communication.
+"""Only an active page-interleaved prefill pauses its multicast prefix gather.
 
-CPU stand-ins check allocation and grouped-launch ordering using the real pause
-context. The multicast GPU tests cover stream execution and gathered values.
+CPU stand-ins check forward scoping, allocation, and grouped-launch ordering.
+The multi-GPU page-interleave tests cover stream execution and gathered KV bytes.
 """
 
 import threading
@@ -16,6 +16,9 @@ from sglang.srt.distributed import parallel_state
 from sglang.srt.distributed.device_communicators import gated_transfer
 from sglang.srt.distributed.device_communicators.gated_transfer import Link
 from sglang.srt.distributed.parallel_state import GroupCoordinator
+from sglang.srt.environ import envs
+from sglang.srt.mem_cache.page_interleave_pool import PageInterleaveKVPoolMixin
+from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -40,9 +43,21 @@ class _Gate:
         self.events.append("resume")
 
 
-class TestForwardCollectivePause(CustomTestCase):
+class TestPageInterleaveGatherPause(CustomTestCase):
     def setUp(self):
         self.gate = _Gate()
+        self.pool = PageInterleaveKVPoolMixin.__new__(PageInterleaveKVPoolMixin)
+        self.pool._shard_extend_active = True
+        self.pool._block_pages = 1
+        self.pool._multicast_gather = SimpleNamespace(
+            chain=SimpleNamespace(link=Link.NVLINK)
+        )
+        self.enterContext(envs.SGLANG_ENABLE_KV_SHARD_GATHER_PAUSE.override(True))
+        self.enterContext(
+            forward_context(
+                ForwardContext(attn_backend=SimpleNamespace(token_to_kv_pool=self.pool))
+            )
+        )
         self.expect_pause = True
         self.grouped = None
         self.comm = SimpleNamespace(
@@ -137,7 +152,7 @@ class TestForwardCollectivePause(CustomTestCase):
             yield allocations
 
     def test_all_reduce_dispatch_and_output_allocation(self):
-        for backend in ("pynccl", "torch_symm_mem", "torch"):
+        for backend in ("pynccl", "torch"):
             with self.subTest(backend=backend):
                 self.gate.events.clear()
                 tensor = torch.arange(4, dtype=torch.float32)
@@ -147,7 +162,7 @@ class TestForwardCollectivePause(CustomTestCase):
                 torch.testing.assert_close(tensor, expected)
                 self.assertEqual(self.gate.events, ["pause", "all_reduce", "resume"])
 
-        for backend in ("pynccl", "torch_symm_mem"):
+        for backend in ("pynccl",):
             with self.subTest(outplace=backend):
                 self.gate.events.clear()
                 tensor = torch.arange(4, dtype=torch.float32)
@@ -165,7 +180,6 @@ class TestForwardCollectivePause(CustomTestCase):
         for backend, symmetric in (
             ("pynccl", False),
             ("pynccl", True),
-            ("pymscclpp", False),
             ("torch", False),
         ):
             with self.subTest(backend=backend, symmetric=symmetric):
@@ -241,6 +255,40 @@ class TestForwardCollectivePause(CustomTestCase):
             self.gate.events, ["pause", "group_start", "failure", "group_end", "resume"]
         )
 
+    def test_no_pause_outside_the_active_page_interleaved_prefill(self):
+        self.expect_pause = False
+        cases = (
+            ("disabled", envs.SGLANG_ENABLE_KV_SHARD_GATHER_PAUSE.override(False)),
+            (
+                "no_forward",
+                patch("sglang.srt.model_executor.forward_context._current", None),
+            ),
+            (
+                "ordinary_pool",
+                forward_context(
+                    ForwardContext(
+                        attn_backend=SimpleNamespace(token_to_kv_pool=object())
+                    )
+                ),
+            ),
+            ("inactive", patch.object(self.pool, "_shard_extend_active", False)),
+            ("empty_prefix", patch.object(self.pool, "_block_pages", 0)),
+            ("nccl_prefix", patch.object(self.pool, "_multicast_gather", None)),
+            ("ungated", patch.object(self.pool._multicast_gather.chain, "link", None)),
+            (
+                "compiling",
+                patch.object(torch.compiler, "is_compiling", return_value=True),
+            ),
+        )
+        for name, context in cases:
+            with self.subTest(name=name), context:
+                self.gate.events.clear()
+                tensor, output = torch.ones(2), torch.empty(4)
+                GroupCoordinator._all_reduce_in_place(self._group(), tensor)
+                GroupCoordinator._all_gather_into_tensor(self._group(), output, tensor)
+                torch.testing.assert_close(output, torch.full((4,), 2.0))
+                self.assertEqual(self.gate.events, ["all_reduce", "all_gather"])
+
     def test_idle_and_capture_still_run_collectives_without_pausing(self):
         self.expect_pause = False
         for capturing in (False, True):
@@ -258,69 +306,6 @@ class TestForwardCollectivePause(CustomTestCase):
                     )
                 torch.testing.assert_close(output, torch.full((4,), 2.0))
                 self.assertEqual(self.gate.events, ["all_reduce", "all_gather"])
-
-    def test_custom_all_reduce_first_launch_is_unpaused_and_output_is_preallocated(
-        self,
-    ):
-        from sglang.srt.distributed.device_communicators import custom_all_reduce
-
-        comm = SimpleNamespace(
-            _ptr=0, buffer_ptrs=[0], rank=0, max_size=4096, _pause_warmed=set()
-        )
-
-        def launch(ptr, input_, output, *args):
-            self._all_reduce(input_, out=output)
-
-        with (
-            patch.object(custom_all_reduce, "_is_cuda", True),
-            patch.object(custom_all_reduce, "_is_hip", False),
-            patch.object(custom_all_reduce.ops, "all_reduce", launch, create=True),
-        ):
-            # An unseen shape can launch a different kernel; warm it before
-            # pausing, even after another shape has already been used.
-            for count, paused in ((4, False), (4, True), (8, False), (8, True)):
-                with self.subTest(count=count, paused=paused):
-                    self.gate.events.clear()
-                    self.expect_pause = paused
-                    tensor = torch.arange(count, dtype=torch.float32)
-                    with self._check_allocations("empty_like") as allocations:
-                        output = custom_all_reduce.CustomAllreduce._all_reduce_impl(
-                            comm, tensor, registered=False
-                        )
-                    self.assertEqual(allocations, ["empty_like"])
-                    torch.testing.assert_close(output, tensor * 2)
-                    self.assertEqual(
-                        self.gate.events,
-                        ["pause", "all_reduce", "resume"] if paused else ["all_reduce"],
-                    )
-
-    def test_flashinfer_allocates_outputs_before_launch(self):
-        from sglang.srt.layers import flashinfer_comm_fusion
-
-        def launch(**kwargs):
-            self._all_reduce(kwargs["input"], out=kwargs["output"])
-
-        comm = SimpleNamespace(
-            AllReduceFusionPattern=SimpleNamespace(kAllReduce="all_reduce"),
-            allreduce_fusion=launch,
-        )
-        workspace = SimpleNamespace(workspace=object(), backend="trtllm")
-        tensor = torch.arange(8, dtype=torch.float32).view(2, 4)
-        with (
-            patch.object(flashinfer_comm_fusion, "_flashinfer_comm", comm),
-            patch.object(
-                flashinfer_comm_fusion,
-                "_get_workspace_manager",
-                return_value=workspace,
-            ),
-            self._check_allocations("empty_like") as allocations,
-        ):
-            output = flashinfer_comm_fusion.flashinfer_allreduce(
-                tensor, use_attn_tp_group=True
-            )
-        self.assertEqual(allocations, ["empty_like"])
-        torch.testing.assert_close(output, tensor * 2)
-        self.assertEqual(self.gate.events, ["pause", "all_reduce", "resume"])
 
 
 if __name__ == "__main__":

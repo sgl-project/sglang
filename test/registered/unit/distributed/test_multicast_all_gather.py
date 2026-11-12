@@ -4,7 +4,6 @@ import ctypes
 import json
 import math
 import tempfile
-import threading
 import time
 import unittest
 import unittest.mock
@@ -31,7 +30,7 @@ from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
-register_cuda_ci(est_time=120, stage="base-c", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=90, stage="base-c", runner_config="4-gpu-b200")
 
 
 class TestMulticastAllGatherLayout(CustomTestCase):
@@ -406,163 +405,6 @@ def _run_multicast(rank, port, backend):
     # Keep the process group alive while symmetric-memory handles remain.
 
 
-def _run_forward_collectives(rank, port, backend):
-    """Public forward collectives pause a real gather without caller brackets."""
-    import torch.distributed as dist
-    import torch.distributed._symmetric_memory as symm_mem
-    from cuda.bindings import driver as cu
-
-    from sglang.srt.distributed.parallel_state import GroupCoordinator
-    from sglang.srt.runtime_context import publish
-    from sglang.srt.server_args import ServerArgs
-    from sglang.srt.utils.cuda_vmm_utils import check_drv
-
-    device = torch.device("cuda", rank)
-    torch.cuda.set_device(device)
-    dist.init_process_group(
-        "nccl",
-        init_method=f"tcp://127.0.0.1:{port}",
-        rank=rank,
-        world_size=_WORLD,
-        device_id=device,
-    )
-    publish(ServerArgs(model_path="dummy", tp_size=_WORLD), role="scheduler")
-    foreground = GroupCoordinator(
-        group_ranks=[list(range(_WORLD))],
-        local_rank=rank,
-        torch_distributed_backend="nccl",
-        use_pynccl=True,
-        use_mscclpp=False,
-        use_custom_allreduce=False,
-        use_torch_symm_mem_all_reduce=False,
-        use_hpu_communicator=False,
-        use_xpu_communicator=False,
-        group_name="forward-pause-test",
-    )
-    if backend is not None:
-        symm_mem.set_backend(backend)
-    count = (1 << 18) + 17
-    source = torch.arange(count, dtype=torch.float32, device=device) + rank * count
-    output = symm_mem.empty(_WORLD * count, dtype=torch.float32, device=device)
-    expected_background = torch.arange(
-        _WORLD * count, dtype=torch.float32, device=device
-    )
-    chain = TransferChain(Link.NVLINK)
-    gather = MulticastAllGather(dist.group.WORLD, output, chain, chunk_bytes=128 << 10)
-    gate = chain._gate
-    foreground_stream = torch.cuda.Stream()
-    foreground_done = torch.cuda.Event()
-    foreground_done.record(foreground_stream)
-    blocker = torch.zeros(1, dtype=torch.int32).pin_memory()
-    x = torch.full((8, 16), rank + 1.0, device=device)
-    gathered = torch.empty((_WORLD * 8, 16), device=device)
-    gathered_list = [torch.empty_like(x) for _ in range(_WORLD)]
-    expected_reduce = torch.full_like(x, _WORLD * (_WORLD + 1) / 2)
-    expected_gather = torch.cat(
-        [torch.full_like(x, peer + 1.0) for peer in range(_WORLD)]
-    )
-    sizes = list(range(1, _WORLD + 1))
-    varying = [
-        torch.full((rank + 1, 16), rank + 1.0 + offset, device=device)
-        for offset in (0, 10)
-    ]
-    expected_varying = [
-        torch.cat(
-            [
-                torch.full((rows, 16), peer + 1.0 + offset, device=device)
-                for peer, rows in enumerate(sizes)
-            ]
-        )
-        for offset in (0, 10)
-    ]
-
-    def hold(stream):
-        check_drv(
-            cu.cuStreamWaitValue32(stream.cuda_stream, blocker.data_ptr(), 1, 1),
-            "forward collective test blocker",
-        )
-
-    def gather_into_tensor():
-        foreground.all_gather_into_tensor(gathered, x)
-        return gathered
-
-    def gather_into_list():
-        foreground.all_gather(x, output_tensor_list=gathered_list)
-        return gathered_list
-
-    cases = [
-        ("all_reduce", lambda: foreground.all_reduce(x), expected_reduce),
-        ("all_gather_into_tensor", gather_into_tensor, expected_gather),
-        ("all_gather", lambda: foreground.all_gather(x, dim=0), expected_gather),
-        ("all_gather_list", gather_into_list, list(expected_gather.chunk(_WORLD))),
-    ]
-    torch.cuda.synchronize()
-    for pynccl_enabled in (False, True):
-        selected = cases
-        if pynccl_enabled:
-            # Two unequal gathers share an outer NCCL group. The resume must
-            # follow group_end, where NCCL actually submits their GPU work.
-            selected = cases + [
-                (
-                    "all_gatherv",
-                    lambda: foreground.all_gatherv(varying, sizes=sizes),
-                    expected_varying,
-                )
-            ]
-        with foreground.pynccl_comm.change_state(enable=pynccl_enabled):
-            for name, collective, expected in selected:
-                label = f"rank {rank}, {name}, pynccl={pynccl_enabled}"
-                # Initialize lazy communicator paths and output allocation on
-                # the same stream before any background stream can park.
-                with torch.cuda.stream(foreground_stream):
-                    x.fill_(rank + 1)
-                    warmup = collective()
-                torch.cuda.synchronize()
-                torch.testing.assert_close(warmup, expected, rtol=0, atol=0)
-                del warmup
-                x.fill_(rank + 1)
-                output.fill_(-1)
-                blocker[0] = 0
-                torch.cuda.synchronize()
-                dist.barrier(group=foreground.cpu_group)
-                chain.run([hold])
-                ticket = gather.run(source)
-                pauses, forced = gate._seq, gate.forced_opens
-                timed_out = threading.Event()
-
-                def release_on_timeout():
-                    timed_out.set()
-                    blocker[0] = 1
-
-                # A regression may block the host in an allocator/device sync.
-                # Release the blocker so it fails instead of stranding workers.
-                timer = threading.Timer(10, release_on_timeout)
-                timer.start()
-                try:
-                    with torch.cuda.stream(foreground_stream):
-                        result = collective()
-                        foreground_done.record()
-                    # The foreground must complete while the gather is still
-                    # blocked: a watchdog rescue cannot make this test pass.
-                    _wait_until(foreground_done.query)
-                    assert not timed_out.is_set(), f"{label}: host synchronized"
-                    assert gate._seq == pauses + 1, f"{label}: did not pause"
-                    assert gate._pause_thread is None, f"{label}: still owned"
-                    assert gate.word() == 0, f"{label}: did not resume"
-                    assert not chain.query(ticket), f"{label}: blocker did not hold"
-                finally:
-                    blocker[0] = 1
-                    timer.cancel()
-                    timer.join()
-                chain.wait(ticket)
-                torch.cuda.synchronize()
-                torch.testing.assert_close(result, expected, rtol=0, atol=0)
-                torch.testing.assert_close(output, expected_background, rtol=0, atol=0)
-                assert gate.forced_opens == forced, f"{label}: watchdog rescue"
-                del result
-    dist.barrier(group=foreground.cpu_group)
-
-
 def _run_matches_nccl(rank, port, backend):
     """Bitwise agreement with NCCL's allgather across dtypes, sizes, chunk
     sizes, in-place inputs, and output views at varying offsets."""
@@ -722,9 +564,6 @@ class TestMulticastAllGatherMultiGpu(CustomTestCase):
 
     def test_rank_without_mapping_raises_on_every_rank(self):
         self._spawn(None, 29840, target=_run_without_control_mapping)
-
-    def test_forward_collectives_pause_background_gather(self):
-        self._spawn(None, 29841, target=_run_forward_collectives)
 
 
 if __name__ == "__main__":

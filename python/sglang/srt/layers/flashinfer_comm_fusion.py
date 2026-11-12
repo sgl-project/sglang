@@ -9,10 +9,6 @@ from torch.distributed import ProcessGroup
 from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import (
     is_one_nvlink_clique,
 )
-from sglang.srt.distributed.device_communicators.gated_transfer import (
-    Link,
-    paused_background_transfers,
-)
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
 from sglang.srt.runtime_context import (
     get_exec,
@@ -960,8 +956,7 @@ def flashinfer_allreduce_residual_rmsnorm(
         kwargs["fp32_acc"] = fp32_acc
     if _flashinfer_allreduce_supports_trigger_completion:
         kwargs["trigger_completion_at_end"] = trigger_completion_at_end
-    with paused_background_transfers(Link.NVLINK):
-        _flashinfer_comm.allreduce_fusion(**kwargs)
+    _flashinfer_comm.allreduce_fusion(**kwargs)
 
     return norm_out, residual_out
 
@@ -1083,8 +1078,7 @@ def flashinfer_allreduce(
         kwargs["fp32_acc"] = True
     if _flashinfer_allreduce_supports_trigger_completion:
         kwargs["trigger_completion_at_end"] = False
-    with paused_background_transfers(Link.NVLINK):
-        _flashinfer_comm.allreduce_fusion(**kwargs)
+    _flashinfer_comm.allreduce_fusion(**kwargs)
     return output
 
 

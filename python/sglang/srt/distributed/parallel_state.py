@@ -46,16 +46,16 @@ from torch.distributed import Backend, ProcessGroup
 
 from sglang.srt import platforms
 from sglang.srt.compilation.compilation_config import register_split_op
-from sglang.srt.distributed.device_communicators.gated_transfer import (
-    Link,
-    paused_background_transfers,
-)
 from sglang.srt.distributed.utils import (
     all_gather_single,
     reduce_scatter_single,
     set_global_tcp_store,
 )
 from sglang.srt.environ import envs
+from sglang.srt.model_executor.forward_context import (
+    get_token_to_kv_pool,
+    has_forward_context,
+)
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
@@ -105,6 +105,23 @@ _MODEL_PARALLEL_GROUP_TIMEOUT: Optional[timedelta] = None
 # (128 KiB of payload at world_size 8).
 _FUSED_AR_RMS_1STAGE_MAX_TOKENS = 80
 _FUSED_AR_RMS_1STAGE_MAX_READ_BYTES = 8 * 128 * 1024
+
+
+def _pause_kv_shard_gather():
+    """Only the active page-interleaved prefill may pause its prefix gather."""
+    if (
+        torch.compiler.is_compiling()
+        or not envs.SGLANG_ENABLE_KV_SHARD_GATHER_PAUSE.get()
+        or not has_forward_context()
+    ):
+        return nullcontext()
+    # The pool imports GroupCoordinator, so resolve its type only at runtime.
+    from sglang.srt.mem_cache.page_interleave_pool import PageInterleaveKVPoolMixin
+
+    pool = get_token_to_kv_pool()
+    if isinstance(pool, PageInterleaveKVPoolMixin):
+        return pool.pause_gather_for_forward()
+    return nullcontext()
 
 
 def get_torch_distributed_pg_options(group_name=None):
@@ -786,7 +803,7 @@ class GroupCoordinator:
         ):
             self.debug_check_symmetric_mempool(self, {"input": input_}, "all_reduce")
             with pynccl_comm.change_state(enable=True):
-                with paused_background_transfers(Link.NVLINK):
+                with _pause_kv_shard_gather():
                     pynccl_comm.all_reduce(input_)
                 return input_
 
@@ -1080,13 +1097,10 @@ class GroupCoordinator:
             out = qr_comm.quick_all_reduce(input_)
         elif outplace_all_reduce_method == "torch_symm_mem":
             assert not torch_symm_mem_comm.disabled
-            out = torch.empty_like(input_)
-            with paused_background_transfers(Link.NVLINK):
-                out = torch_symm_mem_comm.all_reduce(input_, out=out)
+            out = torch_symm_mem_comm.all_reduce(input_)
         elif outplace_all_reduce_method == "pymscclpp":
             assert not pymscclpp_comm.disabled
-            with paused_background_transfers(Link.NVLINK):
-                out = pymscclpp_comm.all_reduce(input_)
+            out = pymscclpp_comm.all_reduce(input_)
         elif outplace_all_reduce_method == "pcie_ipc":
             return self.pcie_ipc_comm.pcie_ipc_all_reduce(input_)
         elif outplace_all_reduce_method == "pynccl":
@@ -1094,7 +1108,7 @@ class GroupCoordinator:
             # synchronize the device and wait on the paused background copy.
             out = torch.empty_like(input_)
             with pynccl_comm.change_state(enable=True):
-                with paused_background_transfers(Link.NVLINK):
+                with _pause_kv_shard_gather():
                     out = pynccl_comm.outplace_all_reduce(input_, out)
         assert out is not None
         return out
@@ -1103,17 +1117,16 @@ class GroupCoordinator:
         pynccl_comm = self.get_available_pynccl_comm()
         torch_symm_mem_comm = self.torch_symm_mem_comm
         if pynccl_comm is not None and not pynccl_comm.disabled:
-            with paused_background_transfers(Link.NVLINK):
+            with _pause_kv_shard_gather():
                 pynccl_comm.all_reduce(input_)
         elif (
             torch_symm_mem_comm is not None
             and not torch_symm_mem_comm.disabled
             and torch_symm_mem_comm.should_torch_symm_mem_allreduce(input_)
         ):
-            with paused_background_transfers(Link.NVLINK):
-                torch_symm_mem_comm.all_reduce(input_, out=input_)
+            torch_symm_mem_comm.all_reduce(input_, out=input_)
         else:
-            with paused_background_transfers(Link.NVLINK):
+            with _pause_kv_shard_gather():
                 torch.distributed.all_reduce(input_, group=self.device_group)
 
     def reduce_scatter_along_dim(
@@ -1366,8 +1379,7 @@ class GroupCoordinator:
         if pymscclpp_comm is not None and pymscclpp_comm.should_mscclpp_allgather(
             output, input
         ):
-            with paused_background_transfers(Link.NVLINK):
-                pymscclpp_comm.all_gather(output, input)
+            pymscclpp_comm.all_gather(output, input)
             return
 
         pynccl_comm = self.get_available_pynccl_comm()
@@ -1378,10 +1390,10 @@ class GroupCoordinator:
                 self, {"output": output}, "all_gather_into_tensor"
             )
             with pynccl_comm.change_state(enable=True):
-                with paused_background_transfers(Link.NVLINK):
+                with _pause_kv_shard_gather():
                     pynccl_comm.all_gather(output, input)
         else:
-            with paused_background_transfers(Link.NVLINK):
+            with _pause_kv_shard_gather():
                 all_gather_single(output, input, group=self.device_group)
 
     def _has_aiter_custom_all_gather(self) -> bool:
@@ -1434,7 +1446,7 @@ class GroupCoordinator:
 
         if output_tensor_list is not None:
             # TODO(ch-wan): support other backends
-            with paused_background_transfers(Link.NVLINK):
+            with _pause_kv_shard_gather():
                 return torch.distributed.all_gather(
                     output_tensor_list, input_, group=self.device_group
                 )
@@ -1544,7 +1556,7 @@ class GroupCoordinator:
 
             # NCCL enqueues grouped collectives at group_end, so keep the
             # gate closed until the entire group has been submitted.
-            with paused_background_transfers(Link.NVLINK):
+            with _pause_kv_shard_gather():
                 pynccl_comm.group_start()
                 try:
                     for i, inp in enumerate(input_):
