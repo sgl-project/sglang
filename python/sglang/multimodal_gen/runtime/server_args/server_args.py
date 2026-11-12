@@ -2070,6 +2070,7 @@ class ServerArgs(DisaggServerArgsMixin):
             )
 
         current_platform.apply_server_args_defaults(self)
+        current_platform.prepare_attention_backend(self)
         # configure logger before use
         configure_logger(server_args=self)
 

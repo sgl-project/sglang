@@ -2,7 +2,6 @@
 # Adapted from vllm-ascend: https://github.com/vllm-project/vllm-ascend/blob/main/vllm_ascend/platform.py
 
 import os
-from collections.abc import Callable
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any
 
@@ -20,21 +19,6 @@ logger = init_logger(__name__)
 
 if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.server_args.server_args import ServerArgs
-
-
-def load_mindiesd_quant_attention() -> Callable[..., torch.Tensor]:
-    """Load the optional SDK before NPU initialization configures custom OPP paths."""
-    try:
-        from mindiesd import quant_attention
-    except ImportError as error:
-        raise ImportError(
-            "Quantized Ascend FA requires a MindIE-SD build exposing the public "
-            "quant_attention API and its native operators. Install a "
-            "compatible MindIE-SD, torch_npu and CANN build."
-        ) from error
-    if not callable(quant_attention):
-        raise ImportError("mindiesd.quant_attention must be callable")
-    return quant_attention
 
 
 def device_id_to_physical_device_id(device_id: int) -> int:
@@ -59,29 +43,12 @@ class NPUPlatformBase(Platform):
     dispatch_key: str = "NPU"
     device_control_env_var: str = "ASCEND_RT_VISIBLE_DEVICES"
 
-    def apply_server_args_defaults(self, server_args: "ServerArgs") -> None:
-        # Inspect the config without changing the normal ServerArgs parsing flow.
-        config = server_args.attention_backend_config or {}
-        if isinstance(config, str):
-            config = server_args._parse_attention_backend_config(config)
-        if "precision" not in config or config["precision"] == "bf16":
-            return
+    def prepare_attention_backend(self, server_args: "ServerArgs") -> None:
+        from sglang.multimodal_gen.runtime.layers.attention.backends.ascend_fa import (
+            AscendFABackend,
+        )
 
-        components, roles = server_args._split_component_attention_backends(
-            server_args.component_attention_backends,
-            server_args.component_attention_backend_roles,
-        )
-        backends = [server_args.attention_backend, *components.values()]
-        backends.extend(
-            backend for entries in roles.values() for backend in entries.values()
-        )
-        if any(
-            backend is None
-            or server_args._normalize_attention_backend_name(backend) == "fa"
-            for backend in backends
-        ):
-            # Load before device queries so workers inherit the custom OPP paths.
-            load_mindiesd_quant_attention()
+        AscendFABackend.prepare_for_server_args(server_args)
 
     @classmethod
     @lru_cache(maxsize=1)
