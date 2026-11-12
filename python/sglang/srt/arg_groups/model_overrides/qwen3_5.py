@@ -60,8 +60,10 @@ def _qwen3_5_xpu_linear_attn_backend_override(server_args: Any, hf_config: Any) 
     cfg = resolving_view(server_args)
     if cfg._linear_attn_backend_explicitly_set or not get_platform().is_xpu:
         return {}
-    import torch
-
-    if not hasattr(torch.ops.sgl_kernel, "gdn_attention"):
+    try:
+        from sglang.srt.layers.attention.linear.kernels.gdn_xpu import (  # noqa: F401
+            XpuGDNKernel,
+        )
+    except ImportError:
         return {}
     return {"linear_attn_backend": "intel_xpu"}
