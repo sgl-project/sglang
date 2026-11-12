@@ -1460,9 +1460,12 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             member.end_load_reservation()
 
     def prewarm_compaction(self) -> None:
-        """Prewarm the page-move path of every member that compacts."""
+        """Prewarm the page-move path of every member that compacts, and the
+        state copy-on-write that runs the same kernel."""
         for member in self.members:
             member.prewarm_compaction()
+        if self.state is not None:
+            self.state.pool.prewarm_copy()
 
     def compaction_can_run(self) -> bool:
         """Whether bytes freed on either side can serve the other side's next
