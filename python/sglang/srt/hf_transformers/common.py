@@ -705,6 +705,7 @@ def get_generation_config(
     model: str,
     trust_remote_code: bool,
     revision: Optional[str] = None,
+    use_modelscope: Optional[bool] = None,
     **kwargs,
 ):
     if check_gguf_file(model):
@@ -720,8 +721,14 @@ def get_generation_config(
             if has_native_gguf_support(model):
                 return build_gguf_generation_config(model)
 
+    config_class = GenerationConfig
+    if use_modelscope is False:
+        from transformers import GenerationConfig as config_class
+    elif use_modelscope is True:
+        from modelscope import GenerationConfig as config_class
+
     try:
-        return GenerationConfig.from_pretrained(
+        return config_class.from_pretrained(
             model, trust_remote_code=trust_remote_code, revision=revision, **kwargs
         )
     except (FileNotFoundError, OSError) as e:

@@ -686,8 +686,11 @@ def handle_missing_default_values(server_args: Any):
         )
 
     # Handle ModelScope model downloads
-    if envs.SGLANG_USE_MODELSCOPE.get():
-        handle_modelscope_paths(server_args)
+    handle_modelscope_paths(
+        server_args,
+        use_modelscope=envs.SGLANG_USE_MODELSCOPE.get(),
+        draft_use_modelscope=envs.SGLANG_DRAFT_USE_MODELSCOPE.get(),
+    )
 
     # In speculative scenario:
     # - If `speculative_draft_model_quantization` is specified, the draft model uses this quantization method.
