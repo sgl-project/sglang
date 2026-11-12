@@ -250,6 +250,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
+    CacheAwarePolicy,
     PrefillAdder,
     SchedulePolicy,
     mamba_prefill_chunk_grid,
@@ -4380,6 +4381,7 @@ class Scheduler(
         # The request between two chunks: in chunked_reqs, not in waiting_queue.
         resumed_req.init_next_round_input()
         budget = adder.rem_chunk_tokens or 0
+        input_bottleneck = False
         if (
             not get_parallel().dcp_enabled
             and not adder.kv_shard_granule
@@ -4387,15 +4389,32 @@ class Scheduler(
         ):
             # Both budgets are charged by the continuation. Reserving only
             # from the chunk budget can leave no input for waiting requests.
-            budget = min(budget, max(adder.rem_input_tokens, 0))
+            rem_input = max(adder.rem_input_tokens, 0)
+            budget = min(budget, rem_input)
+            input_bottleneck = rem_input < (adder.rem_chunk_tokens or 0)
         # Keep DCP and padded/sharded scheduling unchanged: a shortened cap
         # must be reconciled with their boundaries after other chunk limits.
-        adder.chunked_req_limit = self.policy.shortest_prefill_chunk_limit(
+        limit = self.policy.shortest_prefill_chunk_limit(
             resumed_req,
             self.waiting_queue,
             budget,
             self.page_size,
         )
+        if (
+            limit is None
+            and input_bottleneck
+            and self.waiting_queue
+            and self.policy.policy == CacheAwarePolicy.SHORTEST_PREFILL_FIRST
+            and budget >= 2 * self.page_size
+        ):
+            # No waiter is shorter than the continuation, so SPF reserves no
+            # chunk headroom (reserved == 0). With an input budget tighter than
+            # the chunk budget, an uncapped continuation spends every input
+            # token and breaks the waiting loop on each pass (head-of-line
+            # stall). Leave one page of input headroom so a long waiter can
+            # start as its own chunked request.
+            limit = (budget - self.page_size) // self.page_size * self.page_size
+        adder.chunked_req_limit = limit
         if adder.add_chunked_req(resumed_req) is None:
             # Its last chunk is in this batch.
             move([resumed_req], self.prefill_launched_reqs)

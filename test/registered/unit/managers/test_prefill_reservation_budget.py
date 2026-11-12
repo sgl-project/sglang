@@ -188,6 +188,32 @@ class TestPrefillReservationBudget(CustomTestCase):
         )
         self.assertEqual(continuation.extend_len, 4096)
 
+    def test_all_longer_waiters_keep_input_headroom(self):
+        """An input-bound batch with no shorter waiter must not stall the queue.
+
+        When chunked_prefill_size > max_prefill_tokens and every waiter is
+        longer than the continuation, the SPF policy reserves nothing
+        (reserved == 0). An uncapped continuation then spends the whole input
+        budget and breaks the waiting loop on each pass (head-of-line stall).
+        Keep one page of input headroom so a long waiter can start as its own
+        chunked request.
+        """
+        adder = self.make_adder(page=256, input_budget=2048, chunk_budget=4096)
+        continuation = _Req(0, 8192)
+        long_waiter = _Req(0, 16384)
+        self.schedule_continuation(adder, continuation, [long_waiter])
+        self.assertEqual(continuation.extend_len, 1792)
+        self.assertGreater(adder.rem_input_tokens, 0)
+        self.assertEqual(adder.budget_state(), AddReqResult.CONTINUE)
+
+    def test_input_not_bottleneck_keeps_native_continuation(self):
+        """Normal configs (input >= chunk budget) do not take the fallback."""
+        adder = self.make_adder(page=256, input_budget=4096, chunk_budget=4096)
+        continuation = _Req(0, 8192)
+        long_waiter = _Req(0, 16384)
+        self.schedule_continuation(adder, continuation, [long_waiter])
+        self.assertEqual(continuation.extend_len, 4096)
+
 
 if __name__ == "__main__":
     unittest.main()
