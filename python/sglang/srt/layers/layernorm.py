@@ -40,6 +40,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_flashinfer_available,
+    is_gfx95_supported,
     is_gfx1250_supported,
     is_hip,
     is_musa,
@@ -51,6 +52,7 @@ from sglang.srt.utils import (
 _is_cuda = is_cuda()
 _is_flashinfer_available = is_flashinfer_available()
 _is_hip = is_hip()
+_is_gfx95 = is_gfx95_supported()
 _is_musa = is_musa()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
@@ -457,6 +459,9 @@ def _is_static_per_tensor_fp8_linear(quant_method, linear) -> bool:
 class RMSNorm(BaseFusedOp):
     # Explicit opt-in: implementations must honor use_attn_tp_group=False.
     supports_non_attn_tp_allreduce = True
+    # ROCm without vLLM's norms: forward_hip takes rmsnorm_triton for models that set
+    # this (Inkling2's DSpark draft); the rest keep forward_native.
+    hip_triton = False
 
     # The projection that consumes this norm's output; see fuse_input_quant().
     _quant_linear: Optional[nn.Module] = None
@@ -824,6 +829,21 @@ class RMSNorm(BaseFusedOp):
             output = output.reshape(original_shape)
         return output
 
+    def uses_hip_triton(self, residual=None, post_residual_addition=None) -> bool:
+        """Whether forward_hip computes this norm with rmsnorm_triton (an opted-in
+        norm on gfx95, where it was measured), for fused kernels that reproduce it."""
+        return (
+            self.hip_triton
+            and _is_gfx95
+            and not _has_vllm_rms_norm
+            and post_residual_addition is None
+            and not self.cast_x_before_out_mul
+            and self.variance_size_override is None
+            and self.override_orig_dtype is None
+            and not (residual is not None and self.fp32_residual)
+            and not is_batch_invariant_mode_enabled()
+        )
+
     def forward_hip(
         self,
         x: torch.Tensor,
@@ -831,8 +851,21 @@ class RMSNorm(BaseFusedOp):
         post_residual_addition: Optional[torch.Tensor] = None,
         quant_linear: Optional[nn.Module] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        # Fallback to native implementation if vllm is not available
+        # Without vLLM's (or aiter's) kernels: a Triton kernel with forward_native's
+        # semantics for the plain and fused-residual norms, native for the rest.
         if not _has_vllm_rms_norm:
+            if (
+                self.uses_hip_triton(residual, post_residual_addition)
+                and x.shape[-1] == self.hidden_size
+                and x.numel()
+            ):
+                from sglang.kernels.ops.layernorm.rmsnorm_triton import (
+                    rmsnorm as triton_rmsnorm,
+                )
+
+                return triton_rmsnorm(
+                    x, self.weight.data, self.variance_epsilon, residual
+                )
             return self.forward_native(x, residual, post_residual_addition)
 
         if is_batch_invariant_mode_enabled():

@@ -4,6 +4,13 @@ import triton.language as tl
 from triton.language.extra import libdevice
 
 from sglang.kernels.jit.utils import cache_once, is_arch_support_pdl, load_jit
+from sglang.kernels.ops.inkling2.portability import (
+    IS_HIP,
+    approx_f32,
+    gdc_launch_dependents,
+    gdc_wait,
+    pdl_launch,
+)
 
 PDL = is_arch_support_pdl()
 # Below this many rows the Triton _gate_sink_kernel is faster.
@@ -12,24 +19,8 @@ GATE_SINK_CUDA_MIN_ROWS = 64
 
 @triton.jit
 def _sigmoid(x):
-    exponent = -x * 1.4426950408889634
-    exp = tl.inline_asm_elementwise(
-        "ex2.approx.f32 $0, $1;",
-        constraints="=f,f",
-        args=[exponent],
-        dtype=tl.float32,
-        is_pure=True,
-        pack=1,
-    )
-    denominator = exp + 1.0
-    return tl.inline_asm_elementwise(
-        "rcp.approx.f32 $0, $1;",
-        constraints="=f,f",
-        args=[denominator],
-        dtype=tl.float32,
-        is_pure=True,
-        pack=1,
-    )
+    exp = approx_f32(-x * 1.4426950408889634, "ex2.approx.f32")
+    return approx_f32(exp + 1.0, "rcp.approx.f32")
 
 
 @triton.jit
@@ -50,8 +41,8 @@ def _gate_sink_kernel(
     PADDED_GROUP: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    tl.extra.cuda.gdc_wait()
-    tl.extra.cuda.gdc_launch_dependents()
+    gdc_wait()
+    gdc_launch_dependents()
     row = tl.program_id(0)
     col = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
     mask = col < H * D
@@ -256,6 +247,8 @@ def _gate_sink_module(heads, head_dim, group, padded_group):
 
 def _cuda_gate_sink(output, gate, lse, sinks, result, group, padded_group):
     """_gate_sink_kernel in CUDA; False when an operand layout is unsupported."""
+    if IS_HIP:
+        return False
     heads = sinks.shape[-1]
     head_dim = result.shape[1] // heads
     if not (
@@ -313,7 +306,7 @@ def gate_sink(output, gate, lse, sinks, *, output_dtype, head_groups=None):
             padded_group,
             256,
             enable_fp_fusion=False,
-            launch_pdl=PDL,
+            **pdl_launch(PDL),
         )
     return result
 
@@ -327,8 +320,8 @@ def _tau_kernel(
     N: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    tl.extra.cuda.gdc_wait()
-    tl.extra.cuda.gdc_launch_dependents()
+    gdc_wait()
+    gdc_launch_dependents()
     i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     pos = tl.load(Pos + i, i < N, other=0)
     ratio = tl.maximum((pos + 1).to(tl.float32) * (1.0 / FLOOR), 1.0)
@@ -351,7 +344,7 @@ def compute_log_scaling_tau(positions, n_floor, alpha):
             positions.numel(),
             256,
             enable_fp_fusion=False,
-            launch_pdl=PDL,
+            **pdl_launch(PDL),
         )
     return output
 

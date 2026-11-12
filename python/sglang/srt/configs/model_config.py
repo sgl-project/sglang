@@ -2165,6 +2165,7 @@ class ModelConfig:
             "auto-round-int8",
             "quark_int4fp8_moe",
             "quark_mxfp4",
+            "inkling2",
         ]
         optimized_quantization_methods = [
             "fp8",

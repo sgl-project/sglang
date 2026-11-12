@@ -69,6 +69,7 @@ import torch
 
 from sglang.kernels.ops.attention.kv_indices import (
     create_flashinfer_kv_indices_triton,
+    kv_indices_num_token_blocks,
     spec_kv_index_token_blocks,
 )
 from sglang.kernels.ops.kvcache.kv_read_table import (
@@ -84,8 +85,9 @@ from sglang.srt.mem_cache.kv.alloc.iteration_ids import (
     window_read_extent,
 )
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import is_npu
+from sglang.srt.utils import is_gfx95_supported, is_hip, is_npu
 
+_is_gfx95 = is_hip() and is_gfx95_supported()
 _is_npu = is_npu()
 
 
@@ -659,6 +661,12 @@ class RunnerIds:
         )
         assert src.v2p is None, "pack_read_stream: a table-less translating read"
         assert token_mapping is None or not src.is_translated
+        if _is_gfx95 and num_token_blocks == 1:
+            # gfx95: long rows split their copy over several programs, as the aiter
+            # backend does
+            num_token_blocks = kv_indices_num_token_blocks(
+                src.ids.shape[-1] * src.entry_page_size, bs
+            )
         create_flashinfer_kv_indices_triton[(bs, num_token_blocks)](
             src.ids,
             src.row_ids[:bs],

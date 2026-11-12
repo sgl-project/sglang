@@ -219,8 +219,12 @@ def run_resolution_pipeline(server_args: Any) -> None:
 
     run_hook(handle_platform_defaults, server_args)
 
-    from sglang.srt.arg_groups.memory_hook import handle_gpu_memory_settings
+    from sglang.srt.arg_groups.memory_hook import (
+        apply_inkling_rocm_memory_defaults,
+        handle_gpu_memory_settings,
+    )
 
+    run_hook(apply_inkling_rocm_memory_defaults, server_args)
     run_hook(handle_gpu_memory_settings, server_args)
 
     from sglang.srt.arg_groups.model_hook import (

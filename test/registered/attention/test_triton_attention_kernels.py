@@ -972,6 +972,7 @@ class TestTritonAttention(CustomTestCase):
             backend.static_kv_splits = False
             backend.enable_deterministic = False
             backend.split_tile_size = None
+            backend.decode_split_min_tokens = 0
             backend.cuda_graph_num_kv_splits = torch.zeros(
                 bs, dtype=torch.int32, device=device
             )

@@ -6,9 +6,6 @@ from functools import cache
 import torch
 from torch import nn
 
-from sglang.kernels.ops.attention.flash_attn.cute.batch_invariance import (
-    is_batch_invariant,
-)
 from sglang.kernels.ops.attention.score_mod import (
     relative_bias_score_mod as triton_relative_bias_score_mod,
 )
@@ -927,11 +924,15 @@ class InklingAttention(nn.Module):
         # follows the query count, so the same absolute (q, k) pair accumulates in
         # a different order for a few-query decode step than for a many-query
         # prefill. Deterministic mode takes the score_mod path instead.
-        if (
-            envs.SGLANG_OPT_USE_INKLING_SHEARED_BIAS.get()
-            and fa4
-            and not is_batch_invariant()
-        ):
+        sheared_bias = envs.SGLANG_OPT_USE_INKLING_SHEARED_BIAS.get() and fa4
+        if sheared_bias:
+            # FA4-only: the CuTe package does not import on ROCm.
+            from sglang.kernels.ops.attention.flash_attn.cute.batch_invariance import (
+                is_batch_invariant,
+            )
+
+            sheared_bias = not is_batch_invariant()
+        if sheared_bias:
             # FA4 sheared-bias kernel: pass rel_logits directly; the kernel shears
             # it into a column-aligned pre-softmax bias.
             attn_output = self.attn(

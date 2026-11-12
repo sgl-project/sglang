@@ -84,6 +84,7 @@ class QKL2Clip(nn.Module):
         self.threshold = threshold
         self.eps = eps
         self.tp_rank = tp_rank
+        self.hip = get_platform().is_hip
         if learnable_scale:
             self.scale = nn.Parameter(torch.empty(num_heads, dim), requires_grad=False)
             set_weight_attrs(self.scale, {"weight_loader": self.weight_loader})
@@ -99,6 +100,12 @@ class QKL2Clip(nn.Module):
         param.data.copy_(loaded_weight)
 
     def forward(self, x, *, output_scale=None):
+        if self.hip:
+            from sglang.kernels.ops.inkling2.norm_hip import l2_clip
+
+            return l2_clip(
+                x, self.threshold, self.eps, scale=self.scale, output_scale=output_scale
+            ).view(x.shape)
         from sglang.kernels.ops.inkling2.qk_l2_clip import qk_l2_clip_fwd_cutedsl
 
         output = qk_l2_clip_fwd_cutedsl(
@@ -129,6 +136,7 @@ class Inkling2Attention(nn.Module):
         self.d_rel = config.d_rel
         self.is_local = is_local
         self.layer_id = layer_id
+        self.hip = get_platform().is_hip
         self.scaling = self.head_dim**-0.5
         self.rel_extent = config.sliding_window_size if is_local else config.rel_extent
         self.log_scaling_n_floor = config.log_scaling_n_floor
@@ -316,10 +324,12 @@ class Inkling2Attention(nn.Module):
         *,
         verify=False,
         shear=None,
+        kv_pool=None,
     ):
         """_prologue and rel_logits_proj in one kernel; q and the rel bias come out
         padded when padded. With verify (MTP verify tokens), the K/V conv windows
-        are saved instead of updating the conv cache; shear: see attention_prologue."""
+        are saved instead of updating the conv cache; shear: see attention_prologue.
+        kv_pool (k_buffer, v_buffer, loc) also stores K and V into the KV cache."""
         meta = self.k_sconv._conv_state(forward_batch)
         if self.is_local:
             k_weight, v_weight = self.k_sconv._weight_2d(), self.v_sconv._weight_2d()
@@ -330,7 +340,7 @@ class Inkling2Attention(nn.Module):
             k_proj = self.k_sconv.weight_proj.to(k.dtype)
             v_proj = self.v_sconv.weight_proj.to(v.dtype)
             if (
-                uses_k_groups(k_source, k_proj)
+                uses_k_groups(k_source, k_proj, partials=True)
                 and k_source.shape[0] <= PAIRED_PARTIALS_MAX_TOKENS
                 and k_source.stride() == v_source.stride()
                 and k_proj.stride() == v_proj.stride()
@@ -382,6 +392,7 @@ class Inkling2Attention(nn.Module):
                 if verify
                 else None
             ),
+            kv_pool=kv_pool,
         )
 
     def _project_qkvr(self, x):
@@ -409,9 +420,9 @@ class Inkling2Attention(nn.Module):
         return q, k_proj[1], v_proj[2], r, gate, sinks
 
     def forward(self, hidden_states, positions, forward_batch):
-        assert serving_attention_backend(forward_batch) == "fa4", (
-            "Inkling2 requires FA4 attention"
-        )
+        assert serving_attention_backend(forward_batch) == (
+            "triton" if self.hip else "fa4"
+        ), "Inkling2 requires FA4 attention (Triton on ROCm)"
         mxfp8 = get_model().kv_cache_dtype == "mxfp8"
         sources = (
             AttentionSources(hidden_states, hidden_states, hidden_states)
@@ -420,6 +431,12 @@ class Inkling2Attention(nn.Module):
         )
         q, k, v, r, gate, sinks = self._project_sources(sources)
         tokens = q.shape[0]
+        if self.hip:
+            from sglang.srt.models.inkling_common.inkling2_attn_hip import forward
+
+            return forward(
+                self, q, k, v, r, gate, sinks, sources, positions, forward_batch
+            )
         mode = forward_batch.forward_mode
         verify = mode.is_target_verify()
         compact = (

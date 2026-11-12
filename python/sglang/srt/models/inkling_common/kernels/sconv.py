@@ -5,6 +5,7 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
+from sglang.kernels.ops.inkling2.portability import pdl_launch
 from sglang.srt.utils import is_cuda
 
 _PDL = is_arch_support_pdl()
@@ -1219,5 +1220,5 @@ def save_intermediate_conv_windows(
         BLOCK_D=BLOCK_D,
         PAD_SLOT_ID=PAD_SLOT_ID,
         USE_PDL=_PDL,
-        launch_pdl=_PDL,
+        **pdl_launch(_PDL),
     )

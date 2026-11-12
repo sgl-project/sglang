@@ -3,6 +3,8 @@ from dataclasses import dataclass, field
 import torch
 from torch import nn
 
+from sglang.srt.runtime_context import get_platform
+
 
 def block_attn_res(
     blocks: list[torch.Tensor],
@@ -11,13 +13,32 @@ def block_attn_res(
     *,
     normalize_values: bool = False,
     scaled_queries: torch.Tensor | None = None,
+    norms=None,
+    out: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, ...]:
+    """norms (ROCm only): one (weight, pre_weight, eps, dtype) RMSNorm per query,
+    applied in the same kernel; out receives the normalized (queries, tokens, hidden)."""
     if queries.ndim == 1:
         queries = queries.unsqueeze(0)
     assert queries.ndim == 2
     partial_addend = None
     if isinstance(partial_block, tuple):
         partial_block, partial_addend = partial_block
+    if get_platform().is_hip and partial_block is not None:
+        from sglang.kernels.ops.inkling2.norm_hip import attn_res as attn_res_hip
+
+        sources = [*blocks, partial_block]
+        return attn_res_hip(
+            sources,
+            partial_addend,
+            scaled_queries.view(queries.shape)
+            if scaled_queries is not None
+            else queries.float() * (sources[0].shape[-1] ** -0.5),
+            normalize_values=normalize_values,
+            norms=norms,
+            out=out,
+        )
+    assert norms is None, "Fused block attention residual norms are ROCm-only"
     sources = [*blocks, partial_block] if partial_block is not None else list(blocks)
     hidden_size = sources[0].shape[-1]
     assert queries.shape[-1] == hidden_size
@@ -118,20 +139,35 @@ class Inkling2AttnResState:
     partial: torch.Tensor
     blocks: list[torch.Tensor] = field(default_factory=list)
 
-    def attention_input(self, layer_idx: int) -> tuple[torch.Tensor, ...]:
+    def attention_input(
+        self, layer_idx: int, norms=None, out: torch.Tensor | None = None
+    ) -> tuple[torch.Tensor, ...]:
+        """With norms (ROCm), the inputs come out RMS-normalized, into out if given."""
+        count = 1 if layer_idx in self.attn_res.local_layer_ids else 3
+        if not self.blocks and norms is None:
+            return (self.partial,) * count
         if not self.blocks:
-            return (self.partial,) * (
-                1 if layer_idx in self.attn_res.local_layer_ids else 3
+            # A single source takes all the weight, whatever the query.
+            queries = self.partial.new_zeros(
+                (count, self.partial.shape[-1]), dtype=torch.float32
             )
+            scaled = queries
+        else:
+            queries = self.attn_res.attn_query(layer_idx)
+            scaled = self.attn_res.scaled_query("attn", layer_idx)
         return block_attn_res(
             self.blocks,
             self.partial,
-            self.attn_res.attn_query(layer_idx),
+            queries,
             normalize_values=self.attn_res.normalize_values,
-            scaled_queries=self.attn_res.scaled_query("attn", layer_idx),
+            scaled_queries=scaled,
+            norms=norms,
+            out=out,
         )
 
-    def mlp_input(self, layer_idx: int, attn_output: torch.Tensor) -> torch.Tensor:
+    def mlp_input(
+        self, layer_idx: int, attn_output: torch.Tensor, norms=None
+    ) -> torch.Tensor:
         if self.attn_res.is_block_boundary(layer_idx):
             blocks, partial = [*self.blocks, self.partial], attn_output
         else:
@@ -142,6 +178,7 @@ class Inkling2AttnResState:
             self.attn_res.mlp_queries[layer_idx],
             normalize_values=self.attn_res.normalize_values,
             scaled_queries=self.attn_res.scaled_query("mlp", layer_idx),
+            norms=norms,
         )[0]
 
     def finalize_layer(

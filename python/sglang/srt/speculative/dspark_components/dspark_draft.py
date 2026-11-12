@@ -21,9 +21,11 @@ from sglang.srt.model_executor.forward_batch_info import (
     enable_num_token_non_padded,
 )
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
+from sglang.srt.runtime_context import get_platform
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.draft_parallel import resolve_draft_parallel_layout
 from sglang.srt.speculative.draft_worker_common import make_draft_input_v2
+from sglang.srt.speculative.dspark_components import dspark_draft_hip
 from sglang.srt.speculative.dspark_components.dspark_planner import VerifyWindow
 from sglang.srt.speculative.spec_info import (
     SpeculativeAlgorithm,
@@ -225,9 +227,14 @@ def _draft_step(
                 w2_weight=w2_weight,
             )
             return tokens, state
-    bias, state = markov_head.step_bias(
-        prev_tokens, hidden_states=hidden_states, state=state
+    # fold: bias holds the latents and the sampling kernel computes the step bias.
+    fold = (
+        dspark_draft_hip.step_fold(markov_head, prev_tokens)
+        if sharded_accept and get_platform().is_hip
+        else None
     )
+    step_bias = markov_head.step_bias if fold is None else markov_head.step_latent
+    bias, state = step_bias(prev_tokens, hidden_states=hidden_states, state=state)
     shard = markov_head.vocab_shard
     sharded = (
         {}
@@ -251,6 +258,7 @@ def _draft_step(
         has_sampled_rows=None if logits_out is not None else False,
         softcap=markov_head.step_softcap,
         vocab_limit=markov_head.step_vocab_limit,
+        **({} if fold is None else {"fold": fold}),
         **sharded,
     )
     return tokens, state

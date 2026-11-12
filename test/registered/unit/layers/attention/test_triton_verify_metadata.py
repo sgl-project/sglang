@@ -204,6 +204,7 @@ def test_unified_target_verify_uses_resolved_metadata(with_spec_info):
         sliding_window_size=16,
         scaling=0.5,
         xai_temperature_len=None,
+        out_dtype=None,
     )
     forward_batch = SimpleNamespace(
         batch_size=batch_size,
