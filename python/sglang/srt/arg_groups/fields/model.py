@@ -235,7 +235,6 @@ class Model(msgspec.Struct):
                 "lightning indexer."
             ),
             choices=["int8"],
-            resolvable=True,
         ),
     ] = None
     qsa_indexer_dtype: A[
