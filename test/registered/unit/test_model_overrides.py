@@ -3286,6 +3286,9 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 page_size=None,
                 linear_attn_backend="triton",
                 linear_attn_prefill_backend=None,
+                radix_eviction_policy="lru",
+                _radix_eviction_policy_explicitly_set=True,
+                enable_session_radix_cache=False,
             )
             defaults.update(kw)
             return ResolvedView(
@@ -3364,6 +3367,21 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                         "mamba_radix_cache_strategy": "extra_buffer",
                     },
                 )
+        # an unset eviction policy resolves to gds; an explicit lru and the
+        # session radix cache, which gds rejects on these models, keep lru
+        unset = {"_radix_eviction_policy_explicitly_set": False}
+        self.assertEqual(
+            _mamba_radix_cache_resolution(_view("Qwen3NextForCausalLM", **unset))[
+                "radix_eviction_policy"
+            ],
+            "gds",
+        )
+        for kw in ({}, {**unset, "enable_session_radix_cache": True}):
+            with self.subTest(**kw):
+                self.assertNotIn(
+                    "radix_eviction_policy",
+                    _mamba_radix_cache_resolution(_view("Qwen3NextForCausalLM", **kw)),
+                )
         # GraniteMoeHybrid is guarded on mamba layer types
         self.assertEqual(
             _mamba_radix_cache_resolution(
@@ -3421,6 +3439,9 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 page_size=None,
                 linear_attn_backend="triton",
                 linear_attn_prefill_backend=None,
+                radix_eviction_policy="lru",
+                _radix_eviction_policy_explicitly_set=True,
+                enable_session_radix_cache=False,
             )
             defaults.update(kw)
             return ResolvedView(
@@ -4537,6 +4558,46 @@ class TestQwen3VLHopperServingOverrides(CustomTestCase):
         self.assertEqual(envs.SGLANG_MM_FEATURE_CACHE_MB.get(), 2048)
 
 
+class TestKimiK31HiSparseDsaBackends(CustomTestCase):
+    @staticmethod
+    def _resolve(**fields):
+        from sglang.srt.arg_groups.model_override_base import ResolvedView
+        from sglang.srt.arg_groups.overrides import _dsa_split_backend_resolution
+
+        hf = SimpleNamespace(
+            architectures=["KimiK31ForConditionalGeneration"], index_topk=2048
+        )
+        args = dict(
+            kv_cache_dtype="fp8_e4m3",
+            dsa_prefill_backend=None,
+            dsa_decode_backend=None,
+            enable_hisparse=True,
+            dcp_size=1,
+        )
+        args.update(fields)
+        view = ResolvedView(
+            SimpleNamespace(_model_config=SimpleNamespace(hf_config=hf), **args)
+        )
+        with (
+            patch("sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True),
+            override_platform(is_npu=False),
+            override_platform(is_xpu=False),
+            override_platform(is_hip=False),
+            patch("torch.cuda.get_device_capability", return_value=(10, 0)),
+        ):
+            return _dsa_split_backend_resolution(view)
+
+    def test_hisparse_defaults_to_flashmla_kv(self):
+        self.assertEqual(
+            self._resolve(),
+            {"dsa_prefill_backend": "flashmla_kv", "dsa_decode_backend": "flashmla_kv"},
+        )
+
+    def test_hisparse_rejects_trtllm(self):
+        with self.assertRaisesRegex(ValueError, "HiSparse requires DSA backend"):
+            self._resolve(dsa_decode_backend="trtllm")
+
+
 class TestDeterministicAttentionBackendOnXpu(unittest.TestCase):
     """The deterministic fallback must not hand XPU a CUDA-only backend.
 
@@ -4571,6 +4632,58 @@ class TestDeterministicAttentionBackendOnXpu(unittest.TestCase):
                 self._view("triton")
             )
         self.assertEqual(updates, {})
+
+
+class TestGlm5NextAgenticMambaPool(CustomTestCase):
+    ARCH = "Glm5NextForConditionalGeneration"
+
+    def _declared(self, supports_extra_buffer=True, **fields):
+        from sglang.srt.arg_groups.model_overrides.glm5_next import (
+            _glm5_next_overrides,
+        )
+
+        args = dict(
+            mamba_full_memory_ratio=None,
+            mamba_radix_cache_strategy="auto",
+            disaggregation_mode="null",
+            disable_overlap_schedule=False,
+            pp_size=1,
+        )
+        args.update(fields)
+        with patch.object(
+            overrides_module,
+            "supports_mamba_cache_extra_buffer",
+            return_value=supports_extra_buffer,
+        ):
+            return _glm5_next_overrides(
+                SimpleNamespace(**args), SimpleNamespace(architectures=[self.ARCH])
+            )
+
+    def test_defaults_to_agentic_pool(self):
+        self.assertEqual(
+            self._declared(),
+            {
+                "mamba_full_memory_ratio": 0.25,
+                "mamba_radix_cache_strategy": "extra_buffer_lazy",
+            },
+        )
+
+    def test_explicit_values_and_unsupported_lazy_keep_their_strategy(self):
+        self.assertEqual(
+            self._declared(mamba_full_memory_ratio=0.9),
+            {"mamba_radix_cache_strategy": "extra_buffer_lazy"},
+        )
+        for fields in (
+            dict(mamba_radix_cache_strategy="extra_buffer"),
+            dict(supports_extra_buffer=False),
+            dict(disaggregation_mode="prefill"),
+            dict(disable_overlap_schedule=True),
+            dict(pp_size=2),
+        ):
+            with self.subTest(**fields):
+                self.assertEqual(
+                    self._declared(**fields), {"mamba_full_memory_ratio": 0.25}
+                )
 
 
 if __name__ == "__main__":

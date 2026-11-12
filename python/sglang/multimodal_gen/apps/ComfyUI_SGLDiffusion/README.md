@@ -5,10 +5,10 @@ server. Integrated mode keeps ComfyUI's CLIP / VAE / sampler loop and uses
 SGLang only as a per-step DiT forward.
 
 Integrated mode no longer ships dedicated `comfyui_*` pipelines. It starts the
-native Flux / Qwen-Image / Z-Image / MiniMax-H3 pipeline under `--comfyui-mode`,
-loads a single-file ComfyUI `.safetensors` (or GGUF overlay) through a
-checkpoint spec, and translates each `apply_model` call through a small
-per-model adapter.
+native Flux / Qwen-Image / Qwen-Image-2.1 / Z-Image / LTX-2 / MiniMax-H3
+pipeline with `comfyui_mode` set, loads a single-file ComfyUI `.safetensors`
+(or GGUF overlay) through a checkpoint spec, and translates each `apply_model`
+call through a small per-model adapter.
 
 ## Installation
 
@@ -127,12 +127,18 @@ Take **Integrated Mode** only when the model denoises a single latent tensor
 that ComfyUI already knows how to build and decode, so its KSampler can drive
 the loop unchanged. Each model then needs:
 
-- `runtime/pipelines/comfyui_<model>_pipeline.py` mapping ComfyUI's
-  single-file checkpoint layout onto the native module tree (350-690 lines in
-  the existing three)
-- an executor in `executors/` adapting latent layout and conditioning to `Req`
-- entries in both `pipeline_class_dict` and `executor_class_dict` in
-  `core/generator.py`
+- a checkpoint spec module in `runtime/loader/comfyui_checkpoints/<model>.py`
+  mapping ComfyUI's single-file checkpoint layout onto the native module tree,
+  imported in that package's `__init__.py` so it registers
+- a `ComfyUIModelAdapter` subclass (setting `model_types` and
+  `pipeline_class_name`) and an `SGLDiffusionExecutor` subclass in `executors/`
+  adapting latent layout and conditioning to `Req`
+- the executor class added to `_load_executor_classes()` in
+  `core/generator.py`, which builds `pipeline_class_dict` and
+  `executor_class_dict` automatically
+
+The native pipeline runs under `comfyui_mode` (override `create_comfyui_stages`
+if needed). Do not add a `comfyui_*` pipeline class.
 
 ## Example Workflows
 
@@ -207,7 +213,7 @@ flowchart LR
     R0 -->|otherwise| PYO["Original SP / CFG / TP<br/>broadcast_pyobj"]
     NCCL --> PIPE
     PYO --> PIPE
-    PIPE["Native pipeline<br/>--comfyui-mode"]
+    PIPE["Native pipeline<br/>comfyui_mode"]
     SPEC["Checkpoint spec<br/>single .safetensors"] --> PIPE
     PIPE --> STAGE["Latent prep + session cache<br/>+ DenoisingStage"]
   end
@@ -220,7 +226,7 @@ Per sampler step:
 
 1. The adapter turns ComfyUI `apply_model` tensors into an SGLang `Req`.
 2. Local ZMQ pickle replaces CUDA tensors with IPC handles so latents stay on GPU.
-3. Rank 0 materializes the handles. Multi-rank `--comfyui-mode` then detaches CUDA tensors and broadcasts them over NCCL; the general SP / CFG / TP path is still the original whole-list `broadcast_pyobj`.
+3. Rank 0 materializes the handles. Multi-rank `comfyui_mode` then detaches CUDA tensors and broadcasts them over NCCL; the general SP / CFG / TP path is still the original whole-list `broadcast_pyobj`.
 4. The worker pipeline is the native model class with modules trimmed to `transformer` + pass-through scheduler. A single-file checkpoint goes through `comfyui_checkpoints`. After the first step, conditioning stays in a worker session; later steps send latents and the timestep.
 
 Adding a model means a checkpoint spec plus a `ComfyUIModelAdapter`. There is no extra ComfyUI pipeline class.

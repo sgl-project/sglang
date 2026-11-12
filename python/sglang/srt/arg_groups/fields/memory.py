@@ -23,7 +23,7 @@ class Memory(msgspec.Struct):
 
     _NS_PATH = "memory"
     radix_eviction_policy: A[
-        str,
+        Optional[str],
         Arg(
             help=(
                 "The eviction policy of radix trees. 'lru' stands for Least "
@@ -34,17 +34,23 @@ class Memory(msgspec.Struct):
                 "a conversation that cannot affect tail TTFT before falling back "
                 "to LRU. 'joint_lru' evicts full-attention and SWA KV in one "
                 "shared least-recently-used order on a full/SWA hybrid model with "
-                "--enable-unified-memory, and acts as 'lru' elsewhere. See "
+                "--enable-unified-memory, and acts as 'lru' elsewhere. 'gds' evicts "
+                "cached recurrent-state checkpoints on hybrid models by GreedyDual-Size "
+                "over the prefill each one saves, and acts as 'lru' on other models. "
+                "Unset means 'lru', or 'gds' on hybrid models on the Mamba radix "
+                "cache list (e.g. Qwen3-Next, GLM-5.3-Flash) unless "
+                "--enable-session-radix-cache is on. See "
                 "https://docs.sglang.io/docs/advanced_features/radix_eviction_policy "
                 "for what each policy optimizes for."
             ),
             choices=RADIX_EVICTION_POLICY_CHOICES,
             resolvable=True,
+            fallback="lru",
         ),
-    ] = "lru"
-    # The value alone cannot distinguish the default from an explicit LRU
-    # choice, which model-specific defaults must preserve.
-    _radix_eviction_policy_explicitly_set: A[bool, Arg(no_cli=True)] = False
+    ] = None
+    # Whether the caller chose the policy, which model-specific defaults must keep.
+    # Resolution fills it from whether radix_eviction_policy was left None.
+    _radix_eviction_policy_explicitly_set: A[Optional[bool], Arg(no_cli=True)] = None
     radix_eviction_policy_config: A[
         Optional[Dict[str, Any]],
         Arg(
@@ -54,7 +60,9 @@ class Memory(msgspec.Struct):
                 "protected_threshold (int, default 2), e.g. "
                 "'{\"protected_threshold\": 4}'; 'tlru' takes threshold and "
                 "next_prompt_estimate (ints, tokens), e.g. "
-                '\'{"threshold": 4096, "next_prompt_estimate": 512}\'. An '
+                "'{\"threshold\": 4096, \"next_prompt_estimate\": 512}'; 'gds' takes "
+                "the prefill cost coefficients d and e (floats, only their ratio "
+                'matters), e.g. \'{"d": 1.862e-5, "e": 3.33e-6}\'. An '
                 "unrecognized key fails at startup, naming the key and the "
                 "policy. See "
                 "https://docs.sglang.io/docs/advanced_features/radix_eviction_policy#policy-parameters "
@@ -143,6 +151,7 @@ class Memory(msgspec.Struct):
                 "page_first",
                 "page_first_direct",
                 "page_first_kv_split",
+                "layer_first_kv_split",
                 "page_head",
                 "page_unified",
             ],

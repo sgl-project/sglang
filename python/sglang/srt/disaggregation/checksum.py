@@ -150,6 +150,24 @@ class KvChecksumComputer:
         assert len(self._state_data_ptrs) == len(self._state_item_lens)
         assert self._kv_data_ptrs or self._state_data_ptrs
 
+    @classmethod
+    def for_kv_args(cls, kv_args, device: torch.device) -> KvChecksumComputer:
+        """Leaves out a DFLASH draft KV ring's two entries (rows and floor): they
+        are addressed per position, not by the request's state slots."""
+        from sglang.srt.disaggregation.base.conn import StateType
+
+        keep = list(range(len(kv_args.state_types)))
+        if StateType.DRAFT_RING in kv_args.state_types:
+            ring = kv_args.state_types.index(StateType.DRAFT_RING)
+            keep = [i for i in keep if i not in (ring, ring + 1)]
+        return cls(
+            device=device,
+            kv_data_ptrs=kv_args.kv_data_ptrs,
+            kv_item_lens=kv_args.kv_item_lens,
+            state_data_ptrs=[kv_args.state_data_ptrs[i] for i in keep],
+            state_item_lens=[kv_args.state_item_lens[i] for i in keep],
+        )
+
     def compute(
         self,
         kv_page_indices_gpu: torch.Tensor,
