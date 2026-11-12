@@ -123,8 +123,8 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     TreeLock,
 )
-from sglang.srt.mem_cache.capacity import capacity_decision
 from sglang.srt.mem_cache.cache_write_usage import CacheWriteUsage
+from sglang.srt.mem_cache.capacity import capacity_decision
 from sglang.srt.mem_cache.common import (
     RetractionBackup,
     evict_from_tree_cache,
