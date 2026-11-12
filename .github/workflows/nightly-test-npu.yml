@@ -329,7 +329,8 @@ jobs:
 
   nightly-acc-4-npu-a5:
     name: nightly-acc-4-npu-a5
-    if: ${{ !cancelled() }}
+    if: false # TEMP: only the perf in8k case reruns
+
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -361,7 +362,8 @@ jobs:
 
   nightly-poc-multi-node-tests:
     name: multi-node-poc
-    if: ${{ !cancelled() }}
+    if: false # TEMP: only the perf in8k case reruns
+
     needs: [set-image-config, nightly-perf-2-npu-a3, nightly-perf-4-npu-a3, nightly-perf-16-npu-a3, nightly-acc-2-npu-a3, nightly-acc-16-npu-a3]
     strategy:
       fail-fast: false
