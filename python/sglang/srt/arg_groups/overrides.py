@@ -556,6 +556,12 @@ def _check_dsa_backend_constraints(
     """Validate DSA backend / platform / kv-cache-dtype constraints."""
     chosen = {prefill_backend, decode_backend}
 
+    # The SM100/SM103/SM107 check is check_prims_ts_sparse_mla_support, at backend init.
+    if "prims_ts" in chosen and (hip or kv_cache_dtype != "fp8_e4m3"):
+        raise ValueError(
+            "The prims_ts DSA backend needs CUDA and --kv-cache-dtype fp8_e4m3."
+        )
+
     rocm_only = {"triton"} & chosen
     if not hip and rocm_only:
         raise ValueError(
@@ -764,7 +770,7 @@ def _pin_dsa_backends(
 
 # Matches the reference fp8_ds_mla cache; trtllm's 576 B layout does not.
 _KIMI_K31_DSA_BACKEND = "flashmla_kv"
-_KIMI_K31_DSA_BACKENDS = ("flashmla_kv", "trtllm")
+_KIMI_K31_DSA_BACKENDS = ("flashmla_kv", "trtllm", "prims_ts")
 # ROCm: the Triton kernels dequantize the same fp8_ds_mla rows and run BF16 dots.
 _KIMI_K31_DSA_BACKEND_HIP = "triton"
 
@@ -808,16 +814,16 @@ def _kimi_k31_dsa_backends(view: Any) -> dict:
     if len(chosen) > 1:
         raise ValueError(
             "Kimi-K3.1 needs the same --dsa-prefill-backend and "
-            "--dsa-decode-backend (flashmla_kv and trtllm use different KV "
-            f"layouts); got {view.dsa_prefill_backend!r} and "
+            "--dsa-decode-backend (flashmla_kv and trtllm / prims_ts use "
+            f"different KV layouts); got {view.dsa_prefill_backend!r} and "
             f"{view.dsa_decode_backend!r}."
         )
     backend = chosen.pop() if chosen else _KIMI_K31_DSA_BACKEND
-    if backend == "trtllm":
+    if backend in ("trtllm", "prims_ts"):
         logger.warning(
-            "Kimi-K3.1 trtllm DSA uses FP8 q and an unscaled FP8 KV cache, not "
-            "the reference fp8_ds_mla numerics. PD prefill and decode must both "
-            "use trtllm."
+            f"Kimi-K3.1 {backend} DSA uses FP8 q and an unscaled FP8 KV cache, not "
+            "the reference fp8_ds_mla numerics. PD prefill and decode servers must "
+            "both use a raw-FP8-KV backend (trtllm or prims_ts)."
         )
     declared = {f: backend for f in fields if getattr(view, f) is None}
     logger.warning(

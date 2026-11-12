@@ -317,7 +317,8 @@ class ExecKernel(msgspec.Struct):
     dsa_prefill_backend: A[
         Optional[str],
         Arg(
-            help="DSA (DeepSeek Sparse Attention) prefill backend. If not specified, auto-detects based on hardware and kv_cache_dtype.",
+            help="DSA (DeepSeek Sparse Attention) prefill backend. If not specified, auto-detects based on hardware and kv_cache_dtype. "
+            "'prims_ts': FlashInfer Prims-TS sparse MLA (SM100/SM103/SM107, fp8_e4m3 KV).",
             choices=[
                 "flashmla_sparse",
                 "flashmla_sparse_q8",
@@ -330,6 +331,7 @@ class ExecKernel(msgspec.Struct):
                 "triton",
                 "aiter",
                 "trtllm",
+                "prims_ts",
                 "intel_xpu",
             ],
             resolvable=True,
@@ -367,7 +369,8 @@ class ExecKernel(msgspec.Struct):
     dsa_decode_backend: A[
         Optional[str],
         Arg(
-            help="DSA (DeepSeek Sparse Attention) decode backend. If not specified, auto-detects based on hardware and kv_cache_dtype.",
+            help="DSA (DeepSeek Sparse Attention) decode backend. If not specified, auto-detects based on hardware and kv_cache_dtype. "
+            "'prims_ts': FlashInfer Prims-TS sparse MLA (SM100/SM103/SM107, fp8_e4m3 KV).",
             choices=[
                 "flashmla_sparse",
                 "flashmla_sparse_q8",
@@ -379,6 +382,7 @@ class ExecKernel(msgspec.Struct):
                 "triton",
                 "aiter",
                 "trtllm",
+                "prims_ts",
                 "intel_xpu",
             ],
             resolvable=True,
