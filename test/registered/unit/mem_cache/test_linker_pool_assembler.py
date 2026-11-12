@@ -4,6 +4,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
 
+import numpy as np
 import torch
 
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
@@ -73,6 +74,32 @@ class TestDevicePoolEntry(CustomTestCase):
         )
         self.assertEqual(sizes, [[10], [22], [10], [22]])
         self.assertEqual(offsets, [[6], [14], [6], [14]])
+
+    def test_layer_ranges_preserve_layout_and_row_order(self):
+        buffers = [torch.zeros((6, width), dtype=torch.uint8) for width in (3, 5)]
+        for packed in (True, False):
+            pool = DevicePoolEntry(
+                name=PoolName.KV,
+                indices_from_pool=PoolName.KV,
+                device_pool=None,
+                components=[buffers],
+                layer_mapping={0: (0, 1)},
+                page_size=1,
+                rows_are_pages=True,
+                packed=packed,
+            )
+            for rows in ([4, 0, 4], []):
+                ptrs = [[buffer[row].data_ptr() for buffer in buffers] for row in rows]
+                expected = (ptrs, [[3, 5]] * len(rows), [[0, 3]] * len(rows))
+                if not packed:
+                    expected = tuple(
+                        [[value] for row in part for value in row] for part in expected
+                    )
+                for locations in (rows, np.asarray(rows, dtype=np.int64)):
+                    with self.subTest(packed=packed, rows=rows, kind=type(locations)):
+                        self.assertEqual(
+                            pool.get_prepared_layer_range_meta(locations, 0), expected
+                        )
 
     def test_rejects_invalid_pages_and_empty_buffers(self):
         with self.assertRaisesRegex(ValueError, "has no storage buffers"):
@@ -841,6 +868,7 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
     def test_mla_mamba_maps_kv_pages_and_state_slots(self):
         from sglang.srt.mem_cache.hybrid_cache import linker_pool_assembler
         from sglang.srt.mem_cache.memory_pool import (
+            DSATokenToKVPool,
             HybridLinearKVPool,
             MHATokenToKVPool,
             MLATokenToKVPool,
@@ -886,8 +914,11 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
                 patch.object(
                     linker_pool_assembler,
                     "get_parallel",
-                    return_value=SimpleNamespace(attn_dcp_size=dcp_size),
+                    return_value=SimpleNamespace(
+                        attn_dcp_size=dcp_size, attn_dcp_rank=1
+                    ),
                 ),
+                patch.object(MLATokenToKVPool, "rows_are_dcp_collapsed", new=True),
             ):
                 return resolve_hybrid_device_pool_group(
                     kvcache=kvcache,
@@ -906,9 +937,54 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         self.assertEqual(mamba.prepare_locations(torch.tensor([3])), [3])
         self.assertEqual(group.sources[PoolName.DRAFT], PoolName.KV)
         self.assertEqual(group.entry_map[PoolName.DRAFT].layer_mapping, {0: (0, 1)})
+        self.assertNotIn(PoolName.INDEXER, group.entry_map)
 
-        with self.assertRaisesRegex(ValueError, "plain MLA"):
-            resolve(dcp_size=2)
+        mla = kvcache.full_kv_pool
+        dsa = DSATokenToKVPool.__new__(DSATokenToKVPool)
+        dsa.kv_buffer = mla.kv_buffer
+        dsa.index_key_cache = SimpleNamespace(
+            buffer=[
+                torch.zeros((0, 3), dtype=torch.uint8),
+                torch.zeros((4, 3), dtype=torch.uint8),
+            ]
+        )
+        kvcache.full_kv_pool = dsa
+        group = resolve()
+        indexer = group.entry_map[PoolName.INDEXER]
+        self.assertEqual(group.sources[PoolName.INDEXER], PoolName.KV)
+        self.assertEqual(indexer.layer_mapping, {3: 0})
+        self.assertEqual(indexer.prepare_locations(torch.tensor([2, 3])), [1])
+        self.assertEqual(
+            {name: entry.tp_replicated for name, entry in group.entry_map.items()},
+            {
+                PoolName.KV: True,
+                PoolName.INDEXER: True,
+                PoolName.MAMBA: False,
+                PoolName.DRAFT: False,
+            },
+        )
+        dsa.page_size = dsa.index_page_size = 1
+        group = resolve(dcp_size=2)
+        for name in (PoolName.KV, PoolName.INDEXER):
+            entry = group.entry_map[name]
+            self.assertTrue(entry.dcp_sharded, name)
+            locations = entry.prepare_locations(
+                entry.translate_indices(torch.tensor([4, 5]))
+            )
+            self.assertEqual(locations, [2], name)
+        kvcache.full_kv_pool = mla
+
+        mla_draft = MLATokenToKVPool.__new__(MLATokenToKVPool)
+        mla_draft.page_size, mla_draft.layer_num = 2, 2
+        mla_draft.kv_buffer = [
+            torch.zeros((8, 1, 5), dtype=torch.uint8) for _ in range(2)
+        ]
+        params.sidecar_draft_device_pools = (mla_draft,)
+        draft_entry = resolve().entry_map[PoolName.DRAFT]
+        self.assertEqual(draft_entry.layer_mapping, {0: 0, 1: 1})
+        self.assertEqual(draft_entry.prepare_locations(torch.tensor([2, 3])), [2])
+        params.sidecar_draft_device_pools = (draft,)
+
         params.mtp_draft_device_pools = (object(),)
         with self.assertRaisesRegex(ValueError, "plain MLA"):
             resolve()

@@ -107,14 +107,10 @@ def test_marlin_mxfp8(tokens):
 
 
 @hopper
-@pytest.mark.parametrize("impl", ["triton", "fa4"])
 @pytest.mark.parametrize("qlen", [1, 8])
 @pytest.mark.parametrize("window", [None, 1023])
-def test_decode_attention(window, qlen, impl):
-    from sglang.kernels.ops.inkling2.decode_attention_sm90 import (
-        decode_partials,
-        fa4_decode_partials,
-    )
+def test_decode_attention(window, qlen):
+    from sglang.kernels.ops.inkling2.decode_attention_sm90 import decode_partials
 
     d, group, page, extent = 128, 6, 128, 1024
     seqlens = [qlen, 77, 2049, 0 if qlen == 1 else 2111]
@@ -130,8 +126,7 @@ def test_decode_attention(window, qlen, impl):
     bias = torch.randn(batch * qlen, group, extent, device="cuda", dtype=torch.bfloat16)
     lens = torch.tensor(seqlens, device="cuda", dtype=torch.int32)
     scale = d**-0.5
-    partials = decode_partials if impl == "triton" else fa4_decode_partials
-    o, m, l = partials(
+    o, m, l = decode_partials(
         q, k_cache, v_cache, page_table, lens, bias, scale, window_size_left=window
     )
     m = m.reshape(m.shape[0], -1, m.shape[-1])

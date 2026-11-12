@@ -223,15 +223,9 @@ def rel_bias_partials(
                 else None
             ),
         )
-    from sglang.kernels.ops.inkling2.decode_attention_sm90 import (
-        decode_partials,
-        fa4_decode_partials,
-    )
+    from sglang.kernels.ops.inkling2.decode_attention_sm90 import decode_partials
 
-    use_triton = not verify or (
-        window_size_left is not None and seqused_k.shape[0] * k_cache.shape[2] < 8
-    )
-    return (decode_partials if use_triton else fa4_decode_partials)(
+    return decode_partials(
         q,
         k_cache,
         v_cache,

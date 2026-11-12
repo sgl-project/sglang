@@ -179,7 +179,7 @@ class InklingBatchDenseMLP(nn.Module, FusedMoELoadingMixin):
 
             self.quant_method = InklingNvfp4MoEMethod(quant_config=quant_config)
         else:
-            self.quant_method = _InklingUnquantizedFusedMoEMethod(False)
+            self.quant_method = _InklingUnquantizedFusedMoEMethod()
         self.moe_ep_size = 1
         self.moe_ep_rank = 0
         self.num_experts = n_shared_experts

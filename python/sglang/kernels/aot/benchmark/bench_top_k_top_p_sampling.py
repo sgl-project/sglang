@@ -7,9 +7,9 @@ import torch
 import triton
 import triton.testing
 
-from sglang.utils import is_in_ci
+from sglang.srt.environ import envs
 
-IS_CI = is_in_ci()
+IS_CI = envs.SGLANG_IS_IN_CI.get()
 
 
 def torch_top_k_top_p_joint_sampling_from_probs(

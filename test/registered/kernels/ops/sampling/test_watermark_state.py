@@ -12,7 +12,7 @@ from sglang.srt.sampling.watermarking.core import (
 from sglang.srt.sampling.watermarking.detector import hash_context
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 
 def test_repeated_context_and_greedy_bypass():

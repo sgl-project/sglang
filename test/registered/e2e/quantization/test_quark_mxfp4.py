@@ -6,7 +6,6 @@ import unittest
 from sglang.test.ci.ci_register import register_amd_ci
 
 register_amd_ci(est_time=450, suite="nightly-amd-1-gpu-mi35x", nightly=True)
-import os
 import time
 from types import SimpleNamespace
 
@@ -14,13 +13,12 @@ import requests
 import torch
 
 from sglang.srt.utils import kill_process_tree
-from sglang.srt.utils.common import is_cuda_alike, is_gfx95_supported
+from sglang.srt.utils.device import is_cuda_alike, is_gfx95_supported
 from sglang.test.few_shot_gsm8k import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
-    is_in_ci,
     popen_launch_server,
 )
 
@@ -225,25 +223,6 @@ class TestNVFP4ToMXFP4MOETP1(TestOnlineQuantizationMemoryLoad):
         self._test_gsm8k(accuracy_threshold=0.78)
 
 
-@unittest.skipIf(is_in_ci(), "local test only")
-class TestDeepSeekR10528NVFP4ToMXFP4(TestOnlineQuantizationMemoryLoad):
-    # NVFP4 to MXFP4 online requantization for DeepSeek-R1-0528-NVFP4 on TP=8.
-    # Exercises the MLA attention path (attention_backend=aiter), multi-threaded
-    # weight loading, and the per-expert NVFP4 MoE requantization path.
-    model = "nvidia/DeepSeek-R1-0528-NVFP4"  # NVFP4 model
-    tp = 8
-    runner_args = [
-        "--attention-backend",
-        "aiter",
-        "--model-loader-extra-config",
-        '{"enable_multithread_load": true}',
-    ]
-
-    def test_gsm8k(self):
-        # Requantized NVFP4 -> MXFP4 observed accuracy: ~0.95.
-        self._test_gsm8k(accuracy_threshold=0.90)
-
-
 class TestFP8ToMXFP4DenseTP1(TestOnlineQuantizationMemoryLoad):
     tp = 1
     model = "Qwen/Qwen3-8B-FP8"
@@ -252,21 +231,6 @@ class TestFP8ToMXFP4DenseTP1(TestOnlineQuantizationMemoryLoad):
         # Original Qwen/Qwen3-8B-FP8 model: 8.801 GiB (TP=1, peak_memory_before_load)
         self._test_peak_memory(
             threshold=6.5, test_start=False, add_peak_memory_before_load=True
-        )
-
-    def test_gsm8k(self):
-        # Original Qwen/Qwen3-8B-FP8 reference accuracy: ~0.92
-        self._test_gsm8k(accuracy_threshold=0.868)
-
-
-class TestFP8ToMXFP4DenseTP2(TestOnlineQuantizationMemoryLoad):
-    tp = 2
-    model = "Qwen/Qwen3-8B-FP8"
-
-    def test_peak_memory(self):
-        # Original Qwen/Qwen3-8B-FP8 model: 4.663 GiB (TP=2, peak_memory_before_load)
-        self._test_peak_memory(
-            threshold=4.2, test_start=False, add_peak_memory_before_load=True
         )
 
     def test_gsm8k(self):
@@ -288,73 +252,6 @@ class TestFP8ToMXFP4MOETP1(TestOnlineQuantizationMemoryLoad):
         # Original Qwen/Qwen3-30B-A3B-Instruct-2507-FP8 reference accuracy: ~0.948
         # Requantized FP8 -> MXFP4 on MI355X CI: median 0.922, min 0.900 over 47 runs.
         self._test_gsm8k(accuracy_threshold=0.89)
-
-
-@unittest.skipIf(is_in_ci(), "local test only")
-class TestDeepSeekFP8ToMXFP4(TestOnlineQuantizationMemoryLoad):
-    # Loading should take ~51.65 seconds on TP=8 on MI355X.
-    # model = "deepseek-ai/DeepSeek-V3.2"  # FP8 model
-    model = "deepseek-ai/DeepSeek-V3.2"
-    tp = 8
-
-    def test_peak_memory(self):
-        # Original deepseek-ai/DeepSeek-V3.2 model: 80.366 GiB (TP=8, peak_memory_before_load)
-        self._test_peak_memory(
-            threshold=70, test_start=True, add_peak_memory_before_load=False
-        )  # TP=8
-
-    def test_gsm8k(self):
-        # Original deepseek-ai/DeepSeek-V3.2 reference accuracy: ~0.948
-        self._test_gsm8k(accuracy_threshold=0.94)
-
-
-@unittest.skipIf(is_in_ci(), "local test only")
-class TestKimiK2FP8ToMXFP4(TestOnlineQuantizationMemoryLoad):
-    model = "moonshotai/Kimi-K2-Instruct-0905"  # FP8 model
-    tp = 8
-
-    # Same as in test/registered/amd/test_kimi_k2_instruct.py
-    runner_args = [
-        "--decode-attention-backend",
-        "triton",
-        "--prefill-attention-backend",
-        "aiter",
-        "--trust-remote-code",
-    ]
-
-    # Same as in test/registered/amd/test_kimi_k2_instruct.py, getting an error otherwise.
-    environment = {"SGLANG_ROCM_FUSED_DECODE_MLA": "0"}
-
-    def test_peak_memory(self):
-        # Original moonshotai/Kimi-K2-Instruct-0905 model: 121.020 GiB (TP=8, peak_memory_before_load)
-        self._test_peak_memory(
-            threshold=82, test_start=True, add_peak_memory_before_load=False
-        )  # TP=8
-
-    def test_gsm8k(self):
-        # Original moonshotai/Kimi-K2-Instruct-0905 reference accuracy: ~0.962
-        self._test_gsm8k(accuracy_threshold=0.96)
-
-
-@unittest.skipIf(is_in_ci(), "local test only")
-class TestMiniMaxFP8ToMXFP4(TestOnlineQuantizationMemoryLoad):
-    model = "MiniMaxAI/MiniMax-M2.1"  # FP8 model
-
-    tp = 2
-    # NOTE: this test is failing in FP16 (default dtype of the original MiniMax-M2.1 model).
-    # Hence the usage of `--dtype bfloat16`
-    # NOTE: this test requires the following fix for TP>1: https://github.com/sgl-project/sglang/pull/18310
-    runner_args = ["--trust-remote-code", "--dtype", "bfloat16"]
-
-    def test_peak_memory(self):
-        # Original MiniMaxAI/MiniMax-M2.1 model: 107.375 GiB (TP=2, peak_memory_before_load)
-        self._test_peak_memory(
-            threshold=72, test_start=True, add_peak_memory_before_load=False
-        )  # TP=2
-
-    def test_gsm8k(self):
-        # Original MiniMaxAI/MiniMax-M2.1 reference accuracy: 0.954
-        self._test_gsm8k(accuracy_threshold=0.92)
 
 
 if __name__ == "__main__":

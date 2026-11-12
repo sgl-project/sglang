@@ -37,13 +37,18 @@ class UnifiedMambaSlotAllocator:
         self,
         mea,
         device: str,
-        take: Optional[Callable[[int], Optional[torch.Tensor]]] = None,
+        *,
+        take: Callable[[int], Optional[torch.Tensor]],
+        fits: Callable[[int], bool],
+        estimate: Callable[[], int],
     ):
         self._multi_ended_allocator = mea
-        # Slots are taken through the chain allocator when one owns the band.
-        self._take = mea.alloc if take is None else take
+        # Slots are taken and priced through the chain allocator owning the
+        # band: the band's own reads cannot see room a relayout would make.
+        self._take = take
+        self._fits = fits
+        self._estimate = estimate
         self._device = device
-        self._alloc_iter = None  # active alloc_group batch iterator
 
     # -- translation (owns the v<->p mapping) --
 
@@ -62,14 +67,18 @@ class UnifiedMambaSlotAllocator:
         return self._multi_ended_allocator.max_slots - 1
 
     def available_size(self) -> int:
-        # Slot-conservation count (max - allocated): the leak-check view, NOT the
-        # planner value (use schedulable_available_size for that).
+        # Slot-conservation count (max - allocated): the leak-check view, not
+        # what a take can serve (`slots_fit`).
         return self.size - self._multi_ended_allocator.allocated_count()
 
+    def slots_fit(self, count: int) -> bool:
+        # Whether ``count`` slots can be taken now: the chain's layout search.
+        return self._fits(count)
+
     def schedulable_available_size(self) -> int:
-        # Byte-coordinated count (>= N => alloc(N) succeeds); credits the peer's
-        # drainable holes since alloc flushes the peer before extending.
-        return self._multi_ended_allocator.schedulable_available_size()
+        # The chain's estimate of the slots a take could have: observers
+        # only; a decision asks `slots_fit`.
+        return self._estimate()
 
     @property
     def free_slots(self) -> torch.Tensor:
@@ -90,35 +99,20 @@ class UnifiedMambaSlotAllocator:
     # -- slot management (delegates to the Band) --
 
     def alloc(self, need_size: int):
-        # alloc_group fast path: single-slot draws from the prefetched batch.
-        if self._alloc_iter is not None and need_size == 1:
-            slot = next(self._alloc_iter, None)
-            if slot is not None:
-                return slot
         return self._take(need_size)  # VIRTUAL ids
 
     def free(self, free_index: torch.Tensor):
         return self._multi_ended_allocator.free(free_index)
 
     def clear(self):
-        self._alloc_iter = None
         return self._multi_ended_allocator.clear()
 
     def alloc_group_begin(self, num_reqs: int):
-        """Pre-allocate a batch that ``alloc(1)`` then draws from."""
-        self._alloc_iter = None
-        if num_reqs > 0:
-            result = self._take(num_reqs)
-            if result is not None:
-                self._alloc_iter = iter(result.split(1))
+        """Takes nothing ahead: slots share the arena with every other sub-pool,
+        so a slot is taken, and priced, only when a request needs it."""
 
     def alloc_group_end(self):
-        """Return any unused pre-allocated slots from the current group."""
-        if self._alloc_iter is not None:
-            remaining = list(self._alloc_iter)
-            if remaining:
-                self._multi_ended_allocator.free(torch.cat(remaining))
-        self._alloc_iter = None
+        pass
 
     def is_slot_allocated(self, slot) -> bool:
         return self._multi_ended_allocator.is_slot_allocated(int(slot))
@@ -133,6 +127,8 @@ def _wire_mamba_slot_allocator(
     take: Callable[[int], Optional[torch.Tensor]],
     state: StateStorage,
     device,
+    fits: Callable[[int], bool],
+    estimate: Callable[[], int],
 ) -> UnifiedMambaSlotAllocator:
     """Install Mamba slot allocation and host capacities."""
     state_pool = state.pool
@@ -140,6 +136,8 @@ def _wire_mamba_slot_allocator(
         mamba_end,
         device=device,
         take=take,
+        fits=fits,
+        estimate=estimate,
     )
     state.slots = slot_allocator
     state_pool.host_capacity_tokens = state_pool.size
