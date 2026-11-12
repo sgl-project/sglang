@@ -272,6 +272,7 @@ class EagerRunner(BaseRunner):
         ):
             if (
                 get_parallel().attn_dcp_size > 1
+                and not get_parallel().dcp_over_attn_cp
                 and hasattr(
                     model_runner.model, "prepare_context_parallel_metadata_for_dcp"
                 )

@@ -120,7 +120,11 @@ def _select_sampling_mask_rows(
 class Sampler(nn.Module):
     def __init__(self):
         super().__init__()
-        self.tp_sync_group = get_parallel().tp_group.device_group
+        parallel = get_parallel()
+        self.tp_sync_group = parallel.tp_group.device_group
+        self.dcp_token_sync_group = (
+            parallel.dcp_group if parallel.dcp_over_attn_cp else None
+        )
         self.cp_sync_group = None
         if is_dp_attention_enabled():
             self.tp_sync_group = get_parallel().attn_tp_group.device_group
@@ -318,6 +322,11 @@ class Sampler(nn.Module):
                     )
                 del probs
 
+        if self.dcp_token_sync_group is not None:
+            # All KV shards must advance with the same sampled token. Use the
+            # leader's sample before computing the selected token's logprob.
+            self.dcp_token_sync_group.broadcast(batch_next_token_ids)
+
         if return_logprob:
             if target_logprobs is not None:
                 logprobs = target_logprobs
@@ -332,7 +341,8 @@ class Sampler(nn.Module):
             logprob_result.write_output_to(logits_output)
 
         _trace_e2e_sampler("token_sync_enter")
-        self._sync_token_ids_across_tp(batch_next_token_ids, sampling_info)
+        if self.dcp_token_sync_group is None:
+            self._sync_token_ids_across_tp(batch_next_token_ids, sampling_info)
         _trace_e2e_sampler("token_sync_returned")
 
         if return_sampling_mask:
@@ -347,7 +357,11 @@ class Sampler(nn.Module):
                 )
             else:
                 assert sampling_mask_capture is not None
-                if SYNC_TOKEN_IDS_ACROSS_TP or sampling_info.grammars:
+                if (
+                    self.dcp_token_sync_group is not None
+                    or SYNC_TOKEN_IDS_ACROSS_TP
+                    or sampling_info.grammars
+                ):
                     # Token synchronization can replace the producer-selected token.
                     sampling_mask_capture = sampling_mask_capture._replace(
                         selected_weight=None

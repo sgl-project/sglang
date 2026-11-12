@@ -134,10 +134,12 @@ class Parallel(msgspec.Struct):
             help="Communication backend for the decode context-parallel (DCP) "
             "attention reduction: 'ag_rs' (AllGather + ReduceScatter), 'a2a' "
             "(one All-to-All exchange of output+LSE, then a local LSE combine), "
+            "'ag_ar' (AllGather + AllReduce for combined prefill CP and DCP), "
             "or 'fi_a2a' (FlashInfer MNNVL All-to-All kernel; requires "
             "Blackwell and a DCP group within one MNNVL domain). Unset resolves "
-            "to 'fi_a2a' where supported, else 'a2a' on CUDA/ROCm/XPU, else 'ag_rs'.",
-            choices=["ag_rs", "a2a", "fi_a2a"],
+            "to 'ag_ar' with prefill CP and DCP, else 'fi_a2a' where supported, "
+            "else 'a2a' on CUDA/ROCm/XPU, else 'ag_rs'.",
+            choices=["ag_rs", "a2a", "fi_a2a", "ag_ar"],
             resolvable=True,
         ),
     ] = None
@@ -352,7 +354,11 @@ class Parallel(msgspec.Struct):
     )
     attn_dcp_size = Derived(
         fn="sglang.srt.runtime_context.attn_dcp_size_of",
-        doc="Decode context-parallel width inside the attention TP group.",
+        doc="Number of token shards in each decode context-parallel group.",
+    )
+    dcp_over_attn_cp = Derived(
+        fn="sglang.srt.runtime_context.dcp_over_attn_cp_of",
+        doc="Whether DCP shards KV along the attention CP axis.",
     )
     moe_ep_size = Derived(
         fn="sglang.srt.runtime_context.moe_ep_size_of",

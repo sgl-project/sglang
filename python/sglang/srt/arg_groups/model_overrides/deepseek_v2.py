@@ -200,10 +200,7 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
         # MLA prefill CP auto-config. Mirrors the NSA CP block above
         # (minus the in-seq/round-robin mode split, which MLA CP does not support)
         if cfg.enable_prefill_cp and use_mla_backend(server_args):
-            logger.warning(
-                "MLA prefill context parallel is still experimental. "
-                "Verified on Hopper with the fa3 backend."
-            )
+            logger.warning("MLA prefill context parallel is still experimental.")
             attn_dp_size = context_parallel_attn_dp_size(cfg, "MLA context parallelism")
             overrides["attn_dp_size"] = attn_dp_size
             overrides["dp_size"] = 1
@@ -217,7 +214,11 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
             # FIXME(kpham-sgl): Keep attn_tp_size == 1 under MLA CP.
             # The DSA / MLA CP gather and reduce-scatter
             # (the dsa_cp_* helpers in adapters/context_parallel.py) assume it.
-            attn_cp_size = cfg.tp_size // attn_dp_size
+            attn_cp_size = (
+                cfg.attn_cp_size
+                if cfg.dcp_size > 1 and cfg.attn_cp_size > 1
+                else cfg.tp_size // attn_dp_size
+            )
             overrides["attn_cp_size"] = attn_cp_size
             logger.warning(
                 f"Enable Context Parallel opt for MLA, "

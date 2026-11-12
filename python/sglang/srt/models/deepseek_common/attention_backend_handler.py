@@ -114,7 +114,9 @@ def _handle_attention_backend(attn, forward_batch, backend_name):
 
     # Strategy CP gathers latent KV in the backend's absorbed MLA path;
     # normal MHA would write rank-local KV against full cache locations.
-    if is_cp_active(forward_batch):
+    if is_cp_active(forward_batch) or (
+        get_parallel().dcp_over_attn_cp and forward_batch.forward_mode.is_extend()
+    ):
         return _dispatch_mla_subtype(attn, forward_batch)
 
     sum_extend_prefix_lens = _get_sum_extend_prefix_lens(forward_batch)

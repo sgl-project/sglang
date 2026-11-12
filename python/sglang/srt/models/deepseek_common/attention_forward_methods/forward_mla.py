@@ -778,8 +778,9 @@ class DeepseekMLAForwardMixin:
                 defer_materialization=fuse_rope_for_trtllm_mla,
             )
 
-        # all_gather q_pe, q_nope_out,take tp8 as an example， q_pe [B, H, ROPE_DIM], q_nope_out [B, H, NOPE_DIM] gathered to [B, H * dcp_world_size, ROPE_DIM] [B, H * dcp_world_size, NOPE_DIM] for decode batch, and all gather k_pe, k_nope for extend batch.
-        if self.dcp_size > 1:
+        # With combined CP, decode Q heads are already replicated and the
+        # prefill backend assembles KV in chronological order for local Q rows.
+        if self.dcp_size > 1 and not get_parallel().dcp_over_attn_cp:
             if self.is_dcp_mla_decode_phase(forward_batch):
                 if not q_replicate_active:
                     q_nope_out, q_pe = all_gather_q_for_mla_decode(
@@ -928,16 +929,17 @@ class DeepseekMLAForwardMixin:
         if self.is_dcp_mla_decode_phase(forward_batch):
             attn_output = attn_output.view(
                 -1,
-                self.num_local_heads * self.dcp_size,
+                self.attn_mqa_for_dcp_decode.tp_q_head_num,
                 self.kv_lora_rank,
             )
             if get_in_autotune_dummy_run():
                 # The synthetic FlashInfer MoE autotune pass discards model
                 # outputs. Avoid an unnecessary cross-node MNNVL exchange of
                 # zero attention partials.
-                attn_output = _select_local_dcp_heads_for_autotune(
-                    attn_output, self.num_local_heads
-                )
+                if not get_parallel().dcp_over_attn_cp:
+                    attn_output = _select_local_dcp_heads_for_autotune(
+                        attn_output, self.num_local_heads
+                    )
             else:
                 dcp_comm_backend = get_parallel().dcp_comm_backend
                 is_lse_base_on_e = is_mla_dcp_lse_base_on_e(
@@ -1009,6 +1011,7 @@ class DeepseekMLAForwardMixin:
                         lse,
                         get_parallel().dcp_group,
                         is_lse_base_on_e=is_lse_base_on_e,
+                        replicated_heads=dcp_comm_backend == "ag_ar",
                     )
                     attn_output = attn_output.transpose(0, 1)
         if dcp_v_projected:
