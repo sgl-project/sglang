@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 import msgspec
 import torch
 
+from sglang.srt.environ import InvariantCheckLevel
 from sglang.srt.mem_cache.device_pool_info import MambaStateBufferInfo
 from sglang.srt.mem_cache.kv.decl import StateReplay, TensorPartDecl
 from sglang.srt.mem_cache.kv.layout.base import HostPoolOptions, SubPoolSpec
@@ -21,6 +22,7 @@ from sglang.srt.mem_cache.layout.token_major import (
 )
 from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.platforms import current_platform
+from sglang.srt.utils.invariants import Bucket, Invariant, IsTrue, expect, resolve_level
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 if TYPE_CHECKING:
@@ -28,6 +30,12 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.kv.memory.arena import KVArena
 
 logger = logging.getLogger(__name__)
+
+# A state copy is one page-copy launch whose pairs run concurrently, so no
+# slot is both a source and a destination of it.
+_STATE_COPY_DISJOINT = Invariant(
+    "state.copy_disjoint", Bucket.FATAL_UNCONTAINABLE, IsTrue()
+)
 
 
 def _prod(iterable) -> int:
@@ -360,8 +368,26 @@ class StateView:
                 )
 
     def copy_from(self, src_indices: torch.Tensor, dst_indices: torch.Tensor) -> None:
-        entries = self._arena.entries(self._sub_pool_name)
-        entries[dst_indices] = entries[src_indices]
+        # Whole entries through the band's unit copy: one word-wide launch,
+        # with no entry-sized gathered temporary.
+        if resolve_level() >= InvariantCheckLevel.WARN:
+            # A fixed-shape comparison: torch.isin sorts larger inputs through
+            # torch.unique, which reads its output length back to the host.
+            expect(
+                _STATE_COPY_DISJOINT,
+                (dst_indices[:, None] != src_indices[None, :]).all(dim=1),
+                msg=f"{self._sub_pool_name}: a state copy writes one of its sources",
+            )
+        self._arena.move_units(self._sub_pool_name, dst_indices, src_indices)
+
+    def prewarm_copy(self) -> None:
+        """Compile and load the copy for the int32 slot ids a copy-on-write
+        passes, at startup: compaction's prewarm covers only its int64 ids. The
+        pairs name the sink slot 0 at both ends, so nothing is copied."""
+        if torch.device(self.device).type != "cuda":
+            return
+        sink = torch.zeros(2, dtype=torch.int32, device=self.device)
+        self._arena.move_units(self._sub_pool_name, sink, sink)
 
     def get_cpu_copy(self, indices):
         current_platform.synchronize()
