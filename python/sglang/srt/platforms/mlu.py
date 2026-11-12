@@ -11,7 +11,7 @@ from sglang.srt.platforms.device_mixin import (
     DeviceMixin,
     PlatformEnum,
 )
-from sglang.srt.platforms.interface import PlatformCapabilities, SRTPlatform
+from sglang.srt.platforms.interface import KVPoolKind, PlatformCapabilities, SRTPlatform
 
 
 class MluDeviceMixin(DeviceMixin):
@@ -81,7 +81,7 @@ class MluSRTPlatform(MluDeviceMixin, SRTPlatform):
     def apply_server_args_defaults(self, server_args) -> None:
         if server_args.quantization is not None:
             raise NotImplementedError(
-                "MLU GQA inference currently requires unquantized weights."
+                "MLU inference currently requires unquantized weights."
             )
         if server_args.speculative_algorithm is not None:
             raise NotImplementedError("MLU speculative decoding is not supported yet.")
@@ -94,7 +94,7 @@ class MluSRTPlatform(MluDeviceMixin, SRTPlatform):
         ):
             backend = getattr(server_args, field)
             if backend not in (None, "mlu"):
-                raise ValueError(f"MLU GQA inference requires {field}='mlu'.")
+                raise ValueError(f"MLU inference requires {field}='mlu'.")
             if backend is None:
                 setattr(server_args, field, "mlu")
         if server_args.sampling_backend is None:
@@ -106,11 +106,17 @@ class MluSRTPlatform(MluDeviceMixin, SRTPlatform):
     def get_default_attention_backend(self) -> str:
         return "mlu"
 
-    def get_kv_pool_cls(self, *, kind):
+    def get_kv_pool_cls(self, *, kind: KVPoolKind) -> Optional[type]:
         if kind == "mha":
             from sglang.srt.hardware_backend.mlu.memory_pool import (
                 MLUMHATokenToKVPool,
             )
 
             return MLUMHATokenToKVPool
+        if kind == "mla":
+            from sglang.srt.hardware_backend.mlu.memory_pool import (
+                MLUMLATokenToKVPool,
+            )
+
+            return MLUMLATokenToKVPool
         return None
