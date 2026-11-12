@@ -112,6 +112,7 @@ class TestKimiK3PackedExpertLoader(CustomTestCase):
                     model=SimpleNamespace(start_layer=0, end_layer=1),
                     named_parameters=lambda: [(target_name, param)],
                     post_load_weights=lambda: None,
+                    _check_dsa_indexer_loaded=lambda loaded_params: None,
                 )
                 with (
                     patch.object(kimi_k3, "_is_npu", npu),

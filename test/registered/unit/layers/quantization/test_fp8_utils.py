@@ -581,9 +581,11 @@ class TestSailDeepGemmPrequantOutputDtype(CustomTestCase):
     def _run(self, output_dtype):
         M, K, N = 4, 128, 64
         qinput = torch.zeros(M, K, dtype=self.FP8_DTYPE, device="cpu")
-        weight = torch.zeros(N, K, dtype=self.FP8_DTYPE, device="cpu")
+        # apply_fp8_linear takes the weight as [K, N] and hands its transpose to
+        # the NT GEMM.
+        weight = torch.zeros(K, N, dtype=self.FP8_DTYPE, device="cpu")
         # A per-output-channel weight scale is what selects the SAIL branch.
-        weight_scale = torch.ones(K, dtype=torch.float32, device="cpu")
+        weight_scale = torch.ones(N, dtype=torch.float32, device="cpu")
         input_scale = torch.tensor([1.0], dtype=torch.float32, device="cpu")
 
         gemm_calls = []
@@ -620,7 +622,7 @@ class TestSailDeepGemmPrequantOutputDtype(CustomTestCase):
         self.assertEqual(len(gemm_calls), 1)
         gemm_a, gemm_b, gemm_out = gemm_calls[0]
         self.assertEqual(tuple(gemm_a.shape), (M, K))
-        self.assertEqual(tuple(gemm_b.shape), (K, N))
+        self.assertEqual(tuple(gemm_b.shape), (N, K))
         # DeepGEMM always accumulates into bf16; only the return is cast.
         self.assertEqual(gemm_out.dtype, torch.bfloat16)
 
