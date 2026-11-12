@@ -466,8 +466,6 @@ def _h3_runtime_that_must_not_start() -> SGLDiffusionGenerator:
 @pytest.mark.parametrize(
     "key, sgld_options, error",
     [
-        # A FastH3 file loaded as base H3 died in the worker on to_gate_compress.
-        ("blocks.0.attn.to_gate_compress.weight", {}, "SGLDNativeModelLoader"),
         # The single-file loader builds no quant config, so this was silently ignored.
         (
             "blocks.0.attn.to_q.weight",
@@ -487,6 +485,73 @@ def test_unservable_h3_file_is_rejected_before_worker_load(
         _h3_runtime_that_must_not_start().load_model(
             model_path=str(path), sgld_options=sgld_options
         )
+
+
+def _fasth3_file(tmp_path, name, metadata=None):
+    from safetensors.torch import save_file
+
+    path = tmp_path / name
+    save_file(
+        {"blocks.0.attn.to_gate_compress.weight": torch.zeros(1)},
+        path,
+        metadata=metadata,
+    )
+    return str(path)
+
+
+def _fasth3_default(path, options, device_ok=True):
+    from unittest.mock import patch
+
+    from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.core.generator import (
+        _default_fasth3_attention,
+    )
+
+    with patch(
+        "sglang.multimodal_gen.configs.pipeline_configs.minimax_h3."
+        "vsa_h3_device_supported",
+        return_value=device_ok,
+    ):
+        _default_fasth3_attention(path, options)
+    return options.get("attention_backend")
+
+
+@pytest.mark.parametrize(
+    "name, metadata, backend",
+    [
+        ("fasth3_8step.safetensors", None, "video_sparse_attn_h3"),
+        # VSA-H3 does not tile the ComfyUI Ref2VA layout: stay dense, whether
+        # the name or only FastVideo's header says it is the reference model.
+        ("fasth3_omniref_8step.safetensors", None, None),
+        ("fasth3_renamed.safetensors", {"source": "transformer_ref"}, None),
+        ("fasth3_v2.safetensors", {"source": "transformer"}, "video_sparse_attn_h3"),
+    ],
+)
+def test_fasth3_single_file_defaults_to_its_trained_attention(
+    tmp_path, name, metadata, backend
+) -> None:
+    path = _fasth3_file(tmp_path, name, metadata)
+    assert _fasth3_default(path, {}) == backend
+    explicit = {"attention_backend": "fa"}
+    _fasth3_default(path, explicit)
+    assert explicit == {"attention_backend": "fa"}
+
+
+@pytest.mark.parametrize(
+    "options, device_ok",
+    [
+        ({}, False),  # e.g. RTX 4090 / 5090: no VSA-H3 kernels
+        ({"enable_torch_compile": True}, True),
+        ({"enable_breakable_cuda_graph": True}, True),
+        ({"ring_degree": 2}, True),
+    ],
+)
+def test_fasth3_single_file_stays_dense_where_vsa_h3_cannot_run(
+    tmp_path, options, device_ok
+) -> None:
+    """The plugin applies the native FastH3 gates before choosing VSA-H3, so
+    ``auto`` keeps working (dense) where the worker would reject VSA-H3."""
+    path = _fasth3_file(tmp_path, "fasth3_8step.safetensors")
+    assert _fasth3_default(path, dict(options), device_ok=device_ok) is None
 
 
 def test_fasth3_runtime_dir_is_checked_before_worker_load(tmp_path) -> None:
