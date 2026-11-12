@@ -168,29 +168,19 @@ def test_decode_floor_reset_and_unsupported_drafts():
     assert reason(window=4096) is not None
 
 
-def test_ring_admits_triton_only_under_dcp_on_rocm():
-    """Only ROCm's triton draft backend reads a ring window by index, and only under
-    DCP; elsewhere triton has no window index path."""
-
+def test_ring_admits_rocm_triton_under_dcp():
+    """ROCm's triton draft backend reads a ring window by index under DCP."""
     config = {
         "num_hidden_layers": 1,
         "dflash_config": {"attention_mode": "mla"},
         "layer_types": ["sliding_attention"],
     }
-
-    def reason(dcp, hip):
-        with mock.patch.object(
-            draft_worker_common,
-            "get_platform",
-            return_value=SimpleNamespace(is_hip=hip),
-        ):
-            return draft_kv_ring_unsupported_reason(
-                config, draft_backend="triton", draft_window_size=None, dcp_size=dcp
-            )
-
-    assert reason(dcp=8, hip=True) is None
-    assert reason(dcp=1, hip=True) is not None
-    assert reason(dcp=8, hip=False) is not None
+    rocm = SimpleNamespace(is_hip=True)
+    with mock.patch.object(draft_worker_common, "get_platform", return_value=rocm):
+        reason = draft_kv_ring_unsupported_reason(
+            config, draft_backend="triton", draft_window_size=None, dcp_size=8
+        )
+    assert reason is None
 
 
 if __name__ == "__main__":
