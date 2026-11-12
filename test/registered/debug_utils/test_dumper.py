@@ -1,3 +1,4 @@
+import errno
 import io
 import multiprocessing
 import os
@@ -6,6 +7,7 @@ import re
 import sys
 import threading
 import time
+import traceback
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional
@@ -1611,11 +1613,32 @@ class TestReset:
         assert len(captured_b) == 0
 
 
+class _DumperHttpPortCollision(RuntimeError):
+    pass
+
+
+def _is_http_port_collision(error):
+    return "_DumperHttpPortCollision" in str(error)
+
+
 def _dumper_worker(rank, http_port: int, stop_event):
     """Minimal distributed dumper worker: configure, step (triggers ZMQ setup), then wait."""
     try:
         dumper.configure(enable=False, server_port=str(http_port))
         dumper.step()
+    except OSError as exc:
+        # Only a bind failure in the HTTP server is safe to retry. ZMQ and
+        # distributed port collisions must remain visible as test failures.
+        if exc.errno == errno.EADDRINUSE and any(
+            frame.name == "_start_http_server"
+            for frame in traceback.extract_tb(exc.__traceback__)
+        ):
+            stop_event.set()
+            raise _DumperHttpPortCollision(
+                f"HTTP port {http_port} is already in use"
+            ) from exc
+        stop_event.set()
+        raise
     except BaseException:
         # Release the peer rank so the thread can return the real startup error.
         stop_event.set()
@@ -1691,7 +1714,7 @@ class TestZmqPortIsolation:
                     ), f"Instance {i} (port {port}): expected 2 ranks, got {len(states)}"
                 return
             except RuntimeError as exc:
-                if "Address already in use" not in str(exc) or attempt == 2:
+                if not _is_http_port_collision(exc) or attempt == 2:
                     raise
             finally:
                 for event in stop_events:
@@ -1701,11 +1724,25 @@ class TestZmqPortIsolation:
 
     def test_wait_surfaces_startup_error_before_timeout(self):
         errors = queue.Queue()
-        errors.put((41554, "AssertionError: Rank 0: [Errno 98] Address already in use"))
-        with self.assertRaisesRegex(RuntimeError, "Address already in use"):
+        errors.put(
+            (
+                41554,
+                "AssertionError: Rank 0: _DumperHttpPortCollision: "
+                "HTTP port 41554 is already in use",
+            )
+        )
+        with pytest.raises(RuntimeError, match="_DumperHttpPortCollision"):
             _wait_for_dumper_http(
                 "http://127.0.0.1:41554", timeout=0.01, error_queue=errors
             )
+
+    def test_only_http_port_collision_is_retryable(self):
+        assert _is_http_port_collision(
+            RuntimeError("Rank 0: _DumperHttpPortCollision: HTTP port 41554")
+        )
+        assert not _is_http_port_collision(
+            RuntimeError("Rank 0: [ZmqRpc] [Errno 98] Address already in use")
+        )
 
 
 class TestDumperHttp:
