@@ -229,7 +229,6 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         runner._next_token_logits_buffer = lambda _rows: None
         runner._build_capture_spec_info = lambda _num_tokens: None
         runner._capture_num_token_non_padded = lambda _num_tokens: None
-        runner._fill_capture_req_to_token = lambda _capture_seq_lens: None
         runner.tbo_plugin = SimpleNamespace(
             capture_one_batch_size=lambda batch, **_: captured.append(batch)
         )

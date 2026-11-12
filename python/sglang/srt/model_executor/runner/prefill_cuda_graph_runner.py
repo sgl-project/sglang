@@ -1310,22 +1310,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             capture_batch, in_capture=False
         )
 
-    def _fill_capture_req_to_token(self, capture_seq_lens: list[int]) -> None:
-        dcp_size = get_parallel().attn_dcp_size
-        if dcp_size <= 1:
-            return
-        req_to_token = self.model_runner.req_to_token_pool.req_to_token
-        span = dcp_size * self.model_runner.page_size
-        start = span
-        for i, seq_len in enumerate(capture_seq_lens):
-            req_to_token[i, :seq_len] = torch.arange(
-                start,
-                start + seq_len,
-                dtype=req_to_token.dtype,
-                device=req_to_token.device,
-            )
-            start += -(-seq_len // span) * span
-
     def _plan_dcp_metadata(self, forward_batch: ForwardBatch):
         """Plan DCP extend metadata as the eager runner does; the planner needs a
         forward context, which capture has not entered yet."""
@@ -1663,7 +1647,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             f"Capture batch needs {bs} request slots for {num_tokens} tokens, "
             f"but the request pool has only {self.max_bs}."
         )
-        self._fill_capture_req_to_token(capture_seq_lens)
         capture_start_locs = [0]
         for seq_len in capture_seq_lens[:-1]:
             capture_start_locs.append(capture_start_locs[-1] + seq_len)
