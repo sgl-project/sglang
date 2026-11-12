@@ -3,6 +3,7 @@
 
 import os
 import sys
+from contextlib import ExitStack
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, mock_open
 
@@ -13,10 +14,16 @@ import torch.nn.functional as F
 from sglang.multimodal_gen.runtime.layers.attention.backends.ascend_fa import (
     AscendFABackend,
     AscendFAImpl,
+    AscendFAMetadata,
+    AscendFAMetadataBuilder,
     AscendQuantAttention,
 )
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionRequirements,
+)
+from sglang.multimodal_gen.runtime.managers.forward_context import (
+    get_forward_context,
+    set_forward_context,
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.platforms.npu import (
@@ -40,11 +47,7 @@ def _reference(query, key, value, **options):
 
 @pytest.fixture
 def adapter(monkeypatch):
-    from sglang.multimodal_gen.runtime import server_args
-
     config = {"precision": "fp8"}
-    args = SimpleNamespace(attention_backend="fa", attention_backend_config=config)
-    monkeypatch.setattr(server_args, "get_global_server_args", lambda: args)
     provider = Mock(side_effect=_reference)
     sdk = ModuleType("mindiesd")
     sdk.quant_attention = provider
@@ -52,12 +55,16 @@ def adapter(monkeypatch):
     monkeypatch.setattr(AscendFAImpl, "_rot_matrices", {})
     monkeypatch.setattr(AscendQuantAttention, "_rot_matrices", {})
 
-    def build(**kwargs):
-        options = dict(num_heads=4, head_size=64, causal=False, softmax_scale=0.37)
-        options.update(kwargs)
-        return AscendFAImpl(**options)
+    with ExitStack() as contexts:
 
-    return config, provider, build
+        def build(**kwargs):
+            metadata = AscendFAMetadataBuilder().build(attention_backend_config=config)
+            contexts.enter_context(set_forward_context(0, metadata))
+            options = dict(num_heads=4, head_size=64, causal=False, softmax_scale=0.37)
+            options.update(kwargs)
+            return AscendFAImpl(**options)
+
+        yield config, provider, build
 
 
 @pytest.mark.parametrize("precision", ["fp8", "mxfp8", "mxfp4"])
@@ -95,15 +102,18 @@ def test_offline_rotation_is_respected_and_conflicts_rejected(adapter):
     assert provider.call_args.args[0] is query
     assert provider.call_args.kwargs["q_rot"] is None
     config["qk_rotation"] = True
+    impl = build(quant_config=offline)
     with pytest.raises(ValueError, match="offline"):
-        build(quant_config=offline)
+        impl.forward(query, query, query, None)
 
 
 @pytest.mark.parametrize("head_size", [8, 64, 96, 128])
 def test_rotation_matches_ascend_fa_and_preserves_rng(adapter, head_size):
     _, _, build = adapter
     state = torch.get_rng_state().clone()
-    impl = build(head_size=head_size)._sd_executor
+    impl = build(head_size=head_size)._get_sd_executor(
+        get_forward_context().attn_metadata
+    )
     assert torch.equal(state, torch.get_rng_state())
     AscendFAImpl._ensure_rot_matrix(head_size)
     rotation = impl._rot_matrices[head_size]
@@ -111,7 +121,10 @@ def test_rotation_matches_ascend_fa_and_preserves_rng(adapter, head_size):
     torch.testing.assert_close(
         rotation @ rotation.T, torch.eye(head_size), atol=1e-6, rtol=1e-5
     )
-    assert build(head_size=head_size)._sd_executor._rot_matrices[head_size] is rotation
+    second = build(head_size=head_size)._get_sd_executor(
+        get_forward_context().attn_metadata
+    )
+    assert second._rot_matrices[head_size] is rotation
     query = torch.zeros(1, 3, 4, head_size, dtype=torch.bfloat16)
     device_rotation = impl._get_rotation(query)
     assert impl._get_rotation(query) is device_rotation
@@ -121,7 +134,9 @@ def test_rotation_matches_ascend_fa_and_preserves_rng(adapter, head_size):
 
 def test_defaults_and_alternate_fp8_mode(adapter):
     config, provider, build = adapter
-    impl = build(softmax_scale=None)._sd_executor
+    impl = build(softmax_scale=None)._get_sd_executor(
+        get_forward_context().attn_metadata
+    )
     assert impl.precision == "fp8" and impl.qk_rotation
     assert impl.fp8_fa_mode == "HIGH_PRECISION"
     assert impl.head_chunk_size == 4
@@ -149,8 +164,9 @@ def test_defaults_and_alternate_fp8_mode(adapter):
 def test_invalid_options_fail_before_provider(adapter, config, kwargs, message):
     options, provider, build = adapter
     options.update(config)
+    query = torch.randn(1, 7, 4, 64)
     with pytest.raises(ValueError, match=message):
-        build(**kwargs)
+        build(**kwargs).forward(query, query, query, None)
     provider.assert_not_called()
 
 
@@ -430,6 +446,7 @@ def test_only_fa_is_registered():
     [
         (None, {}, {}, {}, False, False),
         ("fa", {}, {}, {}, True, False),
+        ("fa", {}, {}, {"precision": "bf16"}, True, False),
         ("fa", {}, {}, {"precision": "fp8"}, False, True),
         ("fa3", {}, {}, {"precision": "mxfp4"}, False, True),
         (None, "transformer=fa", {}, {"precision": "fp8"}, False, True),
@@ -514,72 +531,101 @@ def legacy_native(monkeypatch, adapter):
     monkeypatch.setattr(
         torch.ops.npu, "npu_fused_infer_attention_score", native_float, raising=False
     )
+    # The packed native entry point checks NPU devices before invoking the op.
+    monkeypatch.setattr(
+        ascend_fa,
+        "fused_infer_attention_varlen",
+        lambda q, k, v, *args, **kwargs: native_float(q, k, v, **kwargs)[0],
+    )
     return config, provider, build, quant, native_mx, native_float
 
 
-@pytest.mark.parametrize(
-    "global_backend,override,scope,precision,expected_sd",
-    [
-        (None, None, "global", "fp8", True),
-        ("FA", None, "global", "fp8", True),
-        ("rain_fusion_attn", None, "deferred", "mix", False),
-        ("rain_fusion_attn", None, "global", "fp8", False),
-        ("torch_sdpa", "FA", "component", "fp8", True),
-        ("torch_sdpa", "FA", "self", "fp8", True),
-        ("fa", "RAIN_FUSION_ATTN", "cross", "fp8", False),
-        ("torch_sdpa", "FA", "deferred", "fp8", True),
-        ("fa", "RAIN_FUSION_ATTN", "deferred", "fp8", False),
-    ],
-)
-def test_fallback_fa_does_not_consume_another_backends_precision(
-    monkeypatch, legacy_native, global_backend, override, scope, precision, expected_sd
+@pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.parametrize("scope", ["absent", "unrelated", "empty", "bf16", "cross"])
+def test_metadata_scope_preserves_native_dispatch(
+    monkeypatch, legacy_native, packed, scope
 ):
-    """A dense fallback must not inherit the selected sparse backend's precision."""
-    from sglang.multimodal_gen.configs.attention_roles import AttentionRole
     from sglang.multimodal_gen.runtime import server_args
-    from sglang.multimodal_gen.runtime.layers.attention import selector
-    from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import MiniMaxH3Attention
+    from sglang.multimodal_gen.runtime.platforms import npu
 
-    config, sd, build, _, _, native_float = legacy_native
-    config.update(precision=precision, qk_rotation=False)
-    server_args.get_global_server_args().attention_backend = global_backend
-    backend = AttentionBackendEnum[override] if override else None
-    context = SimpleNamespace(backend=None, backend_by_role={})
-    if scope == "component":
-        context.backend = backend
-    elif scope in ("self", "cross"):
-        context.backend = (
-            AttentionBackendEnum.FA
-            if scope == "cross"
-            else AttentionBackendEnum.RAIN_FUSION_ATTN
-        )
-        context.backend_by_role[AttentionRole(scope)] = backend
-    monkeypatch.setattr(selector, "get_component_attn_backend_context", lambda: context)
-    if scope == "deferred":
-        # H3 constructs its implementation after the component context has ended.
-        attention = SimpleNamespace(
-            head_dim=64,
-            num_heads=4,
-            softmax_scale=0.37,
-            prefix="blocks.0.attn",
-            _quant_config=None,
-            _selected_attention_backend=backend,
-        )
-        MiniMaxH3Attention._set_attention_backend(attention, AscendFABackend)
-        impl = attention._attention_impl
-    else:
-        impl = build(is_cross_attention=scope == "cross")
-    query = torch.randn(1, 7, 4, 64)
-    actual = impl.forward(query, query, query, None)
-    if expected_sd:
-        torch.testing.assert_close(
-            actual, _reference(query, query, query, **sd.call_args.kwargs)
-        )
-        native_float.assert_not_called()
-    else:
-        torch.testing.assert_close(actual, torch.zeros_like(query))
-        native_float.assert_called_once()
-        sd.assert_not_called()
+    config, sd, build, quant, native_mx, native_float = legacy_native
+    config["precision"] = "fp8"
+    monkeypatch.setattr(
+        server_args,
+        "get_global_server_args",
+        Mock(side_effect=AssertionError("FA must use forward metadata")),
+    )
+    loader = Mock(side_effect=AssertionError("Native FA must not load MindIE-SD"))
+    monkeypatch.setattr(npu, "load_mindiesd_quant_attention", loader)
+    monkeypatch.setitem(sys.modules, "mindiesd", None)
+    impl = build(
+        quant_config=type("MXFP8Config", (), {})(),
+        is_cross_attention=scope == "cross",
+    )
+    assert impl._sd_executor is None
+    metadata = {
+        "absent": None,
+        "unrelated": SimpleNamespace(precision="mxfp4"),
+        "empty": AscendFAMetadata(),
+        "bf16": AscendFAMetadata(precision="bf16"),
+        "cross": AscendFAMetadata(precision="fp8"),
+    }[scope]
+    query = torch.randn(64, 4, 64)
+    with set_forward_context(0, metadata):
+        if packed:
+            actual = impl.forward_varlen(
+                query, query, query, cu_seqlens=torch.tensor([0, 64]), max_seqlen=64
+            )
+        else:
+            actual = impl.forward(query[None], query[None], query[None], None)
+    torch.testing.assert_close(actual, torch.zeros_like(actual))
+    expected_mx = scope in ("absent", "unrelated", "empty")
+    assert native_mx.call_count == int(expected_mx)
+    assert quant.call_count == 3 * int(expected_mx)
+    assert native_float.call_count == int(not expected_mx)
+    sd.assert_not_called()
+    loader.assert_not_called()
+
+
+@pytest.mark.parametrize("packed", [False, True])
+def test_metadata_changes_do_not_leak_between_calls(legacy_native, packed):
+    config, sd, build, _, native_mx, native_float = legacy_native
+    config["precision"] = "mxfp8"
+    impl = build()
+    query = torch.randn(64, 4, 64)
+    configs = [
+        {"precision": "fp8", "qk_rotation": False},
+        {"precision": "mxfp4", "head_chunk_size": 2, "qk_rotation": True},
+        {"precision": "bf16"},
+        {"precision": "fp8", "qk_rotation": False},
+    ]
+    for config in configs:
+        metadata = AscendFAMetadataBuilder().build(attention_backend_config=config)
+        sd.reset_mock()
+        if packed:
+            actual = impl.forward_varlen(
+                query,
+                query,
+                query,
+                cu_seqlens=torch.tensor([0, 64]),
+                max_seqlen=64,
+                attn_metadata=metadata,
+            )
+        else:
+            actual = impl.forward(query[None], query[None], query[None], metadata)[0]
+        if config["precision"] == "bf16":
+            sd.assert_not_called()
+            torch.testing.assert_close(actual, torch.zeros_like(query))
+        else:
+            options = sd.call_args.kwargs
+            assert options["precision"] == config["precision"]
+            assert (options["q_rot"] is not None) == config["qk_rotation"]
+            assert sd.call_count == (2 if config["precision"] == "mxfp4" else 1)
+            torch.testing.assert_close(
+                actual, _reference(query[None], query[None], query[None], **options)[0]
+            )
+    native_float.assert_called_once()
+    native_mx.assert_not_called()
 
 
 @pytest.mark.parametrize("kind", ["MXFP8Config", "ModelSlimConfig"])
@@ -637,7 +683,7 @@ def test_precision_only_selects_sd_without_weight_or_environment_setup(
         ascend_fa.envs, "SGLANG_DIFFUSION_ENABLE_MXFP8_ATTENTION", enabled
     )
     impl = build(num_heads=6, packed_trailing_padding=True)
-    assert impl._sd_executor.precision == precision and impl._sd_executor.qk_rotation
+    assert impl._sd_executor is None
     query = torch.randn(64, 6, 64)
     if packed:
         output = impl.forward_varlen(
@@ -651,6 +697,7 @@ def test_precision_only_selects_sd_without_weight_or_environment_setup(
         assert torch.count_nonzero(output[63:]) == 0
     else:
         impl.forward(query[None], query[None], query[None], None)
+    assert impl._sd_executor.precision == precision and impl._sd_executor.qk_rotation
     sd.assert_called_once()
     assert sd.call_args.args[0].shape[2] == 6  # SD's explicit 0 overrides its default.
     assert sd.call_args.kwargs["precision"] == precision
@@ -723,8 +770,11 @@ def test_sd_dependency_failure_never_falls_back(
     config["precision"] = precision
     loader = Mock(side_effect=failure)
     monkeypatch.setattr(npu, "load_mindiesd_quant_attention", loader)
+    impl = build(quant_config=type("MXFP8Config", (), {})())
+    loader.assert_not_called()
+    query = torch.randn(1, 64, 4, 64)
     with pytest.raises(type(failure)) as caught:
-        build(quant_config=type("MXFP8Config", (), {})())
+        impl.forward(query, query, query, None)
     assert caught.value is failure
     loader.assert_called_once()
     for operator in (sd, quant, native_mx, native_float):
@@ -737,6 +787,8 @@ def test_explicit_quantization_rejects_ring(adapter, precision):
     config["precision"] = precision
     impl = build()
     query = torch.randn(64, 4, 64)
+    with pytest.raises(ValueError, match="Ring/LSE"):
+        AscendFAMetadataBuilder().build(attention_backend_config=config, ring_degree=2)
     with pytest.raises(NotImplementedError, match="Ring/LSE"):
         impl.forward_ring_kv_chunk(query, query, query)
     sd.assert_not_called()
@@ -935,10 +987,7 @@ def test_h3_text_encoder_default_preserves_overrides(
     )
     assert args.attention_backend == "fa"
     if not overrides:
-        if precision is not None:
-            assert args.component_attention_backends["text_encoder"] == "torch_sdpa"
-        else:
-            assert "text_encoder" not in args.component_attention_backends
+        assert "text_encoder" not in args.component_attention_backends
     elif "component_attention_backends" in overrides:
         assert args.component_attention_backends["text_encoder"] == "fa"
     else:
@@ -947,6 +996,83 @@ def test_h3_text_encoder_default_preserves_overrides(
 
 
 # MiniMax-H3 integration: optional linear hooks and real backend dispatch.
+
+
+@pytest.mark.parametrize("precision,ring_degree", [("fp8", 1), ("bf16", 2)])
+def test_denoising_builds_scoped_fa_metadata(precision, ring_degree):
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
+        DenoisingStage,
+    )
+
+    config = {"precision": precision, "head_chunk_size": 2, "qk_rotation": False}
+    stage = SimpleNamespace(attn_backend=AscendFABackend)
+    metadata = DenoisingStage._build_attn_metadata(
+        stage,
+        0,
+        SimpleNamespace(raw_latent_shape=(1, 16, 2, 8, 8)),
+        SimpleNamespace(attention_backend_config=config, ring_degree=ring_degree),
+    )
+    assert metadata == AscendFAMetadata(
+        precision=precision,
+        head_chunk_size=2,
+        qk_rotation=False,
+        ring_degree=ring_degree,
+    )
+    config["precision"] = "mxfp4"
+    assert metadata.precision == precision
+
+
+@pytest.mark.parametrize("prefix", ["blocks.0.attn", "refiner.0.attn"])
+@pytest.mark.parametrize("precision", [None, "mxfp4"])
+def test_h3_refiner_does_not_inherit_dit_quantization(
+    monkeypatch, legacy_native, prefix, precision
+):
+    from sglang.multimodal_gen.runtime.models.dits import minimax_h3
+
+    config, sd, build, quant, native_mx, native_float = legacy_native
+    config["qk_rotation"] = False
+    if precision is not None:
+        config["precision"] = precision
+    impl = build(quant_config=type("MXFP8Config", (), {})())
+    attention = SimpleNamespace(
+        _attention_backend_enum=AttentionBackendEnum.FA,
+        _attention_impl=impl,
+        prefix=prefix,
+    )
+    monkeypatch.setattr(
+        minimax_h3, "_minimax_h3_bind_attention_backend", lambda *args: None
+    )
+    query = torch.randn(64, 4, 64)
+    actual = minimax_h3._minimax_h3_attention_core_impl(
+        attention,
+        query,
+        query,
+        query,
+        cu_seqlens=torch.tensor([0, 64]),
+        cu_seqlens_host=(0, 64),
+        max_seqlen=64,
+        ulysses_active=False,
+    )
+    if precision is None:
+        sd.assert_not_called()
+        native_float.assert_not_called()
+        native_mx.assert_called_once()
+        assert quant.call_count == 3
+        torch.testing.assert_close(actual, torch.zeros_like(query))
+    elif prefix.startswith("blocks."):
+        sd.assert_called_once()
+        native_float.assert_not_called()
+        torch.testing.assert_close(
+            actual,
+            _reference(query[None], query[None], query[None], **sd.call_args.kwargs)[0],
+        )
+    else:
+        sd.assert_not_called()
+        native_float.assert_called_once()
+        torch.testing.assert_close(actual, torch.zeros_like(query))
+    if precision is not None:
+        quant.assert_not_called()
+        native_mx.assert_not_called()
 
 
 @pytest.mark.parametrize("supported", [None, False, True])
@@ -1030,18 +1156,11 @@ def native():
 
 
 @pytest.fixture
-def native_impl(native, monkeypatch):
-    from sglang.multimodal_gen.runtime import server_args
-
+def native_impl(native):
     def build(config, num_heads=4, head_size=128, **kwargs):
-        monkeypatch.setattr(
-            server_args,
-            "get_global_server_args",
-            lambda: SimpleNamespace(
-                attention_backend="fa", attention_backend_config=config
-            ),
-        )
-        return AscendFAImpl(num_heads, head_size, False, head_size**-0.5, **kwargs)
+        metadata = AscendFAMetadataBuilder().build(attention_backend_config=config)
+        impl = AscendFAImpl(num_heads, head_size, False, head_size**-0.5, **kwargs)
+        return impl, metadata
 
     return build
 
@@ -1059,8 +1178,10 @@ class TestAscendFAQuantizedNPU:
         config = dict(precision=precision, head_chunk_size=4)
         if precision == "fp8":
             config["fp8_fa_mode"] = "C8V16_TILING512"
-        chunked = native_impl(config, num_heads=10)
-        unchunked = native_impl({**config, "head_chunk_size": 0}, num_heads=10)
+        chunked, chunked_metadata = native_impl(config, num_heads=10)
+        unchunked, unchunked_metadata = native_impl(
+            {**config, "head_chunk_size": 0}, num_heads=10
+        )
         generator = torch.Generator().manual_seed(42)
         query, key, value = (
             torch.randn(2, 512, 10, 128, generator=generator, dtype=torch.bfloat16).to(
@@ -1077,21 +1198,25 @@ class TestAscendFAQuantizedNPU:
                 cu_seqlens_host=(0, 512, 1024),
                 max_seqlen=512,
             )
-            actual = chunked.forward_varlen(query, key, value, **options)
-            expected = unchunked.forward_varlen(query, key, value, **options)
+            actual = chunked.forward_varlen(
+                query, key, value, attn_metadata=chunked_metadata, **options
+            )
+            expected = unchunked.forward_varlen(
+                query, key, value, attn_metadata=unchunked_metadata, **options
+            )
         else:
-            actual = chunked.forward(query, key, value, None)
-            expected = unchunked.forward(query, key, value, None)
+            actual = chunked.forward(query, key, value, chunked_metadata)
+            expected = unchunked.forward(query, key, value, unchunked_metadata)
         torch.testing.assert_close(actual, expected)
 
     @pytest.mark.parametrize("length", [32, 513])
     def test_native_mxfp8_batch_does_not_mix_value_groups(self, native_impl, length):
-        impl = native_impl({"precision": "mxfp8", "qk_rotation": False})
+        impl, metadata = native_impl({"precision": "mxfp8", "qk_rotation": False})
         query = torch.zeros(2, length, 4, 128, device="npu", dtype=torch.bfloat16)
         # Powers of two are exactly representable in MXFP8. Uniform scores and
         # constant values give an independent analytical per-sequence reference.
         value = torch.stack((torch.ones_like(query[0]), torch.full_like(query[0], 16)))
-        actual = impl.forward(query, query, value, None)
+        actual = impl.forward(query, query, value, metadata)
         torch.testing.assert_close(actual, value, atol=0.02, rtol=0.01)
 
     @pytest.mark.parametrize(
@@ -1109,7 +1234,7 @@ class TestAscendFAQuantizedNPU:
         self, native, native_impl, precision, rotation, head_size, length
     ):
         config = dict(precision=precision, qk_rotation=rotation)
-        impl = native_impl(config, head_size=head_size)
+        impl, metadata = native_impl(config, head_size=head_size)
         generator = torch.Generator().manual_seed(42)
         query, key, value = (
             torch.randn(
@@ -1121,7 +1246,7 @@ class TestAscendFAQuantizedNPU:
             .transpose(1, 2)
             for _ in range(3)
         )
-        matrix = impl._sd_executor._get_rotation(query)
+        matrix = impl._get_sd_executor(metadata)._get_rotation(query)
         options = dict(
             precision=precision,
             layout="BSND",
@@ -1142,14 +1267,14 @@ class TestAscendFAQuantizedNPU:
             )
         else:
             expected = native(query, key, value, **options)
-        actual = impl.forward(query, key, value, None)
+        actual = impl.forward(query, key, value, metadata)
         assert actual.shape == query.shape and actual.dtype == expected.dtype
         assert torch.isfinite(actual).all()
         torch.testing.assert_close(actual, expected)
 
     @pytest.mark.parametrize("precision", ["fp8", "mxfp8", "mxfp4"])
     def test_native_packed_padding_and_gqa(self, native, native_impl, precision):
-        impl = native_impl(
+        impl, metadata = native_impl(
             {"precision": precision}, num_kv_heads=2, packed_trailing_padding=True
         )
         query = torch.randn(576, 4, 128, device="npu", dtype=torch.bfloat16)
@@ -1164,8 +1289,9 @@ class TestAscendFAQuantizedNPU:
             cu_seqlens=torch.tensor([0, 512, 576], device="npu", dtype=torch.int32),
             cu_seqlens_host=(0, 512, 576),
             max_seqlen=512,
+            attn_metadata=metadata,
         )
-        matrix = impl._sd_executor._get_rotation(query)
+        matrix = impl._get_sd_executor(metadata)._get_rotation(query)
         options = {"fp8_fa_mode": "HIGH_PRECISION"} if precision == "fp8" else {}
         expected = native(
             query[:512].unsqueeze(0),
@@ -1186,13 +1312,13 @@ class TestAscendFAQuantizedNPU:
         config = {"precision": precision}
         if precision == "fp8":
             config["fp8_fa_mode"] = "C8V16_TILING512"
-        impl = native_impl(config, num_kv_heads=2)
+        impl, metadata = native_impl(config, num_kv_heads=2)
         query = torch.randn(1, 512, 4, 128, device="npu", dtype=torch.float16)
         key, value = (
             torch.randn(1, 513, 2, 128, device="npu", dtype=torch.float16)
             for _ in range(2)
         )
-        matrix = impl._sd_executor._get_rotation(query)
+        matrix = impl._get_sd_executor(metadata)._get_rotation(query)
         expected = native(
             query,
             key,
@@ -1203,7 +1329,7 @@ class TestAscendFAQuantizedNPU:
             k_rot=matrix,
             **config,
         )
-        actual = impl.forward(query, key, value, None)
+        actual = impl.forward(query, key, value, metadata)
         torch.testing.assert_close(actual, expected)
         if precision == "mxfp4":
             assert actual.dtype == torch.bfloat16

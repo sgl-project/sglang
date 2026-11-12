@@ -14,6 +14,9 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
     AttentionMetadataBuilder,
     trailing_padding_used_len,
 )
+from sglang.multimodal_gen.runtime.managers.forward_context import (
+    get_forward_context_or_none,
+)
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
@@ -192,17 +195,40 @@ def fused_infer_attention_varlen(
     return output, lse.squeeze(-1).transpose(0, 1).contiguous()
 
 
-@dataclass
+@dataclass(frozen=True)
 class AscendFAMetadata:
-    pass
+    # None retains the existing native precision selection.
+    precision: str | None = None
+    fp8_fa_mode: str | None = "HIGH_PRECISION"
+    head_chunk_size: int = 4
+    qk_rotation: bool | None = None
+    ring_degree: int = 1
 
 
 class AscendFAMetadataBuilder(AttentionMetadataBuilder):
     def build(
         self,
+        attention_backend_config: dict | None = None,
+        ring_degree: int = 1,
         **kwargs: dict[str, Any],
-    ) -> AttentionMetadata:
-        return AscendFAMetadata()
+    ) -> AscendFAMetadata:
+        config = attention_backend_config or {}
+        precision = config.get("precision")
+        if "precision" in config and (not isinstance(precision, str) or not precision):
+            raise ValueError("precision must be a non-empty string")
+        if "fp8_fa_mode" in config and precision != "fp8":
+            raise ValueError("fp8_fa_mode is only supported with precision=fp8")
+        if "qk_rotation" in config and not isinstance(config["qk_rotation"], bool):
+            raise ValueError("qk_rotation must be a boolean")
+        if precision not in (None, "bf16") and ring_degree > 1:
+            raise ValueError("Quantized Ascend FA does not support Ring/LSE")
+        return AscendFAMetadata(
+            precision=precision,
+            fp8_fa_mode=config.get("fp8_fa_mode", "HIGH_PRECISION"),
+            head_chunk_size=config.get("head_chunk_size", 4),
+            qk_rotation=config.get("qk_rotation"),
+            ring_degree=ring_degree,
+        )
 
 
 class AscendFABackend(AttentionBackend):
@@ -216,7 +242,7 @@ class AscendFABackend(AttentionBackend):
 
     @staticmethod
     def get_metadata_cls() -> type["AttentionMetadata"]:
-        raise NotImplementedError
+        return AscendFAMetadata
 
     @staticmethod
     def get_builder_cls() -> type["AttentionMetadataBuilder"]:
@@ -259,22 +285,10 @@ class AscendFAImpl(AttentionImpl):
     ) -> None:
         self.causal = causal
         self.softmax_scale = softmax_scale
-        config, server_args = self._get_attention_config(
-            extra_impl_args.get("selected_attention_backend"),
-            extra_impl_args.get("is_cross_attention", False),
-        )
+        self._head_size = head_size
+        self._extra_impl_args = extra_impl_args
+        self._sd_metadata = None
         self._sd_executor = None
-        if "precision" in config:
-            self._sd_executor = AscendQuantAttention(
-                config,
-                head_size=head_size,
-                softmax_scale=softmax_scale,
-                causal=causal,
-                ring_degree=getattr(server_args, "ring_degree", 1),
-                **extra_impl_args,
-            )
-            return
-
         quant_config = extra_impl_args.get("quant_config")
         self._quant_scheme = resolve_mx_fa_scheme(quant_config)
         self.use_offline_qk_rotation = (
@@ -286,40 +300,42 @@ class AscendFAImpl(AttentionImpl):
             extra_impl_args.get("is_cross_attention", False)
         )
         if self._quant_scheme is not None:
-            self._head_size = head_size
             self._mxfp8_head_chunk_size = envs.SGLANG_DIFFUSION_MXFP8_FA_HEAD_CHUNK_SIZE
             self._rot_device: torch.Tensor | None = None
             if not self.use_offline_qk_rotation:
                 self._ensure_rot_matrix(head_size)
 
-    @staticmethod
-    def _get_attention_config(
-        selected_attention_backend: AttentionBackendEnum | None = None,
-        is_cross_attention: bool = False,
-    ) -> tuple[dict, Any]:
-        from sglang.multimodal_gen.configs.attention_roles import AttentionRole
-        from sglang.multimodal_gen.runtime.layers.attention import selector
-        from sglang.multimodal_gen.runtime.server_args import get_global_server_args
+    def _resolve_metadata(self, attn_metadata) -> AscendFAMetadata | None:
+        if self._is_cross_attention:
+            return None
+        if attn_metadata is None:
+            context = get_forward_context_or_none()
+            attn_metadata = context.attn_metadata if context is not None else None
+        return attn_metadata if isinstance(attn_metadata, AscendFAMetadata) else None
 
-        try:
-            server_args = get_global_server_args()
-        except ValueError:
-            # Direct native callers do not have to initialize ServerArgs.
-            return {}, None
-        role = AttentionRole.CROSS if is_cross_attention else AttentionRole.SELF
-        requested_backend = (
-            selected_attention_backend
-            or selector.get_global_forced_attn_backend()
-            or selector.get_component_forced_attn_backend_for_role(role)
-            or selector.get_component_forced_attn_backend()
-        )
-        backend_name = server_args.attention_backend
-        if requested_backend is not None:
-            backend_name = requested_backend.name
-        # FA may be a dense fallback for another backend; its config is not ours.
-        if backend_name is not None and backend_name.lower() != "fa":
-            return {}, server_args
-        return server_args.attention_backend_config or {}, server_args
+    def _get_sd_executor(self, metadata: AscendFAMetadata | None):
+        if metadata is None or metadata.precision in (None, "bf16"):
+            return None
+        if metadata != self._sd_metadata:
+            config = {
+                "precision": metadata.precision,
+                "head_chunk_size": metadata.head_chunk_size,
+            }
+            if metadata.precision == "fp8":
+                config["fp8_fa_mode"] = metadata.fp8_fa_mode
+            if metadata.qk_rotation is not None:
+                config["qk_rotation"] = metadata.qk_rotation
+            executor = AscendQuantAttention(
+                config,
+                head_size=self._head_size,
+                softmax_scale=self.softmax_scale,
+                causal=self.causal,
+                ring_degree=metadata.ring_degree,
+                **self._extra_impl_args,
+            )
+            self._sd_executor = executor
+            self._sd_metadata = metadata
+        return self._sd_executor
 
     @classmethod
     def _ensure_rot_matrix(cls, head_size: int) -> None:
@@ -357,13 +373,16 @@ class AscendFAImpl(AttentionImpl):
         attn_metadata: AttentionMetadata,
         return_softmax_lse: bool = False,
     ) -> torch.Tensor:
-        if self._sd_executor is not None:
-            return self._sd_executor.forward(
+        metadata = self._resolve_metadata(attn_metadata)
+        executor = self._get_sd_executor(metadata)
+        if executor is not None:
+            return executor.forward(
                 query, key, value, attn_metadata, return_softmax_lse=return_softmax_lse
             )
 
         if (
             self._quant_scheme == "MXFP8"
+            and (metadata is None or metadata.precision is None)
             and not self.causal
             and not self._is_cross_attention
             and query.shape[1:3] == key.shape[1:3]
@@ -424,9 +443,12 @@ class AscendFAImpl(AttentionImpl):
         cu_seqlens: torch.Tensor,
         max_seqlen: int,
         cu_seqlens_host: tuple[int, ...] | None = None,
+        attn_metadata: AscendFAMetadata | None = None,
     ) -> torch.Tensor:
-        if self._sd_executor is not None:
-            return self._sd_executor.forward_varlen(
+        metadata = self._resolve_metadata(attn_metadata)
+        executor = self._get_sd_executor(metadata)
+        if executor is not None:
+            return executor.forward_varlen(
                 query,
                 key,
                 value,
@@ -438,6 +460,7 @@ class AscendFAImpl(AttentionImpl):
         del max_seqlen
         if (
             self._quant_scheme == "MXFP8"
+            and (metadata is None or metadata.precision is None)
             and not self.causal
             and not self._is_cross_attention
             and query.shape == key.shape
@@ -474,7 +497,7 @@ class AscendFAImpl(AttentionImpl):
                     query[start:stop].unsqueeze(0),
                     key[start:stop].unsqueeze(0),
                     value[start:stop].unsqueeze(0),
-                    None,
+                    attn_metadata,
                 )
                 output[start:stop].copy_(segment[0])
             return output
@@ -602,7 +625,8 @@ class AscendFAImpl(AttentionImpl):
         value: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Run one Ascend TND ring chunk and return LSE in ``[H, Tq]``."""
-        if self._sd_executor is not None:
+        metadata = self._resolve_metadata(None)
+        if metadata is not None and metadata.precision not in (None, "bf16"):
             raise NotImplementedError("MindIE-SD attention does not support Ring/LSE")
         cu_seqlens_q = torch.tensor(
             [0, query.shape[0]], dtype=torch.int32, device=query.device

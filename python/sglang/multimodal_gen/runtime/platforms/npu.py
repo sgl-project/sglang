@@ -64,7 +64,7 @@ class NPUPlatformBase(Platform):
         config = server_args.attention_backend_config or {}
         if isinstance(config, str):
             config = server_args._parse_attention_backend_config(config)
-        if "precision" not in config:
+        if "precision" not in config or config["precision"] == "bf16":
             return
 
         components, roles = server_args._split_component_attention_backends(

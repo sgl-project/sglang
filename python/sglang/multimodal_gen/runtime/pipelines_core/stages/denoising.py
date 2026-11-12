@@ -2442,7 +2442,9 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             )
         elif self.attn_backend.get_enum() == AttentionBackendEnum.FA:
             attn_metadata = self.attn_metadata_builder.build(
-                raw_latent_shape=batch.raw_latent_shape
+                raw_latent_shape=batch.raw_latent_shape,
+                attention_backend_config=server_args.attention_backend_config,
+                ring_degree=server_args.ring_degree,
             )
         elif self.attn_backend.get_enum() in [
             AttentionBackendEnum.BLOCK_SPARSE_ATTN,

@@ -16,6 +16,10 @@ from sglang.multimodal_gen.runtime.cache.cache_dit_integration import (
     CacheDitConfig,
     disable_cache_on_transformer,
 )
+from sglang.multimodal_gen.runtime.layers.attention.backends.ascend_fa import (
+    AscendFAMetadata,
+    AscendFAMetadataBuilder,
+)
 from sglang.multimodal_gen.runtime.layers.attention.backends.cube_sparse_attn import (
     CubeSparseAttentionMetadata,
     CubeSparseAttentionMetadataBuilder,
@@ -729,6 +733,16 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
             num_steps=len(sigmas_video) - 1,
             device=device,
         )
+        transformer_backend = (server_args.component_attention_backends or {}).get(
+            "transformer", server_args.attention_backend
+        )
+        if current_platform.is_npu() and (
+            transformer_backend is None or transformer_backend.lower() == "fa"
+        ):
+            attn_metadata = AscendFAMetadataBuilder().build(
+                attention_backend_config=server_args.attention_backend_config,
+                ring_degree=server_args.ring_degree,
+            )
 
         placement_managed = self._component_residency_manager is not None
         if placement_managed:
@@ -894,7 +908,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
         step_index: int,
         *,
         batch: Req,
-        attn_metadata: CubeSparseAttentionMetadata | None = None,
+        attn_metadata: AscendFAMetadata | CubeSparseAttentionMetadata | None = None,
         build_vsa_h3_step_metadata: Callable[[int], Any] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Route the custom full loop through the native denoising runner."""
