@@ -26,10 +26,8 @@ QWEN3_6_27B_1080P_ENVS = {
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
     "SGLANG_PREFILL_DELAYER_MAX_PREFILL_BS_WINDOW_SIZE": "128",
     "ASCEND_USE_FIA": "1",
-    # The unchunked 77k-token prefill waves fragment the NPU caching allocator
-    # across waves (59.56 GiB reserved vs 47.05 GiB active observed); a later
-    # 744 MiB contiguous scratch allocation then fails with OOM. expandable_segments
-    # keeps large blocks growable and reusable, matching pr-test-npu.yml behavior.
+    # Unchunked 77k-token prefill waves fragment the NPU allocator; keep large
+    # blocks growable so contiguous allocations do not OOM.
     "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
 }
 
