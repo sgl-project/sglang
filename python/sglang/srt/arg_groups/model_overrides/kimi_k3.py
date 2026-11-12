@@ -79,11 +79,11 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
                     f"not validated under DCP (got {ragged_mode.value!r})."
                 )
 
-            # DSPARK target-verify + draft-extend must run on the decode
-            # (cutedsl_mla) backend, whose _run_decode_kernel implements the DCP
-            # signature (causal_seqs / cp_world / cp_rank). The default
-            # "prefill" routes verify to trtllm_mla, whose base _run_decode_kernel
-            # lacks that DCP path (TypeError: unexpected kwarg 'causal_seqs').
+        if cfg.speculative_algorithm in ("DSPARK", "EAGLE3"):
+            # Target-verify + draft-extend must run on the decode (cutedsl_mla)
+            # backend, whose _run_decode_kernel implements the DCP signature
+            # (causal_seqs / cp_world / cp_rank). The default "prefill" routes
+            # them to trtllm_mla, which refuses DCP with q_len > 1.
             overrides["speculative_attention_mode"] = "decode"
 
         if get_platform().is_npu:
@@ -240,6 +240,19 @@ def _kimi_k31_overrides(server_args: Any, hf_config: Any) -> dict:
         ):
             logger.info("Kimi-K3.1 DCP enables replicated Q projection by default.")
             overrides["dcp_replicate_q_proj"] = True
+    overrides.update(_kimi_k31_lossless_defaults(cfg))
+    return overrides
+
+
+def _kimi_k31_lossless_defaults(cfg: Any) -> dict:
+    """Turn on Kimi-K3.1 optimizations that keep model precision unless set:
+    FlashMLA prefill token packing only reorders the sparse-key sum, is
+    self-gated to the layouts it supports and stays off in deterministic mode."""
+    overrides = {}
+    if cfg.enable_flashmla_prefill_token_packing is None:
+        overrides["enable_flashmla_prefill_token_packing"] = True
+    if overrides:
+        logger.info(f"Kimi-K3.1 enables lossless defaults: {overrides}")
     return overrides
 
 

@@ -160,6 +160,7 @@ class KimiLinearConfig(PretrainedConfig):
                 "Kimi-K3.1 DSA requires dsa_layers == full_attn_layers, got "
                 f"dsa_layers={dsa_layers}, full_attn_layers={full_attn_layers}."
             )
+        self.dsa_layers = list(dsa_layers)
         self.index_topk = dsa_config["index_topk"]
         self.index_n_heads = dsa_config["index_num_heads"]
         self.index_head_dim = dsa_config["index_head_dim"]
@@ -171,6 +172,9 @@ class KimiLinearConfig(PretrainedConfig):
         self.index_k_norm_fp32 = True
         self.index_apply_hadamard = False
         self.index_bf16_head_gate = True
+
+    def is_dsa_layer(self, layer_idx: int) -> bool:
+        return self.dsa_config is not None and (layer_idx + 1) in self.dsa_layers
 
     @property
     def is_mla(self):

@@ -48,6 +48,7 @@ from sglang.kernels.ops.kvcache.cache_ops import launch_reshape_and_cache_flash
 from sglang.kernels.ops.kvcache.kvcache import can_use_store_cache, store_cache
 from sglang.kernels.ops.kvcache.mla_buffer import (
     get_mla_kv_buffer_triton,
+    set_mla_kv_buffer_cast_triton,
     set_mla_kv_buffer_dcp_sharded_triton,
     set_mla_kv_buffer_triton,
     set_mla_kv_buffer_triton_fp8_quant,
@@ -866,13 +867,14 @@ class MambaPool:
                             raise ValueError(
                                 f"spec-verify ring length must be a power of two, got {L}"
                             )
-                        if (
-                            speculative_num_draft_tokens is not None
-                            and L < 2 * speculative_num_draft_tokens
-                        ):
+                        # Fold-every-commit rewrites from offset zero; only
+                        # one verify window is live. Other modes need headroom.
+                        min_ring_len = (speculative_num_draft_tokens or 0) * (
+                            1 if self.replayssm_spec_fold else 2
+                        )
+                        if L < min_ring_len:
                             raise ValueError(
-                                f"spec-verify ring too small: {L} < "
-                                f"2 * {speculative_num_draft_tokens} (early-flush margin)"
+                                f"spec-verify ring too small: {L} < {min_ring_len}"
                             )
                     replayssm_rawv = torch.zeros(
                         size=(num_mamba_layers, num_slots, hv, record_len, v_dim),
@@ -1950,6 +1952,8 @@ class KvBufferDesc:
 class KVCache(abc.ABC):
     layer_shard_enabled: bool = False
     post_capture_active: bool = False
+    # Under DCP, rows are owner rows (loc // dcp_size) rather than raw widened
+    # locs; PD transfer must then map a draft like the target.
     rows_are_dcp_collapsed: bool = False
 
     @property
@@ -4287,6 +4291,8 @@ class HybridLinearKVPool(KVCache):
         # full-attention layers instead of constructing one internally.
         full_kv_pool: Optional[KVCache] = None,
         post_capture_active: bool = False,
+        # HiSparse only: forwarded to a HiSparseDSATokenToKVPool full pool.
+        host_to_device_ratio: Optional[int] = None,
         use_fp4_indexer: bool = False,
         use_combined_kv_buffer: bool = False,
     ):
@@ -4344,6 +4350,11 @@ class HybridLinearKVPool(KVCache):
                 if full_kv_pool_class is not None
                 else DSATokenToKVPool
             )
+            hisparse_kwargs = (
+                {}
+                if host_to_device_ratio is None
+                else {"host_to_device_ratio": host_to_device_ratio}
+            )
             self.full_kv_pool = DSAPoolClass(
                 size=size,
                 page_size=self.page_size,
@@ -4361,6 +4372,7 @@ class HybridLinearKVPool(KVCache):
                 max_running_requests=max_running_requests,
                 skip_topk_layers=skip_topk_layers,
                 kv_scale_ue8m0=kv_scale_ue8m0,
+                **hisparse_kwargs,
                 use_fp4_indexer=use_fp4_indexer,
             )
         else:
@@ -4493,6 +4505,25 @@ class HybridLinearKVPool(KVCache):
 
     def maybe_get_custom_mem_pool(self):
         return self.full_kv_pool.maybe_get_custom_mem_pool()
+
+    def register_mapping(self, mapping: torch.Tensor) -> None:
+        self.full_kv_pool.register_mapping(mapping)
+
+    def _translate_loc_to_hisparse_device(self, indices: torch.Tensor) -> torch.Tensor:
+        return self.full_kv_pool._translate_loc_to_hisparse_device(indices)
+
+    def translate_loc_to_hisparse_device(self, indices: torch.Tensor) -> torch.Tensor:
+        return self.full_kv_pool.translate_loc_to_hisparse_device(indices)
+
+    def translate_loc_from_full_to_hisparse_device(
+        self, indices: torch.Tensor
+    ) -> torch.Tensor:
+        return self.full_kv_pool.translate_loc_from_full_to_hisparse_device(indices)
+
+    def translate_loc_from_full_to_compressed(
+        self, indices: torch.Tensor
+    ) -> torch.Tensor:
+        return self.full_kv_pool.translate_loc_from_full_to_compressed(indices)
 
     def _transfer_full_attention_id(self, layer_id: int):
         if layer_id not in self.full_attention_layer_id_mapping:
@@ -4865,6 +4896,10 @@ class MLATokenToKVPool(KVCache, MLAKVView):
         self.qk_rope_head_dim = qk_rope_head_dim
         self.use_dsa = use_dsa
         self.dcp_replicated = dcp_replicated
+        # fp8_ds_mla tile scales rounded up to powers of two (Kimi-K3.1)
+        self.kv_scale_ue8m0 = False
+        # raw fp8 rows written by a cast-on-store scatter (Kimi-K3.1 trtllm)
+        self.fp8_cast_on_write = False
         self.dsa_kv_cache_store_fp8 = (
             use_dsa
             and dtype == torch.float8_e4m3fn
@@ -5006,6 +5041,8 @@ class MLATokenToKVPool(KVCache, MLAKVView):
 
     @property
     def rows_are_dcp_collapsed(self) -> bool:
+        # Either the plan resolved the owner rule or the sharded kernel does;
+        # a replicated draft pool keeps raw widened rows.
         return get_parallel().dcp_enabled and not self.dcp_replicated
 
     @property
@@ -5108,6 +5145,26 @@ class MLATokenToKVPool(KVCache, MLAKVView):
             # NoPE bytes are [FP8 values | one FP32 scale per 128 values].
             # RoPE bytes contain the raw BF16 tail and may have zero width.
             self._scatter_mla_rows(dst_buffer, loc, cache_k_nope_fp8, cache_k_rope_fp8)
+        elif (
+            self.fp8_cast_on_write
+            and cache_k_nope.dtype == torch.bfloat16
+            and cache_k_rope is not None
+            and cache_k_rope.dtype == torch.bfloat16
+            and cache_k_rope.numel() > 0
+        ):
+            if self.write_loc_is_dcp_resolved or self.dcp_replicated:
+                world, rank = 1, 0
+            else:
+                world = get_parallel().attn_dcp_size
+                rank = get_parallel().attn_dcp_rank
+            set_mla_kv_buffer_cast_triton(
+                dst_buffer.view(self.dtype),
+                loc,
+                cache_k_nope,
+                cache_k_rope,
+                dcp_world_size=world,
+                dcp_rank=rank,
+            )
         else:
             if cache_k_nope.dtype != self.dtype:
                 cache_k_nope = cache_k_nope.to(self.dtype)
@@ -5155,6 +5212,11 @@ class MLATokenToKVPool(KVCache, MLAKVView):
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
     ):
+        """Write the first commit_lens[i] rows of each loc_2d [bs, n] row.
+
+        The other rows go to the reserved padding slot 0, which keeps shapes
+        static and avoids a host sync on commit_lens.
+        """
         self.set_mla_kv_buffer(
             layer,
             _prefix_valid_mla_write_loc(loc_2d, commit_lens, cache_k_nope),
@@ -5470,6 +5532,14 @@ class DSATokenToKVPool(MLATokenToKVPool):
             dcp_replicated=dcp_replicated,
         )
         self.kv_scale_ue8m0 = kv_scale_ue8m0
+        # kv_scale_ue8m0 marks Kimi-K3.1; its raw fp8 layout (trtllm) casts the
+        # bf16 rows inside the scatter kernel.
+        self.fp8_cast_on_write = (
+            kv_scale_ue8m0
+            and _is_cuda
+            and dtype == torch.float8_e4m3fn
+            and not self.dsa_kv_cache_store_fp8
+        )
         # self.index_k_dtype = torch.float8_e4m3fn
         # self.index_k_scale_dtype = torch.float32
         self.index_head_dim = index_head_dim

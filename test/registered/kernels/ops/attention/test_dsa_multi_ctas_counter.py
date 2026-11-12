@@ -41,6 +41,7 @@ def _make_backend(*, allocate_counter: bool = True):
     backend.real_page_span = 64
     backend.attn_dcp_size, backend.attn_dcp_rank = 1, 0
     backend.dsa_shards_index_k = False
+    backend._flashmla_kv_pad_q_in_place = False
     backend.hisparse_coordinator = None
     backend.speculative_num_draft_tokens = _NUM_DRAFT_TOKENS
     backend.dsa_index_kpool = 1

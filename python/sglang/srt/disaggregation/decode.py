@@ -128,12 +128,12 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 from sglang.srt.mem_cache.capacity import capacity_decision
 from sglang.srt.mem_cache.common import (
     RetractionBackup,
-    dsv4_needs_rebootstrap,
     finish_restore_kv_cache,
     kv_to_page_indices,
     match_kv_cache,
     page_align_floor,
     restore_kv_cache,
+    retraction_needs_rebootstrap,
     start_restore_kv_cache,
     suffix_page_indices,
 )
@@ -169,6 +169,7 @@ from sglang.srt.runtime_context import (
     get_memory,
     get_parallel,
 )
+from sglang.srt.speculative.dflash_draft_ring import get_draft_kv_ring
 from sglang.srt.utils import ceil_align, is_npu, rank_consensus_checker
 from sglang.srt.utils.device import async_h2d
 from sglang.srt.utils.network import NetworkAddress
@@ -1126,7 +1127,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if not is_retracted and not is_rebootstrap and is_unadmitted_reject(req):
             self.scheduler.request_retirer.retire_unadmitted(req)
             return
-        if is_retracted and dsv4_needs_rebootstrap(self.token_to_kv_pool_allocator):
+        if is_retracted and retraction_needs_rebootstrap(
+            self.token_to_kv_pool_allocator
+        ):
             req.time_stats.set_retract_time()
             is_retracted = False
             is_rebootstrap = True
@@ -1165,12 +1168,16 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 self._window_tails(fill_len).values(), default=fill_len
             )
         # Match and lock only reusable FULL KV. The entire SWA tail must be
-        # freshly allocated, including when the prefix comes from L2/L3.
+        # freshly allocated, including when the prefix comes from L2/L3. Prefill
+        # always sends the final Mamba state, so a Mamba tree needs no cached
+        # state at the hit: match FULL KV past the last one.
+        full_kv_only = self.tree_cache.supports_full_kv_only_match()
         result = match_kv_cache(
             req,
             self.tree_cache,
             req.origin_input_ids,
-            cow_mamba=self.tree_cache.supports_mamba(),
+            cow_mamba=self.tree_cache.supports_mamba() and not full_kv_only,
+            full_kv_only=full_kv_only,
             max_prefix_len=max_prefix_len,
         )
         req.lock = self.tree_cache.lock(result.last_device_node)
@@ -2197,6 +2204,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 int(decode_req.req.kv.req_pool_idx), seq_len
             )
 
+        def _draft_ring_payload():
+            ring = get_draft_kv_ring()
+            if ring is None:
+                return None
+            ring.reset_floor(int(decode_req.req.kv.req_pool_idx), seq_len)
+            return ring.transfer_rows(int(decode_req.req.kv.req_pool_idx), seq_len)
+
         def _request_row_payload():
             return np.array([decode_req.req.kv.req_pool_idx], dtype=np.int32)
 
@@ -2218,6 +2232,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             StateType.MINIMAX_INDEX_K: _minimax_payload,
             StateType.MINIMAX_DENSE_KV: _full_kv_pages_payload,
             StateType.SWA_RING: _swa_ring_payload,
+            StateType.DRAFT_RING: _draft_ring_payload,
             StateType.DSV4_REQUEST_STATE: _request_state_payload,
             StateType.REQUEST_ROW: _request_row_payload,
             StateType.BLOCK_SCALE: _full_kv_pages_payload,

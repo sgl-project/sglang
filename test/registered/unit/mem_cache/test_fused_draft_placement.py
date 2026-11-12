@@ -780,6 +780,7 @@ class TestFusedDraftDecision(CustomTestCase):
             swa_v_head_dim=64,
         )
         cfg.kv_cache_dtype = host_kv_dtype
+        cfg.dflash_draft_loc_space_scale = 1
         cfg.spec_aux_config = SimpleNamespace(
             eagle_draft_num_layers=1,
             draft_kv_num_layers=1,
@@ -1099,6 +1100,9 @@ class TestFusedDraftDecision(CustomTestCase):
         cfg.model_config = SimpleNamespace(
             hf_config=SimpleNamespace(architectures=["BailingMoeForCausalLMNextN"])
         )
+        cfg.mambaish_config = None
+        cfg.is_hybrid_swa = False
+        cfg.kv_cache_dtype = torch.bfloat16
         for width in (2, 4):
             with self.subTest(dcp=width), get_parallel().override(attn_dcp_size=width):
                 self.assertEqual(cfg.loc_space_scale, 1)

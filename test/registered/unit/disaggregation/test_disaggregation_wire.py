@@ -509,9 +509,12 @@ class TestDisaggregationWire(unittest.TestCase):
         self.assertIs(manager.decode_kv_args_table["decode"], bad)
 
     def test_mooncake_dflash_tp_mismatch_allows_dcp_collapsed_mla_draft(self):
+        """A TP-sharded MHA draft cannot change TP size across PD; a DCP-collapsed
+        MLA draft is replicated and resliced by the DCP send path."""
         for collapsed in (False, True):
             with self.subTest(collapsed=collapsed):
                 manager = object.__new__(MooncakeKVManager)
+                # No replicated single-entry draft layout: the MHA-like case.
                 manager.kv_args = SimpleNamespace(
                     state_types=[],
                     num_draft_entries=0,
@@ -521,7 +524,7 @@ class TestDisaggregationWire(unittest.TestCase):
                 manager.is_mla_backend = True
                 manager.is_hybrid_mla_backend = False
                 manager.pp_size = 1
-                manager.state_tp_size = 2
+                manager.state_tp_size = 2  # prefill CP2 under TP1
                 manager.attn_tp_size = 1
                 registration_info = SimpleNamespace(
                     mooncake_session_id="decode",

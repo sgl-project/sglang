@@ -35,6 +35,8 @@ def _plan(*, src, dst, page_size, dcp_size, dcp_rank, **kwargs):
 
 class TestDcpCollapsedDraftPlan(CustomTestCase):
     def test_collapsed_draft_takes_the_target_rows(self):
+        # Same geometry as test_one_virtual_page_explicit_rows; rank 2 owns
+        # positions 2 and 6 -> src rows 4, 8 -> local rows 14, 15 on page 7.
         plan = _plan(
             src=[5, 2, 11, 4],
             dst=[7],
@@ -60,9 +62,9 @@ class TestDcpCachedPrefixSend(CustomTestCase):
             num_draft_entries=0,
             page_size=page_size,
             gpu_id=0,
-            state_types=[StateType.MAMBA],
+            state_types=[StateType.MAMBA, StateType.DSA],
             dsa_index_k_token_bytes=None,
-            state_sub_pools=[None],
+            state_sub_pools=[None, None],
         )
         mgr._dcp_pack_buffers = None
         mgr._dcp_pack_max_tokens = None
@@ -161,6 +163,10 @@ class TestDcpCachedPrefixSend(CustomTestCase):
                     all(c.kwargs["state_indices"] is None for c in calls[:-1])
                 )
                 self.assertEqual(int(calls[-1].kwargs["state_indices"][0][0]), 17)
+                np.testing.assert_array_equal(
+                    calls[-1].kwargs["state_indices"][1],
+                    np.arange(prefix // page_size, 33),
+                )
 
 
 class TestHostTensorIndicesEvent(CustomTestCase):
@@ -316,6 +322,7 @@ class TestTryDcpPack(CustomTestCase):
             dst_dcp_rank=1, dst_dcp_size=2, dcp_token_item_lens=[item_len]
         )
         with (
+            patch("sglang.srt.disaggregation.common.dcp_pack.torch.cuda.set_device"),
             patch(
                 "sglang.srt.disaggregation.common.dcp_pack.device_stream_context",
                 return_value=nullcontext(),

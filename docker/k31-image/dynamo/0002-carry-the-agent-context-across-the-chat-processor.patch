@@ -1,0 +1,581 @@
+From 122d019df2a8f2406cd98100eceab12e15f2ba9d Mon Sep 17 00:00:00 2001
+From: Po-Han Huang <53919306+nvpohanh@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 11:08:29 +0800
+Subject: [PATCH 2/2] K3.1 session affinity: carry the agent context across the Python
+ chat-processor hop; seed subagent groups from the parent
+
+On --dyn-chat-processor sglang|vllm, RoutedEngine rebuilds the request context, so the typed
+registry entries the HTTP layer set are lost. The cherry-picked upstream fix (ai-dynamo/dynamo#15333,
+rebase of #12191) restores SessionAffinityId. This adds the same carry for AgentContext (the parent
+session id) and makes an unbound subagent group start on its parent's worker:
+
+- bindings: keep AgentContext on the Python Context and re-insert it into the routed request's
+  registry. The request body (PreprocessedRequest.agent_context, i.e. the worker payload) is left
+  unchanged, so workers receive exactly what they received before.
+- migration / prefill router: re-insert the registry AgentContext where the per-attempt and the
+  prefill sub-request contexts are rebuilt (both already re-insert SessionAffinityId).
+- routing_host: group_binding_id falls back to the registry AgentContext; when the subagent group
+  is unbound, its first selection is offered the parent session's current target on that hop
+  (a hint: a failing seeded selection retries unseeded). Logs
+  "K3.1 session affinity: subagent group seeded from parent session binding".
+
+Campaign-local infrastructure shim on v1.6.0 (701da252); not filed upstream.
+
+Signed-off-by: Po-Han Huang <53919306+nvpohanh@users.noreply.github.com>
+---
+ lib/bindings/python/rust/context.rs           |  17 ++-
+ lib/bindings/python/rust/llm/routed_engine.rs |  32 ++++-
+ lib/llm/src/kv_router/prefill_router/mod.rs   |  13 +-
+ lib/llm/src/kv_router/routing_host.rs         |  63 ++++++--
+ lib/llm/src/kv_router/routing_host/tests.rs   | 136 +++++++++++++++++-
+ lib/llm/src/migration.rs                      |  49 ++++++-
+ 6 files changed, 294 insertions(+), 16 deletions(-)
+
+diff --git a/lib/bindings/python/rust/context.rs b/lib/bindings/python/rust/context.rs
+index 42fd51322c..f74261f2e8 100644
+--- a/lib/bindings/python/rust/context.rs
++++ b/lib/bindings/python/rust/context.rs
+@@ -11,7 +11,9 @@
+ // `set_status` operations mirror the OTel `Span` API.
+ 
+ use dynamo_backend_common::FirstTokenNotifier;
+-use dynamo_llm::protocols::common::extensions::{SESSION_AFFINITY_CONTEXT_KEY, SessionAffinityId};
++use dynamo_llm::protocols::common::extensions::{
++    AGENT_CONTEXT_CONTEXT_KEY, AgentContext, SESSION_AFFINITY_CONTEXT_KEY, SessionAffinityId,
++};
+ use dynamo_runtime::logging::DistributedTraceContext;
+ pub use dynamo_runtime::pipeline::AsyncEngineContext;
+ use dynamo_runtime::pipeline::Context as PipelineContext;
+@@ -66,6 +68,8 @@ pub struct Context {
+     first_token: Option<FirstTokenNotifier>,
+     metadata: Arc<Mutex<BTreeMap<String, String>>>,
+     session_affinity: Option<SessionAffinityId>,
++    /// K3.1 session affinity: the typed agent context (parent session id), kept for the router only.
++    agent_context: Option<AgentContext>,
+     /// Captured `engine.generate` span. `None` for Python-instantiated test
+     /// contexts (where no parent span was plumbed in) — `current_span` /
+     /// `start_span` return a no-op `SpanProxy` in that case.
+@@ -186,6 +190,7 @@ impl Context {
+             first_token,
+             metadata: Arc::new(Mutex::new(metadata)),
+             session_affinity: None,
++            agent_context: None,
+             span: None,
+         }
+     }
+@@ -197,6 +202,10 @@ impl Context {
+         self.session_affinity = context
+             .get_optional::<SessionAffinityId>(SESSION_AFFINITY_CONTEXT_KEY)?
+             .map(|session_affinity| session_affinity.as_ref().clone());
++        // K3.1 session affinity: keep the agent context too, so subagent grouping survives the Python hop.
++        self.agent_context = context
++            .get_optional::<AgentContext>(AGENT_CONTEXT_CONTEXT_KEY)?
++            .map(|agent_context| agent_context.as_ref().clone());
+         Ok(self)
+     }
+ 
+@@ -243,6 +252,10 @@ impl Context {
+         self.session_affinity.as_ref()
+     }
+ 
++    pub fn agent_context(&self) -> Option<&AgentContext> {
++        self.agent_context.as_ref()
++    }
++
+     /// Build the `traceparent` header value. Prefers the engine.generate
+     /// OTel span context when valid so downstream engine spans nest under
+     /// `engine.generate`; falls back to the inbound trace context.
+@@ -291,6 +304,7 @@ impl Context {
+             first_token: None,
+             metadata: Arc::new(Mutex::new(metadata.unwrap_or_default())),
+             session_affinity: None,
++            agent_context: None,
+             span: None,
+         }
+     }
+@@ -309,6 +323,7 @@ impl Context {
+             first_token: None,
+             metadata: Arc::new(Mutex::new(self.metadata_snapshot())),
+             session_affinity: self.session_affinity.clone(),
++            agent_context: self.agent_context.clone(),
+             span: self.span.clone(),
+         }
+     }
+diff --git a/lib/bindings/python/rust/llm/routed_engine.rs b/lib/bindings/python/rust/llm/routed_engine.rs
+index b677cd1ac6..7483f16dbc 100644
+--- a/lib/bindings/python/rust/llm/routed_engine.rs
++++ b/lib/bindings/python/rust/llm/routed_engine.rs
+@@ -8,7 +8,9 @@ use tracing::Instrument;
+ use tracing_opentelemetry::OpenTelemetrySpanExt;
+ 
+ use dynamo_llm::entrypoint::PrefillRoutedEngine;
+-use dynamo_llm::protocols::common::extensions::SESSION_AFFINITY_CONTEXT_KEY;
++use dynamo_llm::protocols::common::extensions::{
++    AGENT_CONTEXT_CONTEXT_KEY, SESSION_AFFINITY_CONTEXT_KEY,
++};
+ use dynamo_llm::protocols::common::preprocessor::PreprocessedRequest;
+ use dynamo_runtime::logging::{DistributedTraceContext, otel_parent_context_from_distributed};
+ use dynamo_runtime::pipeline::{AsyncEngineContextProvider, SingleIn};
+@@ -35,6 +37,10 @@ fn copy_session_affinity(
+     if let Some(session_affinity) = parent_context.session_affinity() {
+         child_context.insert(SESSION_AFFINITY_CONTEXT_KEY, session_affinity.clone());
+     }
++    // K3.1 session affinity: registry only; the request body (and so the worker payload) is unchanged.
++    if let Some(agent_context) = parent_context.agent_context() {
++        child_context.insert(AGENT_CONTEXT_CONTEXT_KEY, agent_context.clone());
++    }
+ }
+ 
+ #[pymethods]
+@@ -152,7 +158,7 @@ fn dispatch_span(
+ mod tests {
+     use super::*;
+     use dynamo_llm::protocols::common::extensions::{
+-        SessionAffinityId, session_affinity_from_headers,
++        AgentContext, AgentContextBuilder, SessionAffinityId, session_affinity_from_headers,
+     };
+     use dynamo_runtime::logging::{DistributedTraceIdLayer, inject_trace_headers_into_map};
+     use opentelemetry::trace::{TraceContextExt, TraceId, TracerProvider as _};
+@@ -186,6 +192,28 @@ mod tests {
+         assert_eq!(session_affinity.as_str(), "session-123");
+     }
+ 
++    #[test]
++    fn aria_s1_agent_context_crosses_python_boundary_in_registry_only() {
++        let mut source = SingleIn::new(());
++        let mut agent_context = AgentContextBuilder::default();
++        agent_context.session_id("child-1".to_string());
++        agent_context.parent_session_id("parent-1".to_string());
++        source.insert(AGENT_CONTEXT_CONTEXT_KEY, agent_context.build().unwrap());
++        let python_context =
++            crate::context::Context::new(source.context(), None, None, Default::default())
++                .with_session_affinity_from(&source)
++                .expect("pipeline context converts to Python binding context");
++        let mut routed_context = SingleIn::new(preprocessed_request());
++        copy_session_affinity(&python_context, &mut routed_context);
++
++        let carried = routed_context
++            .get::<AgentContext>(AGENT_CONTEXT_CONTEXT_KEY)
++            .expect("agent context restored after Python boundary");
++        assert_eq!(carried.parent_session_id.as_deref(), Some("parent-1"));
++        // The request body, and so the worker payload, is unchanged.
++        assert!(routed_context.content().agent_context.is_none());
++    }
++
+     fn make_trace_context(
+         trace_id: &str,
+         span_id: &str,
+diff --git a/lib/llm/src/kv_router/prefill_router/mod.rs b/lib/llm/src/kv_router/prefill_router/mod.rs
+index 208277769d..2d991ae455 100644
+--- a/lib/llm/src/kv_router/prefill_router/mod.rs
++++ b/lib/llm/src/kv_router/prefill_router/mod.rs
+@@ -29,7 +29,10 @@ use crate::{
+     discovery::{ModelManager, WorkerSetTarget, WorkerSetTargetId},
+     kv_router::{RoutingHost, SelectionPolicySource},
+     protocols::common::{
+-        extensions::{SESSION_AFFINITY_CONTEXT_KEY, SessionAffinityId},
++        extensions::{
++            AGENT_CONTEXT_CONTEXT_KEY, AgentContext, SESSION_AFFINITY_CONTEXT_KEY,
++            SessionAffinityId,
++        },
+         llm_backend::{LLMEngineOutput, PreprocessedRequest},
+         preprocessor::{BootstrapInfo, PrefillResult, TraceLink},
+         timing::{RequestPhase, RequestTracker},
+@@ -467,6 +470,11 @@ impl
+             .and_then(|r| r.prefill_worker_id);
+ 
+         let tracker = prefill_req.tracker.clone();
++        // K3.1 session affinity: the Python chat-processor path carries the agent context in the registry only.
++        let agent_context = context
++            .get_optional::<AgentContext>(AGENT_CONTEXT_CONTEXT_KEY)
++            .ok()
++            .flatten();
+         let mut prefill_context = independent_prefill_context(prefill_req, &context)?;
+         if let Some(session_affinity) = session_affinity {
+             prefill_context.insert(
+@@ -474,6 +482,9 @@ impl
+                 session_affinity.as_ref().clone(),
+             );
+         }
++        if let Some(agent_context) = agent_context {
++            prefill_context.insert(AGENT_CONTEXT_CONTEXT_KEY, agent_context.as_ref().clone());
++        }
+         let binding = match self.binding.load_full() {
+             Some(binding) => binding,
+             // The target was replaced after the gate above (a WorkerSet succession
+diff --git a/lib/llm/src/kv_router/routing_host.rs b/lib/llm/src/kv_router/routing_host.rs
+index b148ab2e09..284ecb4826 100644
+--- a/lib/llm/src/kv_router/routing_host.rs
++++ b/lib/llm/src/kv_router/routing_host.rs
+@@ -34,7 +34,7 @@ use crate::{
+     preprocessor::PreprocessedRequest,
+     protocols::common::{
+         FinishReason,
+-        extensions::SessionAffinityId,
++        extensions::{AGENT_CONTEXT_CONTEXT_KEY, AgentContext, SessionAffinityId},
+         llm_backend::LLMEngineOutput,
+         preprocessor::owned_abort_error,
+         timing::{RequestPhase, RoutingData, WORKER_TYPE_DECODE, WORKER_TYPE_PREFILL},
+@@ -595,16 +595,37 @@ impl RoutingHost {
+         if explicit.is_some() {
+             return None;
+         }
+-        let parent_session_id = request
+-            .content()
+-            .agent_context
+-            .as_ref()
+-            .and_then(|context| context.parent_session_id.as_deref())?;
++        let parent_session_id = parent_session_id(request)?;
+         Some(Arc::new(SessionAffinityId::new(
+-            subagent_group_affinity_id(parent_session_id),
++            subagent_group_affinity_id(&parent_session_id),
+         )))
+     }
+ 
++    /// K3.1 session affinity: where an unbound subagent group starts, namely the worker (and DP rank)
++    /// its parent session is bound to on this hop, if that target is still usable.
++    fn parent_seed(
++        &self,
++        affinity: &AffinityCoordinator,
++        request: &SingleIn<PreprocessedRequest>,
++        explicit: Option<AffinityTarget>,
++    ) -> Option<AffinityTarget> {
++        if explicit.is_some() {
++            return None;
++        }
++        let parent = SessionAffinityId::new(parent_session_id(request)?);
++        let target = affinity.query_target(&parent, None).ok().flatten()?;
++        if !self.affinity_target_is_valid(target) {
++            return None;
++        }
++        tracing::info!(
++            request_id = %request.context().id(),
++            worker_id = target.worker_id,
++            dp_rank = ?target.dp_rank,
++            "K3.1 session affinity: subagent group seeded from parent session binding"
++        );
++        Some(target)
++    }
++
+     /// Commit a held session to the dispatched worker; a request without a
+     /// session passes its stream through.
+     fn bind_affinity(
+@@ -735,7 +756,10 @@ impl RoutingHost {
+             .group_binding_id(request, explicit)
+             .unwrap_or(session_id);
+         if is_query_only {
+-            let target = affinity.query_target(&session_id, explicit)?;
++            let target = match affinity.query_target(&session_id, explicit)? {
++                Some(target) => Some(target),
++                None => self.parent_seed(affinity, request, explicit),
++            };
+             return Ok((select(target).await?, None));
+         }
+ 
+@@ -751,10 +775,17 @@ impl RoutingHost {
+                 budget,
+             )
+             .await?;
+-        let target = operation.target().map(from_table);
++        // K3.1 session affinity: a subagent group's first turn follows its parent's worker.
++        let seed = match operation.target() {
++            Some(_) => None,
++            None => self.parent_seed(affinity, request, explicit),
++        };
++        let target = operation.target().map(from_table).or(seed);
+         match select(target).await {
+             Ok(selection) => Ok((selection, Some(operation))),
+             Err(error) if is_cancelled(&error) => Err(error),
++            // K3.1 session affinity: the seed is only a hint; on failure select as if there were none.
++            Err(_error) if seed.is_some() => Ok((select(None).await?, Some(operation))),
+             Err(_error)
+                 if self.session_affinity_mode == SessionAffinityMode::Hard
+                     && explicit.is_none()
+@@ -942,5 +973,19 @@ fn classify_response_item(item: &Annotated<LLMEngineOutput>) -> ResponseItemOutc
+     }
+ }
+ 
++/// K3.1 session affinity: the parent session id of a subagent request. The OpenAI preprocessor copies it
++/// onto the request; the Python chat-processor path (`RoutedEngine`) carries it only in the
++/// request context registry, so fall back to that.
++fn parent_session_id(request: &SingleIn<PreprocessedRequest>) -> Option<String> {
++    if let Some(context) = request.content().agent_context.as_ref() {
++        return context.parent_session_id.clone();
++    }
++    request
++        .get_optional::<AgentContext>(AGENT_CONTEXT_CONTEXT_KEY)
++        .ok()
++        .flatten()
++        .and_then(|context| context.parent_session_id.clone())
++}
++
+ #[cfg(test)]
+ mod tests;
+diff --git a/lib/llm/src/kv_router/routing_host/tests.rs b/lib/llm/src/kv_router/routing_host/tests.rs
+index eb3b8b003d..9090b08b9c 100644
+--- a/lib/llm/src/kv_router/routing_host/tests.rs
++++ b/lib/llm/src/kv_router/routing_host/tests.rs
+@@ -41,7 +41,10 @@ use crate::{
+     lora::{LoraReplicaConfig, LoraRoutingTable, LoraStateTracker},
+     migration::Migration,
+     protocols::common::{
+-        extensions::{AgentContextBuilder, SESSION_AFFINITY_CONTEXT_KEY, SessionAffinityId},
++        extensions::{
++            AGENT_CONTEXT_CONTEXT_KEY, AgentContextBuilder, SESSION_AFFINITY_CONTEXT_KEY,
++            SessionAffinityId,
++        },
+         preprocessor::{MmRoutingInfo, RoutingHints},
+         timing::RequestTracker,
+     },
+@@ -4458,6 +4461,137 @@ async fn parent_group_binding_offers_siblings_the_committed_worker() {
+     runtime.shutdown();
+ }
+ 
++/// K3.1 session affinity: the Python chat-processor path carries the agent context in the registry only.
++fn registry_subagent_request(
++    session_id: &str,
++    parent_session_id: &str,
++) -> SingleIn<PreprocessedRequest> {
++    let mut agent_context = AgentContextBuilder::default();
++    agent_context.session_id(session_id.to_string());
++    agent_context.parent_session_id(parent_session_id.to_string());
++    let mut request = Context::new(request());
++    request.insert(
++        SESSION_AFFINITY_CONTEXT_KEY,
++        SessionAffinityId::new(session_id),
++    );
++    request.insert(AGENT_CONTEXT_CONTEXT_KEY, agent_context.build().unwrap());
++    request
++}
++
++#[tokio::test]
++#[serial_test::serial]
++async fn aria_s1_unbound_group_starts_on_the_parent_worker() {
++    let workers = [7u64, 9]
++        .into_iter()
++        .map(|worker_id| (worker_id, ModelRuntimeConfig::default()))
++        .collect();
++    let (router, runtime) =
++        router_with_worker_configs(Some(Duration::from_secs(60)), workers).await;
++    let affinity = router.affinity.as_ref().unwrap();
++
++    // The parent session is bound to worker 9.
++    let Hold::Initialize(parent) = affinity
++        .acquire(&SessionAffinityId::new("parent-1"), None)
++        .await
++        .unwrap()
++    else {
++        panic!("the parent must initialize its own session");
++    };
++    drop(
++        parent
++            .commit(crate::session_affinity::to_table(AffinityTarget::new(
++                9,
++                Some(0),
++            )))
++            .unwrap(),
++    );
++
++    let offered = async |request: &SingleIn<PreprocessedRequest>| {
++        router
++            .select_with_session_affinity(
++                request,
++                RequestPhase::Aggregated,
++                false,
++                &CleanupBudget::default(),
++                |target| std::future::ready(Ok(target)),
++            )
++            .await
++            .unwrap()
++    };
++
++    // The parent link is in the registry only, as on the RoutedEngine path.
++    let first = registry_subagent_request("child-1", "parent-1");
++    assert!(first.content().agent_context.is_none());
++    assert_eq!(
++        router.group_binding_id(&first, None).unwrap().as_str(),
++        parent_group_id("parent-1").as_str()
++    );
++    let (offered_first, hold) = offered(&first).await;
++    assert_eq!(offered_first, Some(AffinityTarget::new(9, Some(0))));
++    assert!(matches!(hold, Some(Hold::Initialize(_))));
++    let mut stream = router
++        .bind_affinity(
++            hold,
++            AffinityTarget::new(9, Some(0)),
++            ResponseStream::new(
++                Box::pin(stream::iter([Annotated::from_data(
++                    LLMEngineOutput::default(),
++                )])),
++                first.context(),
++            ),
++        )
++        .unwrap();
++    while stream.next().await.is_some() {}
++    assert_eq!(
++        affinity
++            .query_target(&parent_group_id("parent-1"), None)
++            .unwrap(),
++        Some(AffinityTarget::new(9, Some(0)))
++    );
++
++    // A child whose parent has no binding starts unbound, as before.
++    let orphan = registry_subagent_request("child-3", "parent-2");
++    let (offered_orphan, _) = offered(&orphan).await;
++    assert_eq!(offered_orphan, None);
++
++    // A failing seeded selection falls back to an unseeded one instead of failing the request.
++    let sibling_of_orphan = registry_subagent_request("child-4", "parent-3");
++    let Hold::Initialize(parent3) = affinity
++        .acquire(&SessionAffinityId::new("parent-3"), None)
++        .await
++        .unwrap()
++    else {
++        panic!("parent-3 must initialize");
++    };
++    drop(
++        parent3
++            .commit(crate::session_affinity::to_table(AffinityTarget::new(
++                7,
++                Some(0),
++            )))
++            .unwrap(),
++    );
++    let (selected, operation) = router
++        .select_with_session_affinity(
++            &sibling_of_orphan,
++            RequestPhase::Aggregated,
++            false,
++            &CleanupBudget::default(),
++            |target: Option<AffinityTarget>| {
++                std::future::ready(match target {
++                    Some(_) => Err(anyhow::anyhow!("pinned selection failed")),
++                    None => Ok(None::<AffinityTarget>),
++                })
++            },
++        )
++        .await
++        .unwrap();
++    assert_eq!(selected, None);
++    assert!(matches!(operation, Some(Hold::Initialize(_))));
++
++    runtime.shutdown();
++}
++
+ #[tokio::test]
+ #[serial_test::serial]
+ async fn hard_parent_group_recovers_when_the_bound_worker_leaves() {
+diff --git a/lib/llm/src/migration.rs b/lib/llm/src/migration.rs
+index 1ce24e2449..335e2b5776 100644
+--- a/lib/llm/src/migration.rs
++++ b/lib/llm/src/migration.rs
+@@ -15,7 +15,10 @@ use crate::{
+     protocols::{
+         TokenIdType,
+         common::{
+-            extensions::{SESSION_AFFINITY_CONTEXT_KEY, SessionAffinityId},
++            extensions::{
++                AGENT_CONTEXT_CONTEXT_KEY, AgentContext, SESSION_AFFINITY_CONTEXT_KEY,
++                SessionAffinityId,
++            },
+             llm_backend::{BackendOutput, DecoderCheckpoint, LLMEngineOutput, PreprocessedRequest},
+             preprocessor::MultimodalData,
+             timing::RequestPhase,
+@@ -265,7 +268,12 @@ where
+             .get_optional::<SessionAffinityId>(SESSION_AFFINITY_CONTEXT_KEY)
+             .map_err(Error::msg)?
+             .map(|session_id| session_id.as_ref().clone());
+-        let retry_manager = RetryManager::build(
++        // K3.1 session affinity: the Python chat-processor path carries the agent context in the registry only.
++        let agent_context = context
++            .get_optional::<AgentContext>(AGENT_CONTEXT_CONTEXT_KEY)
++            .map_err(Error::msg)?
++            .map(|agent_context| agent_context.as_ref().clone());
++        let retry_manager = RetryManager::build_with_agent_context(
+             engine_ctx,
+             context.metadata().clone(),
+             preprocessed_request,
+@@ -275,6 +283,7 @@ where
+             self.model_name.clone(),
+             self.metrics.clone(),
+             session_affinity,
++            agent_context,
+         )
+         .await?;
+         let response_stream = stream::unfold(retry_manager, move |mut retry_manager| async move {
+@@ -310,6 +319,7 @@ where
+     metadata: BTreeMap<String, String>,
+     request: PreprocessedRequest,
+     session_affinity: Option<SessionAffinityId>,
++    agent_context: Option<AgentContext>,
+     next_generate: ServerStreamingEngine<PreprocessedRequest, Annotated<Resp>>,
+     next_stream: Option<ManyOut<Annotated<Resp>>>,
+     retries_left: u64,
+@@ -344,8 +354,38 @@ impl<Resp> RetryManager<Resp>
+ where
+     Resp: Data + HasTokenIds,
+ {
++    /// K3.1 session affinity: the request path calls `build_with_agent_context`; this keeps the tests' call sites.
++    #[cfg(test)]
+     #[allow(clippy::too_many_arguments)]
+     pub async fn build(
++        context: Arc<dyn AsyncEngineContext>,
++        metadata: BTreeMap<String, String>,
++        preprocessed_request: PreprocessedRequest,
++        next: ServerStreamingEngine<PreprocessedRequest, Annotated<Resp>>,
++        retries_left: u32,
++        max_seq_len: Option<u32>,
++        model_name: Arc<String>,
++        metrics: Arc<Metrics>,
++        session_affinity: Option<SessionAffinityId>,
++    ) -> Result<Self> {
++        Self::build_with_agent_context(
++            context,
++            metadata,
++            preprocessed_request,
++            next,
++            retries_left,
++            max_seq_len,
++            model_name,
++            metrics,
++            session_affinity,
++            None,
++        )
++        .await
++    }
++
++    /// K3.1 session affinity: `build`, also re-inserting the registry agent context on every attempt.
++    #[allow(clippy::too_many_arguments)]
++    pub async fn build_with_agent_context(
+         context: Arc<dyn AsyncEngineContext>,
+         metadata: BTreeMap<String, String>,
+         mut preprocessed_request: PreprocessedRequest,
+@@ -355,6 +395,7 @@ where
+         model_name: Arc<String>,
+         metrics: Arc<Metrics>,
+         session_affinity: Option<SessionAffinityId>,
++        agent_context: Option<AgentContext>,
+     ) -> Result<Self> {
+         // TODO: prompt_embeds take precedence over replayed token_ids. Disable migration for
+         // embedding prompts until a retry can represent an embedding-based continuation.
+@@ -400,6 +441,7 @@ where
+             metadata,
+             request: preprocessed_request,
+             session_affinity,
++            agent_context,
+             next_generate: next,
+             next_stream: None,
+             retries_left: u64::from(retries_left) + 1, // +1 to account for the initial attempt
+@@ -532,6 +574,9 @@ where
+             if let Some(session_affinity) = self.session_affinity.as_ref() {
+                 request.insert(SESSION_AFFINITY_CONTEXT_KEY, session_affinity.clone());
+             }
++            if let Some(agent_context) = self.agent_context.as_ref() {
++                request.insert(AGENT_CONTEXT_CONTEXT_KEY, agent_context.clone());
++            }
+             let attempt_context = request.context();
+             self.context.link_child(attempt_context.clone());
+             if self.context.is_stopped() || self.context.is_killed() {
+-- 
+2.39.3
+

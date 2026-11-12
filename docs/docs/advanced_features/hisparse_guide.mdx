@@ -6,7 +6,7 @@ metatags:
 
 HiSparse reduces per-request GPU memory consumption during the decode phase by maintaining only a small "hot" KV buffer on GPU while keeping complete KV data in CPU pinned memory. Combined with PD disaggregation, it enables significantly higher decode concurrency.
 
-> **Prerequisites**: HiSparse works with models that use **DeepSeek Sparse Attention (DSA)** architectures (e.g., DeepSeek-V3.2, GLM-5.1), **DeepSeek V4**, and **MiniMax M3**. These models natively select a subset of tokens for attention, making it possible to keep only the top-k KV on GPU while storing the full KV in host memory — without accuracy loss. Additionally, HiSparse currently requires **PD disaggregation mode** and is enabled on the **decode instance** only.
+> **Prerequisites**: HiSparse works with models that use **DeepSeek Sparse Attention (DSA)** architectures (e.g., DeepSeek-V3.2, GLM-5.1, and the DSA layers of Kimi-K3.1), **DeepSeek V4**, and **MiniMax M3**. These models natively select a subset of tokens for attention, making it possible to keep only the top-k KV on GPU while storing the full KV in host memory — without accuracy loss. Additionally, HiSparse currently requires **PD disaggregation mode** and is enabled on the **decode instance** only.
 
 ## Why HiSparse?
 
@@ -173,6 +173,15 @@ Dense-layer K/V and index K stay on GPU; sparse-layer K/V use host memory plus a
 - Use `--attention-backend triton`, `--mm-attention-backend triton_attn`, `--disable-prefill-cuda-graph`, and `--disable-radix-cache`.
 - Set `device_buffer_size` to at least 2048 in `--hisparse-config`; `top_k` does not override the model's selection width.
 - PD retraction backup is not supported. Use `--num-reserved-decode-tokens` to reserve capacity for the expected output length.
+
+### Kimi-K3.1
+
+Only the DSA layers use HiSparse; the KDA recurrent state stays on GPU and is transferred as usual.
+
+- Run the decode instance without `--dcp-size` and without `--disaggregation-decode-enable-radix-cache`; both are rejected with `--enable-hisparse`. The prefill instance must not use DCP either, since Mooncake cannot move KV from a DCP prefill to a non-DCP decode.
+- The DSA backend resolves to `flashmla_kv`; `trtllm` is rejected.
+- Use `--disaggregation-transfer-backend mooncake`. On hosts that mix InfiniBand and RoCE HCAs, list only one kind in `--disaggregation-ib-device`.
+- DFLASH speculative decoding is supported up to block size 8 (`index_topk` 2048 times 8 draft tokens is the 16384-occurrence limit of the speculative swap kernel).
 
 ### Benchmark
 

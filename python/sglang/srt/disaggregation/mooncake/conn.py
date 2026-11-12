@@ -1064,7 +1064,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             # Use the manager's captured target layout, not scoped CP flags.
             and self.state_tp_size != self.attn_tp_size
             and registration_info.dst_attn_tp_size != self.state_tp_size
+            # A DCP-collapsed MLA draft (Kimi-K3.1) is replicated like the
+            # target and goes through the DCP send path.
             and not registration_info.dst_draft_rows_dcp_collapsed
+            # No draft KV entries to reslice: a DFLASH draft KV ring sends its
+            # replicated window rows as a DRAFT_RING state instead.
+            and self.kv_args.num_draft_entries > 0
         ):
             # Appended draft MHA KV uses physical TP shards, while target MLA
             # KV is replicated. The draft transfer cannot reslice those shards.
@@ -2170,6 +2175,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             StateType.QSA_PENDING,
             StateType.QSA_COMPRESSED,
             StateType.SWA_RING,
+            StateType.DRAFT_RING,
             StateType.DSV4_REQUEST_STATE,
             StateType.REQUEST_ROW,
             StateType.BLOCK_SCALE,
@@ -2182,6 +2188,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             StateType.QSA_PENDING,
             StateType.QSA_COMPRESSED,
             StateType.SWA_RING,
+            StateType.DRAFT_RING,
             StateType.DSV4_REQUEST_STATE,
             StateType.REQUEST_ROW,
         )
@@ -2341,6 +2348,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     or rc
                 )
             elif self._is_generic_kvcache_state_type(st):
+                if st in (StateType.DRAFT_RING, StateType.REQUEST_ROW) and not (
+                    src_data_ptrs and dst_data_ptrs
+                ):
+                    # A side without the draft (a PP stage, or a peer whose
+                    # draft KV ring resolved off) registered empty slots.
+                    continue
                 is_qwen4_qsa_state = st in (
                     StateType.QSA_PENDING,
                     StateType.QSA_COMPRESSED,
@@ -2429,6 +2442,17 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         src_indices = src_indices[: len(dst_indices_local)]
                     else:
                         dst_indices_local = dst_indices_local[: len(src_indices)]
+                if st == StateType.DRAFT_RING:
+                    # Row 0 marks a position one side's DCP rank does not own.
+                    pairs = [
+                        (a, b)
+                        for a, b in zip(src_indices, dst_indices_local)
+                        if a and b
+                    ]
+                    if not pairs:
+                        continue
+                    src_indices = [a for a, _ in pairs]
+                    dst_indices_local = [b for _, b in pairs]
                 if slice_kv_heads:
                     rc = (
                         self._send_swa_state_slice(

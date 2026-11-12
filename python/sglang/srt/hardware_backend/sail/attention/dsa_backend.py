@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
@@ -54,8 +54,15 @@ class SailDeepseekSparseAttnBackend(DeepseekSparseAttnBackend):
     def _call_get_mla_metadata(self, **kwargs):
         return get_mla_metadata(**kwargs)
 
-    def _compute_flashmla_metadata(self, cache_seqlens: torch.Tensor, seq_len_q: int):
-        metadata = super()._compute_flashmla_metadata(cache_seqlens, seq_len_q)
+    def _compute_flashmla_metadata(
+        self,
+        cache_seqlens: torch.Tensor,
+        seq_len_q: int,
+        num_heads_q: Optional[int] = None,
+    ):
+        metadata = super()._compute_flashmla_metadata(
+            cache_seqlens, seq_len_q, num_heads_q
+        )
         return SailDSAFlashMLAMetadata(
             flashmla_metadata=metadata.flashmla_metadata,
             num_splits=metadata.num_splits,

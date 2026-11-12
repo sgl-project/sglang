@@ -1,0 +1,8 @@
+# Used instead of the repo's .dockerignore when building with k31.Dockerfile (BuildKit picks
+# <Dockerfile>.dockerignore next to the Dockerfile). The repo's file drops patterns such as
+# **/lib/ and *.so that can match sources; this one drops only build outputs and keeps .git,
+# which setuptools-scm needs for the package version.
+**/__pycache__
+**/*.pyc
+rust/target
+**/node_modules

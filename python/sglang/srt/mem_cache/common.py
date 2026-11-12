@@ -187,6 +187,7 @@ def match_kv_cache(
     token_ids: Optional[array] = None,
     *,
     cow_mamba: bool = False,
+    full_kv_only: bool = False,
     defer_cow_slot: bool = False,
     max_prefix_len: Optional[int] = None,
 ) -> MatchResult:
@@ -200,6 +201,7 @@ def match_kv_cache(
             cow_mamba=cow_mamba,
             defer_cow_slot=defer_cow_slot,
             req=req,
+            full_kv_only=full_kv_only,
         )
     )
     if envs.SGLANG_RADIX_FORCE_MISS.get():
@@ -282,14 +284,17 @@ def _evict_until_allocatable(
             return total
 
 
-def dsv4_needs_rebootstrap(
+def retraction_needs_rebootstrap(
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
 ) -> bool:
+    from sglang.srt.mem_cache.allocator.hisparse import HiSparseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 
-    pool = token_to_kv_pool_allocator.get_kvcache()
-    # No DeepSeek-V4 pool keeps a host copy of a request's KV; the prefill recomputes it.
-    return isinstance(pool, DeepSeekV4TokenToKVPool)
+    # Neither a DeepSeek-V4 pool nor a HiSparse allocator can take a host copy of a
+    # retracted request's KV, so the prefill recomputes it.
+    return isinstance(
+        token_to_kv_pool_allocator, HiSparseTokenToKVPoolAllocator
+    ) or isinstance(token_to_kv_pool_allocator.get_kvcache(), DeepSeekV4TokenToKVPool)
 
 
 def backup_kv_cache(
@@ -303,7 +308,7 @@ def backup_kv_cache(
     the caller aborts it."""
     if backend == "none":
         return False
-    if dsv4_needs_rebootstrap(token_to_kv_pool_allocator):
+    if retraction_needs_rebootstrap(token_to_kv_pool_allocator):
         if not req.resumable_by_rebootstrap:
             return False
         # Drain the in-flight forward before its slots can receive recomputed KV.

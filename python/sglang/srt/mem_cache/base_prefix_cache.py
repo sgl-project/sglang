@@ -79,6 +79,9 @@ class MatchPrefixParams:
     # matched state, and the slot is bound with the request's row.
     defer_cow_slot: bool = False
     req: Optional[Req] = None
+    # Hit the deepest FULL-KV prefix even past the last cached Mamba state, for
+    # a caller that receives the request's Mamba state elsewhere (PD decode).
+    full_kv_only: bool = False
 
 
 @dataclasses.dataclass
@@ -124,6 +127,8 @@ class InsertParams:
     # values belong to (stamped onto new tree nodes; None when sharding is
     # off). See UnifiedTreeNode.rotation_base.
     rotation_base: Optional[int] = None
+    # Storage backup context: None keeps direct/manual inserts eligible.
+    is_request_end: Optional[bool] = None
 
     def get_evicted_seqlen(self, component_type: ComponentType) -> int:
         return self.component_evicted_seqlens.get(component_type, 0)
@@ -889,6 +894,10 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         return 0
 
     def supports_mamba(self) -> bool:
+        return False
+
+    def supports_full_kv_only_match(self) -> bool:
+        """Whether `MatchPrefixParams.full_kv_only` is honored."""
         return False
 
     def release_session(self, session_id: str) -> None:

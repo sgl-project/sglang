@@ -42,6 +42,7 @@ from sglang.srt.arg_groups.model_override_base import (
     attention_backends_of,
     get_default_attn_backend,
     is_attention_backend_not_set,
+    mamba_extra_buffer_of,
     model_config_of,
     record_of,
     register_model_override_predicate,
@@ -263,7 +264,7 @@ def remote_instance_transfer_engine_of(cfg: Any, load_format: Any = None) -> boo
 def mamba_extra_buffer_lazy_of(cfg: Any) -> bool:
     """The lazy variant of :func:`mamba_extra_buffer_of`."""
     return (
-        cfg.disable_radix_cache is False
+        mamba_extra_buffer_of(cfg)
         and cfg.mamba_radix_cache_strategy == "extra_buffer_lazy"
     )
 
@@ -556,6 +557,12 @@ def _check_dsa_backend_constraints(
     """Validate DSA backend / platform / kv-cache-dtype constraints."""
     chosen = {prefill_backend, decode_backend}
 
+    # The SM100/SM103/SM107 check is check_prims_ts_sparse_mla_support, at backend init.
+    if "prims_ts" in chosen and (hip or kv_cache_dtype != "fp8_e4m3"):
+        raise ValueError(
+            "The prims_ts DSA backend needs CUDA and --kv-cache-dtype fp8_e4m3."
+        )
+
     rocm_only = {"triton"} & chosen
     if not hip and rocm_only:
         raise ValueError(
@@ -764,9 +771,10 @@ def _pin_dsa_backends(
 
 # Matches the reference fp8_ds_mla cache; trtllm's 576 B layout does not.
 _KIMI_K31_DSA_BACKEND = "flashmla_kv"
-_KIMI_K31_DSA_BACKENDS = ("flashmla_kv", "trtllm")
 # ROCm: the Triton kernels dequantize the same fp8_ds_mla rows and run BF16 dots.
 _KIMI_K31_DSA_BACKEND_HIP = "triton"
+# Opt-in: raw FP8 KV (scale 1.0) and FP8 q, so numerics differ from the reference.
+_KIMI_K31_DSA_BACKENDS = ("flashmla_kv", "trtllm", "prims_ts")
 
 
 def _kimi_k31_kv_cache_dtype(view: Any) -> dict:
@@ -782,9 +790,11 @@ def _kimi_k31_kv_cache_dtype(view: Any) -> dict:
 
 
 def _kimi_k31_dsa_backends(view: Any) -> dict:
-    if view.enable_hisparse:
-        raise ValueError("Kimi-K3.1 does not support --enable-hisparse yet.")
     if get_platform().is_hip:
+        if view.enable_hisparse:
+            raise ValueError(
+                "Kimi-K3.1 does not support --enable-hisparse on ROCm yet."
+            )
         backend = _KIMI_K31_DSA_BACKEND_HIP
         return _pin_dsa_backends(
             view,
@@ -808,16 +818,23 @@ def _kimi_k31_dsa_backends(view: Any) -> dict:
     if len(chosen) > 1:
         raise ValueError(
             "Kimi-K3.1 needs the same --dsa-prefill-backend and "
-            "--dsa-decode-backend (flashmla_kv and trtllm use different KV "
-            f"layouts); got {view.dsa_prefill_backend!r} and "
+            "--dsa-decode-backend (flashmla_kv and trtllm / prims_ts use "
+            f"different KV layouts); got {view.dsa_prefill_backend!r} and "
             f"{view.dsa_decode_backend!r}."
         )
     backend = chosen.pop() if chosen else _KIMI_K31_DSA_BACKEND
-    if backend == "trtllm":
+    if backend in ("trtllm", "prims_ts"):
         logger.warning(
-            "Kimi-K3.1 trtllm DSA uses FP8 q and an unscaled FP8 KV cache, not "
-            "the reference fp8_ds_mla numerics. PD prefill and decode must both "
-            "use trtllm."
+            f"Kimi-K3.1 {backend} DSA uses FP8 q and an unscaled FP8 KV cache, not "
+            "the reference fp8_ds_mla numerics. PD prefill and decode servers must "
+            "both use a raw-FP8-KV backend (trtllm or prims_ts)."
+        )
+    if view.enable_hisparse and backend != _KIMI_K31_DSA_BACKEND:
+        # The HiSparse FP8 backend allow-list (hisparse_hook) admits only
+        # flashmla_kv among the K3.1 backends.
+        raise ValueError(
+            f"Kimi-K3.1 HiSparse requires DSA backend {_KIMI_K31_DSA_BACKEND!r}; "
+            f"got {backend!r}."
         )
     declared = {f: backend for f in fields if getattr(view, f) is None}
     logger.warning(

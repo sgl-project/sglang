@@ -57,7 +57,10 @@ class _State(NamedTuple):
 
 @cache_once
 def _get_state() -> Optional[_State]:
-    explicit = envs.SGLANG_K3_AR_FUSION.is_set()
+    explicit = (
+        envs.SGLANG_K3_AR_FUSION.is_set()
+        or envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_K31_GB_OPTIMIZATION.get()
+    )
     if explicit:
         if not envs.SGLANG_K3_AR_FUSION.get():
             return None

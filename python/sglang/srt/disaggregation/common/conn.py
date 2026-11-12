@@ -358,7 +358,8 @@ class CommonKVManager(BaseKVManager):
         self.dsv41_spec_layout = get_dsv41_spec_layout(args)
         self.spec_kv_layout = get_spec_kv_layout(args)
         self.kv_item_lens_sum = sum(args.kv_item_lens)
-        self.state_item_lens_sum = sum(x for comp in args.state_item_lens for x in comp)
+        # Per state component: bytes one of its indices moves (summed over layers).
+        self.state_item_lens_sums = [sum(comp) for comp in args.state_item_lens]
         self.is_mla_backend = is_mla_backend
         # Per-sender fan-out of a KV copy onto N decode destinations
         # (MLA under Prefill-CP + Decode-TP, or decode_tp > prefill_tp).
@@ -2274,6 +2275,7 @@ class CommonKVSender(BaseKVSender):
         self._transfer_metric = KVTransferMetric()
         self._transfer_num_kv_indices = 0
         self._transfer_num_state_indices = 0
+        self._transfer_state_bytes = 0
         self._transfer_start_time: Optional[float] = None
         self._early_send_wait_event: Optional[object] = None
         self.trace_ctx = TraceNullContext()
@@ -2389,9 +2391,7 @@ class CommonKVSender(BaseKVSender):
 
     def get_transfer_metric(self) -> KVTransferMetric:
         total_bytes = self._transfer_num_kv_indices * self.kv_mgr.kv_item_lens_sum
-        total_bytes += (
-            self._transfer_num_state_indices * self.kv_mgr.state_item_lens_sum
-        )
+        total_bytes += self._transfer_state_bytes
         # Pinned to 1 for MHA (disjoint slices); only MLA replication makes it > 1.
         total_bytes *= self.kv_mgr.get_kv_replica_factor()
         self._transfer_metric.transfer_total_bytes = total_bytes
@@ -2404,9 +2404,15 @@ class CommonKVSender(BaseKVSender):
     ):
         self._transfer_num_kv_indices += len(kv_indices)
         if state_indices:
-            for component_indices in state_indices:
+            # Components index different units (a request slot, one row per
+            # page), so each count is priced by its own component's item lens.
+            for component, component_indices in enumerate(state_indices):
                 if component_indices is not None:
                     self._transfer_num_state_indices += len(component_indices)
+                    self._transfer_state_bytes += (
+                        len(component_indices)
+                        * self.kv_mgr.state_item_lens_sums[component]
+                    )
 
     def _prepare_send_indices(
         self,
@@ -2618,11 +2624,10 @@ class CommonKVSender(BaseKVSender):
     def abort(self):
         if self.kv_mgr.deferred_bootstrap is not None and not self._owns_bootstrap_room:
             return
-        self.kv_mgr.record_failure(
-            self.bootstrap_room,
-            "Aborted by AbortReq.",
+        self.kv_mgr.conclude_failure(
+            bootstrap_room=self.bootstrap_room,
+            failure_reason="Aborted by AbortReq.",
         )
-        self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
         self.conclude_state = KVPoll.Failed
         # Some abort paths release the request without ever clearing the
         # sender: retire its sends here, or the record outlives the room.

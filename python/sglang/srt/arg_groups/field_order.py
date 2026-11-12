@@ -568,5 +568,7 @@ POSITIONAL_FIELD_ORDER = (
     "allow_local_media_files",
     "paged_experts_host_memory_gb",
     "_max_running_requests_explicitly_set",
+    # Kimi-K3.1 additions, appended to keep existing positional slots
+    "enable_flashmla_prefill_token_packing",
 )
 # fmt: on

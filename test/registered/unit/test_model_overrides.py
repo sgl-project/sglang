@@ -250,6 +250,7 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "mm_preprocess_cache_size_mb",
                     "mm_feature_transport",
                     "mm_enable_dp_encoder",
+                    "enable_flashmla_prefill_token_packing",
                 }
             ),
         )
@@ -4534,6 +4535,150 @@ class TestQwen3VLHopperServingOverrides(CustomTestCase):
         self.assertEqual(updates, {})
         self.assertEqual(envs.SGLANG_VLM_CACHE_SIZE_MB.get(), 512)
         self.assertEqual(envs.SGLANG_MM_FEATURE_CACHE_MB.get(), 2048)
+
+
+class TestKimiK3DcpSpeculativeAttentionMode(CustomTestCase):
+    """Under DCP only cutedsl_mla (the decode backend) can serve target-verify /
+    draft-extend; the default "prefill" mode would route them to trtllm_mla,
+    which refuses DCP with q_len > 1."""
+
+    @staticmethod
+    def _overrides(**fields):
+        from sglang.srt.arg_groups.model_overrides import kimi_k3 as kimi_k3_module
+
+        args = SimpleNamespace(
+            dcp_size=8,
+            dcp_comm_backend="fi_a2a",
+            dcp_replicate_q_proj=None,
+            enable_symm_mem=False,
+            attention_backend=None,
+            prefill_attention_backend=None,
+            decode_attention_backend=None,
+            kv_cache_dtype="auto",
+            speculative_algorithm=None,
+            enable_prefill_cp=False,
+        )
+        for name, value in fields.items():
+            setattr(args, name, value)
+        # Only the DCP provider; the MoE-runner provider reads unrelated fields.
+        with patch.object(kimi_k3_module, "_require_kimi_k3_cutedsl_dcp_support"):
+            return kimi_k3_module._kimi_k3_overrides(
+                args,
+                SimpleNamespace(architectures=["KimiK3ForConditionalGeneration"]),
+            )
+
+    def test_eagle3_under_dcp_verifies_on_the_decode_backend(self):
+        overrides = self._overrides(speculative_algorithm="EAGLE3")
+        self.assertEqual(overrides["speculative_attention_mode"], "decode")
+        self.assertEqual(overrides["decode_attention_backend"], "cutedsl_mla")
+
+
+class TestKimiK31DsaBackends(CustomTestCase):
+    """Kimi-K3.1 defaults both DSA phases to flashmla_kv; trtllm is opt-in for
+    both phases together."""
+
+    @staticmethod
+    def _resolve(**fields):
+        from sglang.srt.arg_groups.model_override_base import ResolvedView
+        from sglang.srt.arg_groups.overrides import _dsa_split_backend_resolution
+
+        hf = SimpleNamespace(
+            architectures=["KimiK31ForConditionalGeneration"], index_topk=2048
+        )
+        args = dict(
+            kv_cache_dtype="fp8_e4m3",
+            dsa_prefill_backend=None,
+            dsa_decode_backend=None,
+            enable_hisparse=False,
+            dcp_size=1,
+        )
+        args.update(fields)
+        view = ResolvedView(
+            SimpleNamespace(_model_config=SimpleNamespace(hf_config=hf), **args)
+        )
+        with (
+            patch("sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True),
+            override_platform(is_npu=False),
+            override_platform(is_xpu=False),
+            override_platform(is_hip=False),
+            patch("torch.cuda.get_device_capability", return_value=(10, 0)),
+        ):
+            return _dsa_split_backend_resolution(view)
+
+    def test_defaults_to_flashmla_kv(self):
+        self.assertEqual(
+            self._resolve(),
+            {"dsa_prefill_backend": "flashmla_kv", "dsa_decode_backend": "flashmla_kv"},
+        )
+
+    def test_trtllm_on_one_phase_selects_both(self):
+        self.assertEqual(
+            self._resolve(dsa_decode_backend="trtllm"),
+            {"dsa_prefill_backend": "trtllm"},
+        )
+        self.assertEqual(
+            self._resolve(dsa_prefill_backend="trtllm", dsa_decode_backend="trtllm"),
+            {},
+        )
+
+    def test_rejects_mixed_backends(self):
+        with self.assertRaisesRegex(ValueError, "same --dsa-prefill-backend"):
+            self._resolve(
+                dsa_prefill_backend="flashmla_kv", dsa_decode_backend="trtllm"
+            )
+
+    def test_rejects_unsupported_backend(self):
+        with self.assertRaisesRegex(ValueError, "--dsa-decode-backend"):
+            self._resolve(dsa_decode_backend="flashmla_sparse")
+
+    def test_trtllm_with_dcp(self):
+        self.assertEqual(
+            self._resolve(dsa_decode_backend="trtllm", dcp_size=8),
+            {"dsa_prefill_backend": "trtllm"},
+        )
+
+    def test_hisparse_defaults_to_flashmla_kv(self):
+        self.assertEqual(
+            self._resolve(enable_hisparse=True),
+            {"dsa_prefill_backend": "flashmla_kv", "dsa_decode_backend": "flashmla_kv"},
+        )
+
+    def test_hisparse_rejects_trtllm(self):
+        with self.assertRaisesRegex(ValueError, "HiSparse requires DSA backend"):
+            self._resolve(enable_hisparse=True, dsa_decode_backend="trtllm")
+
+
+class TestKimiK31LosslessDefaults(CustomTestCase):
+    """Kimi-K3.1 turns on FlashMLA prefill token packing unless the user sets it."""
+
+    @staticmethod
+    def _defaults(**fields):
+        from sglang.srt.arg_groups.model_overrides import kimi_k3 as kimi_k3_module
+
+        cfg = SimpleNamespace(enable_flashmla_prefill_token_packing=None)
+        for name, value in fields.items():
+            setattr(cfg, name, value)
+        return kimi_k3_module._kimi_k31_lossless_defaults(cfg)
+
+    def test_unset_token_packing_defaults_on(self):
+        self.assertEqual(
+            self._defaults(), {"enable_flashmla_prefill_token_packing": True}
+        )
+
+    def test_explicit_value_is_kept(self):
+        for value in (False, True):
+            with self.subTest(value=value):
+                self.assertEqual(
+                    self._defaults(enable_flashmla_prefill_token_packing=value), {}
+                )
+
+    def test_token_packing_is_model_overridable(self):
+        from sglang.srt.arg_groups.arg_utils import resolvable_fields
+        from sglang.srt.server_args import ServerArgs
+
+        self.assertIn(
+            "enable_flashmla_prefill_token_packing", resolvable_fields(ServerArgs)
+        )
 
 
 class TestDeterministicAttentionBackendOnXpu(unittest.TestCase):

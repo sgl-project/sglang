@@ -268,10 +268,15 @@ def ensure_mamba_capacity(
 
     # Byte-coordinated for the shared allocator; plain free slots otherwise.
     allocator = state.slots
-    supports_mamba = tree_cache is not None and tree_cache.supports_mamba()
+    # Only a tree that holds Mamba states can give slots back.
+    tree_holds_mamba = (
+        tree_cache is not None
+        and tree_cache.supports_mamba()
+        and not getattr(tree_cache, "request_mamba_only", False)
+    )
     if allocator.slots_fit(needed):
         return True
-    if supports_mamba:
+    if tree_holds_mamba:
         tree_cache.evict_for_alloc(KVDemand(state_slots=needed))
     return allocator.slots_fit(needed)
 

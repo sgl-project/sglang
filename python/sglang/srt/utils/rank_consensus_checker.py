@@ -6,6 +6,7 @@ import inspect
 import logging
 import os
 import queue
+import re
 import threading
 from typing import TYPE_CHECKING, Any, Callable, List, Optional
 
@@ -18,6 +19,10 @@ if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state import GroupCoordinator
 
 logger = logging.getLogger(__name__)
+
+# Default object reprs (``<Foo object at 0x7f...>``) carry rank-local
+# addresses, e.g. a request's grammar object; mask them before comparing.
+_ADDR_RE = re.compile(r" at 0x[0-9a-fA-F]+")
 
 _sync_groups: List[dist.ProcessGroup] = []  # Dedicated gloo groups (one per rank-set).
 _q: Optional[queue.Queue[str]] = None
@@ -212,13 +217,13 @@ def _build_payload(
         if tag == "call":
             if skip_name is not None:
                 scope = {k: v for k, v in scope.items() if k != skip_name}
-            return repr(scope)
-        return repr(scope["result"])
+            return _ADDR_RE.sub(" at 0x?", repr(scope))
+        return _ADDR_RE.sub(" at 0x?", repr(scope["result"]))
     parts: list[str] = []
     for expr in selector:
         value = _eval_selector(expr, scope)
         parts.append(f"{expr}={value!r}")
-    return " | ".join(parts)
+    return _ADDR_RE.sub(" at 0x?", " | ".join(parts))
 
 
 def _eval_selector(expr: str, scope: dict[str, Any]) -> Any:
