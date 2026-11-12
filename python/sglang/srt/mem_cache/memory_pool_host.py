@@ -327,7 +327,7 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
                 allocator=self.allocator,
                 registration_granularity_bytes=self.layer_num * self.item_bytes,
             )
-        elif self.layout == "page_first_direct":
+        elif self.layout in ("page_first_direct", "page_unified"):
             self.kv_buffer = alloc_func(
                 (num_host_pages, self.layer_num, 1, self.item_bytes),
                 dtype=self.dtype,
@@ -393,12 +393,12 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
             layer_buffer = self.kv_buffer[l]
         elif self.layout == "page_first":
             layer_buffer = self.kv_buffer[:, l, :]
-        elif self.layout == "page_first_direct":
+        elif self.layout in ("page_first_direct", "page_unified"):
             layer_buffer = self.kv_buffer[:, l, 0, :]
         else:
             raise ValueError(
                 f"{self.pool_name} _host_page_view: kernel_ascend requires "
-                "layer_first/page_first/page_first_direct layout, "
+                "layer_first/page_first/page_first_direct/page_unified layout, "
                 f"got {self.layout!r}"
             )
         device_buffer = self.device_buffers[l]
@@ -416,6 +416,21 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         data_lens = [self.kv_buffer[i].nbytes for i in range(self.layer_num)]
         item_lens = [self.item_bytes * self.dtype.itemsize] * self.layer_num
         return data_ptrs, data_lens, item_lens
+
+    def _direct_page_buffers(self, layer_id: int | None = None):
+        buffers = (
+            self.device_buffers
+            if layer_id is None
+            else self.device_buffers[layer_id : layer_id + 1]
+        )
+        if self.layout == "page_unified":
+            # Direct transport measures both strides in the host dtype. Native
+            # FP16/FP32 pages must expose byte rows to match the uint8 host pool.
+            return [
+                buffer.view(torch.uint8).reshape(buffer.shape[0], self.item_bytes)
+                for buffer in buffers
+            ]
+        return buffers
 
     def _to_page_indices(self, indices: torch.Tensor) -> torch.Tensor:
         return indices.reshape(-1, self.slot_page_size)[:, 0] // self.slot_page_size
@@ -497,7 +512,15 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
     if _is_xpu:
         # {io_backend: {layout: kvcacheio ops}} the transfer methods below call,
         # checked at construction; keep in step with their branches.
-        _kvcacheio_ops = MLA_KVCACHEIO_OPS
+        _kvcacheio_ops = {
+            backend: {
+                **layouts,
+                "page_unified": layouts[
+                    "page_first" if backend == "kernel" else "page_first_direct"
+                ],
+            }
+            for backend, layouts in MLA_KVCACHEIO_OPS.items()
+        }
 
     def backup_tokens_from_device_all_layer(self, host_indices, device_indices):
         """Copy individual tokens; the page path below would copy whole pages."""
@@ -506,7 +529,7 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         # Token-granular DSV4 C4 copy needs this helper because a token is
         # not one contiguous byte range in the paged row:
         # [value0..value63][scale0..scale63].
-        if self.page_aligned_only:
+        if self.page_aligned_only or self.layout == "page_unified":
             raise self._unaligned_transfer_error(host_indices, device_indices)
         transfer_cache_dsv4_mla(
             src_ptrs=self.device_ptrs,
@@ -538,7 +561,7 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
                 item_size=self.item_bytes,
                 num_layers=self.layer_num,
             )
-        elif io_backend == "kernel" and self.layout == "page_first":
+        elif io_backend == "kernel" and self.layout in ("page_first", "page_unified"):
             if self.can_use_write_back_jit:
                 jit_transfer_hicache_all_layer_mla_staged_lf_pf(
                     ptr_src=self.device_ptrs,
@@ -567,9 +590,12 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
                 dst_indices=host_rows,
                 page_size=1,
             )
-        elif io_backend == "direct" and self.layout == "page_first_direct":
+        elif io_backend == "direct" and self.layout in (
+            "page_first_direct",
+            "page_unified",
+        ):
             transfer_kv_all_layer_direct_lf_pf(
-                src_ptrs=self.device_buffers,
+                src_ptrs=self._direct_page_buffers(),
                 dst_ptrs=[self.kv_buffer],
                 src_indices=device_rows,
                 dst_indices=host_rows,
@@ -625,7 +651,7 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         ):
             # Same DSV4 C4 layout issue as backup: this is token-granular
             # preload, so it cannot use the normal HiCache page-row copy.
-            if self.page_aligned_only:
+            if self.page_aligned_only or self.layout == "page_unified":
                 raise self._unaligned_transfer_error(host_indices, device_indices)
             transfer_cache_dsv4_mla(
                 src_ptrs=self.data_ptrs[layer_id : layer_id + 1],
@@ -645,7 +671,7 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
                 dst_indices=device_rows,
                 item_size=self.item_bytes,
             )
-        elif io_backend == "kernel" and self.layout == "page_first":
+        elif io_backend == "kernel" and self.layout in ("page_first", "page_unified"):
             transfer_kv_per_layer_mla_pf_lf(
                 src=self.kv_buffer,
                 dst=self.device_buffers[layer_id],
@@ -663,10 +689,13 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
                 dst_indices=device_rows,
                 page_size=1,
             )
-        elif io_backend == "direct" and self.layout == "page_first_direct":
+        elif io_backend == "direct" and self.layout in (
+            "page_first_direct",
+            "page_unified",
+        ):
             transfer_kv_per_layer_direct_pf_lf(
                 src_ptrs=[self.kv_buffer],
-                dst_ptrs=[self.device_buffers[layer_id]],
+                dst_ptrs=self._direct_page_buffers(layer_id),
                 src_indices=host_rows,
                 dst_indices=device_rows,
                 layer_id=layer_id,
@@ -706,7 +735,7 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
             data_page = torch.stack(
                 [self.kv_buffer[i][index] for i in range(self.layer_num)]
             )
-        elif self.layout in ["page_first", "page_first_direct"]:
+        elif self.layout in ["page_first", "page_first_direct", "page_unified"]:
             data_page = self.kv_buffer[index]
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
@@ -730,7 +759,7 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
             self.kv_buffer[index].copy_(
                 data_page.view(self.dtype).reshape(self.layer_num, self.item_bytes)
             )
-        elif self.layout == "page_first_direct":
+        elif self.layout in ("page_first_direct", "page_unified"):
             self.kv_buffer[index].copy_(
                 data_page.view(self.dtype).reshape(self.layer_num, 1, self.item_bytes)
             )
@@ -751,7 +780,7 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
                     ptr_list.append(ptr)
             element_size = self.item_bytes * self.dtype.itemsize
             return ptr_list, [element_size] * len(ptr_list)
-        if self.layout in ["page_first", "page_first_direct"]:
+        if self.layout in ["page_first", "page_first_direct", "page_unified"]:
             page_bytes = self.layer_num * self.item_bytes * self.dtype.itemsize
             for row in rows:
                 ptr_list.append(self.kv_buffer[int(row)].data_ptr())
@@ -759,7 +788,7 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         raise ValueError(f"Unsupported layout: {self.layout}")
 
     def is_stride_page_aligned(self, page_size_bytes: int = 4096) -> bool:
-        if self.layout not in ["page_first", "page_first_direct"]:
+        if self.layout not in ["page_first", "page_first_direct", "page_unified"]:
             return False
         page_bytes = self.layer_num * self.item_bytes * self.dtype.itemsize
         return (
@@ -849,7 +878,7 @@ class DeepSeekV4StateHostPool(HostKVCache):
                 allocator=self.allocator,
                 registration_granularity_bytes=(self.layer_num * self.state_page_bytes),
             )
-        elif self.layout == "page_first_direct":
+        elif self.layout in ("page_first_direct", "page_unified"):
             self.kv_buffer = alloc_func(
                 (num_host_pages, self.layer_num, 1, self.state_page_bytes),
                 dtype=self.dtype,
@@ -954,12 +983,12 @@ class DeepSeekV4StateHostPool(HostKVCache):
             layer_buffer = self.kv_buffer[l]
         elif self.layout == "page_first":
             layer_buffer = self.kv_buffer[:, l, :]
-        elif self.layout == "page_first_direct":
+        elif self.layout in ("page_first_direct", "page_unified"):
             layer_buffer = self.kv_buffer[:, l, 0, :]
         else:
             raise ValueError(
                 f"{self.pool_name} _state_host_page_view: kernel_ascend requires "
-                "layer_first/page_first/page_first_direct layout, "
+                "layer_first/page_first/page_first_direct/page_unified layout, "
                 f"got {self.layout!r}"
             )
         return layer_buffer.view(state_dtype).view(
@@ -1001,7 +1030,15 @@ class DeepSeekV4StateHostPool(HostKVCache):
     if _is_xpu:
         # {io_backend: {layout: kvcacheio ops}} the transfer methods below call,
         # checked at construction; keep in step with their branches.
-        _kvcacheio_ops = MLA_KVCACHEIO_OPS
+        _kvcacheio_ops = {
+            backend: {
+                **layouts,
+                "page_unified": layouts[
+                    "page_first" if backend == "kernel" else "page_first_direct"
+                ],
+            }
+            for backend, layouts in MLA_KVCACHEIO_OPS.items()
+        }
 
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
@@ -1020,7 +1057,7 @@ class DeepSeekV4StateHostPool(HostKVCache):
                 item_size=self.state_page_bytes,
                 num_layers=self.layer_num,
             )
-        elif io_backend == "kernel" and self.layout == "page_first":
+        elif io_backend == "kernel" and self.layout in ("page_first", "page_unified"):
             if self.can_use_write_back_jit:
                 jit_transfer_hicache_all_layer_mla_staged_lf_pf(
                     ptr_src=self.device_ptrs,
@@ -1049,7 +1086,10 @@ class DeepSeekV4StateHostPool(HostKVCache):
                 dst_indices=host_rows,
                 page_size=1,
             )
-        elif io_backend == "direct" and self.layout == "page_first_direct":
+        elif io_backend == "direct" and self.layout in (
+            "page_first_direct",
+            "page_unified",
+        ):
             transfer_kv_all_layer_direct_lf_pf(
                 src_ptrs=self.device_page_views,
                 dst_ptrs=[self.kv_buffer],
@@ -1114,7 +1154,7 @@ class DeepSeekV4StateHostPool(HostKVCache):
                 dst_indices=device_rows,
                 item_size=self.state_page_bytes,
             )
-        elif io_backend == "kernel" and self.layout == "page_first":
+        elif io_backend == "kernel" and self.layout in ("page_first", "page_unified"):
             transfer_kv_per_layer_mla_pf_lf(
                 src=self.kv_buffer,
                 dst=self.device_page_views[layer_id],
@@ -1132,7 +1172,10 @@ class DeepSeekV4StateHostPool(HostKVCache):
                 dst_indices=device_rows,
                 page_size=1,
             )
-        elif io_backend == "direct" and self.layout == "page_first_direct":
+        elif io_backend == "direct" and self.layout in (
+            "page_first_direct",
+            "page_unified",
+        ):
             transfer_kv_per_layer_direct_pf_lf(
                 src_ptrs=[self.kv_buffer],
                 dst_ptrs=[self.device_page_views[layer_id]],
@@ -1181,7 +1224,7 @@ class DeepSeekV4StateHostPool(HostKVCache):
             data_page = torch.stack(
                 [self.kv_buffer[i][index] for i in range(self.layer_num)]
             )
-        elif self.layout in ["page_first", "page_first_direct"]:
+        elif self.layout in ["page_first", "page_first_direct", "page_unified"]:
             data_page = self.kv_buffer[index]
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
@@ -1209,7 +1252,7 @@ class DeepSeekV4StateHostPool(HostKVCache):
                     self.layer_num, self.state_page_bytes
                 )
             )
-        elif self.layout == "page_first_direct":
+        elif self.layout in ("page_first_direct", "page_unified"):
             self.kv_buffer[index].copy_(
                 data_page.view(self.dtype).reshape(
                     self.layer_num, 1, self.state_page_bytes
@@ -1232,7 +1275,7 @@ class DeepSeekV4StateHostPool(HostKVCache):
                     ptr_list.append(ptr)
             element_size = self.state_page_bytes * self.dtype.itemsize
             return ptr_list, [element_size] * len(ptr_list)
-        if self.layout in ["page_first", "page_first_direct"]:
+        if self.layout in ["page_first", "page_first_direct", "page_unified"]:
             page_bytes = self.layer_num * self.state_page_bytes * self.dtype.itemsize
             for row in rows:
                 ptr_list.append(self.kv_buffer[int(row)].data_ptr())
@@ -1240,7 +1283,7 @@ class DeepSeekV4StateHostPool(HostKVCache):
         raise ValueError(f"Unsupported layout: {self.layout}")
 
     def is_stride_page_aligned(self, page_size_bytes: int = 4096) -> bool:
-        if self.layout not in ["page_first", "page_first_direct"]:
+        if self.layout not in ["page_first", "page_first_direct", "page_unified"]:
             return False
         page_bytes = self.layer_num * self.state_page_bytes * self.dtype.itemsize
         return (

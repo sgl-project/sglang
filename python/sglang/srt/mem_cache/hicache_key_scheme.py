@@ -25,11 +25,19 @@ whose shard tiles the grid derives the same keys for the same bytes. A TP2
 rank's objects are exactly the union of two TP4 ranks'; a PP1 rank's are the
 union of the stages'.
 
-Two fleet-wide agreements set the grid: ``head_group`` (kv heads per chunk) and
+For a dense MHA/MLA pool, two fleet-wide agreements set the grid:
+``head_group`` (kv heads per chunk) and
 ``layer_partition`` (layers per chunk). They are not local tuning knobs --
 they fix chunk boundaries, and boundaries are namespace identity. Left unset,
 each falls back to this rank's own shard, which shares only with its own
 topology.
+
+DeepSeek V4/V4.1 native pools instead store one complete native page per global
+owner/source layer, with the pool role and byte encoding in the digest. Their
+head and layer partitions must be unset or 1. A zero-byte KV marker anchors the
+logical page; the attention, indexer and checkpoint pools carry its payloads.
+This data layout is independent of TP/PP; model execution must also support the
+requested topology. CP, DCP and draft sidecars are unsupported for these pools.
 
 The digest prefixes every key, so any identity mismatch misses rather than
 collides. dtype is the LOGICAL one: fp8_e4m3 and fp8_e5m2 never share a
@@ -40,6 +48,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+from dataclasses import dataclass
 
 import msgspec
 
@@ -50,6 +59,40 @@ logger = logging.getLogger(__name__)
 # The digest covers the encoded struct, so any schema change changes every key.
 # Bump on any field change.
 _SCHEMA_VERSION = 1
+
+
+@dataclass(frozen=True)
+class UnifiedPoolPlan:
+    """Topology-free object suffixes paired with runs in one host page."""
+
+    suffixes: tuple[str, ...]
+    chunk_spans: tuple[tuple[int, int], ...]
+
+    def __post_init__(self) -> None:
+        if (
+            not self.suffixes
+            or len(self.suffixes) != len(self.chunk_spans)
+            or len(set(self.suffixes)) != len(self.suffixes)
+            or any(not suffix for suffix in self.suffixes)
+        ):
+            raise ValueError("Unified pool objects require unique suffixes and spans.")
+        # A logical KV anchor persists one empty marker alongside its real pools.
+        if self.chunk_spans == ((0, 0),):
+            return
+        end = 0
+        for offset, length in sorted(self.chunk_spans):
+            if (
+                type(offset) is not int
+                or type(length) is not int
+                or offset != end
+                or length <= 0
+            ):
+                raise ValueError("Unified pool spans must cover a page without gaps.")
+            end = offset + length
+
+    @property
+    def page_bytes(self) -> int:
+        return sum(length for _, length in self.chunk_spans)
 
 
 class KVCacheNamespace(

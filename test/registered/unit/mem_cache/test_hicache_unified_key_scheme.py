@@ -14,8 +14,15 @@ from sglang.srt.arg_groups.hicache_hook import (
 from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.environ import envs
 from sglang.srt.managers.cache_controller import CacheOperation, HiCacheController
+from sglang.srt.mem_cache.deepseek_v4_buffer_info import DSV4PagedBufferInfo
+from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.mem_cache.device_pool_info import DevicePoolInfo
 from sglang.srt.mem_cache.hicache_key_scheme import derive_namespace, namespace_digest
-from sglang.srt.mem_cache.hicache_storage import HiCacheFile, HiCacheStorageConfig
+from sglang.srt.mem_cache.hicache_storage import (
+    HiCacheFile,
+    HiCacheStorageConfig,
+    PoolName,
+)
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
@@ -119,6 +126,98 @@ class TestUnifiedKeySchemeArgs(CustomTestCase):
                 disaggregation_mode="decode",
                 disaggregation_decode_host_receive_threshold=0.5,
             )
+
+
+class TestDSV4ControllerUnifiedKeys(CustomTestCase):
+    def _config(self, *, tp_rank=0, cp_size=1, dcp_size=1):
+        device = object.__new__(DeepSeekV4TokenToKVPool)
+        device.dtype = torch.float16
+        device.index_pools = {}
+        info = DevicePoolInfo(
+            pool_name=PoolName.DEEPSEEK_V4_C4,
+            indices_from_pool=PoolName.KV,
+            layer_ids=(4, 7),
+            buffer_info=DSV4PagedBufferInfo.from_buffers(
+                (torch.zeros(3, 32, dtype=torch.uint8),) * 2,
+                page_slots=4,
+                layout="v4",
+            ),
+        )
+        device.get_device_pool_infos = lambda: (info,)
+        anchor = SimpleNamespace(
+            layout="page_unified", page_size=16, storage_format_tag=None
+        )
+        paged = SimpleNamespace(
+            layout="page_unified", page_size=16, layer_num=2, item_bytes=32
+        )
+        entries = [
+            SimpleNamespace(name=name, host_pool=host, packed_draft_device_pools=())
+            for name, host in ((PoolName.KV, anchor), (info.pool_name, paged))
+        ]
+        controller = object.__new__(HiCacheController)
+        controller.page_size = 16
+        controller.mem_pool_device = device
+        controller.storage_host_pool = anchor
+        controller.mem_pool_host = SimpleNamespace(
+            layout="page_unified", entries=entries
+        )
+        controller.enable_storage_metrics = False
+        parallel = SimpleNamespace(
+            tp_rank=tp_rank,
+            tp_size=2,
+            attn_tp_rank=tp_rank,
+            attn_tp_size=2,
+            attn_dcp_size=dcp_size,
+            attn_dcp_rank=0,
+            pp_rank=1,
+            pp_size=2,
+        )
+        memory = SimpleNamespace(
+            hicache_storage_key_scheme="unified",
+            hicache_storage_head_partition=None,
+            hicache_storage_layer_partition=None,
+        )
+        with (
+            patch(
+                "sglang.srt.managers.cache_controller.get_memory", return_value=memory
+            ),
+            patch(
+                "sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler.get_memory",
+                return_value=memory,
+            ),
+            patch(
+                "sglang.srt.managers.cache_controller.get_parallel",
+                return_value=parallel,
+            ),
+            patch(
+                "sglang.srt.managers.cache_controller.is_dp_attention_enabled",
+                return_value=False,
+            ),
+            patch.object(
+                controller, "get_attn_cp_rank_and_size", return_value=(0, cp_size)
+            ),
+        ):
+            return controller._generate_storage_config("org/dsv4")
+
+    def test_replicated_pools_keep_global_layers_and_elect_one_tp_writer(self):
+        """A logical anchor must not send DS sidecars through the dense KV grid."""
+        writer, reader = self._config(), self._config(tp_rank=1)
+        self.assertIsNone(writer.unified_suffixes)
+        self.assertTrue(writer.is_storage_writer)
+        self.assertFalse(reader.is_storage_writer)
+        self.assertEqual(writer.unified_pool_plans, reader.unified_pool_plans)
+        plan = writer.unified_pool_plans[PoolName.DEEPSEEK_V4_C4]
+        self.assertEqual(plan.chunk_spans, ((0, 32), (32, 32)))
+        self.assertTrue(plan.suffixes[0].endswith("_L4-5"))
+        self.assertTrue(plan.suffixes[1].endswith("_L7-8"))
+
+    def test_native_pool_plans_reject_token_sharded_pages(self):
+        for kwargs in ({"cp_size": 2}, {"dcp_size": 2}):
+            with (
+                self.subTest(**kwargs),
+                self.assertRaisesRegex(NotImplementedError, "CP or DCP"),
+            ):
+                self._config(**kwargs)
 
 
 class TestControllerUnifiedKeys(CustomTestCase):

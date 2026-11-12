@@ -783,6 +783,7 @@ class HiCacheController:
         # DeepSeekV4TokenToKVPool has compressed MLA-style rank-replicated cache
         # data. storage only needs rank 0 to write it back.
         from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+        from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 
         is_mla_model = isinstance(self.mem_pool_device, MLAKVView)
         is_compressed_mla_model = isinstance(
@@ -806,7 +807,44 @@ class HiCacheController:
         attn_cp_rank, attn_cp_size = self.get_attn_cp_rank_and_size()
         dcp_size = get_parallel().attn_dcp_size
         model_name = storage_model_name(model_name, self.storage_host_pool)
-        unified_plan = self._build_unified_plan(model_name, attn_cp_size)
+        unified_pool_plans = None
+        if (
+            is_compressed_mla_model
+            and get_memory().hicache_storage_key_scheme == "unified"
+        ):
+            if attn_cp_size > 1 or dcp_size > 1:
+                raise NotImplementedError(
+                    "DeepSeek V4 page_unified storage requires complete replicated "
+                    "pages without CP or DCP."
+                )
+            from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+                build_dsv4_unified_pool_plans,
+            )
+
+            unified_pool_plans = build_dsv4_unified_pool_plans(
+                model_id=model_name or "",
+                kvcache=self.mem_pool_device,
+                host_group=self.mem_pool_host,
+                page_size=self.page_size,
+            )
+            unified_plan = None
+        elif (
+            isinstance(self.mem_pool_device, DSATokenToKVPool)
+            and get_memory().hicache_storage_key_scheme == "unified"
+        ):
+            from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+                build_dsa_unified_pool_plans,
+            )
+
+            unified_pool_plans = build_dsa_unified_pool_plans(
+                model_id=model_name or "",
+                kvcache=self.mem_pool_device,
+                host_group=self.mem_pool_host,
+                page_size=self.page_size,
+            )
+            unified_plan = None
+        else:
+            unified_plan = self._build_unified_plan(model_name, attn_cp_size)
         unified_chunk_spans = None
         if unified_plan is not None:
             # Keys are layer-major/head-minor; the physical page is head-major.
@@ -837,6 +875,7 @@ class HiCacheController:
             extra_config=storage_backend_extra_config,
             unified_suffixes=(unified_plan.suffixes if unified_plan else None),
             unified_chunk_spans=unified_chunk_spans,
+            unified_pool_plans=unified_pool_plans,
             dcp_size=dcp_size,
             dcp_rank=get_parallel().attn_dcp_rank,
             logical_page_size=self.page_size if dcp_size > 1 else None,

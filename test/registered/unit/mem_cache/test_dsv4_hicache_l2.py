@@ -1,4 +1,4 @@
-"""Focused CPU contracts for DeepSeek V4 NPU HiCache L2."""
+"""Focused CPU contracts for DeepSeek V4 HiCache L2."""
 
 import unittest
 from types import MethodType, SimpleNamespace
@@ -12,6 +12,7 @@ from sglang.srt.hardware_backend.npu.dsv4.c128_sidecar_component import (
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_allocator import (
     DSV4NPUTokenToKVPoolAllocator,
 )
+from sglang.srt.mem_cache import memory_pool_host as host_pool_module
 from sglang.srt.mem_cache.deepseek_v4_buffer_info import DSV4StateBufferInfo
 from sglang.srt.mem_cache.deepseek_v4_compress_state import (
     CompressStatePool,
@@ -89,11 +90,18 @@ class TestDSV4HostViews(CustomTestCase):
         pool = CompressStatePool.__new__(CompressStatePool)
         pool.request_scoped = False
         pool.ring_size = ring_size
-        pool.kv_score_buffer = KVAndScore(torch.zeros((8, width), dtype=dtype))
+        pool.kv_score_buffer = KVAndScore(
+            torch.zeros((4 * ring_size, width), dtype=dtype)
+        )
         return pool
 
     def test_state_binding_preserves_storage_and_per_layer_dtype(self):
-        for layout in ("layer_first", "page_first", "page_first_direct"):
+        for layout in (
+            "layer_first",
+            "page_first",
+            "page_first_direct",
+            "page_unified",
+        ):
             with self.subTest(layout=layout):
                 pools = [
                     self._state_pool(torch.float16, 4),
@@ -159,7 +167,12 @@ class TestDSV4HostViews(CustomTestCase):
             pages * layers * state_page_bytes, dtype=torch.uint8
         ).reshape(pages, layers, state_page_bytes)
 
-        for layout in ("layer_first", "page_first", "page_first_direct"):
+        for layout in (
+            "layer_first",
+            "page_first",
+            "page_first_direct",
+            "page_unified",
+        ):
             with self.subTest(pool="paged", layout=layout):
                 host = DeepSeekV4PagedHostPool.__new__(DeepSeekV4PagedHostPool)
                 host.pool_name = "c4"
@@ -205,6 +218,157 @@ class TestDSV4HostViews(CustomTestCase):
                 self.assertEqual(view.shape, (pages, 1, ring_size, 1, state_last_dim))
                 self.assertTrue(
                     torch.equal(view.reshape(pages, -1), expected.reshape(pages, -1))
+                )
+
+    @staticmethod
+    def _copy_direct_backup(src_ptrs, dst_ptrs, src_indices, dst_indices, page_size):
+        """Model the transport's copy length, measured in host element units."""
+        host = dst_ptrs[0]
+        assert page_size == 1
+        for source_row, host_row in zip(src_indices.tolist(), dst_indices.tolist()):
+            for layer, source in enumerate(src_ptrs):
+                length = source.stride(0) * host.element_size()
+                native = source.view(torch.uint8).reshape(source.shape[0], -1)
+                host[host_row, layer, 0, :length].copy_(native[source_row, :length])
+
+    @staticmethod
+    def _copy_direct_load(
+        src_ptrs, dst_ptrs, src_indices, dst_indices, layer_id, page_size
+    ):
+        host = src_ptrs[0]
+        destination = dst_ptrs[0]
+        assert page_size == 1
+        length = destination.stride(0) * host.element_size()
+        native = destination.view(torch.uint8).reshape(destination.shape[0], -1)
+        row_pairs = zip(src_indices.tolist(), dst_indices.tolist())
+        for host_row, destination_row in row_pairs:
+            native[destination_row, :length].copy_(host[host_row, layer_id, 0, :length])
+
+    def _assert_page_unified_round_trip(self, host, buffers, logical_page_size):
+        native = [buffer.view(torch.uint8).reshape(4, -1) for buffer in buffers]
+        snapshots = [buffer.clone() for buffer in native]
+        page_bytes = native[0].shape[1]
+        expected = torch.stack([buffer[[2, 0]] for buffer in snapshots], dim=1)
+        host_indices = torch.arange(logical_page_size, 3 * logical_page_size)
+        device_indices = torch.cat(
+            [
+                torch.arange(2 * logical_page_size, 3 * logical_page_size),
+                torch.arange(logical_page_size),
+            ]
+        )
+        self.assertEqual(host.page_size, logical_page_size)
+        self.assertEqual(host.kv_buffer.shape, (3, len(buffers), 1, page_bytes))
+        host.kv_buffer.fill_(251)
+        with patch.object(
+            host_pool_module,
+            "transfer_kv_all_layer_direct_lf_pf",
+            self._copy_direct_backup,
+            create=True,
+        ):
+            host.backup_from_device_all_layer(
+                None, host_indices, device_indices, "direct"
+            )
+        self.assertTrue(torch.equal(host.kv_buffer[1:, :, 0], expected))
+        self.assertTrue((host.kv_buffer[0] == 251).all())
+        serialized = host.get_data_page(logical_page_size).clone()
+        self.assertTrue(torch.equal(serialized, expected[0].flatten()))
+        self.assertEqual(host.get_dummy_flat_data_page().numel(), serialized.numel())
+        host.set_from_flat_data_page(0, serialized)
+        self.assertTrue(torch.equal(host.get_data_page(0), serialized))
+        pointers, lengths = host.get_page_buffer_meta(host_indices)
+        self.assertEqual(
+            pointers,
+            [host.kv_buffer[page].data_ptr() for page in (1, 2)],
+        )
+        self.assertEqual(lengths, [len(buffers) * page_bytes] * 2)
+
+        for buffer in native:
+            buffer.zero_()
+        destination_indices = torch.cat(
+            [
+                torch.arange(3 * logical_page_size, 4 * logical_page_size),
+                torch.arange(logical_page_size, 2 * logical_page_size),
+            ]
+        )
+        with patch.object(
+            host_pool_module,
+            "transfer_kv_per_layer_direct_pf_lf",
+            self._copy_direct_load,
+            create=True,
+        ):
+            for layer in range(len(buffers)):
+                host.load_to_device_per_layer(
+                    None, host_indices, destination_indices, layer, "direct"
+                )
+        for layer, buffer in enumerate(native):
+            self.assertTrue(torch.equal(buffer[3], expected[0, layer]))
+            self.assertTrue(torch.equal(buffer[1], expected[1, layer]))
+            self.assertTrue((buffer[[0, 2]] == 0).all())
+
+    def test_page_unified_paged_transfer_preserves_native_bytes(self):
+        """Changing native element size must not truncate or convert a page."""
+        for dtype in (torch.uint8, torch.float16, torch.float32):
+            with self.subTest(dtype=dtype):
+                buffers = [torch.empty((4, 2, 1, 3), dtype=dtype) for _ in range(2)]
+                for layer, buffer in enumerate(buffers):
+                    raw = buffer.view(torch.uint8)
+                    raw.copy_(
+                        (torch.arange(raw.numel()).reshape(raw.shape) + layer * 17)
+                        .remainder(251)
+                        .to(torch.uint8)
+                    )
+                host = DeepSeekV4PagedHostPool(
+                    pool_name="c4",
+                    device_buffers=buffers,
+                    item_bytes=buffers[0][0].nbytes,
+                    num_host_pages=3,
+                    slot_page_size=8,
+                    layout="page_unified",
+                    pin_memory=False,
+                    page_aligned_only=True,
+                )
+                self._assert_page_unified_round_trip(host, buffers, 8)
+
+    def test_page_unified_rejects_partial_pages_before_transport(self):
+        host = DeepSeekV4PagedHostPool.__new__(DeepSeekV4PagedHostPool)
+        host.layout = "page_unified"
+        host.pool_name = "c4"
+        host.slot_page_size = 4
+        host.page_aligned_only = False
+        indices = torch.arange(3)
+        with self.assertRaisesRegex(ValueError, "page-aligned"):
+            host.backup_from_device_all_layer(None, indices, indices, "kernel")
+        with self.assertRaisesRegex(ValueError, "page-aligned"):
+            host.load_to_device_per_layer(None, indices, indices, 0, "kernel")
+
+    def test_page_unified_state_round_trip_uses_swa_page_ids(self):
+        """SWA page IDs must move complete state rings of either supported size."""
+        for ring_size in (8, 16):
+            with self.subTest(ring_size=ring_size):
+                pools = [
+                    self._state_pool(torch.float16, 4, ring_size),
+                    self._state_pool(torch.float32, 2, ring_size),
+                ]
+                infos = [pool.checkpoint_buffer_info() for pool in pools]
+                for layer, info in enumerate(infos):
+                    info.pages.copy_(
+                        (
+                            torch.arange(info.pages.numel()).reshape(info.pages.shape)
+                            + layer
+                        )
+                        .remainder(251)
+                        .to(torch.uint8)
+                    )
+                host = DeepSeekV4StateHostPool(
+                    pool_name="c4_state",
+                    state_infos=infos,
+                    num_host_pages=3,
+                    swa_page_size=4,
+                    layout="page_unified",
+                    pin_memory=False,
+                )
+                self._assert_page_unified_round_trip(
+                    host, [info.pages for info in infos], 4
                 )
 
 
