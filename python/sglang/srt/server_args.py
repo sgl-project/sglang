@@ -278,6 +278,9 @@ class ServerArgs:
                 validate_mps_model_config(
                     model_config_of(self),
                     lora_enabled=lora_enabled,
+                    attention_backend=cfg.attention_backend,
+                    prefill_attention_backend=cfg.prefill_attention_backend,
+                    decode_attention_backend=cfg.decode_attention_backend,
                 )
         except BaseException:
             self._resolution_failed = True
@@ -765,15 +768,7 @@ def prepare_server_args(argv: list[str]) -> ServerArgs:
         config_merger = ConfigArgumentMerger(parser)
         argv = config_merger.merge_config_with_args(argv)
 
-    radix_eviction_policy_explicitly_set = any(
-        arg == "--radix-eviction-policy" or arg.startswith("--radix-eviction-policy=")
-        for arg in argv
-    )
-
     raw_args = parser.parse_args(argv)
-    raw_args._radix_eviction_policy_explicitly_set = (
-        radix_eviction_policy_explicitly_set
-    )
 
     # Set up basic logging before ServerArgs.__post_init__ so that
     # logger.info / logger.warning calls there are properly formatted.
