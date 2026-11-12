@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -9,7 +10,7 @@ from sglang.srt.beam_search.shared_context_attention import build_metadata
 from sglang.srt.beam_search.trie_output_head import build_trie_row_levels
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.environ import envs
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-large")
@@ -20,6 +21,12 @@ BEAM = 8
 PROMPT_LEN = 5
 NUM_GROUPS = 2
 DECODE_LEN = 2
+
+
+class _FakeRunner(SimpleNamespace):
+    """Weak-referenceable: the shared-context support verdict is cached per runner."""
+
+    __hash__ = object.__hash__
 
 
 def _decode_batch():
@@ -63,7 +70,7 @@ def test_beam_decode_batch_prep_never_syncs_the_host():
     """Overlap: building a beam decode batch (member tail, per-row trie levels,
     shared-context metadata) issues no host sync, so the overlap scheduler
     prepares and launches the next step while the current forward still runs."""
-    model_runner = SimpleNamespace(
+    model_runner = _FakeRunner(
         req_to_token_pool=SimpleNamespace(
             req_to_token=torch.arange(64 * 16, dtype=torch.int32, device="cuda").view(
                 64, 16
@@ -78,8 +85,15 @@ def test_beam_decode_batch_prep_never_syncs_the_host():
         decode_attention_backend_str="flashinfer",
         sliding_window_size=None,
         kv_cache_dtype=torch.bfloat16,
+        model=torch.nn.Sequential(),
     )
-    with envs.SGLANG_ENABLE_BEAM_SHARED_CONTEXT_ATTENTION.override(True):
+    no_two_batch_overlap = SimpleNamespace(
+        overlap=SimpleNamespace(enable_two_batch_overlap=False)
+    )
+    with (
+        envs.SGLANG_ENABLE_BEAM_SHARED_CONTEXT_ATTENTION.override(True),
+        patch("sglang.srt.runtime_context.get_exec", lambda: no_two_batch_overlap),
+    ):
         # Warm-up: first allocations and kernel loads.
         _prepare(_decode_batch(), model_runner)
         torch.cuda.synchronize()

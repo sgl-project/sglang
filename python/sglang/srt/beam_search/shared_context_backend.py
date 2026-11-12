@@ -33,6 +33,10 @@ if TYPE_CHECKING:
 
 
 class BeamSharedContextFlashInferAttnBackend(FlashInferAttnBackend):
+    def __init__(self, model_runner, *args, **kwargs):
+        super().__init__(model_runner, *args, **kwargs)
+        shared_context_attention.supports_shared_context(model_runner)
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         if forward_batch.beam_attention_metadata is None:
             return super().init_forward_metadata(forward_batch)
@@ -57,11 +61,7 @@ class BeamSharedContextFlashInferAttnBackend(FlashInferAttnBackend):
             if save_kv_cache:
                 self.kv_layers.layer(layer.layer_id).store(
                     layer,
-                    KVWriteLoc.for_layer(
-                        forward_batch,
-                        layer,
-                        swa_loc=self.forward_metadata.swa_out_cache_loc,
-                    ),
+                    KVWriteLoc.for_layer(forward_batch, layer),
                     k,
                     v,
                     *self._kv_write_scales(layer),

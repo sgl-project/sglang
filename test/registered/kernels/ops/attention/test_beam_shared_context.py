@@ -343,94 +343,60 @@ class TestBeamSharedContextAttention(CustomTestCase):
     def test_graph_replay_refreshes_mixed_depths_and_row_mapping(self):
         """A graph captured once replays any staged lengths and row mapping: split
         counts, grids and workspaces depend only on the captured shapes."""
-        from sglang.srt.beam_search.shared_context_attention import (
-            BeamAttentionBucket,
-            BeamAttentionMetadata,
-            build_graph_capture_metadata,
-            stage_graph_metadata,
-        )
-        from sglang.srt.environ import envs
-
         torch.manual_seed(17)
-        width = 8
-        for field, value in (
-            (envs.SGLANG_ENABLE_BEAM_SHARED_CONTEXT_ATTENTION, True),
-            (envs.SGLANG_BEAM_SHARED_CONTEXT_WIDTH, width),
-            (envs.SGLANG_BEAM_SHARED_CONTEXT_GRAPH_MAX_CONTEXT, 80),
-            (envs.SGLANG_BEAM_SHARED_CONTEXT_GRAPH_MAX_DECODE, 3),
-        ):
-            self.enterContext(field.override(value))
+        width, max_context, max_decode = 8, 80, 3
         with torch.device("cuda"):
             q = torch.randn((16, 4, 64), dtype=torch.bfloat16)
             k = torch.randn((256, 2, 64), dtype=torch.bfloat16)
             v = torch.randn_like(k)
             rows = torch.arange(16, dtype=torch.int32).view(2, width)
             slots = torch.arange(160, 208, dtype=torch.int32).view(2, 24)
-            a = BeamAttentionMetadata(
-                num_rows=16,
-                buckets=[
-                    BeamAttentionBucket(
-                        row_indices=rows,
-                        context_slots=torch.arange(150, dtype=torch.int32),
-                        context_cu_seqlens=torch.tensor([0, 5, 150], dtype=torch.int32),
-                        decode_slots=slots[:, :16],
-                        beam_width=width,
-                        decode_lens=torch.tensor([1, 2], dtype=torch.int32),
-                    )
-                ],
+            # row_indices, context_slots, context_cu_seqlens, decode_slots, decode_lens
+            a = (
+                rows,
+                torch.arange(150, dtype=torch.int32),
+                torch.tensor([0, 5, 150], dtype=torch.int32),
+                slots[:, :16],
+                torch.tensor([1, 2], dtype=torch.int32),
             )
-            b = BeamAttentionMetadata(
-                num_rows=16,
-                buckets=[
-                    BeamAttentionBucket(
-                        row_indices=rows.flip((0, 1)),
-                        context_slots=torch.tensor([5, 4, 3], dtype=torch.int32),
-                        context_cu_seqlens=torch.tensor([0, 2, 3], dtype=torch.int32),
-                        decode_slots=slots.flip((1,)),
-                        beam_width=width,
-                        decode_lens=torch.tensor([3, 1], dtype=torch.int32),
-                    )
-                ],
+            b = (
+                rows.flip((0, 1)),
+                torch.tensor([5, 4, 3], dtype=torch.int32),
+                torch.tensor([0, 2, 3], dtype=torch.int32),
+                slots.flip((1,)),
+                torch.tensor([3, 1], dtype=torch.int32),
             )
+            # Buffers of fixed capacity, as a decode graph captures them.
+            staged = (
+                torch.empty_like(rows),
+                torch.empty(2 * max_context, dtype=torch.int32),
+                torch.empty(3, dtype=torch.int32),
+                torch.empty((2, width * max_decode), dtype=torch.int32),
+                torch.empty(2, dtype=torch.int32),
+            )
+
+        def stage(source):
+            row_indices, context_slots, cu_seqlens, decode_slots, decode_lens = source
+            staged[1].fill_(255)
+            staged[3].fill_(255)
+            staged[0].copy_(row_indices)
+            staged[1][: context_slots.numel()].copy_(context_slots)
+            staged[2].copy_(cu_seqlens)
+            staged[3][:, : decode_slots.shape[1]].copy_(decode_slots)
+            staged[4].copy_(decode_lens)
 
         for name, kernel in KERNELS.items():
             with self.subTest(kernel=name):
-                target = build_graph_capture_metadata(16, q.device)
-
-                def run(metadata, kernel=kernel):
-                    bucket = metadata.buckets[0]
-                    return kernel(
-                        q,
-                        k,
-                        v,
-                        bucket.row_indices,
-                        bucket.context_slots,
-                        bucket.context_cu_seqlens,
-                        bucket.decode_slots,
-                        bucket.decode_lens,
-                        softmax_scale=0.125,
-                    )
-
-                stage_graph_metadata(target, a)
-                run(target)
+                stage(a)
+                kernel(q, k, v, *staged, softmax_scale=0.125)
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph):
-                    output = run(target)
-                for metadata in (a, b, a):
-                    target.buckets[0].context_slots.fill_(255)
-                    target.buckets[0].decode_slots.fill_(255)
-                    stage_graph_metadata(target, metadata)
+                    output = kernel(q, k, v, *staged, softmax_scale=0.125)
+                for source in (a, b, a):
+                    stage(source)
                     graph.replay()
                     expected = shared_context_attention(
-                        q,
-                        k,
-                        v,
-                        metadata.buckets[0].row_indices,
-                        metadata.buckets[0].context_slots,
-                        metadata.buckets[0].context_cu_seqlens,
-                        metadata.buckets[0].decode_slots,
-                        metadata.buckets[0].decode_lens,
-                        softmax_scale=0.125,
+                        q, k, v, *source, softmax_scale=0.125
                     )
                     torch.cuda.synchronize()
                     torch.testing.assert_close(

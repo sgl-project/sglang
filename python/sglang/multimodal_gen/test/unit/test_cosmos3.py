@@ -24,16 +24,15 @@ from sglang.multimodal_gen.configs.sample.cosmos3 import (
     COSMOS3_EDGE_SUPPORTED_RESOLUTIONS,
     Cosmos3SamplingParams,
 )
-from sglang.multimodal_gen.configs.sample.sampling_params import (
-    DataType,
-    SamplingParams,
-)
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.configs.task_type import DataType
 from sglang.multimodal_gen.registry import (
     _PIPELINE_REGISTRY,
     _discover_and_register_pipelines,
     _get_config_info,
     get_non_diffusers_pipeline_name,
 )
+from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.entrypoints.action.protocol import (
     action_generation_response,
     action_metadata,
@@ -47,6 +46,9 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import request_model
 from sglang.multimodal_gen.runtime.entrypoints.openai.video_api import (
     _multipart_video_extras,
     _resolve_video_path,
+)
+from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
+    Qwen3VLTextRotaryEmbedding,
 )
 from sglang.multimodal_gen.runtime.loader.component_loaders import scheduler_loader
 from sglang.multimodal_gen.runtime.loader.component_loaders.scheduler_loader import (
@@ -106,6 +108,63 @@ def _cosmos3_server_args(config=None, batching_max_size=1):
         batching_max_size=batching_max_size,
         pipeline_config=config or Cosmos3Config(),
     )
+
+
+class _RopeOnlyTransformer(torch.nn.Module):
+    _maybe_install_step_mixed_precision = (
+        Cosmos3OmniTransformer._maybe_install_step_mixed_precision
+    )
+
+    def __init__(self, device, meta_rope, rope_theta, head_dim):
+        super().__init__()
+        self.rope_theta = rope_theta
+        self.hf_config = {}
+        self.modelopt_fp8_checkpoint = False
+        self.language_model = torch.nn.Module()
+        with torch.device("meta" if meta_rope else "cpu"):
+            self.language_model.rotary_emb = Qwen3VLTextRotaryEmbedding(
+                head_dim=head_dim, rope_theta=rope_theta
+            )
+        self.language_model.embed_tokens = torch.nn.Embedding(
+            num_embeddings=2, embedding_dim=2, device=device
+        )
+        self.time_embedder = torch.nn.Linear(
+            in_features=2, out_features=2, device=device
+        )
+        self.proj_in = torch.nn.Linear(in_features=2, out_features=2, device=device)
+        self.proj_out = torch.nn.Linear(in_features=2, out_features=2, device=device)
+
+
+@unittest.skipUnless(
+    torch.cuda.is_available(), "requires CUDA/ROCm for CPU/GPU RoPE parity"
+)
+class TestCosmos3RopePlacement(CustomTestCase):
+    def test_rope_table_does_not_depend_on_dit_placement(self):
+        """A CPU-offloaded DiT must build the RoPE table a resident one builds."""
+        rope_theta, head_dim = 100_000_000, 128
+        exponents = torch.arange(
+            start=0,
+            end=head_dim,
+            step=2,
+            dtype=torch.float32,
+            device=get_local_torch_device(),
+        )
+        reference = (1.0 / (rope_theta ** (exponents / head_dim))).cpu()
+        for device in ("cpu", "cuda"):
+            for meta_rope in (True, False):
+                with self.subTest(device=device, meta_rope=meta_rope):
+                    model = _RopeOnlyTransformer(
+                        device=device,
+                        meta_rope=meta_rope,
+                        rope_theta=rope_theta,
+                        head_dim=head_dim,
+                    )
+                    Cosmos3OmniTransformer.post_load_weights(model)
+                    rotary_emb = model.language_model.rotary_emb
+                    self.assertEqual(rotary_emb.inv_freq.device.type, device)
+                    self.assertEqual(rotary_emb.inv_freq.dtype, torch.float32)
+                    self.assertTrue(torch.equal(rotary_emb.inv_freq.cpu(), reference))
+                    self.assertNotIn("inv_freq", rotary_emb.state_dict())
 
 
 class TestCosmos3T1FusedQKNormRoPE(unittest.TestCase):
@@ -1694,7 +1753,7 @@ class TestCosmos3Transfer(unittest.TestCase):
         self.assertTrue(torch.allclose(out, torch.full((1,), 56.0)))
 
     def test_control_cfg_parallel_distribution(self):
-        """Round-robin branch distribution + all-reduce equals the serial blend."""
+        """Round-robin branches are all-gathered and combined in serial order."""
         stage = Cosmos3DenoisingStage.__new__(Cosmos3DenoisingStage)
         seen = {}
 
@@ -1737,28 +1796,53 @@ class TestCosmos3Transfer(unittest.TestCase):
 
         target = (
             "sglang.multimodal_gen.runtime.pipelines_core.stages."
-            "model_specific_stages.cosmos3.cfg_model_parallel_all_reduce"
+            "model_specific_stages.cosmos3.cfg_model_parallel_all_gather"
         )
-        # Stand in for the all-reduce with identity so each rank returns its own
-        # partial; summing them mimics the cross-rank reduction.
-        with mock.patch(target, side_effect=lambda x: x):
-            # 2 ranks: rank 0 runs the two control-in forwards (cond_full +
-            # uncond), rank 1 runs only the control-dropped cond_nc.
-            r0 = run(0, 2)
-            r1 = run(1, 2)
-            self.assertEqual(seen[0], ["cond", "uncond"])
-            self.assertEqual(seen[1], ["cond_nc"])
-            self.assertTrue(torch.allclose(r0 + r1, torch.full((1,), 86.0)))
+        values = {"cond": 20.0, "cond_nc": 10.0, "uncond": 2.0}
+        branch_order = ["cond", "cond_nc", "uncond"]
+        sent = []
 
-            seen.clear()
-            # 4 ranks for 3 branches: rank 3 is idle and contributes zeros.
-            parts = [run(r, 4) for r in range(4)]
-            self.assertEqual(seen[0], ["cond"])
-            self.assertEqual(seen[1], ["cond_nc"])
-            self.assertEqual(seen[2], ["uncond"])
-            self.assertEqual(seen[3], [])
-            self.assertTrue(torch.allclose(parts[3], torch.zeros(1)))
-            self.assertTrue(torch.allclose(sum(parts), torch.full((1,), 86.0)))
+        def fake_gather(world):
+            # Return what every rank would send for the same slot, so each
+            # rank combines all branches as a real all-gather would let it.
+            def gather(pred, dim, separate_tensors):
+                sent.append(pred)
+                slot = len(sent) - 1
+                bids = [slot * world + r for r in range(world)]
+                return [
+                    (
+                        torch.full_like(pred, values[branch_order[bid]])
+                        if bid < len(branch_order)
+                        else torch.zeros_like(pred)
+                    )
+                    for bid in bids
+                ]
+
+            return gather
+
+        # 2 ranks: rank 0 runs the two control-in forwards (cond_full +
+        # uncond), rank 1 runs only the control-dropped cond_nc.
+        for rank in range(2):
+            sent.clear()
+            with mock.patch(target, side_effect=fake_gather(2)):
+                out = run(rank, 2)
+            self.assertTrue(torch.allclose(out, torch.full((1,), 86.0)))
+        self.assertEqual(seen[0], ["cond", "uncond"])
+        self.assertEqual(seen[1], ["cond_nc"])
+        self.assertTrue(torch.equal(sent[1], torch.zeros(1)))
+
+        seen.clear()
+        # 4 ranks for 3 branches: rank 3 is idle and sends zeros.
+        for rank in range(4):
+            sent.clear()
+            with mock.patch(target, side_effect=fake_gather(4)):
+                out = run(rank, 4)
+            self.assertTrue(torch.allclose(out, torch.full((1,), 86.0)))
+        self.assertEqual(seen[0], ["cond"])
+        self.assertEqual(seen[1], ["cond_nc"])
+        self.assertEqual(seen[2], ["uncond"])
+        self.assertEqual(seen[3], [])
+        self.assertTrue(torch.equal(sent[0], torch.zeros(1)))
 
     def test_single_hint_defaults_applied(self):
         sp = Cosmos3SamplingParams(

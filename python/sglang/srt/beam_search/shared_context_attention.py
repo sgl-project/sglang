@@ -16,6 +16,8 @@
 from __future__ import annotations
 
 import itertools
+import logging
+import weakref
 from typing import TYPE_CHECKING, Optional
 
 import msgspec
@@ -29,6 +31,8 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.kv.router import KVLayerRouter
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.model_executor.model_runner import ModelRunner
+
+logger = logging.getLogger(__name__)
 
 
 class BeamAttentionBucket(msgspec.Struct):
@@ -81,35 +85,50 @@ def _attention_kernel(kernel: str):
     return shared_context_attention
 
 
-def _positive_int(field) -> int:
-    value = field.get()
-    if value <= 0:
-        raise ValueError(f"{field.name} must be positive, got {value}")
-    return value
-
-
-def graph_beam_width() -> int:
-    return _positive_int(envs.SGLANG_BEAM_SHARED_CONTEXT_WIDTH)
-
-
-def graph_max_context() -> int:
-    return _positive_int(envs.SGLANG_BEAM_SHARED_CONTEXT_GRAPH_MAX_CONTEXT)
-
-
-def graph_max_decode() -> int:
-    return _positive_int(envs.SGLANG_BEAM_SHARED_CONTEXT_GRAPH_MAX_DECODE)
-
-
-def supports_shared_context(model_runner) -> bool:
+def _unsupported_reason(model_runner: ModelRunner) -> Optional[str]:
     from sglang.srt.configs.model_config import AttentionArch
+    from sglang.srt.layers.radix_attention import RadixAttention
+    from sglang.srt.runtime_context import get_exec
 
-    return (
-        model_runner.decode_attention_backend_str == "flashinfer"
-        and model_runner.sliding_window_size is None
-        and not model_runner.model_config.is_encoder_decoder
-        and model_runner.model_config.attention_arch == AttentionArch.MHA
-        and model_runner.kv_cache_dtype in (torch.float16, torch.bfloat16)
-    )
+    if model_runner.decode_attention_backend_str != "flashinfer":
+        return "the decode attention backend is not FlashInfer"
+    if model_runner.sliding_window_size is not None:
+        return "sliding-window attention is not supported"
+    if model_runner.model_config.is_encoder_decoder:
+        return "encoder-decoder models are not supported"
+    if model_runner.model_config.attention_arch != AttentionArch.MHA:
+        return "only MHA attention is supported"
+    if model_runner.kv_cache_dtype not in (torch.float16, torch.bfloat16):
+        return "the KV cache dtype must be float16 or bfloat16"
+    if get_exec().overlap.enable_two_batch_overlap:
+        return "two-batch overlap is enabled"
+    for module in model_runner.model.modules():
+        if isinstance(module, RadixAttention):
+            if module.logit_cap > 0:
+                return "attention logit caps are not supported"
+            if module.v_head_dim != module.head_dim:
+                return "v_head_dim differs from head_dim"
+    return None
+
+
+_support: weakref.WeakKeyDictionary[ModelRunner, bool] = weakref.WeakKeyDictionary()
+
+
+def supports_shared_context(model_runner: ModelRunner) -> bool:
+    """Evaluated once per runner; warns once when the env flag is on but the
+    setup falls back to ordinary attention."""
+    supported = _support.get(model_runner)
+    if supported is None:
+        reason = _unsupported_reason(model_runner)
+        if reason is not None:
+            logger.warning(
+                "SGLANG_ENABLE_BEAM_SHARED_CONTEXT_ATTENTION is set but "
+                "shared-context beam attention is unsupported (%s); "
+                "using ordinary attention.",
+                reason,
+            )
+        supported = _support[model_runner] = reason is None
+    return supported
 
 
 def _metadata_tensor(values, dtype, device):
@@ -118,94 +137,6 @@ def _metadata_tensor(values, dtype, device):
             device, non_blocking=True
         )
     return torch.tensor(values, dtype=dtype, device=device)
-
-
-def graph_compatible(metadata, num_rows: int, captured_rows: int) -> bool:
-    if (
-        metadata is None
-        or num_rows != captured_rows
-        or metadata.num_rows != num_rows
-        or len(metadata.buckets) != 1
-    ):
-        return False
-    bucket = metadata.buckets[0]
-    if bucket.row_indices.ndim != 2 or bucket.decode_slots.ndim != 2:
-        return False
-    groups = bucket.row_indices.shape[0]
-    return (
-        bucket.beam_width == graph_beam_width()
-        and bucket.row_indices.shape == (groups, bucket.beam_width)
-        and groups * bucket.beam_width == num_rows
-        and bucket.context_slots.numel() <= groups * graph_max_context()
-        and bucket.context_cu_seqlens.shape == (groups + 1,)
-        and bucket.decode_lens.shape == (groups,)
-        and bucket.decode_slots.shape[0] == groups
-        and bucket.decode_slots.shape[1] <= graph_max_decode() * bucket.beam_width
-    )
-
-
-def build_graph_capture_metadata(num_rows: int, device):
-    width = graph_beam_width()
-    if not enabled() or num_rows < width or num_rows % width:
-        return None
-    groups = num_rows // width
-    rows = [
-        [group]
-        + list(range(groups + group * (width - 1), groups + (group + 1) * (width - 1)))
-        for group in range(groups)
-    ]
-    return BeamAttentionMetadata(
-        num_rows=num_rows,
-        buckets=[
-            BeamAttentionBucket(
-                row_indices=_metadata_tensor(rows, torch.int32, device),
-                context_slots=torch.zeros(
-                    groups * graph_max_context(), dtype=torch.int32, device=device
-                ),
-                context_cu_seqlens=torch.arange(
-                    groups + 1, dtype=torch.int32, device=device
-                ),
-                decode_slots=torch.zeros(
-                    (groups, width * graph_max_decode()),
-                    dtype=torch.int32,
-                    device=device,
-                ),
-                beam_width=width,
-                decode_lens=torch.full(
-                    (groups,), graph_max_decode(), dtype=torch.int32, device=device
-                ),
-            )
-        ],
-    )
-
-
-def stage_graph_metadata(target, source) -> None:
-    if not graph_compatible(source, source.num_rows, target.num_rows):
-        raise ValueError("Shared-context metadata does not fit the captured graph")
-    if len(target.buckets) != 1:
-        raise ValueError("Captured shared-context metadata must have one width")
-    destination, current = target.buckets[0], source.buckets[0]
-    if (
-        destination.beam_width != current.beam_width
-        or destination.row_indices.shape != current.row_indices.shape
-        or current.context_slots.numel() > destination.context_slots.numel()
-        or destination.context_cu_seqlens.shape != current.context_cu_seqlens.shape
-        or destination.decode_lens.shape != current.decode_lens.shape
-        or current.decode_slots.shape[0] != destination.decode_slots.shape[0]
-        or current.decode_slots.shape[1] > destination.decode_slots.shape[1]
-    ):
-        raise ValueError("Shared-context metadata exceeds captured buffers")
-    destination.context_slots[current.context_slots.numel() :].zero_()
-    destination.decode_slots[:, current.decode_slots.shape[1] :].zero_()
-    destination.row_indices.copy_(current.row_indices)
-    destination.context_slots[: current.context_slots.numel()].copy_(
-        current.context_slots
-    )
-    destination.context_cu_seqlens.copy_(current.context_cu_seqlens)
-    destination.decode_slots[:, : current.decode_slots.shape[1]].copy_(
-        current.decode_slots
-    )
-    destination.decode_lens.copy_(current.decode_lens)
 
 
 def build_metadata(
@@ -323,11 +254,7 @@ def forward(
     metadata = forward_batch.beam_attention_metadata
     if metadata is None:
         return None
-    if layer.logit_cap > 0:
-        raise ValueError(
-            "Shared-context beam attention does not support attention logit caps; "
-            "disable SGLANG_ENABLE_BEAM_SHARED_CONTEXT_ATTENTION for this model."
-        )
+    assert layer.logit_cap == 0
 
     k_buffer, v_buffer = kv_layers.read(layer.layer_id).kv()
     if k_buffer.ndim != 3 or v_buffer.ndim != 3:

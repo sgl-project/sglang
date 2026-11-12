@@ -21,6 +21,7 @@ from sglang.srt.beam_search import (
     select_final_topk,
 )
 from sglang.srt.beam_search.coordinator import BeamCoordinator
+from sglang.srt.beam_search.joint_select import SelectResult
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -99,6 +100,22 @@ class TestJointSelectGolden(CustomTestCase):
         self.assert_close(survivors, [(-0.1, 0, 10), (-0.2, 0, 11)])
         self.assertEqual(finished, [])
 
+    def test_no_stop_fast_path_matches_general_path(self):
+        # A stop id that never appears among the tokens forces the general path
+        # without finishing anything.
+        generator = torch.Generator().manual_seed(0)
+        for k in (1, 3, 8):
+            logprobs = torch.randn(k, 2 * k, generator=generator).log_softmax(-1)
+            tokens = torch.arange(k * 2 * k, dtype=torch.int64).reshape(k, 2 * k)
+            cum = torch.randn(k, generator=generator)
+            fast = joint_select(cum, logprobs, tokens, T([], torch.int64), k)
+            general = joint_select(cum, logprobs, tokens, T([10**6], torch.int64), k)
+            for name in SelectResult.__struct_fields__:
+                self.assertTrue(
+                    torch.equal(getattr(fast, name), getattr(general, name)),
+                    f"{name} differs at beam_width {k}",
+                )
+
     def test_stop_routing(self):
         # Sorted walk: 10 survives, 11 is a stop (examined), 12 survives -> stop.
         # 13 and every row-1 candidate fall outside the examined window.
@@ -160,7 +177,7 @@ class TestJointSelectGolden(CustomTestCase):
             future_map=None,
         )
         group = BeamGroup(beam_width=2, stop_token_ids=[99], max_new_tokens=3)
-        tokens, _ = coordinator._select_group(
+        tokens, _ = coordinator.select_group(
             group,
             T([[-0.1, -0.2, -0.3, -0.4]], torch.float32),
             T([[99, 1, 2, 3]], torch.int64),
@@ -341,6 +358,19 @@ class TestBeamGroup(CustomTestCase):
         self.assertAlmostEqual(group.beam_score(-0.3, 2), -0.3, places=6)
         group2 = self._make_group(length_penalty=1.0)
         self.assertAlmostEqual(group2.beam_score(-0.3, 2), -0.15, places=6)
+
+    def test_out_of_vocab_stop_ids_are_dropped(self):
+        """Out-of-vocab stop ids never match and must not break the group's tensor."""
+        from sglang.srt.beam_search.coordinator import BeamCoordinator
+
+        req = SimpleNamespace(eos_token_ids={2}, tokenizer=None)
+        params = SimpleNamespace(
+            ignore_eos=False, stop_token_ids={-1, 0, 5, 31, 32, 2**63}
+        )
+        ids = BeamCoordinator._collect_stop_token_ids(req, params, vocab_size=32)
+        self.assertEqual(ids, [0, 2, 5, 31])
+        group = self._make_group(stop_token_ids=ids)
+        self.assertEqual(group.stop_token_ids.tolist(), ids)
 
     def test_dropped_request_frees_its_group_without_a_gc_pass(self):
         """A request and its group must be freed by reference counting once the

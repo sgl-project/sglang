@@ -28,6 +28,7 @@ from sglang.srt.managers.scheduler_components.metrics_reporter import (
     SchedulerMetricsReporter,
     _CacheHitRateWindow,
 )
+from sglang.srt.managers.scheduler_components.request_list import ListKind
 from sglang.srt.managers.scheduler_pp_mixin import PPBatchMetadata, SchedulerPPMixin
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_mode import ForwardMode
@@ -41,6 +42,7 @@ from sglang.srt.observability.forward_pass_metrics import (
 )
 from sglang.srt.observability.metrics_collector import (
     DPBalanceStats,
+    QueueCount,
     SchedulerMetricsCollector,
 )
 from sglang.srt.observability.scheduler_stage_metrics import (
@@ -48,6 +50,7 @@ from sglang.srt.observability.scheduler_stage_metrics import (
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.device_timer import DeviceTimer, _TimingInterval, device_timer_ctx
+from sglang.test.scheduler_test_utils import FakeReq, decode_queue
 from sglang.test.test_utils import CustomTestCase, enter_scope
 
 
@@ -298,8 +301,6 @@ class TestSpecDecodeLengthSnapshot(CustomTestCase):
                 reqs = [
                     types.SimpleNamespace(
                         seqlen=length + 1,
-                        is_retracted=length == 200,
-                        finished=lambda length=length: length == 300,
                         grammar=None,
                         spec_verify_ct=0,
                         spec_num_correct_drafts=0,
@@ -331,7 +332,7 @@ class TestSpecDecodeLengthSnapshot(CustomTestCase):
                     advance_grammar_fsm=settle_grammar,
                 )
                 tokens = SchedulerBatchResultProcessor._resolve_spec_v2_tokens(
-                    processor, result, batch
+                    processor, result, batch, [True, False, False]
                 )
                 self.assertEqual([len(ids) for ids in tokens], [1, 8, 3])
                 self.assertEqual([req.kv.kv_committed_len for req in reqs], [1, 0, 0])
@@ -438,6 +439,7 @@ def _make_reporter(test, scheduler) -> SchedulerMetricsReporter:
     if not hasattr(scheduler, "kv_events_publisher"):
         scheduler.kv_events_publisher = types.SimpleNamespace(
             init_kv_events=lambda *a, **kw: None,
+            emit_kv_metrics=Mock(),
         )
     if not hasattr(scheduler, "tp_workers"):
         scheduler.tp_workers = []
@@ -739,6 +741,8 @@ class TestForwardPassMetrics(unittest.TestCase):
                 self.scheduler._fpm_publisher.metrics.clear()
                 timer, interval = DeviceTimer(), FakeInterval(9)
                 receiver = SchedulerPPMixin()
+                # No unified pool: nothing keeps freed pages on the forward.
+                receiver._on_step_forward_recorded = lambda forward_done: False
                 receiver._pp_spec_relay = speculative
                 receiver.forward_stream_ctx = nullcontext()
                 receiver.forward_stream = Mock()
@@ -817,6 +821,9 @@ class TestForwardPassMetrics(unittest.TestCase):
             device_module=types.SimpleNamespace(
                 Event=Mock, current_stream=lambda: object()
             ),
+        )
+        scheduler._pp_result_done_event = types.MethodType(
+            SchedulerPPMixin._pp_result_done_event, scheduler
         )
         wire, result, _ = SchedulerPPMixin._pp_make_skip_output_result(
             scheduler, types.SimpleNamespace(reqs=[object()]), metadata
@@ -1017,15 +1024,15 @@ class TestIdleMetrics(CustomTestCase):
     def setUp(self):
         self.scheduler = types.SimpleNamespace(
             running_batch=types.SimpleNamespace(reqs=[]),
-            waiting_queue=[],
-            grammar_manager=[],
+            request_lists=lambda: {kind: [] for kind in ListKind},
             enable_priority_scheduling=False,
             disaggregation_mode=DisaggregationMode.NULL,
             pool_stats_observer=types.SimpleNamespace(
                 get_pool_stats=lambda: types.SimpleNamespace(
                     update_scheduler_stats=lambda _: None,
                     full_capacity=1,
-                    is_hybrid_swa=False,
+                    windows=(),
+                    target_window_stats=lambda: None,
                 ),
                 streaming_session_count=lambda: 0,
                 session_held_tokens=lambda: 0,
@@ -1039,6 +1046,77 @@ class TestIdleMetrics(CustomTestCase):
                 stats.fwd_occupancy
             ),
         )
+
+    def test_idle_publishes_refreshed_kv_metrics(self):
+        self.reporter.current_scheduler_metrics_enabled = True
+        self.scheduler.disagg_decode_prealloc_queue = types.SimpleNamespace(
+            queue=[], pre_allocated_token_counts=lambda windows=(): (0, {})
+        )
+        self.scheduler.disagg_decode_transfer_queue = types.SimpleNamespace(
+            queue=[], num_pending_deferred_releases=lambda: 0
+        )
+        published = []
+        self.scheduler.kv_events_publisher.emit_kv_metrics.side_effect = lambda: (
+            published.append(
+                (
+                    self.reporter.stats.token_usage,
+                    self.reporter.stats.num_running_reqs.total,
+                    self.reporter.stats.num_queue_reqs.total,
+                )
+            )
+        )
+        for mode in DisaggregationMode:
+            for token_usage in (0.0, 0.25):
+                with self.subTest(mode=mode, token_usage=token_usage):
+                    self.scheduler.disaggregation_mode = mode
+                    self.reporter.stats.token_usage = 0.82
+                    self.reporter.stats.num_running_reqs = QueueCount(total=1)
+                    self.reporter.stats.num_queue_reqs = QueueCount(total=1)
+                    self.scheduler.pool_stats_observer.get_pool_stats = lambda: (
+                        types.SimpleNamespace(
+                            update_scheduler_stats=lambda stats: setattr(
+                                stats, "token_usage", token_usage
+                            ),
+                            full_capacity=1,
+                            windows=(),
+                            target_window_stats=lambda: None,
+                        )
+                    )
+                    with patch(
+                        "sglang.srt.managers.scheduler_components.metrics_reporter.time.perf_counter",
+                        return_value=101.0,
+                    ):
+                        self.reporter._maybe_log_idle_metrics()
+                    self.assertEqual(published, [(token_usage, 0, 0)])
+                    published.clear()
+
+    def test_idle_kv_metrics_preserve_rate_limit_and_metrics_gate(self):
+        self.reporter.current_scheduler_metrics_enabled = True
+        with (
+            patch(
+                "sglang.srt.managers.scheduler_components.metrics_reporter.ENABLE_METRICS_DEVICE_TIMER",
+                False,
+            ),
+            patch(
+                "sglang.srt.managers.scheduler_components.metrics_reporter.time.perf_counter",
+                return_value=101.0,
+            ),
+        ):
+            self.reporter._maybe_log_idle_metrics()
+        self.scheduler.kv_events_publisher.emit_kv_metrics.assert_not_called()
+
+        with patch(
+            "sglang.srt.managers.scheduler_components.metrics_reporter.time.perf_counter",
+            return_value=131.0,
+        ):
+            self.reporter._maybe_log_idle_metrics()
+        self.scheduler.kv_events_publisher.emit_kv_metrics.assert_called_once_with()
+
+        self.scheduler.kv_events_publisher.emit_kv_metrics.reset_mock()
+        self.reporter.current_scheduler_metrics_enabled = False
+        self.reporter.stats.num_running_reqs = QueueCount(total=1)
+        self.reporter._maybe_log_idle_metrics()
+        self.scheduler.kv_events_publisher.emit_kv_metrics.assert_not_called()
 
     def test_host_receive_metrics_survive_queue_drain(self):
         registry = prometheus_client.CollectorRegistry()
@@ -1059,14 +1137,15 @@ class TestIdleMetrics(CustomTestCase):
         self.scheduler.disaggregation_mode = DisaggregationMode.DECODE
         self.scheduler.enable_priority_scheduling = True
         self.scheduler.disagg_decode_prealloc_queue = types.SimpleNamespace(
-            queue=[], pre_allocated_token_counts=lambda: (0, 0)
+            queue=[], pre_allocated_token_counts=lambda windows: (0, {})
         )
         host_reqs = [
-            types.SimpleNamespace(host_staged=True, priority=priority)
+            types.SimpleNamespace(req=FakeReq(priority=priority), host_staged=True)
             for priority in (1, 2)
         ]
+        device_req = types.SimpleNamespace(req=FakeReq(priority=1), host_staged=False)
         self.scheduler.disagg_decode_transfer_queue = types.SimpleNamespace(
-            queue=[*host_reqs, types.SimpleNamespace(host_staged=False, priority=1)],
+            queue=decode_queue(ListKind.PD_RECEIVING, [*host_reqs, device_req]),
             num_pending_deferred_releases=lambda: 0,
         )
         for _ in host_reqs:
@@ -1161,6 +1240,139 @@ class TestSchedulerTimeAccounting(CustomTestCase):
             increment_scheduler_stage_seconds=lambda **kwargs: (
                 self.stage_seconds.append(kwargs)
             ),
+        )
+
+    def test_cpu_clock_reset_after_restore_rebases_accounting(self):
+        """CPU clock resets must count CPU time since restore, never decrement."""
+        for is_idle in (False, True):
+            with self.subTest(is_idle=is_idle):
+                registry = prometheus_client.CollectorRegistry()
+                cpu_seconds = prometheus_client.Counter(
+                    "test_scheduler_process_cpu_seconds",
+                    "Scheduler CPU time",
+                    registry=registry,
+                )
+                collector = self.reporter.metrics_collector
+                collector.increment_scheduler_process_cpu_seconds = cpu_seconds.inc
+                with (
+                    patch(
+                        "sglang.srt.managers.scheduler_components.metrics_reporter.time.monotonic_ns",
+                        side_effect=[
+                            0,
+                            1_000_000_000,
+                            2_000_000_000,
+                            3_000_000_000,
+                            4_000_000_000,
+                        ],
+                    ),
+                    patch(
+                        "sglang.srt.managers.scheduler_components.metrics_reporter.time.process_time_ns",
+                        # Each restore starts a new process CPU clock near zero;
+                        # its reading is the CPU time since restore.
+                        side_effect=[
+                            10_000_000_000,
+                            100_000_000,
+                            400_000_000,
+                            10_000_000,
+                            210_000_000,
+                        ],
+                    ),
+                ):
+                    self.reporter.start_scheduler_time_accounting()
+                    for second, expected in enumerate((0.1, 0.4, 0.41, 0.61), start=1):
+                        self.reporter._record_scheduler_time(
+                            is_idle=is_idle, event_ns=second * 1_000_000_000
+                        )
+                        self.assertAlmostEqual(
+                            registry.get_sample_value(
+                                "test_scheduler_process_cpu_seconds_total"
+                            ),
+                            expected,
+                        )
+
+    def test_monotonic_clock_reset_after_restore_rebases_accounting(self):
+        """A backwards monotonic clock must rebase accounting, not stall or go negative."""
+        with (
+            patch(
+                "sglang.srt.managers.scheduler_components.metrics_reporter.time.monotonic_ns",
+                # Restored on a host with less uptime than the checkpointed one.
+                side_effect=[
+                    10_000_000_000,
+                    11_000_000_000,
+                    1_000_000_000,
+                    2_000_000_000,
+                ],
+            ),
+            patch(
+                "sglang.srt.managers.scheduler_components.metrics_reporter.time.process_time_ns",
+                side_effect=[1_000_000_000, 1_500_000_000, 50_000_000, 250_000_000],
+            ),
+        ):
+            self.reporter.start_scheduler_time_accounting()
+            self.reporter._record_scheduler_time(is_idle=True, event_ns=11_000_000_000)
+            # An occupancy window open across the reset would keep measuring
+            # from a pre-restore perf_counter() start.
+            self.reporter._device_timer_window_batch_count = 7
+            for event_ns in (1_000_000_000, 2_000_000_000):
+                self.reporter._record_scheduler_time(is_idle=True, event_ns=event_ns)
+
+        self.assertEqual(self.reporter._device_timer_window_batch_count, 0)
+        self.assertEqual(self.idle_seconds, [1.0, 1.0])
+        self.assertEqual(self.process_cpu_seconds, [0.5, 0.05, 0.2])
+        self.assertTrue(all(kwargs["seconds"] >= 0 for kwargs in self.stage_seconds))
+        self.assertAlmostEqual(
+            sum(kwargs["seconds"] for kwargs in self.stage_seconds), 2.0
+        )
+
+    def test_monotonic_reset_preserves_buffered_idle_and_stage_totals(self):
+        """Restore must publish measured spans even before the reporting deadline."""
+        with (
+            patch(
+                "sglang.srt.managers.scheduler_components.metrics_reporter.time.monotonic_ns",
+                side_effect=[
+                    10_000_000_000,
+                    10_200_000_000,
+                    10_300_000_000,
+                    10_500_000_000,
+                    10_600_000_000,
+                    1_000_000_000,
+                    1_100_000_000,
+                    2_000_000_000,
+                ],
+            ),
+            patch(
+                "sglang.srt.managers.scheduler_components.metrics_reporter.time.process_time_ns",
+                side_effect=[1_000_000_000, 50_000_000, 250_000_000],
+            ),
+        ):
+            self.reporter.start_scheduler_time_accounting()
+            self.reporter.record_scheduler_active(event_ns=10_200_000_000)
+            with self.reporter.scheduler_stage_metrics.record(
+                SCHEDULER_STAGE_RECV_REQUESTS
+            ):
+                pass
+            with self.reporter.scheduler_stage_metrics.record(
+                SCHEDULER_STAGE_RECV_REQUESTS
+            ):
+                # Restore during a stage must retain its category until it exits.
+                self.reporter._record_scheduler_time(
+                    is_idle=False, event_ns=1_000_000_000
+                )
+            self.reporter._record_scheduler_time(is_idle=True, event_ns=2_000_000_000)
+
+        self.assertEqual(self.idle_seconds, [0.2])
+        self.assertEqual(self.process_cpu_seconds, [0.05, 0.2])
+        self.assertTrue(all(sample["seconds"] >= 0 for sample in self.stage_seconds))
+        self.assertAlmostEqual(
+            sum(sample["seconds"] for sample in self.stage_seconds), 1.6
+        )
+        self.assertAlmostEqual(
+            sum(
+                sample["seconds"]
+                for sample in self.stage_seconds
+                if sample["stage"] == SCHEDULER_STAGE_RECV_REQUESTS
+            ),
+            0.3,
         )
 
     def test_counts_idle_wall_time_and_process_cpu_time(self):

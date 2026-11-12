@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING, Any, List, NamedTuple
 import msgspec
 import torch
 
-from sglang.srt.utils.common import is_pin_memory_available
+from sglang.srt.utils.device import is_pin_memory_available
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
@@ -124,6 +124,13 @@ def strip_beam_tail(batch: ScheduleBatch) -> None:
         batch.input_ids = batch.input_ids[:n]
     batch.out_cache_loc = None
     batch.seq_lens_sum = None
+
+
+def beam_launch_complete(req: Req) -> bool:
+    """A launch-complete group leaves the batch: the overlap scheduler would
+    otherwise run a forward for a group with no step left."""
+    group = req.beam_group
+    return group is not None and group.launch_complete()
 
 
 def num_beam_member_rows(reqs) -> int:

@@ -59,6 +59,19 @@ def _filter(batch: ForwardBatch, *, lo: int, hi: int) -> ForwardBatch:
 
 
 class TestTboFilterBatchMarker(CustomTestCase):
+    def test_filter_batch_slices_extend_completion_per_request(self):
+        parent = _make_target_verify_batch(4)
+        parent.forward_mode = ForwardMode.EXTEND
+        parent.extend_num_tokens = 4
+        parent.extend_is_final_cpu = [False, False, True, False]
+
+        first = _filter(parent, lo=0, hi=2)
+        second = _filter(parent, lo=2, hi=4)
+
+        self.assertEqual(first.extend_is_final_cpu, [False, False])
+        self.assertEqual(second.extend_is_final_cpu, [True, False])
+        self.assertEqual(parent.extend_is_final_cpu, [False, False, True, False])
+
     def test_filter_batch_inherits_prefill_completion(self):
         for completing in (False, True):
             with self.subTest(completing=completing):

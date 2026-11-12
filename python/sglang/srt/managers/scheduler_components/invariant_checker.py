@@ -8,8 +8,11 @@ from typing import (
     Callable,
     Deque,
     Dict,
+    Iterable,
     List,
     Optional,
+    Sequence,
+    Set,
     Tuple,
 )
 
@@ -21,13 +24,22 @@ from sglang.srt.layers.cp.base import get_cp_strategy, is_cp_sharded_padded
 from sglang.srt.managers.scheduler_components.pool_stats_observer import (
     PoolStats,
     SchedulerPoolStatsObserver,
-    kv_private_swa_tokens,
+    WindowPoolStats,
     kv_private_tokens,
+    kv_private_window_tokens,
+)
+from sglang.srt.managers.scheduler_components.request_list import ListKind
+from sglang.srt.managers.scheduler_components.state_check import (
+    CheckPhase,
+    FailureReporter,
+    Severity,
+    StateCheck,
 )
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
+from sglang.srt.mem_cache.kv.requests import RequestTable, RowState
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.observability.scheduler_stage_metrics import (
     SCHEDULER_STAGE_SANITY_CHECK_CACHE,
@@ -35,10 +47,7 @@ from sglang.srt.observability.scheduler_stage_metrics import (
     scheduler_stage_method,
 )
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils.common import (
-    ceil_align,
-    raise_error_or_warn,
-)
+from sglang.srt.utils.common import ceil_align
 from sglang.srt.utils.watchdog import WatchdogRaw
 
 if TYPE_CHECKING:
@@ -61,20 +70,107 @@ class SchedulerInvariantChecker:
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
     req_to_token_pool: ReqToTokenPool
     pool_stats_observer: SchedulerPoolStatsObserver
-    get_last_batch: Callable
     scheduler_stage_metrics: SchedulerStageMetricsRecorder
-    # The lists that hold the live requests, by name (`Scheduler.request_lists`).
-    get_request_lists: Callable[[], Dict[str, List[Req]]] = field(default=lambda: {})
+    # The lists that hold the live requests, by kind (`Scheduler.request_lists`).
+    get_request_lists: Callable[[], Dict[ListKind, Iterable[Req]]] = field(
+        default=lambda: {}
+    )
     get_chunked_req: Callable = field(default=lambda: None)
-    get_running_reqs: Callable = field(default=lambda: None)
-    # Under PP, the micro-batches' running batches and step batches.
-    get_pp_running_mbs: Callable = field(default=lambda: ())
+    get_running_batches: Callable = field(default=lambda: ())
+    # Under PP, the micro-batches' launched steps.
     get_pp_mbs: Callable = field(default=lambda: ())
-    count_req_pool_leak_warnings: int = 0
-    count_memory_leak_warnings: int = 0
+    # Whether the idle pool checks skip this idle iteration.
+    get_skip_idle_pool_checks: Callable[[], bool] = field(default=lambda: False)
+    # The finished requests whose KV the decode offload still copies to host;
+    # they exit once the copy lands.
+    get_offloading_reqs: Callable[[], Iterable[Req]] = field(default=lambda: ())
+    reporter: FailureReporter = field(default_factory=FailureReporter)
+    # Requests that have not both exited and sent their final output; an ended
+    # one leaves at the next idle check.
+    unended: Set[Req] = field(default_factory=set)
     recent_busy_msgs: Deque[str] = field(
         default_factory=lambda: deque(maxlen=BUSY_MEM_CHECK_LOG_RING_SIZE)
     )
+    checks: Dict[CheckPhase, List[StateCheck]] = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.checks = {phase: [] for phase in CheckPhase}
+        for check in (
+            StateCheck(
+                phase=CheckPhase.LAUNCH,
+                when=envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.get,
+                fn=self._check_request_lists,
+            ),
+            StateCheck(
+                phase=CheckPhase.RESULT,
+                when=envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.get,
+                fn=self._check_batch_consistency,
+            ),
+            StateCheck(
+                phase=CheckPhase.BUSY,
+                when=envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get,
+                fn=self._check_busy_pools,
+            ),
+            StateCheck(
+                phase=CheckPhase.BUSY,
+                when=envs.SGLANG_CHECK_KV_PAGE_INVARIANTS.get,
+                fn=self._check_kv_page_invariants,
+            ),
+            StateCheck(
+                phase=CheckPhase.IDLE,
+                when=envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.get,
+                fn=self._check_ended_requests,
+            ),
+            StateCheck(
+                phase=CheckPhase.IDLE,
+                when=self._idle_pool_checks_due,
+                fn=self._check_idle_pools,
+            ),
+            StateCheck(
+                phase=CheckPhase.IDLE,
+                when=envs.SGLANG_ENABLE_TREE_CACHE_SANITY_CHECK.get,
+                fn=self._check_tree_cache,
+            ),
+            StateCheck(
+                phase=CheckPhase.FLUSH,
+                when=self._idle_pool_checks_due,
+                fn=self._check_idle_pools,
+            ),
+        ):
+            self.register(check)
+
+    def register(self, check: StateCheck) -> None:
+        """Add `check`; the checks of a phase run in registration order."""
+        self.checks[check.phase].append(check)
+
+    def _idle_pool_checks_due(self) -> bool:
+        return not self.get_skip_idle_pool_checks()
+
+    def run(self, phase: CheckPhase, batch: Optional[ScheduleBatch] = None) -> None:
+        """Run the checks at `phase` that are due, in registration order.
+        LAUNCH and RESULT checks get `batch`. BUSY runs only when `batch` is
+        the batch the iteration ran (None skips it). BUSY and IDLE record the
+        sanity-check stage: IDLE on every run, BUSY when a check is due."""
+        if phase is CheckPhase.BUSY and batch is None:
+            return
+        due = [check for check in self.checks[phase] if check.when()]
+        args = () if batch is None else (batch,)
+        if phase is CheckPhase.IDLE or (phase is CheckPhase.BUSY and due):
+            self._run_in_sanity_stage(due)
+        else:
+            for check in due:
+                check.fn(*args)
+
+    @scheduler_stage_method(SCHEDULER_STAGE_SANITY_CHECK_CACHE)
+    def _run_in_sanity_stage(self, due: List[StateCheck]) -> None:
+        for check in due:
+            check.fn()
+
+    def _raise_if_any(self, reqs: Set[Req], message: str) -> None:
+        if reqs:
+            self.reporter.report(
+                Severity.CORRUPTION, f"{message}: {sorted(req.rid for req in reqs)}"
+            )
 
     @staticmethod
     def _check_pool_invariant(
@@ -97,13 +193,13 @@ class SchedulerInvariantChecker:
 
     def _check_full_pool(self, ps: PoolStats, uncached: int = 0) -> Tuple[bool, str]:
         allocator = self.token_to_kv_pool_allocator
-        if ps.is_hybrid_swa and not ps.full_capacity:
+        if ps.windows and not ps.full_capacity:
             return False, ""
         # The token sub-pool's capacity as the stats report it: the sized cap
         # with a window, the schedulable token count with state.
         total = ps.full_capacity
         session_held = self.pool_stats_observer.session_held_tokens()
-        if ps.is_hybrid_swa or ps.is_hybrid_ssm:
+        if ps.windows or ps.is_hybrid_ssm:
             protected = self.tree_cache.full_protected_size()
         else:
             protected = self.tree_cache.protected_size()
@@ -165,24 +261,28 @@ class SchedulerInvariantChecker:
             return False, f"{msg}, dcp_physical_page_slack_allowed=True"
         return leak, msg
 
-    def _check_swa_pool(self, ps: PoolStats, uncached: int = 0) -> Tuple[bool, str]:
+    def _check_window_pool(
+        self, window: WindowPoolStats, uncached: int = 0
+    ) -> Tuple[bool, str]:
+        """Conservation of one window sub-pool, by the counts of the tree slot
+        that keeps it."""
         allocator = self.token_to_kv_pool_allocator
         if is_swa_req_ring(allocator):
-            # Per-request SWA ring: there is no token pool to conserve; ring-slot
-            # leaks are caught by the req_to_token check instead.
+            # Per-request window ring: there is no token pool to conserve;
+            # ring-slot leaks are caught by the req_to_token check instead.
             return False, (
-                "[swa] unified ring (leak-check skipped): "
-                f"available={ps.swa_available_size}, "
-                f"evictable={ps.swa_evictable_size}, "
-                f"total={ps.swa_capacity}"
+                f"[{window.name}] unified ring (leak-check skipped): "
+                f"available={window.available_size}, "
+                f"evictable={window.evictable_size}, "
+                f"total={window.capacity}"
             )
         return self._check_pool_invariant(
-            "swa",
-            ps.swa_available_size,
-            ps.swa_evictable_size,
-            self.tree_cache.swa_protected_size(),
-            self.pool_stats_observer.session_held_swa_tokens(),
-            ps.swa_capacity,
+            window.name,
+            window.available_size,
+            window.evictable_size,
+            self.tree_cache.window_protected_size(window.sub_pool),
+            self.pool_stats_observer.session_held_window_tokens(window.sub_pool),
+            window.capacity,
             uncached,
         )
 
@@ -278,58 +378,70 @@ class SchedulerInvariantChecker:
                 owners.append(req)
         return owners
 
-    def _get_total_uncached_sizes(self, has_window: bool) -> Tuple[int, int]:
-        """(full, swa) footprint of the KV rows requests own; 0 swa without a window."""
+    def _get_total_uncached_sizes(
+        self, windows: Sequence[str] = ()
+    ) -> Tuple[int, Dict[str, int]]:
+        """The full footprint of the KV rows requests own, and each window
+        slot's in ``windows``."""
         full_uncached = 0
-        swa_uncached = self.tree_cache.swa_transient_size()
+        window_uncached = {sub_pool: 0 for sub_pool in windows}
         for req in self._requests_owning_rows():
-            assert req.kv.cache_protected_len % self.page_size == 0
+            if req.kv.cache_protected_len % self.page_size != 0:
+                self.reporter.report(
+                    Severity.CORRUPTION,
+                    f"Request {req.rid} has cache_protected_len="
+                    f"{req.kv.cache_protected_len}, not a multiple of "
+                    f"page_size={self.page_size}",
+                )
             full_uncached += kv_private_tokens(req.kv, self.page_size)
-            if has_window:
-                swa_uncached += kv_private_swa_tokens(req.kv, self.page_size)
+            for sub_pool in windows:
+                window_uncached[sub_pool] += kv_private_window_tokens(
+                    req.kv, self.page_size, sub_pool
+                )
 
             if req.beam_group is not None:
                 full_uncached += req.beam_group.extra_uncached_tokens()
 
-        return full_uncached, swa_uncached
+        return full_uncached, window_uncached
 
-    @scheduler_stage_method(SCHEDULER_STAGE_SANITY_CHECK_CACHE)
-    def self_check_during_busy(self):
-        if self.get_last_batch() is None:
-            return
-
+    def _check_busy_pools(self):
         ps = self.pool_stats_observer.get_pool_stats()
-        full_uncached, swa_uncached = self._get_total_uncached_sizes(ps.is_hybrid_swa)
+        full_uncached, window_uncached = self._get_total_uncached_sizes(
+            tuple(window.sub_pool for window in ps.windows)
+        )
 
         full_leak, full_msg = self._check_full_pool(ps, uncached=full_uncached)
 
-        swa_leak, swa_msg = False, ""
-        if ps.is_hybrid_swa:
-            swa_leak, swa_msg = self._check_swa_pool(ps, uncached=swa_uncached)
+        window_checks = [
+            self._check_window_pool(window, uncached=window_uncached[window.sub_pool])
+            for window in ps.windows
+        ]
+        window_leaks = [msg for leak, msg in window_checks if leak]
 
         level = envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get()
-        full_line = f"[Mem Check (BUSY)] {full_msg}"
-        swa_line = f"[Mem Check (BUSY)] {swa_msg}" if swa_msg else None
+        lines = [f"[Mem Check (BUSY)] {full_msg}"] + [
+            f"[Mem Check (BUSY)] {msg}" for _, msg in window_checks if msg
+        ]
 
         if level > 1:
             # Verbose: log every iteration.
-            logger.info(full_line)
-            if swa_line:
-                logger.info(swa_line)
+            for line in lines:
+                logger.info(line)
         elif level == 1:
             # Quiet: buffer and stay silent; flush the recent ones only on a leak.
-            self.recent_busy_msgs.append(full_line)
-            if swa_line:
-                self.recent_busy_msgs.append(swa_line)
-            if full_leak or swa_leak:
+            self.recent_busy_msgs.extend(lines)
+            if full_leak or window_leaks:
                 for msg in self.recent_busy_msgs:
                     logger.info(msg)
 
-        assert not full_leak, f"Full Pool Mem Leak Detected! {full_msg}"
-        assert not swa_leak, f"SWA Pool Mem Leak Detected! {swa_msg}"
-
-        if envs.SGLANG_CHECK_KV_PAGE_INVARIANTS.get():
-            self._check_kv_page_invariants()
+        if full_leak:
+            self.reporter.report(
+                Severity.LEAK, f"Full Pool Mem Leak Detected! {full_msg}"
+            )
+        if window_leaks:
+            self.reporter.report(
+                Severity.LEAK, f"Window Pool Mem Leak Detected! {window_leaks}"
+            )
 
     def _check_kv_page_invariants(self):
         """committed<=allocated for every req/slot, and no double free:
@@ -340,7 +452,13 @@ class SchedulerInvariantChecker:
         row_width = rtt.shape[1]
 
         def _add_owner(label, kv):
-            assert 0 <= kv.kv_committed_len <= kv.kv_allocated_len <= row_width
+            if not 0 <= kv.kv_committed_len <= kv.kv_allocated_len <= row_width:
+                self.reporter.report(
+                    Severity.CORRUPTION,
+                    f"KV length out of bounds for {label}: "
+                    f"committed={kv.kv_committed_len}, "
+                    f"allocated={kv.kv_allocated_len}, row_width={row_width}",
+                )
             owners.append((label, kv.req_pool_idx, kv.kv_allocated_len))
 
         owners: list[tuple[str, Optional[int], int]] = []
@@ -395,10 +513,8 @@ class SchedulerInvariantChecker:
             free = sub.get_all_free_pages()
             uniq = torch.unique(free)
             if uniq.numel() != free.numel():
-                raise_error_or_warn(
-                    self,
-                    envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE.get(),
-                    "count_memory_leak_warnings",
+                self.reporter.report(
+                    Severity.CORRUPTION,
                     f"KV double free: sub-pool {i} has {free.numel() - uniq.numel()} duplicate pages.",
                 )
 
@@ -407,45 +523,81 @@ class SchedulerInvariantChecker:
         full_unique = torch.unique(sub_allocs[0].get_all_free_pages())
         stale = owner_pages[torch.isin(owner_pages, full_unique)]
         if stale.numel() > 0:
-            raise_error_or_warn(
-                self,
-                envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE.get(),
-                "count_memory_leak_warnings",
+            self.reporter.report(
+                Severity.CORRUPTION,
                 f"KV page use-after-free: {stale.numel()} owner page refs are in "
                 f"the free pool, sample pages={torch.unique(stale)[:8].tolist()}.",
             )
 
+    def _check_idle_pools(self):
+        has_leak, messages = self._check_all_pools(
+            self.pool_stats_observer.get_pool_stats(),
+        )
+        if has_leak:
+            self.reporter.report(
+                Severity.LEAK, "pool memory leak detected! " + "\n".join(messages)
+            )
+        self._check_req_pool()
+        # Byte-conservation diagnostic (static pools return [] -- the token
+        # identity above can't see byte leaks).
+        byte_violations = self.pool_stats_observer.storage.accounting_violations()
+        if byte_violations:
+            self.reporter.report(
+                Severity.LEAK,
+                "pool-bytes memory leak detected! " + "\n".join(byte_violations),
+            )
+
     def _check_req_pool(self):
+        pool = self.req_to_token_pool
+        session_req_count = self.pool_stats_observer.session_held_req_count()
+        if isinstance(pool, RequestTable):
+            msg = self._row_state_violation(pool, session_req_count)
+        else:
+            msg = self._row_count_violation(pool, session_req_count)
+        if msg is not None:
+            self.reporter.report(Severity.LEAK, msg)
+
+    @staticmethod
+    def _row_state_violation(
+        table: RequestTable, session_req_count: int
+    ) -> Optional[str]:
+        """Idle, every row is FREE, PARKED by a session or HELD by a retained
+        window, and PARKED + HELD is what sessions hold."""
+        counts = {state.name: table.count(state) for state in RowState}
+        problems = []
+        if table.count(RowState.FREE) != len(table.free_slots):
+            problems.append("FREE differs from the free list")
+        if table.count(RowState.ACTIVE) != 0:
+            problems.append("ACTIVE rows while idle")
+        if (
+            table.count(RowState.PARKED) + table.count(RowState.HELD)
+            != session_req_count
+        ):
+            problems.append("PARKED + HELD differs from session_held")
+        if not problems:
+            return None
+        return (
+            "req_to_token_pool memory leak detected! "
+            f"{'; '.join(problems)}: rows={counts}, "
+            f"free_list={len(table.free_slots)}, session_held={session_req_count}\n"
+        )
+
+    @staticmethod
+    def _row_count_violation(
+        pool: ReqToTokenPool, session_req_count: int
+    ) -> Optional[str]:
         # Account for pre-alloc headroom whenever the pool has it. The decode
         # pool always does; with runtime P<->D role switching a prefill instance
         # may also hold a decode-flavored (pre-alloc) pool, so key off the pool
         # itself rather than the current role.
-        req_total_size = (
-            self.req_to_token_pool.size + self.req_to_token_pool.pre_alloc_size
-        )
-
-        session_req_count = self.pool_stats_observer.session_held_req_count()
-        if len(self.req_to_token_pool.free_slots) + session_req_count != req_total_size:
-            msg = (
-                "req_to_token_pool memory leak detected!"
-                f"available_size={len(self.req_to_token_pool.free_slots)}, "
-                f"session_held={session_req_count}, "
-                f"total_size={self.req_to_token_pool.size}\n"
-            )
-            raise_error_or_warn(
-                self,
-                envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE.get(),
-                "count_req_pool_leak_warnings",
-                msg,
-            )
-
-    def _report_leak(self, pool_name: str, token_msg: str):
-        msg = f"{pool_name} memory leak detected! {token_msg}"
-        raise_error_or_warn(
-            self,
-            envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE.get(),
-            "count_memory_leak_warnings",
-            msg,
+        req_total_size = pool.size + pool.pre_alloc_size
+        if len(pool.free_slots) + session_req_count == req_total_size:
+            return None
+        return (
+            "req_to_token_pool memory leak detected!"
+            f"available_size={len(pool.free_slots)}, "
+            f"session_held={session_req_count}, "
+            f"total_size={pool.size}\n"
         )
 
     def _check_all_pools(
@@ -459,10 +611,10 @@ class SchedulerInvariantChecker:
         has_leak |= full_leak
         messages.append(full_msg)
 
-        if ps.is_hybrid_swa:
-            swa_leak, swa_msg = self._check_swa_pool(ps)
-            has_leak |= swa_leak
-            messages.append(swa_msg)
+        for window in ps.windows:
+            window_leak, window_msg = self._check_window_pool(window)
+            has_leak |= window_leak
+            messages.append(window_msg)
 
         if ps.is_hybrid_ssm and self.tree_cache.supports_mamba():
             mamba_leak, mamba_msg = self._check_mamba_pool(ps)
@@ -471,72 +623,120 @@ class SchedulerInvariantChecker:
 
         return has_leak, messages
 
-    def maybe_check_request_lists(self) -> None:
-        """With SGLANG_ENABLE_RUNNING_REQS_CHECK, no request is in two lists."""
+    def check_admitted(self, reqs: Iterable[Req]) -> None:
+        """At admission from the waiting queue: no older step still carries the
+        request. A request never re-enters the batch while one does, which is what
+        lets `Scheduler.still_in_batch` look at the batch lists alone. Gated like
+        the request-list check."""
         if not envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.get():
             return
-        owners: Dict[Req, str] = {}
-        for name, reqs in self.get_request_lists().items():
+        self._raise_if_any(
+            {req for req in reqs if req.inflight_steps != 0},
+            "Requests admitted while an older step still carries them",
+        )
+
+    def _check_request_lists(self, batch: ScheduleBatch) -> None:
+        """At the launch of `batch`: each live request is in exactly one list,
+        the one its `owner_list` names, and that list matches its state."""
+        lists = self.get_request_lists()
+        owners: Dict[Req, ListKind] = {}
+        for kind, reqs in lists.items():
             for req in reqs:
                 if req in owners:
-                    raise RuntimeError(
-                        f"Request {req.rid} is in both {owners[req]} and {name}"
+                    self.reporter.report(
+                        Severity.CORRUPTION,
+                        f"Request {req.rid} is in both {owners[req].name} and {kind.name}",
                     )
-                owners[req] = name
+                if req.owner_list is not reqs:
+                    owner = req.owner_list
+                    self.reporter.report(
+                        Severity.CORRUPTION,
+                        f"Request {req.rid} is in {kind.name} but owned by "
+                        f"{None if owner is None else owner.kind.name}",
+                    )
+                owners[req] = kind
 
-    def maybe_check_running_reqs(
-        self,
-        running_batch: Optional[ScheduleBatch],
-        last_batch: Optional[ScheduleBatch],
-    ) -> None:
-        """With SGLANG_ENABLE_RUNNING_REQS_CHECK, the running requests are exactly
-        the unfinished ones the running batches and the steps decode, apart from
-        the chunked request. A launched prefill joins running at its merge."""
-        if not envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.get():
-            return
-        held = [
-            req
-            for b in (running_batch, *self.get_pp_running_mbs())
-            if b is not None
-            for req in b.reqs
-        ]
-        # An extend step decodes only the rows a mixed step took from a running
-        # batch; its other rows are launched prefills.
-        held += [
-            req
-            for b in (last_batch, *self.get_pp_mbs())
-            if b is not None
-            for req in (
-                (b.decoding_reqs or ()) if b.forward_mode.is_extend() else b.reqs
-            )
-        ]
-        self.get_running_reqs().check(held, chunked_req=self.get_chunked_req())
+        chunked_req = self.get_chunked_req()
 
-    def maybe_check_batch_consistency(self, batch: ScheduleBatch) -> None:
-        """With SGLANG_ENABLE_RUNNING_REQS_CHECK, a step is processed once, with
-        the requests it was launched with."""
-        if not envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.get():
-            return
+        def live(reqs: Iterable[Req]) -> Set[Req]:
+            return {
+                req for req in reqs if not req.finished() and req is not chunked_req
+            }
+
+        in_running_batch = {
+            req for b in self.get_running_batches() if b is not None for req in b.reqs
+        }
+        in_step = {
+            req for b in (batch, *self.get_pp_mbs()) if b is not None for req in b.reqs
+        }
+        running = set(lists.get(ListKind.DECODING, ()))
+
+        self._raise_if_any(
+            live(in_running_batch | in_step) - owners.keys(),
+            "Requests held by a running batch or a step but in no list",
+        )
+        self._raise_if_any(
+            in_running_batch & set(lists.get(ListKind.PREFILL_LAUNCHED, ())),
+            "Requests in prefill_launched but in a running batch",
+        )
+        self._raise_if_any(
+            live(in_running_batch) - running,
+            "Requests in a running batch but not in running",
+        )
+        # Only a step in flight takes a running request out of every running
+        # batch: a mixed step's decode row, or an overlap result that finishes it.
+        self._raise_if_any(
+            {req for req in running - in_running_batch if req.inflight_steps <= 0},
+            "Requests in running but in no running batch or step",
+        )
+
+    def expect_output(self, req: Req) -> None:
+        """Record that `req`, now kept by the scheduler, owes a final output and
+        an exit through the retirer."""
+        if envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.get():
+            self.unended.add(req)
+
+    def _check_ended_requests(self) -> None:
+        """At idle, every request the scheduler kept is in a list (held, parked,
+        deferred) or has sent its final output and exited through the retirer;
+        a decode offload's exit waits for its copy."""
+        self.unended = {
+            req for req in self.unended if req.send_via is None or req.exit_via is None
+        }
+        listed = {req for reqs in self.get_request_lists().values() for req in reqs}
+        unlisted = self.unended - listed
+        self._raise_if_any(
+            {req for req in unlisted if req.send_via is None},
+            "Requests in no list that never sent their final output",
+        )
+        offloading = set(self.get_offloading_reqs())
+        self._raise_if_any(
+            {req for req in unlisted - offloading if req.exit_via is None},
+            "Requests in no list that never exited through the retirer",
+        )
+
+    def _check_batch_consistency(self, batch: ScheduleBatch) -> None:
+        """A step is processed once, with the requests it was launched with."""
         launched = batch.launched_reqs or ()
         if len(batch.reqs) != len(launched) or any(
             req is not launched_req for req, launched_req in zip(batch.reqs, launched)
         ):
-            raise RuntimeError(
+            self.reporter.report(
+                Severity.CORRUPTION,
                 f"Step processed with requests {[req.rid for req in batch.reqs]}, "
-                f"launched with {[req.rid for req in launched]}"
+                f"launched with {[req.rid for req in launched]}",
             )
         uncounted = [req.rid for req in batch.reqs if req.inflight_steps <= 0]
         if uncounted:
-            raise RuntimeError(
-                f"Requests processed by a step they were not launched in: {uncounted}"
+            self.reporter.report(
+                Severity.CORRUPTION,
+                f"Requests processed by a step they were not launched in: {uncounted}",
             )
 
     def _check_tree_cache(self):
-        if not envs.SGLANG_ENABLE_TREE_CACHE_SANITY_CHECK.get():
-            return
         ps = self.pool_stats_observer.get_pool_stats()
         if self.tree_cache.supports_prefix_sharing() and (
-            (ps.is_hybrid_swa and self.tree_cache.supports_swa())
+            (ps.windows and self.tree_cache.supports_swa())
             or (ps.is_hybrid_ssm and self.tree_cache.supports_mamba())
         ):
             self.tree_cache.sanity_check()
@@ -568,11 +768,13 @@ def create_scheduler_watchdog(
 
     return WatchdogRaw(
         debug_name="Scheduler",
-        get_counter=lambda: scheduler.forward_ct,
+        # A step or a heartbeat while it waits (`Scheduler.feed_watchdog`).
+        get_counter=lambda: (scheduler.forward_ct, scheduler.watchdog_heartbeats),
         is_active=lambda: (
             scheduler.is_initializing or scheduler.cur_batch_for_debug is not None
         ),
         watchdog_timeout=watchdog_timeout,
         soft=soft,
         dump_info=dump_info,
+        before_crash=scheduler.dump_requests_before_crash,
     )

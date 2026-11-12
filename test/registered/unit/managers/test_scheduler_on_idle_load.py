@@ -23,6 +23,12 @@ from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.deferred_responses import (
     DeferredResponses,
 )
+from sglang.srt.managers.scheduler_components.pause_state import PauseState
+from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
+    KeyedReqList,
+    ListKind,
+)
 from sglang.srt.managers.scheduler_components.request_receiver import (
     SchedulerRequestReceiver,
 )
@@ -47,6 +53,7 @@ class TestOnIdleStallPublish(CustomTestCase):
         )
         s.scheduler_stage_metrics = None
         s.enable_hicache_storage = False
+        s.enable_unified_cache_external_linker = False
         s.disaggregation_mode = DisaggregationMode.NULL
         s.enable_lmcache = False
         s.maybe_send_health_check_signal = MagicMock()
@@ -109,9 +116,8 @@ class TestAsyncShmIdleAccounting(CustomTestCase):
         scheduler.metrics_reporter = MagicMock()
         scheduler.running_batch = MagicMock()
         scheduler.running_batch.is_empty.return_value = True
-        scheduler.chunked_req = None
+        scheduler.chunked_reqs = IndexedReqList(ListKind.CHUNKED)
         scheduler.dllm_manager = MagicMock()
-        scheduler.dllm_manager.any_staging_reqs.return_value = False
         scheduler.last_batch = None
         scheduler.enable_overlap = False
         scheduler._pp_microbatches_drained = MagicMock(return_value=True)
@@ -119,11 +125,20 @@ class TestAsyncShmIdleAccounting(CustomTestCase):
         scheduler.grammar_manager = SimpleNamespace(grammar_queue=[])
         scheduler.disaggregation_mode = DisaggregationMode.NULL
         scheduler.enable_hisparse = False
+        scheduler.prefill_launched_reqs = KeyedReqList(ListKind.PREFILL_LAUNCHED)
+        scheduler.running_reqs = []
+        scheduler.dllm_config = None
+        scheduler.disagg_prefill_bootstrap_queue = None
+        scheduler.disagg_prefill_transfer_queue = IndexedReqList(ListKind.PD_SENDING)
+        scheduler.disagg_decode_prealloc_queue = None
+        scheduler.disagg_decode_transfer_queue = None
+        scheduler.hisparse_coordinator = None
         scheduler.enable_hierarchical_cache = False
         scheduler.enable_hicache_storage = False
+        scheduler.enable_unified_cache_external_linker = False
         scheduler.enable_lmcache = False
         scheduler.dp_attn_adapter = MagicMock()
-        scheduler._engine_paused = False
+        scheduler.pause_state = PauseState()
         receiver = object.__new__(UocrRequestReceiver)
         object.__setattr__(receiver, "async_shm_materializer", materializer)
         scheduler.request_receiver = receiver
@@ -133,7 +148,6 @@ class TestAsyncShmIdleAccounting(CustomTestCase):
         scheduler.load_inquirer = MagicMock()
         scheduler.enable_unified_memory = False
         scheduler.invariant_checker = MagicMock()
-        scheduler.invariant_checker._check_all_pools.return_value = (False, [])
         scheduler.pool_stats_observer = MagicMock()
         scheduler.token_to_kv_pool_allocator = MagicMock()
         scheduler.token_to_kv_pool_allocator.verify_byte_accounting.return_value = []

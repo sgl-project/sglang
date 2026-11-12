@@ -59,13 +59,12 @@ from sglang.srt.beam_search.trie_constraint import BeamTrieConstraint
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.managers.overlap_utils import FutureMap, RelayPayload
-from sglang.srt.managers.schedule_batch import (
+from sglang.srt.managers.req_types import (
     FINISH_ABORT,
     FINISH_LENGTH,
     FINISH_MATCHED_TOKEN,
-    Req,
-    ScheduleBatch,
 )
+from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
 from sglang.srt.runtime_context import (
     get_disagg,
@@ -73,7 +72,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_schedule,
 )
-from sglang.srt.utils.common import is_pin_memory_available
+from sglang.srt.utils.device import is_pin_memory_available
 
 if TYPE_CHECKING:
     from sglang.srt.beam_search.selection_cuda_graph import TrieSelectionGraphCache
@@ -114,7 +113,6 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
     tree_cache: BasePrefixCache
     future_map: FutureMap
 
-    # Loaded from model_config.beam_trie_config in __post_init__.
     trie_constraint: Optional[BeamTrieConstraint] = None
     # Live (non-retired) groups; the O(1) gate for the per-forward relay hook.
     _num_live_groups: int = 0
@@ -126,6 +124,12 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
             self.trie_constraint = BeamTrieConstraint.load(
                 config, self.req_to_token_pool.device
             )
+            if envs.SGLANG_ENABLE_BEAM_TRIE_SELECTION_GRAPH.get():
+                from sglang.srt.beam_search.selection_cuda_graph import (
+                    TrieSelectionGraphCache,
+                )
+
+                self._trie_selection_graph_cache = TrieSelectionGraphCache()
 
     def _storage(self):
         """Where member rows and their token ids are taken and given back."""
@@ -219,25 +223,28 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
                 f"Beam search needs at least 1 generated token within the "
                 f"context budget (prompt_len={prompt_len}, max_req_len={self.max_req_len})."
             )
-        required_kv_slots = (
-            prompt_len
-            + beam_width * max(max_new_tokens - 1, 0)
-            + self.token_to_kv_pool_allocator.page_size
+        stop_token_ids = self._collect_stop_token_ids(
+            req, user_params, vocab_size=self.model_config.vocab_size
         )
-        if required_kv_slots >= self.token_to_kv_pool_allocator.size:
-            return (
-                f"beam_width ({beam_width}) with prompt length {prompt_len} and "
-                f"max_new_tokens {max_new_tokens} needs up to {required_kv_slots} "
-                f"KV slots, but the pool holds only "
-                f"{self.token_to_kv_pool_allocator.size}."
-            )
-        stop_token_ids = self._collect_stop_token_ids(req, user_params)
         if self.trie_constraint is not None:
             config = self.trie_constraint.config
             if max_new_tokens != config.num_codebooks:
                 return (
                     "Trie-conditioned beam output requires max_new_tokens == "
                     f"{config.num_codebooks}; got {max_new_tokens}."
+                )
+            # Trie groups always decode max_new_tokens steps, so this bound is exact.
+            required_kv_slots = (
+                prompt_len
+                + beam_width * max(max_new_tokens - 1, 0)
+                + self.token_to_kv_pool_allocator.page_size
+            )
+            if required_kv_slots >= self.token_to_kv_pool_allocator.size:
+                return (
+                    f"beam_width ({beam_width}) with prompt length {prompt_len} and "
+                    f"max_new_tokens {max_new_tokens} needs up to {required_kv_slots} "
+                    f"KV slots, but the pool holds only "
+                    f"{self.token_to_kv_pool_allocator.size}."
                 )
             expandable_capacity = min(self.trie_constraint.level_cardinalities[1:])
             if beam_width > expandable_capacity:
@@ -258,7 +265,8 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
             stop_token_ids=stop_token_ids,
             max_new_tokens=max_new_tokens,
             num_return=user_params.n,
-            # Frontier state lives on device; only k-sized results reach the host.
+            # Frontier state lives on device: selection consumes device top-2k
+            # tensors in place; only k-sized results ever reach the host.
             device=self.req_to_token_pool.device,
             device_history=self.trie_constraint is not None,
         )
@@ -299,7 +307,7 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
         )
 
     @staticmethod
-    def _collect_stop_token_ids(req: Req, user_params) -> List[int]:
+    def _collect_stop_token_ids(req: Req, user_params, *, vocab_size: int) -> List[int]:
         if user_params.ignore_eos:
             return []
         stop_ids = set(user_params.stop_token_ids or ())
@@ -309,7 +317,8 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
             if getattr(tokenizer, "eos_token_id", None) is not None:
                 stop_ids.add(tokenizer.eos_token_id)
             stop_ids |= set(getattr(tokenizer, "additional_stop_token_ids", None) or ())
-        return sorted(stop_ids)
+        # Out-of-vocab ids never match; past int64 they would break BeamGroup's tensor.
+        return sorted(t for t in stop_ids if 0 <= t < vocab_size)
 
     def maybe_select_and_relay(
         self, batch: ScheduleBatch, batch_result, chunked_req: Optional[Req] = None
@@ -362,7 +371,7 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
         """Launch half of the leader's prefill tick: first selection, member-row
         spawn, and the relay overwrite (the sampled token is void)."""
         group: BeamGroup = req.beam_group
-        top_logprobs, top_tokens = self._group_topk_logprobs(
+        top_logprobs, top_tokens = self.group_topk_logprobs(
             group,
             [logits_output.beam.leader_logits[pos : pos + 1]],
             self._capture_normalizers(
@@ -371,7 +380,7 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
             ),
         )
         final = group.next_step_is_final()
-        next_tokens, _ = self._select_group(group, top_logprobs, top_tokens, tick)
+        next_tokens, _ = self.select_group(group, top_logprobs, top_tokens, tick)
         if final:
             # Prefill-terminated (max_new_tokens == 1): no spawn, but the relay
             # slot still needs a token so an overshoot step has a valid input.
@@ -387,8 +396,6 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
         """Deferred half of the leader's prefill tick: fold the staged selection
         into the DAG (the designated D2H point) and apply finish/abort."""
         group: BeamGroup = req.beam_group
-        if group.retired:
-            return
         if req.to_finish is not None:
             self._abort_group(group)
             return
@@ -446,51 +453,40 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
                 tail_slice=slice(entry.start, entry.end),
             )
             selected = None
-            if envs.SGLANG_ENABLE_BEAM_TRIE_SELECTION_GRAPH.get():
-                from sglang.srt.beam_search.selection_cuda_graph import (
-                    TrieSelectionGraphCache,
-                )
-
-                if self._trie_selection_graph_cache is None:
-                    self._trie_selection_graph_cache = TrieSelectionGraphCache()
+            if self._trie_selection_graph_cache is not None:
                 selected = self._trie_selection_graph_cache.select(
                     self, group, pieces, normalizers, batch.forward_iter
                 )
             if selected is None:
-                top_logprobs, top_tokens = self._group_topk_logprobs(
+                top_logprobs, top_tokens = self.group_topk_logprobs(
                     group, pieces, normalizers
                 )
-                selected = self._select_group(
+                selected = self.select_group(
                     group, top_logprobs, top_tokens, batch.forward_iter
                 )
             next_tokens, parent_idx = selected
             self._apply_survivors(group, next_tokens, parent_idx, batch.forward_iter)
 
-    def commit_decode(self, batch: ScheduleBatch) -> set:
+    def commit_decode(self, reqs: List[Req], forward_iter: int) -> None:
         """Deferred half: fold staged selections into the DAG and apply
-        finish/abort. Returns groups finished by THIS call -- under overlap a
-        finished leader reappears for one overshoot tick, so the caller runs the
-        shared finish machinery only on the committing tick."""
-        newly_finished = set()
+        finish/abort, on ``reqs``, the requests the step at ``forward_iter``
+        commits on."""
         if self._num_live_groups == 0:
-            return newly_finished
-        for req in batch.reqs:
+            return
+        for req in reqs:
             group = req.beam_group
-            if group is None or group.retired:
+            if group is None:
                 continue
             # Reclaim even if the DAG commit is discarded: the launch path
             # already mutated req_to_token, so the orphans are real either way.
-            self._reclaim_orphans(group, batch.forward_iter)
+            self._reclaim_orphans(group, forward_iter)
             if req.to_finish is not None:
                 self._abort_group(group)
-                newly_finished.add(id(group))
                 continue
-            if group.commit_pending(batch.forward_iter):
+            if group.commit_pending(forward_iter):
                 self._finish_group(group)
-                newly_finished.add(id(group))
-        return newly_finished
 
-    def _select_group(
+    def select_group(
         self,
         group: BeamGroup,
         top_logprobs: torch.Tensor,
@@ -541,7 +537,7 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
             normalizers.append(capture.tail_normalizer[tail_slice])
         return normalizers
 
-    def _group_topk_logprobs(
+    def group_topk_logprobs(
         self,
         group: BeamGroup,
         pieces: Sequence[torch.Tensor],
@@ -549,16 +545,13 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
     ):
         if self.trie_constraint is None:
             return _rows_topk_logprobs(pieces, group.num_candidates)
-        config = self.trie_constraint.config
-        if (
-            group.num_generated >= config.num_codebooks
-            and pieces[0].shape[1] != config.codebook_size
-        ):
-            return _rows_topk_logprobs(pieces, group.num_candidates)
+        # Admission pins max_new_tokens to num_codebooks, and launch-complete
+        # groups leave the batch, so selection depth is always a valid codebook.
+        assert group.num_generated < self.trie_constraint.config.num_codebooks
         return self.trie_constraint.topk_logprobs(
             pieces,
             group.trie_prefix_codes,
-            min(group.num_generated, config.num_codebooks - 1),
+            group.num_generated,
             group.beam_width,
             normalizers,
         )
@@ -662,7 +655,7 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
             self._reclaim_orphans(group)
             group.retired = True
             # Drops overshoot selections staged after the terminal commit.
-            group._pending_steps.clear()
+            group.clear_staged()
             self._num_live_groups -= 1
 
     def _upload_rows(self, rows: List[int]) -> torch.Tensor:

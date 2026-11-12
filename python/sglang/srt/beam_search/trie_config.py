@@ -113,7 +113,6 @@ def discover_trie_output_head_config(
     # The trie head belongs to the target model; a draft model never loads it.
     if is_draft_model or not getattr(hf_config, TRIE_OUTPUT_HEAD_CONFIG_KEY, False):
         return None
-    # A model that opts in must ship the artifact; a missing file raises.
     tensor_path = cached_file(model_path, TRIE_OUTPUT_HEAD_FILENAME, revision=revision)
     config = load_trie_output_head_config(tensor_path)
     if config.token_end > vocab_size:

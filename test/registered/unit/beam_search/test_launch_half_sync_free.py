@@ -11,7 +11,7 @@ from sglang.srt.beam_search.trie_config import TrieOutputHeadConfig
 from sglang.srt.beam_search.trie_constraint import BeamTrieConstraint
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.schedule_batch import ReqKvInfo
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-large")

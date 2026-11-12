@@ -21,11 +21,14 @@ from typing import TYPE_CHECKING, Callable, Optional
 import msgspec
 import torch
 
+from sglang.kernels.ops.activation.softcap import softcap_inplace_logits
 from sglang.srt.beam_search.trie_config import TrieOutputHeadConfig
-from sglang.srt.environ import envs
-from sglang.srt.utils.common import is_pin_memory_available
+from sglang.srt.utils import is_cpu, is_npu
+from sglang.srt.utils.device import is_pin_memory_available
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
+    from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
     from sglang.srt.managers.schedule_batch import ScheduleBatch
     from sglang.srt.model_executor.model_runner import ModelRunner
 
@@ -35,11 +38,7 @@ logger = logging.getLogger(__name__)
 
 class BeamTrieHeadOutput(msgspec.Struct, frozen=True):
     logits: torch.Tensor
-    normalizer: Optional[torch.Tensor]
-
-
-def use_topk_logprob() -> bool:
-    return envs.SGLANG_OPT_BEAM_TRIE_TOPK_LOGPROB.get()
+    normalizer: torch.Tensor
 
 
 def configure_model_trie_output_heads(
@@ -47,26 +46,28 @@ def configure_model_trie_output_heads(
     model: torch.nn.Module,
     config: Optional[TrieOutputHeadConfig],
     device: str,
-    tp_size: int,
     quantization: Optional[str],
     lora_enabled: bool,
-    rl_on_policy_target: Optional[str],
 ) -> bool:
+    """Install the compact head on the model's LogitsProcessors when the setup
+    allows it; returns whether it is on."""
+    if config is None:
+        return False
     from sglang.srt.layers.logits_processor import LogitsProcessor
+    from sglang.srt.runtime_context import get_exec, get_parallel
 
-    enabled = config is not None and (
-        device == "cuda"
-        and tp_size == 1
-        and quantization is None
-        and not lora_enabled
-        and rl_on_policy_target is None
-    )
-    if config is not None and not enabled:
-        logger.info(
-            "Using dense LM-head scoring for model-bundled beam trie; "
-            "the compact output head requires CUDA, TP=1, an unquantized "
-            "LM head, and no LoRA or RL target."
-        )
+    reason = None
+    if device != "cuda":
+        reason = "device is not CUDA"
+    elif get_parallel().tp_size != 1:
+        reason = "TP size is not 1"
+    elif quantization is not None:
+        reason = "the LM head is quantized"
+    elif lora_enabled:
+        reason = "LoRA is enabled"
+    elif get_exec().deterministic.rl_on_policy_target is not None:
+        reason = "an RL on-policy target is set"
+    enabled = reason is None
     configured = 0
     for module in model.modules():
         if isinstance(module, LogitsProcessor):
@@ -77,7 +78,87 @@ def configure_model_trie_output_heads(
             "A model-bundled beam trie was discovered, but the loaded "
             "generation model has no compatible LogitsProcessor"
         )
+    if enabled:
+        logger.info("Beam trie: compact SID output head on")
+    else:
+        logger.info(
+            "Beam trie: compact SID output head off (%s); dense LM head", reason
+        )
     return enabled
+
+
+def compute_beam_trie_logits(
+    processor: LogitsProcessor,
+    hidden_states: torch.Tensor,
+    lm_head: VocabParallelEmbedding,
+    logits_metadata: LogitsMetadata,
+) -> Optional[BeamTrieHeadOutput]:
+    """Compact SID logits for trie decode rows; None runs the dense path."""
+    from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
+    from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+
+    output_head = processor.beam_trie_output_head
+    depths = logits_metadata.beam_trie_levels
+    if (
+        output_head is None
+        or depths is None
+        or not isinstance(lm_head, VocabParallelEmbedding)
+        or should_apply_lm_head_quant_method(lm_head, lm_head.quant_method)
+    ):
+        return None
+    if depths.ndim != 1 or depths.shape[0] != hidden_states.shape[0]:
+        raise RuntimeError("Per-row beam trie depths must match the LM-head input rows")
+    assert not processor.do_tensor_parallel_all_gather
+
+    def project(hidden: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        return _project_lm_head(processor, hidden, weight)
+
+    def transform(logits: torch.Tensor) -> torch.Tensor:
+        return _transform_logits(processor, logits)
+
+    head_output = output_head.project_mixed(
+        hidden_states,
+        lm_head.weight,
+        depths,
+        project,
+        transform,
+        use_grouped_projection=not processor.use_fp32_lm_head,
+    )
+    # Match the dense path: logit_scale runs in the LM-head dtype, then
+    # scoring and softcapping consume FP32 logits.
+    logits = transform(head_output.logits).float()
+    return BeamTrieHeadOutput(logits=logits, normalizer=head_output.normalizer)
+
+
+def _project_lm_head(
+    processor: LogitsProcessor,
+    hidden_states: torch.Tensor,
+    weight: torch.Tensor,
+) -> torch.Tensor:
+    if processor.use_fp32_lm_head:
+        use_mm_out_dtype = (
+            hidden_states.is_cuda
+            and hidden_states.dtype == weight.dtype
+            and hidden_states.dtype in (torch.float16, torch.bfloat16)
+        )
+        if use_mm_out_dtype:
+            return torch.mm(hidden_states, weight.T, out_dtype=torch.float32)
+        return torch.matmul(hidden_states.to(torch.float32), weight.to(torch.float32).T)
+    return torch.matmul(hidden_states.to(weight.dtype), weight.T)
+
+
+def _transform_logits(processor: LogitsProcessor, logits: torch.Tensor) -> torch.Tensor:
+    if processor.logit_scale is not None:
+        logits.mul_(processor.logit_scale)
+    softcap = processor.final_logit_softcapping
+    if softcap is None:
+        return logits
+    logits = logits.float()
+    if not (is_npu() or is_cpu()):
+        softcap_inplace_logits(logits, softcap)
+    else:
+        logits = softcap * torch.tanh(logits / softcap)
+    return logits
 
 
 def build_trie_row_levels(
@@ -98,10 +179,9 @@ def build_trie_row_levels(
         row_levels = [
             min(req.beam_group.num_generated, max_level) for req in batch.reqs
         ]
-        if batch.beam_tail is not None:
-            for entry in batch.beam_tail.entries:
-                level = min(entry.group.num_generated, max_level)
-                row_levels.extend([level] * (entry.end - entry.start))
+        for entry in batch.beam_tail.entries:
+            level = min(entry.group.num_generated, max_level)
+            row_levels.extend([level] * (entry.end - entry.start))
         assert len(row_levels) == len(batch.seq_lens)
         # Pinned and non-blocking, so the host never waits on the running forward.
         return torch.tensor(
@@ -158,16 +238,7 @@ class BeamTrieOutputHead:
                 hidden_states.shape[0], device=hidden_states.device
             )
             logits = all_logits[row_indices, depths]
-        normalizer = (
-            None
-            if use_topk_logprob()
-            else self._stream_normalizer(
-                hidden_states,
-                weight,
-                project,
-                transform,
-            )
-        )
+        normalizer = self._stream_normalizer(hidden_states, weight, project, transform)
         return BeamTrieHeadOutput(logits, normalizer)
 
     def _stream_normalizer(

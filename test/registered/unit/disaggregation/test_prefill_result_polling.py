@@ -31,16 +31,23 @@ from sglang.srt.managers.scheduler import Scheduler, _dispatch_event_loop_once
 from sglang.srt.managers.scheduler_components.deferred_responses import (
     DeferredResponses,
 )
-from sglang.srt.managers.scheduler_components.request_list import RequestList
-from sglang.srt.managers.scheduler_components.running_reqs import RunningReqs
+from sglang.srt.managers.scheduler_components.pause_state import PauseState
+from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
+    KeyedReqList,
+    ListKind,
+    move,
+)
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.scheduler_test_utils import FakeReq, leaving_retirer
 from sglang.test.test_utils import CustomTestCase, published_topology
 
 register_cpu_ci(est_time=25, suite="base-a-test-cpu")
@@ -119,12 +126,21 @@ def _input(batch):
     )
 
 
+def _sending(reqs=()):
+    sending = IndexedReqList(ListKind.PD_SENDING)
+    move(reqs, sending)
+    return sending
+
+
 class _Scheduler(SchedulerDisaggregationPrefillMixin):
     """Run real scheduling and result handling with controlled intake and GPU events."""
 
+    chunked_req = Scheduler.chunked_req
     launch_batch_sample_if_needed = Scheduler.launch_batch_sample_if_needed
     _copy_result_to_cpu = Scheduler._copy_result_to_cpu
     pause_generation = Scheduler.pause_generation
+    _retract_batches = Scheduler._retract_batches
+    _publish_paused_state = Scheduler._publish_paused_state
     continue_generation = Scheduler.continue_generation
     increment_scheduler_iterations = Scheduler.increment_scheduler_iterations
     _on_step_processed = Scheduler._on_step_processed
@@ -145,7 +161,6 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         self.ready_at = ready_at
         self.ready_batches = deque()
         self.request_receiver = SimpleNamespace(recv_requests=self.recv_requests)
-        self._deferred_input_requests = []
         self._incoming_requests = []
         self.pause_at = pause_at
         self.resume_at = resume_at
@@ -173,25 +188,26 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
             output_streamer=None,
             send_abort=None,
         )
-        self.chunked_req = None
+        self.chunked_reqs = IndexedReqList(ListKind.CHUNKED)
         self.decode_offload_manager = None
+        self.hisparse_coordinator = None
         self.running_batch = ScheduleBatch(reqs=[])
-        self.running_reqs = RunningReqs()
-        self.prefill_launched_reqs = RequestList()
+        self.running_reqs = KeyedReqList(ListKind.DECODING)
+        self.prefill_launched_reqs = KeyedReqList(ListKind.PREFILL_LAUNCHED)
         self.invariant_checker = Mock()
         self.uocr_runtime = None
-        self.waiting_queue = []
+        self.waiting_queue = IndexedReqList(ListKind.WAITING)
         self.cur_batch_for_debug = None
-        self._engine_paused = False
-        self._pause_started_at = None
-        self._pause_intervals = deque()
+        self.pause_state = PauseState()
         self.gracefully_exit = False
         self.enable_staging = False
+        self.enable_hierarchical_cache = False
+        self.enable_hicache_storage = False
         self.enable_overlap = True
         self.enable_async_d2h_copy = False
         self.enable_overlap_mlx = False
         self.disagg_prefill_bootstrap_queue = SimpleNamespace(
-            pop_bootstrapped=lambda: []
+            move_bootstrapped=lambda dst: []
         )
         self.ngram_embedding_manager = SimpleNamespace(
             prepare_for_forward=lambda batch, chunked_req: batch
@@ -227,15 +243,16 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         self._record_step_counters = Mock()
         self._maybe_clear_mm_inputs = Mock()
         self.maybe_send_health_check_signal = Mock()
-        self.disagg_prefill_transfer_queue = []
+        self.disagg_prefill_transfer_queue = _sending()
         self.send_kv_chunk = Mock()
         self.process_pending_chunked_abort = Mock()
         self.dp_attn_adapter = SimpleNamespace(
-            maybe_prepare_mlp_sync_batch=lambda batch: batch
+            maybe_prepare_mlp_sync_batch=lambda batch: batch,
+            shutdown_vote_pending=lambda: False,
         )
 
     def _process_hicache_events(self, should_retry_storage_prefetch=True):
-        pass
+        self.actions.append((self.iteration, "hicache", should_retry_storage_prefetch))
 
     def _poll_timeout_aborts(self):
         return []
@@ -309,9 +326,16 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         batch = self.ready_batches.popleft() if self.ready_batches else None
         if batch is not None:
             self.actions.append((self.iteration, "prepare_batch", batch.forward_iter))
-            self.waiting_queue = [
-                req for req in self.waiting_queue if req not in batch.reqs
-            ]
+            self.waiting_queue._leave(batch.reqs)
+            # The request between two chunks stays in chunked_reqs.
+            move(
+                (
+                    req
+                    for req in batch.reqs
+                    if req is not batch.chunked_req and req is not self.chunked_req
+                ),
+                self.prefill_launched_reqs,
+            )
         return NextBatchPlan(batch_to_run=batch, running_batch=running_batch)
 
     def run_batch(self, batch):
@@ -360,6 +384,15 @@ def _run_loop(scheduler, enabled=True, **topology):
         patch("sglang.srt.disaggregation.prefill.checkpoint_kv_cache"),
     ):
         scheduler.tp_size = get_parallel().tp_size
+        scheduler.dp_tp_group = SimpleNamespace(
+            world_size=(
+                get_parallel().attn_tp_size
+                if get_parallel().attn_dp_enabled
+                else get_parallel().tp_size
+            )
+        )
+        if not get_parallel().attn_dp_enabled:
+            scheduler.dp_tp_cpu_group = scheduler.tp_cpu_group
         try:
             _dispatch_event_loop_once(scheduler)
         except _StopLoop:
@@ -439,7 +472,7 @@ def _rank_consensus_worker(rank, rendezvous):
                 assert [a[2] for a in scheduler.actions if a[1] == "result"] == list(
                     names
                 )
-                assert not scheduler._deferred_input_requests
+                assert not scheduler.pause_state.holds_inputs()
                 for name, event in scheduler.copy_events.items():
                     assert event.synchronizations == 1
                     assert event.blocking_synchronizations == int(
@@ -470,7 +503,9 @@ def _rank_consensus_worker(rank, rendezvous):
             )
             scheduler.polls = 0
             scheduler.tp_cpu_group = dist.group.WORLD
-            scheduler.disagg_prefill_transfer_queue = ["transferring"]
+            scheduler.disagg_prefill_transfer_queue = _sending(
+                [FakeReq(rid="transferring")]
+            )
             with envs.SGLANG_DISAGG_PREFILL_POLL_TRANSFERS_WHILE_WAITING.override(True):
                 _run_loop(
                     scheduler,
@@ -509,6 +544,66 @@ def _rank_consensus_worker(rank, rendezvous):
                     assert "must be submitted" in str(error)
                 else:
                     raise AssertionError("An unsubmitted copy was polled")
+    finally:
+        dist.destroy_process_group()
+
+
+def _hicache_scheduler(scheduler, storage):
+    scheduler.enable_hierarchical_cache = True
+    scheduler.enable_hicache_storage = storage
+    scheduler.tree_cache = Mock(spec=UnifiedRadixCache)
+
+
+def _attention_dp_worker(rank, rendezvous, attn_tp_size):
+    world_size = 2 * attn_tp_size
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{rendezvous}",
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=20),
+    )
+    try:
+        # Every rank creates both attention-TP groups, in the same order.
+        shard_groups = [
+            dist.new_group(list(range(start, start + attn_tp_size)))
+            for start in (0, attn_tp_size)
+        ]
+        shard = rank // attn_tp_size
+        topology = dict(
+            tp_size=world_size,
+            dp_size=2,
+            enable_dp_attention=True,
+            ranks={"world_rank": rank},
+        )
+        # Copies finish after the slowest rank of the shard: 3 queries vs 6.
+        queries = {1: (3, 6), 2: (2, 3, 5, 6)}[attn_tp_size][rank]
+        # First only shard 0 has a transfer to retire, so shard 1 blocks; then both
+        # pump HiCache until all ranks in their shard finish the copy: 2 vs 5 passes.
+        for hicache in (False, True):
+            scheduler = _Scheduler(
+                [_batch(1)] + [None] * 3,
+                {1: _result(_Event(ready_after_queries=queries))},
+                {},
+            )
+            scheduler.tp_cpu_group = dist.group.WORLD
+            scheduler.dp_tp_cpu_group = shard_groups[shard]
+            _hicache_scheduler(scheduler, storage=hicache)
+            if not hicache and shard == 0:
+                scheduler.disagg_prefill_transfer_queue = _sending(
+                    [FakeReq(rid="transferring")]
+                )
+            flag = (
+                envs.SGLANG_DISAGG_PREFILL_POLL_HICACHE_WHILE_WAITING
+                if hicache
+                else envs.SGLANG_DISAGG_PREFILL_POLL_TRANSFERS_WHILE_WAITING
+            )
+            with flag.override(True):
+                _run_loop(scheduler, enabled=False, **topology)
+            blocked = scheduler.copy_events[1].blocking_synchronizations
+            assert blocked == (shard == 1 and not hicache), blocked
+            pumps = scheduler.actions.count((1, "hicache", False))
+            assert pumps == ((2, 5)[shard] if hicache else 0), pumps
     finally:
         dist.destroy_process_group()
 
@@ -556,7 +651,7 @@ class TestPrefillResultPolling(CustomTestCase):
                     flush_pending_backups=Mock(),
                     storage_prefetch_retries=retries,
                     supports_fast_match_prefix=lambda: True,
-                    swa_reprefill_tail_tokens=lambda req=None: 0,
+                    window_reprefill_tail_tokens=lambda req=None: 0,
                     match_prefix=match_prefix,
                 )
                 scheduler.policy = SchedulePolicy(
@@ -572,7 +667,7 @@ class TestPrefillResultPolling(CustomTestCase):
                     req.disagg_kv_sender = SimpleNamespace(
                         poll=lambda: KVPoll.WaitingForInput
                     )
-                scheduler.waiting_queue = [head, paced]
+                move([head, paced], scheduler.waiting_queue)
                 retries.poll_miss(paced.rid)
 
                 with _single_rank_gloo_group():
@@ -702,16 +797,16 @@ class TestPrefillResultPolling(CustomTestCase):
                     self.copy_events[1].ready = True
 
         cases = (
-            (False, ["transferring"], 1, 0),
+            (False, [FakeReq(rid="transferring")], 1, 0),
             (True, [], 1, 0),
-            (True, ["transferring"], 0, 3),
+            (True, [FakeReq(rid="transferring")], 0, 3),
         )
         for poll_transfers, inflight, blocking_syncs, wait_polls in cases:
             with self.subTest(poll_transfers=poll_transfers, inflight=inflight):
                 scheduler = TransferScheduler(
                     [_batch(1)] + [None] * 3, {1: _result()}, {1: 4}
                 )
-                scheduler.disagg_prefill_transfer_queue = list(inflight)
+                scheduler.disagg_prefill_transfer_queue = _sending(inflight)
                 with envs.SGLANG_DISAGG_PREFILL_POLL_TRANSFERS_WHILE_WAITING.override(
                     poll_transfers
                 ):
@@ -761,7 +856,9 @@ class TestPrefillResultPolling(CustomTestCase):
                     pause_mode=event if pause else "in_place",
                 )
                 scheduler.shutdown_at = None if pause else 2
-                scheduler.disagg_prefill_transfer_queue = ["transferring"]
+                scheduler.disagg_prefill_transfer_queue = _sending(
+                    [FakeReq(rid="transferring")]
+                )
                 with envs.SGLANG_DISAGG_PREFILL_POLL_TRANSFERS_WHILE_WAITING.override(
                     True
                 ):
@@ -807,7 +904,7 @@ class TestPrefillResultPolling(CustomTestCase):
                     )
 
     def test_transfer_wait_polling_needs_the_flag_and_a_supported_loop(self):
-        # `_is_transfer_wait_polling_enabled`: attention DP and CP shards keep
+        # `_is_transfer_wait_polling_enabled`: attention CP shards keep
         # different inflight queues, so the TP-wide readiness all-reduce would
         # desynchronize. Those and the other unsupported loops warn and keep the
         # blocking wait; so does the flag left off, silently.
@@ -827,7 +924,9 @@ class TestPrefillResultPolling(CustomTestCase):
                     {1: _result(_Event(ready_after_queries=3))},
                     {1: 4},
                 )
-                scheduler.disagg_prefill_transfer_queue = ["transferring"]
+                scheduler.disagg_prefill_transfer_queue = _sending(
+                    [FakeReq(rid="transferring")]
+                )
                 topology = {}
                 if mode == "independent_dp":
                     topology = {"dp_size": 2}
@@ -841,7 +940,7 @@ class TestPrefillResultPolling(CustomTestCase):
                     scheduler.is_generation = False
                 elif mode == "dllm":
                     scheduler.dllm_config = object()
-                polling = mode in ("supported", "independent_dp")
+                polling = mode in ("supported", "independent_dp", "attention_dp")
                 logs = (
                     self.assertNoLogs
                     if polling or mode == "disabled"
@@ -863,6 +962,28 @@ class TestPrefillResultPolling(CustomTestCase):
                     3 if polling else 1,
                 )
                 self.assertEqual(scheduler.result_processes, {1: 1})
+
+    def test_result_wait_pumps_hicache_events_with_its_flag_and_l3_storage(self):
+        # No transfer is in flight, so only a HiCache pump makes the wait poll.
+        for flag, storage, pumps in (
+            (envs.SGLANG_DISAGG_PREFILL_POLL_TRANSFERS_WHILE_WAITING, True, 0),
+            (envs.SGLANG_DISAGG_PREFILL_POLL_HICACHE_WHILE_WAITING, False, 0),
+            (envs.SGLANG_DISAGG_PREFILL_POLL_HICACHE_WHILE_WAITING, True, 2),
+        ):
+            with self.subTest(flag=flag.name, storage=storage):
+                scheduler = _Scheduler(
+                    [_batch(1)] + [None] * 3,
+                    {1: _result(_Event(ready_after_queries=3))},
+                    {1: 4},
+                )
+                _hicache_scheduler(scheduler, storage)
+                with flag.override(True):
+                    _run_loop(scheduler, enabled=False)
+
+                event = scheduler.copy_events[1]
+                self.assertEqual(event.blocking_synchronizations, int(not pumps))
+                # Batch creation retries storage prefetches; the wait does not.
+                self.assertEqual(scheduler.actions.count((1, "hicache", False)), pumps)
 
     def test_delayed_sample_is_submitted_after_predecessor_before_query(self):
         for enabled in (False, True):
@@ -906,7 +1027,7 @@ class TestPrefillResultPolling(CustomTestCase):
                         result = super().run_batch(batch)
                         if batch.forward_iter == 1:
                             self.ready_batches.append(second)
-                            self.waiting_queue.extend(second.reqs)
+                            move(second.reqs, self.waiting_queue)
                         return result
 
                     def get_new_batch_prefill(self, running_batch):
@@ -941,7 +1062,7 @@ class TestPrefillResultPolling(CustomTestCase):
                     ),
                     clear=Mock(),
                 )
-                scheduler.disagg_prefill_transfer_queue = [prior]
+                scheduler.disagg_prefill_transfer_queue = _sending([prior])
                 first.reqs[0].metadata_buffer_index = allocator.alloc()
                 for req in (first.reqs[0], second.reqs[0]):
                     req.pending_bootstrap = False
@@ -949,23 +1070,22 @@ class TestPrefillResultPolling(CustomTestCase):
                         poll=lambda: KVPoll.Transferring
                     )
                 released = []
+                scheduler.request_retirer = leaving_retirer()
+                release = scheduler.request_retirer.release
+                leave = release.side_effect
+                release.side_effect = lambda req, **kwargs: (
+                    leave(req),
+                    released.append(scheduler.iteration),
+                )
                 with (
                     _single_rank_gloo_group(),
-                    patch(
-                        "sglang.srt.disaggregation.prefill.release_kv_cache",
-                        side_effect=lambda *args, **kwargs: released.append(
-                            scheduler.iteration
-                        ),
-                    ) as release_kv,
                     envs.SGLANG_DISAGG_PREFILL_POLL_TRANSFERS_WHILE_WAITING.override(
                         poll_transfers
                     ),
                 ):
                     _run_loop(scheduler)
 
-                release_kv.assert_called_once_with(
-                    prior, scheduler.tree_cache, checkpoint=True
-                )
+                release.assert_called_once_with(prior, checkpoint=True)
                 self.assertEqual(released, [retired_at])
                 self.assertEqual(prior.metadata_buffer_index, -1)
                 self.assertEqual(second.reqs[0].metadata_buffer_index, 0)
@@ -1040,7 +1160,9 @@ class TestPrefillResultPolling(CustomTestCase):
                     {1: ready_at, 2: ready_at + 1},
                 )
                 scheduler.war_barrier_is_coarse = coarse
-                scheduler.disagg_prefill_transfer_queue = ["transferring"]
+                scheduler.disagg_prefill_transfer_queue = _sending(
+                    [FakeReq(rid="transferring")]
+                )
                 with envs.SGLANG_DISAGG_PREFILL_POLL_TRANSFERS_WHILE_WAITING.override(
                     polling == "transfers"
                 ):
@@ -1076,10 +1198,15 @@ class TestPrefillResultPolling(CustomTestCase):
                     def run_batch(self, batch):
                         end = int(batch.forward_iter)
                         req.extend_end = end
-                        self.chunked_req = req if end < 12 else None
+                        dst = (
+                            self.chunked_reqs
+                            if end < 12
+                            else self.prefill_launched_reqs
+                        )
+                        if req.owner_list is not dst:
+                            move([req], dst)
                         batch.chunked_req = self.chunked_req
-                        if self.chunked_req is not None:
-                            req.inflight_middle_chunks += 1
+                        batch.chunked_req = req if end < 12 else None
                         return super().run_batch(batch)
 
                     def checkpoint_disagg_prefill(self, req):
@@ -1119,9 +1246,9 @@ class TestPrefillResultPolling(CustomTestCase):
                 )
                 # Pause must not take a cache snapshot that resume repeats.
                 self.assertEqual(checkpoint_ends, [4, 8, 12])
-                self.assertEqual(req.inflight_middle_chunks, 0)
+                self.assertEqual(req.inflight_steps, 0)
                 self.assertEqual(list(req.output_ids), [11])
-                self.assertEqual(scheduler.disagg_prefill_transfer_queue, [req])
+                self.assertEqual(list(scheduler.disagg_prefill_transfer_queue), [req])
                 self.assertEqual(scheduler.result_processes, {4: 1, 8: 1, 12: 1})
                 for end, event in scheduler.copy_events.items():
                     self.assertEqual(event.synchronizations, 1)
@@ -1150,13 +1277,12 @@ class TestPrefillResultPolling(CustomTestCase):
                 )
 
                 class OptimisticScheduler(_Scheduler):
-                    _release_aborted_request = Scheduler._release_aborted_request
-
                     def run_batch(self, batch):
                         if req in batch.reqs:
                             req.extend_end = batch.forward_iter
-                            self.chunked_req = batch.chunked_req = req
-                            req.inflight_middle_chunks += 1
+                            if req.owner_list is not self.chunked_reqs:
+                                move([req], self.chunked_reqs)
+                            batch.chunked_req = req
                         return super().run_batch(batch)
 
                     def process_input_requests(self, inputs):
@@ -1166,7 +1292,7 @@ class TestPrefillResultPolling(CustomTestCase):
                             and item.rid == "100"
                             for item in inputs
                         ):
-                            self.waiting_queue.extend(other.reqs)
+                            move(other.reqs, self.waiting_queue)
 
                 pause_at = 2 if yield_before_pause else (1 if depth == 1 else 3)
                 ready_at = {**{batch.forward_iter: 20 for batch in chunks}, 100: 7}
@@ -1180,13 +1306,13 @@ class TestPrefillResultPolling(CustomTestCase):
                     resume_at=pause_at + 2,
                     pause_mode="retract",
                 )
-                scheduler.disagg_prefill_pending_chunk_rids = set()
                 scheduler.processed_tokens_counter = 0
                 scheduler.metrics_reporter.enable_metrics = False
                 release_steps = []
 
                 def release(req, tree_cache, checkpoint):
-                    self.assertEqual(req.inflight_middle_chunks, 0)
+                    # Only the step being processed still carries it.
+                    self.assertLessEqual(req.inflight_steps, 1)
                     release_steps.append(scheduler.iteration)
                     req.kv.req_pool_idx = None
                     req.kv.mark_kv_released()
@@ -1206,9 +1332,9 @@ class TestPrefillResultPolling(CustomTestCase):
                 self.assertEqual(
                     release_steps, [3 if depth == 1 or yield_before_pause else 5]
                 )
-                self.assertEqual(scheduler.waiting_queue, [req])
+                self.assertEqual(list(scheduler.waiting_queue), [req])
                 self.assertEqual(req.prefill_attempt_count, 1)
-                self.assertEqual(req.inflight_middle_chunks, 0)
+                self.assertEqual(req.inflight_steps, 0)
                 self.assertEqual(list(req.output_ids), [])
                 self.assertIsNone(scheduler.chunked_req)
                 self.assertEqual(
@@ -1221,19 +1347,28 @@ class TestPrefillResultPolling(CustomTestCase):
 
     @unittest.skipUnless(dist.is_gloo_available(), "requires Gloo")
     def test_ranks_agree_on_fifo_completion_and_copy_submission(self):
+        self._run_ranks(_rank_consensus_worker, 2)
+
+    @unittest.skipUnless(dist.is_gloo_available(), "requires Gloo")
+    def test_attention_dp_shards_leave_result_waits_independently(self):
+        for attn_tp_size in (1, 2):
+            with self.subTest(attn_tp_size=attn_tp_size):
+                self._run_ranks(_attention_dp_worker, 2 * attn_tp_size, attn_tp_size)
+
+    def _run_ranks(self, worker, world_size, *args):
         context = multiprocessing.get_context("spawn")
         with tempfile.TemporaryDirectory() as directory:
             rendezvous = str(Path(directory) / "rendezvous")
             processes = [
-                context.Process(target=_rank_consensus_worker, args=(rank, rendezvous))
-                for rank in range(2)
+                context.Process(target=worker, args=(rank, rendezvous, *args))
+                for rank in range(world_size)
             ]
             try:
                 for process in processes:
                     process.start()
                 for process in processes:
                     process.join(timeout=60)
-                self.assertEqual([process.exitcode for process in processes], [0, 0])
+                self.assertEqual([p.exitcode for p in processes], [0] * world_size)
             finally:
                 for process in processes:
                     if process.is_alive():
@@ -1249,7 +1384,6 @@ class _EarlySendScheduler(SchedulerDisaggregationPrefillMixin):
     """Just enough Scheduler state for run_batch to reach the forward launch."""
 
     _on_step_launch = Scheduler._on_step_launch
-    _join_prefill_launched = Scheduler._join_prefill_launched
 
     def __init__(self):
         self.scheduler_stage_metrics = None
@@ -1262,9 +1396,6 @@ class _EarlySendScheduler(SchedulerDisaggregationPrefillMixin):
         self.profiler_manager = SimpleNamespace(_profile_batch_predicate=Mock())
         self.forward_sleep_time = None
         self.disaggregation_mode = DisaggregationMode.PREFILL
-        self.dllm_config = None
-        self.running_reqs = RunningReqs()
-        self.prefill_launched_reqs = RequestList()
         self.enable_staging = False
         self.enable_overlap = False
         self.token_to_kv_pool_allocator = SimpleNamespace(page_size=64)

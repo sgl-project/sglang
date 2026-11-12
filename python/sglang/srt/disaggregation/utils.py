@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import random
+import time
 from collections import deque
 from contextlib import nullcontext
 from enum import Enum
 from typing import (
     TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
     Iterable,
     List,
     Literal,
@@ -25,7 +30,7 @@ import torch.distributed as dist
 
 from sglang.srt.configs.model_config import get_dsa_mtp_topk_width, is_deepseek_dsa
 from sglang.srt.disaggregation.base import KVPoll
-from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST, DisaggregationMode
+from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.environ import envs
@@ -47,6 +52,8 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.kv.storage import KVStorage
     from sglang.srt.mem_cache.static_kv_storage import StaticKVStorage
+
+logger = logging.getLogger(__name__)
 
 #########################
 # Constants & Enums
@@ -147,55 +154,140 @@ def get_qsa_pending_state_indices(req: Req) -> np.ndarray:
     return np.array([int(req_pool_idx)], dtype=np.int32)
 
 
-def disagg_transfers_in_flight(scheduler):
-    """A PD node's pin source over the unified memory pool.
+def end_network_transfer(storage, req) -> None:
+    """The request's transfers ended: the rows they addressed may be reused."""
+    storage.end_network_transfer(req)
 
-    Returns a predicate that is True while a transfer may be in flight, so
-    compaction never relocates a page the RDMA engine is reading or writing.
-    Safe to read this state from here: every mover runs on the scheduler thread.
 
-    A page is exposed from the moment its address reaches the peer until the
-    transfer concludes, and for part of that lifetime the request is in NEITHER
-    end's queue -- so queue emptiness alone is not enough:
+def record_network_transfer(
+    storage,
+    req,
+    *,
+    peer,
+    writes: bool,
+    page_indices,
+    page_size: int,
+    state_types: Sequence = (),
+    state_indices: Optional[Sequence] = None,
+) -> None:
+    """Record the device rows one send (or with ``writes`` one receive)
+    addresses by physical id: KV pages of ``page_size`` tokens, and each state
+    entry's rows (``state_indices``, aligned with ``state_types``)."""
+    storage.record_network_transfer(
+        req,
+        pages=page_indices,
+        page_size=page_size,
+        states=_state_rows(storage, state_types, state_indices),
+        writes=writes,
+        peer=peer,
+    )
 
-    - PREFILL: scheduling the final chunk clears `chunked_req` while earlier
-      chunks may still be draining, and the request only reaches the inflight
-      queue later, in the result path.
-    - DECODE: `pop_preallocated` publishes one request's destinations and keeps
-      allocating for the next, whose allocation can urgently flush the peer
-      sub-allocator; the batch reaches the transfer queue only after the loop.
 
-    A decode request receiving into the host pool (`host_staged`) exposes host
-    pages only and holds no device page until `allocate_host_staged`, so it
-    does not close the gate while it waits on the transfer queue.
-    """
+def _state_rows(storage, state_types: Sequence, state_indices: Optional[Sequence]):
+    """Each state entry's ``(sub_pool, slots)`` a transfer addresses. A
+    generator: a storage whose rows never move records nothing and never asks."""
+    from sglang.srt.mem_cache.kv.decl import KV_PART, STATE_PART
 
-    # The scheduler and pool outlive the queues rebuilt by a PD role switch.
-    def busy() -> bool:
-        if scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
-            return bool(
-                scheduler.disagg_prefill_transfer_queue
-                or scheduler.disagg_prefill_pending_chunk_rids
+    if state_indices is None:
+        return
+    # State entries are registered in the storage's wire order, so the i-th
+    # entry carries the i-th wire entry's sub-pool.
+    for entry, state_type, ids in zip(
+        storage.wire_entries(), state_types, state_indices
+    ):
+        if (
+            ids is None
+            or entry.part not in (KV_PART, STATE_PART)
+            or _wire_state_type(entry.state_type) != _wire_state_type(state_type)
+        ):
+            continue
+        for part in ids if isinstance(ids, list) else [ids]:
+            # A one-slot entry (a recurrent state's) arrives 0-d.
+            yield (
+                entry.sub_pool,
+                (part if isinstance(part, torch.Tensor) else np.asarray(part)).reshape(
+                    -1
+                ),
             )
-        if scheduler.disaggregation_mode == DisaggregationMode.DECODE:
-            decode_offload_manager = scheduler.decode_offload_manager
-            return bool(
-                any(
-                    not decode_req.host_staged
-                    for decode_req in scheduler.disagg_decode_transfer_queue.queue
-                )
-                or scheduler.disagg_decode_prealloc_queue.has_published_destinations
-                or (
-                    decode_offload_manager is not None
-                    and decode_offload_manager.has_inflight_device_transfer()
-                )
-            )
-        raise ValueError(
-            "disagg_transfers_in_flight: scheduler is not a PD node "
-            f"(mode={scheduler.disaggregation_mode})"
-        )
 
-    return busy
+
+def _describe_peer(peer) -> str:
+    """A network transfer's peer as a stuck wait reports it: its room when the
+    peer names a sender."""
+    sender = peer[0] if isinstance(peer, tuple) and peer else peer
+    room = getattr(sender, "bootstrap_room", None)
+    return repr(peer) if room is None else f"room {room}"
+
+
+class NetworkTransferWaiter:
+    """Waits on the host until the engine is done with every network transfer
+    a page move cannot avoid. Each round every rank contributes one done flag
+    and one in-deadline flag, MIN-reduced over ``groups``, so all ranks return
+    or raise in the same round whatever order they list the transfers in.
+    Between rounds it sleeps, releasing the GIL the engine's threads report
+    through. The default ``deadline`` lies past the protocol's own deadlines."""
+
+    def __init__(
+        self,
+        done: Callable[[Any], bool],
+        groups: Sequence[Optional[dist.ProcessGroup]],
+        *,
+        heartbeat: Optional[Callable[[], None]] = None,
+        interval: float = 0.0005,
+        report_after: float = 10.0,
+        deadline: Optional[float] = None,
+    ):
+        self._done = done
+        self._groups = [g for g in groups if g is not None]
+        self._heartbeat = heartbeat
+        self._interval = interval
+        self._report_after = report_after
+        if deadline is None:
+            deadline = envs.SGLANG_DISAGGREGATION_PAGE_MOVE_WAIT_TIMEOUT.get()
+        if deadline is None:
+            deadline = (
+                envs.SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT.get()
+                + envs.SGLANG_DISAGGREGATION_WAITING_TIMEOUT.get()
+                + envs.SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE_TIMEOUT.get()
+                + 60.0
+            )
+        self._deadline = deadline
+
+    def __call__(self, transfers) -> None:
+        start = time.monotonic()
+        reported = start
+        while True:
+            local = [bool(self._done(t.peer)) for t in transfers]
+            # Whether this rank's wait is within its deadline: reduced with
+            # the done flag, so every rank decides to give up in one round.
+            in_time = time.monotonic() - start < self._deadline
+            flags = [int(all(local)), int(in_time)]
+            for group in self._groups:
+                flags = all_reduce_flags(flags=flags, group=group, op=dist.ReduceOp.MIN)
+            if flags[0]:
+                return
+            if not flags[1]:
+                stuck = [t.peer for t, ended in zip(transfers, local) if not ended]
+                raise RuntimeError(
+                    f"A KV page move waited {time.monotonic() - start:.1f} s, past "
+                    f"its {self._deadline:.0f} s deadline "
+                    "(SGLANG_DISAGGREGATION_PAGE_MOVE_WAIT_TIMEOUT), for network "
+                    f"transfers that never ended; on this rank {len(stuck)} of "
+                    f"{len(local)} still run: {[_describe_peer(p) for p in stuck]}"
+                )
+            if self._heartbeat is not None:
+                self._heartbeat()
+            now = time.monotonic()
+            if now - reported >= self._report_after:
+                logger.warning(
+                    "A KV page move has waited %.1f s for network transfers to "
+                    "finish; %d of %d are still running on this rank.",
+                    now - start,
+                    len(local) - sum(local),
+                    len(local),
+                )
+                reported = now
+            time.sleep(self._interval)
 
 
 #########################
@@ -221,6 +313,14 @@ def _poll_with_failure_injection_pp(pollers) -> List[int]:
             for poller in pollers
         ]
     return [int(poller.poll_pp_consensus()) for poller in pollers]
+
+
+def decode_offloads_kvcache() -> bool:
+    """Whether this PD decode server offloads a finished request's KV to host."""
+    return (
+        get_disagg().disaggregation_mode == "decode"
+        and get_disagg().disaggregation_decode_enable_offload_kvcache
+    )
 
 
 def _is_fake_transfer(req: Req) -> bool:
@@ -259,10 +359,11 @@ def kv_layout_signature(kv_args: KVArgs) -> int:
     Two sides can compare digests only if they cover the same bytes. A prefill
     with another TP width has other per-page item lengths; a PP or
     layer-sharded prefill owns fewer buffers; the same byte sizes under another
-    dtype or page layout (fp16 vs bf16, two V4 layouts) hold other bytes.
-    Shipped beside the digest, so those become one logged skip instead of a
-    mismatch on every request. Positive int64 and never 0, which marks "no
-    digest" in the metadata row.
+    dtype or page layout (fp16 vs bf16, two V4 layouts) hold other bytes; a
+    prefill keeping a longer window tail than its decode digests more of that
+    window's pages. Shipped beside the digest, so those become one logged skip
+    instead of a mismatch on every request. Positive int64 and never 0, which
+    marks "no digest" in the metadata row.
     """
     layout = (
         kv_args.page_size,
@@ -272,9 +373,135 @@ def kv_layout_signature(kv_args: KVArgs) -> int:
         [state_type.value for state_type in kv_args.state_types],
         list(kv_args.kv_item_lens),
         [list(lens) for lens in kv_args.state_item_lens],
+        list(getattr(kv_args, "state_window_tails", None) or ()),
     )
     raw = hashlib.blake2b(repr(layout).encode(), digest_size=8).digest()
     return int.from_bytes(raw, "big") >> 1 | 1
+
+
+def state_wire(kv_args: KVArgs) -> Optional[List[List[Optional[str]]]]:
+    """A PD peer's state entries in order, as [state type, wire key(, window
+    tail)]; peers pair them by position. None before registration."""
+    state_types = getattr(kv_args, "state_types", None)
+    if state_types is None:
+        return None
+    keys = getattr(kv_args, "state_wire_keys", None) or [None] * len(state_types)
+    tails = getattr(kv_args, "state_window_tails", None) or [None] * len(state_types)
+    return [
+        [_wire_state_type(state_type).value, key] + ([] if tail is None else [tail])
+        for state_type, key, tail in zip(state_types, keys, tails)
+    ]
+
+
+def check_state_wire(
+    prefill_wire: Optional[List[List[Optional[str]]]],
+    decode_wire: Optional[List[List[Optional[str]]]],
+) -> None:
+    """Refuse peers whose state entries cannot pair by position; a prefill
+    window tail may be longer than the decode's, never shorter."""
+    if prefill_wire is None or decode_wire is None or prefill_wire == decode_wire:
+        return
+    if len(prefill_wire) == len(decode_wire):
+        prefill_kinds = {entry[1] is None for entry in prefill_wire}
+        decode_kinds = {entry[1] is None for entry in decode_wire}
+        if prefill_wire and prefill_kinds != decode_kinds:
+            raise RuntimeError(
+                f"PD state entry mismatch: prefill server registers {prefill_wire}, "
+                f"but decode server registers {decode_wire}. A server with unified "
+                "memory cannot pair with one without it: mixed pool kinds are not "
+                "supported."
+            )
+        shorter = [
+            (p[1], p[2], d[2])
+            for p, d in zip(prefill_wire, decode_wire)
+            if p[:2] == d[:2] and len(p) > 2 and len(d) > 2 and p[2] < d[2]
+        ]
+        if all(
+            p[:2] == d[:2] and (len(p) > 2) == (len(d) > 2)
+            for p, d in zip(prefill_wire, decode_wire)
+        ):
+            if not shorter:
+                return
+            raise RuntimeError(
+                "PD state entry mismatch: the prefill server keeps a shorter "
+                "window tail than the decode server needs, as (sub-pool, prefill "
+                f"tail, decode tail): {shorter}. Both servers need the same "
+                "draft model and front rows, or a prefill keeping more."
+            )
+    raise RuntimeError(
+        f"PD state entry mismatch: prefill server registers {prefill_wire}, but "
+        f"decode server registers {decode_wire} (state type, sub-pool, window "
+        "tail). Both servers must hold the same attention and state sub-pools "
+        "(model, window lengths, draft model and its front rows, unified memory "
+        "settings)."
+    )
+
+
+def check_stage_state_wires(
+    stage_wires: List[Optional[List[List[Optional[str]]]]],
+    decode_wire: Optional[List[List[Optional[str]]]],
+) -> None:
+    """For a decode receiving from every prefill stage: each stage's entries
+    pair with the decode's leading ones, and all registered stages together
+    reach its last entry. ``stage_wires`` is None for an unregistered stage."""
+    if decode_wire is None:
+        return
+    for wire in stage_wires:
+        if wire is None:
+            continue
+        if len(wire) > len(decode_wire):
+            check_state_wire(wire, decode_wire)
+        check_state_wire(wire, decode_wire[: len(wire)])
+    if stage_wires and all(wire is not None for wire in stage_wires):
+        covered = max(len(wire) for wire in stage_wires)
+        if covered < len(decode_wire):
+            raise RuntimeError(
+                f"PD state entry mismatch: the prefill's pipeline stages register "
+                f"{stage_wires}, but no stage registers the decode server's "
+                f"entries past the first {covered}: {decode_wire[covered:]}."
+            )
+
+
+def align_window_tails(kv_args: KVArgs, prefill_state_indices, dst_state_indices):
+    """Cut each sub-pool window entry to its decode's newest pages: both end at
+    the last token, so a longer prefill tail has its extra pages in front."""
+    from sglang.srt.disaggregation.base.conn import StateType
+
+    sub_pools = getattr(kv_args, "state_sub_pools", None) or []
+    state_types = getattr(kv_args, "state_types", None) or []
+    aligned = list(prefill_state_indices)
+    for i, (state_type, sub_pool) in enumerate(zip(state_types, sub_pools)):
+        if sub_pool is None or state_type != StateType.SWA:
+            continue
+        if i >= len(aligned) or i >= len(dst_state_indices):
+            continue
+        src, dst = aligned[i], dst_state_indices[i]
+        if src is None or dst is None or len(src) <= len(dst):
+            continue
+        aligned[i] = src[len(src) - len(dst) :]
+    return aligned
+
+
+def state_indices_per_entry(
+    kv_args: KVArgs,
+    state_types: Sequence,
+    payloads: Dict,
+    window_payload: Callable[[str], Any],
+) -> List:
+    """One payload per state entry: a sub-pool window entry carries its own
+    sub-pool's pages, any other entry its state type's payload (or None)."""
+    from sglang.srt.disaggregation.base.conn import StateType
+
+    return [
+        (
+            window_payload(sub_pool)
+            if sub_pool is not None and st == StateType.SWA
+            else payloads[st]()
+            if st in payloads
+            else None
+        )
+        for st, sub_pool in zip(state_types, kv_args.state_sub_pools)
+    ]
 
 
 def all_reduce_flags(
@@ -1341,10 +1568,14 @@ def append_state_component(
     conv_shard_groups: Optional[List[Optional[List[int]]]] = None,
     slice_outer_counts: Optional[List[int]] = None,
     layer_ids: Optional[List[int]] = None,
+    sub_pool: Optional[str] = None,
+    wire_key: Optional[str] = None,
 ) -> None:
     """Append one state component. Caller orders state_types consistently
     on prefill and decode sides."""
     kv_args.state_types.append(state_type)
+    kv_args.state_sub_pools.append(sub_pool)
+    kv_args.state_wire_keys.append(wire_key)
     kv_args.state_data_ptrs.append(data_ptrs)
     kv_args.state_data_lens.append(data_lens)
     kv_args.state_item_lens.append(item_lens)
@@ -1553,19 +1784,47 @@ def _wire_state_type(state_type) -> Enum:
     return state_type if isinstance(state_type, Enum) else StateType(state_type)
 
 
+def _nixl_kv_packable(owner_view, draft_token_to_kv_pool) -> bool:
+    """NIXL KV packing gathers [tokens, heads, head_dim] pages; validated only on
+    SWA hybrids whose full and SWA pools are plain NHD MHA pools. Each pool is
+    gathered with one page size for K and V, and both are sliced with the
+    full-attention head count, so K/V head dims and the head counts must match."""
+    from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+    from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+
+    if draft_token_to_kv_pool is not None or not isinstance(owner_view, SWAKVPool):
+        return False
+    pools = (owner_view.full_kv_pool, owner_view.swa_kv_pool)
+    return (
+        all(
+            type(pool) is MHATokenToKVPool
+            and pool.kv_cache_layout == "nhd"
+            and pool.head_dim == pool.v_head_dim
+            for pool in pools
+        )
+        and pools[0].head_num == pools[1].head_num
+    )
+
+
 def setup_state_kv_args(
     kv_args: KVArgs,
     storage: KVStorage | StaticKVStorage,
     draft_token_to_kv_pool=None,
     total_kv_layers: Optional[int] = None,
+    window_tails: Optional[Dict[str, int]] = None,
 ) -> None:
     """Register the storage's state entries in its wire order, and the flags
-    peers read from its token KV layout."""
+    peers read from its token KV layout. ``window_tails`` gives the tail each
+    window sub-pool carries (`KVStorage.retained_window_lengths`); peers agree on it."""
     from sglang.srt.disaggregation.base.conn import StateType
     from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+    from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 
     kv_args.state_types = []
+    kv_args.dsa_index_k_token_bytes = None
+    kv_args.state_sub_pools = []
+    kv_args.state_wire_keys = []
     kv_args.state_data_ptrs = []
     kv_args.state_data_lens = []
     kv_args.state_item_lens = []
@@ -1581,8 +1840,9 @@ def setup_state_kv_args(
         if isinstance(owner_view, DeepSeekV4TokenToKVPool)
         else None
     )
+    kv_args.kv_packable = _nixl_kv_packable(owner_view, draft_token_to_kv_pool)
     for entry in storage.wire_entries():
-        region = storage.regions(entry.sub_pool)
+        region = storage.regions(entry.sub_pool, part=entry.part)
         state_type = _wire_state_type(entry.state_type)
         append_state_component(
             kv_args,
@@ -1594,9 +1854,25 @@ def setup_state_kv_args(
             list(region.conv_shard_groups),
             list(region.slice_outer_counts),
             list(region.layer_ids),
+            sub_pool=storage.entry_sub_pool(entry),
+            wire_key=storage.entry_wire_key(entry),
         )
         if state_type == StateType.SWA:
             kv_args.swa_kv_cache_layout = region.kv_layout
+    if (
+        StateType.DSA in kv_args.state_types
+        and isinstance(owner_view, DSATokenToKVPool)
+        and owner_view.index_kpool == 1
+    ):
+        key_bytes = owner_view.index_key_bytes_per_token
+        kv_args.dsa_index_k_token_bytes = (
+            key_bytes,
+            owner_view.index_bytes_per_token - key_bytes,
+        )
+    kv_args.state_window_tails = [
+        (window_tails or {}).get(sub_pool) if sub_pool is not None else None
+        for sub_pool in kv_args.state_sub_pools
+    ]
     # MLA token KV beside recurrent state.
     kv_args.is_hybrid_mla_backend = (
         is_mla_backend(owner_view) and StateType.MAMBA in kv_args.state_types
@@ -1641,6 +1917,23 @@ def get_dsv41_spec_layout(kv_args: KVArgs) -> Optional[dict]:
     }
 
 
+def get_spec_kv_layout(kv_args: KVArgs) -> Optional[dict]:
+    """{} without injected draft KV; None when this rank has no draft KV entries."""
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+    spec = get_spec()
+    algorithm = SpeculativeAlgorithm.from_string(spec.speculative_algorithm)
+    if not algorithm.is_dflash_family():
+        return {}
+    if not kv_args.num_draft_entries:
+        return None
+    # No block size: prefill writes draft KV per token, unlike DSV4.1's SWA ring.
+    return {
+        "algorithm": algorithm.name,
+        "num_draft_entries": kv_args.num_draft_entries,
+    }
+
+
 def get_pd_kv_layout(token_to_kv_pool) -> Optional[str]:
     """The KV byte layout both PD roles must share, for pools that have more than one."""
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
@@ -1651,7 +1944,7 @@ def get_pd_kv_layout(token_to_kv_pool) -> Optional[str]:
 
 
 def prepare_abort(req: Req, error_message: str, status_code=None):
-    from sglang.srt.managers.schedule_batch import FINISH_ABORT
+    from sglang.srt.managers.req_types import FINISH_ABORT
 
     # populate finish metadata and stream output
     req.finish_outside_step(FINISH_ABORT(error_message, status_code))
@@ -1695,7 +1988,7 @@ def is_unadmitted_reject(req: Req) -> bool:
 
 
 def is_aborted(req: Req) -> bool:
-    from sglang.srt.managers.schedule_batch import FINISH_ABORT
+    from sglang.srt.managers.req_types import FINISH_ABORT
 
     return isinstance(req.to_finish, FINISH_ABORT) or isinstance(
         req.finished_reason, FINISH_ABORT

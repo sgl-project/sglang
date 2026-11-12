@@ -12,15 +12,17 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from sglang.kernels.ops.lora.moe.activation import ActivationFn
 from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
 from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.srt.lora.moe.base_gemm_provider import select_provider_cls
-from sglang.srt.lora.moe.plan import ActivationFn, SelectedPlan, resolve_plans
+from sglang.srt.lora.moe.plan import SelectedPlan, resolve_plans
 from sglang.srt.lora.moe.quant_info import MoeLoraBf16QuantInfo
 from sglang.srt.lora.moe.runner import MoeLoraBatch, MoeLoraRunner
 from sglang.srt.lora.utils import Phase, architecture_for_capability
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.kernels.moe_lora import standalone_output_allocation
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
@@ -141,10 +143,6 @@ def _fp32_reference(
     return output * _ROUTED_SCALING
 
 
-def _standalone_output_allocation(runner, *, num_tokens, dtype, device):
-    return torch.empty((num_tokens, runner.hidden_size), dtype=dtype, device=device)
-
-
 def _build_runner(
     gpu: dict[str, torch.Tensor],
     vendor: str = "cutedsl",
@@ -228,9 +226,7 @@ def test_shared_outer_eager_and_graph_replay_match_fp32_reference(
 ) -> None:
     device = torch.device("cuda")
     _skip_unless_supported(device)
-    monkeypatch.setattr(
-        MoeLoraRunner, "_allocate_output", _standalone_output_allocation
-    )
+    monkeypatch.setattr(MoeLoraRunner, "_allocate_output", standalone_output_allocation)
     cpu = _make_cpu_tensors()
     if phase is Phase.PREFILL:
         cpu["token_lora_mapping"].fill_(0)
@@ -293,9 +289,7 @@ def test_shared_outer_relu2_non_gated_matches_fp32_reference(
     """Inkling's layout: one up projection (S = 1) and relu2, real adapters."""
     device = torch.device("cuda")
     _skip_unless_supported(device)
-    monkeypatch.setattr(
-        MoeLoraRunner, "_allocate_output", _standalone_output_allocation
-    )
+    monkeypatch.setattr(MoeLoraRunner, "_allocate_output", standalone_output_allocation)
     cpu = _make_cpu_tensors(gated=False)
     gpu = {name: tensor.to(device) for name, tensor in cpu.items()}
     reference = _fp32_reference(cpu, gated=False)

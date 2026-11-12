@@ -36,7 +36,7 @@ from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,
 )
 from sglang.srt.model_executor.runner_backend import capture_profile as profile_mod
-from sglang.srt.utils import profile_utils as putils
+from sglang.srt.observability import profile_utils as putils
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -61,18 +61,10 @@ def _make_fake_self(capture_bs):
     fake_self._profile_runner_name = DecodeCudaGraphRunner._profile_runner_name.__get__(
         fake_self
     )
-    return fake_self
-
-
-def _profile_options(runner):
-    per_shape = runner._graph_batch_capture_active()
-    if per_shape:
-        runner._profile_trace_tag = None
-    return profile_mod.CaptureProfileOptions(
-        runner_name=runner._profile_runner_name(),
-        per_shape=per_shape,
-        get_trace_tag=lambda: getattr(runner, "_profile_trace_tag", None),
+    fake_self._capture_profile_options = (
+        DecodeCudaGraphRunner._capture_profile_options.__get__(fake_self)
     )
+    return fake_self
 
 
 def _make_runner(cls, *, is_draft_worker):
@@ -105,7 +97,9 @@ class TestInitProfileBatchMode(CustomTestCase):
             os.environ.pop(_CAPTURE_TRACE, None)  # original flag off
             if profiler_dir is None:
                 os.environ.pop("SGLANG_TORCH_PROFILER_DIR", None)
-            ctx = profile_mod.create_cuda_capture_profile(_profile_options(fake_self))
+            ctx = profile_mod.create_cuda_capture_profile(
+                fake_self._capture_profile_options()
+            )
         self.assertIs(ctx, mock_profile.return_value)
         return fake_self, mock_profile, mock_schedule, mock_record_history
 
@@ -113,11 +107,6 @@ class TestInitProfileBatchMode(CustomTestCase):
         with tempfile.TemporaryDirectory() as tmp:
             self._invoke(capture_bs=[1, 2, 4], profiler_dir=tmp)
             self.assertTrue(os.path.isdir(os.path.join(tmp, "graph_capture_profile")))
-
-    def test_primes_empty_trace_tag(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            fake_self, *_ = self._invoke(capture_bs=[1, 2, 4, 8], profiler_dir=tmp)
-            self.assertIsNone(fake_self._profile_trace_tag)
 
 
 class TestInitProfileOriginalMode(CustomTestCase):
@@ -141,7 +130,9 @@ class TestInitProfileOriginalMode(CustomTestCase):
                 for k in (_CAPTURE_TRACE, _BATCH_CAPTURE):
                     if k not in environ:
                         os.environ.pop(k, None)
-                profile_mod.create_cuda_capture_profile(_profile_options(fake_self))
+                profile_mod.create_cuda_capture_profile(
+                    fake_self._capture_profile_options()
+                )
             kwargs = mock_profile.call_args.kwargs
             # Unscheduled pass: record_shapes only, no schedule / on_trace_ready.
             self.assertTrue(kwargs["record_shapes"])
@@ -181,7 +172,9 @@ class TestOnTraceReadyNaming(CustomTestCase):
             mock.patch("torch.cuda.memory._record_memory_history"),
         ):
             os.environ.pop(_CAPTURE_TRACE, None)
-            profile_mod.create_cuda_capture_profile(_profile_options(fake_self))
+            profile_mod.create_cuda_capture_profile(
+                fake_self._capture_profile_options()
+            )
         on_trace_ready = mock_profile.call_args.kwargs["on_trace_ready"]
         return fake_self, on_trace_ready
 
@@ -445,24 +438,6 @@ class TestAttentionVariantSizes(CustomTestCase):
                     self.assertEqual(replayed, label, bs)
 
 
-class TestCudaProfileFinalization(CustomTestCase):
-    def test_snapshot_history_and_trace_export_are_backend_owned(self):
-        options = profile_mod.CaptureProfileOptions(
-            runner_name="TargetRunner", per_shape=False, get_trace_tag=lambda: None
-        )
-        prof = mock.Mock()
-        prof.key_averages.return_value.table.return_value = "profile summary"
-        with (
-            mock.patch("torch.cuda.memory._dump_snapshot") as dump,
-            mock.patch("torch.cuda.memory._record_memory_history") as history,
-            mock.patch.object(profile_mod, "export_cuda_graph_capture_trace") as export,
-        ):
-            profile_mod.finish_cuda_capture_profile(options, prof)
-        dump.assert_called_once_with("cuda_graph_runner_memory_usage.pickle")
-        history.assert_called_once_with(enabled=None)
-        export.assert_called_once_with(prof, runner_name="TargetRunner")
-
-
 class TestRaggedVerifyLayoutPerTier(CustomTestCase):
     """Every graph variant of a token tier must replay the staged live layout."""
 
@@ -513,6 +488,7 @@ class TestPrePlannedReplayRestage(CustomTestCase):
         runner.ragged_verify_mode = False
         runner.deepep_adapter = SimpleNamespace(replay=lambda: None)
         runner.bs, runner.captured_req_width, runner.raw_num_token = 2, 2, 4
+        runner.raw_bs, runner.require_mlp_tp_gather = 2, False
         runner.buffers = SimpleNamespace(
             input_ids=torch.zeros(4, dtype=torch.int64),
             positions=torch.zeros(4, dtype=torch.int64),
@@ -667,10 +643,13 @@ class TestReplayAttnMetadataWiring(CustomTestCase):
 
     KEY = (2, "TARGET_VERIFY", "TARGET_VERIFY")
 
-    def _replay(self, glue, *, raw_bs=2, bs=2, skip=True, staged=False):
+    def _replay(
+        self, glue, *, raw_bs=2, bs=2, skip=True, staged=False, padded_glue=False
+    ):
         runner = mod.DecodeCudaGraphRunner.__new__(mod.DecodeCudaGraphRunner)
         runner._metadata_glue = glue
         runner._skip_glued_replay_view = skip
+        runner._padded_glue = padded_glue
         runner.enable_two_batch_overlap = False
         runner.model_runner = SimpleNamespace(lora_manager=None)
         runner.capture_forward_mode = mod.ForwardMode.TARGET_VERIFY
@@ -720,6 +699,15 @@ class TestReplayAttnMetadataWiring(CustomTestCase):
 
         glue = _RecordingGlue(captured_keys=[key])
         views, eager = self._replay(glue, raw_bs=1)
+        self.assertEqual((glue.calls, eager), ([], views))
+
+        # A declared DSV4 glue also takes padded replays; IDLE (raw_bs 0) stays eager.
+        glue = _RecordingGlue(captured_keys=[key])
+        views, eager = self._replay(glue, raw_bs=1, padded_glue=True)
+        self.assertEqual((glue.calls, views, eager), ([("replay", key)], [], []))
+
+        glue = _RecordingGlue(captured_keys=[key])
+        views, eager = self._replay(glue, raw_bs=0, padded_glue=True)
         self.assertEqual((glue.calls, eager), ([], views))
 
 

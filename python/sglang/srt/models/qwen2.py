@@ -30,6 +30,7 @@ from sglang.srt.distributed import (
     get_pp_indices,
 )
 from sglang.srt.environ import envs
+from sglang.srt.hf_transformers import get_rope_config
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
@@ -55,6 +56,8 @@ from sglang.srt.layers.quantization.fp8_activation import DenseSiluAndMulQuant
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.layers.utils.layer_list import make_pp_layers
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -65,10 +68,12 @@ from sglang.srt.model_loader.weight_utils import (
     kv_cache_scales_loader,
     supports_quantized_rl_reload,
 )
+from sglang.srt.models.utils import (
+    can_run_silu_fp4_quant_fusion,
+    silu_and_mul_fp4_quant,
+)
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_exec, get_parallel, get_platform
-from sglang.srt.utils import add_prefix, make_pp_layers
-from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 Qwen2Config = None
 
@@ -109,6 +114,10 @@ class Qwen2MLP(nn.Module):
         self.act_fn = SiluAndMul()
         self.dual_gemm = DualGemm(self.gate_up_proj, self.down_proj, hidden_size)
         self.activation_quant = DenseSiluAndMulQuant(self.down_proj)
+        # Off unless the decoder layer enables the fused SiLU+mul+NVFP4 quant path.
+        self._enable_silu_fp4_quant_fusion = False
+        self._masked_m_cache: dict = {}
+        self._down_input_scale_inv_1d = None
         deterministic = get_exec().deterministic
         self.quack_swiglu_enabled = (
             envs.SGLANG_ENABLE_QUACK_SWIGLU_GEMM.get()
@@ -134,7 +143,9 @@ class Qwen2MLP(nn.Module):
             x = quack_swiglu_gemm(x, self.gate_up_proj.weight)
         else:
             gate_up, _ = self.gate_up_proj(x)
-            if forward_batch is not None and forward_batch.forward_mode.is_decode():
+            if can_run_silu_fp4_quant_fusion(self, gate_up):
+                x = silu_and_mul_fp4_quant(self, gate_up)
+            elif forward_batch is not None and forward_batch.forward_mode.is_decode():
                 x = self.activation_quant.forward_decode(
                     gate_up, self.act_fn, self.down_proj
                 )
@@ -184,7 +195,6 @@ class Qwen2Attention(nn.Module):
         rope_scaling: Optional[Dict[str, Any]] = None,
         max_position_embeddings: int = 32768,
         quant_config: Optional[QuantizationConfig] = None,
-        dual_chunk_attention_config: Optional[dict[str, Any]] = None,
         prefix: str = "",
     ) -> None:
         super().__init__()
@@ -237,7 +247,6 @@ class Qwen2Attention(nn.Module):
             max_position=max_position_embeddings,
             base=rope_theta,
             rope_scaling=rope_scaling,
-            dual_chunk_attention_config=dual_chunk_attention_config,
         )
         self.attn = RadixAttention(
             self.num_heads,
@@ -303,9 +312,6 @@ class Qwen2DecoderLayer(nn.Module):
             head_dim = config.hidden_size // config.original_num_attention_heads
         else:
             head_dim = getattr(config, "head_dim", None)
-        dual_chunk_attention_config = getattr(
-            config, "dual_chunk_attention_config", None
-        )
         self.self_attn = Qwen2Attention(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
@@ -316,7 +322,6 @@ class Qwen2DecoderLayer(nn.Module):
             rope_scaling=rope_scaling,
             max_position_embeddings=max_position_embeddings,
             quant_config=quant_config,
-            dual_chunk_attention_config=dual_chunk_attention_config,
             prefix=add_prefix("self_attn", prefix),
         )
         self.mlp = Qwen2MLP(
