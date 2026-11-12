@@ -1773,7 +1773,6 @@ class KVCacheConfigurator:
             elif self.use_mla_backend:
                 token_to_kv_pool = self._build_ascend_mla_kv_pool(
                     max_total_num_tokens=sizes.max_total_num_tokens,
-                    max_running_requests=req_to_token_pool.req_to_token.shape[0],
                     is_dsa_model=is_dsa_model,
                 )
             else:
@@ -2209,11 +2208,7 @@ class KVCacheConfigurator:
         return token_to_kv_pool
 
     def _build_ascend_mla_kv_pool(
-        self,
-        *,
-        max_total_num_tokens: int,
-        max_running_requests: int,
-        is_dsa_model: bool,
+        self, *, max_total_num_tokens: int, is_dsa_model: bool
     ) -> KVCache:
         from sglang.srt.hardware_backend.npu.memory_pool_npu import (
             NPUMLATokenToKVPool,
@@ -2245,25 +2240,6 @@ class KVCacheConfigurator:
         use_dsa_fp8_kv_cache_storage = (
             self.kv_cache_dtype == torch.float8_e4m3fn and is_arch35
         )
-        dsa_pool_kwargs = {}
-        if is_dsa_model and get_dsa_index_kpool(self.model_config.hf_config) > 1:
-            hf_config = self.model_config.hf_config
-            dsa_pool_kwargs = {
-                "index_kpool": get_dsa_index_kpool(hf_config),
-                "index_kpool_compress": get_dsa_index_kpool_compress(hf_config),
-                "tail_extra_slots": (max_speculative_num_draft_tokens() or 0),
-                "max_running_requests": max_running_requests,
-                "skip_topk_layers": (
-                    None
-                    if self.is_draft_worker
-                    else [
-                        dsa_layer_skips_topk(hf_config, layer_id)
-                        for layer_id in range(
-                            self.layer_info.start_layer, self.layer_info.end_layer
-                        )
-                    ]
-                ),
-            }
         token_to_kv_pool = NPUMLATokenToKVPool(
             max_total_num_tokens,
             page_size=get_schedule().page_size,
@@ -2272,6 +2248,7 @@ class KVCacheConfigurator:
             qk_rope_head_dim=self.model_config.qk_rope_head_dim,
             index_head_dim=(self.model_config.index_head_dim if is_dsa_model else None),
             index_size=index_size,
+            index_page_size=get_schedule().page_size,
             indexer_layer_ids=indexer_layer_ids,
             kv_cache_dim=(
                 calculate_mla_kv_cache_dim(
@@ -2288,7 +2265,6 @@ class KVCacheConfigurator:
             end_layer=self.layer_info.end_layer,
             use_combined_kv_buffer=self.use_combined_kv_buffer,
             modelslim_cache_layout=self.modelslim_cache_layout,
-            **dsa_pool_kwargs,
         )
         return token_to_kv_pool
 
