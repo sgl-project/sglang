@@ -66,6 +66,7 @@ from pydantic import (
     ConfigDict,
     Field,
     PrivateAttr,
+    SerializationInfo,
     StrictBool,
     field_serializer,
     field_validator,
@@ -266,6 +267,9 @@ class UsageInfo(BaseModel):
 class StreamOptions(BaseModel):
     include_usage: Optional[bool] = None
     continuous_usage_stats: Optional[bool] = False
+    # Kimi-K3 extension, ignored elsewhere: attach
+    # choices[].internal_content[].token_ids to every increment frame.
+    include_internal_content: Optional[bool] = False
 
 
 class JsonSchemaResponseFormat(BaseModel):
@@ -769,11 +773,33 @@ RerankContentPart = Union[
 RerankContent = Union[str, List[RerankContentPart]]
 
 
+# Request messages reuse ToolCall and reach chat templates through model_dump(),
+# so stream chunks drop null delta keys only under this context.
+STREAM_DELTA_CONTEXT = {"stream_delta": True}
+
+
+def _is_stream_delta(info: SerializationInfo) -> bool:
+    return bool(info.context and info.context.get("stream_delta"))
+
+
 class FunctionResponse(BaseModel):
     """Function response."""
 
     name: Optional[str] = None
     arguments: Optional[str | Dict[str, Any]] = None
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler, info: SerializationInfo):
+        # Continuation chunks must not carry a name key, not even null; the
+        # arguments key must always be present.
+        data = handler(self)
+        if not _is_stream_delta(info):
+            return data
+        if data.get("name") is None:
+            data.pop("name", None)
+        if data.get("arguments") is None:
+            data["arguments"] = ""
+        return data
 
 
 class ToolCall(BaseModel):
@@ -783,6 +809,20 @@ class ToolCall(BaseModel):
     index: Optional[int] = None
     type: Literal["function"] = "function"
     function: FunctionResponse
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler, info: SerializationInfo):
+        # Continuation chunks (id is None) may only carry index +
+        # function.arguments; id/type must not appear, not even null.
+        data = handler(self)
+        if not _is_stream_delta(info):
+            return data
+        if data.get("id") is None:
+            data.pop("id", None)
+            data.pop("type", None)
+        if data.get("index") is None:
+            data.pop("index", None)
+        return data
 
 
 _GenericMessageRole = Literal[
@@ -804,6 +844,18 @@ class ChatCompletionMessageGenericParam(BaseModel):
     tools: Optional[List[Tool]] = Field(default=None, examples=[None])
     # DeepSeek API prefix completion: continue this final assistant message.
     prefix: Optional[bool] = None
+
+    @model_validator(mode="after")
+    def validate_assistant_tool_call_names(self):
+        # FunctionResponse.name is optional for streaming deltas,
+        # but request history must name each call so the chat template can render it.
+        if self.role != "assistant" or not self.tool_calls:
+            return self
+        for index, tool_call in enumerate(self.tool_calls):
+            name = tool_call.function.name
+            if not isinstance(name, str) or not name:
+                raise ValueError(f"tool_calls[{index}]: 'function.name' is required")
+        return self
 
     @field_validator("role", mode="before")
     @classmethod
@@ -1438,7 +1490,13 @@ class ChatCompletionResponseChoice(BaseModel):
     logprobs: Optional[Union[LogProbs, ChoiceLogprobs]] = None
     finish_reason: Optional[
         Literal[
-            "stop", "length", "tool_calls", "content_filter", "function_call", "abort"
+            "stop",
+            "length",
+            "tool_calls",
+            "content_filter",
+            "function_call",
+            "abort",
+            "server_interrupted",
         ]
     ] = None
     matched_stop: Union[None, int, str] = None
@@ -1487,8 +1545,12 @@ class DeltaMessage(BaseModel):
     hidden_states: Optional[object] = None
 
     @model_serializer(mode="wrap")
-    def _serialize(self, handler):
+    def _serialize(self, handler, info: SerializationInfo):
         data = handler(self)
+        # Without the context, null keys stay: OpenAI SDK clients read
+        # reasoning_content as an attribute.
+        if _is_stream_delta(info):
+            return {k: v for k, v in data.items() if v is not None}
         if self.hidden_states is None:
             data.pop("hidden_states", None)
         return data
@@ -1500,14 +1562,23 @@ class ChatCompletionResponseStreamChoice(BaseModel):
     logprobs: Optional[Union[LogProbs, ChoiceLogprobs]] = None
     finish_reason: Optional[
         Literal[
-            "stop", "length", "tool_calls", "content_filter", "function_call", "abort"
+            "stop",
+            "length",
+            "tool_calls",
+            "content_filter",
+            "function_call",
+            "abort",
+            "server_interrupted",
         ]
     ] = None
     matched_stop: Union[None, int, str] = None
+    internal_content: Optional[List[Dict[str, Any]]] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
+        if self.internal_content is None:
+            data.pop("internal_content", None)
         if self.delta.tool_calls is None:
             data["delta"].pop("tool_calls", None)
         return data

@@ -31,6 +31,7 @@ from sglang.srt.mem_cache.kv.plan import (
     TreeSlot,
     WireEntry,
 )
+from sglang.srt.mem_cache.kv.requests import RowResets
 from sglang.srt.mem_cache.kv.state_storage import StateSlotsExhausted
 from sglang.srt.mem_cache.kv.storage import ResumeUnits, SubPoolUsage, window_tail_len
 from sglang.srt.utils import is_npu
@@ -98,36 +99,29 @@ def acquire_rows(
     state: Optional[StateStorage],
     reqs: List[Req],
     *,
-    request_memory=None,
-    reset_request_parts: bool = True,
+    row_resets: Optional[RowResets] = None,
 ) -> Optional[List[int]]:
-    """Bind the requests' rows in a static table and, with recurrent state,
+    """Bind the requests' rows in a request table and, with recurrent state,
     their state and tracking slots; None when the table has too few free rows.
-    A request already holding a row or a slot keeps it. If the slots run out
-    after the rows were bound, the rows and slots taken go back before
-    `StateSlotsExhausted` surfaces. Unified storage supplies its fixed request
-    memory and disables the state's separate request-part reset."""
+    A request already holding a row or a slot keeps it. A row a request did
+    not hold before is marked in the storage's ``row_resets``: the next
+    forward resets its request-scoped state. If the slots run out after the
+    rows were bound, the rows and slots taken go back before
+    `StateSlotsExhausted` surfaces."""
     fresh_rows = [req.kv.req_pool_idx is None for req in reqs]
     rows = table.alloc(reqs)
     if rows is None:
         return None
-    if request_memory is not None:
-        request_memory.reset_rows(
-            [row for row, fresh in zip(rows, fresh_rows) if fresh]
-        )
-    if state is None:
-        return rows
-    try:
-        if reset_request_parts:
-            # Preserve the default acquire contract of backend state overrides.
-            state.acquire(table, reqs, rows, fresh_rows)
-        else:
-            state.acquire(table, reqs, rows, fresh_rows, reset_request_parts=False)
-    except StateSlotsExhausted:
-        for req, fresh in zip(reqs, fresh_rows):
-            if fresh:
-                table.free(req)
-        raise
+    if state is not None:
+        try:
+            state.acquire(table, reqs, rows)
+        except StateSlotsExhausted:
+            for req, fresh in zip(reqs, fresh_rows):
+                if fresh:
+                    table.free(req)
+            raise
+    if row_resets is not None:
+        row_resets.mark([row for row, fresh in zip(rows, fresh_rows) if fresh])
     return rows
 
 
@@ -159,6 +153,7 @@ class StaticKVStorage:
         # A window pool's kept tail, by the window pool's name, bound once at
         # startup (`bind_window_retention`).
         self._window_retention: Optional[Dict[str, int]] = None
+        self._row_resets = RowResets(self._reset_request_rows)
 
     def bind_shape(self, shape: StaticPoolShape) -> None:
         """Describe the static pools for their usage and prefix-tree slots.
@@ -256,7 +251,18 @@ class StaticKVStorage:
         )
 
     def acquire(self, reqs: List[Req]) -> Optional[List[int]]:
-        return acquire_rows(self.requests, self._allocator.state, reqs)
+        return acquire_rows(
+            self.requests, self._allocator.state, reqs, row_resets=self._row_resets
+        )
+
+    def reset_new_rows(self) -> None:
+        """See `KVStorage.reset_new_rows`."""
+        self._row_resets.apply()
+
+    def _reset_request_rows(self, rows: List[int]) -> None:
+        state = self._allocator.state
+        if state is not None:
+            state.reset_request_rows(rows, device=self.requests.device)
 
     def take_tokens(
         self,
@@ -492,7 +498,10 @@ class StaticKVStorage:
         """See `KVStorage.hold_row`."""
 
     def take_rows(self, num_rows: int) -> Optional[List[int]]:
-        return self.requests.alloc_rows(num_rows)
+        rows = self.requests.alloc_rows(num_rows)
+        if rows is not None:
+            self._row_resets.mark(rows)
+        return rows
 
     def release_rows(self, rows: List[int]) -> None:
         self.requests.free_rows(rows)
@@ -525,6 +534,10 @@ class StaticKVStorage:
 
     def available_units(self, sub_pool: str) -> int:
         return self._band(sub_pool).available_size()
+
+    def units_fit(self, sub_pool: str, count: int) -> bool:
+        """Whether ``take_units`` can hand out ``count`` units now."""
+        return self.available_units(sub_pool) >= count
 
     def take_units(self, sub_pool: str, count: int) -> Optional[torch.Tensor]:
         return self._band(sub_pool).alloc(count)
@@ -1181,19 +1194,16 @@ def _static_state_entries(
                 c128_item_lens,
             )
 
-        # On Ascend 950, register C4 state by row so prefill and decode can
-        # pair logical positions even when their SWA-page ring sizes differ.
-        from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
-
-        if is_npu_arch35():
-            c4_ptrs, c4_lens, c4_item_lens = token_to_kv_pool.get_c4_state_buf_infos()
-            if c4_ptrs:
-                add(
-                    AscendStateType.DSV4_C4_STATE,
-                    c4_ptrs,
-                    c4_lens,
-                    c4_item_lens,
-                )
+        # Register C4 state by row on both A3 and Ascend 950 so prefill and
+        # decode can pair logical positions even when their ring sizes differ.
+        c4_ptrs, c4_lens, c4_item_lens = token_to_kv_pool.get_c4_state_buf_infos()
+        if c4_ptrs:
+            add(
+                AscendStateType.DSV4_C4_STATE,
+                c4_ptrs,
+                c4_lens,
+                c4_item_lens,
+            )
 
     # DSV4 NextN shares the target allocator, so target and draft use the same
     # local SWA indices. Keep draft buffers in a separate positional component
