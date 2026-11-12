@@ -33,6 +33,7 @@ from sglang.srt.managers.data_parallel_controller import (
     LoadBalanceMethod,
     WorkerPortHandshake,
 )
+from sglang.srt.managers.incremental_detokenize import LimitedCapacityDict
 from sglang.srt.managers.io_struct import ActiveRanksOutput
 from sglang.srt.managers.load_snapshot import LoadSnapshot
 from sglang.srt.runtime_context import get_context
@@ -81,6 +82,7 @@ def _make_controller(
     ctl.load_balance_method = LoadBalanceMethod.ROUND_ROBIN
     ctl.round_robin_counter = 0
     ctl.health_round_robin_counter = 0
+    ctl.routing_key_to_rank = LimitedCapacityDict(capacity=1 << 16)
     ctl.dp_budget = DPBudget(num_dp_ranks=num_dp_ranks)
     return ctl
 
@@ -92,6 +94,7 @@ def _req(
     rid="USER",
     time_stats=None,
     input_embeds=None,
+    routing_key=None,
 ):
     """Req stand-in; SimpleNamespace avoids pinning to the Req dataclass schema.
 
@@ -104,6 +107,7 @@ def _req(
         bootstrap_room=bootstrap_room,
         input_ids=None if input_embeds is not None else (input_ids or []),
         input_embeds=input_embeds,
+        routing_key=routing_key,
     )
 
 
@@ -374,6 +378,57 @@ class TestRoundRobinScheduler(CustomTestCase):
         # Subsequent round-robin req still lands on worker 0
         ctl.round_robin_scheduler(_req())
         ctl.workers[0].send_pyobj.assert_called_once()
+
+
+class TestFollowRoutingKeyScheduler(CustomTestCase):
+    def test_a_key_stays_on_its_rank_whatever_the_load(self):
+        ctl = _make_controller(num_dp_ranks=4)
+        ctl.follow_routing_key_scheduler(_req(routing_key="session"))
+        first = ctl.routing_key_to_rank[hash("session")]
+        ctl.dp_budget.total_requests[first] = 100
+        for _ in range(3):
+            ctl.follow_routing_key_scheduler(_req(routing_key="session"))
+        self.assertEqual(ctl.workers[first].send_pyobj.call_count, 4)
+
+    def test_new_keys_go_to_the_rank_with_the_fewest_requests(self):
+        ctl = _make_controller(num_dp_ranks=3)
+        ctl.dp_budget.total_requests = [5, 0, 1]
+        ctl.follow_routing_key_scheduler(_req(routing_key="a"))
+        ctl.follow_routing_key_scheduler(_req(routing_key="b"))
+        # "a" lifts rank 1 to 1 request; the tie with rank 2 goes to the lower rank
+        self.assertEqual(ctl.routing_key_to_rank[hash("a")], 1)
+        self.assertEqual(ctl.routing_key_to_rank[hash("b")], 1)
+        self.assertEqual(ctl.dp_budget.total_requests, [5, 2, 1])
+
+    def test_a_key_whose_rank_went_inactive_is_placed_again(self):
+        ctl = _make_controller(num_dp_ranks=4)
+        ctl.follow_routing_key_scheduler(_req(routing_key="session"))
+        first = ctl.routing_key_to_rank[hash("session")]
+        ctl._active_workers = [rank for rank in range(4) if rank != first]
+        ctl.follow_routing_key_scheduler(_req(routing_key="session"))
+        second = ctl.routing_key_to_rank[hash("session")]
+        self.assertNotEqual(second, first)
+        ctl.workers[second].send_pyobj.assert_called_once()
+
+    def test_a_routed_dp_rank_wins_and_is_not_remembered(self):
+        ctl = _make_controller(num_dp_ranks=4)
+        ctl.follow_routing_key_scheduler(_req(routing_key="session", routed_dp_rank=3))
+        ctl.workers[3].send_pyobj.assert_called_once()
+        self.assertNotIn(hash("session"), ctl.routing_key_to_rank)
+
+    def test_a_request_without_a_key_is_balanced_and_not_remembered(self):
+        ctl = _make_controller(num_dp_ranks=2)
+        ctl.dp_budget.total_requests = [3, 0]
+        ctl.follow_routing_key_scheduler(_req())
+        ctl.workers[1].send_pyobj.assert_called_once()
+        self.assertEqual(len(ctl.routing_key_to_rank), 0)
+
+    def test_the_least_recently_used_key_is_forgotten_first(self):
+        ctl = _make_controller(num_dp_ranks=2)
+        ctl.routing_key_to_rank = LimitedCapacityDict(capacity=2)
+        for key in ("a", "b", "a", "c"):
+            ctl.follow_routing_key_scheduler(_req(routing_key=key))
+        self.assertEqual(list(ctl.routing_key_to_rank), [hash("a"), hash("c")])
 
 
 class TestDispatchingWithTrace(CustomTestCase):
