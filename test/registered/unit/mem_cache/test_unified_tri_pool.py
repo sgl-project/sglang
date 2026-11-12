@@ -1146,6 +1146,115 @@ class TestTriFactorySizing(_PoolTestCase):
                 ]
                 self.assertEqual(gathered.tolist(), item_reads)
 
+    def _state_pool(self, *, lazy, slots):
+        from sglang.srt.runtime_context import get_parallel
+
+        kw = self._factory_kwargs(
+            enable_mamba_extra_buffer=True,
+            enable_mamba_extra_buffer_lazy=lazy,
+            disable_overlap_schedule=False,
+            max_mamba_cache_size=slots,
+        )
+        with get_parallel().override(attn_dcp_size=1):
+            bundle = build_test_unified_pools(**kw)
+        return bundle.req_to_token_pool, bundle.token_to_kv_pool_allocator
+
+    def test_a_prefill_takes_every_state_and_tracking_slot_in_one_bind(self):
+        """A batch's state slots and every request's ping-pong tracking slots
+        come from one take of the state band, which binds them in one launch;
+        lazy buffers keep the -1 sentinel past their first slot."""
+        from sglang.srt.managers.schedule_batch import ReqKvInfo
+
+        for lazy in (False, True):
+            with self.subTest(lazy=lazy):
+                pool, allocator = self._state_pool(lazy=lazy, slots=16)
+                state = allocator.state
+                n = pool.mamba_initial_tracking_slots
+                reqs = [SimpleNamespace(kv=ReqKvInfo()) for _ in range(3)]
+                with patch.object(
+                    state.slots, "_take", wraps=state.slots._take
+                ) as take:
+                    rows = acquire_rows(pool, state, reqs)
+                self.assertEqual(
+                    [c.args for c in take.call_args_list], [(3 * (1 + n),)]
+                )
+                mapping = pool.req_index_to_mamba_ping_pong_track_buffer_mapping
+                buffers = [req.kv.mamba_ping_pong_track_buffer for req in reqs]
+                self.assertEqual(mapping[rows].tolist(), [b.tolist() for b in buffers])
+                for buf in buffers:
+                    self.assertEqual(int((buf == -1).sum()), 1 if lazy else 0)
+                held = {int(req.kv.mamba_pool_idx) for req in reqs} | {
+                    v for b in buffers for v in b.tolist() if v != -1
+                }
+                self.assertEqual(len(held), 3 * (1 + n))
+                self.assertTrue(
+                    bool((state.slots.translate(torch.tensor(sorted(held))) >= 0).all())
+                )
+
+    def test_a_short_prefill_hands_out_no_slot(self):
+        """Slots for one request and a half: the second request's shortfall
+        leaves every slot and row where it was, the first request's included."""
+        from sglang.srt.managers.schedule_batch import ReqKvInfo
+        from sglang.srt.mem_cache.kv.state_storage import StateSlotsExhausted
+
+        pool, allocator = self._state_pool(lazy=False, slots=16)
+        state = allocator.state
+        per_request = 1 + pool.mamba_initial_tracking_slots
+        filler = []
+        while (slot := state.slots.alloc(1)) is not None:
+            filler.append(slot)
+        state.slots.free(torch.cat(filler[: per_request + 1]))
+        available = state.slots.available_size()
+        rows_free = pool.available_size()
+        reqs = [SimpleNamespace(kv=ReqKvInfo()) for _ in range(2)]
+        with self.assertRaises(StateSlotsExhausted):
+            acquire_rows(pool, state, reqs)
+        self.assertEqual(state.slots.available_size(), available)
+        self.assertEqual(pool.available_size(), rows_free)
+        for req in reqs:
+            self.assertIsNone(req.kv.mamba_pool_idx)
+            self.assertIsNone(req.kv.mamba_ping_pong_track_buffer)
+
+    def test_a_retire_batch_unbinds_the_state_band_once(self):
+        """Inside the allocator's free group a retire batch's state and
+        tracking slots go back in one unbind of the state band at the group's
+        end, except the tracking slot the prefix cache keeps; a slot take
+        inside the group still sees the slots released before it."""
+        from sglang.srt.managers.schedule_batch import ReqKvInfo
+
+        for lazy in (False, True):
+            with self.subTest(lazy=lazy):
+                pool, allocator = self._state_pool(lazy=lazy, slots=16)
+                state = allocator.state
+                band = allocator.mamba_allocator
+                available = state.slots.available_size()
+                reqs = [SimpleNamespace(kv=ReqKvInfo()) for _ in range(3)]
+                acquire_rows(pool, state, reqs)
+                kept = reqs[0].kv.mamba_ping_pong_track_buffer[0:1].clone()
+                unbinds = band._stats_n_free_lazy
+                allocator.free_group_begin()
+                state.release(pool, reqs[0], 0)
+                for req in reqs[1:]:
+                    state.release(pool, req)
+                self.assertEqual(band._stats_n_free_lazy, unbinds)
+                allocator.free_group_end()
+                self.assertEqual(band._stats_n_free_lazy, unbinds + 1)
+                self.assertEqual(state.slots.available_size(), available - 1)
+                self.assertGreaterEqual(int(state.slots.translate(kept)), 0)
+                state.slots.free(kept)
+                for req in reqs:
+                    pool.free(req)
+
+                # A take inside the group, with only released slots left.
+                again = [SimpleNamespace(kv=ReqKvInfo())]
+                acquire_rows(pool, state, again)
+                while state.slots.alloc(1) is not None:
+                    pass
+                allocator.free_group_begin()
+                state.release(pool, again[0])
+                self.assertIsNotNone(state.slots.alloc(1))
+                allocator.free_group_end()
+
     def test_budget_sizing_and_boot_signature(self):
         from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator
 

@@ -1656,7 +1656,11 @@ class Band:
     # -- free --
 
     def free(
-        self, free_index: torch.Tensor, *, _pages: Optional[torch.Tensor] = None
+        self,
+        free_index: torch.Tensor,
+        *,
+        _pages: Optional[torch.Tensor] = None,
+        owned: bool = False,
     ) -> None:
         """Free virtual TOKEN ids: recover virtual PAGE ids, un-map v2p/p2v,
         (if id-owner) recycle the page ids, and return the physical pages to the
@@ -1666,12 +1670,16 @@ class Band:
         the data-dependent dedup is skipped. `free_index` is token-granular and
         need not be page-aligned. While a forward is in flight the physical
         pages are pending until its step is processed (`_pend_until_retire`).
+        ``owned``: the caller hands ``free_index`` over and never writes it
+        again, so an open free group holds it without a copy.
         """
         with record_function("Band.free"):
             if free_index is None or free_index.numel() == 0:
                 return
             if self.free_group is not None:
-                self.free_group.append(self._copy_for_free_group(free_index))
+                self.free_group.append(
+                    free_index if owned else self._copy_for_free_group(free_index)
+                )
                 return
             self._free_lazy(free_index, pages=_pages)
 
@@ -3386,20 +3394,26 @@ class FloatBand(Band):
     # -- free: hole-marking, boundary absorption, park-on-empty --
 
     def free(
-        self, free_index: torch.Tensor, *, _pages: Optional[torch.Tensor] = None
+        self,
+        free_index: torch.Tensor,
+        *,
+        _pages: Optional[torch.Tensor] = None,
+        owned: bool = False,
     ) -> None:
         """Mark the freed pages as interior HOLES / absorb boundary ones.
 
         `_pages` carries virtual PAGE ids the caller already derived -- same
         contract as the base allocator, and honoured for the same reason: deriving
         them again via `torch.unique` is a data-dependent-shape op, i.e. a HOST
-        SYNC on the per-step free path.
+        SYNC on the per-step free path. ``owned``: as `Band.free`.
         """
         with record_function("FloatBand.free"):
             if free_index is None or free_index.numel() == 0:
                 return
             if self.free_group is not None:
-                self.free_group.append(self._copy_for_free_group(free_index))
+                self.free_group.append(
+                    free_index if owned else self._copy_for_free_group(free_index)
+                )
                 return
             # Page-derivation ladder, as `_free_lazy`: caller ids, the ps==1
             # identity, then dedup.
