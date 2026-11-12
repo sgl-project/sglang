@@ -1761,6 +1761,11 @@ class Envs:
     SGLANG_OPT_FREEZE_ENV_READS = EnvBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # Decode graph replay writes the local num_token_non_padded slot from the host
+    # count in one fill, not from the device scalar (subtract, clamp and copy).
+    SGLANG_OPT_HOST_NUM_TOKEN_NON_PADDED_FILL = EnvBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
     # Runtime optimizations that follow SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION. Each
     # still accepts its former name (deprecated_name) until the alias is removed.
     # The fused small-field copy gives each field its own blocks and moves aligned fields in 16 B units.

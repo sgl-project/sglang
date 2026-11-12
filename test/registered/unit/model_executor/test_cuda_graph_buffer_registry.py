@@ -924,6 +924,104 @@ class TestBuildDecodeRegistry(unittest.TestCase):
             )
         self.assertEqual(int(src.num_token_non_padded.item()), 7)
 
+    def _num_token_non_padded_after_fill(
+        self, *, host_fill, rank, sharded, global_gpu, global_cpu
+    ) -> int:
+        from sglang.srt.model_executor.cuda_graph_buffer_registry import (
+            build_decode_registry,
+        )
+        from sglang.srt.runtime_context import get_parallel
+
+        ntnp = torch.full((1,), 99, dtype=torch.int32)  # poisoned static buffer
+        src = SimpleNamespace(
+            input_ids=torch.zeros(8, dtype=torch.int64),
+            positions=torch.zeros(8, dtype=torch.int64),
+            out_cache_loc=torch.zeros(8, dtype=torch.int64),
+            req_pool_indices=torch.zeros(4, dtype=torch.int64),
+            seq_lens=torch.full((4,), 5, dtype=torch.int64),
+            seq_lens_cpu=torch.full((4,), 5, dtype=torch.int64),
+            mrope_positions=torch.zeros((3, 8), dtype=torch.int64),
+            num_token_non_padded=ntnp,
+            global_num_tokens_gpu=torch.zeros(1, dtype=torch.int32),
+            global_num_tokens_for_logprob_gpu=torch.zeros(1, dtype=torch.int32),
+        )
+        with (
+            envs.SGLANG_OPT_HOST_NUM_TOKEN_NON_PADDED_FILL.override(host_fill),
+            get_parallel().override(attn_tp_size=2, attn_tp_rank=rank),
+        ):
+            reg = build_decode_registry(
+                device=torch.device("cpu"),
+                max_bs=4,
+                max_num_token=8,
+                seq_len_fill_value=5,
+                cache_loc_dtype=torch.int64,
+                enable_num_token_non_padded=True,
+                require_gathered_buffer=True,
+                attn_tp_sharded_fn=lambda num_tokens: sharded,
+                source=src,
+            )
+            fb = _MiniForwardBatch(
+                global_num_token_non_padded=torch.tensor(global_gpu, dtype=torch.int32),
+                global_num_token_non_padded_cpu=global_cpu,
+            )
+            reg.fill_from(
+                fb, raw_bs=4, padded_bs=4, raw_num_tokens=4, padded_num_tokens=8
+            )
+        return int(src.num_token_non_padded.item())
+
+    def test_num_token_non_padded_host_fill_matches_device_path(self):
+        # SGLANG_OPT_HOST_NUM_TOKEN_NON_PADDED_FILL writes the slot from the host
+        # count; with the host and device counts equal it must write what the
+        # device path writes, sharded or replicated, on every attn-TP rank.
+        for global_count in (0, 3, 6, 8, 100):
+            for rank in (0, 1):
+                for sharded in (False, True):
+                    kwargs = dict(
+                        rank=rank,
+                        sharded=sharded,
+                        global_gpu=global_count,
+                        global_cpu=global_count,
+                    )
+                    with self.subTest(**kwargs):
+                        self.assertEqual(
+                            self._num_token_non_padded_after_fill(
+                                host_fill=True, **kwargs
+                            ),
+                            self._num_token_non_padded_after_fill(
+                                host_fill=False, **kwargs
+                            ),
+                        )
+        # tokens_per_rank = 8 // 2 = 4; rank 1 keeps clamp(6 - 4, 0, 4) = 2.
+        self.assertEqual(
+            self._num_token_non_padded_after_fill(
+                host_fill=True, rank=1, sharded=True, global_gpu=6, global_cpu=6
+            ),
+            2,
+        )
+
+    def test_num_token_non_padded_host_fill_source(self):
+        # On: the host count is the source (a disagreeing device scalar is not
+        # read). Without a host count, or with the switch off, the device scalar is.
+        common = dict(rank=0, sharded=False, global_gpu=5)
+        self.assertEqual(
+            self._num_token_non_padded_after_fill(
+                host_fill=True, global_cpu=3, **common
+            ),
+            3,
+        )
+        self.assertEqual(
+            self._num_token_non_padded_after_fill(
+                host_fill=True, global_cpu=None, **common
+            ),
+            5,
+        )
+        self.assertEqual(
+            self._num_token_non_padded_after_fill(
+                host_fill=False, global_cpu=3, **common
+            ),
+            5,
+        )
+
     def test_register_global_num_tokens_false_carries_fb_values(self):
         # register_global_num_tokens=False (eager) excludes the computed
         # global_num_tokens_* slots so the batch's DP values are carried, not
