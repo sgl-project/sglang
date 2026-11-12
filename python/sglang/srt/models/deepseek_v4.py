@@ -4744,10 +4744,11 @@ class DeepseekV4Model(nn.Module):
             )
         hidden_states = self.norm(hidden_states)
 
-        # CUDA prefill CP: the runner gathers every output, DSpark captures
-        # included, by this rank's full shard layout, so the tail rows go back
-        # into that layout before the gather.
-        cuda_cp_tail = _needs_cp_tail_scatter(tail, forward_batch)
+        # DSpark's model-boundary hook gathers compact tail rows. Other CP
+        # outputs are gathered with this rank's full shard layout.
+        cuda_cp_tail = not capture_dspark and _needs_cp_tail_scatter(
+            tail, forward_batch
+        )
         num_tokens = input_ids.shape[0]
         if tail is not None and (not capture_dspark or cuda_cp_tail):
             # The logits processor indexes rows by the full extend layout.
