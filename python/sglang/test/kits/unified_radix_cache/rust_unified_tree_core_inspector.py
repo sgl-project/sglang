@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Optional
 
 import torch
@@ -22,6 +23,22 @@ from sglang.test.kits.unified_radix_cache.unified_tree_core_inspection_interface
 )
 
 _inspection_bindings = load_tree_core_extension(inspection=True)
+
+
+# The match-result fields the native core reads, other than the window hit.
+_CORE_MATCH_FIELDS = (
+    "device_prefix_len",
+    "last_device_node",
+    "last_host_node",
+    "best_match_node",
+    "last_visited_node_id",
+    "full_device_match_len",
+    "host_hit_length",
+    "swa_branching_seqlen",
+    "mamba_host_hit_length",
+    "mamba_branching_seqlen",
+    "full_kv_hit_length",
+)
 
 
 class RustUnifiedTreeCoreInspector(
@@ -59,21 +76,21 @@ class RustUnifiedTreeCoreInspector(
         self, node_id: NodeId, component_type: ComponentType
     ) -> Optional[torch.Tensor]:
         return self._binding.inspect_get_component_host_value(
-            node_id, int(component_type)
+            node_id, self._ids.core(component_type)
         )
 
     def get_component_device_lock_ref(
         self, node_id: NodeId, component_type: ComponentType
     ) -> int:
         return self._binding.inspect_get_component_device_lock_ref(
-            node_id, int(component_type)
+            node_id, self._ids.core(component_type)
         )
 
     def get_component_host_lock_ref(
         self, node_id: NodeId, component_type: ComponentType
     ) -> int:
         return self._binding.inspect_get_component_host_lock_ref(
-            node_id, int(component_type)
+            node_id, self._ids.core(component_type)
         )
 
     def get_node_hit_count(self, node_id: NodeId) -> int:
@@ -88,18 +105,22 @@ class RustUnifiedTreeCoreInspector(
     def is_node_in_device_lru(
         self, node_id: NodeId, component_type: ComponentType
     ) -> bool:
-        return self._binding.inspect_is_node_in_device_lru(node_id, int(component_type))
+        return self._binding.inspect_is_node_in_device_lru(
+            node_id, self._ids.core(component_type)
+        )
 
     def is_node_in_host_lru(
         self, node_id: NodeId, component_type: ComponentType
     ) -> bool:
-        return self._binding.inspect_is_node_in_host_lru(node_id, int(component_type))
+        return self._binding.inspect_is_node_in_host_lru(
+            node_id, self._ids.core(component_type)
+        )
 
     def get_component_device_lru_node_ids(
         self, component_type: ComponentType
     ) -> list[NodeId]:
         return self._binding.inspect_get_component_device_lru_node_ids(
-            int(component_type)
+            self._ids.core(component_type)
         )
 
     def is_device_evictable_leaf(self, node_id: NodeId) -> bool:
@@ -115,7 +136,9 @@ class RustUnifiedTreeCoreInspector(
         return self._binding.inspect_get_all_node_ids()
 
     def component_protected_size(self, component_type: ComponentType) -> int:
-        return self._binding.inspect_component_protected_size(int(component_type))
+        return self._binding.inspect_component_protected_size(
+            self._ids.core(component_type)
+        )
 
     def set_node_hash_values(
         self, node_id: NodeId, hash_values: Optional[list[str]]
@@ -129,7 +152,7 @@ class RustUnifiedTreeCoreInspector(
         value: Optional[torch.Tensor],
     ) -> None:
         self._binding.inspect_set_component_device_value_raw(
-            node_id, int(component_type), value
+            node_id, self._ids.core(component_type), value
         )
 
     def set_component_host_value_raw(
@@ -139,7 +162,7 @@ class RustUnifiedTreeCoreInspector(
         value: Optional[torch.Tensor],
     ) -> None:
         self._binding.inspect_set_component_host_value_raw(
-            node_id, int(component_type), value
+            node_id, self._ids.core(component_type), value
         )
 
     def set_component_device_lock_ref(
@@ -147,30 +170,38 @@ class RustUnifiedTreeCoreInspector(
     ) -> None:
         assert lock_ref >= 0
         self._binding.inspect_set_component_device_lock_ref(
-            node_id, int(component_type), lock_ref
+            node_id, self._ids.core(component_type), lock_ref
         )
 
     def remove_node_from_device_lru(
         self, node_id: NodeId, component_type: ComponentType
     ) -> None:
-        self._binding.inspect_remove_node_from_device_lru(node_id, int(component_type))
+        self._binding.inspect_remove_node_from_device_lru(
+            node_id, self._ids.core(component_type)
+        )
 
     def insert_node_into_host_lru(
         self, node_id: NodeId, component_type: ComponentType
     ) -> None:
-        self._binding.inspect_insert_node_into_host_lru(node_id, int(component_type))
+        self._binding.inspect_insert_node_into_host_lru(
+            node_id, self._ids.core(component_type)
+        )
 
     def set_component_evictable_size(
         self, component_type: ComponentType, value: int
     ) -> None:
         assert value >= 0
-        self._binding.inspect_set_component_evictable_size(int(component_type), value)
+        self._binding.inspect_set_component_evictable_size(
+            self._ids.core(component_type), value
+        )
 
     def set_component_protected_size(
         self, component_type: ComponentType, value: int
     ) -> None:
         assert value >= 0
-        self._binding.inspect_set_component_protected_size(int(component_type), value)
+        self._binding.inspect_set_component_protected_size(
+            self._ids.core(component_type), value
+        )
 
     def update_duplicate_tracking(self, node_id: NodeId) -> None:
         self._binding.inspect_update_duplicate_tracking(node_id)
@@ -185,7 +216,7 @@ class RustUnifiedTreeCoreInspector(
         target: EvictLayer,
     ) -> BaseEvictionResult:
         binding_result = self._binding.inspect_evict_component(
-            node_id, int(component_type), int(target)
+            node_id, self._ids.core(component_type), int(target)
         )
         return self._fill_evict_result(binding_result, BaseEvictionResult())
 
@@ -196,7 +227,7 @@ class RustUnifiedTreeCoreInspector(
         target: EvictLayer,
     ) -> None:
         self._binding.inspect_validate_cascade_evict(
-            node_id, int(component_type), int(target)
+            node_id, self._ids.core(component_type), int(target)
         )
 
     def cleanup_tombstone_ancestors(self, node_id: NodeId) -> BaseEvictionResult:
@@ -211,9 +242,15 @@ class RustUnifiedTreeCoreInspector(
         value_chunks: list[torch.Tensor],
         best_value_len: int,
     ) -> MatchResult:
+        # The native core keeps one window: hand it that window's host hit
+        # under the field name it reads.
+        core_result = SimpleNamespace(
+            **{name: getattr(result, name) for name in _CORE_MATCH_FIELDS},
+            swa_host_hit_length=result.window_host_hit_lengths.get(self._ids.window, 0),
+        )
         binding_result = self._binding.inspect_finalize_component_match_result(
-            int(component_type),
-            result,
+            self._ids.core(component_type),
+            core_result,
             _radix_key_buffer(params.key),
             params.key.extra_key,
             params.key.cache_salt,

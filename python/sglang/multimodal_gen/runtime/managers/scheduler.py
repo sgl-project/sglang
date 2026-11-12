@@ -146,7 +146,6 @@ class Scheduler(
         local_rank: int | None = None,
     ):
         self.server_args = server_args
-        self.port_args = port_args
 
         # local_rank is the physical GPU index for torch.cuda.set_device.
         # In non-disagg mode, it equals gpu_id. In disagg mode, it may differ
@@ -1449,7 +1448,7 @@ class Scheduler(
     def recv_reqs(self) -> List[tuple[bytes, Any]]:
         """
         For non-main schedulers, reqs are broadcasted from main using
-        broadcast_pyobj. ``--comfyui-mode`` multi-rank instead keeps CUDA
+        broadcast_pyobj. ``comfyui_mode`` multi-rank instead keeps CUDA
         tensors on NCCL so per-step latents do not pickle onto the gloo group.
         """
         if self.receiver is not None:

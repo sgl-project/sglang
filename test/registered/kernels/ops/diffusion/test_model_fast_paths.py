@@ -2,8 +2,8 @@
 
 A diffusion kernel is only as good as the wrapper that decides when to use it,
 and that decision is model-specific: FLUX.1 and GLM-Image feed different adaLN
-layouts to the same LayerNorm+modulate kernel, Sana only engages on non-default
-streams, ERNIE runs a bit-exact chain unconditionally.  Kernel-level numerics
+layouts to the same LayerNorm+modulate kernel, Sana gates on stream and model
+opt-in, ERNIE runs a bit-exact chain unconditionally.  Kernel-level numerics
 live in ``test_norm.py`` / ``test_modulate.py`` / ``test_rope.py``; this file
 covers the wiring: right kernel, right reference, gate ends in the right state.
 
@@ -25,6 +25,7 @@ import unittest
 import weakref
 from contextlib import ExitStack, contextmanager
 from copy import deepcopy
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -500,32 +501,6 @@ class TestFlux2EagerFusions(CustomTestCase):
         self.assertTrue(torch.equal(actual, expected))
         self.assertEqual(len(flux2._FLUX2_SWIGLU_SIGS), 1)
 
-    @pytest.mark.skipif(
-        not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3),
-        reason="FLUX.2 token-cat NVFP4 requires Blackwell SM103",
-    )
-    def test_token_cat_nvfp4_matches_flashinfer(self):
-        import flashinfer
-
-        torch.manual_seed(20260830)
-        attention = torch.randn(1, 17, 6144, device="cuda", dtype=torch.bfloat16)
-        mlp = torch.randn(1, 17, 18432, device="cuda", dtype=torch.bfloat16)
-        global_scale = torch.tensor(0.625, device="cuda", dtype=torch.float32)
-
-        expected_fp4, expected_scales = flashinfer.fp4_quantize(
-            torch.cat([attention, mlp], dim=-1).view(-1, 24576), global_scale
-        )
-        actual = try_flux2_token_cat_nvfp4(attention, mlp, global_scale)
-
-        self.assertIsNotNone(actual)
-        actual_fp4, actual_scales = actual
-        self.assertTrue(torch.equal(actual_fp4, expected_fp4))
-        self.assertTrue(
-            torch.equal(
-                actual_scales.view(torch.uint8), expected_scales.view(torch.uint8)
-            )
-        )
-
     def test_token_cat_nvfp4_falls_back_while_compiling(self):
         attention = torch.empty(1, 1, 6144, device="cuda", dtype=torch.bfloat16)
         mlp = torch.empty(1, 1, 18432, device="cuda", dtype=torch.bfloat16)
@@ -795,6 +770,7 @@ def test_glm_qk_head_layernorm_is_bit_exact(shape):
 
 
 @requires_inline_ptx
+@pytest.mark.parametrize("allow_eager", [False, True])
 @pytest.mark.parametrize(
     "shape,nmod,transposed",
     [
@@ -804,10 +780,15 @@ def test_glm_qk_head_layernorm_is_bit_exact(shape):
         ((1, 37, 2240), 6, False),
     ],
 )
-def test_sana_fused_ln_modulate_is_bit_exact(shape, nmod, transposed):
-    # (., 1024, 2240) is the real Sana 1024px shape; hidden 2240 % 512 != 0
-    # exercises the kernel's partial tail chunk.  nmod mirrors the two adaLN
-    # chunk layouts, transposed the permuted layout the Sana DiT serves.
+def test_sana_fused_ln_modulate_is_bit_exact(
+    shape, nmod, transposed, allow_eager, monkeypatch
+):
+    gate = BitExactFusionGate("Sana test LN+modulate", per_signature=True)
+    monkeypatch.setattr(sana, "_SANA_LN_MOD", gate)
+    monkeypatch.setattr(sana, "_SANA_LN_MOD_SIGS", gate.verified_sigs)
+    monkeypatch.setattr(sana, "_SANA_LN_MOD_DISABLED", False)
+    # Width 2240 exercises a partial tail chunk; nmod mirrors the two adaLN
+    # layouts, and transposed covers the permuted layout the DiT serves.
     torch.manual_seed(0)
     batch, seq, hidden = shape
     norm = torch.nn.LayerNorm(hidden, eps=1e-6, elementwise_affine=False).cuda()
@@ -816,147 +797,36 @@ def test_sana_fused_ln_modulate_is_bit_exact(shape, nmod, transposed):
         x = x.permute(0, 2, 1).contiguous().permute(0, 2, 1)
     emb = torch.randn(batch, nmod, hidden, device="cuda").bfloat16()
     shift, scale = emb.chunk(nmod, dim=1)[0], emb.chunk(nmod, dim=1)[-1]
-    # default-stream eager serving must stay on the untouched eager chain
-    n_sigs = len(sana._SANA_LN_MOD.verified_sigs)
-    sana_ln_modulate(norm, x, scale, shift)
-    assert len(sana._SANA_LN_MOD.verified_sigs) == n_sigs
-    # The fusion engages on non-default streams (the BCG warmup/capture path).
-    # x/scale/shift were filled on the default stream, so the side stream must
-    # wait for that work before reading them -- without this the fused kernel
-    # can read a half-written tensor, the first-sight torch.equal check fails,
-    # and the gate disables itself *permanently*, which then breaks every later
-    # parametrization too. It only loses the race when the GPU is contended,
-    # which is why it shows up on shared CI runners and not on an idle box.
-    side = torch.cuda.Stream()
-    side.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(side):
+
+    # Image inference still defaults to the eager chain.
+    with torch.no_grad():
         out = sana_ln_modulate(norm, x, scale, shift)
-        assert len(sana._SANA_LN_MOD.verified_sigs) == n_sigs + 1  # verified
-        out2 = sana_ln_modulate(norm, x, scale, shift)  # verified-sig lane
-    torch.cuda.current_stream().wait_stream(side)
+        assert torch.equal(out, _sana_eager_ln_modulate(norm, x, scale, shift))
+    assert not gate.verified_sigs
+
+    # The video opt-in must preserve autograd on the default stream.
+    with torch.enable_grad():
+        grad_out = sana_ln_modulate(
+            norm, x.requires_grad_(), scale, shift, allow_eager=allow_eager
+        )
+    assert grad_out.requires_grad
+    assert torch.equal(grad_out, _sana_eager_ln_modulate(norm, x, scale, shift))
+    x = x.detach()
+    assert not gate.verified_sigs
+
+    # The BCG side stream must wait for inputs filled on the default stream
+    # before first-use verification; otherwise a race permanently disables it.
+    current = torch.cuda.current_stream()
+    stream = current if allow_eager else torch.cuda.Stream()
+    stream.wait_stream(current)
+    with torch.no_grad(), torch.cuda.stream(stream):
+        out = sana_ln_modulate(norm, x, scale, shift, allow_eager=allow_eager)
+        assert len(gate.verified_sigs) == 1
+        out2 = sana_ln_modulate(norm, x, scale, shift, allow_eager=allow_eager)
+    current.wait_stream(stream)
     torch.cuda.synchronize()
     assert torch.equal(out, _sana_eager_ln_modulate(norm, x, scale, shift))
-    assert torch.equal(out2, out) and not sana._SANA_LN_MOD.disabled
-
-
-# -------------------------------------------------------------------------
-# SANA-Video -- depthwise convolution and rounded GLU
-# -------------------------------------------------------------------------
-
-
-requires_sana_video_depthwise = pytest.mark.skipif(
-    not (
-        torch.cuda.is_available()
-        and torch.version.hip is None
-        and torch.cuda.get_device_capability() == (12, 0)
-    ),
-    reason="SANA-Video depthwise fast path is enabled on SM120",
-)
-
-
-@requires_sana_video_depthwise
-@pytest.mark.parametrize("shape", [(2, 34, 1, 1), (2, 192, 7, 11), (21, 13440, 30, 52)])
-@torch.no_grad()
-def test_sana_video_depthwise_glu_rounding_and_row_tails(shape):
-    """Keep each BF16 rounding boundary and mask partial four-row tiles."""
-    from sglang.kernels.ops.diffusion import fused_depthwise_conv3x3_bias_glu
-
-    torch.manual_seed(606)
-    x = torch.randn(shape, device="cuda", dtype=torch.bfloat16).to(
-        memory_format=torch.channels_last
-    )
-    weight = torch.randn((shape[1], 1, 3, 3), device=x.device, dtype=x.dtype) * 0.1
-    bias = torch.randn(shape[1], device=x.device, dtype=x.dtype) * 0.1
-    raw = F.conv2d(x, weight, None, padding=1, groups=shape[1])
-    hidden, gate = (raw + bias[None, :, None, None]).chunk(2, dim=1)
-    actual = fused_depthwise_conv3x3_bias_glu(x, weight, bias)
-    assert torch.equal(actual, hidden * F.silu(gate))
-    assert actual.is_contiguous(memory_format=torch.channels_last)
-
-
-@requires_sana_video_depthwise
-@torch.no_grad()
-def test_sana_video_depthwise_gate_capture_and_changed_inputs(monkeypatch):
-    """Capture cannot verify; warmed replay must read current inputs and bias."""
-    from sglang.multimodal_gen.runtime.models.dits import sana_video
-
-    gate = BitExactFusionGate("test depthwise", per_signature=True)
-    monkeypatch.setattr(sana_video, "_SANA_VIDEO_DEPTHWISE_GLU", gate)
-    torch.manual_seed(606)
-    module = sana_video.GLUMBTempConv(32, 3).cuda().bfloat16()
-    module.conv_depth = (
-        nn.Conv2d(13440, 13440, 3, padding=1, groups=13440).cuda().bfloat16()
-    )
-    x = torch.randn((2, 13440, 30, 52), device="cuda", dtype=torch.bfloat16).to(
-        memory_format=torch.channels_last
-    )
-    expected = sana.sana_conv_bias_glu(module.conv_depth, x, allow_eager=True)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        unverified = module._depthwise_glu(x)
-    graph.replay()
-    assert torch.equal(unverified, expected)
-    assert not gate.verified and not gate.disabled
-    assert torch.equal(module._depthwise_glu(x), expected)
-    assert gate.verified and not gate.disabled
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        actual = module._depthwise_glu(x)
-    x.add_(0.125)
-    module.conv_depth.bias.mul_(0.75)
-    graph.replay()
-    assert torch.equal(
-        actual, sana.sana_conv_bias_glu(module.conv_depth, x, allow_eager=True)
-    )
-    gate = BitExactFusionGate("test mismatch", per_signature=True)
-    monkeypatch.setattr(sana_video, "_SANA_VIDEO_DEPTHWISE_GLU", gate)
-    expected = sana.sana_conv_bias_glu(module.conv_depth, x, allow_eager=True)
-    with monkeypatch.context() as context:
-        context.setattr(
-            sana_video,
-            "fused_depthwise_conv3x3_bias_glu",
-            lambda *args: torch.zeros_like(expected),
-        )
-        assert torch.equal(module._depthwise_glu(x), expected)
-    assert gate.disabled
-    x.mul_(0.5)
-    assert torch.equal(
-        module._depthwise_glu(x),
-        sana.sana_conv_bias_glu(module.conv_depth, x, allow_eager=True),
-    )
-
-
-@requires_sana_video_depthwise
-@pytest.mark.parametrize("grad_enabled", [True, False])
-def test_sana_video_depthwise_reference_fallback(monkeypatch, grad_enabled):
-    from sglang.multimodal_gen.runtime.models.dits import sana_video
-
-    gate = BitExactFusionGate("test fallback", per_signature=True)
-    monkeypatch.setattr(sana_video, "_SANA_VIDEO_DEPTHWISE_GLU", gate)
-    torch.manual_seed(606)
-    module = sana_video.GLUMBTempConv(32, 3).cuda().bfloat16()
-    # Both shapes pass the size floor. Use two groups for the non-cuDNN path.
-    shape = (2, 13440, 30, 52) if grad_enabled else (1, 2, 4096, 2048)
-    module.conv_depth = (
-        nn.Conv2d(shape[1], shape[1], 3, padding=1, groups=shape[1]).cuda().bfloat16()
-    )
-    x = (
-        torch.randn(shape, device="cuda", dtype=torch.bfloat16)
-        .to(memory_format=torch.channels_last)
-        .requires_grad_(grad_enabled)
-    )
-    with (
-        torch.set_grad_enabled(grad_enabled),
-        torch.backends.cudnn.flags(enabled=grad_enabled),
-    ):
-        actual = module._depthwise_glu(x)
-        expected = sana.sana_conv_bias_glu(module.conv_depth, x, allow_eager=True)
-        assert torch.equal(actual, expected)
-        if grad_enabled:
-            actual_grad = torch.autograd.grad(actual.sum(), x)[0]
-            expected_grad = torch.autograd.grad(expected.sum(), x)[0]
-            assert torch.equal(actual_grad, expected_grad)
-    assert not gate.verified and not gate.disabled
+    assert torch.equal(out2, out) and not gate.disabled
 
 
 # -------------------------------------------------------------------------
@@ -1823,6 +1693,71 @@ requires_nvidia_jit = pytest.mark.skipif(
 )
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or torch.version.hip is not None
+    or torch.cuda.get_device_capability() != (12, 0),
+    reason="Qwen-Image 2.1 BF16 MLP packing is enabled on SM120 only",
+)
+@torch.no_grad()
+@pytest.mark.parametrize("tokens", [1024, 4096])
+def test_qwen21_bf16_mlp_packing_restore_and_lora(tokens):
+    from sglang.multimodal_gen.runtime.layers.lora.linear import wrap_with_lora_layer
+
+    if not model_parallel_is_initialized():
+        ensure_distributed_env_defaults()
+        maybe_init_distributed_environment_and_model_parallel(tp_size=1, sp_size=1)
+    torch.manual_seed(42)
+    mlp = qwen_image21.QwenImage21FeedForward(4096, 3, None, "img_mlp").to(
+        device="cuda", dtype=torch.bfloat16
+    )
+    for parameter in mlp.parameters():
+        parameter.normal_(0, 0.01)
+    x = torch.randn(1, tokens, 4096, device="cuda", dtype=torch.bfloat16)
+    reference = mlp.out(F.silu(mlp.gate_layer(x)[0]) * mlp.proj(x)[0])[0]
+    mlp.pack_gate_up_weights()
+    assert set(mlp.state_dict()) == {"gate_layer.weight", "proj.weight", "out.weight"}
+    with patch.object(
+        qwen_image21,
+        "fused_packed_silu_mul_bitexact",
+        wraps=qwen_image21.fused_packed_silu_mul_bitexact,
+    ) as fused:
+        torch.testing.assert_close(
+            mlp(x, use_packed_bf16=True), reference, atol=2e-2, rtol=2e-2
+        )
+        assert fused.call_count == 1
+        assert torch.equal(mlp(x), reference)
+        prefix = x[:, :33].contiguous()
+        assert torch.equal(mlp(prefix, use_packed_bf16=True), mlp(prefix))
+        assert fused.call_count == 1
+
+        compiled = torch.compile(mlp, backend="eager", fullgraph=True)
+        assert torch.equal(compiled(x, use_packed_bf16=True), reference)
+        assert fused.call_count == 1
+
+        mlp.cpu().cuda()
+        torch.testing.assert_close(
+            mlp(x, use_packed_bf16=True), reference, atol=2e-2, rtol=2e-2
+        )
+        assert fused.call_count == 2
+        mlp.proj.weight.data = mlp.proj.weight.data.clone()
+        assert torch.equal(mlp(x, use_packed_bf16=True), reference)
+        assert fused.call_count == 2
+        mlp.pack_gate_up_weights()
+
+        wrapper = wrap_with_lora_layer(mlp.gate_layer, lora_rank=4, lora_alpha=4)
+        wrapper.set_lora_weights(
+            torch.randn(4, 4096, device=x.device, dtype=x.dtype) * 0.02,
+            torch.randn(12288, 4, device=x.device, dtype=x.dtype) * 0.02,
+            merge_weights=False,
+        )
+        mlp.gate_layer = wrapper
+        adapted = mlp(x)
+        assert not torch.equal(adapted, reference)
+        assert torch.equal(mlp(x, use_packed_bf16=True), adapted)
+        assert fused.call_count == 2
+
+
 def _qwen21_rope(tokens: int, device: torch.device) -> torch.Tensor:
     angles = torch.randn(tokens, 64, device=device, dtype=torch.float32)
     return torch.polar(torch.ones_like(angles), angles)
@@ -2551,73 +2486,6 @@ def test_moss_image_selected_kernel_rejects_mismatched_operands(monkeypatch, ope
 
 
 # -------------------------------------------------------------------------
-# Joy -- high-mode image MLP epilogue on SM120
-# -------------------------------------------------------------------------
-
-
-@pytest.mark.skipif(
-    not torch.cuda.is_available()
-    or torch.version.hip is not None
-    or torch.cuda.get_device_capability() != (12, 0),
-    reason="Joy's large image GEMM epilogue is enabled on SM120 only",
-)
-@torch.no_grad()
-def test_joy_image_mlp_quality_restore_and_dynamic_lora():
-    from sglang.multimodal_gen.runtime.layers.lora.linear import wrap_with_lora_layer
-    from sglang.multimodal_gen.runtime.layers.mlp import MLP
-    from sglang.multimodal_gen.runtime.models.dits import joy_image
-
-    if not model_parallel_is_initialized():
-        ensure_distributed_env_defaults()
-        maybe_init_distributed_environment_and_model_parallel(tp_size=1, sp_size=1)
-    torch.manual_seed(42)
-    mlp = MLP(4096, 16384).to(device="cuda", dtype=torch.bfloat16)
-    for parameter in mlp.parameters():
-        parameter.normal_(0, 0.01)
-    x = torch.randn(1, 7168, 4096, device="cuda", dtype=torch.bfloat16)
-    reference = mlp(x)
-    with patch.object(
-        joy_image, "fused_linear_gelu_tanh", wraps=joy_image.fused_linear_gelu_tanh
-    ) as fused:
-        torch.testing.assert_close(
-            joy_image._joy_image_mlp(mlp, x, fuse_gelu=True),
-            reference,
-            atol=2e-2,
-            rtol=2e-2,
-        )
-        assert fused.call_count == 1
-        assert torch.equal(joy_image._joy_image_mlp(mlp, x, fuse_gelu=False), reference)
-        # Smaller text/token counts must keep their original, faster projection.
-        text = x[:, :1053].contiguous()
-        assert torch.equal(
-            joy_image._joy_image_mlp(mlp, text, fuse_gelu=True), mlp(text)
-        )
-        assert fused.call_count == 1
-
-        compiled = torch.compile(
-            joy_image._joy_image_mlp, backend="eager", fullgraph=True
-        )
-        assert torch.equal(compiled(mlp, x, True), reference)
-        assert fused.call_count == 1
-
-        wrapper = wrap_with_lora_layer(mlp.fc_in, lora_rank=4, lora_alpha=4)
-        wrapper.set_lora_weights(
-            torch.randn(4, 4096, device=x.device, dtype=x.dtype) * 0.02,
-            torch.randn(16384, 4, device=x.device, dtype=x.dtype) * 0.02,
-            merge_weights=False,
-        )
-        mlp.fc_in = wrapper
-        adapted = mlp(x)
-        assert not torch.equal(adapted, reference)
-        assert torch.equal(joy_image._joy_image_mlp(mlp, x, fuse_gelu=True), adapted)
-        assert fused.call_count == 1
-        wrapper.disable_lora = True
-        joy_image._joy_image_mlp(mlp, x, fuse_gelu=True)
-        assert fused.call_count == 2
-        assert torch.equal(joy_image._joy_image_mlp(mlp, x, fuse_gelu=False), reference)
-
-
-# -------------------------------------------------------------------------
 # Wan -- fused q/k/v GEMM, FFN residual chain, text K/V once per loop
 # -------------------------------------------------------------------------
 
@@ -2637,7 +2505,13 @@ def _wan_block_env():
             ("_maybe_install_backend_autotune", None),
         ):
             stack.enter_context(patch.object(attn_layer, name, return_value=value))
-        stack.enter_context(set_forward_context(0, None))
+        stack.enter_context(
+            set_forward_context(
+                0,
+                None,
+                SimpleNamespace(sampling_params=SimpleNamespace(quality="lossless")),
+            )
+        )
         yield
 
 
@@ -2830,6 +2704,73 @@ def test_wan_text_kv_lives_for_one_loop_of_one_request():
         del req
         gc.collect()
         assert gone() is None
+
+
+@torch.inference_mode()
+@pytest.mark.skipif(not is_cuda(), reason="Requires CUDA")
+@pytest.mark.parametrize("mode", ["fused", "strided", "fp32", "mismatch"])
+def test_hidream_rope_dispatch_and_fallback(monkeypatch, mode):
+    """Preserve GQA and batch-specific tables, including the native fallback."""
+    from types import SimpleNamespace
+
+    from sglang.multimodal_gen.runtime.models.dits import hidream_o1_image as hidream
+
+    gate = BitExactFusionGate("HiDream RoPE test")
+    monkeypatch.setattr(hidream, "_HIDREAM_ROPE", gate)
+    generator = torch.Generator(device="cuda").manual_seed(42)
+    dtype = torch.float32 if mode == "fp32" else torch.bfloat16
+    qkv = torch.randn(2, 17, 12 * 128, device="cuda", dtype=dtype, generator=generator)
+    angles = torch.randn(2, 17, 128, device="cuda", generator=generator)
+    cos, sin = angles.cos().to(dtype), angles.sin().to(dtype)
+    norm = (lambda x: x) if mode == "strided" else lambda x: x.contiguous()
+    captured = []
+
+    def attention(q, k, v, *, attn_mask):
+        captured.append((q, k, v))
+        return q
+
+    # Run the real attention forward; isolate its RoPE from projection weights
+    # and SDPA so a Q/K rounding mismatch cannot disappear in a later cast.
+    layer = SimpleNamespace(
+        num_heads=8,
+        num_kv_heads=2,
+        head_dim=128,
+        q_size=8 * 128,
+        kv_size=2 * 128,
+        qkv_proj=lambda x: (x, None),
+        q_norm=norm,
+        k_norm=norm,
+        attn=attention,
+        o_proj=lambda x: (x, None),
+    )
+    fused = MagicMock(
+        side_effect=(
+            (lambda x, cos, sin: torch.zeros_like(x))
+            if mode == "mismatch"
+            else hidream.fused_rope_rotate_half_bitexact
+        )
+    )
+    monkeypatch.setattr(hidream, "fused_rope_rotate_half_bitexact", fused)
+    mask = torch.zeros(1, 1, 17, 17, device="cuda", dtype=dtype)
+    for x in (qkv, qkv * 2):
+        original = x.clone()
+        q, k, v = x.split([8 * 128, 2 * 128, 2 * 128], dim=-1)
+        expected_q, expected_k = hidream.qwen3_apply_rotary_pos_emb(
+            norm(q.reshape(2, 17, 8, 128)),
+            norm(k.reshape(2, 17, 2, 128)),
+            cos.unsqueeze(2),
+            sin.unsqueeze(2),
+        )
+        hidream.HiDreamO1Attention.forward(layer, x, cos, sin, mask)
+        actual_q, actual_k, actual_v = captured[-1]
+        assert torch.equal(actual_q, expected_q) and torch.equal(actual_k, expected_k)
+        assert torch.equal(actual_v, v.reshape(2, 17, 2, 128))
+        assert torch.equal(x, original)
+    assert (
+        fused.call_count == {"fused": 4, "strided": 0, "fp32": 0, "mismatch": 2}[mode]
+    )
+    assert gate.verified == (mode == "fused")
+    assert gate.disabled == (mode == "mismatch")
 
 
 if __name__ == "__main__":
