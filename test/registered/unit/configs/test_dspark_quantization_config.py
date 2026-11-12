@@ -15,7 +15,7 @@ from pathlib import Path
 import torch
 from transformers import GlmMoeDsaConfig
 
-from sglang.srt.arg_groups.overrides import resolving_view
+from sglang.srt.arg_groups.model_override_base import resolving_view
 from sglang.srt.arg_groups.serving_hook import handle_missing_default_values
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.environ import EnvField, envs
