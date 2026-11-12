@@ -23,14 +23,9 @@ def _get_loop_num(hf_config: Any) -> int:
 
 
 def compute_attention_and_moe_layers(layer_model: Any) -> AttentionAndMoeLayers:
-    """Find each layer's attention module, MoE block and DSA indexer.
-
-    Attention modules are found at known attribute paths (e.g.
-    ``layers[i].self_attn.attn``). If ``layer_model`` (the module that owns
-    ``layers``) defines ``get_attention_layers()``, its list is used instead:
-    one attention module (or None) per entry of ``layers``. MoE blocks and DSA
-    indexers are always found by attribute path.
-    """
+    """``layer_model`` (the module owning ``layers``) may define
+    ``get_attention_layers()``, returning one attention module (or None) per
+    layer, in place of the attribute-path lookup of attention modules."""
     attention_layers: list[Any] = []
     moe_layers: list[Any] = []
     moe_fusions: list[Any] = []
