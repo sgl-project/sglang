@@ -555,6 +555,7 @@ class DSparkWorkerV2(BaseSpecWorker):
 
     def _on_prefill_target_hidden(self, batch, target_hidden):
         pass
+
     def _build_acceptance_estimator(self) -> Optional[OnlineAcceptanceEstimator]:
         if (
             read_ragged_verify_mode() is RaggedVerifyMode.STATIC

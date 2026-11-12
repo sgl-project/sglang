@@ -426,6 +426,8 @@ def _build_kimi_k3(ctx: ChatEncodingAdapterContext) -> ChatEncodingAdapter:
     return KimiK3ChatEncodingAdapter(
         tokenizer=ctx.tokenizer, hf_config=ctx.hf_config, chat_hooks=ctx.chat_hooks
     )
+
+
 def _build_inkling2(ctx: ChatEncodingAdapterContext) -> Optional[ChatEncodingAdapter]:
     if ctx.tokenizer is None:
         return None  # --skip-tokenizer-init: the server encodes no chat prompts.
