@@ -194,6 +194,7 @@ from sglang.srt.managers.io_struct import (
     PluginWeightUpdateReqInput,
     ProfileReq,
     ReleaseMemoryOccupationReqInput,
+    ReleaseMemoryOccupationReqOutput,
     ReleaseUocrDocReqInput,
     RemoveExternalCorpusReqInput,
     RemoveExternalCorpusReqOutput,
@@ -1630,11 +1631,14 @@ class Scheduler(
                 transfer_backend=self.transfer_backend,
             )
 
-        draft_token_to_kv_pool = (
-            self.draft_worker.primary_draft_kv_pool
-            if self.draft_worker is not None
-            else None
-        )
+        # A DFLASH draft KV ring is sent as its own state, not as draft KV pages.
+        draft_kv_ring = None
+        draft_token_to_kv_pool = None
+        if self.draft_worker is not None:
+            if get_spec().speculative_dflash_draft_kv_ring:
+                draft_kv_ring = self.draft_worker.draft_kv_ring
+            else:
+                draft_token_to_kv_pool = self.draft_worker.primary_draft_kv_pool
 
         if self.spec_algorithm.carries_draft_hidden_states():
             # Derive the rank-uniform PD wire schema from config because only the
@@ -1703,6 +1707,7 @@ class Scheduler(
                 max_total_num_tokens=self.max_total_num_tokens,
                 num_reserved_decode_tokens=get_disagg().num_reserved_decode_tokens,
                 transfer_backend=self.transfer_backend,
+                draft_kv_ring=draft_kv_ring,
             )
 
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -1732,6 +1737,7 @@ class Scheduler(
                 scheduler=self,
                 scheduler_stage_metrics=self.scheduler_stage_metrics,
                 transfer_backend=self.transfer_backend,
+                draft_kv_ring=draft_kv_ring,
             )
             self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
 
@@ -2361,6 +2367,11 @@ class Scheduler(
                 if self.rust_server is None and isinstance(output, RpcReqOutput):
                     if self.ipc_channels.recv_from_rpc is not None:
                         sock_send(self.ipc_channels.recv_from_rpc, output)
+                elif get_parallel().pp_size > 1 and isinstance(
+                    output, ReleaseMemoryOccupationReqOutput
+                ):
+                    # Answered by the first stage once every stage has released.
+                    self._pp_pass_release_verdict(output, recv_req)
                 else:
                     self.send_control_output(output, recv_req)
 
