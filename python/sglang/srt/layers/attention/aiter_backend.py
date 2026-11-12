@@ -1598,7 +1598,7 @@ class AiterAttnBackend(AttentionBackend):
         """Convert ragged token-level KV indices to a dense block page table."""
         page_size = self.page_size
         if max_blocks is None:
-            max_blocks = (self.max_context_len + page_size - 1) // page_size
+            max_blocks = self._unified_page_table_blocks()
 
         swa_slot_mapping = None
         swa_page_table = None
@@ -1638,6 +1638,19 @@ class AiterAttnBackend(AttentionBackend):
         )
 
         return page_table, swa_page_table
+
+    def _unified_page_table_blocks(self) -> int:
+        """Columns of a unified_attention page table that must hold any request.
+
+        A request row in req_to_token is wider than context_len: it also holds
+        the speculative tokens of a verify step, so seq_len + draft tokens can
+        exceed context_len near the end of a request. Size the page tables by
+        the req_to_token row, which is the most a request can address.
+        """
+        max_kv_len = self.max_context_len
+        if self.req_to_token is not None:
+            max_kv_len = max(max_kv_len, self.req_to_token.shape[1])
+        return (max_kv_len + self.page_size - 1) // self.page_size
 
     def _build_unified_page_table_from_spec(
         self,
@@ -1681,7 +1694,7 @@ class AiterAttnBackend(AttentionBackend):
         )
 
         page_size = self.page_size
-        max_blocks = (self.max_context_len + page_size - 1) // page_size
+        max_blocks = self._unified_page_table_blocks()
 
         swa_slot_mapping = None
         swa_page_table = None
@@ -3635,9 +3648,7 @@ class AiterAttnBackend(AttentionBackend):
             # unified target_verify.  Sharing cuda_graph_kv_indices with flat
             # per-token indices makes page-table width ambiguous after the
             # token buffer is expanded.
-            max_num_blocks_per_seq = (
-                self.max_context_len + self.page_size - 1
-            ) // self.page_size
+            max_num_blocks_per_seq = self._unified_page_table_blocks()
             self.cuda_graph_page_table = torch.zeros(
                 (max_bs, max_num_blocks_per_seq),
                 dtype=torch.int32,
@@ -3733,9 +3744,7 @@ class AiterAttnBackend(AttentionBackend):
             self.reduce_partial_map = None
 
         if self.use_sliding_window_kv_pool:
-            max_num_blocks_per_seq = (
-                self.max_context_len + self.page_size - 1
-            ) // self.page_size
+            max_num_blocks_per_seq = self._unified_page_table_blocks()
             self.cuda_graph_swa_page_table = torch.zeros(
                 (max_bs, max_num_blocks_per_seq),
                 dtype=torch.int32,
@@ -4129,9 +4138,7 @@ class AiterAttnBackend(AttentionBackend):
             else:
                 max_q_len = verify_tokens_per_req
                 if self._use_unified_verify:
-                    max_num_blocks_per_seq = (
-                        self.max_context_len + self.page_size - 1
-                    ) // self.page_size
+                    max_num_blocks_per_seq = self._unified_page_table_blocks()
                     page_table = self.cuda_graph_page_table[:bs]
 
                     swa_page_table = None
