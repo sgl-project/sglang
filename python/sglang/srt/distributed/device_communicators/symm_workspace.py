@@ -419,17 +419,21 @@ def v2_push_slot_bytes(group: ProcessGroup) -> Optional[int]:
 
 
 def is_multicast_supported(group: ProcessGroup, device: torch.device) -> bool:
-    """Whether a symmetric allocation on ``group`` gets a multicast mapping on every
-    rank (collective, cached); callers may branch on it at model construction.
+    """Whether ``group`` can host a symmetric workspace whose allocation gets a
+    multicast mapping on every rank (collective, cached); callers may branch on it at
+    model construction.
 
     Measured once with a small probe allocation: a device can report multicast support
     that the driver then refuses to map (seen on H100 TP2).
     """
     name = group.group_name
     if name not in _MULTICAST:
-        supported = _on_all_ranks(
-            group, not _is_hip() and _device_has_multicast(device)
-        )
+        # no probe on a group that cannot host a workspace (e.g. two nodes outside one
+        # NVLink clique): its rendezvous would fail; folded into the vote so every rank
+        # takes the same branch
+        local = is_symm_workspace_supported(group, device)
+        local = local and not _is_hip() and _device_has_multicast(device)
+        supported = _on_all_ranks(group, local)
         if supported:
             probe = SymmetricBuffer(group, device, _ALIGN_BYTES)
             supported = _on_all_ranks(group, probe.multicast_ptr != 0)
