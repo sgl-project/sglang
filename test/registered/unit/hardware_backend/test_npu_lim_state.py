@@ -11,7 +11,7 @@ from sglang.kernels.ops.attention.npu_lim import (
     load_fused_lim_operator,
 )
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.mtp import (
-    prepare_mtp_rows,
+    mtp_row_geometry,
 )
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.prefill_kv_plan import (
     prepare_prefill_gather_rows,
@@ -24,10 +24,7 @@ register_cpu_ci(est_time=3, stage="base-a", runner_config="cpu")
 
 
 class TestLIMState(CustomTestCase):
-    def test_mtp_absolute_positions_and_draft_extend_padding(self):
-        # Prefix lengths are unchanged across draft steps. Using seq_lens-1
-        # would overwrite a committed token, and padded extend columns must
-        # not overwrite a future token with their duplicate/dummy positions.
+    def test_mtp_row_geometry(self):
         batch = SimpleNamespace(
             forward_mode=ForwardMode.DECODE,
             req_pool_indices=torch.tensor([2, 0, 4, 1]),
@@ -36,20 +33,13 @@ class TestLIMState(CustomTestCase):
             out_cache_loc=torch.tensor([100, 0, 102, 103]),
             spec_info=SimpleNamespace(num_accept_tokens=torch.tensor([1, 3, 0, 2])),
         )
-        _, positions, valid = prepare_mtp_rows(batch, 4, 4, 64)
-        self.assertEqual(positions[valid].tolist(), [12, 22])
+        self.assertEqual(mtp_row_geometry(batch, 4), (4, 1, 4))
         batch.forward_mode = ForwardMode.TARGET_VERIFY
         batch.positions = torch.tensor([10, 11, 12, 0, 0, 0, 8, 9, 10, 20, 21, 22])
         batch.out_cache_loc = torch.arange(12)
-        requests, positions, valid = prepare_mtp_rows(batch, 12, 4, 64)
-        self.assertEqual(requests[valid].tolist(), [2, 2, 2, 1, 1, 1])
-        self.assertEqual(positions[valid].tolist(), [10, 11, 12, 20, 21, 22])
+        self.assertEqual(mtp_row_geometry(batch, 12), (4, 3, 12))
         batch.forward_mode = ForwardMode.DRAFT_EXTEND_V2
-        _, positions, valid = prepare_mtp_rows(batch, 12, 4, 64)
-        self.assertEqual(positions[valid].tolist(), [10, 20, 21])
-        batch.out_cache_loc[10] = -1
-        _, positions, valid = prepare_mtp_rows(batch, 12, 4, 64)
-        self.assertEqual(positions[valid].tolist(), [10, 20])
+        self.assertEqual(mtp_row_geometry(batch, 12), (4, 3, 12))
 
     def test_prefill_gather_shape_ignores_padding_and_checks_host_bounds(self):
         # Host row order and total must match the ragged KV payload, including

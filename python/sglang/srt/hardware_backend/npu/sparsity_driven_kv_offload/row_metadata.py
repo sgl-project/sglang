@@ -2,17 +2,8 @@
 
 from __future__ import annotations
 
-import importlib
-from functools import lru_cache
-
 import torch
-
-
-@lru_cache(maxsize=1)
-def _kernel_module():
-    return importlib.import_module(
-        "sgl_kernel_npu.sparsity_driven_kv_offload.row_metadata"
-    )
+from sgl_kernel_npu.sparsity_driven_kv_offload import row_metadata as kernels
 
 
 def mtp_rows(
@@ -30,7 +21,7 @@ def mtp_rows(
         if batch.forward_mode.is_draft_extend_v2()
         else None
     )
-    return _kernel_module().mtp_rows(
+    return kernels.mtp_rows(
         batch.req_pool_indices,
         batch.seq_lens,
         batch.positions,
@@ -65,7 +56,7 @@ def mtp_publication_rows(batch, num_tokens, request_rows, context_len, host_capa
 
 def prefill_plan(batch, manager, total):
     """Keep CPU-derived output sizing outside the tensor-only device operator."""
-    return _kernel_module().prefill_plan(
+    return kernels.prefill_plan(
         batch.req_pool_indices,
         batch.seq_lens,
         manager.req_to_token_pool.req_to_token,
@@ -95,7 +86,7 @@ def prefill_current_mapping(
     metadata = torch.tensor(
         ends + starts + prefixes + live_ends, device=device, dtype=torch.long
     )
-    return _kernel_module().prefill_current_mapping(
+    return kernels.prefill_current_mapping(
         plan.source,
         locations,
         current_valid,
@@ -108,6 +99,6 @@ def prefill_current_mapping(
 
 def copy_rows_metadata(sources, destinations, source_rows, destination_rows, valid):
     """Build descriptors through the matching companion kernel package."""
-    return _kernel_module().copy_rows_metadata(
+    return kernels.copy_rows_metadata(
         sources, destinations, source_rows, destination_rows, valid
     )

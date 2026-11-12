@@ -15,7 +15,7 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_lim import
     LIMDecodeAdapter,
 )
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.mtp import (
-    prepare_mtp_rows,
+    mtp_row_geometry,
     sparse_query_width,
 )
 from sglang.srt.model_executor.forward_mode import ForwardMode
@@ -444,10 +444,7 @@ class TestLIMState(CustomTestCase):
                 ),
                 out_cache_loc=torch.tensor(list(range(width)) + [-1] * (count - width)),
             )
-            req, pos, valid = prepare_mtp_rows(batch, count, 3, 1024)
-            self.assertEqual(pos.shape, (2, width))
-            self.assertEqual(pos[valid].tolist(), list(range(100, 100 + width)))
-            self.assertEqual(req[valid].tolist(), [1] * width)
+            self.assertEqual(mtp_row_geometry(batch, count), (2, width, 2 * width))
 
 
 if __name__ == "__main__":

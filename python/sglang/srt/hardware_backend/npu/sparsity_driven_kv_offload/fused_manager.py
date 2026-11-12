@@ -6,9 +6,7 @@ import logging
 from typing import TYPE_CHECKING, List, Optional, Union
 
 import torch
-from sgl_kernel_npu.sparsity_driven_kv_offload import (
-    unidex_copy_inplace,
-)
+from sgl_kernel_npu.sparsity_driven_kv_offload import unidex_copy_inplace
 from sgl_kernel_npu.sparsity_driven_kv_offload.fused_shm import (
     create_fused_shm_tensor as create_shm_tensor,
 )
@@ -21,19 +19,13 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
     use_pd_split_kv,
 )
-from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.mtp import (
-    prepare_mtp_rows,
-)
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.prefill_kv_plan import (
     fused_prefill_current_mapping,
     make_fused_prefill_plan,
     prepare_prefill_gather_rows,
 )
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-from sglang.srt.mem_cache.memory_pool import (
-    MLATokenToKVPool,
-    ReqToTokenPool,
-)
+from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool, ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import get_disagg, get_parallel
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
@@ -413,10 +405,7 @@ class FusedSparseKVCacheManager:
         src_tensor = torch.cat([k, k_rope], dim=-1).contiguous()
         dst_tensor = self.host_kv_buffer[layer_idx] if self.host_pool is None else None
         num_src_kvs = int(src_tensor.shape[0])
-        fused_mtp_rows = (
-            device.type == "npu"
-            and not forward_batch.forward_mode.is_extend_without_speculative()
-        )
+        fused_mtp_rows = not forward_batch.forward_mode.is_extend_without_speculative()
         if not fused_mtp_rows:
             src_index = torch.arange(num_src_kvs, device=device, dtype=torch.long)
 
@@ -432,22 +421,6 @@ class FusedSparseKVCacheManager:
                 self.logical_max_context_len,
                 self.host_token_capacity,
             )
-        elif not forward_batch.forward_mode.is_extend_without_speculative():
-            req_ids, token_pos, valid_mask = prepare_mtp_rows(
-                forward_batch, num_src_kvs, self.size, self.logical_max_context_len
-            )
-            token_to_slots = req_ids.reshape(-1).contiguous()
-            token_positions = token_pos.reshape(-1).contiguous()
-            valid_mask = valid_mask.reshape(-1).contiguous()
-            # TP token padding is a suffix, independent of the request window.
-            padding = num_src_kvs - token_to_slots.numel()
-            token_to_slots = torch.nn.functional.pad(
-                token_to_slots, (0, padding), value=0
-            )
-            token_positions = torch.nn.functional.pad(
-                token_positions, (0, padding), value=-1
-            )
-            valid_mask = torch.nn.functional.pad(valid_mask, (0, padding), value=False)
         else:
             if (
                 forward_batch.extend_seq_lens is None

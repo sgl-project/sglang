@@ -54,7 +54,7 @@ class FusedPrefillPlan:
 
 
 def make_fused_prefill_plan(batch, manager, stream, *, prepared=None):
-    keep, total = (
+    _, total = (
         prepare_prefill_gather_rows(
             batch.req_pool_indices_cpu,
             batch.seq_lens_cpu,
@@ -69,35 +69,12 @@ def make_fused_prefill_plan(batch, manager, stream, *, prepared=None):
         or batch.req_pool_indices.numel() != batch.req_pool_indices_cpu.numel()
     ):
         raise RuntimeError("Prefill CPU and device metadata must have matching sizes")
-    device = manager.device
-    if torch.device(device).type == "npu":
-        from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.row_metadata import (
-            prefill_plan,
-        )
+    from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.row_metadata import (
+        prefill_plan,
+    )
 
-        source, destination, valid = prefill_plan(batch, manager, total)
-        return FusedPrefillPlan(stream, total, source, destination, valid)
-    req_pool_indices = batch.req_pool_indices.to(device=device, dtype=torch.long)
-    lengths = batch.seq_lens.to(device=device, dtype=torch.long)
-    if keep.numel() != req_pool_indices.numel():
-        keep = keep.to(device=device, dtype=torch.long, non_blocking=True)
-        req_pool_indices = req_pool_indices.index_select(0, keep)
-        lengths = lengths.index_select(0, keep)
-    starts = torch.cumsum(lengths, 0) - lengths
-    token_to_slots = torch.repeat_interleave(
-        req_pool_indices, lengths, output_size=total
-    )
-    starts = torch.repeat_interleave(starts, lengths, output_size=total)
-    destination = torch.arange(total, device=device, dtype=torch.long)
-    token_positions = destination - starts
-    source = manager.host_source_indices(token_to_slots, token_positions).contiguous()
-    return FusedPrefillPlan(
-        stream,
-        total,
-        source,
-        destination,
-        torch.ones(total, device=device, dtype=torch.bool),
-    )
+    source, destination, valid = prefill_plan(batch, manager, total)
+    return FusedPrefillPlan(stream, total, source, destination, valid)
 
 
 def fused_prefill_current_mapping(plan, batch, current_valid, host_token_capacity):
@@ -136,55 +113,18 @@ def fused_prefill_current_mapping(plan, batch, current_valid, host_token_capacit
         slots = [rows // n] * n
     else:
         return None
-    if plan.source.device.type == "npu":
-        from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.row_metadata import (
-            prefill_current_mapping,
-        )
+    from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.row_metadata import (
+        prefill_current_mapping,
+    )
 
-        return prefill_current_mapping(
-            plan,
-            batch,
-            current_valid,
-            host_token_capacity,
-            slots,
-            requests,
-            lens,
-            prefixes,
-            counts,
-        )
-    dest, eligible = [], []
-    offset = 0
-    for req_id, length, pre, ext_len, width in zip(
-        requests, lens, prefixes, counts, slots
-    ):
-        for local in range(width):
-            is_valid = req_id > 0 and length > 0 and local < ext_len
-            dest.append(offset + pre + local if is_valid else 0)
-            eligible.append(is_valid)
-        if req_id >= 0 and length > 0:
-            offset += length
-    device = plan.source.device
-    dst = torch.tensor(dest, device=device, dtype=torch.long)
-    eligible = torch.tensor(eligible, device=device, dtype=torch.bool)
-    physical = loc.to(device=device, dtype=torch.long).reshape(-1)
-    valid = (
-        eligible & current_valid & (physical >= 0) & (physical < host_token_capacity)
-    )
-    safe_physical = physical.clamp(0, host_token_capacity - 1)
-    counts_by_physical = torch.zeros(
-        host_token_capacity, device=device, dtype=torch.int32
-    )
-    counts_by_physical.scatter_add_(0, safe_physical, valid.to(torch.int32))
-    valid = (
-        valid
-        & (counts_by_physical[safe_physical] == 1)
-        & (plan.source[dst] == physical)
-    )
-    occupied = torch.zeros(plan.total_tokens, device=device, dtype=torch.int32)
-    occupied.scatter_add_(0, dst, valid.to(torch.int32))
-    return (
-        torch.arange(rows, device=device, dtype=torch.long),
-        dst,
-        valid.contiguous(),
-        (occupied == 0).contiguous(),
+    return prefill_current_mapping(
+        plan,
+        batch,
+        current_valid,
+        host_token_capacity,
+        slots,
+        requests,
+        lens,
+        prefixes,
+        counts,
     )

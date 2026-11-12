@@ -4,7 +4,8 @@ import importlib.util
 import sys
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -19,7 +20,44 @@ sys.modules[spec.name] = module
 spec.loader.exec_module(module)
 
 
-class TestPhysicalPrefillPlan(unittest.TestCase):
+class PrefillReferenceTest(unittest.TestCase):
+    def setUp(self):
+        # Exercise framework planning on CPU; device kernel parity is tested by
+        # test_sparse_kv_row_metadata.py and the companion NPU kernel tests.
+        reference_path = (
+            PATH.parents[6] / "test/manual/npu/test_sparse_kv_row_metadata.py"
+        )
+        reference_spec = importlib.util.spec_from_file_location(
+            "row_metadata_test_reference", reference_path
+        )
+        reference = importlib.util.module_from_spec(reference_spec)
+        reference_spec.loader.exec_module(reference)
+        adapter = ModuleType("row_metadata_test_adapter")
+
+        def prefill_plan(batch, manager, total):
+            rows, positions = [], []
+            for req, length in zip(batch.req_pool_indices_cpu, batch.seq_lens_cpu):
+                if req >= 0 and length > 0:
+                    rows.extend([int(req)] * int(length))
+                    positions.extend(range(int(length)))
+            source = manager.host_source_indices(
+                torch.tensor(rows), torch.tensor(positions)
+            )
+            return source, torch.arange(total), torch.ones(total, dtype=torch.bool)
+
+        adapter.prefill_plan = prefill_plan
+        adapter.prefill_current_mapping = reference.mapping_reference
+        self.enterContext(
+            patch.dict(
+                sys.modules,
+                {
+                    "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.row_metadata": adapter
+                },
+            )
+        )
+
+
+class TestPhysicalPrefillPlan(PrefillReferenceTest):
     def check_case(
         self,
         request_map,
@@ -150,7 +188,7 @@ class TestPhysicalPrefillPlan(unittest.TestCase):
         self.assertIsNone(mapping)
 
 
-class TestWorkspaceLifecycle(unittest.TestCase):
+class TestWorkspaceLifecycle(PrefillReferenceTest):
     @classmethod
     def setUpClass(cls):
         manager_path = PATH.parent / "fused_manager.py"
