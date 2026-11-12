@@ -1639,7 +1639,12 @@ class ModelRunner:
 
     def configure_kv_cache_dtype(self):
         spec_algorithm = getattr(self, "spec_algorithm", None)
-        resolved_kv_cache_dtype, self.kv_cache_dtype = (
+        # This runner's OWN resolved dtype label (target or draft), resolved
+        # with its torch dtype. Attention backends read it directly instead of
+        # the process-global get_model() bag: a draft runner does not publish
+        # its args, so the bag would carry the target's dtype and mis-drive
+        # the draft's FP8 cast/descale paths.
+        self.kv_cache_dtype_str, self.kv_cache_dtype = (
             kv_cache_dtype.configure_kv_cache_dtype(
                 server_args_kv_cache_dtype=get_model().kv_cache_dtype,
                 quant_config=getattr(
@@ -1655,15 +1660,6 @@ class ModelRunner:
                 speculative_draft_attention_backend=self.draft_attention_backend,
                 speculative_draft_kv_cache_dtype=get_spec().speculative_draft_kv_cache_dtype,
             )
-        )
-        # This runner's OWN resolved dtype string (target or draft). Attention
-        # backends read it directly instead of the process-global get_model()
-        # bag: a draft runner does not publish its args, so the bag would carry
-        # the target's dtype and mis-drive the draft's FP8 cast/descale paths.
-        self.kv_cache_dtype_str = (
-            resolved_kv_cache_dtype
-            if resolved_kv_cache_dtype is not None
-            else get_model().kv_cache_dtype
         )
 
     def _get_attention_backend(self, init_new_workspace: bool = False):

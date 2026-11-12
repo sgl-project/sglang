@@ -31,19 +31,22 @@ def configure_kv_cache_dtype(
     is_dflash: bool,
     speculative_draft_attention_backend: str,
     speculative_draft_kv_cache_dtype: Optional[str] = None,
-) -> tuple[Optional[str], torch.dtype]:
-    """The KV cache dtype a runner stores, as its string and its torch dtype.
+) -> tuple[str, torch.dtype]:
+    """The KV cache dtype a runner stores, as its label and its torch dtype.
 
     ``auto`` resolves from ``quant_config``, the quantization config the
     runner's model keeps (its ``quant_config``): FP8 when it declares an FP8 KV
     cache, else ``model_dtype``. A draft runner's own flag, when given, replaces
     the target's.
+
+    The label is resolved with the dtype: an explicit flag labels itself, an
+    ``auto`` that resolves to FP8 is labelled by that FP8 dtype, and a pool in
+    the compute dtype is labelled ``"auto"`` (backends gate their FP8 casts and
+    descales on that label).
     """
-    resolved_kv_cache_dtype: Optional[str] = None
     if is_draft_worker and speculative_draft_kv_cache_dtype is not None:
         server_args_kv_cache_dtype = speculative_draft_kv_cache_dtype
-        if server_args_kv_cache_dtype != "auto":
-            resolved_kv_cache_dtype = server_args_kv_cache_dtype
+    kv_cache_dtype_str = server_args_kv_cache_dtype
     if server_args_kv_cache_dtype == "auto":
         kv_cache_quant_algo = getattr(quant_config, "kv_cache_quant_algo", None)
         if (
@@ -51,8 +54,9 @@ def configure_kv_cache_dtype(
             and kv_cache_quant_algo.upper() == "FP8"
         ):
             kv_cache_dtype = fp8_dtype if _is_hip else torch.float8_e4m3fn
-            resolved_kv_cache_dtype = TORCH_DTYPE_TO_KV_CACHE_STR[kv_cache_dtype]
+            kv_cache_dtype_str = TORCH_DTYPE_TO_KV_CACHE_STR[kv_cache_dtype]
         else:
+            # Unquantized: the label stays "auto".
             kv_cache_dtype = model_dtype
     elif server_args_kv_cache_dtype == "fp8_e5m2":
         if current_platform.is_cpu():
@@ -102,6 +106,6 @@ def configure_kv_cache_dtype(
         )
         kv_cache_dtype = model_dtype
         # "auto" is the tag for an unquantized pool; backends gate descale on it.
-        resolved_kv_cache_dtype = "auto"
+        kv_cache_dtype_str = "auto"
 
-    return resolved_kv_cache_dtype, kv_cache_dtype
+    return kv_cache_dtype_str, kv_cache_dtype
