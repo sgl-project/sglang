@@ -328,36 +328,6 @@ def run_command(command: list[str]) -> bool:
     return False
 
 
-# ---------------------------------------------------------------------------
-# GPU memory helpers (nvidia-smi)
-# ---------------------------------------------------------------------------
-
-
-def query_gpu_mem_used_mib(gpu_index: int = 0, required: bool = False) -> int | None:
-    """Return GPU memory usage in MiB via ``nvidia-smi``, or *None* on failure.
-
-    When *required* is ``True`` the function raises instead of returning ``None``.
-    """
-    try:
-        out = subprocess.check_output(
-            [
-                "nvidia-smi",
-                f"--id={gpu_index}",
-                "--query-gpu=memory.used",
-                "--format=csv,noheader,nounits",
-            ],
-            text=True,
-        ).strip()
-        return int(out.splitlines()[0].strip())
-    except Exception as e:
-        logger.warning(f"nvidia-smi memory query failed: {type(e).__name__}: {e}")
-        assert not required, (
-            "nvidia-smi memory query is unavailable; "
-            "cannot enforce GPU memory assertions."
-        )
-        return None
-
-
 def is_mp4(data: bytes) -> bool:
     """Check if data represents a valid MP4 file by magic bytes."""
     if len(data) < 8:
