@@ -301,7 +301,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     num_prefilled_input_skips = 0
     # SGLANG_OPT_SKIP_GLUED_REPLAY_VIEW, read in __init__.
     _skip_glued_replay_view = False
-    # SGLANG_OPT_DSV41_DSPARK_VERIFY_IDS_IN_PLACE: input_ids kept out of the shared pool.
+    # input_ids kept out of the shared pool: the DSpark draft graph may write the verify
+    # ids straight into it (the early verify metadata runner only).
     private_input_ids = False
 
     def __init__(
@@ -575,16 +576,15 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             aux_hidden_states_width=self.model_runner.get_aux_hidden_states_width(),
         )
         # The early verify metadata writes these slots beside the draft graph, which
-        # must not share their storage through the process-wide pool; with the verify
-        # ids in place the draft graph writes input_ids, which its own inputs may not
-        # alias.
-        exclude = STAGED_SLOTS if self._wants_early_verify_metadata() else frozenset()
-        self.private_input_ids = (
-            bool(exclude) and envs.SGLANG_OPT_DSV41_DSPARK_VERIFY_IDS_IN_PLACE.get()
+        # must not share their storage through the process-wide pool. Nor may input_ids,
+        # which the DSpark draft graph may write the verify ids into: its own inputs
+        # must not alias it.
+        self.private_input_ids = self._wants_early_verify_metadata()
+        self.buffers.share_buffers(
+            exclude=(
+                STAGED_SLOTS | {"input_ids"} if self.private_input_ids else frozenset()
+            )
         )
-        if self.private_input_ids:
-            exclude = exclude | {"input_ids"}
-        self.buffers.share_buffers(exclude=exclude)
         # FB-shared slot registry adopting DecodeInputBuffers storage (same
         # physical tensors, stable data_ptr for capture vs replay). Provides
         # the unified fill_from / slot access surface for capture/replay.

@@ -607,15 +607,11 @@ class DsparkVerifyEpilogue:
         accept_tail_max_bs: int = 0,
         deferred_draft_kv: Optional[DeferredDraftKVStore] = None,
         post_fold: bool = False,
-        greedy_commit_tail: bool = False,
     ) -> None:
         self.max_bs = int(max_bs)
         # SGLANG_OPT_DSV41_DSPARK_POST_FOLD: static graphs also scatter new seq lens
         # and the bonus into the FutureMap's slots; built at the first warmup.
         self._post_fold = bool(post_fold)
-        # SGLANG_OPT_DSV41_DSPARK_GREEDY_COMMIT_TAIL: the fused greedy accept tail also
-        # runs run_static's relay scatter, engram history commit and draft KV staging.
-        self._greedy_commit_tail = bool(greedy_commit_tail)
         self.future_relay: Optional[FutureRelayBuffers] = None
         # SGLANG_DSPARK_DEFER_CONTEXT_KV: static graphs join its forked projection and
         # stage its stores; the next draft forward runs them.
@@ -769,9 +765,12 @@ class DsparkVerifyEpilogue:
         bs = io.candidates.shape[0]
         verify_lens = self.verify_lens_buf[:bs]
         folds = self.folds_commit
+        # The fused greedy accept tail also runs the commits below in its launch. The
+        # verify graph records this greedy epilogue for every step, so a sampled step
+        # (gate 0) runs it too before its own accept replays the commits.
         commit_tail = (
             self._commit_tail_plan(io, folds=folds, kv_projected=kv_projected)
-            if accept == self._accept_static_greedy and self._serves_commit_tail(bs)
+            if accept == self._accept_static_greedy and self._serves_accept_tail(bs)
             else None
         )
         if commit_tail is not None:
@@ -848,9 +847,6 @@ class DsparkVerifyEpilogue:
         return CommitTail(
             req_slots=io.req_pool_indices, history=self.engram_history(), stage=stage
         )
-
-    def _serves_commit_tail(self, bs: int) -> bool:
-        return self._greedy_commit_tail and self._serves_accept_tail(bs)
 
     def _accept_static_greedy(
         self,

@@ -462,7 +462,6 @@ class DSparkWorkerV2(BaseSpecWorker):
                     static_epilogue_supported
                     and envs.SGLANG_OPT_DSV41_DSPARK_POST_FOLD.get()
                 ),
-                greedy_commit_tail=envs.SGLANG_OPT_DSV41_DSPARK_GREEDY_COMMIT_TAIL.get(),
                 commit_ctx=CommitInjectCtx(
                     draft_model=self.draft_model,
                     block_pos_offsets=self._block_pos_offsets,
@@ -711,12 +710,9 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
     def _target_verify_input_ids(self) -> Optional[torch.Tensor]:
-        """SGLANG_OPT_DSV41_DSPARK_VERIFY_IDS_IN_PLACE: the target verify graphs'
-        input_ids slot as the mid fold's [max_bs, gamma + 1] verify ids, or None."""
-        if not (
-            envs.SGLANG_OPT_DSV41_DSPARK_VERIFY_IDS_IN_PLACE.get()
-            and envs.SGLANG_OPT_DSV41_DSPARK_MID_FOLD.get()
-        ):
+        """The target verify graphs' input_ids slot as the mid fold's
+        [max_bs, gamma + 1] verify ids, so the verify replay copies none; or None."""
+        if not envs.SGLANG_OPT_DSV41_DSPARK_MID_FOLD.get():
             return None
         runner = self.target_worker.model_runner.decode_cuda_graph_runner
         max_bs = max(get_exec().graph.cuda_graph_config.decode.bs)
@@ -736,7 +732,11 @@ class DSparkWorkerV2(BaseSpecWorker):
         if self._target_tp_rank == 0:
             logger.info(
                 "DSpark verify ids written in place into the verify graph inputs: %s.",
-                "on" if eligible else "off (the verify graph layout differs)",
+                (
+                    "on"
+                    if eligible
+                    else "off (no private input_ids slot of the verify layout)"
+                ),
             )
         if not eligible:
             return None

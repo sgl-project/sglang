@@ -7,7 +7,10 @@ import unittest
 
 import torch
 
-from sglang.kernels.ops.speculative.gather_spec_extras import gather_spec_extras
+from sglang.kernels.ops.speculative.gather_spec_extras import (
+    gather_seq_lens_and_bonus,
+    gather_spec_extras,
+)
 from sglang.test.test_utils import CustomTestCase
 
 _OUTPUT_NAMES = ("topk_p", "topk_index", "bonus_tokens", "hidden_states")
@@ -209,6 +212,16 @@ class TestGatherSpecExtras(CustomTestCase):
                 buf.data_ptr(),
                 f"{name} output aliases its source buffer",
             )
+
+    def test_seq_lens_and_bonus_match_index_gather(self):
+        # The spec v2 relay resolve: int32, strided, multi-block and empty indices.
+        seq_buf = torch.randint(0, 1 << 40, (300,), device=self.device)
+        tok_buf = torch.randint(0, 32000, (300,), device=self.device)
+        idx = torch.randint(0, 300, (2048,), device=self.device)
+        for indices in (idx[:1], idx.to(torch.int32), idx[::3], idx[:0]):
+            seq, tok = gather_seq_lens_and_bonus(indices, seq_buf, tok_buf)
+            torch.testing.assert_close(seq, seq_buf[indices], rtol=0, atol=0)
+            torch.testing.assert_close(tok, tok_buf[indices], rtol=0, atol=0)
 
 
 if __name__ == "__main__":

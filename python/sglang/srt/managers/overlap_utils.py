@@ -392,9 +392,8 @@ class FutureMap:
             tuple[torch.Tensor, RelayPayload, EagleDraftInput]
         ] = None
         self._relay: Optional[FutureRelayBuffers] = None
-        # SGLANG_OPT_SPEC_FUSED_RELAY_GATHER: (future_indices, bonus_tokens) gathered
-        # with the committed lengths, taken by the next _resolve_spec_extras.
-        self.fused_relay_gather = envs.SGLANG_OPT_SPEC_FUSED_RELAY_GATHER.get()
+        # (future_indices, bonus_tokens) gathered with the committed lengths, taken by
+        # the next _resolve_spec_extras.
         self._pregathered_bonus: Optional[tuple[torch.Tensor, torch.Tensor]] = None
         # The last stash left its bonus rows to the forward's in-graph relay, written
         # before publish_ready: a gather behind that event reads them.
@@ -655,8 +654,7 @@ class FutureMap:
         behind publish_ready: the bonus rows were relayed in the forward's graph, no
         stash is deferred, and no other extra is read."""
         return (
-            self.fused_relay_gather
-            and self._bonus_before_publish
+            self._bonus_before_publish
             and self.publish_ready is not None
             and self._deferred_relay is None
             and not self.spec_algo.is_ngram()

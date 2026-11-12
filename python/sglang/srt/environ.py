@@ -628,11 +628,6 @@ class Envs:
     SGLANG_OPT_DSV41_DSPARK_ONE_LAUNCH_COMMIT_STAGE = EnvBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
-    # DSpark static verify: the fused greedy accept tail also runs what follows it,
-    # the FutureMap relay scatter, the engram history commit and the draft KV staging.
-    SGLANG_OPT_DSV41_DSPARK_GREEDY_COMMIT_TAIL = EnvBool(
-        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
-    )
 
     # ===================================================================
     # Memory pools and KV-cache sizing
@@ -1723,11 +1718,6 @@ class Envs:
     SGLANG_OPT_SPEC_RELAY_IN_PLACE = EnvBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
-    # Spec v2 relay without top-k extras (DFlash, DSpark): gather the next step's
-    # committed lengths and bonus tokens in one launch, beside the length resolve.
-    SGLANG_OPT_SPEC_FUSED_RELAY_GATHER = EnvBool(
-        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
-    )
     # Runtime optimizations that follow SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION. Each
     # still accepts its former name (deprecated_name) until the alias is removed.
     # The fused small-field copy gives each field its own blocks and moves aligned fields in 16 B units.
@@ -2124,11 +2114,6 @@ class Envs:
     # DSpark folded draft: the draft graph's tail writes [anchor | draft tokens]
     # into the sampler's own buffer, so the step skips its eager concat.
     SGLANG_OPT_DSV41_DSPARK_MID_FOLD = EnvBool(
-        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
-    )
-    # With the mid fold, the draft graph's tail writes [anchor | draft tokens] straight
-    # into the target verify graph's input_ids slot, so the verify replay copies none.
-    SGLANG_OPT_DSV41_DSPARK_VERIFY_IDS_IN_PLACE = EnvBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
     # DSpark static verify: run the target verify runner's metadata prep through the

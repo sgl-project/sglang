@@ -6,12 +6,11 @@ Per row, from the target's argmax ids: the leading draft matches and the bonus
 bonus's per-split maxima reduced here),
 the simulated correct length override (build_accept_outs), commit / new seq lens and
 a zero cap trim (FinalizeAcceptLens), the output tokens (BuildOutTokens), and the
-gated commit lengths the static epilogue's draft-KV commit reads. With
-SGLANG_OPT_DSV41_DSPARK_GREEDY_COMMIT_TAIL it also runs what run_static issues after
-the accept: the FutureMap relay scatter (``relay``), the engram history commit and
-the deferred draft KV staging (``commit_tail``). Every output equals the separate
-ops' bit for bit. With a simulated length and ``bonus_parts`` the argmax ids are not
-read.
+gated commit lengths the static epilogue's draft-KV commit reads. It can also run
+what run_static issues after the accept: the FutureMap relay scatter (``relay``), the
+engram history commit and the deferred draft KV staging (``commit_tail``). Every
+output equals the separate ops' bit for bit. With a simulated length and
+``bonus_parts`` the argmax ids are not read.
 """
 
 from __future__ import annotations
