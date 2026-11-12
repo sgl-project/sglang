@@ -272,8 +272,15 @@ impl CoreHandle {
     /// Cancel active generations by public ID, or all active generations,
     /// ending each call as `ending` says. The admission gate and internal IDs
     /// keep cancellation safe across preprocessing, queueing, duplicate public
-    /// IDs, and ID reuse.
+    /// IDs, and ID reuse. Every entry's abort comes here, and one by a
+    /// non-empty `rid` tells the package's [`crate::AbortHook`] before anything
+    /// ends.
     pub(crate) fn abort(&self, rid: Option<&str>, ending: AbortEnding) -> bool {
+        if let (Some(hook), Some(rid)) = (&self.inner.abort_hook, rid)
+            && !rid.is_empty()
+        {
+            hook.named_abort(rid);
+        }
         self.inner
             .generations
             .abort(rid, ending, &self.inner.abort_tx)
@@ -1013,6 +1020,7 @@ mod tests {
                 metrics: Some(metrics.clone()),
                 request_log: None,
                 generate_validator: None,
+                abort_hook: None,
             },
         );
         let mut call = handle
@@ -1254,6 +1262,7 @@ mod tests {
                 metrics: None,
                 request_log: Some(crate::api_server::core::RequestLog::for_test(None, true)),
                 generate_validator: None,
+                abort_hook: None,
             },
         );
         let call = handle
@@ -1713,6 +1722,7 @@ mod tests {
                 metrics: Some(metrics.clone()),
                 request_log: None,
                 generate_validator: None,
+                abort_hook: None,
             },
         );
         let mut submit =
@@ -1991,6 +2001,7 @@ mod tests {
                     metrics: None,
                     request_log: None,
                     generate_validator: None,
+                    abort_hook: None,
                 },
             );
             (handle, intake_rx)

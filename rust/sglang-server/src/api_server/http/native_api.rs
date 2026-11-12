@@ -1186,6 +1186,7 @@ mod tests {
                     metrics: None,
                     request_log: None,
                     generate_validator: None,
+                    abort_hook: None,
                 },
             ),
             server_args: Arc::new(crate::message::config::ServerArgs::default()),
@@ -1235,6 +1236,7 @@ mod tests {
                     metrics: None,
                     request_log: None,
                     generate_validator: None,
+                    abort_hook: None,
                 },
             ),
             server_args: Arc::new(crate::message::config::ServerArgs::default()),
@@ -1272,6 +1274,7 @@ mod tests {
                     metrics: None,
                     request_log: None,
                     generate_validator: None,
+                    abort_hook: None,
                 },
             ),
             server_args: Arc::new(crate::message::config::ServerArgs::default()),
@@ -1321,6 +1324,7 @@ mod tests {
                     metrics: None,
                     request_log: None,
                     generate_validator: None,
+                    abort_hook: None,
                 },
             ),
             generation_policy: crate::message::request::GenerationPolicy::from(&server_args),
@@ -1367,6 +1371,7 @@ mod tests {
                 metrics: None,
                 request_log: None,
                 generate_validator: None,
+                abort_hook: None,
             },
         );
         let state = Arc::new(AppState {
@@ -1458,6 +1463,7 @@ mod tests {
                 metrics: None,
                 request_log: None,
                 generate_validator: None,
+                abort_hook: None,
             },
         );
         let state = Arc::new(AppState {
@@ -1519,6 +1525,7 @@ mod tests {
                 peer_endpoints: Vec::new(),
                 request_log: None,
                 generate_validator: None,
+                abort_hook: None,
             },
         );
         let server_args = crate::message::config::ServerArgs::default();
@@ -1649,6 +1656,7 @@ mod tests {
                     metrics: None,
                     request_log: None,
                     generate_validator: None,
+                    abort_hook: None,
                 },
             ),
             generation_policy: GenerationPolicy::default(),
@@ -2000,6 +2008,7 @@ mod tests {
                     request_log: None,
                     peer_endpoints: Vec::new(),
                     generate_validator: Some(Arc::new(crate::api_server::core::TopLogprobsCap)),
+                    abort_hook: None,
                 },
             );
             let state = Arc::new(AppState {
@@ -2109,6 +2118,7 @@ mod tests {
                     metrics: None,
                     request_log: None,
                     generate_validator: None,
+                    abort_hook: None,
                 },
             );
             let top_p_hook = TopPHook::default();

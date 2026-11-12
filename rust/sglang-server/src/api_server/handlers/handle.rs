@@ -26,7 +26,8 @@ use super::control::PEER_ABORT_MAX_IN_FLIGHT;
 use super::generate::{Cancellation, Generation, Generations};
 use crate::api_server::core::fanout::{ControlTarget, RankId};
 use crate::api_server::core::{
-    CoreError, DrainEnd, DrainState, FrontendMetrics, GenerateValidator, InFlight, RequestLog,
+    AbortHook, CoreError, DrainEnd, DrainState, FrontendMetrics, GenerateValidator, InFlight,
+    RequestLog,
 };
 
 /// How long the listeners keep open connections after a drain's requests
@@ -55,6 +56,9 @@ pub(crate) struct CoreConfig {
     /// A model package's admission check, run on every client generation
     /// before media prefetch.
     pub(crate) generate_validator: Option<Arc<dyn GenerateValidator>>,
+    /// A model package's hook, told of every abort that names live requests
+    /// ([`CoreHandle::abort`]).
+    pub(crate) abort_hook: Option<Arc<dyn AbortHook>>,
 }
 
 /// Immutable, transport-independent metadata retained by the core.
@@ -169,6 +173,7 @@ pub(super) struct CoreInner {
     pub(super) dp_rank: RankId,
     pub(super) peer_endpoints: Vec<Arc<dyn ControlTarget>>,
     pub(super) generate_validator: Option<Arc<dyn GenerateValidator>>,
+    pub(super) abort_hook: Option<Arc<dyn AbortHook>>,
     /// Shared by every transport (see [`CoreHandle::begin_drain`]).
     pub(super) drain: Arc<DrainState>,
     /// Overrides [`GRACEFUL_CLOSE_TIMEOUT`] (see
@@ -221,6 +226,7 @@ impl CoreHandle {
                 dp_rank,
                 peer_endpoints: config.peer_endpoints,
                 generate_validator: config.generate_validator,
+                abort_hook: config.abort_hook,
                 drain: Arc::default(),
                 graceful_close_timeout: OnceLock::new(),
                 peer_abort_permits: tokio::sync::Semaphore::new(PEER_ABORT_MAX_IN_FLIGHT),

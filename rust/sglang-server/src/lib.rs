@@ -18,15 +18,19 @@ mod tokenizer_manager;
 mod utils;
 
 pub use api_server::core::GenerateValidator;
-pub use api_server::core::{ExtensionCounter, ExtensionHistogram};
+pub use api_server::core::{AbortHook, ExtensionCounter, ExtensionHistogram};
 pub use api_server::handlers::{AbortEnding, Aborted};
 pub use api_server::http::generate_hook::{
     GenerateFrameHook, GenerateFrameInfo, GenerateFrameKeys, GenerateHook, GenerateMetaInfo,
     GenerateTerminal,
 };
 pub use api_server::http::pre_generate::abortable_before_generate;
+/// What a model package's tests serve its extensions from.
 #[cfg(feature = "test-support")]
-pub use api_server::http::pre_generate::test_support;
+pub mod test_support {
+    pub use crate::api_server::http::pre_generate::test_support::*;
+    pub use crate::utils::runtime::test_support::*;
+}
 pub use message::config::{
     DefaultSamplingParams, DisaggregationMode, MetricsConfig, MmFamily, MmResample, MmSpec,
     ModelConfig, RequestLogConfig, RustServerServerArgs, ServerArgs,
@@ -219,6 +223,7 @@ impl Server {
             None,
             None,
             None,
+            None,
             Vec::new(),
         )
     }
@@ -408,10 +413,12 @@ impl Server {
     /// package's own server class: `http_layer` wraps the HTTP app (see
     /// [`HttpLayer`]), `generate_hook` adds the package's keys to native
     /// `/generate` frames (see [`GenerateHook`]), `generate_validator`
-    /// refuses generations from every ingress (see [`GenerateValidator`]), and
-    /// `server_info_state_keys` names the package scheduler's own
-    /// `internal_state` fields, which `/server_info` reports as the scheduler
-    /// set them; a name it already reports, or one given twice, fails the start.
+    /// refuses generations from every ingress (see [`GenerateValidator`]),
+    /// `abort_hook` is told of every abort that names live requests (see
+    /// [`AbortHook`]), and `server_info_state_keys` names the package
+    /// scheduler's own `internal_state` fields, which `/server_info` reports
+    /// as the scheduler set them; a name it already reports, or one given
+    /// twice, fails the start.
     #[allow(clippy::too_many_arguments)]
     pub fn start_with_extensions(
         server_args: ServerArgs,
@@ -423,6 +430,7 @@ impl Server {
         http_layer: Option<HttpLayer>,
         generate_hook: Option<Arc<dyn GenerateHook>>,
         generate_validator: Option<Arc<dyn GenerateValidator>>,
+        abort_hook: Option<Arc<dyn AbortHook>>,
         server_info_state_keys: Vec<String>,
     ) -> PyResult<Self> {
         // `server_args` already arrived typed (pyo3 rejected any missing/extra/
@@ -453,6 +461,7 @@ impl Server {
             server_args: std::sync::Arc::new(server_args),
             generate_hook,
             generate_validator,
+            abort_hook,
             server_info_state_keys,
         };
         let rt =
