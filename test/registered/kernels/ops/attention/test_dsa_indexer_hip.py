@@ -186,6 +186,7 @@ def _kimi_k31_indexer() -> Indexer:
         index_rope_dim=0,
         index_apply_hadamard=False,
         index_k_norm_eps=1e-5,
+        index_bf16_head_gate=True,
     )
     with published_topology():
         indexer = Indexer(
