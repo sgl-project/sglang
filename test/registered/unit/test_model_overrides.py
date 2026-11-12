@@ -4537,6 +4537,46 @@ class TestQwen3VLHopperServingOverrides(CustomTestCase):
         self.assertEqual(envs.SGLANG_MM_FEATURE_CACHE_MB.get(), 2048)
 
 
+class TestKimiK31HiSparseDsaBackends(CustomTestCase):
+    @staticmethod
+    def _resolve(**fields):
+        from sglang.srt.arg_groups.model_override_base import ResolvedView
+        from sglang.srt.arg_groups.overrides import _dsa_split_backend_resolution
+
+        hf = SimpleNamespace(
+            architectures=["KimiK31ForConditionalGeneration"], index_topk=2048
+        )
+        args = dict(
+            kv_cache_dtype="fp8_e4m3",
+            dsa_prefill_backend=None,
+            dsa_decode_backend=None,
+            enable_hisparse=True,
+            dcp_size=1,
+        )
+        args.update(fields)
+        view = ResolvedView(
+            SimpleNamespace(_model_config=SimpleNamespace(hf_config=hf), **args)
+        )
+        with (
+            patch("sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True),
+            override_platform(is_npu=False),
+            override_platform(is_xpu=False),
+            override_platform(is_hip=False),
+            patch("torch.cuda.get_device_capability", return_value=(10, 0)),
+        ):
+            return _dsa_split_backend_resolution(view)
+
+    def test_hisparse_defaults_to_flashmla_kv(self):
+        self.assertEqual(
+            self._resolve(),
+            {"dsa_prefill_backend": "flashmla_kv", "dsa_decode_backend": "flashmla_kv"},
+        )
+
+    def test_hisparse_rejects_trtllm(self):
+        with self.assertRaisesRegex(ValueError, "HiSparse requires DSA backend"):
+            self._resolve(dsa_decode_backend="trtllm")
+
+
 class TestDeterministicAttentionBackendOnXpu(unittest.TestCase):
     """The deterministic fallback must not hand XPU a CUDA-only backend.
 

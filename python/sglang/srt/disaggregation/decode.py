@@ -128,12 +128,12 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 from sglang.srt.mem_cache.capacity import capacity_decision
 from sglang.srt.mem_cache.common import (
     RetractionBackup,
-    dsv4_needs_rebootstrap,
     finish_restore_kv_cache,
     kv_to_page_indices,
     match_kv_cache,
     page_align_floor,
     restore_kv_cache,
+    retraction_needs_rebootstrap,
     start_restore_kv_cache,
     suffix_page_indices,
 )
@@ -1126,7 +1126,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if not is_retracted and not is_rebootstrap and is_unadmitted_reject(req):
             self.scheduler.request_retirer.retire_unadmitted(req)
             return
-        if is_retracted and dsv4_needs_rebootstrap(self.token_to_kv_pool_allocator):
+        if is_retracted and retraction_needs_rebootstrap(
+            self.token_to_kv_pool_allocator
+        ):
             req.time_stats.set_retract_time()
             is_retracted = False
             is_rebootstrap = True

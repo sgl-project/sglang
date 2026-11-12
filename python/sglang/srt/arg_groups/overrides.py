@@ -788,9 +788,11 @@ def _kimi_k31_kv_cache_dtype(view: Any) -> dict:
 
 
 def _kimi_k31_dsa_backends(view: Any) -> dict:
-    if view.enable_hisparse:
-        raise ValueError("Kimi-K3.1 does not support --enable-hisparse yet.")
     if get_platform().is_hip:
+        if view.enable_hisparse:
+            raise ValueError(
+                "Kimi-K3.1 does not support --enable-hisparse on ROCm yet."
+            )
         backend = _KIMI_K31_DSA_BACKEND_HIP
         return _pin_dsa_backends(
             view,
@@ -824,6 +826,13 @@ def _kimi_k31_dsa_backends(view: Any) -> dict:
             f"Kimi-K3.1 {backend} DSA uses FP8 q and an unscaled FP8 KV cache, not "
             "the reference fp8_ds_mla numerics. PD prefill and decode servers must "
             "both use a raw-FP8-KV backend (trtllm or prims_ts)."
+        )
+    if view.enable_hisparse and backend != _KIMI_K31_DSA_BACKEND:
+        # The HiSparse FP8 backend allow-list (hisparse_hook) admits only
+        # flashmla_kv among the K3.1 backends.
+        raise ValueError(
+            f"Kimi-K3.1 HiSparse requires DSA backend {_KIMI_K31_DSA_BACKEND!r}; "
+            f"got {backend!r}."
         )
     declared = {f: backend for f in fields if getattr(view, f) is None}
     logger.warning(

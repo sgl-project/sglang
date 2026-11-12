@@ -232,6 +232,16 @@ def _commit_accept(candidates, accept_len, bonus_tokens):
     return out_tokens, accept_len.to(torch.int32) + 1
 
 
+def _chain_accept_indices(commit_lens: torch.Tensor, block_size: int) -> torch.Tensor:
+    """[bs, block_size] flat offsets into the verify out_cache_loc of each
+    committed chain position, -1 past the commit length (EAGLE accept_index
+    layout at topk 1)."""
+    steps = torch.arange(block_size, device=commit_lens.device)
+    row_offsets = torch.arange(commit_lens.numel(), device=commit_lens.device)
+    flat = row_offsets[:, None] * block_size + steps
+    return torch.where(steps < commit_lens[:, None], flat, -1)
+
+
 def _resolve_dflash_embedding_module(draft_model, target_model):
     if getattr(draft_model, "is_nemotron_35_draft", False):
         embed_module = draft_model.get_input_embeddings()
@@ -3046,6 +3056,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
 
         batch.out_cache_loc = verify_out_cache_loc
+        if batch.hisparse_coordinator is not None:
+            batch.hisparse_coordinator.prepare_spec_verify(batch)
         sampling_info = batch.sampling_info
 
         seq_lens_pre_verify = (
@@ -3149,6 +3161,13 @@ class DFlashWorkerV2(BaseSpecWorker):
             bs=bs,
             target_predict=target_predict,
         )
+        if batch.hisparse_coordinator is not None:
+            batch.hisparse_coordinator.commit_spec_accept_tokens(
+                batch=batch,
+                accept_indices=_chain_accept_indices(
+                    commit_lens=commit_lens, block_size=block_size
+                ),
+            )
 
         sampling_mask_capture = SpeculativeSamplingMaskCapture.from_logits(
             sampling_info,
