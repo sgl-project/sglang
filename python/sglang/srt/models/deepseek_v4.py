@@ -1346,6 +1346,9 @@ class MqaAttentionBase(nn.Module):
     @contextmanager
     def maybe_use_decode_attn_tp(self, forward_batch: ForwardBatch):
         ctx = get_cp_decode_attn_tp_ctx()
+        if not ctx.is_enabled:
+            yield
+            return
         attn = self.attn_mqa if isinstance(self, MQALayer) else self.attn
         with ctx.maybe_use_decode_attn_tp(
             forward_batch,
