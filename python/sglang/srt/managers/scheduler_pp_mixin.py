@@ -326,6 +326,7 @@ class SchedulerPPMixin:
                 # The pipeline loop builds its own batch instead of calling
                 # get_next_batch_to_run, so label the same work here.
                 with self.scheduler_stage_metrics.record(SCHEDULER_STAGE_BUILD_BATCH):
+                    self.process_pending_chunked_abort()
                     self.process_prefill_chunk(
                         last_batch=self.last_batch, running_batch=self.running_batch
                     )
@@ -707,12 +708,6 @@ class SchedulerPPMixin:
         if get_parallel().pp_size == 1 or not isinstance(allocator, ChainAllocator):
             return
         checks = resolve_level() >= InvariantCheckLevel.WARN
-        if checks and self.recv_skipper is not None:
-            raise ValueError(
-                "the pipeline stages compare their capacity decisions with "
-                "every iteration's requests under invariant checks; that needs "
-                "--scheduler-recv-interval 1"
-            )
         geometries = [None] * get_parallel().pp_size
         torch.distributed.all_gather_object(
             geometries, allocator.stage_geometry(), group=self.pp_group.cpu_group
