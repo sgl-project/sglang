@@ -15,7 +15,7 @@ from pathlib import Path
 
 from tml_renderers import chat, tokenizers, v0
 
-TOKENIZER = tokenizers.o200k_base_chat()
+TOKENIZER = tokenizers.O200kBaseChatTokenizer()
 RENDERER = v0.Renderer(TOKENIZER)
 IMAGE_PLACEHOLDER = -101
 
@@ -348,7 +348,9 @@ def output(name, text):
             re.sub(r"\[\[ORD:.*?\]\]", "", text),
         )
     )
-    for message in parser.parse_tokens(ids) + parser.flush():
+    # The scheduler stops on the renderer's stop token before parsing.
+    sampled = ids[:-1] if ids[-1] in RENDERER.stop() else ids
+    for message in parser.parse_tokens(sampled).messages:
         part = message.content
         if isinstance(part, chat.Text):
             content.append(part.text)
@@ -385,11 +387,6 @@ output(
     '"args":{"city":"東京","unit":"c"}}<|end_message|>'
     '<|message_model|>search<|content_invoke_tool_json|>{ "args": {"q": "x", "n": 2.50},'
     ' "name": "search" }<|end_message|><|content_model_end_sampling|>',
-)
-output(
-    "payload_name_wins_over_header",
-    "<|message_model|>search<|content_invoke_tool_json|>"
-    '{"name":"get_weather","args":{}}<|end_message|><|content_model_end_sampling|>',
 )
 output(
     "marker_spellings_in_text_stay_text",

@@ -119,6 +119,8 @@ def to_cute_aux_tensor(t, enable_tvm_ffi=True):
 def get_aux_tensor_metadata(aux_tensors):
     return tuple(
         (
+            t.dtype,
+            t.ndim,
             getattr(t, "__assumed_align__", 0),
             getattr(t, "__leading_dim__", -1),
             hasattr(t, "__leading_dim__"),

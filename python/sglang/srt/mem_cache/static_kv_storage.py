@@ -308,8 +308,9 @@ class StaticKVStorage:
         rows: Optional[torch.Tensor],
         seq_lens: torch.Tensor,
         seq_lens_cpu: torch.Tensor,
-        last_loc: torch.Tensor,
+        last_loc: Optional[torch.Tensor],
         make_room: Callable[[int], Any],
+        req_to_token_write: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> Optional[torch.Tensor]:
         allocator = self._allocator
         # Over estimate the number of tokens: assume each request needs a new page.
@@ -319,6 +320,8 @@ class StaticKVStorage:
         # returns a DSV4OutCacheLoc bundle; hasattr-gated so others stay unchanged.
         is_dsv4 = rows is not None and hasattr(allocator, "c128_attn_allocator")
         extra_alloc_kwargs = {}
+        if req_to_token_write is not None:
+            extra_alloc_kwargs["req_to_token_write"] = req_to_token_write
         if is_dsv4:
             c128_num_pages = allocator.c128_num_pages_needed(
                 (seq_lens_cpu - 1).clamp(min=0), seq_lens_cpu

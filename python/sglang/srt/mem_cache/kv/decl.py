@@ -74,6 +74,7 @@ class MHAGeometry(msgspec.Struct, frozen=True, kw_only=True):
     head_dim: int
     v_head_dim: int
     kv_cache_dtype: torch.dtype
+    is_mxfp8: bool = False
 
 
 class MLAGeometry(msgspec.Struct, frozen=True, kw_only=True):

@@ -995,6 +995,7 @@ class KVCacheConfigurator:
                 head_dim=geometry.head_dim,
                 v_head_dim=geometry.v_head_dim,
                 kv_cache_dtype=self.kv_cache_dtype,
+                is_mxfp8=self.kv_cache_dtype_str == "mxfp8",
             )
         else:
             full_geometry = MHAGeometry(
@@ -1004,6 +1005,7 @@ class KVCacheConfigurator:
                 head_dim=self.model_config.head_dim,
                 v_head_dim=self.model_config.v_head_dim,
                 kv_cache_dtype=self.kv_cache_dtype,
+                is_mxfp8=self.kv_cache_dtype_str == "mxfp8",
             )
         window = {}
         if has_window:
@@ -1015,6 +1017,7 @@ class KVCacheConfigurator:
                     head_dim=geometry.swa_head_dim,
                     v_head_dim=geometry.swa_v_head_dim,
                     kv_cache_dtype=self.kv_cache_dtype,
+                    is_mxfp8=self.kv_cache_dtype_str == "mxfp8",
                 ),
                 # The window the layers attend over, as the runner resolved it.
                 window=self.sliding_window_size,

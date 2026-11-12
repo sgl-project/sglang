@@ -394,6 +394,10 @@ def _flash_attn_fwd(
     qk_sf_vec_size: Optional[int] = None,
     v_sf_vec_size: Optional[int] = None,
     rel_bias_prep_cache: Optional[dict] = None,
+    rel_bias_scale_after_add: bool = False,
+    rel_bias_presheared: bool = False,
+    rel_bias_compact: bool = False,
+    return_partials: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Forward pass for FlashAttention.
 
@@ -412,6 +416,13 @@ def _flash_attn_fwd(
     fake_mode = is_fake_mode()
     arch = _get_device_arch() if _arch is None else _arch
     arch_forward_host = get_forward_host(arch)
+    if rel_bias_scale_after_add and rel_bias is not None:
+        assert arch // 10 in (9, 10, 11), (
+            "Scale-after-add relative bias requires SM90/SM100/SM110"
+        )
+        assert score_mod is None and softcap in (None, 0.0), (
+            "Scale-after-add relative bias cannot combine with score_mod or softcap"
+        )
     requested_num_splits = num_splits
     if (
         not fake_mode
@@ -495,7 +506,9 @@ def _flash_attn_fwd(
         seqlen_k = num_pages * page_size
         # Paged KV: SF is interleaved (TMA-loadable) only when page_size == 128
         # so a page maps exactly onto the SF atom's 128-row tile.
-        kv_sf_interleaved = page_size == 128
+        kv_sf_interleaved = page_size == 128 and all(
+            sf is None or sf.ndim == 5 for sf in (sfk, sfv)
+        )
     else:
         num_pages, page_size = None, None
         seqlen_k = v.shape[-3]
@@ -654,6 +667,10 @@ def _flash_attn_fwd(
         out_torch_dtype = torch.bfloat16 if v_blockscaled else v.dtype
     else:
         out_torch_dtype = torch.bfloat16 if is_fp8 else q_dtype
+    if out is not None:
+        if out.dtype not in (out_torch_dtype, torch.float32):
+            raise ValueError("Attention output must use its input dtype or float32")
+        out_torch_dtype = out.dtype
     device = v.device
     q_batch_seqlen_shape = (
         (batch_size, seqlen_q) if cu_seqlens_q is None else (total_q,)
@@ -910,8 +927,23 @@ def _flash_attn_fwd(
         # The qv kernel has no split-KV variant.
         num_splits = 1
 
-    is_split_kv = num_splits > 1
-    if is_split_kv:
+    if return_partials:
+        assert arch // 10 == 9 and lse is None
+    fp32_out_sm90 = (
+        arch // 10 == 9
+        and out.dtype == torch.float32
+        and num_splits == 1
+        and not return_partials
+    )
+    is_split_kv = num_splits > 1 or fp32_out_sm90 or return_partials
+    if fp32_out_sm90:
+        out_partial = out.unsqueeze(0)
+        lse_partial = (
+            lse.unsqueeze(0)
+            if lse is not None
+            else torch.empty(1, *lse_shape, dtype=torch.float32, device=device)
+        )
+    elif is_split_kv:
         out_partial = torch.empty(
             num_splits,
             *q_batch_seqlen_shape,
@@ -946,6 +978,10 @@ def _flash_attn_fwd(
         arch // 10 in [10, 11] and head_dim == 256 and head_dim_v == 256
     )
     use_2cta_instrs = use_2cta_instrs or use_dedicated_hd256_kernel
+    if rel_bias_scale_after_add and rel_bias is not None:
+        assert not use_dedicated_hd256_kernel, (
+            "Scale-after-add bias does not support head_dim=256"
+        )
 
     if softcap is not None:
         assert score_mod is None, "softcap and score_mod cannot be used together"
@@ -1067,13 +1103,25 @@ def _flash_attn_fwd(
     tile_bias = tile_m
     cu_total_m_blocks_bias = None
     blocks_to_batch_idx = None
-    if rel_bias is not None:
+    if rel_bias is not None and rel_bias_compact:
+        # SM90 only: the kernel reads rel_bias (total_q, num_head, rel_extent) by
+        # query-key distance itself, so there is no shear step or tile constraint.
+        assert arch // 10 == 9 and arch_forward_host is None
+        assert pack_gqa and not rel_bias_presheared
+        rel_extent = rel_bias.shape[-1]
+        bias = rel_bias.reshape(-1, num_head, rel_extent)
+        assert bias.shape[0] == (
+            total_q if cu_seqlens_q is not None else batch_size * seqlen_q
+        )
+        assert bias.stride(-1) == 1 and rel_extent % 8 == 0
+        assert bias.dtype == torch.bfloat16
+    elif rel_bias is not None:
         assert arch // 10 in [9, 10, 11] or arch_forward_host is not None, (
             "rel_bias requires SM9x/10x/11x or an architecture-owned "
             "forward implementation"
         )
         qhead_per_kvhead_packgqa = qhead_per_kvhead if pack_gqa else 1
-        rel_extent = rel_bias.shape[-1]
+        rel_extent = rel_bias.shape[-1] - (256 if rel_bias_presheared else 0)
         rel_extent_padded = rel_extent + 256
         assert rel_extent % 128 == 0
         assert tile_n == 128
@@ -1090,6 +1138,17 @@ def _flash_attn_fwd(
         tile_bias = (
             (seqlen_q_packgqa + 7) // 8 * 8 if seqlen_q_packgqa < tile_m else tile_m
         )
+    if rel_bias is not None and rel_bias_presheared:
+        # The caller already wrote the sheared layout this call's shear step
+        # would produce: (round_up(total_q, tile_m), num_head, rel_extent + 256).
+        assert cu_seqlens_q is not None
+        assert rel_bias.shape == (
+            _round_up_to_tile(total_q, tile_m),
+            num_head,
+            rel_extent_padded,
+        )
+        bias = rel_bias
+    elif rel_bias is not None and not rel_bias_compact:
         if cu_seqlens_q is None:
             bias_seqlen_q_rounded = _round_up_to_tile(seqlen_q, tile_m)
             assert rel_bias.shape == (batch_size, seqlen_q, num_head, rel_extent)
@@ -1279,10 +1338,15 @@ def _flash_attn_fwd(
             # Benchmark hook: time just the shear-prep kernels, skip the attention kernel.
             return out, lse
 
+    paged_kv_non_tma = page_size not in [None, tile_n] or (
+        (qk_blockscaled or v_blockscaled) and not kv_sf_interleaved
+    )
     batch_invariant = is_batch_invariant()
     tmem_load_red_max = _tmem_load_red_max_enabled()
     compile_key = (
         dtype,
+        out_torch_dtype,
+        rel_bias_scale_after_add,
         head_dim,
         head_dim_v,
         qhead_per_kvhead,
@@ -1317,7 +1381,7 @@ def _flash_attn_fwd(
         arch,
         arch_forward_config.compile_key if arch_forward_config is not None else None,
         arch_forward_plan.compile_key if arch_forward_plan is not None else None,
-        page_size not in [None, tile_n],  # paged KV non-TMA
+        paged_kv_non_tma,
         use_2cta_instrs,
         q_subtile_factor,
         mma_pv_is_rs,
@@ -1331,6 +1395,7 @@ def _flash_attn_fwd(
         sparse_kv,
         disable_sparse_kv_bitmask,
         bias is not None,
+        rel_bias_compact,
         tile_bias,
         rel_extent,
         qk_blockscaled,
@@ -1469,9 +1534,11 @@ def _flash_attn_fwd(
                 has_aux_tensors=aux_tensors is not None,
                 q_subtile_factor=q_subtile_factor,
                 paged_kv_non_tma=page_size not in [None, tile_n],
-                has_bias=bias is not None,
+                has_bias=bias is not None and not rel_bias_compact,
                 bias_block_size=tile_bias,
                 rel_extent_padded=rel_extent_padded,
+                compact_bias=rel_bias_compact,
+                rel_extent=rel_extent,
             )
         elif arch // 10 in [10, 11]:
             if qv is not None:
@@ -1549,7 +1616,7 @@ def _flash_attn_fwd(
                     score_mod=score_mod,
                     mask_mod=mask_mod,
                     has_aux_tensors=aux_tensors is not None,
-                    paged_kv_non_tma=page_size not in [None, tile_n],
+                    paged_kv_non_tma=paged_kv_non_tma,
                     is_varlen_q=cu_seqlens_q is not None or seqused_q is not None,
                     q_subtile_factor=q_subtile_factor,
                     use_2cta_instrs=use_2cta_instrs,
@@ -1562,6 +1629,7 @@ def _flash_attn_fwd(
                         {}
                         if use_dedicated_hd256_kernel
                         else dict(
+                            rel_bias_scale_after_add=rel_bias_scale_after_add,
                             qk_blockscaled=qk_blockscaled,
                             v_dequant=v_blockscaled,
                             q_sf_interleaved=q_sf_interleaved,
@@ -1822,7 +1890,9 @@ def _flash_attn_fwd(
                     pack_gqa=pack_gqa,
                 )
             compiled_fwd(*call_args)
-    if is_split_kv:
+    if return_partials:
+        return out_partial, lse_partial
+    if is_split_kv and not fp32_out_sm90:
         _flash_attn_fwd_combine(
             out_partial,
             lse_partial.transpose(-1, -2),
@@ -2029,6 +2099,8 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         rel_bias_prep_cache: Optional[dict] = None,
         return_lse: bool = False,
         out: Optional[torch.Tensor] = None,
+        rel_bias_scale_after_add: bool = False,
+        rel_bias_presheared: bool = False,
     ):
         aux_scalars = tuple(aux_scalars) if aux_scalars else None
         shared_kv = k is v
@@ -2070,6 +2142,8 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             return_lse=return_lse,
             gather_kv_indices=gather_kv_indices,
             rel_bias=rel_bias,
+            rel_bias_scale_after_add=rel_bias_scale_after_add,
+            rel_bias_presheared=rel_bias_presheared,
             sfq=sfq,
             sfk=sfk,
             sfv=sfv,
@@ -2195,6 +2269,8 @@ def flash_attn_varlen_func(
     rel_bias_prep_cache: Optional[dict] = None,
     return_lse: bool = False,
     out: Optional[torch.Tensor] = None,
+    rel_bias_scale_after_add: bool = False,
+    rel_bias_presheared: bool = False,
 ):
     """
     Tensor arguments:
@@ -2330,6 +2406,8 @@ def flash_attn_varlen_func(
         rel_bias_prep_cache,
         return_lse,
         out,
+        rel_bias_scale_after_add,
+        rel_bias_presheared,
     )
     needs_autograd = False
     if forward_host is not None or out is not None:

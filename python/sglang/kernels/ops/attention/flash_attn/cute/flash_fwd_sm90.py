@@ -66,9 +66,19 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         has_bias: bool = False,
         bias_block_size: int = 128,
         rel_extent_padded: int = 128,
+        compact_bias: bool = False,
+        rel_extent: int = 0,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
+        assert not (compact_bias and has_bias)
+        assert not compact_bias or self.pack_gqa
+        self.compact_bias = compact_bias
+        self.rel_extent = rel_extent
+        assert not compact_bias or rel_extent % 8 == 0
+        self.cb_stages = 2
+        self.cb_words = (self.tile_n + 8) // 2
+        self.cb_producer_threads = 96
         self.intra_wg_overlap = intra_wg_overlap
         self.mma_pv_is_rs = mma_pv_is_rs
         self.buffer_align_bytes = 1024
@@ -219,6 +229,29 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             sBias: sBias_struct
             sP: sP_struct
 
+        mbar_ptr_CB_struct = cute.struct.MemRange[cutlass.Int64, self.cb_stages * 2]
+        sCB_struct = cute.struct.Align[
+            cute.struct.MemRange[
+                cutlass.Int32, self.tile_m * self.cb_words * self.cb_stages
+            ],
+            128,
+        ]
+
+        @cute.struct
+        class SharedStorageQKVCompactBias:
+            mbar_ptr_Q: mbar_ptr_Q_struct
+            mbar_ptr_K: mbar_ptr_K_struct
+            mbar_ptr_V: mbar_ptr_V_struct
+            mbar_ptr_CB: mbar_ptr_CB_struct
+            sV: sV_struct
+            sQ: sQ_struct
+            sK: sK_struct
+            sCB: sCB_struct
+            sP: sP_struct
+
+        if const_expr(self.compact_bias):
+            assert not self.Q_in_regs
+            return SharedStorageQKVCompactBias
         if const_expr(self.has_bias):
             return (
                 SharedStorageQKVBias
@@ -285,6 +318,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             mBias.element_type if const_expr(mBias is not None) else self.dtype
         )
         mQ, mK, mV, mO = [assume_tensor_aligned(t) for t in (mQ, mK, mV, mO)]
+        mBiasCompact = None
+        if const_expr(self.compact_bias):
+            mBiasCompact, mBias = mBias, None
         if const_expr(mBias is not None):
             mBias = assume_tensor_aligned(mBias)
         Q_layout_transpose = (
@@ -355,6 +391,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             self.num_wg_mma == 2 and (not self.use_tma_Q or not self.use_tma_KV)
         ):
             self.num_mma_regs, self.num_producer_regs = 224, 40
+        if const_expr(self.compact_bias and self.num_wg_mma == 1):
+            self.num_producer_regs = 96
         self.rescale_O_before_gemm = self.tile_hdimv > 128 and self.intra_wg_overlap
         self._setup_attributes()
         # TODO: we prob don't need most of what's in _setup_attributes
@@ -518,7 +556,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             base_softmax_scale = softmax_scale
             softmax_scale_log2, softmax_scale = utils.LOG2_E, None
         else:
-            base_softmax_scale = None
+            base_softmax_scale = (
+                Float32(1.0) / softmax_scale if const_expr(self.compact_bias) else None
+            )
             softmax_scale_log2, softmax_scale = utils.compute_softmax_scale_log2(
                 softmax_scale, self.score_mod
             )
@@ -574,6 +614,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             num_splits,
             aux_data,
             fastdiv_mods,
+            mBiasCompact,
         ).launch(
             grid=grid_dim,
             block=[self.num_threads, 1, 1],
@@ -625,6 +666,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         num_splits: Int32 = 1,
         aux_data: AuxData = AuxData(),
         fastdiv_mods=None,
+        mBiasCompact: Optional[cute.Tensor] = None,
     ):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         # Prefetch tma descriptor
@@ -718,6 +760,18 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             )
         else:
             pipeline_bias = None
+        pipeline_cb, sCB_ptr = None, None
+        if const_expr(self.compact_bias):
+            pipeline_cb = pipeline_custom.PipelineCpAsync.create(
+                barrier_storage=storage.mbar_ptr_CB.data_ptr(),
+                num_stages=self.cb_stages,
+                producer_group=ThreadCooperativeGroup(self.cb_producer_threads),
+                consumer_group=mma_warps,
+                defer_sync=True,
+                elect_one_release=True,
+                syncwarp_before_release=False,
+            )
+            sCB_ptr = storage.sCB.data_ptr()
 
         # Cluster arrive after barrier init
         pipeline_init_arrive(cluster_shape_mn=self.cluster_shape_mn, is_relaxed=True)
@@ -828,6 +882,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 SeqlenInfoCls,
                 TileSchedulerCls,
                 num_splits,
+                mBiasCompact,
+                sCB_ptr,
+                pipeline_cb,
             )
 
         else:  # Consumer
@@ -867,7 +924,123 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 fastdiv_mods,
                 sBias,
                 pipeline_bias,
+                mBiasCompact,
+                sCB_ptr,
+                pipeline_cb,
             )
+
+    @cute.jit
+    def compact_bias_n_lo(self, block_info, seqlen, m_block, n_block_min):
+        """Lowest n_block of the masked mainloop phase with compact bias: it extends
+        down to cover every tile with keys inside the rel_extent band."""
+        n_band = (
+            cutlass.max(seqlen.seqlen_k - seqlen.seqlen_q - self.rel_extent + 1, 0)
+            // self.tile_n
+        )
+        return cutlass.min(
+            block_info.get_n_block_min_causal_local_mask(seqlen, m_block, n_block_min),
+            cutlass.max(n_band, n_block_min),
+        )
+
+    @cute.jit
+    def load_compact_bias(
+        self,
+        mBias: cute.Tensor,
+        sCB_ptr: cute.Pointer,
+        pipeline_cb,
+        seqlen: SeqlenInfoQK,
+        head_idx: Int32,
+        m_block: Int32,
+        n_block_max: Int32,
+        num_tiles: Int32,
+        tidx: Int32,
+        token0: Int32,
+    ):
+        """Producer of the compact-bias ring: for band tile i (n_block = n_block_max
+        - 1 - i), row r of stage i % cb_stages holds rel_bias[q, head, lo_r : lo_r +
+        tile_n + 8], lo_r the row's smallest distance in the tile rounded down to a
+        multiple of 8, copied in 16-byte cp.async chunks; chunks outside
+        [0, rel_extent) or past seqlen_q are zero-filled."""
+        for i in cutlass.range(num_tiles, unroll=1):
+            self.fill_compact_bias_tile(
+                mBias,
+                sCB_ptr,
+                pipeline_cb,
+                seqlen,
+                head_idx,
+                m_block,
+                n_block_max,
+                i,
+                tidx,
+                token0,
+            )
+
+    @cute.jit
+    def fill_compact_bias_tile(
+        self,
+        mBias: cute.Tensor,
+        sCB_ptr: cute.Pointer,
+        pipeline_cb,
+        seqlen: SeqlenInfoQK,
+        head_idx: Int32,
+        m_block: Int32,
+        n_block_max: Int32,
+        i: Int32,
+        tidx: Int32,
+        token0: Int32,
+    ):
+        chunks_per_row = (self.tile_n + 8) // 8
+        chunks = self.tile_m * chunks_per_row
+        s_token = mBias.stride[0]
+        s_head = mBias.stride[1]
+        stage = i % self.cb_stages
+        pipeline_cb.producer_acquire_w_index_phase(
+            stage, ((i // self.cb_stages) & 1) ^ 1
+        )
+        atom = cute.make_copy_atom(
+            cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL),
+            cutlass.BFloat16,
+            num_bits_per_copy=128,
+        )
+        sCB_bf16 = cute.recast_ptr(sCB_ptr, dtype=cutlass.BFloat16) + cute.assume(
+            stage * (self.tile_m * self.cb_words * 2), divby=8
+        )
+        dist0 = (
+            seqlen.seqlen_k
+            - seqlen.seqlen_q
+            - (n_block_max - 1 - i) * self.tile_n
+            - (self.tile_n - 1)
+        )
+        row0 = m_block * self.tile_m
+        bias_base = mBias.iterator + cute.assume(token0 * s_token, divby=8)
+        for j in cutlass.range_constexpr(
+            (chunks + self.cb_producer_threads - 1) // self.cb_producer_threads
+        ):
+            idx = tidx + j * self.cb_producer_threads
+            if idx < chunks:
+                r = idx // chunks_per_row
+                q_idx = (row0 + r) // self.qhead_per_kvhead
+                head = head_idx * self.qhead_per_kvhead + (row0 + r) % self.qhead_per_kvhead
+                lo = dist0 + q_idx
+                e = (lo & ~7) + 8 * (idx - r * chunks_per_row)
+                dst = cute.make_tensor(
+                    sCB_bf16 + cute.assume(idx * 8, divby=8), cute.make_layout((8,))
+                )
+                if (q_idx < seqlen.seqlen_q) & (e >= 0) & (e < self.rel_extent):
+                    src = cute.make_tensor(
+                        bias_base
+                        + cute.assume(q_idx * s_token + head * s_head + e, divby=8),
+                        cute.make_layout((8,)),
+                    )
+                    cute.copy(
+                        atom,
+                        cute.tiled_divide(src, (8,)),
+                        cute.tiled_divide(dst, (8,)),
+                    )
+                else:
+                    dst.fill(0.0)
+        cute.arch.cp_async_commit_group()
+        pipeline_cb.producer_commit_w_index(stage)
 
     @cute.jit
     def load(
@@ -895,6 +1068,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         SeqlenInfoCls: Callable,
         TileSchedulerCls: Callable,
         num_splits: Int32 = 1,
+        mBiasCompact: Optional[cute.Tensor] = None,
+        sCB_ptr: Optional[cute.Pointer] = None,
+        pipeline_cb=None,
     ):
         warp_idx_in_wg = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
         tidx, _, _ = cute.arch.thread_idx()
@@ -902,7 +1078,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         # TMA: only warp 0 loads. cp_async: all warps load.
         # When not use_tma_Q, all 128 producer threads participate in Q loading.
         is_load_warp = warp_idx_in_wg == 0 or const_expr(
-            not self.use_tma_KV or not self.use_tma_Q
+            not self.use_tma_KV or not self.use_tma_Q or self.compact_bias
         )
         # KV loading restricted to warp 0 for TMA, all warps for non-TMA KV
         is_kv_load_warp = warp_idx_in_wg == 0 or const_expr(not self.use_tma_KV)
@@ -1091,6 +1267,47 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     load_kv = True
                     if const_expr(self.is_split_kv):
                         load_kv = n_block_min < n_block_max
+                    num_cb_tiles = Int32(0)
+                    fill_cb = None
+                    if const_expr(self.compact_bias):
+                        num_cb_tiles = n_block_max - cutlass.min(
+                            self.compact_bias_n_lo(
+                                block_info, seqlen, m_block, n_block_min
+                            ),
+                            n_block_max - 1,
+                        )
+                        token0 = (
+                            seqlen.offset_q
+                            if const_expr(seqlen.has_cu_seqlens_q)
+                            else batch_idx * seqlen.seqlen_q
+                        )
+                        fill_cb = partial(
+                            self.fill_compact_bias_tile,
+                            mBiasCompact,
+                            sCB_ptr,
+                            pipeline_cb,
+                            seqlen,
+                            head_idx,
+                            m_block,
+                            n_block_max,
+                            tidx=tidx - cute.arch.WARP_SIZE,
+                            token0=token0,
+                        )
+                        if const_expr(self.use_tma_KV):
+                            if load_kv:
+                                if warp_idx_in_wg > 0:
+                                    self.load_compact_bias(
+                                        mBiasCompact,
+                                        sCB_ptr,
+                                        pipeline_cb,
+                                        seqlen,
+                                        head_idx,
+                                        m_block,
+                                        n_block_max,
+                                        num_cb_tiles,
+                                        tidx - cute.arch.WARP_SIZE,
+                                        token0,
+                                    )
                     if load_kv:
                         # Clamp n_block to 0 when n_block_max == 0 (can happen with causal
                         # + pack_gqa when seqlen_k < tile_n). TMA handles n_block=-1
@@ -1135,6 +1352,11 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                                     page_idx=page_idx,
                                 )
                                 kv_producer_state.advance()
+                                if const_expr(
+                                    self.compact_bias and not self.use_tma_KV
+                                ):
+                                    if warp_idx_in_wg > 0:
+                                        fill_cb(i=Int32(0))
                                 for i in cutlass.range(
                                     n_block_max - 1 - n_block_min, unroll=1
                                 ):
@@ -1167,6 +1389,12 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                                         page_idx=page_idx,
                                     )
                                     kv_producer_state.advance()
+                                    if const_expr(
+                                        self.compact_bias and not self.use_tma_KV
+                                    ):
+                                        if warp_idx_in_wg > 0:
+                                            if i + 1 < num_cb_tiles:
+                                                fill_cb(i=i + 1)
                             else:
                                 for i in cutlass.range(
                                     n_block_max - 1 - n_block_min, unroll=1
@@ -1352,6 +1580,46 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 acc_S[i] = acc_S[i] * bias_softmax_scale
 
     @cute.jit
+    def apply_compact_bias(
+        self,
+        acc_S: cute.Tensor,
+        n_block: Int32,
+        sCB_ptr: cute.Pointer,
+        pipeline_cb,
+        n_block_top: Int32,
+        thr_mma_qk: cute.ThrMma,
+        seqlen: SeqlenInfoQK,
+        m_block: Int32,
+        inv_scale: Float32,
+    ):
+        """acc_S += rel_bias[q, head, q_pos - key] / softmax_scale, read from the
+        compact-bias ring stage the producer filled for this band tile (out-of-band
+        entries are 0; causal / window masking follows)."""
+        i = n_block_top - 1 - n_block
+        stage = i % self.cb_stages
+        pipeline_cb.consumer_wait_w_index_phase(stage, (i // self.cb_stages) & 1)
+        sCB_bf16 = cute.recast_ptr(sCB_ptr, dtype=cutlass.BFloat16) + stage * (
+            self.tile_m * self.cb_words * 2
+        )
+        acc_S_mn = layout_utils.reshape_acc_to_mn(acc_S)
+        cS = cute.make_identity_tensor((self.tile_m, self.tile_n))
+        tScS_mn = layout_utils.reshape_acc_to_mn(thr_mma_qk.partition_C(cS))
+        dist0 = seqlen.seqlen_k - seqlen.seqlen_q - n_block * self.tile_n
+        for r in cutlass.range_constexpr(cute.size(tScS_mn.shape[0])):
+            r_local = tScS_mn[r, 0][0]
+            row = m_block * self.tile_m + r_local
+            row_dist = dist0 + row // self.qhead_per_kvhead
+            lo = row_dist - (self.tile_n - 1)
+            # element (r, c) sits at row_dist - c - floor8(lo) in row r_local
+            row_ptr = sCB_bf16 + r_local * (self.cb_words * 2) + (lo & 7) + (self.tile_n - 1)
+            for c in cutlass.range_constexpr(cute.size(tScS_mn.shape[1])):
+                value = cute.make_tensor(
+                    row_ptr - tScS_mn[0, c][1], cute.make_layout((1,))
+                )[0].to(Float32)
+                acc_S_mn[r, c] = acc_S_mn[r, c] + value * inv_scale
+        pipeline_cb.consumer_release_w_index(stage)
+
+    @cute.jit
     def mma(
         self,
         tiled_mma_qk: cute.TiledMma,
@@ -1383,6 +1651,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         fastdiv_mods=None,
         sBias: Optional[cute.Tensor] = None,
         pipeline_bias: Optional[pipeline.PipelineAsync] = None,
+        mBiasCompact: Optional[cute.Tensor] = None,
+        sCB_ptr: Optional[cute.Pointer] = None,
+        pipeline_cb=None,
     ):
         aux_tensors = aux_data.tensors
         warp_group_idx = cute.arch.make_warp_uniform(
@@ -1538,6 +1809,21 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     aux_data=aux_data,
                     fastdiv_mods=fastdiv_mods,
                 )
+            compact_bias_fn = None
+            if const_expr(self.compact_bias):
+                _, n_block_top = block_info.get_n_block_min_max(
+                    seqlen, m_block, split_idx, num_splits
+                )
+                compact_bias_fn = partial(
+                    self.apply_compact_bias,
+                    sCB_ptr=sCB_ptr,
+                    pipeline_cb=pipeline_cb,
+                    n_block_top=n_block_top,
+                    thr_mma_qk=thr_mma_qk,
+                    seqlen=seqlen,
+                    m_block=m_block,
+                    inv_scale=base_softmax_scale,
+                )
             mma_one_n_block = partial(
                 mma_one_n_block_all,
                 seqlen=seqlen,
@@ -1583,6 +1869,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                             kv_consumer_state=kv_consumer_state,
                             mask_fn=partial(mask_fn, mask_mod=self.mask_mod),
                             score_mod_fn=score_mod_fn,
+                            compact_bias_fn=compact_bias_fn,
                             is_first_block=True,
                             apply_bias=const_expr(self.has_bias) and num_bias_loads > 0,
                         )
@@ -1598,6 +1885,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                                 mask_fn, mask_mod=self.mask_mod, mask_seqlen=True
                             ),
                             apply_bias=const_expr(self.has_bias) and num_bias_loads > 0,
+                            compact_bias_fn=compact_bias_fn,
                         )
                         O_should_accumulate = True
                     # if cute.arch.thread_idx()[0] == 128: cute.printf("m_block = {}, n_block_max = {}, n_block_min = {}", m_block, n_block_max, n_block_min)
@@ -1615,6 +1903,10 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                                     seqlen, m_block, n_block_min
                                 )
                             )
+                            if const_expr(self.compact_bias):
+                                n_block_min_causal_local_mask = self.compact_bias_n_lo(
+                                    block_info, seqlen, m_block, n_block_min
+                                )
                         # if cute.arch.thread_idx()[0] == 128: cute.printf("n_block_min_causal_local_mask = {}", n_block_min_causal_local_mask)
                         for n_tile in cutlass.range(
                             n_block_max - n_block_min_causal_local_mask, unroll=1
@@ -1636,6 +1928,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                                     )
                                 ),
                                 apply_bias=self.has_bias,
+                                compact_bias_fn=compact_bias_fn,
                             )
                             O_should_accumulate = True
                         n_block_max = cutlass.min(
@@ -1776,25 +2069,94 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             # ///////////////////////////////////////////////////////////////////////////////
             # Epilogue
             # ///////////////////////////////////////////////////////////////////////////////
-            self.epilogue(
-                acc_O,
-                softmax.row_sum,
-                mO,
-                mLSE,
-                sO,
-                seqlen,
-                gmem_tiled_copy_O,
-                tma_atom_O,
-                tiled_mma_pv,
-                tidx,
-                m_block,
-                head_idx,
-                batch_idx,
-                split_idx,
-            )
+            if const_expr(self.compact_bias and self.is_split_kv):
+                self.epilogue_split_pairs(
+                    acc_O,
+                    softmax.row_sum,
+                    mO,
+                    mLSE,
+                    seqlen,
+                    tiled_mma_pv,
+                    tidx,
+                    m_block,
+                    head_idx,
+                    batch_idx,
+                    split_idx,
+                )
+            else:
+                self.epilogue(
+                    acc_O,
+                    softmax.row_sum,
+                    mO,
+                    mLSE,
+                    sO,
+                    seqlen,
+                    gmem_tiled_copy_O,
+                    tma_atom_O,
+                    tiled_mma_pv,
+                    tidx,
+                    m_block,
+                    head_idx,
+                    batch_idx,
+                    split_idx,
+                )
 
             tile_scheduler.advance_to_next_work()
             work_tile = tile_scheduler.get_current_work()
+
+    @cute.jit
+    def epilogue_split_pairs(
+        self,
+        acc_O: cute.Tensor,
+        lse: cute.Tensor,
+        mO: cute.Tensor,
+        mLSE: Optional[cute.Tensor],
+        seqlen: SeqlenInfoQK,
+        tiled_mma: cute.TiledMma,
+        tidx: Int32,
+        m_block: Int32,
+        head_idx: Int32,
+        batch_idx: Int32,
+        split_idx: Int32,
+    ):
+        """Pack-GQA fp32 split epilogue writing each thread's adjacent accumulator
+        columns as one 8-byte store."""
+        assert self.pack_gqa and not self.check_hdim_v_oob
+        thr_mma = tiled_mma.get_slice(tidx)
+        cO = cute.make_identity_tensor((self.tile_m, self.tile_hdimv))
+        taccOcO = layout_utils.reshape_acc_to_mn(thr_mma.partition_C(cO))
+        acc_O_mn = layout_utils.reshape_acc_to_mn(acc_O)
+        row_limit = seqlen.seqlen_q * self.qhead_per_kvhead
+        if const_expr(mLSE is not None):
+            mLSE_cur = seqlen.offset_batch_Q(mLSE, batch_idx, dim=2)[
+                None, head_idx, split_idx
+            ]
+            if taccOcO[0][1] == 0:
+                for r in cutlass.range(cute.size(taccOcO, mode=[0]), unroll_full=True):
+                    row = m_block * self.tile_m + taccOcO[r, 0][0]
+                    if row < row_limit:
+                        mLSE_cur[row] = lse[r]
+        mO_cur = seqlen.offset_batch_Q(mO, batch_idx, dim=3)[
+            None, None, head_idx, split_idx
+        ]
+        for r in cutlass.range_constexpr(cute.size(acc_O_mn, mode=[0])):
+            row = m_block * self.tile_m + taccOcO[r, 0][0]
+            if row < row_limit:
+                mO_row = mO_cur[row, None]
+                for k in cutlass.range_constexpr(cute.size(acc_O_mn, mode=[1]) // 2):
+                    pair = cute.make_rmem_tensor((2,), Float32)
+                    pair[0] = acc_O_mn[r, 2 * k]
+                    pair[1] = acc_O_mn[r, 2 * k + 1]
+                    dst = cute.make_tensor(
+                        cute.make_ptr(
+                            Float32,
+                            (mO_row.iterator + taccOcO[r, 2 * k][1]).toint(),
+                            cute.AddressSpace.gmem,
+                            assumed_align=8,
+                        ),
+                        cute.make_layout((2,)),
+                    )
+                    cute.autovec_copy(pair, dst)
 
     @cute.jit
     def first_half_block_overlap(
@@ -1811,6 +2173,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         acc_O: Optional[cute.Tensor] = None,
         mask_fn: Callable = None,
         score_mod_fn: Optional[Callable] = None,
+        compact_bias_fn: Optional[Callable] = None,
         is_first_block: bool = False,
         thr_mma_qk: Optional[cute.ThrMma] = None,
         sBias: Optional[cute.Tensor] = None,
@@ -1836,6 +2199,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 kv_consumer_state,
                 apply_bias,
             )
+
+        if const_expr(compact_bias_fn is not None):
+            compact_bias_fn(acc_S, n_block=n_block)
 
         # Apply score modification if present
         if const_expr(score_mod_fn is not None):
@@ -1925,6 +2291,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         scores_scale: Optional[cute.Tensor] = None,  # not used
         score_mod_fn: Optional[Callable] = None,
         mask_fn: Optional[Callable] = None,
+        compact_bias_fn: Optional[Callable] = None,
         is_first_n_block: cutlass.Constexpr = False,
         check_inf: cutlass.Constexpr = True,
         thr_mma_qk: Optional[cute.ThrMma] = None,
@@ -1952,6 +2319,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 smem_pipe_read,
                 apply_bias,
             )
+
+        if const_expr(compact_bias_fn is not None):
+            compact_bias_fn(acc_S, n_block=n_block)
 
         # handle score mods and masking
         if const_expr(score_mod_fn is not None):
@@ -2022,6 +2392,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         scores_scale: Optional[cute.Tensor] = None,
         score_mod_fn: Optional[Callable] = None,
         mask_fn: Optional[Callable] = None,
+        compact_bias_fn: Optional[Callable] = None,
         check_inf: cutlass.Constexpr = True,
         thr_mma_qk: Optional[cute.ThrMma] = None,
         sBias: Optional[cute.Tensor] = None,
@@ -2059,6 +2430,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 smem_pipe_read,
                 apply_bias,
             )
+
+        if const_expr(compact_bias_fn is not None):
+            compact_bias_fn(acc_S, n_block=n_block)
 
         # handle score mods and masking
         if const_expr(score_mod_fn is not None):

@@ -1754,12 +1754,16 @@ def mamba_lazy_spec_in_window(
 
 
 def set_mamba_track_indices_from_reqs(
-    batch, track_positions: Optional[List[int]] = None
+    batch,
+    track_positions: Optional[List[int]] = None,
+    track_mask: Optional[List[bool]] = None,
 ):
     """Build mamba_track_indices from req objects (authoritative source).
 
     track_positions: optional per-req ping-pong position override (the lazy
     spec track plan, see mamba_lazy_spec_prepare).
+    track_mask: when given, uploaded with the positions in one H2D and set as
+    batch.mamba_track_mask.
     """
     mapping = batch.req_to_token_pool.req_index_to_mamba_ping_pong_track_buffer_mapping
     if track_positions is None:
@@ -1779,7 +1783,18 @@ def set_mamba_track_indices_from_reqs(
         i for i, req in enumerate(batch.reqs) if req.kv.mamba_next_track_idx is None
     ]
     batch.mamba_track_buffer_indices = list(track_positions)
-    positions = async_h2d(track_positions, dtype=torch.int64, device=mapping.device)
+    if track_mask is not None:
+        # int64 positions, then the mask as bool bytes in the tail words.
+        bs = len(track_positions)
+        host = torch.empty(bs + (bs + 7) // 8, dtype=torch.int64, pin_memory=True)
+        host_np = host.numpy()
+        host_np[:bs] = track_positions
+        host_np[bs:].view(np.bool_)[:bs] = track_mask
+        dev = host.to(device=mapping.device, non_blocking=True)
+        batch.mamba_track_mask = dev[bs:].view(torch.bool)[:bs]
+        positions = dev[:bs]
+    else:
+        positions = async_h2d(track_positions, dtype=torch.int64, device=mapping.device)
     batch.mamba_track_indices = _gather_mamba_track_indices(
         mapping, batch.req_pool_indices, positions
     )
@@ -2152,7 +2167,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             chunked_req=chunked_req,
             chunked_req_next_prompt_token=_compute_chunked_req_next_prompt_token(
                 chunked_req,
-                model_config.vocab_size,
+                model_config.token_id_vocab_size,
             ),
             dllm_config=dllm_config,
         )
@@ -3269,19 +3284,24 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if get_exec().mamba.enable_mamba_extra_buffer:
             mamba_track_interval = mamba_track_grid(self.tree_cache.page_size)
 
+            track_remainders_cpu = self.seq_lens_cpu % mamba_track_interval
+            track_mask_cpu = track_remainders_cpu == 0
+            self.mamba_track_mask_cpu = track_mask_cpu.tolist()
+
             if len(self.reqs) == 0:
                 self.mamba_track_indices = torch.empty(
                     (0,), dtype=torch.int64, device=self.device
                 )
                 self.mamba_track_buffer_indices = []
+                self.mamba_track_mask = torch.empty(
+                    (0,), dtype=torch.bool, device=self.device
+                )
             else:
                 if get_exec().mamba.enable_mamba_extra_buffer_lazy:
                     self.mamba_lazy_prealloc_at_boundary(mamba_track_interval)
-                set_mamba_track_indices_from_reqs(self)
-
-            track_remainders_cpu = self.seq_lens_cpu % mamba_track_interval
-            track_mask_cpu = track_remainders_cpu == 0
-            self.mamba_track_mask_cpu = track_mask_cpu.tolist()
+                set_mamba_track_indices_from_reqs(
+                    self, track_mask=self.mamba_track_mask_cpu
+                )
             self.mamba_track_mask_next_cpu = (
                 (track_remainders_cpu == mamba_track_interval - 1).tolist()
                 if self.enable_overlap
@@ -3293,10 +3313,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.mamba_decode_batch_idx_cpu = [
                 req.decode_batch_idx for req in self.reqs
             ]
-            # async H2D
-            self.mamba_track_mask = track_mask_cpu.pin_memory().to(
-                device=self.device, non_blocking=True
-            )
 
     def filter_batch(
         self,

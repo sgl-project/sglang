@@ -1817,16 +1817,24 @@ def build_hicache_draft_sidecars(
 
     assert len(draft_device_pools) == 1
     draft_kv_pool = draft_device_pools[0]
-    builder = (
-        build_swa_draft_pools
-        if draft_kv_pool.layer_router.sub_pool(IdSpaceKind.SLIDING_WINDOW) is not None
-        or isinstance(draft_kv_pool, DeepSeekV4TokenToKVPool)
-        else build_full_draft_pools
+    router = draft_kv_pool.layer_router
+    if isinstance(draft_kv_pool, DeepSeekV4TokenToKVPool):
+        return build_swa_draft_pools(draft_kv_pool=draft_kv_pool, tree_cache=tree_cache)
+    if router.sub_pool(IdSpaceKind.SLIDING_WINDOW) is None:
+        return build_full_draft_pools(
+            draft_kv_pool=draft_kv_pool, tree_cache=tree_cache
+        )
+    # A hybrid draft keeps full-attention layers next to its SWA layers;
+    # both must be restored or the draft reads stale KV after a hit.
+    specs, entries = build_swa_draft_pools(
+        draft_kv_pool=draft_kv_pool, tree_cache=tree_cache
     )
-    return builder(
-        draft_kv_pool=draft_kv_pool,
-        tree_cache=tree_cache,
-    )
+    if router.routes_to(IdSpaceKind.FULL):
+        full_specs, full_entries = build_full_draft_pools(
+            draft_kv_pool=router.view(IdSpaceKind.FULL), tree_cache=tree_cache
+        )
+        specs, entries = full_specs + specs, full_entries + entries
+    return specs, entries
 
 
 _COMPONENT_HOST_ATTR: dict[ComponentType, tuple[str, str]] = {

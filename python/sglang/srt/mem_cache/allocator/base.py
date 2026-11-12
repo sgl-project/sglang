@@ -42,6 +42,8 @@ class MambaFullCacheDonor(Protocol):
 
 
 class BaseTokenToKVPoolAllocator(abc.ABC):
+    # alloc_decode accepts req_to_token_write (one-launch alloc + req_to_token write).
+    supports_fused_decode_write = False
     # Ids handed out index a virtual space the allocator translates to physical
     # rows (a unified pool's chain), not the pool's rows themselves.
     hands_out_virtual_ids = False

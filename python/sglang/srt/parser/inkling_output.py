@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import json
 import logging
 from collections.abc import Sequence
@@ -52,12 +53,15 @@ class InklingOutputParser:
         parse_tool_calls: bool,
         stream_reasoning: bool = True,
         continues_text_block: bool = False,
+        spec: str = "inkling",
     ):
-        self._tml = load_tml_renderers()
+        self._tml = load_tml_renderers(spec)
+        self._byte_ids = native_byte_ids(spec)
         self._separate_reasoning = separate_reasoning
         self._hold_reasoning = separate_reasoning and not stream_reasoning
         self._parse_tool_calls = parse_tool_calls
         _spans, self._parser = self._tml.renderer.render_for_completion([])
+        self._stream = self._parser.parse_stream()
         tokenizer = self._tml.tokenizer
         self._content_kind_ids = frozenset(
             tokenizer.encode_special(name) for name in _CONTENT_KIND_NAMES
@@ -67,9 +71,11 @@ class InklingOutputParser:
             tokenizer.encode_special("content_text"),
         )
         self._end_message_id = tokenizer.encode_special("end_message")
+        self._thinking_id = tokenizer.encode_special("content_thinking")
         self._message_ids: list[int] = []
         self._streamed = ""
         self._held_reasoning = ""
+        self._held_recovered = ""
         self._model_authored = True
         self._at_message_boundary = True
         self._in_unframed_text = False
@@ -85,9 +91,17 @@ class InklingOutputParser:
     def feed(self, token_ids: Sequence[int]) -> InklingOutputDelta:
         delta = _DeltaBuilder()
         for token_id in token_ids:
-            self.num_consumed_tokens += 1
             self._feed_token(token_id, delta)
+        self.num_consumed_tokens += len(token_ids)
         return delta.build()
+
+    def abort(self, token_ids: Sequence[int] = ()) -> InklingOutputDelta:
+        """Parses tokens generated before an abort without finalizing, so an open
+        call is never completed into an executable one."""
+        if self._finished:
+            return InklingOutputDelta()
+        self._finished = True
+        return self.feed(token_ids)
 
     def finish(
         self,
@@ -101,8 +115,10 @@ class InklingOutputParser:
         if self._finished:
             return InklingOutputDelta()
         self._finished = True
+        num_consumed_tokens = self.num_consumed_tokens + len(token_ids)
+        partial = b""
         if isinstance(matched_stop, str):
-            token_ids = self._cut_at_stop_string(
+            token_ids, partial = self._cut_at_stop_string(
                 token_ids, matched_stop, keep_stop=keep_matched_stop
             )
         elif (
@@ -114,16 +130,22 @@ class InklingOutputParser:
             # Inside an open block TML renders even a special stop as text;
             # only end_message closes a block without rendering.
             token_ids = token_ids[:-1]
-        return self.feed(token_ids).merge(self._flush())
+        delta = _DeltaBuilder()
+        for token_id in [*token_ids, *(self._byte_ids[byte] for byte in partial)]:
+            self._feed_token(token_id, delta)
+        self.num_consumed_tokens = num_consumed_tokens
+        return delta.build().merge(self._flush())
 
     def _cut_at_stop_string(
         self, token_ids: Sequence[int], stop: str, *, keep_stop: bool
-    ) -> list[int]:
+    ) -> tuple[list[int], bytes]:
+        """Returns the whole tokens kept plus the kept byte prefix of the token the
+        cut falls in; those bytes may continue a character from earlier tokens."""
         # The scheduler matched ``stop`` on the decoded ids, framing included,
         # and ended on the token completing it; cut the raw stream there.
         tokenizer = self._tml.tokenizer
         if not token_ids:
-            return []
+            return [], b""
         stop_bytes = stop.encode()
         pieces = [tokenizer.decode_bytes([token_ids[-1]])]
         last_len = region_len = len(pieces[0])
@@ -135,7 +157,7 @@ class InklingOutputParser:
             region_len += len(pieces[0])
         cut = b"".join(pieces).find(stop_bytes)
         if cut == -1:
-            return list(token_ids)
+            return list(token_ids), b""
         if keep_stop:
             cut += len(stop_bytes)
         kept = list(token_ids[:start])
@@ -144,36 +166,46 @@ class InklingOutputParser:
             if offset + len(piece) <= cut:
                 kept.append(token_id)
             elif offset < cut and not tokenizer.is_special_token(token_id):
-                partial = piece[: cut - offset].decode(errors="ignore")
-                kept += tokenizer.encode_ordinary(partial)
+                return kept, piece[: cut - offset]
+            else:
+                break
             offset += len(piece)
-        return kept
+        return kept, b""
 
     def _flush(self) -> InklingOutputDelta:
         delta = _DeltaBuilder()
-        try:
-            updates = self._parser.flush_updates()
-        except self._tml.v0.ParseError as exc:
-            self._recover_message(delta, exc)
-            return delta.build()
-        for update in updates:
-            self._apply(update.update, delta)
-        self._surface_unclosed_message(delta)
+        if self._content_kind_id() is not None:
+            # A block cut off (e.g. by max_tokens) is closed so the native parser
+            # completes it as its own kind or rejects an incomplete payload.
+            self._parse(self._end_message_id, delta)
+        # A header with no content block yet carries no payload; native finish
+        # would reject it as unterminated.
+        if not self._message_ids:
+            try:
+                updates = self._stream.finish()
+            except self._tml.v0.ParseError as exc:
+                self._recover_message(delta, exc)
+                return delta.build()
+            for update in updates:
+                self._apply(update.update, delta)
         self._release_held_reasoning(delta)
         return delta.build()
 
-    def _surface_unclosed_message(self, delta: _DeltaBuilder) -> None:
-        # A message cut off (e.g. by max_tokens) never completes; only text kinds
-        # streamed, so a call payload would otherwise vanish.
-        if not self._model_authored or not any(
-            token_id in self._content_kind_ids for token_id in self._message_ids
-        ):
-            return
-        text = self._payload_text()
-        if text.startswith(self._streamed):
-            delta.content.append(text[len(self._streamed) :])
+    def _content_kind_id(self) -> int | None:
+        return next(
+            (
+                token_id
+                for token_id in self._message_ids
+                if token_id in self._content_kind_ids
+            ),
+            None,
+        )
 
     def _feed_token(self, token_id: int, delta: _DeltaBuilder) -> None:
+        if token_id in self._tml.unused_special_ids:
+            raise ValueError(
+                f"Generated token {token_id} is a reserved token of this checkpoint"
+            )
         is_special = self._tml.tokenizer.is_special_token(token_id)
         if self._in_unframed_text and is_special:
             # Inside a real text block TML reads most specials as text; the
@@ -192,9 +224,11 @@ class InklingOutputParser:
         self._at_message_boundary = False
         self._message_ids.append(token_id)
         try:
-            updates = self._parser.parse_token(token_id)
+            updates = self._stream.feed([token_id])
         except self._tml.v0.ParseError as exc:
-            self._recover_message(delta, exc)
+            self._recover_message(
+                delta, exc, block_open=token_id != self._end_message_id
+            )
             return
         for update in updates:
             self._apply(update.update, delta)
@@ -206,7 +240,11 @@ class InklingOutputParser:
             self._streamed = ""
         elif isinstance(update, chat.StreamingContent):
             if self._model_authored:
-                self._emit_text(update.content, update.content.text, delta)
+                self._emit_text(
+                    update.content.text,
+                    delta,
+                    thinking=isinstance(update.content, chat.Thinking),
+                )
                 self._streamed += update.content.text
         else:
             self._complete_message(update, delta)
@@ -221,8 +259,14 @@ class InklingOutputParser:
             logger.debug("Dropping non-model Inkling output message: %r", message)
         elif isinstance(content, (chat.Text, chat.Thinking)):
             if content.text.startswith(self._streamed):
-                self._emit_text(content, content.text[len(self._streamed) :], delta)
+                self._emit_text(
+                    content.text[len(self._streamed) :],
+                    delta,
+                    thinking=isinstance(content, chat.Thinking),
+                )
             self._release_held_reasoning(delta)
+        elif isinstance(content, chat.ToolError):
+            delta.content.append(content.text)
         elif isinstance(content, chat.InvokeTool):
             if self._parse_tool_calls and content.text is None:
                 delta.tool_calls.append(self._tool_call(message))
@@ -230,10 +274,8 @@ class InklingOutputParser:
             else:
                 delta.content.append(self._payload_text())
 
-    def _emit_text(self, content: Any, text: str, delta: _DeltaBuilder) -> None:
-        if not (
-            self._separate_reasoning and isinstance(content, self._tml.chat.Thinking)
-        ):
+    def _emit_text(self, text: str, delta: _DeltaBuilder, *, thinking: bool) -> None:
+        if not (self._separate_reasoning and thinking):
             delta.content.append(text)
         elif self._hold_reasoning:
             self._held_reasoning += text
@@ -244,6 +286,7 @@ class InklingOutputParser:
         if self._held_reasoning:
             delta.reasoning.append(self._held_reasoning)
             self._held_reasoning = ""
+        self._held_recovered = ""
 
     def _tool_call(self, message: Any) -> InklingToolCall:
         chat = self._tml.chat
@@ -260,21 +303,48 @@ class InklingOutputParser:
             arguments=json.dumps(args, ensure_ascii=False),
         )
 
-    def _recover_message(self, delta: _DeltaBuilder, exc: Exception) -> None:
+    def _recover_message(
+        self, delta: _DeltaBuilder, exc: Exception, *, block_open: bool = False
+    ) -> None:
         logger.warning(
             "Inkling output failed TMLv0 parsing; surfacing as text: %s", exc
         )
         text = self._payload_text()
-        emitted = "" if self._held_reasoning else self._streamed
-        if text.startswith(emitted):
-            delta.content.append(text[len(emitted) :])
-        self._held_reasoning = ""
-        self._parser.reset()
+        kind_id = self._content_kind_id()
+        reopen = (
+            block_open
+            and self._model_authored
+            and kind_id in (self._thinking_id, self._text_opener_ids[1])
+        )
+        unframed = self._in_unframed_text
+        if kind_id == self._thinking_id and self._hold_reasoning:
+            # The decoded payload supersedes this segment's held text; segments
+            # recovered earlier in the same block stay held until it closes.
+            self._held_reasoning = self._held_recovered + text
+            self._held_recovered = self._held_reasoning
+            if not reopen:
+                self._release_held_reasoning(delta)
+        elif kind_id == self._thinking_id:
+            if text.startswith(self._streamed):
+                self._emit_text(text[len(self._streamed) :], delta, thinking=True)
+        else:
+            emitted = "" if self._held_reasoning else self._streamed
+            if text.startswith(emitted):
+                delta.content.append(text[len(emitted) :])
+            self._held_reasoning = ""
+            self._held_recovered = ""
+        self._stream = self._parser.parse_stream()
         self._message_ids = []
         self._streamed = ""
         self._model_authored = True
         self._at_message_boundary = True
         self._in_unframed_text = False
+        if reopen:
+            # Native parsing rejects a block at its first invalid byte; reopen it so
+            # the rest of the block keeps its channel until its own end_message.
+            for token_id in (self._text_opener_ids[0], kind_id):
+                self._parse(token_id, delta)
+            self._in_unframed_text = unframed
 
     def _payload_ids(self) -> list[int]:
         ids = self._message_ids
@@ -296,6 +366,20 @@ class InklingOutputParser:
         if ids and ids[-1] == self._end_message_id:
             ids = ids[:-1]
         return self._tml.tokenizer.decode(ids)
+
+
+@functools.cache
+def native_byte_ids(spec: str = "inkling") -> tuple[int, ...]:
+    tokenizer = load_tml_renderers(spec).tokenizer
+    byte_ids: dict[int, int] = {}
+    token_id = 0
+    while len(byte_ids) < 256:
+        if not tokenizer.is_special_token(token_id):
+            data = tokenizer.decode_bytes([token_id])
+            if len(data) == 1:
+                byte_ids.setdefault(data[0], token_id)
+        token_id += 1
+    return tuple(byte_ids[byte] for byte in range(256))
 
 
 class _DeltaBuilder:

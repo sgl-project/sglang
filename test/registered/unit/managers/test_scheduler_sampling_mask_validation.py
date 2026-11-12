@@ -24,7 +24,7 @@ class TestSchedulerSamplingMaskValidation(CustomTestCase):
                 scheduler = Scheduler.__new__(Scheduler)
                 scheduler.enable_session_radix_cache = False
                 scheduler.model_config = SimpleNamespace(
-                    hf_eos_token_id={1}, vocab_size=128
+                    hf_eos_token_id={1}, vocab_size=128, token_id_vocab_size=120
                 )
                 scheduler.disaggregation_mode = mode
                 scheduler.disagg_metadata_buffers = SimpleNamespace(
@@ -54,10 +54,13 @@ class TestSchedulerSamplingMaskValidation(CustomTestCase):
                         "sglang.srt.managers.scheduler.BeamCoordinator.request_beam_width",
                         return_value=1,
                     ),
-                    patch("sglang.srt.managers.scheduler.Req", return_value=req),
+                    patch(
+                        "sglang.srt.managers.scheduler.Req", return_value=req
+                    ) as make_req,
                     patch("sglang.srt.managers.scheduler.prepare_abort") as abort,
                 ):
                     scheduler.handle_generate_request(recv_req)
+                self.assertEqual(make_req.call_args.kwargs["vocab_size"], 120)
                 abort.assert_called_once()
                 self.assertEqual(
                     abort.call_args.kwargs["status_code"], HTTPStatus.BAD_REQUEST

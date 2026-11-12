@@ -244,6 +244,7 @@ class FlashAttentionForwardSm100:
         kv_sf_interleaved: bool = False,
         batch_invariant: bool = False,
         tmem_load_red_max: bool = True,
+        rel_bias_scale_after_add: bool = False,
     ):
         # MXFP8 block-scaled attention (see interface._flash_attn_fwd):
         #   qk_blockscaled: Q/K fp8 e4m3 + per-32 UE8M0 scales; QK^T runs as
@@ -333,6 +334,7 @@ class FlashAttentionForwardSm100:
         self.pack_gqa = pack_gqa
         # relative (sheared) bias
         self.has_bias = has_bias
+        self.rel_bias_scale_after_add = rel_bias_scale_after_add
         self.batch_invariant = batch_invariant
         self.rel_extent_padded = rel_extent_padded
         assert rel_extent_padded % n_block_size == 0
@@ -864,8 +866,13 @@ class FlashAttentionForwardSm100:
                 assert (
                     not self.use_tma_KV
                 ), "can't use TMA to load SFV if not interleaved in gmem"
+                # V scales follow V's transposed layout in PagedKVManager.
                 mSFV = cute.make_tensor(
-                    mSFV.iterator, cute.select(mSFV.layout, mode=KV_layout_transpose)
+                    mSFV.iterator,
+                    cute.select(
+                        cute.select(mSFV.layout, mode=KV_layout_transpose),
+                        mode=V_layout_transpose,
+                    ),
                 )
 
         # check type consistency
@@ -905,6 +912,12 @@ class FlashAttentionForwardSm100:
                     self.num_regs_other = (
                         512 - self.num_regs_softmax * 2 - self.num_regs_correction
                     )
+        if const_expr(
+            self.q_stage == 2
+            and self.o_dtype == Float32
+            and self.o_dtype.width > self.q_dtype.width
+        ):
+            self.overlap_sO_sQ = True
         self._setup_attributes()
         # Blockscaled SF TMEM offsets: the SFs for q_stage i live in the S
         # region of the OTHER stage (stage 0 SF -> col tmem_s_offset[1], stage 1
@@ -1530,11 +1543,16 @@ class FlashAttentionForwardSm100:
 
         self.shared_storage = SharedStorage
 
-        # rel_bias needs to match the score_mod arithmetic domain: qk is scaled first,
-        # then bias is added, then softmax applies the base-2 conversion. Route LOG2_E
-        # through the same runtime kernel argument as the score_mod path so the device
-        # code sees identical operand kinds (constant vs register changes codegen).
-        if const_expr(self.has_bias):
+        if const_expr(self.has_bias and self.rel_bias_scale_after_add):
+            base_softmax_scale = 1.0 / softmax_scale
+            softmax_scale_log2, softmax_scale = utils.compute_softmax_scale_log2(
+                softmax_scale, self.score_mod
+            )
+        elif const_expr(self.has_bias):
+            # rel_bias needs to match the score_mod arithmetic domain: qk is scaled first,
+            # then bias is added, then softmax applies the base-2 conversion. Route LOG2_E
+            # through the same runtime kernel argument as the score_mod path so the device
+            # code sees identical operand kinds (constant vs register changes codegen).
             base_softmax_scale = softmax_scale
             softmax_scale_log2, softmax_scale = utils.LOG2_E, None
         else:
@@ -2815,6 +2833,7 @@ class FlashAttentionForwardSm100:
                         # ordering here.
                         if const_expr(not self.is_split_kv) or bias_max_idx0 >= 0:
                             cute.arch.griddepcontrol_wait()
+                            cute.arch.griddepcontrol_launch_dependents()
                         if issue_q_for_this_warp and (
                             const_expr(not self.is_split_kv) or bias_max_idx0 >= 0
                         ):
@@ -4384,13 +4403,15 @@ class FlashAttentionForwardSm100:
                     for j in cutlass.range(
                         0, cute.size(tBrS_cur.shape), 2, unroll_full=True
                     ):
+                        scores = (tBrS_cur[j], tBrS_cur[j + 1])
+                        biases = (
+                            tS2RrBias_cur[j].to(self.qk_acc_dtype),
+                            tS2RrBias_cur[j + 1].to(self.qk_acc_dtype),
+                        )
                         tBrS_cur[j], tBrS_cur[j + 1] = cute.arch.fma_packed_f32x2(
-                            (tBrS_cur[j], tBrS_cur[j + 1]),
+                            biases if const_expr(self.rel_bias_scale_after_add) else scores,
                             (bias_softmax_scale, bias_softmax_scale),
-                            (
-                                tS2RrBias_cur[j].to(self.qk_acc_dtype),
-                                tS2RrBias_cur[j + 1].to(self.qk_acc_dtype),
-                            ),
+                            scores if const_expr(self.rel_bias_scale_after_add) else biases,
                         )
             cute.arch.fence_view_async_shared()
             cute.arch.barrier(
@@ -4399,7 +4420,9 @@ class FlashAttentionForwardSm100:
             )
             pipeline_bias.consumer_release_w_index(bias_si_stage)
 
-        if const_expr(self.has_bias and not apply_bias):
+        if const_expr(
+            self.has_bias and not apply_bias and not self.rel_bias_scale_after_add
+        ):
             # Blocks beyond the bias band: the score_mod reference still scales qk there
             # (its bias contribution is 0), so scale to stay in the same domain.
             assert cute.size(tSrS_t2r.shape) % 2 == 0

@@ -266,14 +266,19 @@ class KVStorage:
         rows: torch.Tensor,
         seq_lens: torch.Tensor,
         seq_lens_cpu: torch.Tensor,
-        last_loc: torch.Tensor,
+        last_loc: Optional[torch.Tensor],
         make_room: Callable[[int], Any],
+        req_to_token_write: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> Optional[torch.Tensor]:
         """One owner token id per ``rows`` entry, at ``seq_len - 1``, taking a
         page only when that request's last page is full; None when they do not
         fit."""
         make_room(len(seq_lens) * self._allocator.page_size)
-        return self._allocator.alloc_decode(seq_lens, seq_lens_cpu, last_loc)
+        if req_to_token_write is None:
+            return self._allocator.alloc_decode(seq_lens, seq_lens_cpu, last_loc)
+        return self._allocator.alloc_decode(
+            seq_lens, seq_lens_cpu, last_loc, req_to_token_write=req_to_token_write
+        )
 
     def free_tokens(self, ids: torch.Tensor) -> None:
         """Give back owner token ids no request holds any more."""

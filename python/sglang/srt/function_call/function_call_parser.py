@@ -34,6 +34,7 @@ from sglang.srt.function_call.glm47_moe_detector import Glm47MoeDetector
 from sglang.srt.function_call.gpt_oss_detector import GptOssDetector
 from sglang.srt.function_call.hermes_detector import HermesDetector
 from sglang.srt.function_call.hunyuan_detector import HunyuanDetector
+from sglang.srt.function_call.inkling2_detector import Inkling2Detector
 from sglang.srt.function_call.inkling_detector import InklingDetector
 from sglang.srt.function_call.internlm_detector import InternlmDetector
 from sglang.srt.function_call.iquest_q1_detector import IQuestQ1Detector
@@ -118,6 +119,7 @@ class FunctionCallParser:
         "gigachat35": GigaChat35Detector,
         "gemma4": Gemma4Detector,
         "inkling": InklingDetector,
+        "inkling2": Inkling2Detector,
         "iquest_q1": IQuestQ1Detector,
         "response_template": ResponseTemplateToolDetector,
     }
