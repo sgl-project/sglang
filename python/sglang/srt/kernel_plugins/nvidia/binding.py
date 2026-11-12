@@ -1610,7 +1610,7 @@ class _Dispatch:
                 view = (
                     self.binding.prefill_view()
                     if step.mode == "prefill"
-                    else self.binding.forward_view()
+                    else self.binding.forward_view(forward_batch)
                 )
             return self.built.forward(
                 msgspec.structs.replace(step, view=view),
