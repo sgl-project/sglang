@@ -17,7 +17,7 @@ class TestDsaTilelangFp8Validation(CustomTestCase):
 
     def test_cuda_fp8_tilelang_prefill_rejected(self):
         with self.assertRaises(ValueError):
-            _check_tilelang_dsa_fp8_kv("fp8_e4m3", "tilelang", "trtllm", hip=False)
+            _check_tilelang_dsa_fp8_kv("fp8_e4m3", "tilelang", "flashmla_kv", hip=False)
 
     @patch("torch.cuda.get_device_capability", return_value=(9, 0))
     def test_cuda_fp8_tilelang_allowed(self, _capability):
@@ -43,7 +43,8 @@ class TestDsaTilelangFp8Validation(CustomTestCase):
 
     def test_cuda_fp8_non_tilelang_allowed(self):
         # fp8-capable backends must pass
-        _check_tilelang_dsa_fp8_kv("fp8_e4m3", "flashmla_kv", "trtllm", hip=False)
+        _check_tilelang_dsa_fp8_kv("fp8_e4m3", "flashmla_kv", "flashmla_kv", hip=False)
+        _check_tilelang_dsa_fp8_kv("fp8_e4m3", "trtllm", "trtllm", hip=False)
 
 
 if __name__ == "__main__":

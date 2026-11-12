@@ -2873,9 +2873,15 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             )
             # user-set prefill survives; only decode defaulted
             self.assertEqual(
-                _dsa_split_backend_resolution(_view(dsa_prefill_backend="trtllm")),
+                _dsa_split_backend_resolution(
+                    _view(dsa_prefill_backend="flashmla_sparse")
+                ),
                 {"dsa_decode_backend": "flashmla_kv"},
             )
+            for field in ("dsa_prefill_backend", "dsa_decode_backend"):
+                with self.subTest(mixed_trtllm_backend=field):
+                    with self.assertRaisesRegex(ValueError, "raw FP8 rows"):
+                        _dsa_split_backend_resolution(_view(**{field: "trtllm"}))
             # hisparse arm takes precedence (CUDA fp8 -> flashmla_kv)
             self.assertEqual(
                 _dsa_split_backend_resolution(_view(enable_hisparse=True)),
