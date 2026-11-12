@@ -13,6 +13,7 @@ from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
     _cuda_host_unregister,
     get_allocator_from_storage,
+    resolve_host_pin_memory,
 )
 from sglang.srt.utils import is_cuda, is_hip
 
@@ -80,6 +81,10 @@ class _SharedPageEnvelopeHostBacking:
         device: str,
         allocator_type: str,
     ):
+        # Rebind instead of resolving at the assignment: the allocation below
+        # has to place the buffer with the same pageable flag self.pin_memory
+        # ends up reporting.
+        pin_memory = resolve_host_pin_memory(pin_memory)
         if len(device_pools) != len(pool_names) or not device_pools:
             raise ValueError("Unified host pool devices and names must be non-empty.")
         if len(device_pools) > 2:
@@ -722,6 +727,9 @@ class UnifiedPageEnvelopeHostPool(HostKVCache):
         _shared_backing: _SharedPageEnvelopeHostBacking | None = None,
         _buffer_info: PageEnvelopeBufferInfo | None = None,
     ):
+        # Resolve before the backing is built so the pool reports the flag the
+        # backing actually allocated with (see _SharedPageEnvelopeHostBacking).
+        pin_memory = resolve_host_pin_memory(pin_memory)
         if mtp_draft_device_pools:
             raise NotImplementedError(
                 "Unified page-envelope host pools do not support packed MTP draft pools."

@@ -19,6 +19,7 @@ from sglang.srt.mem_cache.pool_host.base import HostKVCache, host_memory_budget_
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
     get_allocator_from_storage,
+    resolve_host_pin_memory,
 )
 from sglang.srt.utils import is_cuda
 
@@ -60,6 +61,9 @@ class MiniMaxM3Nvfp4IndexKPoolHost(HostKVCache):
         start_layer: int,
         end_layer: int,
     ):
+        # Rebind so the allocations below use the same pageable flag that
+        # self.pin_memory reports (SGLANG_HICACHE_DISABLE_NPU_HOST_PIN_MEMORY).
+        pin_memory = resolve_host_pin_memory(pin_memory)
         if layout not in _LAYOUTS:
             raise ValueError(
                 "MiniMax NVFP4 HiCache supports layer_first, page_first, "
