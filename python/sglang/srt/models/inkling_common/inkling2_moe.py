@@ -8,7 +8,7 @@ from typing import NamedTuple
 import torch
 from torch import nn
 
-from sglang.kernels.ops.inkling2 import experts_hip, experts_sm90, marlin_sm90
+from sglang.kernels.ops.inkling2 import experts_sm90, marlin_sm90
 from sglang.kernels.ops.inkling2.comm import (
     ROUTED_EXCHANGE_MIN_ROWS,
     all_reduce,
@@ -169,23 +169,17 @@ class Inkling2Experts(nn.Module):
                 self.quantize_w2,
             ),
         ):
+            loader = partial(self._load_shard, dim=dim)
             nvfp4 = (
                 quant_config is not None
                 and checkpoint_prefix + name + "_weight" in quant_config.nvfp4_weights
             )
-            mfma_order = (
-                quantized
-                and hip_path
-                and experts_hip.MFMA_ORDER
-                and experts_hip.experts_gluon.fits(*shape[1:])
-            )
-            loader = partial(
-                self._load_shard,
-                dim=dim,
-                reorder=(
-                    experts_hip.experts_gluon.mfma_order_weights if mfma_order else None
-                ),
-            )
+            weight_reorder = scale_reorder = None
+            if quantized and hip_path:
+                from sglang.srt.models.inkling_common import inkling2_moe_hip
+
+                weight_reorder, scale_reorder = inkling2_moe_hip.mfma_reorders(shape)
+                loader = partial(loader, reorder=weight_reorder)
             if nvfp4 and self.tp_size != 1:
                 raise ValueError(
                     "NVFP4 experts require expert parallelism so activation scales "
@@ -222,16 +216,11 @@ class Inkling2Experts(nn.Module):
                 if nvfp4:
                     # Replaced by the swizzled GEMM layout after loading.
                     self._nvfp4_scale_shapes[name] = tuple(scale.shape)
-                loader = partial(
-                    self._load_shard,
-                    dim=dim,
-                    checkpoint_shape=tuple(scale.shape) if nvfp4 else None,
-                    reorder=(
-                        experts_hip.experts_gluon.mfma_order_scales
-                        if mfma_order
-                        else None
-                    ),
-                )
+                    loader = partial(
+                        self._load_shard, dim=dim, checkpoint_shape=tuple(scale.shape)
+                    )
+                if scale_reorder is not None:
+                    loader = partial(loader, reorder=scale_reorder)
                 set_weight_attrs(scale, {"weight_loader": loader})
             else:
                 self.register_buffer(name + "_scale", None, persistent=False)
@@ -477,12 +466,9 @@ class Inkling2Experts(nn.Module):
         """Convert freshly loaded NVFP4 block scales to the GEMM layout once (on Hopper,
         repack NVFP4 and MXFP8 experts for Marlin; ROCm keeps the checkpoint layout)."""
         if self.hip:
-            # Identity src2dst for the combined decode rows (as on Hopper); kept
-            # across reloads, since captured graphs hold its address.
-            if self.w13_weight.is_cuda and getattr(self, "_identity", None) is None:
-                self._identity = torch.arange(
-                    1 << 17, dtype=torch.int32, device=self.w13_weight.device
-                )
+            from sglang.srt.models.inkling_common import inkling2_moe_hip
+
+            inkling2_moe_hip.prepare_experts(self)
             return
         if self.sm90:
             for name in ("w13", "w2"):
@@ -532,10 +518,10 @@ class Inkling2Experts(nn.Module):
         return mxfp8_matmul(x, weight, scale, metadata=metadata)
 
     def uses_hip_path(self):
-        """Whether forward takes inkling2_moe_hip, which can use a precomputed route."""
+        """Whether the experts (and Inkling2MoE's routing) run inkling2_moe_hip."""
         return self.hip and self.quantize_w13 and self.quantize_w2
 
-    def forward(self, x, weights, ids, combine=True, route=None, quantized=None):
+    def forward(self, x, weights, ids, combine=True):
         if x.shape[0] == 0:
             return x
         if self.uses_hip_path():
@@ -543,7 +529,7 @@ class Inkling2Experts(nn.Module):
                 forward_experts,
             )
 
-            return forward_experts(self, x, weights, ids, combine, route, quantized)
+            return forward_experts(self, x, weights, ids, combine)
         if self.hip:
             # The other ROCm paths return combined rows; the layer wraps them.
             combine = True
@@ -1081,18 +1067,14 @@ class Inkling2MoE(nn.Module):
         """combine=False may return a RoutedOutput instead of the combined output."""
         if x.shape[0] == 0:
             return x
-        route = quantized = None
         if self.experts.uses_hip_path():
-            from sglang.srt.models.inkling_common.inkling2_moe_hip import gate_and_route
+            from sglang.srt.models.inkling_common.inkling2_moe_hip import moe_forward
 
-            weights, ids, route, quantized = gate_and_route(self.gate, self.experts, x)
-        else:
-            weights, ids = self.gate(x)
+            return moe_forward(self, x, combine)
+        weights, ids = self.gate(x)
         if not combine and get_parallel().moe_tp_size == 1:
-            return self.experts(
-                x, weights, ids, combine=False, route=route, quantized=quantized
-            )
-        out = self.experts(x, weights, ids, route=route, quantized=quantized)
+            return self.experts(x, weights, ids, combine=False)
+        out = self.experts(x, weights, ids)
         if get_parallel().moe_tp_size > 1:
             out = all_reduce(out, get_parallel().moe_tp_group)
         return out

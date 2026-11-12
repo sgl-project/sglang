@@ -4,6 +4,7 @@ and its fused decode routing."""
 import torch
 
 from sglang.kernels.ops.inkling2 import experts_hip, experts_sm90, marlin_sm90
+from sglang.kernels.ops.inkling2.comm import all_reduce
 from sglang.kernels.ops.inkling2.linear import linear_k_group_partials, uses_k_groups
 from sglang.kernels.ops.inkling2.route_hip import (
     ROUTE_FUSED_MAX_TOKENS,
@@ -18,7 +19,37 @@ from sglang.srt.models.inkling_common.inkling2_moe import (
 from sglang.srt.runtime_context import get_parallel
 
 
-def forward_experts(experts, x, weights, ids, combine, route, quantized):
+def mfma_reorders(shape):
+    """(weight, scale) reorders that load quantized experts of this shape in
+    experts_gluon's MFMA order, or (None, None) where Gluon does not take them."""
+    if not (experts_hip.MFMA_ORDER and experts_hip.experts_gluon.fits(*shape[1:])):
+        return None, None
+    gluon = experts_hip.experts_gluon
+    return gluon.mfma_order_weights, gluon.mfma_order_scales
+
+
+def prepare_experts(experts):
+    """After loading: the identity src2dst for the combined decode rows (as on
+    Hopper), kept across reloads, since captured graphs hold its address."""
+    if experts.w13_weight.is_cuda and getattr(experts, "_identity", None) is None:
+        experts._identity = torch.arange(
+            1 << 17, dtype=torch.int32, device=experts.w13_weight.device
+        )
+
+
+def moe_forward(moe, x, combine):
+    """Inkling2MoE.forward on this path: gate_and_route's route and quantized x go
+    straight to forward_experts."""
+    weights, ids, route, quantized = gate_and_route(moe.gate, moe.experts, x)
+    if not combine and get_parallel().moe_tp_size == 1:
+        return forward_experts(moe.experts, x, weights, ids, False, route, quantized)
+    out = forward_experts(moe.experts, x, weights, ids, True, route, quantized)
+    if get_parallel().moe_tp_size > 1:
+        out = all_reduce(out, get_parallel().moe_tp_group)
+    return out
+
+
+def forward_experts(experts, x, weights, ids, combine, route=None, quantized=None):
     """ROCm NVFP4 / MXFP8 experts in source (token, top-k) order, with the Hopper
     path's numerics: fake-quantized activations against BF16-dequantized weights.
     quantized is x's (fake-quantized rows, amax) when already computed.
