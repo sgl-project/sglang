@@ -1798,18 +1798,15 @@ class Envs:
     SGLANG_OPT_FUSED_KDA_VERIFY = EnvBool(False)
     # A/B: keep the DFLASH draft greedy head eager (not folded in-graph).
     SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
+    # The DFLASH draft KV ring (speculative/dflash_draft_ring.py); resolved at
+    # startup to off where it does not fit.
+    SGLANG_ENABLE_DFLASH_DRAFT_KV_RING = EnvBool(True)
     # Disable the compact-slot SWA window lookup for compact MLA drafts; off by default.
     SGLANG_DISABLE_DFLASH_COMPACT_SWA_WINDOW = EnvBool(False)
-    # Keep an all-sliding-window MLA DFLASH draft's KV in a per-request ring of
-    # window + verify-block rows instead of one row per target slot. On by default;
-    # resolved at startup to off for drafts or backends it does not fit.
-    SGLANG_DFLASH_DRAFT_KV_RING = EnvBool(True)
     # Gather DFLASH candidate top-k in one multicast all-gather.
     SGLANG_OPT_DFLASH_FUSED_CANDIDATE_AG = EnvBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_K31_GB_OPTIMIZATION.get
     )
-    # Compute a draft block's ring locs in one Triton launch; off by default.
-    SGLANG_OPT_DFLASH_RING_LOCS_FUSED = EnvBool(False)
     # Capture the DFLASH aux append (draft KV) as CUDA graphs.
     SGLANG_DFLASH_AUX_GRAPH = EnvBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_K31_GB_OPTIMIZATION.get

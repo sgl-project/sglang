@@ -1101,33 +1101,6 @@ def _resolve_dflash_mla_draft_window(server_args: ServerArgs) -> None:
         )
 
 
-def _resolve_dflash_draft_kv_ring(server_args: ServerArgs) -> None:
-    """Settle SGLANG_DFLASH_DRAFT_KV_RING once, before any worker starts, so
-    every process agrees, including PP stages that own no draft: they still
-    register the ring's PD state slots. Runs after the draft backend and the
-    compact window are final."""
-    from sglang.srt.speculative.dflash_draft_ring import (
-        draft_kv_ring_unsupported_reason,
-    )
-
-    flag = envs.SGLANG_DFLASH_DRAFT_KV_RING
-    if not flag.get():
-        return
-    cfg = resolving_view(server_args)
-    reason = draft_kv_ring_unsupported_reason(
-        _load_draft_hf_config(cfg),
-        draft_backend=cfg.speculative_draft_attention_backend,
-        draft_window_size=cfg.speculative_draft_window_size,
-    )
-    if reason is None:
-        logger.info("DFLASH draft KV ring: on.")
-        return
-    if flag.is_set():
-        raise ValueError(f"SGLANG_DFLASH_DRAFT_KV_RING=1, but {reason}.")
-    logger.info("DFLASH draft KV ring: off, %s.", reason)
-    flag.set(False)
-
-
 def _reject_dflash_sliding_mla_draft_window(server_args: ServerArgs) -> None:
     from sglang.srt.speculative.dflash_utils import (
         get_dflash_layer_types,
@@ -1151,6 +1124,38 @@ def _reject_dflash_sliding_mla_draft_window(server_args: ServerArgs) -> None:
             f"with sliding-window layers on {draft_backend}: the backend applies "
             "the draft's own window."
         )
+
+
+def _resolve_dflash_draft_kv_ring(server_args: ServerArgs) -> None:
+    """Runs after the draft backend is final, which it reads."""
+    from sglang.srt.speculative.dflash_draft_ring import (
+        draft_kv_ring_unsupported_reason,
+    )
+
+    switch = envs.SGLANG_ENABLE_DFLASH_DRAFT_KV_RING
+    if not switch.get():
+        logger.info("DFLASH draft KV ring: off, SGLANG_ENABLE_DFLASH_DRAFT_KV_RING=0.")
+        return
+    cfg = resolving_view(server_args)
+    reason = draft_kv_ring_unsupported_reason(
+        lambda: _load_draft_hf_config(cfg),
+        draft_backend=cfg.speculative_draft_attention_backend,
+        disaggregation_mode=cfg.disaggregation_mode,
+        enable_unified_memory=cfg.enable_unified_memory,
+        dcp_size=cfg.dcp_size,
+        draft_window_size=cfg.speculative_draft_window_size,
+    )
+    if reason is not None:
+        if switch.is_set():
+            raise ValueError(f"SGLANG_ENABLE_DFLASH_DRAFT_KV_RING=1, but {reason}.")
+        logger.info("DFLASH draft KV ring: off, %s.", reason)
+        return
+    logger.info("DFLASH draft KV ring: on.")
+    declare_resolution(
+        server_args,
+        "_resolve_dflash_draft_kv_ring",
+        speculative_dflash_draft_kv_ring=True,
+    )
 
 
 def _handle_frozen_kv_mtp(server_args: ServerArgs) -> None:
