@@ -796,6 +796,26 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         """Whether ``count`` state slots can be taken now."""
         return count <= 0 or self.units_fit({self.mamba_allocator.sub_pool_name: count})
 
+    def state_slots_fit_in_place(self, count: int) -> bool:
+        """Whether ``count`` state slots can be taken now without moving a page:
+        where the bands stand, around send-held bytes, so the take needs no
+        relief (compaction or relayout) and waits for no send. Under pipeline
+        stages, on every stage's snapshot, so all of them answer alike."""
+        if count <= 0:
+            return True
+        name = self.mamba_allocator.sub_pool_name
+        demands = {name: count}
+
+        def in_place(snapshot: ChainSnapshot) -> bool:
+            return (
+                count <= snapshot.band(name).free_virtual_pages
+                and plan_layout(snapshot, demands, NO_MOVE) is not None
+            )
+
+        if self.stage_capacity is None:
+            return in_place(self.held_snapshot())
+        return self._ask("state_in_place", lambda: _units_key(demands), in_place)
+
     def estimated_state_slots_available(self) -> int:
         """`estimated_units_available` of the state sub-pool: observers only."""
         return self.estimated_units_available(self.mamba_allocator.sub_pool_name)
