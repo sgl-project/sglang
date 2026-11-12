@@ -554,8 +554,10 @@ class Envs:
     # (random) or round-robin expert sets, weighted 1/k (times any routed scale).
     # Grouped routers (topk_group < n_group) get sets within topk_group groups.
     # Routers that pick experts inside the MoE kernel (bypassed top-k) get logits
-    # that select the simulated sets, and a zero correction bias. Uniform's seed is
-    # baked in at CUDA-graph capture, so each graph replays one fixed assignment.
+    # that select the simulated sets, and a zero correction bias; a plain sigmoid
+    # router then weights 1/k only up to the logit's rounding (bf16, k=8: 0.12506).
+    # Uniform's seed is baked in at CUDA-graph capture, so each graph replays one
+    # fixed assignment. Not compatible with --ep-dispatch-algorithm fake.
     SGLANG_SIMULATE_UNIFORM_EXPERTS = EnvBool(False)
     SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS = EnvBool(False)
 

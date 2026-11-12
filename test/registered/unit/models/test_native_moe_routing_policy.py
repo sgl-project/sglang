@@ -634,10 +634,18 @@ class TestSimulatedRoutingLogitEncoding(CustomTestCase):
         self.assertEqual(
             topk_module.simulated_logit_encoding(topk.topk_config).groups, (4, 2)
         )
+        # Reused across forwards, also when a model reassigns the same bias each
+        # forward (beam), but rebuilt when a field changes after bind.
+        self.assertIs(topk._simulated_topk_config(), simulated)
+        topk.topk_config.correction_bias = bias
+        self.assertIs(topk._simulated_topk_config(), simulated)
         topk.topk_config.allow_routed_experts_capture = False
-        self.assertFalse(topk._simulated_topk_config().allow_routed_experts_capture)
-        # Per-forward configs share one cast of the zero bias.
-        cast = topk._simulated_topk_config().correction_bias_for_dtype(torch.bfloat16)
+        rebuilt = topk._simulated_topk_config()
+        self.assertFalse(rebuilt.allow_routed_experts_capture)
+        self.assertIs(topk._simulated_topk_config(), rebuilt)
+        # A rebuild keeps the one cast of the zero bias.
+        cast = rebuilt.correction_bias_for_dtype(torch.bfloat16)
+        topk.topk_config.renormalize = not topk.topk_config.renormalize
         self.assertIs(
             topk._simulated_topk_config().correction_bias_for_dtype(torch.bfloat16),
             cast,

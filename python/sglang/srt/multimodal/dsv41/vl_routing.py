@@ -13,6 +13,7 @@ from sglang.srt.layers.moe.topk import (
     apply_routing_simulation,
     routing_simulation_enabled,
     simulated_routing_groups,
+    simulated_routing_weight_scale,
 )
 from sglang.srt.layers.moe.utils import (
     get_moe_a2a_backend,
@@ -151,6 +152,7 @@ def _finish_vision_topk(
             top_k=config.top_k,
             layer_id=moe.layer_id,
             groups=simulated_routing_groups(config),
+            weight_scale=simulated_routing_weight_scale(config),
         )
         padded_rows_masked = False
     indices, weights, recorder_ids = _post_process_topk_ids(

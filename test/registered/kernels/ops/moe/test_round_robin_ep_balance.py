@@ -226,6 +226,8 @@ def _select(
     ep_size: int = EP_SIZE,
     scattered: bool = True,
     uniform: bool = False,
+    routed_scaling_factor=None,
+    apply_routed_scaling_factor_on_output: bool = False,
     **forward_flags,
 ):
     with (
@@ -253,6 +255,8 @@ def _select(
                     num_fused_shared_experts=num_fused_shared_experts
                 ),
                 custom_routing_function=_fixed_router,
+                routed_scaling_factor=routed_scaling_factor,
+                apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
             ),
             layer_id=0,
         )
@@ -307,6 +311,19 @@ def test_select_experts_preserves_fused_shared_expert_column(uniform):
     if not uniform:
         loads = _rank_loads(output.topk_ids[:, :TOPK])
         assert torch.equal(loads, torch.ones_like(loads))
+
+
+@pytest.mark.parametrize("on_output", [False, True])
+def test_select_experts_carries_a_routed_scale_folded_into_routing(on_output):
+    # A scale folded into routing is skipped by the MoE epilogue, so simulated
+    # weights must carry it, as the in-kernel routers' encoded logits do; otherwise
+    # the epilogue applies it.
+    output = _select(
+        routed_scaling_factor=2.5, apply_routed_scaling_factor_on_output=on_output
+    )
+    expected = (2.5 if on_output else 1.0) / TOPK
+    weights = output.topk_weights
+    assert torch.equal(weights, torch.full_like(weights, expected))
 
 
 # (num_experts, top_k, (num_expert_group, topk_group)). DeepSeek-V3 splits its 8
@@ -419,6 +436,27 @@ def test_grouped_round_robin_spreads_small_batches_over_ranks_sharing_a_group(
     assert torch.equal(loads, torch.full_like(loads, num_tokens * TOPK // ep_size))
 
 
+@pytest.mark.parametrize("num_shards", [3, 8, 16])
+def test_grouped_round_robin_balances_each_uneven_shard_on_its_own(num_shards):
+    # DeepSeek-V3 under scattered DP: a shard's whole 8-token cycles must load every
+    # EP rank equally whatever the other shards hold, rather than pinning a shard to
+    # the few groups its global token numbers would reach.
+    for rank in range(num_shards):
+        num_tokens = 8 * (rank % 3)
+        ids, _ = _route_grouped(
+            num_tokens,
+            NUM_EXPERTS,
+            TOPK,
+            (8, 4),
+            num_ranks=8,
+            token_shard_rank=rank,
+            num_token_shards=num_shards,
+            layer_id=2,
+        )
+        loads = _rank_loads(ids, 8)
+        assert torch.equal(loads, torch.full_like(loads, num_tokens)), (rank, loads)
+
+
 def test_grouped_round_robin_masks_padded_rows():
     ids, weights = _route_grouped(
         10,
@@ -510,6 +548,50 @@ def test_encoder_marks_exactly_the_generated_experts(uniform, groups, dtype, ep_
     assert encoded.dtype == dtype
     assert torch.equal(_targets(encoded), ids.sort(-1).values)
     assert int((encoded == -64.0).sum()) == 33 * (NUM_EXPERTS - TOPK)
+
+
+@pytest.mark.parametrize("contiguous", [True, False])
+def test_encoder_in_place_reuses_contiguous_logits_only(contiguous):
+    # The bypass path overwrites the raw logits instead of allocating per forward;
+    # rows it cannot address by one stride get a fresh buffer and stay untouched.
+    from sglang.srt.layers.moe.topk import (
+        encode_simulated_router_logits,
+        simulated_logit_encoding,
+    )
+    from sglang.srt.layers.moe.utils import RoutingMethodType
+
+    config = _bypassed_config(RoutingMethodType.DeepSeekV3, TOPK, (8, 4))
+    shape = (9, NUM_EXPERTS) if contiguous else (NUM_EXPERTS, 9)
+    raw = torch.full(shape, 3.0, dtype=torch.bfloat16, device="cuda")
+    logits = raw if contiguous else raw.t()
+    with _simulation_scope(uniform=False, ep_size=8):
+        encoded = encode_simulated_router_logits(
+            logits,
+            encoding=simulated_logit_encoding(config),
+            layer_id=config.layer_id,
+            in_place=True,
+        )
+        expected = _encode(config, 9)
+    assert (encoded.data_ptr() == raw.data_ptr()) == contiguous
+    assert bool((raw == 3.0).all()) != contiguous
+    assert torch.equal(encoded, expected)
+
+
+def test_encoder_from_ids_marks_exactly_the_given_experts_and_skips_padding():
+    # gfx1250 W4A8 routes from logits even when TopK materialized simulated ids, so
+    # the logits must select those ids (and padded -1 rows must not fault).
+    from sglang.srt.layers.moe.topk import encode_router_logits_from_topk_ids
+
+    ids, _ = _route(5)
+    ids[3:] = -1
+    encoded = encode_router_logits_from_topk_ids(
+        ids, num_experts=NUM_EXPERTS, dtype=torch.bfloat16
+    )
+    assert encoded.dtype == torch.bfloat16
+    assert torch.equal(_targets(encoded[:3]), ids[:3].sort(-1).values)
+    assert bool((encoded[3:] == -64.0).all())
+    weights = encoded[:3].float().softmax(-1).topk(TOPK).values
+    assert torch.equal(weights, torch.full_like(weights, 1.0 / TOPK))
 
 
 @pytest.mark.parametrize("uniform", [False, True])
