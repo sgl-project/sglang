@@ -358,10 +358,28 @@ class TestReasoningTokenFields(CustomTestCase):
 
 class TestDecisionCheckpointConfig(CustomTestCase):
     def _checkpoint(self, directory, **decision):
-        Qwen3_5Config(architectures=["Qwen3_5Model"]).save_pretrained(directory)
+        Qwen3_5Config(
+            architectures=["Qwen3_5Model"], tie_word_embeddings=True
+        ).save_pretrained(directory)
         decision = {"format_version": 1, "codes": ["A"], "token_ids": [32], **decision}
         with open(os.path.join(directory, "decision_config.json"), "w") as f:
             json.dump(decision, f)
+
+    def test_readout_does_not_share_storage_with_the_embedding(self):
+        """The readout fills only the code rows, so a tied head would zero every other row."""
+        with TemporaryDirectory() as checkpoint:
+            self._checkpoint(checkpoint)
+            config = ModelConfig(model_path=checkpoint)
+            self.assertIs(config.hf_config.tie_word_embeddings, False)
+
+    def test_bare_backbone_keeps_its_tie_without_a_readout(self):
+        """Only a checkpoint whose head the readout replaces may drop the tie."""
+        with TemporaryDirectory() as checkpoint:
+            Qwen3_5Config(
+                architectures=["Qwen3_5Model"], tie_word_embeddings=True
+            ).save_pretrained(checkpoint)
+            config = ModelConfig(model_path=checkpoint)
+            self.assertIs(config.hf_config.tie_word_embeddings, True)
 
     def test_attention_mode_reaches_the_text_config(self):
         """A noncausal decision checkpoint must not be served with causal full attention."""
