@@ -22,24 +22,22 @@ register_npu_ci(
 )
 
 QWEN3_6_27B_1080P_ENVS = {
-    # Avoid the fragmentation-driven OOM when a 37-image 1080p ViT batch is
-    # captured by the ViT NPU graph runner (same setting as the 1024x1024 case).
-    "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
     "STREAMS_PER_DEVICE": "32",
     "HCCL_SOCKET_IFNAME": "lo",
     "GLOO_SOCKET_IFNAME": "lo",
     "HCCL_OP_EXPANSION_MODE": "AIV",
     "SGLANG_SET_CPU_AFFINITY": "1",
-    # The ViT NPU graph runner permanently caches one graph (plus block buffers,
-    # up to ~3 GB for a 37-image batch) per distinct image-batch layout. NPU is
-    # back on the per-request ViT path (see mm_schedule.py), so only the
-    # single-image layout is ever captured and the graph can stay enabled.
     "SGLANG_VIT_ENABLE_CUDA_GRAPH": "1",
     "SGLANG_NPU_PROFILING": "0",
     "SGLANG_NPU_PROFILING_STAGE": "prefill",
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
     "SGLANG_PREFILL_DELAYER_MAX_PREFILL_BS_WINDOW_SIZE": "128",
     "ASCEND_USE_FIA": "1",
+    # The unchunked 77k-token prefill waves fragment the NPU caching allocator
+    # across waves (59.56 GiB reserved vs 47.05 GiB active observed); a later
+    # 744 MiB contiguous scratch allocation then fails with OOM. expandable_segments
+    # keeps large blocks growable and reusable, matching pr-test-npu.yml behavior.
+    "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
 }
 
 QWEN3_6_27B_1080P_OTHER_ARGS = [
@@ -58,9 +56,9 @@ QWEN3_6_27B_1080P_OTHER_ARGS = [
     "--disable-radix-cache",
     "--trust-remote-code",
     "--max-running-requests",
-    38,
+    36,
     "--max-mamba-cache-size",
-    38,
+    36,
     "--mem-fraction-static",
     0.70,
     "--cuda-graph-bs-decode",
@@ -77,7 +75,7 @@ QWEN3_6_27B_1080P_OTHER_ARGS = [
     30,
     32,
     35,
-    38,
+    36,
     "--enable-prefill-delayer",
     "--prefill-delayer-queue-min-ratio",
     0.45,
@@ -117,9 +115,9 @@ class TestNPUQwen3_6_27B_1P_In1080p_30_Out256_50ms(TestNpuPerformanceTestCaseBas
     envs = QWEN3_6_27B_1080P_ENVS
     backend = "sglang-oai-chat"
     dataset_name = "image"
-    warmup_requests = 38
-    max_concurrency = 42
-    num_prompts = 152
+    warmup_requests = 36
+    max_concurrency = 40
+    num_prompts = 144
     input_len = 30
     output_len = 256
     random_range_ratio = 1
