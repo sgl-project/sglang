@@ -95,8 +95,8 @@ def prefer_conditioning_cache():
 # those blocks still identifies every byte, without copying the zeros to host.
 _SPARSE_HASH_BLOCK_BYTES = 64 * 1024
 _SPARSE_HASH_MIN_BYTES = 16 * 1024 * 1024
-# Arbitrary bound on bookkeeping, not memory; ServerArgs.conditioning_cache_max_entries
-# repeats it so argument parsing does not import this module.
+# Bound on bookkeeping, not memory: the byte budget normally binds first, even
+# for tiled VAE references that store one small entry per tile.
 DEFAULT_CONDITIONING_CACHE_MAX_ENTRIES = 4096
 
 

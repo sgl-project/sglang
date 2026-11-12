@@ -13,7 +13,6 @@ from typing import TYPE_CHECKING, Any, Callable, List
 import torch
 
 from sglang.multimodal_gen.runtime.cache.conditioning import (
-    DEFAULT_CONDITIONING_CACHE_MAX_ENTRIES,
     ConditioningCache,
     conditioning_cache_group,
 )
@@ -67,18 +66,10 @@ class PipelineExecutor(ABC):
     def __init__(self, server_args):
         self.server_args = server_args
         self.component_residency_manager = None
-        cache_enabled = not server_args.disable_conditioning_cache
         self.conditioning_cache = ConditioningCache(
-            (
-                int(server_args.conditioning_cache_max_size_mb * 1024**2)
-                if cache_enabled
-                else 0
-            ),
-            max_entries=(
-                server_args.conditioning_cache_max_entries
-                if cache_enabled
-                else DEFAULT_CONDITIONING_CACHE_MAX_ENTRIES
-            ),
+            int(server_args.conditioning_cache_max_size_mb * 1024**2)
+            if not server_args.disable_conditioning_cache
+            else 0
         )
 
     def begin_component_residency_request(

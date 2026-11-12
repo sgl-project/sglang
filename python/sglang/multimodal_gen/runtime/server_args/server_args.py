@@ -642,9 +642,6 @@ class ServerArgs(DisaggServerArgsMixin):
     enable_cache_report: bool = False
     disable_conditioning_cache: bool = False
     conditioning_cache_max_size_mb: float = 512.0
-    # Same as DEFAULT_CONDITIONING_CACHE_MAX_ENTRIES in runtime/cache/conditioning.py:
-    # high enough that the byte budget binds first for tiled VAE references.
-    conditioning_cache_max_entries: int = 4096
 
     # Tracing
     enable_trace: bool = False
@@ -2163,11 +2160,6 @@ class ServerArgs(DisaggServerArgsMixin):
             raise ValueError(
                 "conditioning_cache_max_size_mb must be finite and nonnegative"
             )
-        if (
-            type(self.conditioning_cache_max_entries) is not int
-            or self.conditioning_cache_max_entries < 1
-        ):
-            raise ValueError("conditioning_cache_max_entries must be a positive int")
         if not self._explicit_arg_names:
             self._explicit_arg_names = _infer_direct_constructor_explicit_arg_names(
                 self
@@ -3345,12 +3337,6 @@ class ServerArgs(DisaggServerArgsMixin):
             type=float,
             default=ServerArgs.conditioning_cache_max_size_mb,
             help="Per-worker conditioning cache capacity across CPU and device entries in MiB (default: 512; 0 disables cross-request caching).",
-        )
-        parser.add_argument(
-            "--conditioning-cache-max-entries",
-            type=int,
-            default=ServerArgs.conditioning_cache_max_entries,
-            help="Per-worker limit on conditioning cache entries, a bound on bookkeeping rather than memory; the byte capacity normally binds first (default: %(default)s).",
         )
         parser.add_argument(
             "--backend",

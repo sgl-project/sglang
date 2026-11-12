@@ -14,7 +14,6 @@ from diffusers.models.modeling_outputs import AutoencoderKLOutput
 
 from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput
 from sglang.multimodal_gen.runtime.cache.conditioning import (
-    DEFAULT_CONDITIONING_CACHE_MAX_ENTRIES,
     ConditioningCache,
     cached_conditioning,
     cached_encoder_call,
@@ -25,7 +24,6 @@ from sglang.multimodal_gen.runtime.cache.conditioning import (
 from sglang.multimodal_gen.runtime.models.encoders.base import (
     EncoderTensorParallelMixin,
 )
-from sglang.multimodal_gen.runtime.server_args.server_args import ServerArgs
 
 
 class Encoder(EncoderTensorParallelMixin, torch.nn.Module):
@@ -201,14 +199,6 @@ def test_group_tier_keeps_a_stage_with_more_than_128_private_entries():
             for x in tiles:
                 model(x)
     assert (model.calls, cache.group_hits) == (148, 148)
-
-
-def test_server_and_direct_construction_share_the_default_entry_limit():
-    # ServerArgs repeats the literal so argument parsing does not import the cache.
-    assert (
-        ServerArgs.conditioning_cache_max_entries
-        == DEFAULT_CONDITIONING_CACHE_MAX_ENTRIES
-    )
 
 
 @torch.no_grad()
