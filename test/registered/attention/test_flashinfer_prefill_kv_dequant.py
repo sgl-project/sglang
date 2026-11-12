@@ -133,7 +133,7 @@ class TestFlashInferPrefillKVDequant(CustomTestCase):
 
     def test_backend_routes_enabled_and_following_fallback_batches(self):
         from sglang.srt.environ import envs
-        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from sglang.srt.model_executor.forward_mode import ForwardMode
         from sglang.test.kits.attention_unittest.attention_methods import (
             dense_attention as dense,
         )
