@@ -2638,6 +2638,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         )
 
     @property
+    def num_tokens_pending_prealloc(self):
+        return sum(pre_alloc_fill_len(req) for req in self.queue) + sum(
+            pre_alloc_fill_len(req) for req in self.retracted_queue
+        )
+
+    @property
     def num_tokens_pre_allocated(self):
         return sum(
             decode_req.req.extend_end
@@ -3994,11 +4000,8 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                         is_drained,
                     )
                 )
-        # Drop the released entries before releasing so a _do_release exception
-        # can't leave one in the list (double-free / None receiver on retry).
-        self._deferred_releases._leave(
-            [decode_req.req for decode_req, *_ in to_release]
-        )
+        # Each release takes its entry out; a failed one is abandoned, not retried,
+        # so the ranks' lists stay the same.
         for decode_req, start_time, idx, room, drained in to_release:
             if not drained:
                 logger.warning(
@@ -4009,9 +4012,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             outcome = "drained" if drained else "timeout"
             try:
                 self._do_release(decode_req, idx)
-            except Exception:
-                # Isolate a failed release so the rest still run; entry already dropped.
-                logger.exception(f"Deferred KV release failed for room {room}")
+            except Exception as error:
+                # Isolate a failed release so the rest still run.
+                self.scheduler.request_retirer.abandon(decode_req.req, error)
                 outcome = "error"
             self._observe_deferred_kv_release(
                 duration_seconds=max(0.0, now - start_time),

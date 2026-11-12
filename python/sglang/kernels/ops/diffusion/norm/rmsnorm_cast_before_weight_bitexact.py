@@ -25,14 +25,13 @@ def _fold_halves(values, ROWS: tl.constexpr, WIDTH: tl.constexpr):
 
 
 @triton.jit
-def _ordered_rstd(
+def _ordered_mean_square(
     X,
     M: tl.constexpr,
     DIM: tl.constexpr,
     ROWS: tl.constexpr,
     HEADS: tl.constexpr = 1,
     TOKEN_STRIDE: tl.constexpr = 0,
-    EPS: tl.constexpr = 1e-6,
 ):
     rows = tl.program_id(0).to(tl.int64) * ROWS + tl.arange(0, ROWS)
     if TOKEN_STRIDE == 0 or TOKEN_STRIDE == HEADS * DIM:
@@ -59,8 +58,66 @@ def _ordered_rstd(
     total = _fold_halves(total, ROWS, 4)
     total = _fold_halves(total, ROWS, 2)
     total = _fold_halves(total, ROWS, 1)
-    mean = mul_rn_f32(tl.reshape(total, (ROWS,)), 1.0 / DIM)
+    return mul_rn_f32(tl.reshape(total, (ROWS,)), 1.0 / DIM)
+
+
+@triton.jit
+def _ordered_rstd(
+    X,
+    M: tl.constexpr,
+    DIM: tl.constexpr,
+    ROWS: tl.constexpr,
+    HEADS: tl.constexpr = 1,
+    TOKEN_STRIDE: tl.constexpr = 0,
+    EPS: tl.constexpr = 1e-6,
+):
+    mean = _ordered_mean_square(X, M, DIM, ROWS, HEADS, TOKEN_STRIDE)
     return cuda_rsqrtf(mean + EPS)
+
+
+@triton.jit
+def _mean_square_kernel(
+    X, Out, M: tl.constexpr, HEADS: tl.constexpr, TOKEN_STRIDE: tl.constexpr
+):
+    rows = tl.program_id(0).to(tl.int64) * 16 + tl.arange(0, 16)
+    mean = _ordered_mean_square(X, M, 128, 16, HEADS, TOKEN_STRIDE)
+    tl.store(Out + rows, mean, rows < M)
+
+
+def _fake_mean_square(x):
+    return torch.empty((*x.shape[:-1], 1), device=x.device, dtype=torch.float32)
+
+
+def can_use_rmsnorm_mean_square(x: torch.Tensor) -> bool:
+    return (
+        is_cuda()
+        and x.is_cuda
+        and x.dtype == torch.bfloat16
+        and x.ndim == 4
+        and x.shape[-1] == 128
+        and x.stride(-1) == 1
+        and x.stride(-2) == 128
+        and x.stride(1) >= x.shape[2] * 128
+        and (x.shape[0] == 1 or x.stride(0) == x.shape[1] * x.stride(1))
+        and 16 <= x.numel() // 128
+        and x.numel() < 2**29
+    )
+
+
+@register_custom_op(
+    op_name="rmsnorm_mean_square_bitexact", mutates_args=[], fake_impl=_fake_mean_square
+)
+def rmsnorm_mean_square_bitexact(x: torch.Tensor) -> torch.Tensor:
+    """Match ``x.float().square().mean(-1, keepdim=True)`` for BF16 head-128 views."""
+    if not can_use_rmsnorm_mean_square(x):
+        raise ValueError("Unsupported head-128 mean-square inputs")
+    with torch.cuda.device(x.device):
+        out = _fake_mean_square(x)
+        rows = x.numel() // 128
+        _mean_square_kernel[(triton.cdiv(rows, 16),)](
+            x, out, rows, x.shape[2], x.stride(1), num_warps=4, enable_fp_fusion=False
+        )
+    return out
 
 
 @triton.jit
