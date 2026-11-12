@@ -68,7 +68,49 @@ class SeqLenBucketGraphVariants(msgspec.Struct, frozen=True):
         return self.fallback_label
 
 
+HS_MIXED = "hs_mixed"
+HS_RESIDENT = "hs_resident"
+
+
+@dataclass(frozen=True)
+class HiSparseResidentGraphVariants:
+    """HS_FAST: HiSparse decode graphs; "hs_resident" when every request of the batch is resident (its whole KV in the
+    device pool), else "hs_mixed". The coordinator built the device page table for exactly this batch."""
+
+    # Mixed first: its capture peak (swap-in workspaces) subsumes the resident graph's in the shared pool.
+    capture_labels: ClassVar[tuple[str, ...]] = (HS_MIXED, HS_RESIDENT)
+
+    def select(self, forward_batch: ForwardBatch) -> str:
+        from sglang.srt.managers import hisparse_coordinator as hc
+
+        coord = hc.HS_ACTIVE_COORDINATOR
+        if coord is not None and coord.hs_batch_all_resident(forward_batch):
+            return HS_RESIDENT
+        return HS_MIXED
+
+
+def _hs_resident_graph_variants() -> Optional[AttentionGraphVariants]:
+    from sglang.srt.environ import envs
+    from sglang.srt.runtime_context import get_memory
+
+    if not (
+        envs.SGLANG_HISPARSE_RESIDENT_GRAPH.get()
+        and envs.SGLANG_HISPARSE_RESIDENT.get()
+        and envs.SGLANG_HISPARSE_FAST_TOPK.get()  # the all-resident graph's top-k emits device slots
+    ):
+        return None
+    if not get_memory().enable_hisparse:
+        return None
+    logger.info(
+        "HiSparse: capturing hs_mixed + hs_resident decode graphs (all-resident batches skip the swap-in)"
+    )
+    return HiSparseResidentGraphVariants()
+
+
 def create_attention_graph_variants(hf_config) -> Optional[AttentionGraphVariants]:
+    hs = _hs_resident_graph_variants()  # HS_FAST
+    if hs is not None:
+        return hs
     from sglang.srt.configs.model_config import (
         get_dsa_index_kpool,
         get_dsa_index_topk,

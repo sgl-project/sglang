@@ -24,6 +24,32 @@ class TopkTransformMethod(IntEnum):
     RAGGED = auto()
 
 
+def _hs_resident_page_table(attn_metadata, rows: int, lengths=None):
+    """HS_FAST: while capturing the all-resident graph, the device page table of this forward, else None."""
+    from sglang.srt.model_executor.runner_utils.capture_mode import (
+        get_capture_attention_variant,
+    )
+
+    if get_capture_attention_variant() != "hs_resident":
+        return None
+    from sglang.srt.managers import hisparse_coordinator as hc
+
+    coord = hc.HS_ACTIVE_COORDINATOR
+    return (
+        None
+        if coord is None
+        else coord.hs_device_page_table(attn_metadata, rows, lengths)
+    )
+
+
+def _hs_resident_capture() -> bool:
+    from sglang.srt.model_executor.runner_utils.capture_mode import (
+        get_capture_attention_variant,
+    )
+
+    return get_capture_attention_variant() == "hs_resident"
+
+
 class DSATopKBackend(Enum):
     SGL_KERNEL = "sgl-kernel"
     TORCH = "torch"
@@ -105,6 +131,38 @@ class DSATopKBackend(Enum):
         packed_extend_topk: bool = False,
     ) -> torch.Tensor:
         if not envs.SGLANG_DSA_FUSE_TOPK.get() or force_unfused_topk:
+            # HS_PATCH: HiSparse decode (forced unfused): v2 kernel in raw-index mode = logical positions, no page table
+            plan = getattr(attn_metadata, "topk_v2_plan", None)
+            if (
+                force_unfused_topk
+                and envs.SGLANG_HISPARSE_FAST_TOPK.get()
+                and self.should_use_topk_v2()
+                and topk_transform_method == TopkTransformMethod.PAGED
+                and row_starts is None
+                and batch_idx_list is None
+                and 0 < topk <= 2048
+                and plan is not None
+                and lengths.shape[0] == logits.shape[0] == plan.shape[0] - 1
+                and logits.dtype == torch.float32
+                and logits.stride(1) == 1
+                and logits.stride(0) % 4 == 0
+            ):
+                from sglang.kernels.ops.attention.dsv4.topk import (
+                    topk_transform_paged_v2,
+                )
+
+                out = logits.new_empty((logits.shape[0], topk), dtype=torch.int32)
+                # HS_FAST: in the all-resident graph the kernel maps positions to device slots itself
+                hs_pt = _hs_resident_page_table(attn_metadata, logits.shape[0], lengths)
+                topk_transform_paged_v2(
+                    logits, lengths, hs_pt, out, attn_metadata.page_size, plan
+                )
+                return out
+            if force_unfused_topk and _hs_resident_capture():
+                raise RuntimeError(
+                    "HiSparse all-resident decode graph: the fast top-k route did not apply to this forward "
+                    "(it maps positions to device slots); unset SGLANG_HISPARSE_RESIDENT_GRAPH"
+                )
             return self.topk_func(logits, lengths, topk, row_starts=row_starts)
 
         # Decode-shaped PAGED top-k for the SGL backend (plain decode AND spec

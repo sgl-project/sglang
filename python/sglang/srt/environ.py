@@ -808,6 +808,11 @@ class Envs:
     SGLANG_HISPARSE_EXCLUSIVE = EnvBool(False)
     SGLANG_HISPARSE_HOST_TOKENS = EnvInt(0)
     SGLANG_HISPARSE_EXCL_HOST_MARGIN = EnvInt(65536)
+    # HiSparse decode top-k through the paged v2 kernel. Opt-in: its exactness against torch.topk is under test.
+    SGLANG_HISPARSE_FAST_TOPK = EnvBool(False)
+    # HiSparse: a decode graph for all-resident batches (needs RESIDENT and FAST_TOPK); its page table in one kernel.
+    SGLANG_HISPARSE_RESIDENT_GRAPH = EnvBool(False)
+    SGLANG_HISPARSE_FUSED_PAGE_TABLE = EnvBool(False)
     SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS = EnvBool(True)
     # Decode batches between SWA out-of-window evictions.
     SGLANG_SWA_EVICTION_INTERVAL = EnvInt(128)

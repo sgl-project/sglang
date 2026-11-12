@@ -361,9 +361,13 @@ class HiSparseSpecSwapManager:
                 f"got {verify_cache_locs.numel()}."
             )
         reqs = batch.reqs
+        coordinator._hs_verify_sel = None  # HS_SPECFAST
         if coordinator.hs_spec_res:  # HS_SPECRES: resident rows write their verify KV to their own mirrored slots
             res_rows = coordinator._hs_spec_res_prepare(batch)
             if len(res_rows) == len(reqs):
+                coordinator._hs_verify_sel = len(
+                    reqs
+                )  # HS_SPECFAST: an all-resident round: the resident graph
                 return
             if res_rows:
                 rs = set(res_rows)
@@ -607,9 +611,78 @@ class HiSparseSpecSwapManager:
         ]
 
 
+HS_ACTIVE_COORDINATOR = None  # HS_FAST: this process's coordinator, for the graph variants and the top-k route
 _HS_I64_MAX = (
     2**63 - 1
 )  # HS_LEAN: hs_lazy_from of a request whose host copy is complete
+
+
+def _hs_fused_page_table_kernel():
+    """HS_LEAN: Triton kernel, dev_pt[r, j] = map[max(rpt[r, j], 0) * PAGE] // PAGE for j < ceil(len[r] / PAGE)."""
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def kernel(
+        rpt_ptr,
+        rpt_stride,
+        map_ptr,
+        len_ptr,
+        out_ptr,
+        out_stride,
+        width,
+        PAGE: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
+        row = tl.program_id(0)
+        j = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+        n = tl.load(len_ptr + row).to(tl.int64)
+        m = (j < (n + PAGE - 1) // PAGE) & (j < width)
+        lp = tl.load(rpt_ptr + row * rpt_stride + j, mask=m, other=0).to(tl.int64)
+        lp = tl.maximum(lp, 0)
+        d = tl.load(map_ptr + lp * PAGE, mask=m, other=0)
+        tl.store(out_ptr + row * out_stride + j, (d // PAGE).to(tl.int32), mask=m)
+
+    return kernel
+
+
+_HS_FUSED_PT = None
+
+
+def hs_fused_device_page_table(rpt, mapping, lengths, page_size, out=None, block=1024):
+    """HS_LEAN: the all-resident graph's device page table in one launch (rows = lengths.shape[0]); entries past a
+    row's last page are left as they are (the top-k kernel reads page_table[r, pos // page] for pos < len[r] only)."""
+    global _HS_FUSED_PT
+    if _HS_FUSED_PT is None:
+        _HS_FUSED_PT = _hs_fused_page_table_kernel()
+    rows = int(lengths.shape[0])
+    width = int(rpt.shape[1])
+    if out is None:
+        out = torch.empty((rows, width), dtype=torch.int32, device=rpt.device)
+    assert (
+        rpt.dtype == torch.int32
+        and mapping.dtype == torch.int64
+        and out.dtype == torch.int32
+    )
+    assert (
+        rpt.stride(1) == 1
+        and out.stride(1) == 1
+        and rpt.shape[0] >= rows
+        and mapping.is_contiguous()
+    )
+    grid = (rows, (width + block - 1) // block)
+    _HS_FUSED_PT[grid](
+        rpt,
+        rpt.stride(0),
+        mapping,
+        lengths,
+        out,
+        out.stride(0),
+        width,
+        PAGE=page_size,
+        BLOCK=block,
+    )
+    return out
 
 
 class HiSparseCoordinator:
@@ -617,6 +690,7 @@ class HiSparseCoordinator:
         False  # HS_SPECRES (class default for coordinators built without __init__)
     )
     hs_el = None  # HS_ELASTIC (class default)
+    _hs_verify_sel = None  # HS_SPECFAST (class default)
     _hs_anchor_copy_blocks = 0
     _hs_stats_every = 0
     _hs_step = 0
@@ -624,8 +698,10 @@ class HiSparseCoordinator:
     _hs_map_init = None
     _hs_group_of_layer = types.MappingProxyType({})
     enable_resident = False
+    hs_fast = False
     hs_lazy = False
     hs_lazy_from = None
+    hs_fused_pt = False
     _resident = types.MappingProxyType({})
     resident_demotions = 0
     _resident_steps = 0
@@ -926,7 +1002,24 @@ class HiSparseCoordinator:
         self._resident: dict = {}  # req_pool_idx -> Req
         self.resident_demotions = 0
         self._resident_steps = 0
-        # HS_LEAN: lazy host backup of resident requests (+ lean all-resident prep)
+        # HS_FAST: device page table of all-resident batches (row = batch row; device page of each 64-token page)
+        self.hs_fast = bool(  # HS_SPECFAST: the all-resident graph variant also for the verify round
+            self.enable_resident
+            and envs.SGLANG_HISPARSE_RESIDENT_GRAPH.get()
+            and envs.SGLANG_HISPARSE_FAST_TOPK.get()  # the graph's top-k emits device slots (dsa_topk_backend)
+            and (num_draft_tokens == 0 or self.hs_spec_res)
+        )
+        if envs.SGLANG_HISPARSE_RESIDENT_GRAPH.get() and not self.hs_fast:
+            logger.warning(
+                "HiSparse: SGLANG_HISPARSE_RESIDENT_GRAPH ignored (needs SGLANG_HISPARSE_RESIDENT=1 and "
+                "SGLANG_HISPARSE_FAST_TOPK=1, and SGLANG_HISPARSE_SPEC_RESIDENT=1 under speculative decoding)"
+            )
+        self._hs_verify_sel = None  # HS_SPECFAST: rows of the last verify preparation when every row was resident
+        self._hs_pt_batch = None
+        self._hs_pt_seq = None
+        self._hs_sel = [0, 0]
+        self._hs_pt_memo = None
+        # HS_LEAN: lazy host backup of resident requests (+ lean all-resident prep); fused all-resident page table
         self.hs_lazy = bool(
             self.enable_resident and envs.SGLANG_HISPARSE_LAZY_BACKUP.get()
         )
@@ -978,6 +1071,14 @@ class HiSparseCoordinator:
             0,
             0,
         ]  # decode steps prepared by the lean all-resident path, by the general path
+        self.hs_fused_pt = bool(
+            self.hs_fast and envs.SGLANG_HISPARSE_FUSED_PAGE_TABLE.get()
+        )
+        if self.hs_fused_pt:
+            logger.info("HiSparse: fused all-resident device page table")
+        if self.hs_fast:
+            global HS_ACTIVE_COORDINATOR
+            HS_ACTIVE_COORDINATOR = self
         if self.hs_spec_res:
             logger.info(
                 "HiSparse: resident requests under speculative decoding (mirrored device pages, lazy backup)"
@@ -1576,6 +1677,78 @@ class HiSparseCoordinator:
         reserved_positions = (seq_lens - 1).clamp(max=self.device_buffer_size)
         return self.req_to_device_buffer[req_pool_indices, reserved_positions]
 
+    # ---- HS_FAST ----------------------------------------------------------------------------------------------------
+    def _hs_build_dev_page_table(
+        self, req_pool_indices, seq_lens_cpu, req_pool_indices_cpu
+    ) -> None:
+        """Records whether the batch just prepared is all-resident (the graph choice). The device page table itself is
+        built inside the graph from the forward's own page table (hs_device_page_table), so nothing host-side is
+        shared with the step still running."""
+        rpi = tuple(int(r) for r in req_pool_indices_cpu.tolist())
+        self._hs_pt_batch = None
+        if not rpi or any(r not in self._resident for r in rpi):
+            return
+        self._hs_pt_batch = rpi
+        self._hs_pt_seq = tuple(int(x) for x in seq_lens_cpu.tolist())
+
+    def hs_device_page_table(self, attn_metadata, rows: int, lengths=None):
+        """Device page of each logical page in this forward's real_page_table (the indexer's, 64-token pages). A
+        resident request's device slot of position p is dev_page[p // 64] * 64 + p % 64. Computed by the first top-k
+        of the forward and reused by the others (keyed on the metadata object, its table and the capture state: a
+        graph's warm-up and its capture each compute their own)."""
+        rpt = attn_metadata.real_page_table
+        key = (
+            id(attn_metadata),
+            torch.cuda.is_current_stream_capturing(),
+            rpt.data_ptr(),
+            tuple(rpt.shape),
+        )
+        memo = self._hs_pt_memo
+        if memo is not None and memo[0] == key and memo[1].shape[0] >= rows:
+            return memo[1][:rows]
+        mapping = self.token_to_kv_pool_allocator.full_to_hisparse_device_index_mapping
+        if (
+            self.hs_fused_pt and lengths is not None and lengths.shape[0] == rows
+        ):  # HS_LEAN: one kernel, read pages
+            dev = hs_fused_device_page_table(rpt, mapping, lengths, self.page_size)
+            self._hs_pt_memo = (key, dev)
+            return dev
+        first = rpt.to(torch.int64).clamp(min=0) * self.page_size
+        dev = mapping[first] // self.page_size
+        dev = dev.to(torch.int32)
+        self._hs_pt_memo = (key, dev)
+        return dev[:rows]
+
+    def hs_batch_all_resident(self, forward_batch) -> bool:
+        """The graph-variant choice: every request resident, and the page table built for exactly this batch."""
+        ok = False
+        fm = getattr(forward_batch, "forward_mode", None)
+        if self.hs_fast and fm is not None and fm.is_target_verify():
+            # HS_SPECFAST: the verify graph is chosen right after this round's preparation, in the same thread
+            ok = self._hs_verify_sel is not None and self._hs_verify_sel == int(
+                forward_batch.batch_size
+            )
+        elif self._hs_pt_batch is not None and self.hs_fast:
+            rpi_cpu = getattr(forward_batch, "req_pool_indices_cpu", None)
+            seq_cpu = getattr(forward_batch, "seq_lens_cpu", None)
+            if rpi_cpu is not None:
+                ok = tuple(int(r) for r in rpi_cpu.tolist()) == self._hs_pt_batch
+            elif (
+                seq_cpu is not None
+            ):  # plain decode keeps this host mirror; same lengths in the same order
+                ok = (
+                    int(forward_batch.batch_size) == len(self._hs_pt_batch)
+                    and tuple(int(x) for x in seq_cpu.tolist()) == self._hs_pt_seq
+                )
+        self._hs_sel[ok] += 1
+        if sum(self._hs_sel) % 500 == 0:
+            logger.info(
+                "HiSparse graph variants: %d hs_resident, %d hs_mixed replays so far",
+                self._hs_sel[1],
+                self._hs_sel[0],
+            )
+        return ok
+
     # ---- HS_RESIDENT ----------------------------------------------------------------------------------------------
     def _gpu_rows(self, rows) -> torch.Tensor:
         # Pinned, non-blocking H2D: a plain torch.tensor(..., device=) would wait for the schedule stream's queued work.
@@ -1814,6 +1987,7 @@ class HiSparseCoordinator:
                 f"HiSparse elastic: free device page {int(fp.max())} above the band limit {new_max_page}"
             )
         torch.cuda.synchronize()
+        self._hs_pt_memo = None
         kv.shrink_to(new_bytes)
         self.hs_el_stats[1] += 1
         logger.info(
@@ -2061,6 +2235,10 @@ class HiSparseCoordinator:
         self.mem_pool_device.full_to_hisparse_device_index_mapping[compressed_locs] = (
             new_locs
         )
+        if self.hs_fast:
+            self._hs_build_dev_page_table(
+                req_pool_indices, seq_lens_cpu, req_pool_indices_cpu
+            )
         return True
 
     def _resident_decode_locs(
@@ -2232,6 +2410,10 @@ class HiSparseCoordinator:
             self.mem_pool_device.full_to_hisparse_device_index_mapping[
                 compressed_locs
             ] = reserved_buffer_loc
+            if self.hs_fast:
+                self._hs_build_dev_page_table(
+                    req_pool_indices, seq_lens_cpu, req_pool_indices_cpu
+                )
             return
 
         active_reqs = seq_lens % self.compress_ratio == 0
@@ -2784,6 +2966,16 @@ class HiSparseCoordinator:
         With prefetch enabled, anchors swap in synchronously (recording the miss
         plan) and prefetch their skip layers' copies; skip layers just wait.
         """
+        if self.hs_fast and top_k_result.ndim in (
+            2,
+            3,
+        ):  # HS_FAST (+ HS_SPECFAST verify): top-k emitted device slots
+            from sglang.srt.model_executor.runner_utils.capture_mode import (
+                get_capture_attention_variant,
+            )
+
+            if get_capture_attention_variant() == "hs_resident":
+                return top_k_result
         if not self.enable_prefetch:
             return self._run_swap_in_kernel(
                 req_pool_indices,
