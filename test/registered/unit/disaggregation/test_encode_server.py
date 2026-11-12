@@ -30,7 +30,6 @@ from sglang.srt.disaggregation.encoder.server import (
     meta_registry,
 )
 from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
-    MooncakeMemoryRegistry,
     MooncakeTransferEngine,
 )
 from sglang.srt.managers.io_struct import unwrap_from_pickle
@@ -662,7 +661,6 @@ class TestMooncakeRegistration(CustomTestCase):
     def setUp(self):
         self.engine = MooncakeTransferEngine.__new__(MooncakeTransferEngine)
         self.engine.engine = unittest.mock.Mock()
-        self.engine.memory_registry = MooncakeMemoryRegistry(self.engine.engine)
         self.engine.ib_device = "mlx5_0"
 
     def test_register_raises_on_nonzero_status(self):
@@ -693,16 +691,6 @@ class TestMooncakeRegistration(CustomTestCase):
 
         with self.assertRaisesRegex(RuntimeError, "registration failed.*ret=-7"):
             self.engine.batch_register([0x10000], [0x1000])
-
-    def test_batch_register_shares_already_registered_region(self):
-        self.engine.engine.batch_register_memory.return_value = 0
-
-        self.engine.batch_register([0x10000], [0x1000])
-        self.engine.batch_register([0x10000], [0x1000])
-
-        self.engine.engine.batch_register_memory.assert_called_once_with(
-            [0x10000], [0x1000]
-        )
 
 
 if __name__ == "__main__":

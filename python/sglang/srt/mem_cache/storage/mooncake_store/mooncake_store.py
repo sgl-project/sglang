@@ -286,8 +286,6 @@ class MooncakeBaseStore:
     def __init__(self):
         self.store = None
         self.config = None
-        # The transfer engine shared with other components, when the store runs on it.
-        self._shared_mooncake_transfer_engine = None
 
     def _import_mooncake_store(self):
         try:
@@ -364,11 +362,6 @@ class MooncakeBaseStore:
             raise RuntimeError(
                 f"Failed to register buffer to Mooncake Store, error code: {ret_code}"
             )
-        # Other users of the shared engine may need the same region, e.g. PD
-        # transfer of the GPU KV pool the linker registered.
-        shared_engine = self._shared_mooncake_transfer_engine
-        if shared_engine is not None:
-            shared_engine.memory_registry.adopt_store_registration(ptr, size)
 
     @cached_property
     def _has_request_context_support(self) -> bool:
@@ -631,9 +624,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     and self.config.metadata_server == "P2PHANDSHAKE"
                     and self.config.protocol == "rdma"
                 ):
-                    self._shared_mooncake_transfer_engine = shared_engine
                     client_hostname = shared_engine.get_session_id()
                     transfer_engine = shared_engine.get_engine()
+                    shared_engine.enable_shared_memory_registration()
                     logger.info(
                         f"Reuse initialized mooncake transfer engine: {shared_engine}"
                     )
