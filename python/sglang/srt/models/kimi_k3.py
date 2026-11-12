@@ -3471,11 +3471,16 @@ class KimiK3LinearForCausalLM(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import register_tgv_m_ranges
+        if not _is_hip:
+            # The CuTe DSL GEMM module imports cuda.bindings and cutlass at
+            # module level; neither ships on ROCm.
+            from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import (
+                register_tgv_m_ranges,
+            )
 
-        register_tgv_m_ranges(_K3_TGV_M_RANGES)
-        if get_platform().device_sm == 103:
-            register_tgv_m_ranges(_K3_GB300_TGV_M_RANGES)
+            register_tgv_m_ranges(_K3_TGV_M_RANGES)
+            if get_platform().device_sm == 103:
+                register_tgv_m_ranges(_K3_GB300_TGV_M_RANGES)
         if quant_config is not None:
             if isinstance(quant_config, ModelSlimConfig):
                 model_mapping = {

@@ -566,5 +566,7 @@ POSITIONAL_FIELD_ORDER = (
     "speculative_dspark_lm_head_dtype",
     "media_url_timeout",
     "allow_local_media_files",
+    "paged_experts_host_memory_gb",
+    "_max_running_requests_explicitly_set",
 )
 # fmt: on
