@@ -17,6 +17,7 @@ from sglang.srt.mem_cache.hisparse_memory_pool import (
 )
 from sglang.srt.mem_cache.utils import get_num_new_pages
 from sglang.srt.platforms import current_platform
+from sglang.srt.runtime_context import get_disagg
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
@@ -117,6 +118,23 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return min(
             self.logical_attn_allocator.available_size(),
             self.hisparse_attn_allocator.available_size(),
+        )
+
+    def max_new_tokens_for_memory(
+        self,
+        input_tokens: int,
+        max_new_tokens: int,
+        *,
+        token_capacity: int,
+        **kwargs,
+    ) -> int | None:
+        if get_disagg().disaggregation_mode == "decode":
+            token_capacity = max(token_capacity, self._size_full)
+        return super().max_new_tokens_for_memory(
+            input_tokens,
+            max_new_tokens,
+            token_capacity=token_capacity,
+            **kwargs,
         )
 
     def get_kvcache(self):

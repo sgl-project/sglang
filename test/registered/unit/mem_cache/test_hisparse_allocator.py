@@ -13,10 +13,15 @@ from sglang.srt.mem_cache.allocator.hisparse import (
 )
 from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
-from sglang.srt.runtime_context import get_context, publish, reset_context
+from sglang.srt.runtime_context import (
+    get_context,
+    get_disagg,
+    publish,
+    reset_context,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, enter_scope, published_topology
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -432,6 +437,56 @@ class TestHiSparseRetraction(CustomTestCase):
 
         allocator = object.__new__(HiSparseTokenToKVPoolAllocator)
         self.assertTrue(retraction_needs_rebootstrap(allocator))
+
+
+class TestHiSparseMaxNewTokens(CustomTestCase):
+    """A decode engine budgets the prompt against the logical pool; an engine
+    that prefills itself keeps the device-row budget."""
+
+    def setUp(self):
+        enter_scope(self, published_topology())
+
+    @staticmethod
+    def _alloc(size_full: int) -> HiSparseTokenToKVPoolAllocator:
+        alloc = HiSparseTokenToKVPoolAllocator.__new__(HiSparseTokenToKVPoolAllocator)
+        alloc._size_full = size_full
+        alloc.page_size = 64
+        return alloc
+
+    @staticmethod
+    def _budget(alloc, input_tokens: int, max_new: int, device_rows: int, mode: str):
+        with get_disagg().override(disaggregation_mode=mode):
+            return alloc.max_new_tokens_for_memory(
+                input_tokens,
+                max_new,
+                token_capacity=device_rows,
+                sliding_window_size=None,
+                chunk_size=None,
+                prefill_retire_lag=0,
+                eviction_interval=0,
+            )
+
+    def test_decode_admits_a_prompt_longer_than_device_rows(self):
+        # 262K prompt, 170K device rows, 2.7M logical rows (ratio 16).
+        alloc = self._alloc(2_727_936)
+        self.assertEqual(self._budget(alloc, 262_146, 2048, 170_496, "decode"), 2048)
+
+    def test_decode_is_still_clipped_by_the_logical_pool(self):
+        alloc = self._alloc(1024)
+        self.assertEqual(
+            self._budget(alloc, 896, 2048, 512, "decode"), 1024 - 896 - 64 - 1
+        )
+
+    def test_self_prefilling_engines_keep_the_device_row_budget(self):
+        # Prefill allocates a device row per prompt token, so the device rows
+        # still bound the prompt there.
+        alloc = self._alloc(2_727_936)
+        for mode in ("null", "prefill"):
+            with self.subTest(mode=mode):
+                self.assertEqual(self._budget(alloc, 262_146, 2048, 170_496, mode), 0)
+                self.assertEqual(
+                    self._budget(alloc, 896, 2048, 1024, mode), 1024 - 896 - 64 - 1
+                )
 
 
 if __name__ == "__main__":
