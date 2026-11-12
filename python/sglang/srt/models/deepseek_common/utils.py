@@ -161,6 +161,53 @@ def is_wint4afp8_or_wint4a16_config(
     ) or quant_config._is_wint4abf16(weight_quant, input_quant)
 
 
+# Formats whose qweight / qzeros / scales put the output dim last
+# (AutoRound packs as auto_gptq or auto_awq).
+_OUTPUTS_LAST_PACKED_FORMATS = (
+    "awq",
+    "awq_marlin",
+    "moe_wna16",
+    "gptq",
+    "gptq_marlin",
+    "auto-round",
+)
+
+
+def fuse_qkv_a_proj_tensors(
+    name: str,
+    *,
+    q_a: torch.Tensor,
+    kv_a: torch.Tensor,
+    quant_config: Optional[QuantizationConfig] = None,
+) -> torch.Tensor:
+    """Merge a q_a_proj tensor with its kv_a_proj_with_mqa twin for
+    fused_qkv_a_proj_with_mqa; ``weight_shape`` adds the output rows."""
+    if q_a.dim() == 0 and kv_a.dim() == 0:
+        return q_a
+    if name.endswith(".weight_shape"):
+        assert q_a.shape == kv_a.shape == (2,) and q_a[1] == kv_a[1], (
+            f"{name}: q_a_proj {q_a.tolist()} and kv_a_proj_with_mqa "
+            f"{kv_a.tolist()} must share the input size"
+        )
+        return torch.stack([q_a[0] + kv_a[0], q_a[1]])
+    if name.endswith((".weight_g_idx", ".g_idx")):
+        if not torch.equal(q_a, kv_a):
+            raise ValueError(
+                f"{name}: q_a_proj and kv_a_proj_with_mqa use different "
+                "activation orders and cannot be fused."
+            )
+        return q_a
+    # AWQ/GPTQ-packed tensors store the output dim last; a projection such a
+    # checkpoint leaves unconverted keeps a plain [out, in] weight. Keyed on
+    # the format too, since GGUF also names its tensors qweight.
+    packed_outputs_last = (
+        quant_config is not None
+        and quant_config.get_name() in (_OUTPUTS_LAST_PACKED_FORMATS)
+        and name.endswith((".qweight", ".qzeros", ".scales"))
+    )
+    return torch.cat([q_a, kv_a], dim=1 if packed_outputs_last else 0)
+
+
 def quant_blocks_shared_experts_fusion(
     quant_config: Optional[QuantizationConfig],
 ) -> bool:

@@ -3468,6 +3468,7 @@ class TestPipelineParallelCompat(CustomTestCase):
             enable_multi_layer_eagle=False,
             disaggregation_mode="prefill",
             min_free_slots_delay=None,
+            scheduler_recv_interval=1,
         )
         cfg.update(overrides)
         return SimpleNamespace(**cfg)
@@ -3475,6 +3476,10 @@ class TestPipelineParallelCompat(CustomTestCase):
     def test_overlap_schedule_must_be_off(self):
         with self.assertRaisesRegex(AssertionError, "overlap schedule"):
             check_pipeline_parallel_compat(self._cfg(disable_overlap_schedule=False))
+
+    def test_scheduler_recv_interval_must_be_one(self):
+        with self.assertRaisesRegex(AssertionError, "--scheduler-recv-interval"):
+            check_pipeline_parallel_compat(self._cfg(scheduler_recv_interval=2))
 
     def test_no_speculative_decoding_is_fine(self):
         check_pipeline_parallel_compat(self._cfg())
