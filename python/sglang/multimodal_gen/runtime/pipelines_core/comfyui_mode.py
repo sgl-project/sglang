@@ -45,10 +45,20 @@ _CONDITIONING_FIELDS = (
     "sigmas",
 )
 _SESSION_SKIP_EXTRA = frozenset(
-    {"comfyui_session_id", "comfyui_cond_key", "comfyui_cache_fp", "comfyui_control"}
+    {
+        "comfyui_session_id",
+        "comfyui_cond_key",
+        "comfyui_cache_fp",
+        "comfyui_control",
+        "comfyui_num_steps",
+        "comfyui_separate_cfg",
+    }
 )
 _SESSIONS: dict[str, dict[str, Any]] = {}
 _RUNS: dict[str, Any] = {}
+# Cache-DiT's per-run step count. Kept apart from _RUNS, which model stages
+# fill with their own opaque state (e.g. Qwen-Image-2.1 conds) before denoising.
+_CACHE_DIT_RUNS: dict[str, int] = {}
 
 
 def is_comfyui_mode(server_args: ServerArgs) -> bool:
@@ -115,7 +125,7 @@ def _session_family(session_id: str) -> str:
 def _evict_other_runs(session_id: str) -> None:
     """Drop older ``{uuid}:{run}`` slots for this executor."""
     prefix = _session_family(session_id) + ":"
-    for store in (_SESSIONS, _RUNS):
+    for store in (_SESSIONS, _RUNS, _CACHE_DIT_RUNS):
         for key in list(store):
             if key.startswith(prefix) and key != session_id:
                 store.pop(key, None)
@@ -210,16 +220,36 @@ def get_or_create_run_state(req, factory: Callable[[], Any]):
     return state
 
 
+def comfyui_cache_dit_run(req) -> tuple[int, bool, bool] | None:
+    """(sampler steps in this ComfyUI run, whether this is the run's first call,
+    whether its cond and uncond calls alternate as separate requests).
+
+    Each ComfyUI step is its own request, so Cache-DiT has to keep one context
+    for the whole run instead of refreshing it per request.
+    """
+    extra = getattr(req, "extra", None) or {}
+    steps = extra.get("comfyui_num_steps")
+    if not steps:
+        return None
+    sid = session_id_from_req(req)
+    first_call = sid is None or sid not in _CACHE_DIT_RUNS
+    if first_call and sid:
+        _CACHE_DIT_RUNS[sid] = int(steps)
+    return int(steps), first_call, bool(extra.get("comfyui_separate_cfg"))
+
+
 def release_run_state(session_id: str | None) -> None:
     """Drop per-run objects; keep cached conditioning for the next step."""
     if session_id:
         _RUNS.pop(session_id, None)
+        _CACHE_DIT_RUNS.pop(session_id, None)
 
 
 def release_comfyui_session(session_id: str | None) -> None:
     if session_id:
         _SESSIONS.pop(session_id, None)
         _RUNS.pop(session_id, None)
+        _CACHE_DIT_RUNS.pop(session_id, None)
 
 
 def _is_empty(value) -> bool:
