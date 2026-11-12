@@ -277,11 +277,39 @@ impl SglangService for GrpcService {
                 "provide either a nonempty rid or abort_all=true, not both",
             ));
         }
+        // Opt-in retirement wait is DRAFT / NOT IMPLEMENTED: validate, then
+        // UNIMPLEMENTED before any core abort. No capture/replay registry yet.
+        if !request.cancellation_id.is_empty() && request.wait_for_retirement_ms.is_none() {
+            return Err(Status::invalid_argument(
+                "cancellation_id requires wait_for_retirement_ms",
+            ));
+        }
+        if let Some(wait_ms) = request.wait_for_retirement_ms {
+            if request.abort_all {
+                return Err(Status::invalid_argument(
+                    "wait_for_retirement_ms requires an exact rid, not abort_all",
+                ));
+            }
+            if request.cancellation_id.is_empty() || request.cancellation_id.len() > 128 {
+                return Err(Status::invalid_argument(
+                    "wait_for_retirement_ms requires a nonempty cancellation_id of at most 128 UTF-8 bytes",
+                ));
+            }
+            if wait_ms > 30_000 {
+                return Err(Status::invalid_argument(
+                    "wait_for_retirement_ms must be <= 30000",
+                ));
+            }
+            return Err(Status::unimplemented(
+                "wait_for_retirement_ms is not implemented yet",
+            ));
+        }
         Ok(Response::new(api::AbortResponse {
             success: self.core.abort(
                 (!request.abort_all).then_some(request.rid.as_str()),
                 AbortEnding::CancelledError,
             ),
+            retirement_confirmed: false,
         }))
     }
 }
@@ -304,7 +332,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use futures::StreamExt;
+    use futures::{FutureExt, StreamExt};
     use sglang_api_types::api::v1 as api;
     use sglang_api_types::api::v1::generate_stream_item::Item;
     use sglang_api_types::api::v1::sglang_service_server::SglangService;
@@ -1300,11 +1328,13 @@ mod tests {
             .abort(Request::new(api::AbortRequest {
                 rid: "abort-me".into(),
                 abort_all: false,
+                ..Default::default()
             }))
             .await
             .unwrap()
             .into_inner();
         assert!(reply.success);
+        assert!(!reply.retirement_confirmed);
         assert_eq!(harness.abort_rx.try_recv().unwrap().rid(), &intake.rid);
         let error = stream_error(stream.next().await.unwrap().unwrap());
         assert_eq!(error.error.unwrap().code, 499);
@@ -1315,6 +1345,7 @@ mod tests {
                 .abort(Request::new(api::AbortRequest {
                     rid: "abort-me".into(),
                     abort_all: false,
+                    ..Default::default()
                 }))
                 .await
                 .unwrap()
@@ -1334,6 +1365,7 @@ mod tests {
                 .abort(Request::new(api::AbortRequest {
                     rid: rid.into(),
                     abort_all,
+                    ..Default::default()
                 }))
                 .await
                 .unwrap_err();
@@ -1353,6 +1385,7 @@ mod tests {
                 .abort(Request::new(api::AbortRequest {
                     rid: String::new(),
                     abort_all: true,
+                    ..Default::default()
                 }))
                 .await
                 .unwrap()
@@ -1362,5 +1395,133 @@ mod tests {
         assert_eq!(harness.abort_rx.try_recv().unwrap().rid(), &intake.rid);
         drop(stream);
         assert!(harness.abort_rx.try_recv().is_err());
+    }
+
+    /// Opt-in retirement wait is rejected before any cancel; generation can
+    /// still finish normally afterward.
+    #[tokio::test]
+    async fn abort_wait_for_retirement_is_unimplemented_without_cancelling() {
+        let harness = Harness::new(2, false, Duration::from_secs(1));
+        let mut stream = harness
+            .service
+            .generate(Request::new(ids_request(&[1], Some("retire-me"))))
+            .await
+            .unwrap()
+            .into_inner();
+        let intake = harness.next_generation().await;
+        assert!(intake.admission.try_accept());
+        intake
+            .sink
+            .try_send(ResponseItem::Frame(chunk(&intake.rid, "first", 1, false)))
+            .unwrap();
+        assert_eq!(frame(stream.next().await.unwrap().unwrap()).text, "first");
+        for (wait_ms, cancellation_id) in [(0, "op-retire-me".into()), (30_000, "é".repeat(64))] {
+            let error = harness
+                .service
+                .abort(Request::new(api::AbortRequest {
+                    rid: "retire-me".into(),
+                    abort_all: false,
+                    wait_for_retirement_ms: Some(wait_ms),
+                    cancellation_id,
+                }))
+                .await
+                .unwrap_err();
+            assert_eq!(error.code(), Code::Unimplemented);
+        }
+        assert!(harness.abort_rx.try_recv().is_err());
+        assert!(stream.next().now_or_never().is_none());
+        intake
+            .sink
+            .try_send(ResponseItem::Done(chunk(&intake.rid, " final", 2, true)))
+            .unwrap();
+        let finished = frame(stream.next().await.unwrap().unwrap());
+        assert_eq!(finished.text, "first final");
+        assert!(
+            meta(&finished)
+                .finish_reason
+                .as_ref()
+                .is_some_and(|reason| {
+                    matches!(reason.kind, Some(api::finish_reason::Kind::Stop(_)))
+                })
+        );
+        assert!(stream.next().await.is_none());
+        assert!(harness.abort_rx.try_recv().is_err());
+    }
+
+    /// Invalid opt-in bounds do not cancel; legacy Abort still cancels afterward.
+    #[tokio::test]
+    async fn abort_wait_for_retirement_rejects_invalid_without_cancelling() {
+        let harness = Harness::new(2, false, Duration::from_secs(1));
+        let mut stream = harness
+            .service
+            .generate(Request::new(ids_request(&[1], Some("keep-me"))))
+            .await
+            .unwrap()
+            .into_inner();
+        let intake = harness.next_generation().await;
+        assert!(intake.admission.try_accept());
+        for request in [
+            api::AbortRequest {
+                rid: String::new(),
+                abort_all: true,
+                wait_for_retirement_ms: Some(1),
+                cancellation_id: "op-keep-me".into(),
+            },
+            api::AbortRequest {
+                rid: "keep-me".into(),
+                abort_all: false,
+                wait_for_retirement_ms: Some(30_001),
+                cancellation_id: "op-keep-me".into(),
+            },
+            api::AbortRequest {
+                rid: "keep-me".into(),
+                abort_all: false,
+                wait_for_retirement_ms: Some(1),
+                cancellation_id: String::new(),
+            },
+            api::AbortRequest {
+                rid: "keep-me".into(),
+                abort_all: false,
+                wait_for_retirement_ms: Some(1),
+                cancellation_id: "x".repeat(129),
+            },
+            api::AbortRequest {
+                rid: "keep-me".into(),
+                abort_all: false,
+                wait_for_retirement_ms: Some(1),
+                cancellation_id: "é".repeat(65),
+            },
+            api::AbortRequest {
+                rid: "keep-me".into(),
+                abort_all: false,
+                wait_for_retirement_ms: None,
+                cancellation_id: "op-keep-me".into(),
+            },
+        ] {
+            let error = harness
+                .service
+                .abort(Request::new(request))
+                .await
+                .unwrap_err();
+            assert_eq!(error.code(), Code::InvalidArgument);
+            assert!(harness.abort_rx.try_recv().is_err());
+        }
+        assert!(stream.next().now_or_never().is_none());
+        let reply = harness
+            .service
+            .abort(Request::new(api::AbortRequest {
+                rid: "keep-me".into(),
+                abort_all: false,
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(reply.success);
+        assert!(!reply.retirement_confirmed);
+        assert_eq!(harness.abort_rx.try_recv().unwrap().rid(), &intake.rid);
+        let error = stream_error(stream.next().await.unwrap().unwrap());
+        assert_eq!(error.error.unwrap().code, 499);
+        assert!(stream.next().await.is_none());
     }
 }

@@ -78,19 +78,31 @@
       "type": "AbortRequest",
       "name": "single public request ID",
       "input": {"rid": "request", "abort_all": false},
-      "canonical": "{\"rid\":\"request\",\"abort_all\":false}"
+      "canonical": "{\"rid\":\"request\",\"abort_all\":false,\"cancellation_id\":\"\"}"
     },
     {
       "type": "AbortRequest",
       "name": "all generations",
       "input": {"rid": "", "abort_all": true},
-      "canonical": "{\"rid\":\"\",\"abort_all\":true}"
+      "canonical": "{\"rid\":\"\",\"abort_all\":true,\"cancellation_id\":\"\"}"
     },
     {
       "type": "AbortResponse",
       "name": "unknown ID is an explicit unsuccessful match",
       "input": {"success": false},
-      "canonical": "{\"success\":false}"
+      "canonical": "{\"success\":false,\"retirement_confirmed\":false}"
+    },
+    {
+      "type": "AbortResponse",
+      "name": "legacy accepted cancellation does not confirm retirement",
+      "input": {"success": true},
+      "canonical": "{\"success\":true,\"retirement_confirmed\":false}"
+    },
+    {
+      "type": "AbortRequest",
+      "name": "an explicit zero wait is an opt-in poll, not an absent wait",
+      "input": {"rid": "request", "wait_for_retirement_ms": 0, "cancellation_id": "operation"},
+      "canonical": "{\"rid\":\"request\",\"abort_all\":false,\"wait_for_retirement_ms\":0,\"cancellation_id\":\"operation\"}"
     },
     {
       "type": "GenerateRequest",

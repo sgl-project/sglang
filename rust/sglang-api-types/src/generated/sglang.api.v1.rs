@@ -865,6 +865,22 @@ pub struct AbortRequest {
     /// this call, including HTTP chat/completions.
     #[prost(bool, tag = "2")]
     pub abort_all: bool,
+    /// DRAFT / NOT IMPLEMENTED in this first slice.
+    /// Absent: legacy accepted-only Abort (cancellation requested, no retirement
+    /// wait). Present: opt into exact-request scheduler retirement with a bounded
+    /// wait of this many milliseconds, including 0 for a single poll. Cap is
+    /// 30000. abort_all is rejected. Until a retirement backend is integrated,
+    /// servers that understand this field still return UNIMPLEMENTED without
+    /// cancelling.
+    #[prost(uint32, optional, tag = "3")]
+    pub wait_for_retirement_ms: ::core::option::Option<u32>,
+    /// DRAFT / NOT IMPLEMENTED. Required only with wait_for_retirement_ms; max 128
+    /// UTF-8 bytes; scoped to one engine lifetime. Future retries bind to the
+    /// originally captured internal request instances and MUST NOT recapture by
+    /// public RID. No request-instance registry or retirement backend in this
+    /// slice.
+    #[prost(string, tag = "4")]
+    pub cancellation_id: ::prost::alloc::string::String,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct AbortResponse {
@@ -873,6 +889,14 @@ pub struct AbortResponse {
     /// False for an unknown/already-finished ID; repeated aborts are harmless.
     #[prost(bool, tag = "1")]
     pub success: bool,
+    /// DRAFT / NOT IMPLEMENTED in this first slice (always false today).
+    /// True only after ALL internal generations captured for the exact public RID
+    /// have retired from scheduler ownership. Unknown targets cannot confirm it.
+    /// This is not device-wide idleness. Defaults to false. Old servers ignore
+    /// wait_for_retirement_ms, so clients MUST require an explicit true and MUST
+    /// NOT infer completion from success.
+    #[prost(bool, tag = "2")]
+    pub retirement_confirmed: bool,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct HealthCheckRequest {}

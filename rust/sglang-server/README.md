@@ -12,13 +12,38 @@
 
 ## Draft proposal: api.v1 cancellation retirement
 
-This section is a design seed only. No new RPC or scheduler retirement guarantee is implemented in this initial change.
+This section documents the first DRAFT scaffold only. Protocol field shape is
+pending reviewer feedback. A real request-instance capture/replay registry and
+retirement backend are NOT implemented in this slice: opt-in
+`wait_for_retirement_ms` is rejected with `UNIMPLEMENTED` after validation
+(no cancel), and `retirement_confirmed` stays false on the legacy path. An
+operation key (`cancellation_id`) is required with the wait field for future
+retry safety so retries cannot recapture by public RID.
 
-**Today.** An api.v1 Abort success only acknowledges that cancellation was requested. A Generate `CANCELLED` outcome or other final output is not scheduler retirement: the request may still be alive in the scheduler after the client sees those signals.
+**Today / first scaffold.** Absent `wait_for_retirement_ms` preserves legacy
+accepted-only Abort (`success` means cancellation was requested). Present
+opts into exact-request bounded wait (including zero poll; cap 30000 ms) and
+requires `cancellation_id`, but this slice does not wait, confirm retirement,
+or replay captured instances. A Generate `CANCELLED` outcome or other final
+output is still not scheduler retirement. Clients MUST require explicit
+`retirement_confirmed=true` and MUST NOT infer completion from `success`; old
+servers ignore the new request fields.
 
-**Proposal.** Add an opt-in, exact-request, bounded-wait retirement receipt that is independent of stream lifetime. Pin the receipt to the original request instance so public ID reuse cannot retire the wrong work. Fail closed for unknown or unsupported scope. Preserve existing Abort request/acknowledge behavior for callers that do not opt in.
+**Proposal (future).** Add a real opt-in, exact-request, bounded-wait
+retirement receipt independent of stream lifetime. Bind retries to originally
+captured internal request instances via `cancellation_id`; MUST NOT recapture
+by public RID. Fail closed for unknown or unsupported scope. Preserve existing
+Abort request/acknowledge behavior for callers that do not opt in.
 
-**Prior art.** [PR #48624](https://github.com/sgl-project/sglang/pull/48624) is an unmerged Python HTTP scheduler receipt implementation. Reuse its retirement predicates where possible; it currently excludes the Rust frontend, which this proposal targets.
+A future positive receipt must cover every internal generation captured for
+the exact public RID, including duplicate public IDs. An unknown target or a
+normal generation terminal cannot establish retirement. The scope is scheduler
+ownership, not device-wide idleness, native preprocessing, or PD transfer drain.
+
+**Prior art.** [PR #48624](https://github.com/sgl-project/sglang/pull/48624)
+is an unmerged Python HTTP scheduler receipt implementation. Reuse its
+retirement predicates where possible; it currently excludes the Rust
+frontend, which this proposal targets.
 
 **Validation plan (when implemented).**
 
