@@ -512,6 +512,7 @@ def _uses_ep_a2a() -> bool:
         _a2a_backend.is_megamoe()
         or _a2a_backend.is_flashinfer_megamoe()
         or _a2a_backend.is_deepep()
+        or _a2a_backend.is_ascend_ops()
         or _a2a_backend.is_mooncake()
         or _a2a_backend.is_ascend_fuseep()
         or _a2a_backend.is_mori()
