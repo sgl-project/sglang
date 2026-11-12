@@ -16,8 +16,6 @@ from sglang.srt.models.kimi_k3 import (
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-small")
-# The K3.1 side-stream TGV case needs SM10x.
 register_cuda_ci(est_time=12, stage="base-b", runner_config="4-gpu-b200")
 
 _H = 7168
@@ -98,10 +96,8 @@ class TestKimiK3BfaOverlap(CustomTestCase):
                             ):
                                 self.assertTrue(torch.equal(got, ref), name)
 
-    def test_k31_side_bfa_tgv_capture_matches_eager_tgv(self):
-        """Verify-sized batches run [f_a|b] as TGV with the K3.1 GB300
-        side-stream tactic: graph replay matches the same kernel run eagerly,
-        and stays within bf16 rounding of cuBLAS."""
+    def test_side_bfa_tgv_capture_matches_eager_tgv(self):
+        """Graph replay of the side-stream TGV [f_a | b] matches the eager kernel."""
         if torch.cuda.get_device_capability()[0] != 10:
             self.skipTest("TGV needs SM10x")
         from sglang.kernels.ops.gemm import cutedsl_bf16_gemm as cg
@@ -110,7 +106,7 @@ class TestKimiK3BfaOverlap(CustomTestCase):
 
         forward = KimiK3DeltaAttention.forward_qkvbfg_fused
         ranges = cg.TGVMRanges()
-        for m_lo, m_hi, tactic in kimi_k3._K31_GB300_BFA_SIDE_TGV_M_RANGES[
+        for m_lo, m_hi, tactic in kimi_k3._K3_GB300_BFA_SIDE_TGV_M_RANGES[
             (_BFA_W_ROWS, _H)
         ]:
             ranges.append(m_lo=m_lo, m_hi=m_hi, tactic=tactic)
