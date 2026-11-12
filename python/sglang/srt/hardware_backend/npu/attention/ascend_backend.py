@@ -3160,6 +3160,14 @@ class AscendAttnBackend(AttentionBackend):
         sinks: Optional[torch.Tensor] = None,
         q_descale: Optional[torch.Tensor] = None,
     ):
+        ragged_layout = forward_batch.ragged_verify_layout
+        if ragged_layout is not None and (
+            self.graph_mode or self.use_mla or self.use_paged_mtp or self.use_quant_flash_attn
+        ):
+            raise ValueError(
+                "Ascend ragged verification currently requires eager, unquantized MHA "
+                "with ASCEND_USE_PAGED_MTP=0."
+            )
         if save_kv_cache:
             if self.use_mla:
                 k = k.view(-1, layer.tp_k_head_num, self.kv_lora_rank)
@@ -3267,7 +3275,11 @@ class AscendAttnBackend(AttentionBackend):
                 # operator's batchSize (TND layout); only target_verify has a
                 # uniform per-request width.
                 if forward_batch.forward_mode.is_target_verify():
-                    real_bs = query.shape[0] // self.speculative_num_draft_tokens
+                    real_bs = (
+                        ragged_layout.bs
+                        if ragged_layout is not None
+                        else query.shape[0] // self.speculative_num_draft_tokens
+                    )
 
             if self.forward_metadata.seq_lens_cpu_int is None:
                 # Graph mode: bind the Python list, which graph.update can
@@ -3284,7 +3296,11 @@ class AscendAttnBackend(AttentionBackend):
             ):
                 actual_seq_lengths_kv = actual_seq_lengths_kv[:real_bs]
 
-            if forward_batch.forward_mode.is_draft_extend_v2():
+            if ragged_layout is not None:
+                # FIA consumes cumulative query lengths for TND input. Each
+                # request contributes its own admitted verification prefix.
+                actual_seq_lengths = ragged_layout.qo_indptr_device[1:].cpu().tolist()
+            elif forward_batch.forward_mode.is_draft_extend_v2():
                 extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
                 if not self.graph_mode:
                     extend_seq_lens_cpu = extend_seq_lens_cpu[

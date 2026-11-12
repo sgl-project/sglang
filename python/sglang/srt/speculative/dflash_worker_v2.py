@@ -58,6 +58,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.adaflash_verify import make_adaflash_verify
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, HiCacheDraftPlan
 from sglang.srt.speculative.dflash_dp import gather_draft_embedding
 from sglang.srt.speculative.dflash_draft_ring import (
@@ -547,6 +548,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                     model_block_size,
                 )
         self.draft_model.set_block_size(self.block_size)
+        self._adaflash_verify = make_adaflash_verify(self)
         self.speculative_num_draft_tokens = int(self.block_size)
         if self._is_domino and self.block_size <= 1:
             raise ValueError(
@@ -2378,7 +2380,18 @@ class DFlashWorkerV2(BaseSpecWorker):
         prefix_lens: torch.Tensor,
         bs: int,
         target_predict: Optional[torch.Tensor] = None,
+        verify_layout=None,
     ):
+        if verify_layout is not None:
+            accept_len, bonus = self._adaflash_verify.accept(
+                candidates=candidates,
+                logits=next_token_logits,
+                layout=verify_layout,
+                target_predict=target_predict,
+            )
+            out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
+            new_seq_lens = prefix_lens + commit_lens.to(prefix_lens.dtype)
+            return accept_len, commit_lens, bonus, out_tokens, new_seq_lens
         new_seq_lens = None
         # A resolved argmax (vocab-sharded verify) means the accept is greedy.
         if target_predict is None and self._selector_sample is not None:
@@ -2473,6 +2486,8 @@ class DFlashWorkerV2(BaseSpecWorker):
 
     def _validate_phase1_sampling_support(self, batch: ScheduleBatch) -> None:
         sampling_info = batch.sampling_info
+        if self._adaflash_verify is not None and not _is_all_greedy(sampling_info):
+            raise ValueError("AdaFlash compact verification currently requires temperature=0.")
         if sampling_info is None or sampling_info.is_all_greedy:
             return
 
@@ -3035,66 +3050,82 @@ class DFlashWorkerV2(BaseSpecWorker):
         # TARGET_VERIFY uses standard causal masking; custom masks are unnecessary here.
         custom_mask = None
 
-        verify_input_ids = draft_tokens.reshape(-1)
-        verify_input = DFlashVerifyInput(
-            draft_token=verify_input_ids,
-            positions=positions,
-            draft_token_num=int(self.block_size),
-            custom_mask=custom_mask,
-            capture_hidden_mode=CaptureHiddenMode.FULL,
-            iteration_ids=iteration_ids,
-        )
-
-        batch.out_cache_loc = verify_out_cache_loc
+        verify_layout = None
         sampling_info = batch.sampling_info
+        if self._adaflash_verify is not None:
+            draft_hidden = draft_logits_output.hidden_states.view(bs, block_size, -1)
+            verify_layout = self._adaflash_verify.layout(draft_hidden)
+            target_out = self._adaflash_verify.run(
+                batch=batch,
+                layout=verify_layout,
+                block_ids=block_ids,
+                draft_tokens=draft_tokens,
+                positions_2d=positions_2d,
+                cache_loc_2d=verify_out_cache_loc_2d,
+                iteration_ids=iteration_ids,
+                device=device,
+            )
+        else:
+            verify_input_ids = draft_tokens.reshape(-1)
+            verify_input = DFlashVerifyInput(
+                draft_token=verify_input_ids,
+                positions=positions,
+                draft_token_num=int(self.block_size),
+                custom_mask=custom_mask,
+                capture_hidden_mode=CaptureHiddenMode.FULL,
+                iteration_ids=iteration_ids,
+            )
 
-        seq_lens_pre_verify = (
-            batch.seq_lens.clone() if self._need_mamba_verify_commit else None
-        )
-        seq_lens_cpu_backup = batch.seq_lens_cpu
-        seq_lens_sum_backup = batch.seq_lens_sum
-        if seq_lens_cpu_backup is not None:
-            # Verify host bound = committed prefix + one verify block (matches draft).
-            verify_host_seq_lens = seq_lens_cpu_backup + block_size
-            batch.seq_lens_cpu = verify_host_seq_lens
-            batch.seq_lens_sum = int(verify_host_seq_lens.sum())
-        elif draft_input.nxt_kv_lens_cpu is not None:
-            batch.seq_lens_cpu = draft_input.nxt_kv_lens_cpu
-            batch.seq_lens_sum = int(draft_input.nxt_kv_lens_sum)
+            batch.out_cache_loc = verify_out_cache_loc
+            sampling_info = batch.sampling_info
 
-        verify_forward_batch, _ = verify_input.prepare_for_verify(
-            batch,
-            self.target_worker,
-            defer_metadata_init=get_parallel().attn_dp_enabled,
-        )
-        batch.seq_lens_cpu = seq_lens_cpu_backup
-        batch.seq_lens_sum = seq_lens_sum_backup
+            seq_lens_pre_verify = (
+                batch.seq_lens.clone() if self._need_mamba_verify_commit else None
+            )
+            seq_lens_cpu_backup = batch.seq_lens_cpu
+            seq_lens_sum_backup = batch.seq_lens_sum
+            if seq_lens_cpu_backup is not None:
+                # Verify host bound = committed prefix + one verify block (matches draft).
+                verify_host_seq_lens = seq_lens_cpu_backup + block_size
+                batch.seq_lens_cpu = verify_host_seq_lens
+                batch.seq_lens_sum = int(verify_host_seq_lens.sum())
+            elif draft_input.nxt_kv_lens_cpu is not None:
+                batch.seq_lens_cpu = draft_input.nxt_kv_lens_cpu
+                batch.seq_lens_sum = int(draft_input.nxt_kv_lens_sum)
 
-        # Idle-DP guard: an idle rank's eager verify contributes raw scheduler
-        # counts while a graph-replaying rank assumes the padded bucket, so
-        # their DP-gather segment offsets disagree. Fall back to eager verify
-        # whenever any DP rank is idle this round.
-        if (
-            get_parallel().attn_dp_enabled
-            and verify_forward_batch.original_global_num_tokens_cpu is not None
-            and min(verify_forward_batch.original_global_num_tokens_cpu) == 0
-        ):
-            verify_forward_batch.can_run_decode_cuda_graph = False
+            verify_forward_batch, _ = verify_input.prepare_for_verify(
+                batch,
+                self.target_worker,
+                defer_metadata_init=get_parallel().attn_dp_enabled,
+            )
+            batch.seq_lens_cpu = seq_lens_cpu_backup
+            batch.seq_lens_sum = seq_lens_sum_backup
 
-        # Mixed-round guard: an extend rank's raw token counts disagree with
-        # the verify batch's spec-scaled counts on the DP-gather layout; run
-        # eager, symmetric with the idle guard above.
-        if get_parallel().attn_dp_enabled and batch.is_extend_in_batch:
-            verify_forward_batch.can_run_decode_cuda_graph = False
+            # Idle-DP guard: an idle rank's eager verify contributes raw scheduler
+            # counts while a graph-replaying rank assumes the padded bucket, so
+            # their DP-gather segment offsets disagree. Fall back to eager verify
+            # whenever any DP rank is idle this round.
+            if (
+                get_parallel().attn_dp_enabled
+                and verify_forward_batch.original_global_num_tokens_cpu is not None
+                and min(verify_forward_batch.original_global_num_tokens_cpu) == 0
+            ):
+                verify_forward_batch.can_run_decode_cuda_graph = False
 
-        target_out = self.target_worker.forward_batch_generation(
-            batch=None,
-            forward_batch=verify_forward_batch,
-            is_verify=True,
-            skip_attn_backend_init=(
-                None if _is_npu or get_parallel().attn_dp_enabled else True
-            ),
-        )
+            # Mixed-round guard: an extend rank's raw token counts disagree with
+            # the verify batch's spec-scaled counts on the DP-gather layout; run
+            # eager, symmetric with the idle guard above.
+            if get_parallel().attn_dp_enabled and batch.is_extend_in_batch:
+                verify_forward_batch.can_run_decode_cuda_graph = False
+
+            target_out = self.target_worker.forward_batch_generation(
+                batch=None,
+                forward_batch=verify_forward_batch,
+                is_verify=True,
+                skip_attn_backend_init=(
+                    None if _is_npu or get_parallel().attn_dp_enabled else True
+                ),
+            )
         logits_output = target_out.logits_output
         can_run_cuda_graph = target_out.can_run_cuda_graph
         target_predict = None
@@ -3148,6 +3179,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             prefix_lens=prefix_lens,
             bs=bs,
             target_predict=target_predict,
+            verify_layout=verify_layout,
         )
 
         sampling_mask_capture = SpeculativeSamplingMaskCapture.from_logits(
