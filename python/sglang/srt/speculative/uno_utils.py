@@ -4,8 +4,8 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
-from flashinfer import top_k as _flashinfer_top_k
 
+from sglang.kernels.ops.sampling.topk import radix_topk
 from sglang.kernels.ops.speculative.reject_sampling import (
     chain_speculative_sampling_triton,
 )
@@ -142,10 +142,9 @@ def _build_sparse_target_support_tensors(
     """Build compact support using the fastest available top-k primitive."""
     # Runs outside torch.compile: Dynamo cannot trace FlashInfer's stream-keyed
     # scratch-buffer lookup, which calls torch._C._cuda_getCurrentRawStream since 0.7.4.
-    topk_logits, topk_ids = _flashinfer_top_k(
-        next_token_logits.contiguous(),
+    topk_logits, topk_ids = radix_topk(
+        next_token_logits,
         max_top_k,
-        sorted=True,
         deterministic=False,
     )
     return _sparse_target_support_from_topk(
