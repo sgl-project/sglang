@@ -15,6 +15,7 @@ from torch import nn
 
 from sglang.srt.configs.inkling2 import Inkling2MMConfig, Inkling2ModelConfig
 from sglang.srt.configs.model_config import get_hybrid_layer_ids, is_hybrid_swa_model
+from sglang.srt.hf_transformers import get_config
 from sglang.srt.layers import logits_processor as logits_module
 from sglang.srt.layers.logits_processor import LogitsMetadata
 from sglang.srt.layers.quantization.inkling2 import Inkling2QuantConfig
@@ -29,7 +30,6 @@ from sglang.srt.models.inkling_common import inkling2_moe as moe
 from sglang.srt.multimodal.inkling2 import Inkling2ImageProcessor
 from sglang.srt.parser.inkling_renderer import render_inkling_messages
 from sglang.srt.parser.inkling_tokenizer import IMAGE_TOKEN_ID
-from sglang.srt.utils.hf_transformers import get_config
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.inkling2_test_utils import precision_group
 

@@ -327,7 +327,6 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                 None,
                 self.free_pages,
                 out_indices,
-                next_power_of_2(bs),
                 self.page_size,
                 swa_free_page_ptr=None if swa is None else swa[0].free_pages,
                 full_to_swa_ptr=None if swa is None else swa[1],

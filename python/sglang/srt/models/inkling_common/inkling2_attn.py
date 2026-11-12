@@ -24,6 +24,7 @@ from sglang.kernels.ops.inkling2.prologue import attention_prologue
 from sglang.srt.environ import envs
 from sglang.srt.layers.linear import MergedColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.layers.utils.common import add_prefix, set_weight_attrs
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.models.inkling_common.attn import (
     RelLogitsProj,
@@ -33,7 +34,7 @@ from sglang.srt.models.inkling_common.attn import (
 from sglang.srt.models.inkling_common.inkling2_sconv import ShortConvolution
 from sglang.srt.models.inkling_common.sconv import SconvType
 from sglang.srt.runtime_context import get_model, get_parallel, get_platform
-from sglang.srt.utils import add_prefix, get_device_core_count, set_weight_attrs
+from sglang.srt.utils import get_device_core_count
 
 PADDED_DECODE_MIN_TOKENS = 8
 # linear() sums split-K partials up to this many rows (its tiles < 256 branch).

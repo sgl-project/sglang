@@ -11,6 +11,7 @@ from sglang.srt.configs.inkling2 import Inkling2MMConfig, Inkling2ModelConfig
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStatePacker
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.inkling2 import Inkling2QuantConfig
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -46,7 +47,6 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_spec,
 )
-from sglang.srt.utils import add_prefix
 
 VERIFY_ROUTED_EPILOGUE_MAX_TOKENS = 32
 

@@ -6,7 +6,7 @@ from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.runtime_context import get_disagg
 from sglang.srt.speculative.dspark_components.dspark_verify import TargetVerifyExecutor
 from sglang.srt.speculative.dspark_components.dspark_worker_v2 import DSparkWorkerV2
-from sglang.srt.utils.common import async_h2d
+from sglang.srt.utils.device import async_h2d
 
 
 class Inkling2MTPVerifyExecutor(TargetVerifyExecutor):

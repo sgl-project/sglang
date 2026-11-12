@@ -72,13 +72,13 @@ from sglang.kernels.ops.moe.inkling_moe import (
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.layers.quantization.inkling2 import Inkling2QuantConfig
+from sglang.srt.layers.utils.common import set_weight_attrs
 from sglang.srt.models.inkling_common.moe import renorm_topk_logits_scaled
 from sglang.srt.runtime_context import (
     cutedsl_moe_max_num_tokens,
     get_parallel,
     get_platform,
 )
-from sglang.srt.utils import set_weight_attrs
 
 BF16_COMBINE_MIN_TOKENS = 512
 

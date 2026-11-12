@@ -6,6 +6,7 @@ from sglang.kernels.ops.inkling2.sconv import (
     routed_sconv_epilogue,
     short_convolution,
 )
+from sglang.srt.layers.utils.common import set_weight_attrs
 from sglang.srt.models.inkling_common.kernels.sconv import update_sconv_cache
 from sglang.srt.models.inkling_common.sconv import (
     SconvType,
@@ -14,7 +15,6 @@ from sglang.srt.models.inkling_common.sconv import (
     ShortConvolution as InklingShortConvolution,
 )
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import set_weight_attrs
 
 
 class ShortConvolution(InklingShortConvolution):
