@@ -485,31 +485,70 @@ def _launch_argv(argv):
     return [sys.executable, "-m", "sglang.cli.main", "serve", *argv]
 
 
+# Cookbook hardware the Guide does not detect from a device name yet: CPU, Apple,
+# TPU, Ascend NPU, and Vera Rubin, whose device name no cell has recorded. Their
+# commands target other builds (sglang-jax, the NPU image), so nothing here checks them.
+UNDETECTED_HARDWARE = {"xeon", "mac", "tpu7x", "a3", "a5", "vera-rubin"}
+# Cookbook pages whose model runs only in an image built from a branch.
+NOT_IN_MAIN = {"stepfun-ai/Step-5-Preview"}
+
+
+def _launchable():
+    """(model, entry) for every command the Guide can pick and this build can run."""
+    detected = {hw for _, hardware in interactive._HARDWARE for hw in hardware}
+    return [
+        (model, entry)
+        for model, entries in _exported().items()
+        if model not in NOT_IN_MAIN
+        for entry in entries
+        if entry["hw"] in detected
+    ]
+
+
 class TestExportedCookbookCommands(CustomTestCase):
+    def test_every_hardware_is_detected_or_known_undetected(self):
+        """A hardware id new to the Cookbook must not leave its commands unreachable."""
+        detected = {hw for _, hardware in interactive._HARDWARE for hw in hardware}
+        exported = {e["hw"] for entries in _exported().values() for e in entries}
+        self.assertEqual(exported - detected - UNDETECTED_HARDWARE, set())
+
+    def test_models_not_in_main_still_fail_to_parse(self):
+        """Once main runs a NOT_IN_MAIN model, drop it so its commands get checked."""
+        for model in NOT_IN_MAIN:
+            for entry in _exported()[model]:
+                with (
+                    self.subTest(entry["url"]),
+                    contextlib.redirect_stderr(io.StringIO()),
+                    self.assertRaises(SystemExit),
+                ):
+                    prepare_server_args(command_argv(entry["command"]))
+
     def test_every_command_parses_as_server_args(self):
-        exported = _exported()
-        self.assertTrue(exported)
-        for model, entries in exported.items():
-            for entry in entries:
-                with self.subTest(entry["url"]):
-                    server_args = prepare_server_args(command_argv(entry["command"]))
-                    self.assertEqual(server_args.model_path, model)
-                    gpus = compute_world_size(
-                        dp_size=server_args.dp_size,
-                        tp_size=server_args.tp_size,
-                        pp_size=server_args.pp_size,
-                    )
-                    self.assertEqual(entry["gpus"], gpus)
-                    prefix = entry["command"].split("sglang serve")[0]
-                    env_lines = [
-                        line.rstrip(" \\")
-                        for line in prefix.splitlines()
-                        if line.strip() and not line.startswith("#")
-                    ]
-                    self.assertEqual(
-                        env_lines,
-                        [f"{key}={value}" for key, value in entry["env"].items()],
-                    )
+        launchable = _launchable()
+        self.assertTrue(launchable)
+        for model, entry in launchable:
+            with self.subTest(entry["url"]):
+                server_args = prepare_server_args(command_argv(entry["command"]))
+                self.assertEqual(server_args.model_path, model)
+                # The deprecated --dp N --enable-dp-attention resolves to
+                # --attn-dp-size N, which adds no GPUs.
+                dp_size = 1 if server_args.enable_dp_attention else server_args.dp_size
+                gpus = compute_world_size(
+                    dp_size=dp_size,
+                    tp_size=server_args.tp_size,
+                    pp_size=server_args.pp_size,
+                )
+                self.assertEqual(entry["gpus"], gpus)
+                prefix = entry["command"].split("sglang serve")[0]
+                env_lines = [
+                    line.rstrip(" \\")
+                    for line in prefix.splitlines()
+                    if line.strip() and not line.startswith("#")
+                ]
+                self.assertEqual(
+                    env_lines,
+                    [f"{key}={value}" for key, value in entry["env"].items()],
+                )
 
 
 class _PipedStdout(io.StringIO):
@@ -708,21 +747,29 @@ class TestCliGuide(CustomTestCase):
         self.assertNotIn("Mode [", stderr)
         execvpe.assert_called_once()
 
-    def test_hardware_id_from_device_name(self):
-        for device, hw in (
-            ("NVIDIA GB300", "gb300"),
-            ("NVIDIA B300 SXM6 AC", "b300"),
-            ("NVIDIA GB200", "gb200"),
-            ("NVIDIA B200", "b200"),
-            ("NVIDIA GB10", "dgx-spark"),
-            ("NVIDIA H200", "h200"),
-            ("NVIDIA GH200 480GB", None),
-            ("AMD Instinct MI355X", "mi355x"),
-            ("NVIDIA A100-SXM4-80GB", None),
-            (None, None),
+    def test_hardware_ids_from_device_name(self):
+        for device, hardware in (
+            ("NVIDIA GB300", ("gb300",)),
+            ("NVIDIA B300 SXM6 AC", ("b300",)),
+            ("NVIDIA GB200", ("gb200",)),
+            ("NVIDIA B200", ("b200",)),
+            ("NVIDIA GB10", ("dgx-spark",)),
+            (
+                "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+                ("rtx6000", "rtx-pro-6000"),
+            ),
+            ("NVIDIA GeForce RTX 5090", ("rtx5090",)),
+            ("NVIDIA H20-3e", ("h20-3e",)),
+            ("NVIDIA H200", ("h200",)),
+            ("NVIDIA H20", ()),
+            ("NVIDIA L20", ("l20",)),
+            ("NVIDIA GH200 480GB", ()),
+            ("AMD Instinct MI355X", ("mi355x",)),
+            ("NVIDIA A100-SXM4-80GB", ()),
+            (None, ()),
         ):
             with self.subTest(device):
-                self.assertEqual(interactive._hardware_id(device), hw)
+                self.assertEqual(interactive._hardware_ids(device), hardware)
 
 
 class TestFlagEdits(unittest.TestCase):
@@ -741,15 +788,14 @@ class TestFlagEdits(unittest.TestCase):
                     edit_flags(argv=self.ARGV, edits=edits)
 
     def test_format_matches_every_cookbook_command(self):
-        for entries in _exported().values():
-            for entry in entries:
-                with self.subTest(entry["url"]):
-                    lines = entry["command"].splitlines()
-                    command = "\n".join(l for l in lines if not l.startswith("#"))
-                    formatted = format_command(
-                        env=entry["env"], argv=command_argv(entry["command"])
-                    )
-                    self.assertEqual(formatted, command)
+        for _, entry in _launchable():
+            with self.subTest(entry["url"]):
+                lines = entry["command"].splitlines()
+                command = "\n".join(l for l in lines if not l.startswith("#"))
+                formatted = format_command(
+                    env=entry["env"], argv=command_argv(entry["command"])
+                )
+                self.assertEqual(formatted, command)
 
 
 if __name__ == "__main__":

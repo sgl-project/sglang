@@ -1,0 +1,3 @@
+[
+  {"hw":"mac","mode":null,"verified":"unverified","gpus":1,"gsm8k_pct":null,"env":{"SGLANG_USE_MLX":"1","SGLANG_MLX_CACHE_LIMIT_GB":"8"},"url":"https://docs.sglang.io/cookbook/autoregressive/Meta/MuseGlimmer#hw=mac&variant=default&quant=mlx-q4&strategy=standard&nodes=single&modality=text","command":"SGLANG_USE_MLX=1 \\\nSGLANG_MLX_CACHE_LIMIT_GB=8 \\\nsglang serve \\\n  --model-path RadixArk/Muse-Glimmer-q4-MLX \\\n  --trust-remote-code \\\n  --reasoning-parser muse \\\n  --tool-call-parser muse \\\n  --disable-radix-cache \\\n  --mem-fraction-static 0.85 \\\n  --host 0.0.0.0 \\\n  --port 30000"}
+]

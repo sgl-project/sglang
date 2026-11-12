@@ -26,22 +26,26 @@ EDIT_PROMPT = (
     'Change a flag ("--port 8000"), remove one ("!--port"), or press Enter to launch: '
 )
 
-# Cookbook hardware ids by device name, most specific first;
+# Cookbook hardware ids by device name, most specific first; some pages
+# spell the same GPU differently.
 _HARDWARE = (
-    ("GB300", "gb300"),
-    ("B300", "b300"),
-    ("GB200", "gb200"),
-    ("B200", "b200"),
-    ("GB10", "dgx-spark"),
-    ("RTX PRO 6000", "rtx6000"),
-    ("GH200", None),
-    ("H200", "h200"),
-    ("H100", "h100"),
-    ("H800", "h800"),
-    ("MI355X", "mi355x"),
-    ("MI350X", "mi350x"),
-    ("MI325X", "mi325x"),
-    ("MI300X", "mi300x"),
+    ("GB300", ("gb300",)),
+    ("B300", ("b300",)),
+    ("GB200", ("gb200",)),
+    ("B200", ("b200",)),
+    ("GB10", ("dgx-spark",)),
+    ("RTX PRO 6000", ("rtx6000", "rtx-pro-6000")),
+    ("RTX 5090", ("rtx5090",)),
+    ("GH200", ()),
+    ("H20-3E", ("h20-3e",)),
+    ("H200", ("h200",)),
+    ("H100", ("h100",)),
+    ("H800", ("h800",)),
+    ("L20", ("l20",)),
+    ("MI355X", ("mi355x",)),
+    ("MI350X", ("mi350x",)),
+    ("MI325X", ("mi325x",)),
+    ("MI300X", ("mi300x",)),
 )
 
 
@@ -52,8 +56,8 @@ def recipes_for_this_machine(model: str) -> list[dict]:
         _log(NO_RECIPE_MESSAGE.format(model=model))
         return []
     device_name, gpus = _detect_gpus()
-    hw = _hardware_id(device_name)
-    matching = [r for r in recipes if r["hw"] == hw and r["gpus"] == gpus]
+    hardware = _hardware_ids(device_name)
+    matching = [r for r in recipes if r["hw"] in hardware and r["gpus"] == gpus]
     if not matching:
         machine = f"{gpus}x {device_name}" if gpus else "this machine (no GPU)"
         available = ", ".join(sorted({f"{r['gpus']}x {r['hw']}" for r in recipes}))
@@ -92,8 +96,8 @@ def run_guide(model: str, recipes: list[dict], dry_run: bool) -> None:
         _log(f"Using your exported {', '.join(yours)} instead of the Cookbook's.")
 
     _log(
-        f'To change flags, run "sglang serve {model} --dry-run", '
-        "edit the command without running."
+        f'To change flags: run "sglang serve {model} --dry-run" to print the '
+        "command, edit it, then run it."
     )
     sys.stdout.flush()
     sys.stderr.flush()
@@ -114,7 +118,9 @@ def command_argv(command: str) -> list[str]:
 
 def format_command(env: dict[str, str], argv: list[str]) -> str:
     """Render a command in the Cookbook's one-flag-per-line style."""
-    lines = [f"{key}={shlex.quote(value)}" for key, value in env.items()]
+    lines = [
+        f"{key}={shlex.quote(value) if value else ''}" for key, value in env.items()
+    ]
     lines.append("sglang serve")
     lines += [f"  {shlex.join(group)}" for group in _flag_groups(argv)]
     return " \\\n".join(lines)
@@ -221,11 +227,11 @@ def _detect_gpus() -> tuple[str | None, int]:
     return (get_device_name() if count else None), count
 
 
-def _hardware_id(device_name: str | None) -> str | None:
-    for name, hw in _HARDWARE:
+def _hardware_ids(device_name: str | None) -> tuple[str, ...]:
+    for name, hardware in _HARDWARE:
         if device_name and name in device_name.upper():
-            return hw
-    return None
+            return hardware
+    return ()
 
 
 def _log(message: str) -> None:
