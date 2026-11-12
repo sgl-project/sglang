@@ -28,12 +28,15 @@ jobs:
     needs: call-gate
     permissions: {}
     runs-on: nvoss-sg-l-gb300-4-a
-    timeout-minutes: 5
+    # Job budget includes startup; ARC's pod-readiness timeout is separate.
+    timeout-minutes: 20
     container:
       image: lmsysorg/sglang@sha256:9b524a335866163c89d28652f1c9a0fc603bc386143e47659fb5dfcb611479b3
       options: --user 1001
     steps:
       - name: Check user, architecture and GPU inventory
+        # Keep the inventory probe short after startup.
+        timeout-minutes: 2
         shell: bash
         run: |
           set -euo pipefail
