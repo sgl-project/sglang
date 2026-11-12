@@ -250,10 +250,9 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
         scales = None
         if self.is_modelslim_mxfp8:
             scales = KVScaleBuffers(
-                k=tuple(self.k_scale_buffer),
+                k=self._hicache_k_scale_buffer,
                 v=tuple(self.v_scale_buffer),
-                layout=KVScaleLayout.MODELSLIM_MXFP8,
-                k_transfer_buffer=self._hicache_k_scale_buffer,
+                layout=KVScaleLayout.MXFP8_MODELSLIM_K_DYNAMIC_V_PER_CHANNEL,
             )
         return MHABufferInfo(
             buffers=KVBuffers(

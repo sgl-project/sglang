@@ -304,8 +304,11 @@ class MHATokenToKVPoolMXFP8Host(MHATokenToKVPoolHost):
         raise self._storage_pages_unsupported()
 
 
-class NPUModelSlimMXFP8Host(MHATokenToKVPoolHost):
-    """Page-first K/V and dynamic K scales. V scales come from model weights."""
+class NPUModelSlimMXFP8KDynamicVPerChannelHost(MHATokenToKVPoolHost):
+    """L2 host pool for ModelSlim QK_MXFP8_DYNAMIC_V_MXFP8_PER_CHANNEL.
+
+    Pages carry K/V and dynamic K scales. Static V scales come from the weights.
+    """
 
     supports_l3 = False
 
@@ -341,7 +344,7 @@ class NPUModelSlimMXFP8Host(MHATokenToKVPoolHost):
         yield from super()._npu_transfer_buffers()
         layer_start = 0
         for info in self._buffer_infos:
-            k_scale = info.scales.k_transfer_buffer.flatten(-2)
+            k_scale = info.scales.k.flatten(-2)
             layer_end = layer_start + k_scale.shape[0]
             yield (
                 k_scale,

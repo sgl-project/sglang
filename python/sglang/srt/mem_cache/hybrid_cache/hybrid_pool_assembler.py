@@ -147,9 +147,10 @@ def _mha_host_inputs(pool, info, drafts=()):
 
 def _is_modelslim_host_kv(info):
     if isinstance(info, MHABufferInfo):
+        scales = info.scales
         return (
-            info.scales is not None
-            and info.scales.layout is KVScaleLayout.MODELSLIM_MXFP8
+            scales is not None
+            and scales.layout is KVScaleLayout.MXFP8_MODELSLIM_K_DYNAMIC_V_PER_CHANNEL
         )
     return (
         isinstance(info, MLABufferInfo)
