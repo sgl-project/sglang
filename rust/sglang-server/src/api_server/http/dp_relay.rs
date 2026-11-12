@@ -32,7 +32,7 @@
 //! ranks. Clients reach the other ranks through a router that dials each
 //! listener (DP rank 0 publishes them), or by dialing them themselves.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use axum::Router;
@@ -41,6 +41,7 @@ use axum::extract::{Request, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::Response;
+use futures::TryStreamExt;
 use serde::Deserialize;
 
 use super::request_headers::int_header;
@@ -318,14 +319,20 @@ impl DpRelay {
     /// response back as received.
     async fn relay(&self, rank: u32, base: &str, request: Request) -> Response {
         let (parts, body) = request.into_parts();
-        let body = match axum::body::to_bytes(body, usize::MAX).await {
-            Ok(body) => body,
-            Err(error) => return unreadable_body(error),
-        };
+        // A client body that fails to read also fails the send;
+        // that is the client's 400, not a 502 that blames the peer.
+        let read_error = Arc::new(OnceLock::new());
+        let body = reqwest::Body::wrap_stream(body.into_data_stream().inspect_err({
+            let read_error = read_error.clone();
+            move |error| {
+                let _ = read_error.set(error.to_string());
+            }
+        }));
         let mut headers = parts.headers;
         strip_hop_by_hop(&mut headers);
-        // The body is already whole: the relay sets its own length.
-        for name in [header::HOST, header::CONTENT_LENGTH, header::EXPECT] {
+        // The body goes on as it arrives, so `Content-Length` stays;
+        // without one, it goes chunked.
+        for name in [header::HOST, header::EXPECT] {
             headers.remove(name);
         }
         headers.insert(RELAYED_RANK_HEADER, HeaderValue::from(rank));
@@ -348,6 +355,9 @@ impl DpRelay {
         {
             Ok(upstream) => upstream,
             Err(error) => {
+                if let Some(cause) = read_error.get() {
+                    return unreadable_body(cause);
+                }
                 let status = if error.is_connect() {
                     StatusCode::SERVICE_UNAVAILABLE
                 } else {
@@ -414,10 +424,10 @@ fn strip_hop_by_hop(headers: &mut HeaderMap) {
     }
 }
 
-fn unreadable_body(error: axum::Error) -> Response {
+fn unreadable_body(error: impl std::fmt::Display) -> Response {
     json_error(
         StatusCode::BAD_REQUEST,
-        &format!("Failed to buffer the request body: {error}"),
+        &format!("Failed to read the request body: {error}"),
     )
 }
 
@@ -1066,7 +1076,7 @@ mod tests {
         drop(feed);
         let (status, reply) = reply(response.await.unwrap().unwrap()).await;
         assert_eq!(status, StatusCode::OK);
-        assert!(reply.starts_with("8 bytes, "), "{reply}");
+        assert_eq!(reply, "8 bytes, content-length None");
     }
 
     /// A body that fails while it is relayed is the client's fault: 400, not
@@ -1081,6 +1091,9 @@ mod tests {
             .unwrap();
         let (status, reply) = reply(response.await.unwrap().unwrap()).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{reply}");
-        assert!(reply.contains("request body: client gone"), "{reply}");
+        assert!(
+            reply.contains("Failed to read the request body: client gone"),
+            "{reply}"
+        );
     }
 }
