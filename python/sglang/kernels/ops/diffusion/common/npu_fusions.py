@@ -9,7 +9,7 @@ installed wheel, once per process. A wheel that predates them raises
 from __future__ import annotations
 
 _UNRESOLVED = object()
-# (silu_mul, residual_gate_add, rmsnorm_cast_before_weight)
+# (silu_mul, rmsnorm_cast_before_weight)
 _ops: object = _UNRESOLVED
 
 
@@ -17,12 +17,11 @@ def _resolve():
     global _ops
     if _ops is _UNRESOLVED:
         from sgl_kernel_npu.operators.diffusion import (
-            residual_gate_add,
             rmsnorm_cast_before_weight,
             silu_mul,
         )
 
-        _ops = (silu_mul, residual_gate_add, rmsnorm_cast_before_weight)
+        _ops = (silu_mul, rmsnorm_cast_before_weight)
     return _ops
 
 
@@ -30,9 +29,5 @@ def silu_mul_npu(gate, value):
     return _resolve()[0](gate, value)
 
 
-def residual_gate_add_npu(residual, update, gate):
-    return _resolve()[1](residual, update, gate)
-
-
 def rmsnorm_npu_onepass(x, weight, eps):
-    return _resolve()[2](x, weight, eps)
+    return _resolve()[1](x, weight, eps)

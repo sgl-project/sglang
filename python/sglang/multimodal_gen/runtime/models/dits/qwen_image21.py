@@ -17,7 +17,6 @@ from sglang.kernels.ops.diffusion import (
     qknorm_complex_rope_cuda,
     qknorm_complex_rope_pack_,
     residual_gate_add,
-    residual_gate_add_npu,
     rmsnorm_npu_onepass,
     rmsnorm_preserve_reduction,
     silu_mul_npu,
@@ -92,7 +91,6 @@ _QKV_PACK_FUSION = BitExactFusionGate(
 _QK_NORM_FUSION = BitExactFusionGate("Qwen-Image 2.1 Q/K RMSNorm")
 _MODULATION_FUSION = BitExactFusionGate("Qwen-Image 2.1 LayerNorm modulation")
 _QK_NORM_NPU_FUSION = BitExactFusionGate("Qwen-Image 2.1 Q/K RMSNorm on NPU")
-_RESIDUAL_GATE_NPU_FUSION = BitExactFusionGate("Qwen-Image 2.1 residual + gate on NPU")
 
 
 def build_layout(image_slots, image_shapes, axes_dims, device):
@@ -170,23 +168,6 @@ def apply_qk_norm(x, norm):
             logger=logger,
         )
     return norm(x)
-
-
-def apply_residual_gate(residual, update, gate):
-    fused = None
-    if (
-        _is_npu
-        and residual.is_npu
-        and residual.dtype is torch.bfloat16
-        and _RESIDUAL_GATE_NPU_FUSION.can_attempt_once()
-    ):
-        fused = residual_gate_add_npu(residual, update, gate)
-        if _RESIDUAL_GATE_NPU_FUSION.verified:
-            return fused
-    out = residual_gate_add(residual, update, gate)
-    if fused is not None:
-        return _RESIDUAL_GATE_NPU_FUSION.accept_or_fallback(fused, out, logger=logger)
-    return out
 
 
 def apply_qk_norm_rope(x, norm, rope):
@@ -972,8 +953,8 @@ class QwenImage21TransformerBlock(nn.Module):
             caches,
             prefix_pad,
         )
-        hidden_states = apply_residual_gate(hidden_states, attention, gate1)
-        hidden_states = apply_residual_gate(
+        hidden_states = residual_gate_add(hidden_states, attention, gate1)
+        hidden_states = residual_gate_add(
             hidden_states,
             self.img_mlp(
                 apply_modulation(hidden_states, self.img_norm2, scale2),
@@ -984,8 +965,8 @@ class QwenImage21TransformerBlock(nn.Module):
         for state, attention in zip(prefix_states, prefix_attentions, strict=True):
             if attention is not None:
                 _, pg1, ps2, pg2 = prefix_modulation
-                prefix = apply_residual_gate(state["hidden_states"], attention, pg1)
-                state["hidden_states"] = apply_residual_gate(
+                prefix = residual_gate_add(state["hidden_states"], attention, pg1)
+                state["hidden_states"] = residual_gate_add(
                     prefix,
                     self.img_mlp(apply_modulation(prefix, self.img_norm2, ps2)),
                     pg2,

@@ -355,7 +355,7 @@ inspecting model modules is its whole job.
 
 ### Ascend fusions (sgl-kernel-npu)
 
-Qwen-Image 2.1's three NPU sites resolve their kernels from the installed
+Qwen-Image 2.1's two NPU sites resolve their kernels from the installed
 `sgl-kernel-npu` wheel at first use; this package only adapts the calls. A wheel
 that predates them raises `ModuleNotFoundError` at the first call, as every other
 NPU kernel path in this repository does.
@@ -363,7 +363,6 @@ NPU kernel path in this repository does.
 | Entry point | Backend | Contract | Applies to |
 |---|---|---|---|
 | `silu_mul_npu` | sgl-kernel-npu Triton | bit-exact `silu(a) * b` | Qwen-Image 2.1 feed-forward |
-| `residual_gate_add_npu` | sgl-kernel-npu Triton | bit-exact `residual + update * gate`, elementwise or one broadcast row | Qwen-Image 2.1 block residual |
 | `rmsnorm_npu_onepass` | sgl-kernel-npu Triton | FP32 row reduction, BF16 round before the learned scale | Qwen-Image 2.1 Q/K norm |
 
 ## Adding a kernel

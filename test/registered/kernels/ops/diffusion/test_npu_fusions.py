@@ -13,11 +13,7 @@ import sys
 import pytest
 import torch
 
-from sglang.kernels.ops.diffusion import (
-    residual_gate_add_npu,
-    rmsnorm_npu_onepass,
-    silu_mul_npu,
-)
+from sglang.kernels.ops.diffusion import rmsnorm_npu_onepass, silu_mul_npu
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.test.ci.ci_register import register_npu_ci
 
@@ -38,17 +34,6 @@ def test_silu_mul_matches_eager(shape):
     b = torch.randn(shape, device=DEVICE, dtype=torch.bfloat16)
     expected = torch.nn.functional.silu(a) * b
     assert torch.equal(silu_mul_npu(a, b), expected)
-
-
-@pytest.mark.parametrize("per_row", [False, True])
-def test_residual_gate_add_matches_eager(per_row):
-    torch.manual_seed(42)
-    residual = torch.randn(1, 4096, 4096, device=DEVICE, dtype=torch.bfloat16)
-    update = torch.randn_like(residual)
-    shape = residual.shape if per_row else (1, 1, 4096)
-    gate = torch.randn(shape, device=DEVICE, dtype=torch.bfloat16)
-    expected = residual + update * gate
-    assert torch.equal(residual_gate_add_npu(residual, update, gate), expected)
 
 
 def _reference_norm(shape, scale, eps):
