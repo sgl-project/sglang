@@ -189,11 +189,17 @@ pub struct Node<K: ChildKeyType> {
     pub rotation_base: Option<i64>,
     /// The in-flight write-through backup's ack id.
     pub write_through_pending_id: Option<usize>,
+    /// Queued for its demote by the running write-back eviction walk.
+    pub write_back_queued: bool,
     /// Load-back anchor currently reading this node's Full host slots.
     /// Auxiliary transfers are protected by their component locks.
     pub load_back_pending_id: Option<NodeId>,
     /// Monotonic access tick for LRU ordering (exact; not wall-clock).
     pub last_access_counter: i64,
+    /// GDS eviction watermark at this state's last use; NaN before its first.
+    pub gds_stamp: f64,
+    /// Last computed prefill to rebuild this state from a shallower one.
+    pub gds_gain: f64,
     /// Tick stamped at construction.
     pub creation_counter: i64,
     /// Match hits accumulated for write-through and LFU decisions.
@@ -426,8 +432,11 @@ impl<K: ChildKeyType> Node<K> {
             external_cache_stored: false,
             rotation_base: None,
             write_through_pending_id: None,
+            write_back_queued: false,
             load_back_pending_id: None,
             last_access_counter: 0,
+            gds_stamp: f64::NAN,
+            gds_gain: 0.0,
             creation_counter: 0,
             hit_count: 0,
             tlru_cached_prefix_len: 0,
@@ -453,8 +462,11 @@ impl<K: ChildKeyType> Node<K> {
             external_cache_stored: false,
             rotation_base: None,
             write_through_pending_id: None,
+            write_back_queued: false,
             load_back_pending_id: None,
             last_access_counter: 0,
+            gds_stamp: f64::NAN,
+            gds_gain: 0.0,
             creation_counter: 0,
             hit_count: 0,
             tlru_cached_prefix_len: 0,
@@ -1185,6 +1197,11 @@ impl<K: ChildKeyType> NodeArena<K> {
             node.values[ct.idx()].lock_ref = 1;
         }
         idx
+    }
+
+    /// Whether the slot holds a live node.
+    pub fn is_allocated(&self, id: NodeIdx_) -> bool {
+        self.nodes.get(id.0).is_some_and(Option::is_some)
     }
 
     /// Every live node id, in slot order.

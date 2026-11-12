@@ -14,8 +14,13 @@ from unittest.mock import MagicMock, patch
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.common.conn import KVTransferError
 from sglang.srt.disaggregation.decode import DecodeTransferQueue
+from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
+    ListKind,
+)
 from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.scheduler_test_utils import FakeReq, decode_queue, leaving_retirer
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -25,7 +30,9 @@ def _stage(first_rank: bool, succeeded, failed, prev=None):
     """A PP stage whose own receivers report `succeeded` / `failed` rids."""
     return SimpleNamespace(
         pp_group=SimpleNamespace(is_first_rank=first_rank),
-        disagg_decode_transfer_queue=SimpleNamespace(queue=[]),
+        disagg_decode_transfer_queue=SimpleNamespace(
+            queue=decode_queue(ListKind.PD_RECEIVING)
+        ),
         get_rids=lambda queue, is_send, *groups: (list(succeeded), list(failed)),
         _pp_recv_pyobj_from_prev_stage=lambda: prev,
     )
@@ -83,7 +90,7 @@ class _Receiver:
 
 def _decode_req(rid, poll):
     return SimpleNamespace(
-        req=SimpleNamespace(
+        req=FakeReq(
             rid=rid, bootstrap_room=7, return_logprob=False, finished_reason=None
         ),
         kv_receiver=_Receiver(poll),
@@ -96,7 +103,7 @@ def _decode_req(rid, poll):
 
 def _transfer_queue(decode_reqs):
     queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
-    queue.queue = list(decode_reqs)
+    queue.queue = decode_queue(ListKind.PD_RECEIVING, decode_reqs)
     queue.enable_staging = False
     queue.enable_host_receive = False
     queue.enable_deferred_kv_release = False
@@ -108,8 +115,8 @@ def _transfer_queue(decode_reqs):
     queue._clean_hicache_prefetch_resources = MagicMock()
     queue._commit_transfer_to_req = MagicMock()
     queue._record_transfer_failure = MagicMock()
-    queue._release_request = MagicMock()
     queue.scheduler = SimpleNamespace(
+        request_retirer=leaving_retirer(),
         enable_decode_hicache=False,
         enable_hisparse=False,
         metrics_reporter=SimpleNamespace(enable_metrics=False),
@@ -133,7 +140,6 @@ class TestPopTransferredFollowsConsensusOutcome(CustomTestCase):
                 },
             ),
             ("sglang.srt.disaggregation.decode.prepare_abort", {}),
-            ("sglang.srt.disaggregation.decode.release_kv_cache", {}),
         ):
             patcher = patch(target, **kwargs)
             patcher.start()
@@ -145,13 +151,17 @@ class TestPopTransferredFollowsConsensusOutcome(CustomTestCase):
         not_yet_agreed = _decode_req("h", KVPoll.Success)
         queue = _transfer_queue([admitted, failed_elsewhere, not_yet_agreed])
 
-        reqs, outcomes = queue.pop_transferred_with_outcomes({"s": False, "f": True})
+        reqs, outcomes = queue.move_transferred_with_outcomes(
+            IndexedReqList(ListKind.WAITING), {"s": False, "f": True}
+        )
 
         self.assertEqual(reqs, [admitted.req])
         self.assertEqual(outcomes, {"s": False, "f": True})
-        self.assertEqual(queue.queue, [not_yet_agreed])
+        self.assertEqual(list(queue.queue.items()), [not_yet_agreed])
         queue._commit_transfer_to_req.assert_called_once_with(admitted)
-        queue._release_request.assert_called_once_with(failed_elsewhere)
+        queue.scheduler.request_retirer.release.assert_called_once_with(
+            failed_elsewhere.req, checkpoint=False
+        )
         queue._record_transfer_failure.assert_called_once_with(
             "Failed due to an unknown reason from another rank"
         )
@@ -160,16 +170,20 @@ class TestPopTransferredFollowsConsensusOutcome(CustomTestCase):
         failed_here = _decode_req("f", KVPoll.Failed)
         queue = _transfer_queue([failed_here])
 
-        reqs, outcomes = queue.pop_transferred_with_outcomes({"f": False})
+        reqs, outcomes = queue.move_transferred_with_outcomes(
+            IndexedReqList(ListKind.WAITING), {"f": False}
+        )
 
         self.assertEqual(reqs, [])
         self.assertEqual(outcomes, {"f": True})
-        self.assertEqual(queue.queue, [])
+        self.assertEqual(list(queue.queue.items()), [])
 
     def test_non_pp_path_keeps_the_request_list(self):
         admitted = _decode_req("s", KVPoll.Success)
         queue = _transfer_queue([admitted])
-        self.assertEqual(queue.pop_transferred(), [admitted.req])
+        self.assertEqual(
+            queue.move_transferred(IndexedReqList(ListKind.WAITING)), [admitted.req]
+        )
 
 
 class TestProcessDecodeTransferQueueForwardsOutcomes(CustomTestCase):
@@ -178,24 +192,26 @@ class TestProcessDecodeTransferQueueForwardsOutcomes(CustomTestCase):
         scheduler = SimpleNamespace(
             disagg_decode_transfer_queue=SimpleNamespace(
                 resolve_deferred_releases=MagicMock(),
-                pop_transferred_with_outcomes=MagicMock(
+                move_transferred_with_outcomes=MagicMock(
                     return_value=([admitted], {"s": False, "f": True})
                 ),
             ),
             enable_hisparse=False,
-            waiting_queue=[],
+            waiting_queue=IndexedReqList(ListKind.WAITING),
         )
         forwarded = SchedulerPPMixin.process_decode_transfer_queue(
             scheduler, {"s": False, "f": True, "h": False}
         )
         self.assertEqual(forwarded, {"s": False, "f": True})
-        self.assertEqual(scheduler.waiting_queue, [admitted])
+        scheduler.disagg_decode_transfer_queue.move_transferred_with_outcomes.assert_called_once_with(
+            scheduler.waiting_queue, {"s": False, "f": True, "h": False}
+        )
 
     def test_no_consensus_means_nothing_to_forward(self):
         scheduler = SimpleNamespace(
             disagg_decode_transfer_queue=SimpleNamespace(
                 resolve_deferred_releases=MagicMock(),
-                pop_transferred_with_outcomes=MagicMock(),
+                move_transferred_with_outcomes=MagicMock(),
             ),
             enable_hisparse=False,
             waiting_queue=[],
@@ -203,7 +219,7 @@ class TestProcessDecodeTransferQueueForwardsOutcomes(CustomTestCase):
         self.assertIsNone(
             SchedulerPPMixin.process_decode_transfer_queue(scheduler, None)
         )
-        scheduler.disagg_decode_transfer_queue.pop_transferred_with_outcomes.assert_not_called()
+        scheduler.disagg_decode_transfer_queue.move_transferred_with_outcomes.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -125,9 +125,13 @@ class SpecTpSync:
         # Parsed even on a single rank so a typo fails on every deployment.
         sites = parse_spec_tp_sync(envs.SGLANG_SPEC_TP_SYNC.get())
         self._sites = sites if tp_group.world_size > 1 else frozenset()
-        if sites != _ALL and tp_group.world_size > 1 and tp_group.rank_in_group == 0:
-            logger.warning(
-                "Speculative TP sync limited to %s.",
+        if (
+            envs.SGLANG_SPEC_TP_SYNC.is_set()
+            and tp_group.world_size > 1
+            and tp_group.rank_in_group == 0
+        ):
+            logger.info(
+                "Speculative TP sync broadcasts %s.",
                 [f"{int(s)}:{s.slug}" for s in sorted(sites)] or "no site",
             )
 

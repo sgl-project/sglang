@@ -12,17 +12,16 @@ from typing import Optional
 import msgspec
 import torch
 
+from sglang.srt.managers.req_types import MM_PAD_SHIFT_VALUE
 from sglang.srt.runtime_context import get_buffer
 
 _INT16_MAX = 32767
 
-# Multimodal placeholders are rewritten above this value; text markers are not.
-_MM_PAD_SHIFT_VALUE = 1_000_000
-
 
 def image_token_mask(ids: torch.Tensor, image_token_id: int) -> torch.Tensor:
     """``True`` where a token is an image placeholder (sentinel or literal id)."""
-    return (ids >= _MM_PAD_SHIFT_VALUE) | (ids == image_token_id)
+    # Multimodal placeholders are rewritten above this value; text markers are not.
+    return (ids >= MM_PAD_SHIFT_VALUE) | (ids == image_token_id)
 
 
 def _stable(name: str, t: torch.Tensor) -> torch.Tensor:
