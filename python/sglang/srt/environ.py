@@ -426,6 +426,16 @@ class Envs:
     SGLANG_OPT_SPEC_POST_VERIFY_BONUS_I64 = EnvRuntimeBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # EAGLE chain verify (topk 1): accept the drafts in one fused kernel where
+    # _chain_accept_applies holds (same accepted tokens as the stock accept).
+    SGLANG_OPT_SPEC_FUSED_CHAIN_ACCEPT = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
+    # With the EAGLE post-verify graphs: SamplingBatchInfo.copy_for_forward copies the
+    # fields directly instead of dataclasses.replace (same fields).
+    SGLANG_OPT_SPEC_HOST_SAMPLING_COPY = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
     # Forced acceptance lengths (SGLANG_SIMULATE_ACC_LEN, match-expected): pre-draw the
     # generator's exponentials in blocks and take each draw's torch.multinomial outcome
     # from them (same outcomes, checked once against single draws on a copy).

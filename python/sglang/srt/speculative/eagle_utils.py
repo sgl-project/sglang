@@ -82,7 +82,7 @@ logger = logging.getLogger(__name__)
 
 
 def _fused_accept_enabled() -> bool:
-    return envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get()
+    return envs.SGLANG_OPT_SPEC_FUSED_CHAIN_ACCEPT.get()
 
 
 def per_step_draft_out_cache_loc(
