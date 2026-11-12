@@ -1815,6 +1815,9 @@ class HiSparseCoordinator:
         req._hisparse_host_discarded = None
         req._hisparse_host_pool_idx = None
         req.hisparse_borrowed_prefix_len = 0
+        # The borrow is gone with the ref above; a stale NodeId would let a
+        # rebootstrap gather slots the tree no longer pins.
+        req.hisparse_borrowed_host_node = None
         self.req_to_host_pool[req_pool_idx, :] = -1
         self.req_to_host_pool_allocated_len[req_pool_idx] = 0
 

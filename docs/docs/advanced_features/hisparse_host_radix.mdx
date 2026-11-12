@@ -119,5 +119,5 @@ Here every configuration is bound by the GPU hot buffer. The elision configurati
 
 - A request whose prompt has no cached prefix still pays a full P->D transfer.
 - The prefix index-K restore occupies GPU logical rows for each request that reuses the prefix; the GPU copy is not shared.
-- Retracting a HiSparse request re-bootstraps it: the prefill instance recomputes its KV.
+- Retracting a HiSparse request re-bootstraps it: the prefill instance recomputes its KV. The decode side reuses the prompt prefix the host tree still holds, which cuts the P->D transfer and the host slots it allocates for that prefix; the request lost its locks when it was retracted, so the prefix may since have been evicted, and a miss recomputes the whole prompt. Only published tokens are reusable: the decode tail past the last checkpoint has no host node and is always recomputed.
 - Finished requests' private suffixes stay in the host tier until LRU eviction reclaims them, so host pool usage grows toward `host_token_capacity` under sustained load. This does not reduce admission, which evicts unreferenced nodes on demand.

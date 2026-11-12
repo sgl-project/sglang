@@ -1812,9 +1812,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             # TODO: add new_token ratio
             fill_len = pre_alloc_fill_len(decode_req.req)
             prefix_match: Optional[DecodePrefixMatch] = None
+            # a miss recomputes the whole prefix, and a hit still recomputes the unpublished tail.
             use_decode_radix_cache = (
                 get_disagg().disaggregation_decode_enable_radix_cache
-                and not decode_req.is_rebootstrap
+                and (
+                    not decode_req.is_rebootstrap
+                    or self._rebootstrap_may_reuse_prefix()
+                )
             )
             if use_decode_radix_cache:
                 # Match prefix against decode's radix cache.
@@ -1950,45 +1954,16 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 else 0
             )
 
-            # Host-pool admission gate
-            # Needed when host can run out before the logical budget above:
-            # host-radix (the L2 tree retains slots past a request) or a host pool
-            # sized below the logical pool (hisparse-config host_token_capacity).
-            # On shortfall it evicts the tree's host nodes first and defers only
-            # if that is still short.
-            host_gate = self._host_radix or (
-                self.scheduler.enable_hisparse
-                and self.scheduler.hisparse_coordinator.host_pool_decoupled
-            )
+            host_gate = self._hisparse_host_gate
             if host_gate:
-                coordinator = self.scheduler.hisparse_coordinator
-                host_pool = coordinator.mem_pool_host
-                if host_growth_reserved is None:
-                    host_growth_reserved = self._hisparse_host_growth_reserved()
-                # Host layer is 1:1 with tokens here (non-dsv4): this request's
-                # full output plus every active request's remaining one.
-                host_need = (
-                    self._hisparse_host_target(decode_req.req, fill_len)
-                    - total_prefix_len
-                    + host_growth_reserved
+                host_growth_reserved = self._hisparse_host_admit(
+                    decode_req,
+                    prefix_match,
+                    fill_len,
+                    total_prefix_len,
+                    host_growth_reserved,
                 )
-                if self._host_radix and host_pool.available_size() < host_need:
-                    self.tree_cache.evict_host(host_need - host_pool.available_size())
-                if host_pool.available_size() < host_need:
-                    if prefix_match is not None and prefix_match.l1_prefix_len > 0:
-                        self.tree_cache.unlock(decode_req.req.lock)
-                        decode_req.req.lock = None
-                    self._release_host_prefix_ref(decode_req.req)
-                    # Retried every poll while the pool stays full; log once per req.
-                    if not getattr(decode_req, "_host_defer_logged", False):
-                        decode_req._host_defer_logged = True
-                        logger.warning(
-                            "hisparse prealloc deferred: rid=%s needs %d host slots, "
-                            "%d available; admission is host-capacity bound",
-                            decode_req.req.rid,
-                            host_need,
-                            host_pool.available_size(),
-                        )
+                if host_growth_reserved is None:
                     break
             dst_kv_indices = self._pre_alloc(
                 decode_req.req,
@@ -1997,15 +1972,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 total_prefix_len,
             )
             if host_gate:
-                # The prompt is now allocated; its decode growth is still owed.
-                host_growth_reserved += max(
-                    0,
-                    self._hisparse_host_target(decode_req.req, fill_len)
-                    - int(
-                        coordinator.req_to_host_pool_allocated_len[
-                            decode_req.req.kv.req_pool_idx
-                        ]
-                    ),
+                host_growth_reserved += self._hisparse_host_growth_owed(
+                    decode_req.req, fill_len
                 )
             decode_req.prefix_match = prefix_match
             hisparse_req_budget -= 1
@@ -2992,6 +2960,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     def _host_radix(self) -> bool:
         return self.scheduler.enable_hisparse_host_radix
 
+    def _rebootstrap_may_reuse_prefix(self) -> bool:
+        """Whether a retracted request may reuse the prefix the host tree holds.
+
+        A retraction releases the request's locks, so the tree may evict those
+        nodes before the request is re-admitted.
+        """
+        return self._host_radix
+
     def _hisparse_host_target(self, req: Req, fill_len: int) -> int:
         """Host slots a request holds once its (clipped) output is generated.
 
@@ -3001,6 +2977,72 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         return ceil_align(
             fill_len + min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKEN),
             self.scheduler.hisparse_coordinator.mem_pool_host.page_size,
+        )
+
+    @property
+    def _hisparse_host_gate(self) -> bool:
+        """Whether admission must check the HiSparse host pool.
+
+        Needed when host can run out before the logical budget: host-radix (the
+        L2 tree retains slots past a request) or a host pool sized below the
+        logical pool (hisparse-config host_token_capacity).
+        """
+        return self._host_radix or (
+            self.scheduler.enable_hisparse
+            and self.scheduler.hisparse_coordinator.host_pool_decoupled
+        )
+
+    def _hisparse_host_admit(
+        self,
+        decode_req: DecodeRequest,
+        prefix_match: Optional[DecodePrefixMatch],
+        fill_len: int,
+        total_prefix_len: int,
+        host_growth_reserved: Optional[int],
+    ) -> Optional[int]:
+        """Host-pool admission gate; return the growth reserve, or None to defer.
+
+        On shortfall it evicts the tree's host nodes first and defers only if
+        that is still short, dropping the locks the match took.
+        """
+        host_pool = self.scheduler.hisparse_coordinator.mem_pool_host
+        if host_growth_reserved is None:
+            host_growth_reserved = self._hisparse_host_growth_reserved()
+        # Host layer is 1:1 with tokens here (non-dsv4): this request's
+        # full output plus every active request's remaining one.
+        host_need = (
+            self._hisparse_host_target(decode_req.req, fill_len)
+            - total_prefix_len
+            + host_growth_reserved
+        )
+        if self._host_radix and host_pool.available_size() < host_need:
+            self.tree_cache.evict_host(host_need - host_pool.available_size())
+        if host_pool.available_size() >= host_need:
+            return host_growth_reserved
+
+        if prefix_match is not None and prefix_match.l1_prefix_len > 0:
+            self.tree_cache.unlock(decode_req.req.lock)
+            decode_req.req.lock = None
+        self._release_host_prefix_ref(decode_req.req)
+        # Retried every poll while the pool stays full; log once per req.
+        if not getattr(decode_req, "_host_defer_logged", False):
+            decode_req._host_defer_logged = True
+            logger.warning(
+                "hisparse prealloc deferred: rid=%s needs %d host slots, "
+                "%d available; admission is host-capacity bound",
+                decode_req.req.rid,
+                host_need,
+                host_pool.available_size(),
+            )
+        return None
+
+    def _hisparse_host_growth_owed(self, req: Req, fill_len: int) -> int:
+        """Decode growth a just-allocated request still owes the host pool."""
+        allocated = self.scheduler.hisparse_coordinator.req_to_host_pool_allocated_len
+        return max(
+            0,
+            self._hisparse_host_target(req, fill_len)
+            - int(allocated[req.kv.req_pool_idx]),
         )
 
     def _hisparse_host_growth_reserved(self) -> int:

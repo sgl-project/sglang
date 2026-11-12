@@ -12,6 +12,7 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.disaggregation.decode import DecodePreallocQueue
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.mem_cache.allocator.hisparse import HiSparseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
@@ -441,40 +442,6 @@ class TestHostGrowthReserved(CustomTestCase):
         self.assertEqual(q._hisparse_host_growth_reserved(), 0)
 
 
-class TestHiSparseMaxNewTokens(CustomTestCase):
-    """The generation budget follows the logical pool, not the device rows."""
-
-    def _alloc(self, size_full):
-        from sglang.srt.mem_cache.allocator.hisparse import (
-            HiSparseTokenToKVPoolAllocator,
-        )
-
-        alloc = HiSparseTokenToKVPoolAllocator.__new__(HiSparseTokenToKVPoolAllocator)
-        alloc._size_full = size_full
-        alloc.page_size = 64
-        return alloc
-
-    def _budget(self, alloc, input_tokens, max_new, device_rows):
-        return alloc.max_new_tokens_for_memory(
-            input_tokens,
-            max_new,
-            token_capacity=device_rows,
-            sliding_window_size=None,
-            chunk_size=None,
-            prefill_retire_lag=0,
-            eviction_interval=0,
-        )
-
-    def test_prompt_longer_than_device_rows_keeps_output(self):
-        # 131K prompt, 78K device rows, 2.2M logical rows.
-        alloc = self._alloc(2_204_160)
-        self.assertEqual(self._budget(alloc, 131_100, 2048, 78_720), 2048)
-
-    def test_still_clipped_by_logical_pool(self):
-        alloc = self._alloc(1024)
-        self.assertEqual(self._budget(alloc, 896, 2048, 512), 1024 - 896 - 64 - 1)
-
-
 class TestHostTokenCapacityConfig(CustomTestCase):
     """hisparse-config host_token_capacity parsing."""
 
@@ -638,8 +605,11 @@ class TestReleaseHostAfterInsert(CustomTestCase):
         coord, _ = self._coord(256)
         dropped = []
         coord._host_borrow_release_fn = dropped.append
-        self._release(coord, self._req())
+        req = self._req(hisparse_borrowed_host_node=7)
+        self._release(coord, req)
         self.assertEqual(dropped, ["r0"])
+        # The borrow is gone, so the node id must not survive to be gathered.
+        self.assertIsNone(req.hisparse_borrowed_host_node)
 
     def test_falls_back_to_the_stashed_pool_index(self):
         # release_kv_cache nulls req.kv.req_pool_idx before this runs.
@@ -769,6 +739,27 @@ class TestRequestRetirerHostRadixSplit(CustomTestCase):
             self._release(host_radix=True, checkpoint=True, staging=True),
             ["staging", "release(checkpoint=True)"],
         )
+
+
+class TestRebootstrapPrefixReuse(CustomTestCase):
+    """A retracted request may reuse only what the host tree still holds.
+
+    Retraction releases the request's locks, so the tree may evict the prefix
+    before re-admission: the match is best-effort and a miss falls back to a
+    full recompute. Native HiSparse keeps no host-tier tree, so it never reuses.
+    """
+
+    @staticmethod
+    def _mixin(host_radix: bool) -> DecodePreallocQueue:
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.scheduler = SimpleNamespace(enable_hisparse_host_radix=host_radix)
+        return queue
+
+    def test_host_radix_allows_best_effort_reuse(self):
+        self.assertTrue(self._mixin(True)._rebootstrap_may_reuse_prefix())
+
+    def test_native_hisparse_recomputes_from_token_zero(self):
+        self.assertFalse(self._mixin(False)._rebootstrap_may_reuse_prefix())
 
 
 if __name__ == "__main__":

@@ -141,21 +141,6 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         fn = self._host_decode_capacity_fn
         return fn is None or requests is None or fn(requests)
 
-    def max_new_tokens_for_memory(
-        self,
-        input_tokens: int,
-        max_new_tokens: int,
-        *,
-        token_capacity: int,
-        **kwargs,
-    ) -> int | None:
-        return super().max_new_tokens_for_memory(
-            input_tokens,
-            max_new_tokens,
-            token_capacity=max(token_capacity, self._size_full),
-            **kwargs,
-        )
-
     @property
     def supports_deferred_release(self) -> bool:
         return getattr(self.logical_attn_allocator, "supports_deferred_release", False)
