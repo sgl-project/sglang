@@ -58,7 +58,7 @@ pub struct CacheWatermark {
 pub enum KvCacheEvent {
     /// `{"type": "BlockStored", "block_hashes", "parent_block_hash",
     /// "token_ids", "block_size", "lora_id", "medium"?, ...}`. Keys the
-    /// unknown future keys are ignored; session attribution is preserved.
+    /// gateway does not route on (`session_id`) are ignored.
     BlockStored(BlockStored),
     /// `{"type": "BlockRemoved", "block_hashes", "medium"?}`.
     BlockRemoved(BlockRemoved),
@@ -81,9 +81,6 @@ pub struct BlockStored {
     pub lora_id: Option<i64>,
     pub lora_name: Option<String>,
     pub cache_salt: Option<String>,
-    /// Attribution only: absence/incarnation/branch remain unknown. A physical
-    /// Stored event is not duplicated for every session sharing that block.
-    pub session_id: Option<String>,
     pub is_bigram: bool,
     /// Storage tier (`"GPU"`, `"CPU_PINNED"`, `"DISK"`, `"EXTERNAL"`).
     /// Optional in the Python schema (`= None` default), so it may be
@@ -396,7 +393,7 @@ impl<'de> Deserialize<'de> for KvCacheEvent {
         D: Deserializer<'de>,
     {
         /// Map keys of a `KVCacheEvent` the gateway reads. Every other key
-        /// unknown future additions are skipped.
+        /// (`session_id`, future additions) is skipped.
         enum EventField {
             Type,
             BlockHashes,
@@ -406,7 +403,6 @@ impl<'de> Deserialize<'de> for KvCacheEvent {
             LoraId,
             LoraName,
             CacheSalt,
-            SessionId,
             Medium,
             Other,
         }
@@ -432,7 +428,6 @@ impl<'de> Deserialize<'de> for KvCacheEvent {
                             "lora_id" => EventField::LoraId,
                             "lora_name" => EventField::LoraName,
                             "cache_salt" => EventField::CacheSalt,
-                            "session_id" => EventField::SessionId,
                             "medium" => EventField::Medium,
                             _ => EventField::Other,
                         })
@@ -463,7 +458,6 @@ impl<'de> Deserialize<'de> for KvCacheEvent {
                 let mut lora_id: Option<i64> = None;
                 let mut lora_name: Option<String> = None;
                 let mut cache_salt: Option<String> = None;
-                let mut session_id: Option<String> = None;
                 let mut medium: Option<String> = None;
                 while let Some(field) = map.next_key::<EventField>()? {
                     match field {
@@ -476,7 +470,6 @@ impl<'de> Deserialize<'de> for KvCacheEvent {
                         EventField::LoraId => lora_id = map.next_value()?,
                         EventField::LoraName => lora_name = map.next_value()?,
                         EventField::CacheSalt => cache_salt = map.next_value()?,
-                        EventField::SessionId => session_id = map.next_value()?,
                         EventField::Medium => medium = map.next_value()?,
                         EventField::Other => {
                             map.next_value::<IgnoredAny>()?;
@@ -499,7 +492,6 @@ impl<'de> Deserialize<'de> for KvCacheEvent {
                         lora_id,
                         lora_name,
                         cache_salt,
-                        session_id,
                         is_bigram,
                         medium,
                     })),
@@ -796,7 +788,6 @@ mod tests {
                 assert_eq!(b.block_size, 4);
                 assert_eq!(b.lora_id, Some(7));
                 assert_eq!(b.medium.as_deref(), Some("GPU"));
-                assert_eq!(b.session_id, None);
             }
             other => panic!("expected BlockStored, got {other:?}"),
         }
@@ -845,7 +836,6 @@ mod tests {
                 assert_eq!(b.block_hashes, vec![10]);
                 assert_eq!(b.parent_block_hash, Some(1));
                 assert_eq!(b.medium.as_deref(), Some("GPU"));
-                assert_eq!(b.session_id.as_deref(), Some("session-a"));
             }
             other => panic!("unexpected variant: {other:?}"),
         }

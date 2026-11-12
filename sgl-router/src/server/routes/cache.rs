@@ -617,7 +617,6 @@ mod tests {
         index.tree().store_event(
             &worker,
             &BlockStored {
-                session_id: None,
                 block_hashes: vec![100],
                 parent_block_hash: None,
                 token_ids: vec![1, 2],

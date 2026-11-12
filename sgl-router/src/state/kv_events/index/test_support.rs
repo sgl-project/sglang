@@ -101,7 +101,6 @@ pub(super) fn spawn_pump_with_bootstrap(
 
 pub(super) fn stored(parent: Option<i64>, hashes: Vec<i64>) -> KvCacheEvent {
     KvCacheEvent::BlockStored(BlockStored {
-        session_id: None,
         lora_name: None,
         cache_salt: None,
         is_bigram: false,
