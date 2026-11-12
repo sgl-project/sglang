@@ -611,12 +611,6 @@
         "cooldown_interval_minutes": 0,
         "reason": "top contributor"
     },
-    "dqh1900013087-tech": {
-        "can_tag_run_ci_label": true,
-        "can_rerun_failed_ci": true,
-        "cooldown_interval_minutes": 0,
-        "reason": "custom override"
-    },
     "ekzhang": {
         "can_tag_run_ci_label": true,
         "can_rerun_failed_ci": true,
