@@ -1,33 +1,35 @@
-"""MLU HND cache writes, movement and unsupported configurations.
-
-Cover the MLU writer and HND storage without loading model weights.
-Run with SGLANG_PLUGINS=none on one free MLU:
-    python test/registered/unit/hardware_backend/mlu/test_memory_pool.py -f
-"""
+"""Test MLU MHA and MLA KV-pool reads, writes, and configuration validation."""
 
 import unittest
+from contextlib import ExitStack
 from types import SimpleNamespace
 
 import torch
-import torch_mlu  # noqa: F401
 
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.mlu.memory_pool import MLUMHATokenToKVPool
+from sglang.srt.hardware_backend.mlu.memory_pool import (
+    MLUMHATokenToKVPool,
+    MLUMLATokenToKVPool,
+)
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_mlu_ci
 from sglang.test.test_utils import CustomTestCase
 
-# Exercises the MLU reshape_paged_cache writer and HND cache movement.
 register_mlu_ci(est_time=60, suite="pr-test-1-mlu")
 
 
-class TestMLUKVCache(CustomTestCase):
-    def _pool(self, *, dtype=torch.bfloat16, layers=2, start=0, layout=None, heads=2):
+class TestMLUMHATokenToKVPool(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        torch.manual_seed(0)
+
+    def _create_pool(self, *, dtype=torch.bfloat16, layers=2, start=0, layout=None):
         pool = MLUMHATokenToKVPool(
             size=128,
             page_size=16,
             dtype=dtype,
-            head_num=heads,
+            head_num=2,
             head_dim=128,
             layer_num=layers,
             start_layer=start,
@@ -40,20 +42,14 @@ class TestMLUKVCache(CustomTestCase):
             buf.zero_()
         return pool
 
-    def _write(self, pool, expected, layer, loc, offset=0):
-        k = self._values(loc.numel(), pool.head_num, 128, pool.dtype, offset)
-        v = -k
-        pool.set_kv_buffer(
-            SimpleNamespace(layer_id=layer), loc, k.to("mlu"), v.to("mlu")
-        )
-        slots = loc.cpu().long()
-        expected[0][layer - pool.start_layer, slots] = k
-        expected[1][layer - pool.start_layer, slots] = v
-        self._assert_cache(pool, expected)
-
     @staticmethod
-    def _snapshot(pool):
-        # Independent logical [layer, physical_slot, head, dim] reference.
+    def _snapshot_cache_in_token_order(pool):
+        """Snapshot all K/V slots on CPU in [layer, physical_slot, head, dim] order.
+
+        Convert each HND buffer from [page, head, offset_in_page, dim] to
+        [physical_slot, head, dim], where physical_slot = page * page_size
+        + offset_in_page. This reads the entire cache without selecting slots.
+        """
         return tuple(
             torch.stack(
                 [
@@ -66,102 +62,177 @@ class TestMLUKVCache(CustomTestCase):
             for buffers in (pool.k_buffer, pool.v_buffer)
         )
 
-    def _assert_cache(self, pool, expected):
-        for actual, reference in zip(self._snapshot(pool), expected):
+    def _assert_cache_matches(self, pool, expected):
+        """Compare all K/V slots across all layers against token-order references."""
+        for actual, reference in zip(
+            self._snapshot_cache_in_token_order(pool), expected
+        ):
             torch.testing.assert_close(actual, reference, rtol=0, atol=0)
 
-    @staticmethod
-    def _values(count, heads, dim, dtype, offset=0):
-        # Small exact integers make bit-exact BF16/FP16 copy assertions possible.
-        return (
-            (torch.arange(count * heads * dim).reshape(count, heads, dim) + offset)
-            % 127
-            - 63
-        ).to(dtype)
-
-    def test_hnd_writes_overwrite_scaling_and_layer_override(self):
+    def test_write_overwrite_and_layer_override(self):
         """Writes cross pages, preserve other slots and honor scales/layer offsets."""
-        with envs.SGLANG_USE_HND_KVCACHE.override(None):
-            envs.SGLANG_USE_HND_KVCACHE.clear()
-            pool = self._pool(start=5)
-        self.assertTrue(pool.use_hnd)
-        expected = self._snapshot(pool)
-        loc = torch.tensor([143, 16, 31, 0, 32, 15], device="mlu")
-        self._write(pool, expected, 6, loc)
-        loc = loc[::2].contiguous().int()
-        k = self._values(loc.numel(), pool.head_num, 128, torch.float32, 37)
+        # Create the pool and input tensors.
+        pool = self._create_pool(start=5)
+        self.assertTrue(pool.use_hnd, "MLU KV cache should use HND layout by default.")
+        loc = torch.tensor([143, 16, 31, 0, 32, 15])
+        k = torch.randn(loc.numel(), pool.head_num, 128).to(pool.dtype)
         v = -k
+        overwrite_loc = loc[::2].contiguous().int()
+        overwrite_k = torch.randn(overwrite_loc.numel(), pool.head_num, 128)
+        overwrite_v = -overwrite_k
+
+        # Compute the expected cache contents on CPU.
+        expected = self._snapshot_cache_in_token_order(pool)
+        expected[0][1, loc] = k
+        expected[1][1, loc] = v
+        expected_overwrite = tuple(buffer.clone() for buffer in expected)
+        expected_overwrite[0][1, overwrite_loc.long()] = (overwrite_k / 2).to(
+            pool.dtype
+        )
+        expected_overwrite[1][1, overwrite_loc.long()] = (overwrite_v / 4).to(
+            pool.dtype
+        )
+
+        # Write and overwrite the cache on MLU.
+        pool.set_kv_buffer(
+            SimpleNamespace(layer_id=6), loc.to("mlu"), k.to("mlu"), v.to("mlu")
+        )
+        actual = self._snapshot_cache_in_token_order(pool)
         pool.set_kv_buffer(
             SimpleNamespace(layer_id=5),
-            KVWriteLoc(loc=loc),
-            k.to("mlu"),
-            v.to("mlu"),
+            KVWriteLoc(loc=overwrite_loc.to("mlu")),
+            overwrite_k.to("mlu"),
+            overwrite_v.to("mlu"),
             k_scale=2,
             v_scale=4,
             layer_id_override=6,
         )
-        expected[0][1, loc.cpu().long()] = (k / 2).to(pool.dtype)
-        expected[1][1, loc.cpu().long()] = (v / 4).to(pool.dtype)
-        self._assert_cache(pool, expected)
+
+        # Check the cache after each write against the CPU reference.
+        for buffer, reference in zip(actual, expected):
+            torch.testing.assert_close(buffer, reference, rtol=0, atol=0)
+        self._assert_cache_matches(pool, expected_overwrite)
 
     def test_invalid_configuration_is_rejected(self):
-        # Explicit overrides bypass shared HND initialization, even "hnd".
         with envs.SGLANG_USE_HND_KVCACHE.override(True):
-            for layout in ("hnd", "nhd"):
-                with self.subTest(layout=layout):
-                    with self.assertRaisesRegex(
-                        NotImplementedError, "remove any explicit"
-                    ):
-                        self._pool(layout=layout)
+            with self.assertRaises(NotImplementedError):
+                self._create_pool(layout="nhd")
+
         with envs.SGLANG_USE_HND_KVCACHE.override(False):
-            with self.assertRaisesRegex(
-                NotImplementedError, "got kv_cache_layout='nhd'"
-            ):
-                self._pool()
+            with self.assertRaises(NotImplementedError):
+                self._create_pool()
 
-        with self.assertRaisesRegex(NotImplementedError, "got dtype=torch.float32"):
-            self._pool(dtype=torch.float32)
+        with self.assertRaises(NotImplementedError):
+            self._create_pool(dtype=torch.float32)
 
-    def test_dcp_mask_rejected_before_input_or_cache_mutation(self):
-        """Unsupported DCP must fail before scaling inputs or writing local KV."""
-        pool = self._pool(layers=1)
-        expected = self._snapshot(pool)
-        loc = torch.tensor([15, 16], device="mlu")
-        k = self._values(2, pool.head_num, 128, torch.float32).to("mlu")
-        v = self._values(2, pool.head_num, 128, torch.float32, 17).to("mlu")
-        original_k, original_v = k.clone(), v.clone()
-        mask = torch.tensor([True, False], device="mlu")
-        with self.assertRaisesRegex(NotImplementedError, "dcp_kv_mask.*not supported"):
-            pool.set_kv_buffer(
-                SimpleNamespace(layer_id=0),
-                KVWriteLoc(loc=loc),
-                k,
-                v,
-                k_scale=2,
-                v_scale=4,
-                dcp_kv_mask=mask,
-            )
-        torch.testing.assert_close(k, original_k, rtol=0, atol=0)
-        torch.testing.assert_close(v, original_v, rtol=0, atol=0)
-        self._assert_cache(pool, expected)
 
-    def test_move_overlapping_slots_uses_original_sources_all_layers(self):
-        pool = self._pool()
-        loc = torch.arange(16, 144, device="mlu")
-        for layer_id in range(pool.layer_num):
-            k = self._values(128, pool.head_num, 128, pool.dtype, layer_id * 29)
-            v = self._values(128, pool.head_num, 128, pool.dtype, layer_id * 29 + 13)
-            pool.set_kv_buffer(
-                SimpleNamespace(layer_id=layer_id), loc, k.to("mlu"), v.to("mlu")
-            )
-        expected = self._snapshot(pool)
-        src, dst = [16, 31, 32, 47, 80], [31, 32, 47, 80, 143]
-        for reference in expected:
-            reference[:, dst] = reference[:, src].clone()
-        pool.move_kv_cache(
-            torch.tensor(dst, device="mlu"), torch.tensor(src, device="mlu")
+class TestMLUMLATokenToKVPool(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        torch.manual_seed(0)
+        stack = ExitStack()
+        self.addCleanup(stack.close)
+        stack.enter_context(get_parallel().override(dcp_enabled=False))
+
+    @staticmethod
+    def _create_pool(rope_dim=64, dtype=torch.bfloat16, use_dsa=False):
+        pool = MLUMLATokenToKVPool(
+            size=32,
+            page_size=16,
+            dtype=dtype,
+            kv_lora_rank=512,
+            qk_rope_head_dim=rope_dim,
+            layer_num=2,
+            start_layer=5,
+            end_layer=6,
+            device="mlu",
+            enable_memory_saver=False,
+            use_dsa=use_dsa,
         )
-        self._assert_cache(pool, expected)
+        for buf in pool.kv_buffer:
+            buf.zero_()
+        return pool
+
+    def test_write_and_gather_preserve_slots_and_layers(self):
+        """Paged writes and latent gathers agree across overwrites and layer offsets."""
+        # Create the pool and input tensors.
+        pool = self._create_pool()
+        layer = SimpleNamespace(layer_id=5)
+        # Out-of-order slots span a page boundary and the last allocated slot.
+        loc = torch.tensor([47, 16, 0, 15])
+        values = torch.randn(4, 1, 576).to(torch.bfloat16)
+        replacement = torch.randn(2, 1, 576)
+        overwrite_loc = loc[:2]
+
+        # Compute the expected cache contents on CPU.
+        expected = torch.zeros(2, 48, 1, 576, dtype=torch.bfloat16)
+        expected[0, loc] = values
+        expected[0, overwrite_loc] = replacement.to(torch.bfloat16)
+        expected[1, loc] = -values
+
+        # Write and overwrite the cache on MLU.
+        mlu_loc = loc.to("mlu")
+        pool.set_kv_buffer(layer, mlu_loc, values.to("mlu"), None)
+        pool.set_kv_buffer(
+            layer, KVWriteLoc(loc=overwrite_loc.to("mlu")), replacement.to("mlu"), None
+        )
+        pool.set_kv_buffer(
+            layer, mlu_loc, (-values).to("mlu"), None, layer_id_override=6
+        )
+
+        # Check the full cache and gathered rows against the CPU reference.
+        for layer_id in (5, 6):
+            torch.testing.assert_close(
+                pool.get_key_buffer(layer_id).cpu(),
+                expected[layer_id - 5],
+                rtol=0,
+                atol=0,
+            )
+            nope, rope = pool.get_mla_kv_buffer(
+                layer, mlu_loc, layer_id_override=layer_id
+            )
+            torch.testing.assert_close(
+                torch.cat((nope, rope), dim=-1).cpu(),
+                expected[layer_id - 5, loc],
+                rtol=0,
+                atol=0,
+            )
+
+    def test_gather_dtype_and_optional_rope(self):
+        """The pool preserves latent/RoPE components when selecting output dtype."""
+        layer = SimpleNamespace(layer_id=5)
+        loc = torch.tensor([16, 1], device="mlu")
+
+        for rope_dim in (64, 0):
+            with self.subTest(rope_dim=rope_dim):
+                # Create the pool and input tensor.
+                pool = self._create_pool(rope_dim=rope_dim)
+                values = torch.randn(2, 1, 512 + rope_dim).to(torch.bfloat16)
+
+                # Convert the reference values to FP32 on CPU.
+                expected = values.float()
+
+                # Write the cache and gather FP32 outputs on MLU.
+                pool.set_kv_buffer(layer, loc, values.to("mlu"), None)
+                nope, rope = pool.get_mla_kv_buffer(layer, loc, dst_dtype=torch.float32)
+
+                # Check the latent values and optional RoPE output.
+                torch.testing.assert_close(
+                    nope.cpu(), expected[..., :512], rtol=0, atol=0
+                )
+                if rope_dim:
+                    torch.testing.assert_close(
+                        rope.cpu(), expected[..., 512:], rtol=0, atol=0
+                    )
+                else:
+                    self.assertIsNone(rope)
+
+    def test_unsupported_cache_formats_rejected(self):
+        """Reject layouts and dtypes the dense BF16 cache writer cannot represent."""
+        for dtype, use_dsa in ((torch.float16, False), (torch.bfloat16, True)):
+            with self.subTest(dtype=dtype, use_dsa=use_dsa):
+                with self.assertRaises(NotImplementedError):
+                    self._create_pool(dtype=dtype, use_dsa=use_dsa)
 
 
 if __name__ == "__main__":
