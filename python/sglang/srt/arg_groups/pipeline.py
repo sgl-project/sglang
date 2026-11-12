@@ -158,6 +158,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
 
     from sglang.srt.arg_groups.kv_cache_hook import (
         handle_cache_compatibility,
+        handle_int8_kv_cache_compatibility,
         handle_kv4_compatibility,
         handle_mxfp8_kv_cache_compatibility,
         handle_nvfp4_prefill_kv_dequant_dtype,
@@ -290,6 +291,8 @@ def run_resolution_pipeline(server_args: Any) -> None:
     run_hook(handle_load_balance_method, server_args)
 
     run_hook(handle_context_parallelism, server_args)
+    # After the HiCache, PD and CP hooks: it rejects their resolved values.
+    run_hook(handle_int8_kv_cache_compatibility, server_args)
     if cfg.enable_prefill_cp:
         run_hook(apply_prefill_cp_cuda_graph_default, server_args)
 

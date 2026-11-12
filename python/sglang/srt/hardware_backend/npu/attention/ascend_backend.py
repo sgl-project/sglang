@@ -2052,9 +2052,11 @@ class AscendAttnBackend(AttentionBackend):
                     speculative_num_draft_tokens=self.speculative_num_draft_tokens,
                     scaling=layer.scaling,
                 )
-            if self.kv_cache_dtype == torch.float8_e4m3fn:
+            # The pool decides the layout: k_nope is then the packed record,
+            # already stored in the one-byte pool dtype.
+            if self.token_to_kv_pool.dsa_kv_cache_store_fp8:
                 assert q_nope.dtype == q_pe.dtype == torch.bfloat16
-                packed = k_nope.view(torch.float8_e4m3fn)
+                packed = k_nope
                 attn_out = torch_npu.npu_kv_quant_sparse_flash_attention(
                     query=torch.cat((q_nope, q_pe), dim=-1).contiguous(),
                     key=packed,

@@ -73,6 +73,7 @@ _OVERRIDABLE_HOOKS: FrozenSet[str] = frozenset(
         "handle_data_parallelism",
         "handle_load_balance_method",
         "handle_context_parallelism",
+        "handle_int8_kv_cache_compatibility",
         "apply_prefill_cp_cuda_graph_default",
         "handle_kv_cache_sharding",
         "handle_moe_kernel_config",

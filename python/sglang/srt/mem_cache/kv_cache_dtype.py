@@ -62,6 +62,9 @@ def configure_kv_cache_dtype(
         kv_cache_dtype = torch.float8_e4m3fn
     elif server_args_kv_cache_dtype in ("bf16", "bfloat16"):
         kv_cache_dtype = torch.bfloat16
+    elif server_args_kv_cache_dtype == "int8":
+        # Startup checks and the NPU capability admit it for DSA on A2 only.
+        kv_cache_dtype = torch.int8
     elif server_args_kv_cache_dtype in ("nvfp4", "fp4_mx_block16"):
         if hasattr(torch, "float4_e2m1fn_x2"):
             kv_cache_dtype = torch.float4_e2m1fn_x2
@@ -94,6 +97,18 @@ def configure_kv_cache_dtype(
         )
         kv_cache_dtype = model_dtype
         # "auto" is the tag for an unquantized pool; backends gate descale on it.
+        resolved_kv_cache_dtype = "auto"
+
+    # The packed INT8 record covers the target pool only; a draft inheriting
+    # --kv-cache-dtype int8 keeps an unquantized cache.
+    if is_draft_worker and kv_cache_dtype == torch.int8:
+        logger.info(
+            "Speculative draft: overriding KV cache dtype %s -> %s "
+            "(the INT8 KV cache is supported for the target pool only).",
+            kv_cache_dtype,
+            model_dtype,
+        )
+        kv_cache_dtype = model_dtype
         resolved_kv_cache_dtype = "auto"
 
     return resolved_kv_cache_dtype, kv_cache_dtype

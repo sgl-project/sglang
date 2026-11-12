@@ -1,9 +1,9 @@
 ---
 title: "Quantized KV Cache"
 metatags:
-    description: "SGLang quantized KV cache: FP8 E4M3/E5M2 and FP4 E2M1 formats, memory savings up to 3.56x, scaling factors, accuracy benchmarks."
+    description: "SGLang quantized KV cache: FP8 E4M3/E5M2, FP4 E2M1 and Ascend INT8 formats, memory savings up to 3.56x, scaling factors, accuracy benchmarks."
 ---
-Quantized KV cache reduces the memory footprint of key-value cache storage by using lower-precision data types (FP8 or FP4) instead of the default model precision in BF16. During autoregressive generation, LLMs cache previously computed key-value pairs to avoid redundant calculations. The KV cache typically consumes a significant portion of GPU memory, especially for long sequences.
+Quantized KV cache reduces the memory footprint of key-value cache storage by using lower-precision data types (FP8, FP4 or INT8) instead of the default model precision in BF16. During autoregressive generation, LLMs cache previously computed key-value pairs to avoid redundant calculations. The KV cache typically consumes a significant portion of GPU memory, especially for long sequences.
 
 Quantized KV cache is a memory optimization technique that primarily benefits throughput by allowing more tokens to be cached, but may introduce minimal accuracy degradation depending on the quantization format used.
 
@@ -35,6 +35,23 @@ FP4 quantization is currently experimental.
 - **`nvfp4`**: NVIDIA FP4 with 16-value blocks, E4M3 block scales, and a per-tensor global scale.
 - **`fp4_mx_block16`**: An E2M1 block-size-16 compatibility recipe. It is distinct from the standard OCP MXFP4 block-size-32 format.
 
+### INT8 Format (Ascend NPU)
+
+`int8` is an Ascend recipe for DSA (sparse MLA) models such as GLM-5.2 on
+NPUs without an FP8 KV cache, such as Ascend 910B (A2). Each
+token's MLA KV is stored as one packed record (INT8 latent, BF16 rope,
+per-128-element FP32 scales; 656 bytes per layer for a 512-rank latent instead
+of 1152 in BF16), which the NPU sparse attention kernel reads back directly.
+Only the main KV is quantized: the DSA indexer K cache stays BF16. A
+speculative draft model keeps an unquantized KV cache.
+
+`--kv-cache-dtype int8` is rejected at startup on other platforms, for non-DSA
+models, on arch35 NPUs (use `fp8_e4m3` there), and together with
+`SGLANG_NPU_USE_MLAPO`, `SGLANG_USE_FIA_NZ`, sparse KV offload, the combined
+MLA KV buffer (`SGLANG_NPU_USE_FLASH_MLA`), attention context parallelism
+(`--attn-cp-size` or `--dcp-size` above 1), HiCache, and the decode host KV
+pool.
+
 ## Usage
 
 ### Enabling Quantized KV Cache
@@ -61,6 +78,11 @@ python3 -m sglang.launch_server \
 python3 -m sglang.launch_server \
     --model-path deepseek-ai/DeepSeek-R1-0528 \
     --kv-cache-dtype fp4_mx_block16 \
+
+# Enable INT8 KV cache for a DSA model on an Ascend A2 NPU
+python3 -m sglang.launch_server \
+    --model-path zai-org/GLM-5.2 \
+    --kv-cache-dtype int8 \
 ```
 
 ### SM100 native NVFP4 recipes
