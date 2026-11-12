@@ -116,6 +116,39 @@ def get_remote_instance_transfer_engine_info_per_rank(seed_url: str, rank: int):
 
 
 def register_memory_region(model, transfer_engine):
+    from sglang.srt.utils.device import is_xpu
+
+    # Merging blocks reads torch.cuda's caching-allocator snapshot, which XPU
+    # lacks; there each weight is registered on its own.
+    if is_xpu():
+        return _register_each_weight(model, transfer_engine)
+    return _register_merged_weight_blocks(model, transfer_engine)
+
+
+def _register_each_weight(model, transfer_engine):
+    start_tic = time.time()
+
+    weight_mr_dict = {}
+    for name, weight in model.named_parameters():
+        ret = transfer_engine.register_memory(
+            weight.data_ptr(), weight.numel() * weight.element_size()
+        )
+        if ret != 0:
+            raise RuntimeError(
+                f"register memory failed for weight {name}, error: {ret}"
+            )
+        weight_mr_dict[name] = (
+            weight.data_ptr(),
+            weight.numel(),
+            weight.element_size(),
+        )
+
+    end_tic = time.time()
+    logger.debug(f"Register memory region time: {(end_tic - start_tic):.4f}s")
+    return weight_mr_dict
+
+
+def _register_merged_weight_blocks(model, transfer_engine):
     start_tic = time.time()
 
     weight_mr_dict = {}

@@ -104,3 +104,9 @@ python -m sglang.launch_server [args] \
 ```
 
 All SGLang instances use the same command shape. If no ready source exists, the instance loads weights natively and publishes metadata to ModelExpress. If a compatible source exists, it loads weights through ModelExpress P2P transfer. Set <code>"transport": "transfer_engine"</code> to use Mooncake TransferEngine instead of the default NIXL transport.
+
+### Intel XPU
+
+The `nccl` and `transfer_engine` backends run on Intel XPU (`--device xpu`) on the
+seed and the client. See
+[R-Fork on Intel XPU](/docs/hardware-platforms/xpu#r-fork-remote-instance-weight-loading-on-intel-xpu-experimental).
