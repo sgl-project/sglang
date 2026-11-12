@@ -182,14 +182,18 @@ V3.2 configuration splits them like this:
 | `--chunked-prefill-size` / `--max-prefill-tokens` / `--max-running-requests` | `-1` / `68000` / `1` | — / — / `32` | [Prefill Tuning](#prefill-tuning) |
 | `--disable-radix-cache` | on (random-input benchmark traffic) | on (PD decode forces it off) | [Prefill Tuning](#prefill-tuning) |
 
-Four spellings in the published scripts predate the flags shown here: the prefill script passes `--cp-strategy
-zigzag`, which current builds reject for DeepSeek V3.2 — startup requires `interleave`; it also passes the deprecated
-`--disable-cuda-graph` (prefill graphs are already off by default) and sets the deprecated
-`DEEP_NORMAL_MODE_USE_INT8_QUANT=1` instead of `--deepep-dispatcher-output-dtype int8`; and the decode
-script writes the deprecated `--enable-dp-attention --dp-size 8`. The decode script also carries
-`--chunked-prefill-size -1` and `--max-prefill-tokens 68000`, which have no effect in that role because the decode
-role never runs prefill forwards; a `—` entry above means
-the knob is not needed on that role, not that the script omits every such flag.
+Four spellings in the published scripts predate the flags shown here:
+
+- The prefill script passes `--cp-strategy zigzag`, which current builds reject for DeepSeek V3.2 — startup requires
+  `interleave`
+- The prefill script passes the deprecated `--disable-cuda-graph` (prefill graphs are already off by default)
+- The prefill script sets the deprecated `DEEP_NORMAL_MODE_USE_INT8_QUANT=1` instead of
+  `--deepep-dispatcher-output-dtype int8`
+- The decode script writes the deprecated `--enable-dp-attention --dp-size 8`
+
+The decode script also carries `--chunked-prefill-size -1` and `--max-prefill-tokens 68000`, which have no effect in
+that role because the decode role never runs prefill forwards; a `—` entry above means the knob is not needed on that
+role, not that the script omits every such flag.
 
 The roles differ because their workloads differ: prefill is throughput-bound on large token counts (bulk dispatch
 buffers, un-chunked batches, no graphs worth capturing), while decode is latency-bound (small graph-captured batches,
