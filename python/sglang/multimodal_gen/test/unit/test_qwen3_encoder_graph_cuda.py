@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Qwen3 text encoder CUDA graph replay; no checkpoint needed."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -18,6 +20,9 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
 )
 from sglang.multimodal_gen.runtime.loader.utils import set_default_torch_dtype
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
+from sglang.multimodal_gen.runtime.managers.memory_managers.memory_occupation_controller import (
+    MemoryOccupationController,
+)
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import (
     ServerArgs,
@@ -133,13 +138,17 @@ def test_replaced_weights_drop_the_graph(encoder, monkeypatch):
 
     layer = encoder.layers[0].mlp.down_proj
     layer.weight = torch.nn.Parameter(layer.weight.clone() + 0.01)
-    got = _encode(encoder, *request)
+    got = [_encode(encoder, *request)]
     assert not graphs.graphs
+    # the old graphs freed their pool, so the recapture needs a new one
+    got.append(_encode(encoder, *request))
+    assert graphs.graphs
     with monkeypatch.context() as eager_only:
         eager_only.setattr(encoder, "_cuda_graphs", None, raising=False)
         want = _encode(encoder, *request)
-    for a, b in zip(got, want):
-        assert torch.equal(a, b)
+    for have in got:
+        for a, b in zip(have, want):
+            assert torch.equal(a, b)
 
 
 @torch.inference_mode()
@@ -153,3 +162,59 @@ def test_module_hooks_keep_the_encoder_eager(encoder):
     finally:
         handle.remove()
     assert len(calls) == 3
+
+
+def _storage_bytes(tensors):
+    storages = {t.untyped_storage().data_ptr(): t.untyped_storage() for t in tensors}
+    return sum(storage.nbytes() for storage in storages.values())
+
+
+def _captured_bytes(graphs):
+    tensors = []
+    for _, static_ids, output in graphs.graphs.values():
+        tensors += [static_ids, output.last_hidden_state, *output.hidden_states]
+    return _storage_bytes([t for t in tensors if t is not None])
+
+
+@pytest.mark.parametrize("offloaded_between_uses", [False, True])
+@torch.inference_mode()
+def test_release_memory_occupation_frees_the_graphs(
+    encoder, monkeypatch, offloaded_between_uses
+):
+    request = _request(19, 300)
+    for _ in range(2):
+        _encode(encoder, *request)
+    assert encoder._cuda_graphs.graphs
+    if offloaded_between_uses:
+        # component CPU offload moves the encoder off the GPU after each use
+        encoder.to("cpu")
+
+    torch.cuda.synchronize()
+    allocated = torch.cuda.memory_allocated()
+    weight_bytes = _storage_bytes(
+        [t for t in [*encoder.parameters(), *encoder.buffers()] if t.is_cuda]
+    )
+    captured_bytes = _captured_bytes(encoder._cuda_graphs)
+    controller = MemoryOccupationController(
+        SimpleNamespace(modules={"text_encoder": encoder}),
+        rank=0,
+        use_fsdp_inference=False,
+    )
+    assert controller.release_memory_occupation()["success"]
+    try:
+        assert not encoder._cuda_graphs.graphs
+        assert (
+            torch.cuda.memory_allocated() <= allocated - weight_bytes - captured_bytes
+        )
+    finally:
+        assert controller.resume_memory_occupation()["success"]
+        encoder.cuda()
+
+    got = [_encode(encoder, *request) for _ in range(2)]
+    assert encoder._cuda_graphs.graphs
+    with monkeypatch.context() as eager_only:
+        eager_only.setattr(encoder, "_cuda_graphs", None, raising=False)
+        want = _encode(encoder, *request)
+    for have in got:
+        for a, b in zip(have, want):
+            assert torch.equal(a, b)

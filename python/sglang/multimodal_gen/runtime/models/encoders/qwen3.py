@@ -433,8 +433,8 @@ class EncoderGraphs:
     runs eagerly between segments and reads each request's valid lengths, so
     prompts padded to one length (FLUX.2-klein, Z-Image) share one graph. The
     replayed kernels are the eager ones, so the output is bit-identical. A shape
-    is captured on its second request; moved or replaced weights drop every
-    graph. A replay overwrites the previous output, so callers copy what they
+    is captured on its second request; moved or replaced weights, and
+    /release_memory_occupation, drop every graph. A replay overwrites the previous output, so callers copy what they
     keep (the Qwen3 text postprocessors all build new tensors).
     """
 
@@ -473,8 +473,7 @@ class EncoderGraphs:
         # graphs read weights by address; offload, reload or replacement moves them
         weights = tuple(t.data_ptr() for t in tensors)
         if weights != self.weights:
-            self.graphs.clear()
-            self.seen.clear()
+            self.clear()
             self.weights = weights
         key = (*input_ids.shape, output_hidden_states)
         entry = self.graphs.get(key)
@@ -500,6 +499,12 @@ class EncoderGraphs:
         self.lengths.value = attention_lengths
         graph.replay()
         return output
+
+    def clear(self):
+        self.graphs.clear()
+        self.seen.clear()
+        self.weights = None
+        self.pool = None
 
     def _capture(self, model, input_ids, attention_lengths, output_hidden_states):
         static_ids = input_ids.clone()
@@ -578,6 +583,9 @@ class Qwen3ForCausalLM(TextEncoder):
         # Final layer norm
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self._cuda_graphs = EncoderGraphs()
+
+    def release_cuda_graphs(self) -> None:
+        self._cuda_graphs.clear()
 
     def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
