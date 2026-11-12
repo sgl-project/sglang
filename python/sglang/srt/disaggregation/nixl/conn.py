@@ -2068,6 +2068,13 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     # Drain posted writes before the retry reuses this worker's
                     # packing buffers; the re-enqueued chunk stays counted.
                     continue
+                if (
+                    self._staging_outstanding.get(room, 0) == 1
+                    and self.check_status(room) == KVPoll.Success
+                ):
+                    # A chunk deferred past the last one: the transfer ends at
+                    # its drain. Stamp before the decrement releases Success.
+                    self.record_success_time(room)
                 # Clear with the decrement: the failure path below reads this
                 # flag, so a raise after this point must not uncount twice.
                 self.note_send_finished(room, kv_chunk.send_record)

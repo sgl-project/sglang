@@ -2403,11 +2403,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 [to_host(indices) for indices in payload] for payload in state_indices
             ]
             # Fence both the D2H and the prior forward before exposing reused pages.
+            device_module = self.scheduler.device_module
             if self.scheduler.enable_overlap:
-                forward_done = self.scheduler.device_module.Event()
+                forward_done = device_module.Event()
                 forward_done.record(stream=self.scheduler.forward_stream)
-                torch.cuda.current_stream().wait_event(forward_done)
-            readback_ready = torch.cuda.Event()
+                device_module.current_stream().wait_event(forward_done)
+            readback_ready = device_module.Event()
             readback_ready.record()
         else:
             page_indices = self._transfer_page_indices(

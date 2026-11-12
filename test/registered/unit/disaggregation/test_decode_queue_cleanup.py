@@ -666,7 +666,10 @@ class TestDeferredDestinationPublish(CustomTestCase):
             queue.scheduler.enable_overlap = True
             forward_done, readback_done = MagicMock(), MagicMock()
             forward_done.query.return_value = readback_done.query.return_value = False
-            queue.scheduler.device_module = SimpleNamespace(Event=lambda: forward_done)
+            events = iter((forward_done, readback_done))
+            queue.scheduler.device_module = SimpleNamespace(
+                Event=lambda: next(events), current_stream=MagicMock()
+            )
             queue.scheduler.forward_stream = object()
             queue.transfer_queue.enable_staging = staging
             queue.transfer_queue.staging_handler = MagicMock()
@@ -696,16 +699,16 @@ class TestDeferredDestinationPublish(CustomTestCase):
                     return_value=True,
                 ),
                 patch(
-                    "sglang.srt.disaggregation.decode.torch.cuda.Event",
-                    return_value=readback_done,
-                ),
-                patch(
                     "sglang.srt.disaggregation.decode.torch.empty",
                     side_effect=pinned_empty,
                 ),
                 patch.object(torch.Tensor, "copy_", copy),
             ):
                 queue.move_preallocated(queue.transfer_queue.queue)
+            if master and staging:
+                # The readback is fenced after the in-flight forward.
+                wait_event = queue.scheduler.device_module.current_stream()
+                wait_event.wait_event.assert_called_once_with(forward_done)
             transfer = DecodeTransferQueue.__new__(DecodeTransferQueue)
             transfer.queue = queue.transfer_queue.queue
             transfer.gloo_group = object()

@@ -327,6 +327,9 @@ class CommonKVManager(BaseKVManager):
     # Sender reports transfer_latency_s (first enqueue -> Success). Otherwise
     # the metric keeps its last-chunk fallback, so dashboards do not move.
     reports_transfer_latency: bool = False
+    # Room -> perf_counter() when its transfer finished (Success with no staging
+    # chunk outstanding), set by the transfer worker.
+    _success_times: Optional[Dict[int, float]] = None
 
     kv_layout: Optional[str] = None
     dsv41_spec_layout: Optional[dict] = None
@@ -799,6 +802,7 @@ class CommonKVManager(BaseKVManager):
                 self._deferred_ack_poisoned_rooms.discard(bootstrap_room)
                 self._staging_outstanding.pop(bootstrap_room, None)
                 self._forget_sends(bootstrap_room)
+                self.pop_success_time(bootstrap_room)
                 self.request_status[bootstrap_room] = status
             return
         if status == KVPoll.Failed:
@@ -812,7 +816,29 @@ class CommonKVManager(BaseKVManager):
             # Failed is terminal. It also sorts lowest, so the max() below would
             # happily promote it back to Transferring or Success.
             return
-        self.request_status[bootstrap_room] = max(current, status)
+        new_status = max(current, status)
+        # Stamp before publishing Success, so a poll cannot conclude and clear
+        # the room first. A chunk still staging stamps when it drains instead.
+        if (
+            self.reports_transfer_latency
+            and new_status == KVPoll.Success
+            and self._staging_outstanding.get(bootstrap_room, 0) <= 0
+        ):
+            self.record_success_time(bootstrap_room)
+        self.request_status[bootstrap_room] = new_status
+
+    def record_success_time(self, bootstrap_room: int) -> None:
+        """Stamp the room's transfer end; the first stamp wins."""
+        if not self.reports_transfer_latency:
+            return
+        # __dict__.setdefault is atomic, so concurrent workers share one table.
+        times = self.__dict__.setdefault("_success_times", {})
+        times.setdefault(bootstrap_room, time.perf_counter())
+
+    def pop_success_time(self, bootstrap_room: int) -> Optional[float]:
+        if self._success_times is None:
+            return None
+        return self._success_times.pop(bootstrap_room, None)
 
     def send_record(self, bootstrap_room: int) -> SendRecord:
         """The room's send record, created by its first send (scheduler
@@ -2588,8 +2614,12 @@ class CommonKVSender(BaseKVSender):
                 and self.kv_mgr.reports_transfer_latency
                 and self._transfer_start_time is not None
             ):
+                success_time = self.kv_mgr.pop_success_time(self.bootstrap_room)
+                end_time = (
+                    success_time if success_time is not None else time.perf_counter()
+                )
                 self._transfer_metric.transfer_latency_s = (
-                    time.perf_counter() - self._transfer_start_time
+                    end_time - self._transfer_start_time
                 )
             self.trace_ctx.trace_req_finish()
         return status
@@ -2635,6 +2665,7 @@ class CommonKVSender(BaseKVSender):
             if status in (KVPoll.Success, KVPoll.Failed):
                 self.conclude_state = status
         self.kv_mgr.request_status.pop(self.bootstrap_room, None)
+        self.kv_mgr.pop_success_time(self.bootstrap_room)
         self._retire_sends()
         self.kv_mgr.req_to_decode_prefix_len.pop(self.bootstrap_room, None)
         self.kv_mgr.transfer_infos.pop(self.bootstrap_room, None)
@@ -3158,6 +3189,7 @@ class CommonKVReceiver(BaseKVReceiver):
                 status if status in (KVPoll.Success, KVPoll.Failed) else KVPoll.Failed
             )
         self.kv_mgr.request_status.pop(self.bootstrap_room, None)
+        self.kv_mgr.pop_success_time(self.bootstrap_room)
         self.kv_mgr.required_prefill_response_num_table.pop(self.bootstrap_room, None)
         self.kv_mgr.prefill_response_tracker.pop(self.bootstrap_room, None)
         self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].discard(
