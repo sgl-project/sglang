@@ -2,14 +2,17 @@
 """Exercise the real head's transfer protocol with lightweight worker peers."""
 
 import base64
+import errno
 import json
 import pickle
+import socket as tcp_socket
 import time
 
 import pytest
 import torch
 import zmq
 
+from sglang.multimodal_gen.runtime.disaggregation import orchestrator
 from sglang.multimodal_gen.runtime.disaggregation.orchestrator import DiffusionServer
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.disaggregation.transport.codec import (
@@ -39,9 +42,12 @@ from sglang.multimodal_gen.runtime.pipelines_core import Req
         "unidentified",
         "role_error",
         "audio",
+        "startup_port",
     ],
 )
-def test_pipeline_transfer_and_slot_reuse(tmp_path, split, preallocated, fault):
+def test_pipeline_transfer_and_slot_reuse(
+    tmp_path, monkeypatch, split, preallocated, fault
+):
     """Every hop reaches its owner; repeated requests and errors return capacity."""
     context = zmq.Context()
     sockets = []
@@ -86,6 +92,27 @@ def test_pipeline_transfer_and_slot_reuse(tmp_path, split, preallocated, fault):
         prompt_encoder_result_endpoint=results[3],
         image_encoder_result_endpoint=results[4],
     )
+    competing_connections = []
+    if fault == "startup_port":
+        original_get_socket = orchestrator.get_zmq_socket
+
+        def connect_with_competing_source_port(*args, **kwargs):
+            if not kwargs["bind"] and not competing_connections:
+                connection = tcp_socket.socket()
+                try:
+                    connection.bind(("127.0.0.1", int(results[2].rsplit(":", 1)[1])))
+                except OSError as error:
+                    connection.close()
+                    if error.errno != errno.EADDRINUSE:
+                        raise
+                else:
+                    connection.connect(("127.0.0.1", int(args[2].rsplit(":", 1)[1])))
+                    competing_connections.append(connection)
+            return original_get_socket(*args, **kwargs)
+
+        monkeypatch.setattr(
+            orchestrator, "get_zmq_socket", connect_with_competing_source_port
+        )
     try:
         server.start()
         assert server.wait_ready(5)
@@ -293,6 +320,8 @@ def test_pipeline_transfer_and_slot_reuse(tmp_path, split, preallocated, fault):
                 )
     finally:
         server.stop()
+        for connection in competing_connections:
+            connection.close()
         for sock in sockets:
             sock.close(linger=0)
         context.destroy(linger=0)
