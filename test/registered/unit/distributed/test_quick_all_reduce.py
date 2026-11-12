@@ -136,6 +136,28 @@ class TestQuickAllReduceFlyDSLInt4(CustomTestCase):
         ]
         self.assertEqual(len(activation), 2)
 
+    def test_flydsl_class_without_compile_falls_back_to_hip(self):
+        """A newer aiter's QuickAllReduceInt4 (preload(), no compile()) is not built."""
+
+        class _PreloadOnly:
+            def __init__(self, **kwargs):
+                raise AssertionError("must not be constructed")
+
+            def preload(self, *, payload_range=None):
+                pass
+
+        fake_module = types.ModuleType("aiter.ops.flydsl")
+        fake_module.QuickAllReduceInt4 = _PreloadOnly
+        print_warning_once.cache_clear()
+        quick_reduce = _make_uninitialized_quick_reduce()
+        with (
+            patch.dict(sys.modules, {"aiter.ops.flydsl": fake_module}),
+            self.assertLogs(level="WARNING") as logs,
+        ):
+            self.assertFalse(quick_reduce._init_flydsl_int4(2048 * MB))
+        self.assertIsNone(quick_reduce._flydsl_int4)
+        self.assertIn("has no compile()", "\n".join(logs.output))
+
     def test_close_releases_flydsl_int4(self):
         fake = _FakeFlyDSLInt4()
         quick_reduce = _make_flydsl_quick_reduce(fake)

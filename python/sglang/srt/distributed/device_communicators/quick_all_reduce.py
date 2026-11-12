@@ -233,6 +233,14 @@ class QuickAllReduce:
                 f"QuickAllReduceInt4 ({e}); QuickReduce INT4 uses the HIP kernel."
             )
             return False
+        # Since ROCm/aiter#5555 this name is the multi-codec FlyQuickAllReduce,
+        # which has preload() instead of compile().
+        if not hasattr(QuickAllReduceInt4, "compile"):
+            print_warning_once(
+                "SGLANG_USE_AITER_FLYDSL_QUICK_REDUCE is set, but aiter's FlyDSL "
+                "QuickAllReduceInt4 has no compile(); QuickReduce INT4 uses the HIP kernel."
+            )
+            return False
 
         self._flydsl_int4 = QuickAllReduceInt4(
             group=self.group,
