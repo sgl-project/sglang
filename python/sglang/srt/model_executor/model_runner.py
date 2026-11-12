@@ -1,4 +1,5 @@
 # Copyright 2023-2024 SGLang Team
+# SPDX-FileCopyrightText: Copyright 2026 Arm Limited and/or its affiliates <open-source-office@arm.com>
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -1515,11 +1516,22 @@ class ModelRunner:
         maybe_precompile_model_kernels_after_loading(self.model, self.device)
 
     def _uses_cpu_graph_attention_backend(self) -> bool:
-        return (
-            self.device == "cpu"
-            and self.prefill_attention_backend_str == "intel_amx"
+        if self.device != "cpu":
+            return False
+
+        if (
+            self.prefill_attention_backend_str == "intel_amx"
             and self.decode_attention_backend_str == "intel_amx"
-        )
+        ):
+            return True
+
+        if (
+            self.prefill_attention_backend_str == "arm"
+            and self.decode_attention_backend_str == "arm"
+        ):
+            return True
+
+        return False
 
     def maybe_init_dwdp(self):
         if self.is_draft_worker:

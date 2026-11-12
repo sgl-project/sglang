@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright 2026 Arm Limited and/or its affiliates <open-source-office@arm.com>
+
 import logging
 import warnings
 from typing import TYPE_CHECKING
@@ -375,6 +378,13 @@ def create_intel_amx_backend(runner):
     from sglang.srt.layers.attention.intel_amx_backend import IntelAMXAttnBackend
 
     return IntelAMXAttnBackend(runner)
+
+
+@register_attention_backend("arm")
+def create_arm_backend(runner):
+    from sglang.srt.layers.attention.arm_backend import ArmAttentionBackend
+
+    return ArmAttentionBackend(runner)
 
 
 def attn_backend_wrapper_for_draft_extend(
