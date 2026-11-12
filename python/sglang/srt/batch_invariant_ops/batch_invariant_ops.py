@@ -527,11 +527,13 @@ def matmul_persistent(
         and ENABLE_JIT_DEEPGEMM
         and (a.dtype == torch.bfloat16)
         and (b.dtype == torch.bfloat16)
-        and a.is_contiguous()
         and b.transpose(0, 1).is_contiguous()
         and N >= MIN_DEEPGEMM_DIM
         and deepgemm_tma_aligned
     ):
+        # Copy rather than gate on a.is_contiguous(): that check ignores size-1 dims,
+        # so the chosen kernel (and its bias rounding) would depend on the batch size.
+        a = a.contiguous()
         if _ENABLE_MM_COMPARISON_TEST:
             out_triton = _matmul_persistent_triton(
                 a=a, b=b, bias=bias, out_dtype=out_dtype
