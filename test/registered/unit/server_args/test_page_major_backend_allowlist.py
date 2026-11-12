@@ -284,6 +284,28 @@ class TestPageMajorBackendAllowlist(unittest.TestCase):
                         )
                     )
 
+    def test_aiter_fp8_mha_and_swa_pages(self):
+        # Both CLI FP8 spellings resolve to the native E4M3 dtype on HIP.
+        with envs.SGLANG_ENABLE_AITER_UNIFIED_MEMORY.override(True):
+            for kv_cache_dtype in ("fp8_e4m3", "fp8_e5m2"):
+                for is_hybrid_swa in (False, True):
+                    for page_size in (1, 16, 64):
+                        with self.subTest(
+                            dtype=kv_cache_dtype,
+                            swa=is_hybrid_swa,
+                            page_size=page_size,
+                        ):
+                            self.assertTrue(
+                                _accepts(
+                                    "aiter",
+                                    use_mla=False,
+                                    dtype="bfloat16",
+                                    kv_cache_dtype=kv_cache_dtype,
+                                    is_hybrid_swa=is_hybrid_swa,
+                                    page_size=page_size,
+                                )
+                            )
+
     def test_aiter_bf16_hicache_pages(self):
         with envs.SGLANG_ENABLE_AITER_UNIFIED_MEMORY.override(True):
             for page_size in (1, 16):
@@ -330,17 +352,27 @@ class TestPageMajorBackendAllowlist(unittest.TestCase):
             {"has_asymmetric_kv": True},
             {"unified": False},
             {"dtype": "float16"},
-            {"kv_cache_dtype": "fp8_e4m3"},
+            {"kv_cache_dtype": "mxfp8"},
+            {"kv_cache_dtype": "nvfp4"},
             {"speculative_algorithm": "EAGLE"},
-            {"dcp_size": 2},
-            {"attn_cp_size": 2},
-            {"enable_prefill_cp": True},
-            {"enable_deterministic_inference": True},
         ]
         with envs.SGLANG_ENABLE_AITER_UNIFIED_MEMORY.override(True):
             for case in cases:
                 with self.subTest(case=case):
                     self.assertFalse(_accepts("aiter", **{"use_mla": False, **case}))
+
+    def test_aiter_defers_parallelism_and_determinism_to_existing_validation(self):
+        # This handler admits the reader; shared configuration and the existing
+        # AITER backend retain their parallelism/determinism restrictions.
+        with envs.SGLANG_ENABLE_AITER_UNIFIED_MEMORY.override(True):
+            for case in (
+                {"dcp_size": 2},
+                {"attn_cp_size": 2},
+                {"enable_prefill_cp": True},
+                {"enable_deterministic_inference": True},
+            ):
+                with self.subTest(case=case):
+                    self.assertTrue(_accepts("aiter", use_mla=False, **case))
 
     def test_helion_linear_attention_is_kda_only(self):
         for phase in ("decode", "prefill"):

@@ -1,5 +1,6 @@
-"""AITER reads real BF16 full/window arenas across compaction and graph replay."""
+"""AITER reads BF16/FP8 full/window arenas across compaction and graph replay."""
 
+import json
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -26,6 +27,7 @@ class TestAiterUnifiedMemory(CustomTestCase):
     page_size = 1
     window = None
     query_heads = _HEADS
+    fp8 = False
 
     def setUp(self):
         super().setUp()
@@ -35,6 +37,7 @@ class TestAiterUnifiedMemory(CustomTestCase):
         from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
         from sglang.srt.runtime_context import get_parallel, publish, reset_context
         from sglang.srt.server_args import ServerArgs
+        from sglang.srt.utils import is_gfx95_supported
         from sglang.test.unified_allocator_fixtures import (
             UnifiedGeometry,
             build_unified_bundle,
@@ -50,6 +53,12 @@ class TestAiterUnifiedMemory(CustomTestCase):
         publish(args, role="test")
         self.enterContext(get_parallel().override(attn_dcp_size=1, dcp_enabled=False))
         torch.manual_seed(123)
+        if self.fp8:
+            from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
+
+            self.cache_dtype = fp8_dtype
+        else:
+            self.cache_dtype = _DTYPE
         context_len = 256 if self.window else 128
         self.bundle = build_unified_bundle(
             UnifiedGeometry(
@@ -61,11 +70,11 @@ class TestAiterUnifiedMemory(CustomTestCase):
                 head_dim=_DIM,
                 swa_head_num=_KV_HEADS,
                 swa_head_dim=_DIM,
-                kv_cache_dtype=_DTYPE,
+                kv_cache_dtype=self.cache_dtype,
                 page_size=self.page_size,
                 window=self.window or 32,
                 # Per-layer logical bytes fit int32; interleaved arena spans do not.
-                full_tokens=2048 if self.window else 300_000,
+                full_tokens=2048 if self.window else (600_000 if self.fp8 else 300_000),
                 swa_tokens=2048,
                 state_slots=64,
                 context_len=context_len,
@@ -102,7 +111,7 @@ class TestAiterUnifiedMemory(CustomTestCase):
             model_config=config,
             server_args=args,
             dtype=_DTYPE,
-            kv_cache_dtype=_DTYPE,
+            kv_cache_dtype=self.cache_dtype,
             device="cuda",
             sliding_window_size=self.window,
             is_draft_worker=False,
@@ -115,6 +124,7 @@ class TestAiterUnifiedMemory(CustomTestCase):
         self.enterContext(envs.SGLANG_USE_AITER_UNIFIED_ATTN.override(False))
         self.backend = AiterAttnBackend(self.runner)
         self.assertTrue(self.backend.use_triton_unified_attention)
+        self.fp8_full_prefill_q = self.fp8 and is_gfx95_supported()
         self.layers = [
             RadixAttention(
                 self.query_heads,
@@ -126,6 +136,13 @@ class TestAiterUnifiedMemory(CustomTestCase):
             )
             for i, layer_id in enumerate(_LAYERS)
         ]
+        if self.fp8:
+            self.backend.q_scale = torch.tensor([0.25], device="cuda")
+            for layer, (k_scale, v_scale) in zip(
+                self.layers, ((0.25, 0.5), (0.5, 0.125))
+            ):
+                layer.k_scale = torch.tensor(k_scale, device="cuda")
+                layer.v_scale = torch.tensor(v_scale, device="cuda")
         lengths = (37, 31, 131, 85) if self.window else (37, 31, 67, 53)
         self.groups = [
             self.alloc.alloc(-(-n // self.page_size) * self.page_size) for n in lengths
@@ -172,7 +189,7 @@ class TestAiterUnifiedMemory(CustomTestCase):
 
     def _assert_high_physical_offsets(self):
         # FULL grows down: low virtual ids already map to the arena's high end.
-        physical = self.alloc.full_v2p_page_table[torch.cat(self.live)]
+        physical = self._physical(torch.cat(self.live), 0)
         first = int(physical.min().item())
         for layer_id in _LAYERS:
             for cache in self.pool.layer_router.read(layer_id).kv():
@@ -206,10 +223,57 @@ class TestAiterUnifiedMemory(CustomTestCase):
         self.ids.bind_own_plan(fb)
         return fb
 
-    def _reference(self, q, layer_index, lengths, query_lengths):
+    def _encoded_kv(self, values, layer_index, *, key=False):
+        if not self.fp8:
+            return values
+        layer = self.layers[layer_index]
+        scale = layer.k_scale if key else layer.v_scale
+        # The shared writer scales BF16 inputs before storing their FP8 values.
+        # Reconstruct that representation independently of the physical cache.
+        return (values.float() / scale).to(_DTYPE).to(self.cache_dtype)
+
+    def _cache_rows(self, cache, physical):
+        if self.fp8:
+            # Advanced indexing is not implemented for every ROCm FP8 dtype.
+            return cache.view(torch.uint8)[physical].view(self.cache_dtype)
+        return cache[physical]
+
+    def _check_stored_values(self, cache, physical, expected, layer_index):
+        actual = self._cache_rows(cache, physical)
+        expected = self._encoded_kv(expected, layer_index)
+        if self.fp8:
+            actual, expected = actual.view(torch.uint8), expected.view(torch.uint8)
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    def _decode(self, q, k, v, layer, fb, write=True):
+        # The shared quantized store scales its input in place. A real graph's
+        # QKV producer refreshes them on every replay; cloning inside this graph
+        # gives the attention-only fixture the same property.
+        if self.fp8 and write:
+            k, v = k.clone(), v.clone()
+        return self.backend.forward_decode(q, k, v, layer, fb, write)
+
+    def _encoded_q(self, q):
+        limit = torch.finfo(self.cache_dtype).max
+        return (
+            (q.float() / self.backend.q_scale).clamp(-limit, limit).to(self.cache_dtype)
+        )
+
+    def _reference(
+        self, q, layer_index, lengths, query_lengths, *, decode, output_dtype=_DTYPE
+    ):
         q = q.view(-1, self.query_heads, _DIM)
+        # On gfx950 these HD256 full layers use FP8-query ASM for both cold
+        # and cached prefill. Window prefill uses BF16 Q; decode quantizes Q.
+        fp8_prefill = self.fp8_full_prefill_q and not (self.window and layer_index == 1)
+        if self.fp8 and (decode or fp8_prefill):
+            q = self._encoded_q(q).float() * self.backend.q_scale
         outputs, offset = [], 0
         for (k, v), n, qn in zip(self.logical[layer_index], lengths, query_lengths):
+            if self.fp8:
+                layer = self.layers[layer_index]
+                k = self._encoded_kv(k, layer_index, key=True).float() * layer.k_scale
+                v = self._encoded_kv(v, layer_index).float() * layer.v_scale
             keys = k[:n].float().repeat_interleave(self.query_heads // _KV_HEADS, dim=1)
             values = (
                 v[:n].float().repeat_interleave(self.query_heads // _KV_HEADS, dim=1)
@@ -226,13 +290,163 @@ class TestAiterUnifiedMemory(CustomTestCase):
             scores.masked_fill_(~allowed, float("-inf"))
             outputs.append(torch.einsum("hqk,khd->qhd", scores.softmax(-1), values))
             offset += qn
-        return torch.cat(outputs).to(_DTYPE).flatten(1)
+        return torch.cat(outputs).to(output_dtype).flatten(1)
 
-    def _check(self, actual, q, layer_index, lengths, query_lengths):
+    def _packed_fp8_prefill_reference(self, q, layer_index, lengths, query_lengths):
+        from aiter import flash_attn_varlen_fp8_pertensor_func
+
+        # Feed the same native primitive independent logical tensors. Neither
+        # the arena, its page tables nor its gathered rows enter this oracle.
+        layer = self.layers[layer_index]
+        k, v = [
+            torch.cat(
+                [
+                    self._encoded_kv(pair[j][:n], layer_index, key=j == 0)
+                    for pair, n in zip(self.logical[layer_index], lengths)
+                ]
+            )
+            for j in (0, 1)
+        ]
+        cu_q = torch.tensor(
+            [0, *query_lengths], dtype=torch.int32, device="cuda"
+        ).cumsum(0, dtype=torch.int32)
+        cu_k = torch.tensor([0, *lengths], dtype=torch.int32, device="cuda").cumsum(
+            0, dtype=torch.int32
+        )
+        return (
+            flash_attn_varlen_fp8_pertensor_func(
+                self._encoded_q(q.view(-1, self.query_heads, _DIM)),
+                k,
+                v,
+                self.backend.q_scale.reshape(1),
+                layer.k_scale.reshape(1),
+                layer.v_scale.reshape(1),
+                cu_q,
+                cu_k,
+                max(query_lengths),
+                max(lengths),
+                softmax_scale=_DIM**-0.5,
+                causal=True,
+            )
+            .to(_DTYPE)
+            .flatten(1)
+        )
+
+    def _packed_fp8_decode_reference(self, q, layer_index, lengths):
+        from aiter.ops.triton.attention.unified_attention import unified_attention
+
+        layer = self.layers[layer_index]
+        window = self.window if layer_index == 1 else 0
+        metadata = self.backend.forward_metadata
+        arena_table = metadata.swa_page_table if window else metadata.kv_indices
+        # Preserve dispatch shapes, including graph padding, but construct the
+        # reference page IDs and contents solely from independent logical K/V.
+        batch_size, table_width = q.shape[0], arena_table.shape[1]
+        pages = [-(-n // self.page_size) for n in lengths]
+        shape = (1 + sum(pages), self.page_size, _KV_HEADS, _DIM)
+        k = torch.zeros(shape, dtype=self.cache_dtype, device="cuda")
+        v = torch.zeros_like(k)
+        table = torch.zeros((batch_size, table_width), dtype=torch.int32, device="cuda")
+        page_offset = 1  # Keep an independent finite sink for padded requests.
+        for row, (pair, n, count) in enumerate(
+            zip(self.logical[layer_index], lengths, pages)
+        ):
+            table[row, :count] = torch.arange(
+                page_offset, page_offset + count, dtype=torch.int32, device="cuda"
+            )
+            token_offset = page_offset * self.page_size
+            for j, cache in enumerate((k, v)):
+                cache.view(-1, _KV_HEADS, _DIM)[token_offset : token_offset + n].copy_(
+                    self._encoded_kv(pair[j][:n], layer_index, key=j == 0)
+                )
+            page_offset += count
+        out = torch.empty(
+            (batch_size, self.query_heads, _DIM), dtype=_DTYPE, device="cuda"
+        )
+        unified_attention(
+            q=self._encoded_q(q.view(batch_size, self.query_heads, _DIM)),
+            k=k,
+            v=v,
+            out=out,
+            cu_seqlens_q=torch.arange(batch_size + 1, dtype=torch.int32, device="cuda"),
+            seqused_k=torch.tensor(
+                [*lengths, *([1] * (batch_size - len(lengths)))],
+                dtype=torch.int64,
+                device="cuda",
+            ),
+            max_seqlen_q=1,
+            max_seqlen_k=table_width * self.page_size,
+            softmax_scale=layer.scaling,
+            causal=True,
+            window_size=(window - 1, 0) if window else (-1, -1),
+            block_table=table,
+            softcap=layer.logit_cap,
+            q_descale=self.backend.q_scale,
+            k_descale=layer.k_scale,
+            v_descale=layer.v_scale,
+            sinks=None,
+        )
+        return out.flatten(1)
+
+    def _check(self, actual, q, layer_index, lengths, query_lengths, *, decode=True):
         self.assertTrue(torch.isfinite(actual).all().item())
+        native = None
+        if self.fp8 and decode:
+            native = self._packed_fp8_decode_reference(q, layer_index, lengths)
+        elif (
+            not decode
+            and self.fp8_full_prefill_q
+            and not (self.window and layer_index == 1)
+        ):
+            native = self._packed_fp8_prefill_reference(
+                q, layer_index, lengths, query_lengths
+            )
+        if native is not None:
+            # Both native FP8 kernels round softmax probabilities to FP8 before
+            # PV. Exact packed parity isolates layout regressions from that
+            # existing numerical difference against mathematical attention.
+            torch.testing.assert_close(actual, native, atol=0, rtol=0)
+            valid_tokens = sum(query_lengths)
+            mathematical = self._reference(
+                q,
+                layer_index,
+                lengths,
+                query_lengths,
+                decode=decode,
+                output_dtype=torch.float32,
+            )
+            metrics = {}
+            for name, result in (("arena", actual), ("packed", native)):
+                delta = result[:valid_tokens].float() - mathematical
+                metrics[name] = {
+                    "max_abs": delta.abs().max().item(),
+                    "rmse": delta.square().mean().sqrt().item(),
+                    "relative_l2": (
+                        delta.norm() / mathematical.norm().clamp_min(1e-12)
+                    ).item(),
+                }
+            print(
+                ("FP8_DECODE_PARITY " if decode else "FP8_PREFILL_PARITY ")
+                + json.dumps(
+                    {
+                        "case": type(self).__name__,
+                        "layer": layer_index,
+                        "lengths": lengths,
+                        "query_lengths": query_lengths,
+                        "query_rows": q.shape[0],
+                        "exact_native_match": True,
+                        **metrics,
+                    }
+                )
+            )
+            # Match the existing native FP8 numerical policy in
+            # test_aiter_fp8_kv_scales_paths.py. Exact packed parity above is
+            # the arena-regression check; this separately bounds kernel error.
+            self.assertLess(metrics["arena"]["relative_l2"], 0.15, metrics)
+            return
         torch.testing.assert_close(
-            actual,
-            self._reference(q, layer_index, lengths, query_lengths),
+            actual[: sum(query_lengths)],
+            self._reference(q, layer_index, lengths, query_lengths, decode=decode),
             atol=0.015,
             rtol=0.01,
         )
@@ -248,13 +462,11 @@ class TestAiterUnifiedMemory(CustomTestCase):
                 k, v = [
                     torch.cat([pair[j] for pair in self.logical[i]]) for j in (0, 1)
                 ]
-            fn = (
-                self.backend.forward_decode
-                if query_lengths is None
-                else self.backend.forward_extend
-            )
-            out = fn(q, k, v, layer, fb, save_kv_cache=write)
-            self._check(out, q, i, lengths, qn)
+            if query_lengths is None:
+                out = self._decode(q, k, v, layer, fb, write)
+            else:
+                out = self.backend.forward_extend(q, k, v, layer, fb, write)
+            self._check(out, q, i, lengths, qn, decode=query_lengths is None)
 
     def test_relocation_prefill_and_captured_decode(self):
         from sglang.srt.mem_cache.memory_pool import KVWriteLoc
@@ -296,12 +508,12 @@ class TestAiterUnifiedMemory(CustomTestCase):
         with torch.cuda.stream(stream):
             for _ in range(2):
                 for layer, (k, v) in zip(self.layers, decode_kv):
-                    self.backend.forward_decode(q, k, v, layer, fb, True)
+                    self._decode(q, k, v, layer, fb)
         torch.cuda.current_stream().wait_stream(stream)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, stream=stream):
             outputs = [
-                self.backend.forward_decode(q, k, v, layer, fb, True)
+                self._decode(q, k, v, layer, fb)
                 for layer, (k, v) in zip(self.layers, decode_kv)
             ]
         graph.replay()
@@ -373,11 +585,11 @@ class TestAiterUnifiedMemory(CustomTestCase):
             physical = self._physical(
                 torch.stack([slots[-1] for slots in self.live]), i
             )
-            torch.testing.assert_close(
-                self.pool.layer_router.read(layer.layer_id).value()[physical],
+            self._check_stored_values(
+                self.pool.layer_router.read(layer.layer_id).value(),
+                physical,
                 decode_kv[i][1],
-                rtol=0,
-                atol=0,
+                i,
             )
 
         # One real lane remains. Poison only its ignored suffix and unrelated reused
@@ -388,8 +600,17 @@ class TestAiterUnifiedMemory(CustomTestCase):
             # ignored page-table columns. A page1 pass cannot cover this case.
             ignored = torch.cat((self.groups[0][5:], reused))
             physical = self._physical(ignored, i)
-            k[physical] = torch.nan
-            v[physical] = torch.nan
+            if self.fp8:
+                nan_byte = (
+                    torch.tensor(torch.nan, dtype=self.cache_dtype)
+                    .view(torch.uint8)
+                    .item()
+                )
+                k.view(torch.uint8)[physical] = nan_byte
+                v.view(torch.uint8)[physical] = nan_byte
+            else:
+                k[physical] = torch.nan
+                v[physical] = torch.nan
         fb.seq_lens.copy_(torch.tensor([5, 1, 1], device="cuda"))
         fb.seq_lens_cpu = torch.tensor([5, 1, 1])
         fb.seq_lens_sum = 7
@@ -412,18 +633,18 @@ class TestAiterUnifiedMemory(CustomTestCase):
             self.assertTrue((table[1:] == 0).all().item())
         graph.replay()
         for i, output in enumerate(outputs):
-            self._check(output[:1], q[:1], i, [5], [1])
+            self._check(output, q, i, [5], [1])
             self.assertTrue(torch.isfinite(output).all().item())
             physical = self._physical(self.live[0][4:5], i)
-            torch.testing.assert_close(
-                self.pool.layer_router.read(self.layers[i].layer_id).value()[physical],
+            self._check_stored_values(
+                self.pool.layer_router.read(self.layers[i].layer_id).value(),
+                physical,
                 decode_kv[i][1][:1],
-                rtol=0,
-                atol=0,
+                i,
             )
         for layer in self.layers:
             for cache in self.pool.layer_router.read(layer.layer_id).kv():
-                self.assertTrue(torch.isfinite(cache[0]).all().item())
+                self.assertTrue(torch.isfinite(cache[0].float()).all().item())
 
     def test_unavailable_sink_safe_writer_is_rejected(self):
         from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
@@ -452,6 +673,54 @@ class TestAiterUnifiedWindowPage64(TestAiterUnifiedWindowPage1):
 
 
 class TestAiterUnifiedWindowPage16MHA(TestAiterUnifiedWindowPage16):
+    query_heads = _KV_HEADS
+
+
+class TestAiterUnifiedFP8Page1(TestAiterUnifiedMemory):
+    fp8 = True
+
+
+class TestAiterUnifiedFP8Page16(TestAiterUnifiedFP8Page1):
+    page_size = 16
+
+
+class TestAiterUnifiedFP8Page64(TestAiterUnifiedFP8Page1):
+    page_size = 64
+
+
+class TestAiterUnifiedFP8Page1MHA(TestAiterUnifiedFP8Page1):
+    query_heads = _KV_HEADS
+
+
+class TestAiterUnifiedFP8Page16MHA(TestAiterUnifiedFP8Page16):
+    query_heads = _KV_HEADS
+
+
+class TestAiterUnifiedFP8Page64MHA(TestAiterUnifiedFP8Page64):
+    query_heads = _KV_HEADS
+
+
+class TestAiterUnifiedFP8WindowPage1(TestAiterUnifiedFP8Page1):
+    window = 32
+
+
+class TestAiterUnifiedFP8WindowPage16(TestAiterUnifiedFP8WindowPage1):
+    page_size = 16
+
+
+class TestAiterUnifiedFP8WindowPage64(TestAiterUnifiedFP8WindowPage1):
+    page_size = 64
+
+
+class TestAiterUnifiedFP8WindowPage1MHA(TestAiterUnifiedFP8WindowPage1):
+    query_heads = _KV_HEADS
+
+
+class TestAiterUnifiedFP8WindowPage16MHA(TestAiterUnifiedFP8WindowPage16):
+    query_heads = _KV_HEADS
+
+
+class TestAiterUnifiedFP8WindowPage64MHA(TestAiterUnifiedFP8WindowPage64):
     query_heads = _KV_HEADS
 
 

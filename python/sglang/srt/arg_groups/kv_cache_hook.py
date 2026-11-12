@@ -866,15 +866,13 @@ def handle_page_major_kv_layout(server_args: Any):
             "auto",
             "bf16",
             "bfloat16",
-        ), "--enable-unified-memory with aiter requires BF16 query and KV dtypes."
+            "fp8_e4m3",
+            "fp8_e5m2",
+        ), (
+            "--enable-unified-memory with aiter requires BF16 queries and BF16 or native FP8 KV."
+        )
         assert cfg.speculative_algorithm is None, (
             "--enable-unified-memory with aiter does not support speculative decoding."
-        )
-        assert cfg.dcp_size == cfg.attn_cp_size == 1 and not cfg.enable_prefill_cp, (
-            "--enable-unified-memory with aiter does not support context parallelism."
-        )
-        assert not cfg.enable_deterministic_inference, (
-            "--enable-unified-memory with aiter does not support deterministic inference."
         )
         allowed_full.add("aiter")
     assert backends <= allowed_full, (

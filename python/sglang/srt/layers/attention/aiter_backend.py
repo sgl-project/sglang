@@ -840,11 +840,12 @@ class AiterAttnBackend(AttentionBackend):
                 or self.use_mla
                 or self.kv_cache_is_vectorized_5d
                 or self.input_dtype != torch.bfloat16
-                or self.kv_cache_dtype != torch.bfloat16
+                or self.kv_cache_dtype not in (torch.bfloat16, fp8_dtype)
                 or self.head_dim != self.v_head_dim
             ):
                 raise ValueError(
-                    "AITER unified memory requires translated MHA, BF16 Q/K/V, "
+                    "AITER unified memory requires translated MHA, BF16 queries "
+                    "and BF16 or native FP8 KV, "
                     "equal K/V head dimensions; MLA, "
                     "vectorized and fused-draft caches are not supported."
                 )
@@ -4304,9 +4305,11 @@ class AiterAttnBackend(AttentionBackend):
 
     def _use_fused_fp8_kv_write(self, layer: RadixAttention) -> bool:
         # Fused write reuses K's num_heads/head_dim for V, so it needs FP8,
-        # non-MLA, non-SWA, and matching K/V head count + head_dim.
+        # non-MLA, non-SWA, and matching K/V head count + head_dim. The arena
+        # uses the shared writer, which preserves its reserved padding sink.
         return (
             self.kv_cache_dtype == fp8_dtype
+            and not self.use_unified_memory
             and not self.use_mla
             and not self.use_sliding_window_kv_pool
             and layer.tp_k_head_num == layer.tp_v_head_num
@@ -5915,14 +5918,15 @@ class AiterIndicesUpdaterPrefill:
                 dtype=torch.int32,
                 device=req_pool_indices.device,
             )
-            create_flashinfer_kv_indices_triton[(bs,)](
-                self.req_to_token,
-                req_pool_indices,
-                paged_kernel_lens,
-                kv_indptr,
-                kv_start_idx,
-                kv_indices,
-                self.req_to_token.shape[1],
+            # FP8 context-prefill gathers consume physical token slots, just
+            # like the page-table readers. Let RunnerIds translate arena ids.
+            self.runner_ids.pack_read_stream(
+                plan,
+                req_pool_indices=req_pool_indices,
+                seq_lens=paged_kernel_lens,
+                indptr=kv_indptr,
+                out=kv_indices,
+                kv_start_idx=kv_start_idx,
             )
 
             # Pad past the real total kv_indptr[bs] (seq_lens_sum may be an upper bound)
