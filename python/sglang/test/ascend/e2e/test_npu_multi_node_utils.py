@@ -171,45 +171,38 @@ def get_host_ip():
     return host_ip
 
 
-def build_meta_service_config(host: Optional[str] = None):
-    """Return the npu_memcache MetaService endpoints for the current pod.
-
-    Uses the pod's real IP (POD_IP) instead of loopback so a multi-pod
-    prefill instance can reach the MetaService across nodes; falls back to
-    loopback when POD_IP is unset (e.g. local test collection outside k8s).
-
-    ``host`` overrides the endpoint IP, e.g. the prefill instance master IP
-    resolved from the ConfigMap; when omitted the local POD_IP is used.
-    """
-    host = host or os.getenv("POD_IP", "127.0.0.1")
-    return {
-        "meta_service_url": f"tcp://{host}:{META_SERVICE_PORT}",
-        "config_store_url": f"tcp://{host}:{CONFIG_STORE_PORT}",
-        "metrics_url": f"http://{host}:{META_METRICS_PORT}",
-    }
-
-
 def build_hicache_storage_extra_config(
     world_size: int, protocol: str, dram_size: str
 ):
     """Return the npu_memcache L3 backend config for
     ``--hicache-storage-backend-extra-config``.
 
-    The MetaService/config-store endpoints are derived from
-    ``build_meta_service_config`` so the L3 backend connects to the
-    MetaService that ``launch_pd_separation_node`` starts for the same pod.
+    The endpoints initially use the local POD_IP; the launch functions point
+    them at the node where ``start_meta_service`` actually runs.
     """
-    meta_service_config = build_meta_service_config()
+    host = os.getenv("POD_IP", "127.0.0.1")
     return json.dumps(
         {
-            "meta_service_url": meta_service_config["meta_service_url"],
-            "config_store_url": meta_service_config["config_store_url"],
+            "meta_service_url": f"tcp://{host}:{META_SERVICE_PORT}",
+            "config_store_url": f"tcp://{host}:{CONFIG_STORE_PORT}",
             "log_level": "info",
             "world_size": world_size,
             "protocol": protocol,
             "dram_size": dram_size,
         }
     )
+
+
+def _set_hicache_storage_host(service_args, host):
+    """Point the L3 backend extra config at the MetaService node IP."""
+    flag = "--hicache-storage-backend-extra-config"
+    if flag not in service_args:
+        return
+    index = service_args.index(flag) + 1
+    extra_config = json.loads(service_args[index])
+    extra_config["meta_service_url"] = f"tcp://{host}:{META_SERVICE_PORT}"
+    extra_config["config_store_url"] = f"tcp://{host}:{CONFIG_STORE_PORT}"
+    service_args[index] = json.dumps(extra_config)
 
 
 def get_k8s_api():
@@ -542,9 +535,10 @@ def launch_pd_mix_node(model_config):
     # as soon as the model server starts, so the service must already be
     # listening. All pods use the same master node IP (read from the ConfigMap
     # above) and only the pod owning that IP can bind it, so just the master
-    # node hosts the service.
+    # node hosts the service while every model server targets that IP.
     meta_service_process = None
     if "--hicache-storage-backend-extra-config" in other_args:
+        _set_hicache_storage_host(other_args, master_node_ip)
         if host_ip == master_node_ip:
             meta_service_process = start_meta_service(master_node_ip)
 
@@ -741,12 +735,12 @@ def launch_pd_separation_node(model_config):
 
     # The npu_memcache L3 backend connects to the Ascend MemCache MetaService
     # as soon as the model server starts, so the service must already be
-    # listening. It is enabled through the storage backend extra config flag,
-    # which only the prefill side carries. All pods use the same prefill node
-    # IP (read from the ConfigMap above) and only the pod owning that IP can
-    # bind it, so just the master prefill pod hosts the service.
+    # listening. All pods use the same prefill node IP (read from the ConfigMap
+    # above) and only the pod owning that IP can bind it, so just the master
+    # prefill pod hosts the service while every model server targets that IP.
     meta_service_process = None
     if "--hicache-storage-backend-extra-config" in service_args:
+        _set_hicache_storage_host(service_args, master_prefill_ip)
         if host_ip == master_prefill_ip:
             meta_service_process = start_meta_service(master_prefill_ip)
 
@@ -925,7 +919,11 @@ def start_meta_service(host_ip):
 
     Returns the MetaService process.
     """
-    meta_service_config = build_meta_service_config(host_ip)
+    meta_service_config = {
+        "meta_service_url": f"tcp://{host_ip}:{META_SERVICE_PORT}",
+        "config_store_url": f"tcp://{host_ip}:{CONFIG_STORE_PORT}",
+        "metrics_url": f"http://{host_ip}:{META_METRICS_PORT}",
+    }
     port = META_SERVICE_PORT
 
     # Materialize the config on the pod-local temp dir so runtime ports

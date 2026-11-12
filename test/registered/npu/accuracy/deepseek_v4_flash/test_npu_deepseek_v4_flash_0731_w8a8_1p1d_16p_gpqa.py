@@ -25,11 +25,11 @@ register_npu_ci(
     nightly=True,
 )
 
-# npu_memcache L3 backend config (--hicache-storage-backend-extra-config);
-# the MetaService/config-store endpoints match the service started by
-# launch_pd_separation_node. world_size is the prefill instance's
-# tp_size*pp_size and dram_size is the per-rank host DRAM contribution (all
-# 16 ranks live on the prefill node, so the node donates 16 x 4GB = 64GB).
+# npu_memcache L3 backend config; launch_pd_separation_node retargets the
+# MetaService/config-store endpoints at the master prefill node that hosts the
+# service. world_size is the prefill instance's tp_size*pp_size and dram_size
+# is the per-rank host DRAM contribution (all 16 ranks live on the prefill
+# node, so the node donates 16 x 4GB = 64GB).
 HICACHE_STORAGE_EXTRA_CONFIG = build_hicache_storage_extra_config(
     world_size=16,
     protocol="device_sdma",
