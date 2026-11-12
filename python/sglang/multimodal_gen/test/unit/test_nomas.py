@@ -20,6 +20,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.nomas import (
     NomasPipelineConfig,
     nomas_postprocess_text,
 )
+from sglang.multimodal_gen.runtime.layers.kvcache.nomas_segment_cache import (
+    NomasAttentionPlan,
+)
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     RowParallelLinear,
@@ -45,9 +48,6 @@ from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
     resolve_transformer_quant_load_spec,
 )
 from sglang.multimodal_gen.runtime.models.dits.nomas import NomasTransformer3DModel
-from sglang.multimodal_gen.runtime.models.dits.nomas_kv_cache import (
-    NomasAttentionPlan,
-)
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
 )
@@ -344,6 +344,37 @@ def test_fused_qk_norm_rope_and_modulate_cast_are_bitwise_exact():
         fused = layers.modulate_for_linear(x, shift, scale)
     assert fused.dtype == torch.bfloat16
     assert torch.equal(fused, layers.modulate(x, shift, scale).to(torch.bfloat16))
+
+
+@pytest.mark.skipif(not is_nvidia_cuda, reason="fused kernels need CUDA")
+@torch.inference_mode()
+def test_mean_square_fusion_preserves_compiled_rope_and_camera_fallback():
+    from sglang.multimodal_gen.runtime.models.dits import nomas_layers as layers
+
+    for dim in (128, 64):
+        x = torch.randn(1, 2000, 3, 16, dim, device="cuda", dtype=torch.bfloat16)[
+            :, :, 1
+        ]
+        norm = layers.RMSNorm(dim).cuda().bfloat16()
+        norm.weight.normal_(1, 0.1)
+        angles = torch.randn(2000, dim, device="cuda")
+        freqs = (angles.cos(), angles.sin())
+        cos, sin = layers._rope_tables(x, freqs)
+        expected = layers._compiled_norm_rotate()(
+            x,
+            x.float().square().mean(-1, keepdim=True),
+            norm.eps,
+            norm.weight,
+            cos,
+            sin,
+            torch.bfloat16,
+        )
+        assert torch.equal(
+            layers.rms_norm_rotate(norm, x, freqs, torch.bfloat16), expected
+        )
+        if dim == 128:
+            assert layers._MEAN_SQUARE.is_verified((x.shape, x.stride(), x.device))
+            assert not layers._MEAN_SQUARE.disabled
 
 
 @pytest.mark.skipif(not is_nvidia_cuda, reason="fused kernels need CUDA")
