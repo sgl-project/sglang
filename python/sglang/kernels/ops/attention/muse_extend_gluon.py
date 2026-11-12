@@ -7,6 +7,10 @@ MFMA once its key rows are relabelled (V^T is loaded in the same relabelled key 
 through LDS. K / V tiles are async-copied into two LDS buffers (one barrier per tile) with page ids fetched two tiles
 ahead. P is formed as 448 * exp2(.) (the FP8 E4M3 range), which scales numerator and denominator alike and keeps
 small probabilities out of the FP8 subnormals.
+
+The loop is VALU-bound (the softmax, not the MFMAs), so the per-tile address work is kept minimal: the KV strides
+are constexpr, each lane's (KV head, row % PAGE, dim) pointer is hoisted out of the loop so a tile only adds
+page * stride, and the block-table row of a tile is read through a scalar base with loop-invariant lane offsets.
 """
 
 import torch
@@ -41,62 +45,64 @@ def _relabel(x, TILE: gl.constexpr, N: gl.constexpr):
 
 
 @gluon.jit
-def _pages(bt, j, kr, vr, seq_len, PAGE: gl.constexpr, TILE: gl.constexpr, n_tiles, lo):
-    # Page ids of tile j's K rows (key order) and V rows (relabelled order); 0 past the end and below ``lo`` (the
-    # first key a sliding block sees: the pages before it may be freed).
-    key = j * TILE + kr
-    key_v = j * TILE + vr
-    live = j < n_tiles
-    page = gl.load(bt + key // PAGE, mask=live & (key < seq_len) & (key >= lo), other=0)
-    page_v = gl.load(
-        bt + key_v // PAGE, mask=live & (key_v < seq_len) & (key_v >= lo), other=0
-    )
-    return page, page_v
-
-
-@gluon.jit
-def _issue(
-    K,
-    V,
+def _pages(
+    bt,
     j,
-    page,
-    page_v,
     kr,
     vr,
-    kd,
     seq_len,
-    kvh,
-    k_stride0,
-    k_stride1,
-    k_stride2,
-    v_stride0,
-    v_stride1,
-    v_stride2,
-    k_buf,
-    v_buf,
     PAGE: gl.constexpr,
     TILE: gl.constexpr,
     n_tiles,
     lo,
     MASKED: gl.constexpr,
 ):
-    key = j * TILE + kr
-    key_v = j * TILE + vr
-    k_ptr = (
-        K
-        + page.to(gl.int64)[:, None] * k_stride0
-        + (key % PAGE)[:, None] * k_stride1
-        + kvh * k_stride2
-        + kd[None, :]
-    )
-    v_ptr = (
-        V
-        + page_v.to(gl.int64)[:, None] * v_stride0
-        + (key_v % PAGE)[:, None] * v_stride1
-        + kvh * v_stride2
-        + kd[None, :]
-    )
+    # Page ids of tile j's K rows (key order) and V rows (relabelled order); 0 past the end and below ``lo`` (the
+    # first key a sliding block sees: the pages before it may be freed).
+    # Scalar row base for tile j, so the lane offsets kr // PAGE, vr // PAGE stay loop-invariant.
+    tb = bt + j * (TILE // PAGE)
     if MASKED:
+        key = j * TILE + kr
+        key_v = j * TILE + vr
+        live = j < n_tiles
+        page = gl.amd.cdna4.buffer_load(
+            tb, kr // PAGE, mask=live & (key < seq_len) & (key >= lo), other=0
+        )
+        page_v = gl.amd.cdna4.buffer_load(
+            tb, vr // PAGE, mask=live & (key_v < seq_len) & (key_v >= lo), other=0
+        )
+    else:
+        page = gl.amd.cdna4.buffer_load(tb, kr // PAGE)
+        page_v = gl.amd.cdna4.buffer_load(tb, vr // PAGE)
+    return page, page_v
+
+
+@gluon.jit
+def _issue(
+    k_lane,
+    v_lane,
+    j,
+    page,
+    page_v,
+    kr,
+    vr,
+    seq_len,
+    k_buf,
+    v_buf,
+    K_S0: gl.constexpr,
+    V_S0: gl.constexpr,
+    TILE: gl.constexpr,
+    n_tiles,
+    lo,
+    MASKED: gl.constexpr,
+):
+    # k_lane / v_lane: loop-invariant per-lane pointers (KV head, row % PAGE, dim); a tile only adds page * stride,
+    # in 64-bit since a layer's KV pool can exceed 2 GiB.
+    k_ptr = k_lane + page.to(gl.int64)[:, None] * K_S0
+    v_ptr = v_lane + page_v.to(gl.int64)[:, None] * V_S0
+    if MASKED:
+        key = j * TILE + kr
+        key_v = j * TILE + vr
         live = j < n_tiles
         gl.amd.cdna4.async_copy.global_load_to_shared(
             k_buf,
@@ -130,24 +136,18 @@ def _step(
     c,
     q_pos,
     seq_len,
-    K,
-    V,
     bt,
     kr,
     vr,
-    kd,
-    kvh,
-    k_stride0,
-    k_stride1,
-    k_stride2,
-    v_stride0,
-    v_stride1,
-    v_stride2,
+    k_lane,
+    v_lane,
     n_tiles,
     lo,
     mfma: gl.constexpr,
     a_op: gl.constexpr,
     b_op: gl.constexpr,
+    K_S0: gl.constexpr,
+    V_S0: gl.constexpr,
     PAGE: gl.constexpr,
     TILE: gl.constexpr,
     BM: gl.constexpr,
@@ -162,31 +162,25 @@ def _step(
     gl.barrier()
     nb = (j + 1) % 2
     _issue(
-        K,
-        V,
+        k_lane,
+        v_lane,
         j + 1,
         pg,
         pg_v,
         kr,
         vr,
-        kd,
         seq_len,
-        kvh,
-        k_stride0,
-        k_stride1,
-        k_stride2,
-        v_stride0,
-        v_stride1,
-        v_stride2,
         k_bufs.index(nb),
         v_bufs.index(nb),
-        PAGE,
+        K_S0,
+        V_S0,
         TILE,
         n_tiles,
         lo,
         NEXT_MASKED,
     )
-    pg, pg_v = _pages(bt, j + 2, kr, vr, seq_len, PAGE, TILE, n_tiles, lo)
+    # Unmasked only when tile j + 2 lies below `interior` (the caller's loop bounds guarantee it).
+    pg, pg_v = _pages(bt, j + 2, kr, vr, seq_len, PAGE, TILE, n_tiles, lo, NEXT_MASKED)
     cb = j % 2
     ka = gl.amd.cdna4.async_copy.load_shared_relaxed(k_bufs.index(cb), a_op)
     s = gl.amd.cdna4.mfma_scaled(
@@ -238,12 +232,12 @@ def _muse_extend_kernel(
     bt_stride,
     q_stride0,
     o_stride0,
-    k_stride0,
-    k_stride1,
-    k_stride2,
-    v_stride0,
-    v_stride1,
-    v_stride2,
+    K_S0: gl.constexpr,
+    K_S1: gl.constexpr,
+    K_S2: gl.constexpr,
+    V_S0: gl.constexpr,
+    V_S1: gl.constexpr,
+    V_S2: gl.constexpr,
     GQA: gl.constexpr,
     D: gl.constexpr,
     PAGE: gl.constexpr,
@@ -297,6 +291,9 @@ def _muse_extend_kernel(
         vr = gl.reshape(_relabel(gl.reshape(kr, [TILE, 1]), TILE, 1), [TILE])
         vr = gl.convert_layout(vr, gl.SliceLayout(1, kv_blk))
         bt = BT + seq * bt_stride
+        # (key % PAGE) == (row % PAGE) for every tile since PAGE divides TILE.
+        k_lane = K + kvh * K_S2 + ((kr % PAGE)[:, None] * K_S1 + kd[None, :])
+        v_lane = V + kvh * V_S2 + ((vr % PAGE)[:, None] * V_S1 + kd[None, :])
 
         q_pos = ctx + local * BLOCK_Q + gl.arange(0, BM, layout=col) // GQA
         # sliding: a query can see none of the window's first tile, so the running max starts finite (exp2 of
@@ -323,61 +320,51 @@ def _muse_extend_kernel(
             lo = 0
             j0 = 0
             full_lo = 0
-        pg, pg_v = _pages(bt, j0, kr, vr, seq_len, PAGE, TILE, n_tiles, lo)
+        pg, pg_v = _pages(bt, j0, kr, vr, seq_len, PAGE, TILE, n_tiles, lo, True)
         _issue(
-            K,
-            V,
+            k_lane,
+            v_lane,
             j0,
             pg,
             pg_v,
             kr,
             vr,
-            kd,
             seq_len,
-            kvh,
-            k_stride0,
-            k_stride1,
-            k_stride2,
-            v_stride0,
-            v_stride1,
-            v_stride2,
             k_bufs.index(j0 % 2),
             v_bufs.index(j0 % 2),
-            PAGE,
+            K_S0,
+            V_S0,
             TILE,
             n_tiles,
             lo,
             True,
         )
-        pg, pg_v = _pages(bt, j0 + 1, kr, vr, seq_len, PAGE, TILE, n_tiles, lo)
+        pg, pg_v = _pages(bt, j0 + 1, kr, vr, seq_len, PAGE, TILE, n_tiles, lo, True)
         if WINDOW > 0:
             for j in range(j0, full_lo):
                 pg, pg_v, m_i, l_i, acc = _step(
                     j, pg, pg_v, k_bufs, v_bufs, qt, m_i, l_i, acc, c, q_pos, seq_len,
-                    K, V, bt, kr, vr, kd, kvh, k_stride0, k_stride1, k_stride2,
-                    v_stride0, v_stride1, v_stride2, n_tiles, lo, mfma, a_op, b_op, PAGE, TILE, BM,
-                    True, True, WINDOW,
+                    bt, kr, vr, k_lane, v_lane, n_tiles, lo, mfma, a_op, b_op, K_S0, V_S0,
+                    PAGE, TILE, BM, True, True, WINDOW,
                 )  # fmt: skip
-        for j in range(full_lo, interior - 1):
+        # Stops at interior - 2: these steps prefetch tile j + 2's page ids unmasked.
+        for j in range(full_lo, interior - 2):
             pg, pg_v, m_i, l_i, acc = _step(
                 j, pg, pg_v, k_bufs, v_bufs, qt, m_i, l_i, acc, c, q_pos, seq_len,
-                K, V, bt, kr, vr, kd, kvh, k_stride0, k_stride1, k_stride2,
-                v_stride0, v_stride1, v_stride2, n_tiles, lo, mfma, a_op, b_op, PAGE, TILE, BM,
-                False, False, WINDOW,
+                bt, kr, vr, k_lane, v_lane, n_tiles, lo, mfma, a_op, b_op, K_S0, V_S0,
+                PAGE, TILE, BM, False, False, WINDOW,
             )  # fmt: skip
-        for j in range(gl.maximum(interior - 1, full_lo), interior):
+        for j in range(gl.maximum(interior - 2, full_lo), interior):
             pg, pg_v, m_i, l_i, acc = _step(
                 j, pg, pg_v, k_bufs, v_bufs, qt, m_i, l_i, acc, c, q_pos, seq_len,
-                K, V, bt, kr, vr, kd, kvh, k_stride0, k_stride1, k_stride2,
-                v_stride0, v_stride1, v_stride2, n_tiles, lo, mfma, a_op, b_op, PAGE, TILE, BM,
-                False, True, WINDOW,
+                bt, kr, vr, k_lane, v_lane, n_tiles, lo, mfma, a_op, b_op, K_S0, V_S0,
+                PAGE, TILE, BM, False, True, WINDOW,
             )  # fmt: skip
         for j in range(interior, n_tiles):
             pg, pg_v, m_i, l_i, acc = _step(
                 j, pg, pg_v, k_bufs, v_bufs, qt, m_i, l_i, acc, c, q_pos, seq_len,
-                K, V, bt, kr, vr, kd, kvh, k_stride0, k_stride1, k_stride2,
-                v_stride0, v_stride1, v_stride2, n_tiles, lo, mfma, a_op, b_op, PAGE, TILE, BM,
-                True, True, WINDOW,
+                bt, kr, vr, k_lane, v_lane, n_tiles, lo, mfma, a_op, b_op, K_S0, V_S0,
+                PAGE, TILE, BM, True, True, WINDOW,
             )  # fmt: skip
         gl.amd.cdna4.async_copy.wait_group(0)
         o = acc * (gl.load(VD) / l_i)[None, :]
@@ -443,12 +430,12 @@ def muse_extend_attention(
         block_table.stride(0),
         q.stride(0),
         out.stride(0),
-        k_cache.stride(0),
-        k_cache.stride(1),
-        k_cache.stride(2),
-        v_cache.stride(0),
-        v_cache.stride(1),
-        v_cache.stride(2),
+        K_S0=k_cache.stride(0),
+        K_S1=k_cache.stride(1),
+        K_S2=k_cache.stride(2),
+        V_S0=v_cache.stride(0),
+        V_S1=v_cache.stride(1),
+        V_S2=v_cache.stride(2),
         GQA=q.shape[1] // hk,
         D=q.shape[2],
         PAGE=k_cache.shape[1],
