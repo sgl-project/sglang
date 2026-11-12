@@ -1565,6 +1565,10 @@ class TestDflashDraftKvBudget(CustomTestCase):
         )
 
     def test_draft_kv_ring_charge_matches_the_ring_pool(self):
+        from sglang.srt.speculative.dflash_draft_ring import (
+            draft_kv_ring_pool_rows_from_config,
+        )
+
         for dcp_size, page_size, publish in (
             (8, 1, {}),
             (1, 64, {}),
@@ -1587,8 +1591,8 @@ class TestDflashDraftKvBudget(CustomTestCase):
                 req_pool = config._build_req_to_token_pool(
                     max_num_reqs=config._req_pool_rows(48)
                 )
-                rows = config._dflash_draft_kv_ring_rows(
-                    draft_hf_config=config.spec_aux_config.draft_model_config.hf_config,
+                rows = draft_kv_ring_pool_rows_from_config(
+                    config.spec_aux_config.draft_model_config.hf_config,
                     req_to_token_rows=req_pool.req_to_token.shape[0],
                     page_size=page_size,
                 )

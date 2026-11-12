@@ -108,7 +108,6 @@ export const KimiK31MambaRatioCalculator = () => {
       (!pdRole || transfer.startsWith("mooncake")) &&
       ["cutedsl_mla", "trtllm_mla"].includes(flagArg("--speculative-draft-attention-backend")) &&
       !hasFlag("--enable-unified-memory") &&
-      !hasFlag("--speculative-draft-window-size") &&
       !env.some((e) => e.startsWith("SGLANG_ENABLE_DFLASH_DRAFT_KV_RING=0"));
 
     const ssmBytes = ssmDtype === "float32" ? 4 : 2;

@@ -1098,7 +1098,6 @@ def _resolve_dflash_draft_kv_ring(server_args: ServerArgs) -> None:
     reason = draft_kv_ring_unsupported_reason(
         lambda: _load_draft_hf_config(cfg),
         draft_backend=cfg.speculative_draft_attention_backend,
-        draft_window_size=cfg.speculative_draft_window_size,
         disaggregation_mode=cfg.disaggregation_mode,
         disaggregation_transfer_backend=cfg.disaggregation_transfer_backend,
         disaggregation_decode_host_receive_threshold=(
