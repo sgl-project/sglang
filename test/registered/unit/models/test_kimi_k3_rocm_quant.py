@@ -5,7 +5,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 import unittest
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest import mock
 
 import torch
@@ -25,7 +25,7 @@ from sglang.srt.models.kimi_k3_rocm_quant import (
     _k3_channel_fp8_to_bf16,
     k3_fused_decode_f_b_weight,
 )
-from sglang.srt.runtime_context import get_context
+from sglang.srt.runtime_context import get_context, get_exec
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -166,7 +166,7 @@ def _armable_hip_attention() -> SimpleNamespace:
     """A stand-in KDA attention whose static inputs fit the fused decode kernel."""
     heads, dim = 12, 128
     f_b_weight = torch.zeros(heads * dim, dim, dtype=torch.bfloat16)
-    return SimpleNamespace(
+    attention = SimpleNamespace(
         attn=SimpleNamespace(
             conv_weights=torch.zeros(3 * heads * dim, 4),
             A_log=torch.zeros(heads),
@@ -174,6 +174,7 @@ def _armable_hip_attention() -> SimpleNamespace:
             lower_bound=-5.0,
         ),
         f_b_proj=SimpleNamespace(weight=f_b_weight),
+        use_full_rank_gate=True,
         _fused_decode_f_b_weight=lambda: f_b_weight,
         o_norm=SimpleNamespace(weight=torch.ones(dim), eps=1e-5),
         config=SimpleNamespace(
@@ -182,6 +183,10 @@ def _armable_hip_attention() -> SimpleNamespace:
             )
         ),
     )
+    attention._prepare_fused_verify_hip = MethodType(
+        KimiK3DeltaAttention._prepare_fused_verify_hip, attention
+    )
+    return attention
 
 
 class TestHipFusedDecodeArming(CustomTestCase):
@@ -211,6 +216,7 @@ class TestHipFusedDecodeArming(CustomTestCase):
         )
 
         with (
+            get_context().override_server_args(),
             mock.patch.object(kimi_k3, "_is_hip", True),
             envs.SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND.override("aiter"),
             mock.patch.object(
@@ -273,30 +279,99 @@ class TestHipFusedDecodeArming(CustomTestCase):
                 )
 
     def test_replayssm_ring_keeps_decode_from_deferring_f_b(self):
-        """Either ReplaySSM flag allocates the ring, whose decode skips the fused kernel;
-        a deferred f_b there reaches the recurrence as the raw f_a, so only ring-free
-        decode may defer it."""
-        for flags, defers in (
-            ({}, True),
-            ({"enable_linear_replayssm": True}, False),
-            ({"enable_linear_replayssm_spec": True}, False),
+        """ReplaySSM decode must keep f_b projected and skip unused fused weights
+        and warmup, rather than reporting an armed kernel that never runs."""
+        for backend, fused_ops in (
+            ("gfx950", kda_fused_decode_gfx950),
+            ("aiter", kda_fused_decode_aiter_hip),
+        ):
+            for flags, armed in (
+                ({}, True),
+                ({"enable_linear_replayssm": True}, False),
+                ({"enable_linear_replayssm_spec": True}, False),
+            ):
+                attention = _armable_hip_attention()
+                with (
+                    self.subTest(backend=backend, flags=flags),
+                    get_context().override_server_args(**flags),
+                    mock.patch.object(kimi_k3, "_is_hip", True),
+                    envs.SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND.override(backend),
+                    envs.SGLANG_OPT_HIP_K3_KDA_FLYDSL_VERIFY.override(False),
+                    mock.patch.object(
+                        fused_ops, "available", return_value=True
+                    ) as available,
+                    mock.patch.object(
+                        attention,
+                        "_fused_decode_f_b_weight",
+                        wraps=attention._fused_decode_f_b_weight,
+                    ) as f_b_weight,
+                    mock.patch.object(fused_ops, "warmup") as warmup,
+                    mock.patch.object(kimi_k3, "print_warning_once") as warn,
+                ):
+                    KimiK3DeltaAttention._prepare_fused_decode(attention)
+
+                    self.assertEqual(attention._kda_hip_fused_decode_ready, armed)
+                    self.assertFalse(attention._kda_hip_fused_verify_ready)
+                    self.assertEqual(
+                        attention.attn._k3_hip_fused_decode_args is not None, armed
+                    )
+                    self.assertEqual(
+                        attention.attn._k3_hip_fused_decode_ops is not None, armed
+                    )
+                    self.assertEqual(available.called, armed)
+                    self.assertEqual(f_b_weight.called, armed)
+                    self.assertEqual(warmup.called, armed)
+                    self.assertEqual(warn.called, not armed)
+
+    def test_replayssm_ring_preserves_fused_verify_without_decode_warmup(self):
+        """Skipping fused ring decode must not disable supported fused verify
+        or warm the unused decode kernel."""
+        for flags in (
+            {"enable_linear_replayssm": True},
+            {"enable_linear_replayssm_spec": True},
         ):
             attention = _armable_hip_attention()
             with (
                 self.subTest(flags=flags),
-                get_context().override_server_args(**flags),
-                mock.patch.object(kimi_k3, "_is_hip", True),
-                envs.SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND.override("gfx950"),
-                mock.patch.object(
-                    kda_fused_decode_gfx950, "available", return_value=True
+                get_context().override_server_args(
+                    speculative_num_draft_tokens=5,
+                    speculative_eagle_topk=1,
+                    **flags,
                 ),
-                mock.patch.object(kda_fused_decode_gfx950, "warmup"),
+                mock.patch.object(kimi_k3, "_is_hip", True),
+                envs.SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND.override("aiter"),
+                envs.SGLANG_OPT_HIP_K3_KDA_FLYDSL_VERIFY.override(True),
+                envs.SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT.override(False),
+                mock.patch.object(
+                    kda_fused_decode_aiter_hip, "available", return_value=True
+                ),
+                mock.patch.object(
+                    kda_fused_decode_aiter_hip, "warmup"
+                ) as decode_warmup,
+                mock.patch.object(
+                    kda_fused_verify_aiter_hip, "available", return_value=True
+                ),
+                mock.patch.object(
+                    kda_fused_verify_aiter_hip, "warmup"
+                ) as verify_warmup,
+                mock.patch.object(kimi_k3, "print_warning_once"),
             ):
                 KimiK3DeltaAttention._prepare_fused_decode(attention)
 
-                # Armed in every case, so a False comes from the ring alone.
+                self.assertFalse(attention._kda_hip_fused_decode_ready)
+                self.assertTrue(attention._kda_hip_fused_verify_ready)
                 self.assertIsNotNone(attention.attn._k3_hip_fused_decode_args)
-                self.assertEqual(attention._kda_hip_fused_decode_ready, defers)
+                self.assertIsNone(attention.attn._k3_hip_fused_decode_ops)
+                self.assertEqual(
+                    attention.attn._k3_hip_fused_verify_args,
+                    (*attention.attn._k3_hip_fused_decode_args, 5),
+                )
+                decode_warmup.assert_not_called()
+                verify_warmup.assert_called_once()
+                self.assertEqual(
+                    verify_warmup.call_args.kwargs["replay_ring"],
+                    get_exec().mamba.enable_linear_replayssm_spec,
+                )
 
     def test_block_fp8_f_b_arms_from_the_merged_bf16_copy(self):
         """A block-FP8 f_b_proj holds FP8 with no Quark scheme; the fused decode must

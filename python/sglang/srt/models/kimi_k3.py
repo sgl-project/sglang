@@ -2252,8 +2252,26 @@ class KimiK3DeltaAttention(nn.Module):
                 "aiter": kda_fused_decode_aiter_hip,
                 "gfx950": kda_fused_decode_gfx950,
             }.get(backend)
+            if fused_ops is None:
+                return
+            # Either ReplaySSM flag allocates the ring (kv_cache_configurator.py),
+            # whose decode skips the fused kernel and needs f_b already applied.
+            mamba = get_exec().mamba
+            replayssm_ring = (
+                mamba.enable_linear_replayssm or mamba.enable_linear_replayssm_spec
+            )
+            if replayssm_ring:
+                print_warning_once(
+                    "Kimi-K3 fused KDA decode stays off: ReplaySSM uses the unfused "
+                    "ring decode"
+                )
+                if (
+                    backend != "aiter"
+                    or not envs.SGLANG_OPT_HIP_K3_KDA_FLYDSL_VERIFY.get()
+                ):
+                    return
             state_dtype = self.config.mamba2_cache_params.dtype.temporal
-            backend_available = fused_ops is not None and fused_ops.available(
+            backend_available = fused_ops.available(
                 device=self.f_b_proj.weight.device, state_dtype=state_dtype
             )
             f_b_weight = self._fused_decode_f_b_weight() if backend_available else None
@@ -2282,25 +2300,20 @@ class KimiK3DeltaAttention(nn.Module):
                     float(self.o_norm.eps),
                     a_log,
                 )
-                fused_ops.warmup(
-                    f_b_weight=f_b_weight,
-                    conv_weight=w,
-                    A_log=a_log,
-                    dt_bias=layer.dt_bias,
-                    lower_bound=float(layer.lower_bound),
-                    norm_weight=norm_weight,
-                    norm_eps=float(self.o_norm.eps),
-                    state_dtype=state_dtype,
-                )
-                layer._k3_hip_fused_decode_backend = backend
-                layer._k3_hip_fused_decode_ops = fused_ops
-                # Either ReplaySSM flag allocates the ring (kv_cache_configurator.py),
-                # whose decode skips the fused kernel and needs f_b already applied.
-                mamba = get_exec().mamba
-                replayssm_ring = (
-                    mamba.enable_linear_replayssm or mamba.enable_linear_replayssm_spec
-                )
-                self._kda_hip_fused_decode_ready = not replayssm_ring
+                if not replayssm_ring:
+                    fused_ops.warmup(
+                        f_b_weight=f_b_weight,
+                        conv_weight=w,
+                        A_log=a_log,
+                        dt_bias=layer.dt_bias,
+                        lower_bound=float(layer.lower_bound),
+                        norm_weight=norm_weight,
+                        norm_eps=float(self.o_norm.eps),
+                        state_dtype=state_dtype,
+                    )
+                    layer._k3_hip_fused_decode_backend = backend
+                    layer._k3_hip_fused_decode_ops = fused_ops
+                    self._kda_hip_fused_decode_ready = True
                 if backend == "aiter":
                     self._prepare_fused_verify_hip(state_dtype=state_dtype)
             return
