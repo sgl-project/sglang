@@ -1,6 +1,8 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: Apache-2.0
 # Vendored from flashinfer-ai/flashinfer PR #4266 at 629147317d4149a12e53bcef27808bac380c283f.
+# With FlashInfer #7443 (854a896b3f, first released in v0.7.3) applied: the TMEM release waits for the barrier's
+# phase 0, the owner reads the peers' partials at .acquire.cluster, and tcgen05 fences order the TMEM hand-offs.
 """Blackwell low-M BF16/FP16 GEMM with an in-kernel cluster split-K reduction.
 
 Each cluster rank accumulates an exact K slice in FP32. Peers publish partials
@@ -240,20 +242,6 @@ def _map_shared_rank(
     )
 
 
-def _tcgen05_fence(*, before: bool) -> None:
-    """``tcgen05.fence::{before,after}_thread_sync`` around an mbarrier hand-off of
-    tcgen05 work (PTX ISA canonical tcgen05 synchronization patterns)."""
-    llvm.inline_asm(
-        None,
-        [],
-        f"tcgen05.fence::{'before' if before else 'after'}_thread_sync;",
-        "",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-    )
-
-
 @dsl_user_op
 def _store_shared_remote_v4(
     value0,
@@ -288,6 +276,55 @@ def _store_shared_remote_v4(
         has_side_effects=True,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
+def _mbarrier_wait_acquire_cluster(
+    mbar_ptr: cute.Pointer,
+    phase: Int32,
+    *,
+    loc=None,
+    ip=None,
+) -> None:
+    """``cute.arch.mbarrier_wait`` with ``.acquire.cluster`` semantics.
+
+    The peers' ``st.async`` complete-tx operations release at cluster scope; the
+    default ``.acquire.cta`` wait does not synchronize with other CTAs' threads.
+    """
+    llvm.inline_asm(
+        None,
+        [
+            mbar_ptr.toint(loc=loc, ip=ip).ir_value(),
+            phase.ir_value(loc=loc, ip=ip),
+        ],
+        "{\n\t.reg .pred P1;\n\tLAB_WAIT:\n\t"
+        "mbarrier.try_wait.parity.acquire.cluster.shared::cta.b64 "
+        "P1, [$0], $1, 10000000;\n\t"
+        "@P1 bra DONE;\n\tbra LAB_WAIT;\n\tDONE:\n\t}",
+        "r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _tcgen05_fence(*, before: bool, loc=None, ip=None) -> None:
+    """``tcgen05.fence::{before,after}_thread_sync`` around an mbarrier hand-off of
+    tcgen05 work (PTX ISA canonical tcgen05 synchronization patterns)."""
+    llvm.inline_asm(
+        None,
+        [],
+        f"tcgen05.fence::{'before' if before else 'after'}_thread_sync;",
+        "",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
     )
 
 
@@ -686,6 +723,7 @@ class SplitKDenseGemmKernel:
     ):
         num_tmem_cols = 256
         cute.arch.alloc_tmem(num_tmem_cols, tmem_base_ptr, is_two_cta=False)
+        _tcgen05_fence(before=True)
         cute.arch.mbarrier_arrive(bar_tmem_alloc)
         cute.arch.relinquish_tmem_alloc_permit(is_two_cta=False)
 
@@ -696,6 +734,7 @@ class SplitKDenseGemmKernel:
         for k_tile in cutlass.range(k_tile_count, unroll=1):
             stage = k_tile % self.num_ab_stage
             cute.arch.mbarrier_wait(bar_full + stage, full_phase)
+            _tcgen05_fence(before=False)
             for k_block in range(mma_inst_tile_k):
                 if k_block == 0:
                     mma_atom.set(tcgen05.Field.ACCUMULATE, k_tile != 0)
@@ -716,13 +755,10 @@ class SplitKDenseGemmKernel:
             tcgen05.commit(bar_mma_epilog, None, self.cta_group)
         # The release arrival must land in phase 1. Made while phase 0 is still
         # open, it counts toward phase 0, and the parity-1 wait can then pass
-        # before the epilogue has read TMEM. Phase-0 wait and tcgen05 fences as
-        # in flashinfer PR 7443.
+        # before the epilogue has read TMEM.
         cute.arch.mbarrier_wait(bar_tmem_alloc, 0)
         cute.arch.mbarrier_arrive(bar_tmem_alloc)
         cute.arch.mbarrier_wait(bar_tmem_alloc, 1)
-        # tcgen05.fence::after_thread_sync: order the dealloc after the tcgen05
-        # work handed off through the waits above.
         _tcgen05_fence(before=False)
         cute.arch.dealloc_tmem(tmem_ptr, num_tmem_cols, is_two_cta=False)
 
@@ -751,6 +787,7 @@ class SplitKDenseGemmKernel:
         # Wait until MMA publishes the TMEM base pointer.
         cute.arch.mbarrier_arrive(bar_tmem_alloc)
         cute.arch.mbarrier_wait(bar_tmem_alloc, 0)
+        _tcgen05_fence(before=False)
 
         acc_view = cute.make_tensor(
             cute.arch.retrieve_tmem_ptr(self.acc_dtype, 16, tmem_base_ptr),
@@ -814,11 +851,10 @@ class SplitKDenseGemmKernel:
                 rBiasAcc.store(rBias.load().to(self.acc_dtype))
 
         cute.arch.mbarrier_wait(bar_mma_epilog, 0)
+        _tcgen05_fence(before=False)
         cute_ext.partition_and_copy(thr_t2r, acc_view, rAcc)
         # Make tcgen05.ld visible before TMEM release and RMEM use.
         cute.arch.fence_view_async_tmem_load()
-        # tcgen05.fence::before_thread_sync: publish the retired tcgen05.ld to
-        # MMA's dealloc across the mbarrier hand-off.
         _tcgen05_fence(before=True)
         cute.arch.mbarrier_arrive(bar_tmem_alloc)
 
@@ -850,7 +886,7 @@ class SplitKDenseGemmKernel:
                     cute.arch.mbarrier_arrive_and_expect_tx(
                         bar_reduce, self.expected_transaction_bytes
                     )
-                cute.arch.mbarrier_wait(bar_reduce, 0)
+                _mbarrier_wait_acquire_cluster(bar_reduce, Int32(0))
                 for peer in cutlass.range_constexpr(self.split_k - 1):
                     for value_idx in cutlass.range_constexpr(values_per_thread):
                         rAcc[value_idx] = (
