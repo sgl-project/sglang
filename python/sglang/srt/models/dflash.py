@@ -12,8 +12,13 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from sglang.kernels.ops.speculative.dflash import selector_walk_triton
+from sglang.kernels.ops.sampling.topk import radix_topk
+from sglang.kernels.ops.speculative.dflash import (
+    dflash_grouped_conv,
+    selector_walk_triton,
+)
 from sglang.kernels.ops.speculative.lilicorr import lilicorr_topk_lse
+from sglang.srt.arg_groups.choices import DFLASH_MLA_ONLY_DRAFT_BACKENDS
 from sglang.srt.configs.draft_parallel import DraftParallelSpec, DraftTPExecution
 from sglang.srt.configs.laguna import normalize_gating
 from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
@@ -60,9 +65,18 @@ from sglang.srt.speculative.dflash_utils import (
     is_nemotron_35_draft_config,
     parse_dflash_draft_config,
 )
-from sglang.srt.utils import BumpAllocator, is_gfx95_supported, is_hip, is_npu
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.utils import (
+    BumpAllocator,
+    is_cuda,
+    is_flashinfer_available,
+    is_gfx95_supported,
+    is_hip,
+    is_npu,
+)
 from sglang.srt.utils.device import get_compiler_backend
 
+_is_cuda = is_cuda()
 _is_npu = is_npu()
 if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
@@ -91,18 +105,6 @@ _GFX950_ROWMAJOR_WEIGHTS = ((2560, 8192), (8192, 7168), (14336, 8192))
 _GFX950_HIPBLASLT_WEIGHTS = ((14336, 8192),)
 _GFX950_HIPBLASLT_ROWS = range(33, 129)
 logger = logging.getLogger(__name__)
-
-try:
-    from flashinfer import top_k as _flashinfer_top_k
-except ImportError:
-    _flashinfer_top_k = None
-
-
-def _radix_topk(scores: torch.Tensor, k: int) -> Tuple[torch.Tensor, torch.Tensor]:
-    # The selector's largest single cost: it reads the whole logits tensor.
-    if _flashinfer_top_k is not None:
-        return _flashinfer_top_k(scores, k, sorted=True, deterministic=True)
-    return torch.topk(scores, k, dim=-1)
 
 
 def _logical_linear_weight_shape(
@@ -140,8 +142,8 @@ def _project_candidate_logits(
             return bf16_gemm_dispatch(hidden, weight[:num_org], None)
         return torch.matmul(hidden, weight[:num_org].T)
     # A packed weight can't be row-sliced to the org vocab like the dense path,
-    # and flashinfer's radix top-k rejects the crop view (non-contiguous), so
-    # mask the padded tail out of the top-k instead.
+    # and flashinfer's radix top-k only reads dense rows (a crop view would be
+    # copied), so mask the padded tail out of the top-k instead.
     logits = lm_head.quant_method.apply(lm_head, hidden, None).contiguous()
     if logits.shape[-1] > num_org:
         logits[:, num_org:] = float("-inf")
@@ -198,7 +200,8 @@ def candidate_topk(
     if with_partition:
         vals, ids, lse = lilicorr_topk_lse(logits, k)
     else:
-        vals, ids = _radix_topk(logits, k)
+        # The selector's largest single cost: it reads the whole logits tensor.
+        vals, ids = radix_topk(logits, k)
     if tp:
         return ids.long(), vals, lse
     global_ids = ids.long() + int(lm_head.shard_indices.org_vocab_start_index)
@@ -533,18 +536,38 @@ class DFlashMLAAttention(DeepseekV2AttentionMLA):
         sliding_window_size, attn_type = _get_dflash_layer_attention_params(
             config, layer_id
         )
-        if sliding_window_size > -1:
+        if sliding_window_size > -1 or attn_type != AttentionType.DECODER:
             from sglang.srt.speculative.draft_worker_common import (
                 resolve_draft_worker_attention_backend,
             )
 
+            # DSPARK builds this layer too; its worker resolves without the DFLASH label.
+            is_dflash = SpeculativeAlgorithm.from_string(
+                get_spec().speculative_algorithm
+            ).is_dflash()
+            draft_attention_backend = resolve_draft_worker_attention_backend(
+                algo_label="DFLASH" if is_dflash else None
+            )
             # The other MLA backends ignore a layer's sliding window.
-            draft_attention_backend = resolve_draft_worker_attention_backend()
-            if draft_attention_backend != "triton":
+            if sliding_window_size > -1 and draft_attention_backend not in (
+                "triton",
+                *DFLASH_MLA_ONLY_DRAFT_BACKENDS,
+            ):
                 raise ValueError(
                     "DFLASH mla sliding_attention layers require "
-                    "--speculative-draft-attention-backend triton, "
-                    f"got {draft_attention_backend!r}."
+                    "--speculative-draft-attention-backend triton, trtllm_mla or "
+                    f"cutedsl_mla, got {draft_attention_backend!r}."
+                )
+            if attn_type != AttentionType.DECODER and (
+                draft_attention_backend == "trtllm_mla"
+                or (
+                    sliding_window_size > -1
+                    and draft_attention_backend == "cutedsl_mla"
+                )
+            ):
+                raise ValueError(
+                    f"{draft_attention_backend} runs DFLASH MLA draft attention "
+                    "causally; this draft sets is_causal=False."
                 )
         rope_theta, rope_scaling = get_rope_config(config)
         if rope_scaling is not None and rope_scaling.get(
@@ -817,6 +840,16 @@ class DFlashGroupedConv(nn.Module):
         )
 
     def _convolve(self, hidden_states, delta, side: int) -> torch.Tensor:
+        # NVIDIA only: the Triton kernel is not validated on ROCm.
+        if _is_cuda and hidden_states.is_cuda and hidden_states.dim() == 2:
+            return dflash_grouped_conv(
+                hidden_states=hidden_states,
+                delta=delta,
+                base=self.base_kernel[side],
+                block_size=self.block_size,
+                group_size=self.group_size,
+                taps=self.taps,
+            )
         # Marked here, not inside: by the time the compiled function traces, the dim
         # is symbolic and the group index costs an integer div and mod per element.
         torch._dynamo.mark_static(hidden_states, 1)
@@ -1513,7 +1546,7 @@ class CandidateSelector(nn.Module):
         top_k: int,
     ) -> None:
         super().__init__()
-        if _flashinfer_top_k is None:
+        if not is_flashinfer_available():
             logger.warning(
                 "flashinfer is unavailable; the DFlash2 selector falls back to "
                 "torch.topk, which roughly halves end-to-end throughput on a large "

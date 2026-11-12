@@ -10,6 +10,7 @@ import torch
 import torch.nn.functional as F
 
 from sglang.kernels.ops.sampling import argmax as sampling_argmax
+from sglang.kernels.ops.sampling.topk import radix_topk
 from sglang.kernels.ops.speculative.verify_sampling import (
     tree_speculative_sampling_target_only,
 )
@@ -1159,14 +1160,13 @@ def build_speculative_verify_target_probs(
     expanded_temperature = torch.repeat_interleave(
         sampling_info.temperatures, draft_token_num, dim=0
     )
-    scaled_logits = next_token_logits / expanded_temperature
     sparse_topk_applied = False
 
     if use_sparse_topk and need_top_k:
         repeated_top_ks = torch.repeat_interleave(
             sampling_info.top_ks, draft_token_num, dim=0
         ).to(dtype=torch.int64)
-        vocab_size = int(scaled_logits.shape[-1])
+        vocab_size = int(next_token_logits.shape[-1])
         repeated_top_ks.clamp_(min=1, max=vocab_size)
         if max_top_k is None:
             max_top_k = int(repeated_top_ks.max().item())
@@ -1179,7 +1179,10 @@ def build_speculative_verify_target_probs(
 
         # Sparse exact path for joint top-k/top-p filtering, then scatter to dense.
         if 0 < max_top_k < vocab_size:
-            topk_logits, topk_indices = torch.topk(scaled_logits, k=max_top_k, dim=-1)
+            # A positive temperature keeps the order of the logits, so select on
+            # the raw logits and scale only the selected values.
+            topk_logits, topk_indices = radix_topk(next_token_logits, max_top_k)
+            topk_logits = topk_logits / expanded_temperature
             if uniform_top_k_value is None or int(uniform_top_k_value) != max_top_k:
                 ranks = torch.arange(max_top_k, device=device, dtype=torch.int64)[
                     None, :
@@ -1192,6 +1195,7 @@ def build_speculative_verify_target_probs(
                 repeated_top_ps = torch.repeat_interleave(
                     sampling_info.top_ps, draft_token_num, dim=0
                 )
+                scaled_logits = next_token_logits / expanded_temperature
                 if is_cuda() and getattr(sampling_info, "sampling_seed", None) is None:
                     adjusted_top_ps = _adjust_top_p_for_top_k(
                         topk_logits, scaled_logits, repeated_top_ps[:, None]
@@ -1205,12 +1209,12 @@ def build_speculative_verify_target_probs(
                     adjusted_top_ps = torch.clamp(repeated_top_ps / topk_mass, max=1.0)
                 topk_probs = _dflash_top_p_renorm_prob(topk_probs, adjusted_top_ps)
 
-            target_probs = torch.zeros_like(scaled_logits, dtype=topk_probs.dtype)
+            target_probs = topk_probs.new_zeros(next_token_logits.shape)
             target_probs.scatter_(1, topk_indices, topk_probs)
             sparse_topk_applied = True
 
     if not sparse_topk_applied:
-        target_probs = F.softmax(scaled_logits, dim=-1)
+        target_probs = F.softmax(next_token_logits / expanded_temperature, dim=-1)
         if need_top_p:
             target_probs = _dflash_top_p_renorm_prob(
                 target_probs,

@@ -28,7 +28,10 @@ from sglang.srt.layers.dcp import (
     dcp_push_combine_fits,
     dcp_push_combine_reduce,
 )
-from sglang.srt.layers.dcp.layout import dsa_shards_index_k
+from sglang.srt.layers.dcp.layout import (
+    dsa_shards_index_k,
+    is_mla_dcp_lse_base_on_e,
+)
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
 from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
 from sglang.srt.lora.utils import kv_b_lora_correction
@@ -91,13 +94,6 @@ def _select_local_dcp_heads_for_autotune(
     """Select this rank's head shard without communicating dummy outputs."""
     rank = get_parallel().attn_dcp_rank
     return attn_output.narrow(1, rank * num_local_heads, num_local_heads)
-
-
-def is_mla_dcp_lse_base_on_e(attention_backend: Optional[str]) -> bool:
-    if attention_backend == "dsa":
-        # trtllm-gen partials carry a base-2 LSE.
-        return dsa_shards_index_k() and get_exec().kernel.dsa_decode_backend != "trtllm"
-    return attention_backend in {"flashmla", "cutedsl_mla", "aiter"}
 
 
 @eager_on_graph(True)
