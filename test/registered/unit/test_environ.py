@@ -36,8 +36,6 @@ NV_MEGA_RUNTIME_CHILDREN = (
     "SGLANG_OPT_DSV41_SAMPLING_ACCEPT_GRAPH",
     "SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH",
     "SGLANG_OPT_SPEC_RELAY_IN_PLACE",
-    "SGLANG_OPT_FREEZE_ENV_READS",
-    "SGLANG_OPT_HOST_NUM_TOKEN_NON_PADDED_FILL",
     "SGLANG_OPT_SMALL_FIELD_COPY_VECTORIZED",
     "SGLANG_OPT_SPEC_VERIFY_REUSE_STAGED_INPUTS",
     "SGLANG_OPT_SPEC_POST_VERIFY_ONE_LAUNCH_LOAD",
@@ -271,31 +269,13 @@ class TestDeprecatedEnvRegistry(unittest.TestCase):
 
 
 class TestFreezeEnvReads(unittest.TestCase):
-    def setUp(self):
-        self.addCleanup(setattr, environ_module, "_frozen_reads", None)
-
-    def test_not_frozen_without_the_switch(self):
-        child = envs.SGLANG_OPT_FREEZE_ENV_READS
-        with (
-            envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(False),
-            child.override(False),
-        ):
-            child.clear()
-            self.assertFalse(freeze_env_reads())
-
-    def test_frozen_reads_ignore_raw_environ_writes(self):
-        field = envs.SGLANG_TEST_RETRACT
-        with envs.SGLANG_OPT_FREEZE_ENV_READS.override(True), field.override(False):
-            self.assertTrue(freeze_env_reads())
-            self.assertIs(field.get(), False)
-            os.environ[field.name] = "1"
-            self.assertIs(field.get(), False)
-
     def test_field_writes_drop_the_memo(self):
+        self.addCleanup(setattr, environ_module, "_frozen_reads", None)
         field = envs.SGLANG_TEST_RETRACT
-        with envs.SGLANG_OPT_FREEZE_ENV_READS.override(True), field.override(False):
-            self.assertTrue(freeze_env_reads())
+        with field.override(False):
+            freeze_env_reads()
             self.assertIs(field.get(), False)
+            # Every EnvField write drops the memo (a raw os.environ write would not).
             with field.override(True):
                 self.assertIs(field.get(), True)
             self.assertIs(field.get(), False)

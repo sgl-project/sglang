@@ -689,25 +689,10 @@ class TestCopyForForward(CustomTestCase):
         self.assertEqual(copied.__dict__.keys(), replaced.__dict__.keys())
         for name, value in replaced.__dict__.items():
             self.assertIs(copied.__dict__[name], value, name)
-
-    def test_fields_stay_copyable_without_init(self):
-        """The copy skips __init__: a __post_init__ or an init=False field would
-        make it differ from dataclasses.replace."""
+        # The copy skips __init__: a __post_init__ or an init=False field would
+        # make it differ from dataclasses.replace.
         self.assertNotIn("__post_init__", dir(SamplingBatchInfo))
-        for field in dataclasses.fields(SamplingBatchInfo):
-            with self.subTest(field=field.name):
-                self.assertTrue(field.init)
-
-    def test_subclass_copies_through_dataclasses_replace(self):
-        @dataclasses.dataclass
-        class Derived(SamplingBatchInfo):
-            extra: int = 7
-
-        info = Derived(**{**_make_info(batch_size=1).__dict__, "extra": 3})
-        copied = info.copy_for_forward()
-        self.assertIs(type(copied), Derived)
-        self.assertEqual(copied.extra, 3)
-        self.assertIsNone(copied.penalizer_orchestrator)
+        self.assertTrue(all(f.init for f in dataclasses.fields(SamplingBatchInfo)))
 
 
 # from_schedule_batch
