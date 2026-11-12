@@ -209,6 +209,7 @@ def fused_dsa_decode_metadata(
         "real_page_table_stride_0",
         "bs",
         "max_seqlen_k",
+        "max_splits",
     ]
 )
 def _fused_dsa_target_verify_metadata_kernel(
