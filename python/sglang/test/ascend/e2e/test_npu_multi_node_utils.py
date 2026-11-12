@@ -727,11 +727,13 @@ def launch_pd_separation_node(model_config):
 
     # The npu_memcache L3 backend connects to the Ascend MemCache MetaService
     # as soon as the model server starts, so the service must already be
-    # listening on this pod's IP. It is enabled through the storage backend
-    # extra config flag, which only the prefill side carries.
+    # listening. It is enabled through the storage backend extra config flag,
+    # which only the prefill side carries. All pods use the same prefill node
+    # IP (read from the ConfigMap above) so there is a single MetaService
+    # address regardless of where each pod runs.
     meta_service_process = None
     if "--hicache-storage-backend-extra-config" in service_args:
-        meta_service_process = start_meta_service(host_ip)
+        meta_service_process = start_meta_service(master_prefill_ip)
 
     other_args.extend(service_args)
 
@@ -899,11 +901,12 @@ def launch_router(model_config):
 
 
 def start_meta_service(host_ip):
-    """Start the npu_memcache MetaService on this pod before the model server.
+    """Start the npu_memcache MetaService before the model server.
 
     The L3 npu_memcache backend connects to the Ascend MemCache MetaService
-    at startup, so it must already be listening. The service is hosted on the
-    current pod's IP, which is also what the L3 backend extra config targets.
+    at startup, so it must already be listening. ``host_ip`` is the prefill
+    node IP shared by all pods, which is also what the L3 backend extra config
+    targets.
 
     Returns the MetaService process.
     """
