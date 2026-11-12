@@ -317,6 +317,11 @@ class Envs:
     SGLANG_OPT_POST_VERIFY_POOL_PRESIZE = EnvRuntimeBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # Host-only Mamba checkpoints: the D2H copy does not block the host; a finished
+    # request's tracking slot is parked until it lands.
+    SGLANG_OPT_MAMBA_HOST_CHECKPOINT_NO_WAIT = EnvRuntimeBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
     # HiCache Mamba side-state rows backed up / loaded by stream-ordered kernels.
     SGLANG_OPT_HICACHE_MAMBA_SLOT_STATE_ASYNC = EnvRuntimeBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
