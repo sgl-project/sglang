@@ -343,6 +343,21 @@ class TestMegakernelRuntime(CustomTestCase):
         self.assertIsInstance(lm.context.binding, OtherBinding)
         self.assertIs(lm.context.binding.model, lm)
 
+    def test_a_spec_that_names_its_binding_gets_it_whatever_its_architecture(self):
+        with (
+            patch.dict(binding._BINDINGS, {ARCH: OtherBinding}),
+            patch.object(binding, "BINDING_KINDS", {"other": Mock}),
+        ):
+            lm = self._install_spec(replace(SPEC, binding="other"), tokens=1)
+        self.assertIsInstance(lm.context.binding, Mock)
+        self.assertIs(
+            binding._binding_class([ARCH], kind="eagle_hybrid"),
+            binding.BINDING_KINDS["eagle_hybrid"],
+        )
+        # an unknown kind is refused on every rank before build
+        with self.assertRaisesRegex(ValueError, "binding 'nope' is not one of"):
+            self._install_spec(replace(SPEC, binding="nope"), tokens=1)
+
     def test_offered_entries_reach_sglang_only_when_every_rank_offers_them(self):
         registry.register(architecture="EagleDraft", path="_fakes:EAGLE_DRAFT")
         lm = install(archs=["EagleDraft"], is_draft=True)

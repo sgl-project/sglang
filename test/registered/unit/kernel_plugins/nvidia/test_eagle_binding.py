@@ -607,6 +607,7 @@ class TestEagleEntries(CustomTestCase):
                     prepare=None,
                     max_rows=4,
                     numerics=SimpleNamespace(kind=SimpleNamespace(value="exact")),
+                    binding="",
                 )
                 hooks = []
                 refused = (

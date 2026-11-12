@@ -579,6 +579,9 @@ class MegakernelSpec(msgspec.Struct, frozen=True):
     tensor_verify_build: Optional[Callable[[Any, float], BuiltMegakernel]] = None
     # Pool preparation after allocation and before any forward or graph capture.
     prepare: Optional[Callable[[BuiltMegakernel, PreparationView], None]] = None
+    # The binding kind SGLang hands build and forward (BINDING_KINDS in
+    # sglang.srt.kernel_plugins.nvidia.binding); empty picks it by architecture.
+    binding: str = ""
 
 
 # HF architecture -> the "module:attribute" path of its spec

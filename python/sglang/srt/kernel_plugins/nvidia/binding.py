@@ -89,7 +89,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# HF architecture -> the binding its megakernel gets; every other architecture gets
+# For a spec that names no binding kind: HF architecture -> the binding its
+# megakernel gets; every other architecture gets
 # MegakernelBinding.
 _BINDINGS: dict[str, type] = {
     arch: EagleBinding
@@ -1252,7 +1253,7 @@ def install_megakernel(
     _refuse(_gather_reasons(reasons))
 
     tokens = _tokens_per_request()
-    binding = _binding_class(hf_config.architectures)(model=model)
+    binding = _binding_class(hf_config.architectures, kind=spec.binding)(model=model)
     context = BuildContext(
         widths=_kimi_build_widths(
             spec.max_rows, tokens, hf_config.architectures, is_draft=is_draft
@@ -1449,8 +1450,17 @@ def _offered_graph_variants(
     return {} if built is None or built.graph_variants is None else built.graph_variants
 
 
-def _binding_class(architectures: Optional[list[str]]) -> type:
-    """Return the binding for the first registered model architecture."""
+# MegakernelSpec.binding -> the binding SGLang builds for that spec.
+BINDING_KINDS: Mapping[str, type] = MappingProxyType(
+    {"default": MegakernelBinding, "eagle_hybrid": EagleBinding}
+)
+
+
+def _binding_class(architectures: Optional[list[str]], kind: str = "") -> type:
+    """Return the binding the spec names, else the one of the first registered model
+    architecture."""
+    if kind:
+        return BINDING_KINDS[kind]
     for arch in architectures or ():
         if arch in _BINDINGS:
             return _BINDINGS[arch]
@@ -1506,6 +1516,10 @@ def _requirement_reasons(
     """The spec's requirements this runner can check without the server arguments."""
     req, tp_size = spec.requires, get_parallel().tp_size
     reasons = []
+    if spec.binding and spec.binding not in BINDING_KINDS:
+        reasons.append(
+            f"binding {spec.binding!r} is not one of {sorted(BINDING_KINDS)}"
+        )
     # an empty set accepts any TP size, as at argument resolution
     if req.tp_sizes and tp_size not in req.tp_sizes:
         reasons.append(f"tp_size {tp_size} is not one of {sorted(req.tp_sizes)}")
@@ -1567,7 +1581,7 @@ class _Dispatch:
     """The installed forward: covered steps run the built megakernel."""
 
     def __init__(self, *, built: BuiltMegakernel, original: Callable, binding: Any):
-        # MegakernelBinding, or the model-specific binding in _BINDINGS.
+        # MegakernelBinding, or the binding the spec names or _BINDINGS maps.
         self.built, self.original, self.binding = built, original, binding
         # batch size -> the step planned while capturing its decode graphs; plan reads
         # only the mode and rows, so every graph variant of a batch size plans alike
