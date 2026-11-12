@@ -171,19 +171,6 @@ class FeedbackJournal:
             self.append(
                 "claim", result.ref.context.caller_id, result.public_result.claim
             )
-        if (
-            result.update.logical_change is not None
-            and result.update.logical_change.removed_tasks
-        ):
-            self.append(
-                "association",
-                result.ref.context.caller_id,
-                {
-                    "operation_ref": result.ref,
-                    "change": result.update.logical_change,
-                    "association_state": "local_index_change",
-                },
-            )
 
     def register_request(self, context, request_id):
         self._owner()

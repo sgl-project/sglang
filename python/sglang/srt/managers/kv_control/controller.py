@@ -134,8 +134,7 @@ class KVControl:
         submission = self.registry.reserve(batch, context)
         if submission.replayed:
             return msgspec.structs.replace(submission, unhandled_actions=unhandled)
-        # Resolve every historical selector against the state at submission,
-        # before any sibling can mutate the index. List order is no dependency API.
+        # Freeze each prefix at submission; action order is not a dependency API.
         prepared = []
         for frozen in batch.actions:
             try:
@@ -411,11 +410,6 @@ class KVControl:
 
     @staticmethod
     def _validate_execution(pending, update):
-        if update.logical_change is not None or update.derived_operations:
-            raise ControlError(
-                "invalid_completion",
-                "Executors cannot report logical mutations or create child operations",
-            )
         payload = pending.payload
         location = payload.destination
         required = (

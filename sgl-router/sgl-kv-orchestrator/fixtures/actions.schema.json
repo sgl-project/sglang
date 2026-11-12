@@ -447,7 +447,6 @@
           "anyOf": [
             {
               "enum": [
-                "backend_soft_pin",
                 "eviction_exclusion",
                 "eviction_priority"
               ]

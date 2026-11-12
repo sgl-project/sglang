@@ -39,13 +39,8 @@ class Limits(Value):
     max_records: int = 4096
     max_messages: int = 8192
     retention_seconds: float = 300.0
-    max_sessions: int = 4096
-    max_continuations: int = 16384
-    max_index_spans: int = 65536
-    max_index_tokens: int = 1048576
     max_scope_spans: int = 4096
     max_scope_tokens: int = 65536
-    max_branches: int = 256
     max_page_size: int = 256
 
     def __post_init__(self):
@@ -236,9 +231,9 @@ class Pin(Value):
     revision: Position
     ttl_seconds: Seconds | None = None
     priority: Priority | None = None
-    required_protection: (
-        Literal["eviction_exclusion", "eviction_priority", "backend_soft_pin"] | None
-    ) = None
+    required_protection: Literal["eviction_exclusion", "eviction_priority"] | None = (
+        None
+    )
     # Explicit demand ownership, independent of the selected content/session.
     owner_task: TaskIdentity | None = None
 
@@ -255,9 +250,9 @@ class ClaimState(Value):
     # A release tombstone fences late renewals without asserting live protection.
     protection_version: Literal["1.0"] = "1.0"
     tombstone: bool = False
-    effective_protection: (
-        Literal["eviction_exclusion", "eviction_priority", "backend_soft_pin"] | None
-    ) = None
+    effective_protection: Literal["eviction_exclusion", "eviction_priority"] | None = (
+        None
+    )
     remaining_ttl: Seconds | None = None
     priority: Priority | None = None
     owner_task: TaskIdentity | None = None
@@ -322,14 +317,6 @@ class TaskIdentity(Value):
     incarnation: Position
 
 
-class LogicalChange(Value):
-    index_generation: Position
-    session_revision: Position | None = None
-    continuation_revision: Position | None = None
-    incarnation: Position | None = None
-    removed_tasks: tuple[TaskIdentity, ...] = ()
-
-
 class ExecutionUpdate(Value):
     status: Status
     # True certifies all access/retirement obligations for this operation ended.
@@ -339,9 +326,6 @@ class ExecutionUpdate(Value):
     reason: str = ""
     completed_steps: tuple[Identifier, ...] = ()
     target_outcomes: tuple[TargetOutcome, ...] = ()
-    logical_change: LogicalChange | None = None
-    # Owner-created children have independent results/cancellation lifetimes.
-    derived_operations: tuple[OperationRef, ...] = ()
 
 
 class PublicResult(Value, kw_only=True):
