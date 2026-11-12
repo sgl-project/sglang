@@ -343,13 +343,9 @@ class KVEventBatch(EventBatch):
     events: list[Union[BlockStored, BlockRemoved, AllBlocksCleared]]
 
 
-class WatermarkedKVEventBatch(KVEventBatch):
-    """Optional fourth batch slot; legacy event variants remain unchanged."""
-    cache_watermark: dict[str, Any] | None = None
-
-
 class PublisherBatch(Protocol):
     """Shared transport metadata for location and independent control batches."""
+
     attn_dp_rank: Optional[int]
 
 

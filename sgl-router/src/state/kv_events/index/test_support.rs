@@ -19,7 +19,6 @@ pub(super) fn batch(events: Vec<KvCacheEvent>) -> KvEventBatch {
         ts: 0.0,
         events,
         attn_dp_rank: None,
-        cache_watermark: None,
     }
 }
 

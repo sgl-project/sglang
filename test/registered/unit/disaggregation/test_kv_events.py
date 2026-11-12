@@ -22,7 +22,6 @@ from sglang.srt.disaggregation.kv_events import (
     EventPublisherFactory,
     KVEventBatch,
     StorageMedium,
-    WatermarkedKVEventBatch,
     ZmqEventPublisher,
     kv_event_namespace_seed,
     namespaced_block_hash,
@@ -154,17 +153,6 @@ class TestBlockStoredWireFormat(CustomTestCase):
         self.assertEqual([e.session_id for e in stored], [None, None, "session-a"])
         self.assertIsInstance(round_tripped.events[3], BlockRemoved)
         self.assertIsInstance(round_tripped.events[4], AllBlocksCleared)
-
-    def test_watermark_tail_preserves_legacy_batch_and_event_decoding(self):
-        old = KVEventBatch(ts=1, events=[self._event(session_id="s"), AllBlocksCleared()])
-        old_bytes = msgspec.msgpack.encode(old)
-        self.assertEqual(len(msgspec.msgpack.decode(old_bytes)), 3)
-        self.assertIsNone(msgspec.msgpack.decode(old_bytes, type=WatermarkedKVEventBatch).cache_watermark)
-        watermark = dict(source_id="cache:owner", source_epoch="cache-epoch", generation=2, version=9)
-        extended = WatermarkedKVEventBatch(ts=1, events=old.events, cache_watermark=watermark)
-        encoded = msgspec.msgpack.encode(extended)
-        self.assertEqual(msgspec.msgpack.decode(encoded, type=KVEventBatch), old)
-        self.assertEqual(msgspec.msgpack.decode(encoded, type=WatermarkedKVEventBatch).cache_watermark, watermark)
 
 
 class TestNamespacedBlockHash(CustomTestCase):

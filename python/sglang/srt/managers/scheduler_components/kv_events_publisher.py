@@ -11,10 +11,10 @@ from typing import (
 
 import msgspec
 import zmq
+
 from sglang.srt.disaggregation.kv_events import (
     EventPublisherFactory,
     KVEventBatch,
-    WatermarkedKVEventBatch,
     is_kv_publisher_rank,
     select_kv_publisher_dp_rank,
 )
@@ -101,14 +101,5 @@ class SchedulerKvEventsPublisher:
 
         events = self.tree_cache.take_events()
         if events:
-            service = getattr(self.tree_cache, "kv_control_service", None)
-            batch = (
-                WatermarkedKVEventBatch(
-                    ts=time.time(),
-                    events=events,
-                    cache_watermark=msgspec.to_builtins(service.cache_watermark()),
-                )
-                if service is not None
-                else KVEventBatch(ts=time.time(), events=events)
-            )
+            batch = KVEventBatch(ts=time.time(), events=events)
             self.kv_event_publisher.publish(batch)

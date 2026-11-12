@@ -41,15 +41,6 @@ pub struct KvEventBatch {
     /// publisher emitted nil. The decoder also accepts an omitted field for
     /// compatibility.
     pub attn_dp_rank: Option<u32>,
-    pub cache_watermark: Option<CacheWatermark>,
-}
-
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-pub struct CacheWatermark {
-    pub source_id: String,
-    pub source_epoch: String,
-    pub generation: u64,
-    pub version: u64,
 }
 
 /// A single KV cache event. The Python base class `KVCacheEvent` uses
@@ -370,7 +361,6 @@ impl<'de> Deserialize<'de> for KvEventBatch {
                 // attn_dp_rank may be present-as-nil, present-as-int, or
                 // omitted entirely under msgspec's `omit_defaults`.
                 let attn_dp_rank: Option<u32> = seq.next_element()?.unwrap_or(None);
-                let cache_watermark: Option<CacheWatermark> = seq.next_element()?.unwrap_or(None);
                 // Drain any extra trailing fields a future schema might add
                 // (forward-compat).
                 while seq.next_element::<IgnoredAny>()?.is_some() {}
@@ -378,7 +368,6 @@ impl<'de> Deserialize<'de> for KvEventBatch {
                     ts,
                     events,
                     attn_dp_rank,
-                    cache_watermark,
                 })
             }
         }
@@ -905,31 +894,6 @@ mod tests {
         let batch = decode_event_batch(&bytes).expect("decode");
         assert_eq!(batch.attn_dp_rank, None);
         assert_eq!(batch.events.len(), 1);
-        assert_eq!(batch.cache_watermark, None);
-    }
-
-    #[test]
-    fn optional_watermark_tail_is_distinct_from_publisher_sequence() {
-        let mut bytes = build_batch_bytes(5.0, &[build_all_blocks_cleared_bytes()], Some(3), true);
-        bytes[0] = 0x94; // Four slots, with the legacy three preserved verbatim.
-        mp::write_map_len(&mut bytes, 4).unwrap();
-        for (key, value) in [
-            ("source_id", "cache:owner"),
-            ("source_epoch", "cache-epoch"),
-        ] {
-            write_key(&mut bytes, key);
-            mp::write_str(&mut bytes, value).unwrap();
-        }
-        for (key, value) in [("generation", 2), ("version", 9)] {
-            write_key(&mut bytes, key);
-            mp::write_uint(&mut bytes, value).unwrap();
-        }
-        let decoded = decode_event_batch(&bytes).unwrap();
-        assert_eq!(decoded.attn_dp_rank, Some(3));
-        let watermark = decoded.cache_watermark.unwrap();
-        assert_eq!(watermark.source_epoch, "cache-epoch");
-        assert_eq!((watermark.generation, watermark.version), (2, 9));
-        assert_eq!(decoded.events, vec![KvCacheEvent::AllBlocksCleared]);
     }
 
     #[test]

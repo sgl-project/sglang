@@ -19,7 +19,6 @@ import zmq
 from sglang.srt.disaggregation.kv_events import (
     AllBlocksCleared,
     KVEventBatch,
-    WatermarkedKVEventBatch,
     ZmqEventPublisher,
 )
 from sglang.srt.managers.kv_control.contracts import Status
@@ -30,9 +29,6 @@ from sglang.srt.managers.kv_control.feedback import (
 )
 from sglang.srt.managers.kv_control.service import ServiceConfig, dispatch
 from sglang.srt.managers.schedule_batch import FINISH_LENGTH
-from sglang.srt.managers.scheduler_components.kv_events_publisher import (
-    SchedulerKvEventsPublisher,
-)
 from sglang.srt.utils.network import get_free_port
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -143,36 +139,6 @@ class TestKVControlFeedback(cache_fixtures.KVCacheTestCase):
                 msgspec.to_builtins(done.cache_watermark),
             )
             cache.sanity_check()
-
-    def test_location_publisher_attaches_same_owner_cache_watermark_without_control_events(
-        self,
-    ):
-        with transfer_fixtures.hicache(self) as owner:
-            _, cache, service, _ = owner
-            cache.tree_core.kv_events.enabled = True
-            cache.tree_core.kv_events.record_all_cleared()
-            batches = []
-
-            class Sink:
-                def publish(self, batch):
-                    batches.append(batch)
-
-            publisher = SchedulerKvEventsPublisher.__new__(SchedulerKvEventsPublisher)
-            publisher.enable_kv_cache_events = True
-            publisher.tree_cache = cache
-            publisher.kv_event_publisher = Sink()
-            publisher.publish_kv_events()
-            self.assertIsInstance(batches[0], WatermarkedKVEventBatch)
-            self.assertEqual(
-                batches[0].cache_watermark,
-                msgspec.to_builtins(service.cache_watermark()),
-            )
-            legacy = msgspec.msgpack.decode(
-                msgspec.msgpack.encode(batches[0]), type=KVEventBatch
-            )
-            self.assertTrue(
-                all(isinstance(event, AllBlocksCleared) for event in legacy.events)
-            )
 
     def test_owner_watermark_orders_real_ready_remove_and_scoped_reconciliation(self):
         with transfer_fixtures.hicache(self, storage=True) as owner:
