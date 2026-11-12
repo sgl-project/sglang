@@ -24,6 +24,7 @@ from sglang.srt.arg_groups.overrides import (
 )
 from sglang.srt.configs.ernie55 import ERNIE5_5_MOE_ARCH
 from sglang.srt.environ import envs
+from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
 
@@ -453,8 +454,16 @@ def _handle_dflash(server_args: ServerArgs) -> None:
 def _handle_uno(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
 
-    if not cfg.device.startswith("cuda"):
-        raise ValueError("UNO only supports CUDA.")
+    is_xpu = cfg.device == "xpu"
+    if not (cfg.device.startswith("cuda") or is_xpu):
+        raise ValueError("UNO only supports CUDA and XPU.")
+    if is_xpu and cfg.cuda_graph_config.decode.backend != Backend.DISABLED:
+        # The XPU graph runner is not UNO's runner, so a captured draft would
+        # replay without its LoRA routing.
+        raise ValueError(
+            "UNO on XPU does not support decode graphs yet; "
+            "drop --cuda-graph-backend-decode."
+        )
     if cfg.speculative_draft_model_path is not None:
         raise ValueError(
             "UNO reuses the target model and does not accept "
@@ -606,9 +615,11 @@ def _handle_uno(server_args: ServerArgs) -> None:
         )
 
     prefill_backend, decode_backend = attention_backends_of(resolved_view(server_args))
-    if (prefill_backend, decode_backend) != ("fa3", "fa3"):
+    supported_backends = ("intel_xpu", "triton") if is_xpu else ("fa3",)
+    if prefill_backend != decode_backend or decode_backend not in supported_backends:
         raise ValueError(
-            "UNO requires FA3 for both prefill and decode attention; "
+            "UNO requires the same attention backend for prefill and decode, "
+            f"one of {supported_backends} on {cfg.device}; "
             f"got prefill={prefill_backend!r}, decode={decode_backend!r}."
         )
 

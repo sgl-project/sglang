@@ -1,6 +1,6 @@
 """Single-adapter LoRA backend for UNO draft forwards.
 
-Parallel-linear layers overlap LoRA-A with the base GEMM on an auxiliary CUDA
+Parallel-linear layers overlap LoRA-A with the base GEMM on an auxiliary device
 stream. Other dense LoRA layers use the inherited Triton implementation.
 Single-request cuBLAS batches operate only on draft rows; larger batches use
 one ``mm``/``addmm_`` over all rows and zero the seed-row LoRA hidden states
@@ -38,7 +38,7 @@ class _UnoSingleAdapterRoute:
 @dataclass(frozen=True)
 class _PendingLoRAA:
     output: torch.Tensor
-    producer_stream: torch.cuda.Stream
+    producer_stream: torch.Stream
 
 
 class UnoCublasLoRABackend(TritonLoRABackend):
@@ -64,10 +64,12 @@ class UnoCublasLoRABackend(TritonLoRABackend):
         **kwargs,
     ):
         super().__init__(max_loras_per_batch, device, **kwargs)
+        # torch.cuda on CUDA/ROCm, torch.xpu on XPU.
+        self._device_module = torch.get_device_module(device)
         # Different CUDA-graph runners may capture and replay on different main
         # streams. Give each main stream its own LoRA-A side stream so concurrently
         # replayed graphs do not serialize or interfere through one shared stream.
-        self._lora_a_streams: dict[torch.cuda.Stream, torch.cuda.Stream] = {}
+        self._lora_a_streams: dict[torch.Stream, torch.Stream] = {}
         self._pending_lora_a: Optional[_PendingLoRAA] = None
         self._use_cublas_lora_b = False
 
@@ -418,15 +420,16 @@ class UnoCublasLoRABackend(TritonLoRABackend):
         lora_input = self._lora_a_input(x, route)
         active_a = weights[route.weight_index, :out_dim]
 
-        main_stream = torch.cuda.current_stream(x.device)
+        device_module = self._device_module
+        main_stream = device_module.current_stream(x.device)
         stream = self._lora_a_streams.get(main_stream)
         if stream is None:
-            if torch.cuda.is_current_stream_capturing():
+            if device_module.is_current_stream_capturing():
                 raise RuntimeError(
                     "UNO LoRA overlap side stream was not created during "
                     "CUDA-graph warmup."
                 )
-            stream = torch.cuda.Stream(device=x.device)
+            stream = device_module.Stream(device=x.device)
             self._lora_a_streams[main_stream] = stream
 
         # Allocate on the main/consumer stream before handing the buffer to
@@ -438,7 +441,7 @@ class UnoCublasLoRABackend(TritonLoRABackend):
             device=x.device,
         )
         stream.wait_stream(main_stream)
-        with torch.cuda.stream(stream):
+        with device_module.stream(stream):
             self._compute_lora_a(lora_input, active_a, route, output=output)
 
         self._pending_lora_a = _PendingLoRAA(
@@ -451,7 +454,7 @@ class UnoCublasLoRABackend(TritonLoRABackend):
         pending: _PendingLoRAA,
     ) -> torch.Tensor:
         self._pending_lora_a = None
-        torch.cuda.current_stream(pending.output.device).wait_stream(
+        self._device_module.current_stream(pending.output.device).wait_stream(
             pending.producer_stream
         )
         return pending.output
