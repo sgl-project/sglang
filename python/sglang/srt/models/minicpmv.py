@@ -1765,6 +1765,21 @@ class MiniCPMV:
             raise e
         self.config = config
 
+    def train(self, mode: bool = True):
+        """Stay on this wrapper.
+
+        ``__getattr__`` forwards unknown names to the inner module, and
+        ``nn.Module.train`` / ``eval`` return that module. ``load_model``
+        finishes with ``return model.eval()``, so a forwarded ``eval``
+        replaces the wrapper with the inner ``MiniCPMV*`` and drops
+        attributes set on the wrapper, including ``shared_experts_config``.
+        """
+        self.minicpmv.train(mode)
+        return self
+
+    def eval(self):
+        return self.train(False)
+
     def __getattr__(self, name):
         if name == "minicpmv":
             return None
