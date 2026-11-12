@@ -5,6 +5,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=26, suite="base-a-test-cpu")
 register_cpu_ci(est_time=6, suite="stage-b-test-cpu-intel")
 
+import dataclasses
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -675,25 +676,38 @@ class TestMergeBatch(CustomTestCase):
 
 # copy_for_forward
 class TestCopyForForward(CustomTestCase):
-    def test_returns_copy_without_orchestrator(self):
-        """Both copy implementations preserve every field except the forward-only
-        penalizer removal, including fields declared with init=False."""
-        for fast_path in (False, True):
-            orch = MagicMock(is_required=False)
-            info = _make_info(batch_size=1, penalizer_orchestrator=orch)
-            with (
-                self.subTest(fast_path=fast_path),
-                patch(
-                    "sglang.srt.sampling.sampling_batch_info._fast_copy_enabled",
-                    return_value=fast_path,
-                ),
-            ):
-                copied = info.copy_for_forward()
-            self.assertIsNone(copied.penalizer_orchestrator)
-            self.assertIs(info.penalizer_orchestrator, orch)
-            for name, value in info.__dict__.items():
-                if name != "penalizer_orchestrator":
-                    self.assertIs(copied.__dict__[name], value, name)
+    def test_copy_matches_dataclasses_replace(self):
+        """The one-dict-update copy holds exactly what dataclasses.replace holds:
+        every field, with the forward-only penalizer removed."""
+        orch = MagicMock(is_required=False)
+        info = _make_info(batch_size=1, penalizer_orchestrator=orch)
+        copied = info.copy_for_forward()
+        replaced = dataclasses.replace(info, penalizer_orchestrator=None)
+        self.assertIs(type(copied), SamplingBatchInfo)
+        self.assertIsNone(copied.penalizer_orchestrator)
+        self.assertIs(info.penalizer_orchestrator, orch)
+        self.assertEqual(copied.__dict__.keys(), replaced.__dict__.keys())
+        for name, value in replaced.__dict__.items():
+            self.assertIs(copied.__dict__[name], value, name)
+
+    def test_fields_stay_copyable_without_init(self):
+        """The copy skips __init__: a __post_init__ or an init=False field would
+        make it differ from dataclasses.replace."""
+        self.assertNotIn("__post_init__", dir(SamplingBatchInfo))
+        for field in dataclasses.fields(SamplingBatchInfo):
+            with self.subTest(field=field.name):
+                self.assertTrue(field.init)
+
+    def test_subclass_copies_through_dataclasses_replace(self):
+        @dataclasses.dataclass
+        class Derived(SamplingBatchInfo):
+            extra: int = 7
+
+        info = Derived(**{**_make_info(batch_size=1).__dict__, "extra": 3})
+        copied = info.copy_for_forward()
+        self.assertIs(type(copied), Derived)
+        self.assertEqual(copied.extra, 3)
+        self.assertIsNone(copied.penalizer_orchestrator)
 
 
 # from_schedule_batch
