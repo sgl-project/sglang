@@ -1064,7 +1064,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
         return output
 
 
-def _use_xpu_moe_ld_padding(use_triton_kernels: bool) -> bool:
+def _use_xpu_moe_ld_padding() -> bool:
     """Whether MoE expert weights should get a padded row stride for XPU.
 
     is_xpu() only tells us an XPU exists on this machine, not that the weights
@@ -1075,14 +1075,12 @@ def _use_xpu_moe_ld_padding(use_triton_kernels: bool) -> bool:
     backends' MoE kernels expect contiguous expert tensors.
 
     The Triton path stores B transposed and does not read a row stride, so it
-    is excluded even on XPU (either via --moe-runner-backend triton or the
-    triton_kernels build).
+    is excluded even on XPU (--moe-runner-backend triton).
     """
     return (
         is_xpu()
         and not get_moe_runner_backend().is_triton()
         and torch.get_default_device().type == "xpu"
-        and not use_triton_kernels
     )
 
 
@@ -1132,13 +1130,11 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
 
     def __init__(
         self,
-        use_triton_kernels: bool = False,
         use_flashinfer_trtllm_moe: bool = False,
         use_deep_gemm: bool = False,
     ):
         super().__init__()
         self.use_flashinfer_cutlass = get_moe_runner_backend().is_flashinfer_cutlass()
-        self.use_triton_kernels = use_triton_kernels
         self.with_bias = False
         self.use_flashinfer_trtllm_moe = use_flashinfer_trtllm_moe
         self.use_deep_gemm = use_deep_gemm
@@ -1169,7 +1165,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         # XPU only: the sgl-kernel-xpu grouped GEMM honours the weights' row
         # stride, so it can be padded to dodge L3 set aliasing on unlucky K
         # dims. Every other device allocates plainly, exactly as before.
-        pad_ld_for_xpu = _use_xpu_moe_ld_padding(self.use_triton_kernels)
+        pad_ld_for_xpu = _use_xpu_moe_ld_padding()
 
         # Fused gate_up_proj (column parallel)
         w13_up_dim = (
@@ -1178,8 +1174,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             else intermediate_size_per_partition
         )
         w13_weight_n, w13_weight_k = (w13_up_dim, hidden_size)
-        if self.use_triton_kernels:
-            w13_weight_n, w13_weight_k = w13_weight_k, w13_weight_n
         if pad_ld_for_xpu:
             w13_weight_data = _empty_xpu_moe_expert_weight(
                 num_experts, w13_weight_n, w13_weight_k, params_dtype
@@ -1205,8 +1199,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             hidden_size,
             intermediate_size_per_partition,
         )
-        if self.use_triton_kernels:
-            w2_weight_n, w2_weight_k = w2_weight_k, w2_weight_n
         if pad_ld_for_xpu:
             w2_weight_data = _empty_xpu_moe_expert_weight(
                 num_experts, w2_weight_n, w2_weight_k, params_dtype
@@ -1564,8 +1556,6 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             backend = MoeRunnerBackend.FLASHINFER_CUTLASS
         elif self.use_deep_gemm:
             backend = MoeRunnerBackend.DEEP_GEMM
-        elif self.use_triton_kernels:
-            backend = MoeRunnerBackend.TRITON_KERNELS
         elif _is_npu:
             layer.w13_kernel = NPUUnquantMoEMethod()
             layer.w2_kernel = NPUUnquantMoEMethod()
@@ -1643,19 +1633,7 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         x = dispatch_output.hidden_states
 
         backend = self.runner.runner_backend
-        if backend.is_triton_kernels():
-            from sglang.srt.layers.moe.moe_runner.triton_kernels import (
-                TritonKernelsQuantInfo,
-            )
-
-            quant_info = TritonKernelsQuantInfo(
-                w13_weight=layer.w13_weight,
-                w2_weight=layer.w2_weight,
-                w13_bias=getattr(layer, "w13_weight_bias", None),
-                w2_bias=getattr(layer, "w2_weight_bias", None),
-            )
-            return self.runner.run(dispatch_output, quant_info)
-        elif self.runner.runner_backend.is_deep_gemm():
+        if backend.is_deep_gemm():
             w13_weight = layer.w13_weight
             w2_weight = layer.w2_weight
             from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmMoeQuantInfo
