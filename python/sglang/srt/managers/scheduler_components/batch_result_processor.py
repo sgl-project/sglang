@@ -1165,6 +1165,11 @@ class SchedulerBatchResultProcessor:
             )
 
         self.token_to_kv_pool_allocator.free_group_begin()
+        # Finished requests whose release runs after the send below. A consumer
+        # of auxiliary output may defer a response, which requires it released.
+        releases_after_send: Optional[List[Tuple[Req, bool]]] = (
+            [] if auxiliary_output is None else None
+        )
 
         # Folds the relay point's selection into the DAG and sets the finish
         # states the loop below observes. Beam + spec is rejected at admission.
@@ -1214,7 +1219,13 @@ class SchedulerBatchResultProcessor:
                 continue
 
             self._handle_finish_state_updated_req(
-                req, batch, result, i, logits_output, new_accept_len
+                req,
+                batch,
+                result,
+                i,
+                logits_output,
+                new_accept_len,
+                releases_after_send=releases_after_send,
             )
 
             if req.return_logprob:
@@ -1260,6 +1271,9 @@ class SchedulerBatchResultProcessor:
             )
 
         self.output_streamer.stream_output(reqs_still_in_batch, batch.return_logprob)
+        for req, checkpoint in releases_after_send or ():
+            self._prepare_kv_cache_release(req)
+            self.request_retirer.release(req, checkpoint=checkpoint)
         self.token_to_kv_pool_allocator.free_group_end()
 
         self.metrics_reporter.forward_ct_decode = (
@@ -1538,7 +1552,11 @@ class SchedulerBatchResultProcessor:
         i: int,
         logits_output: LogitsProcessorOutput,
         num_new_tokens: int = 1,
+        *,
+        releases_after_send: Optional[List[Tuple[Req, bool]]] = None,
     ):
+        """``releases_after_send``, when given, takes a finished request's
+        release for the caller to run after it sends the step's outputs."""
         lazy = get_exec().mamba.enable_mamba_extra_buffer_lazy
         known_mamba_boundary = None
         completed_mamba_boundary = None
@@ -1608,13 +1626,22 @@ class SchedulerBatchResultProcessor:
                 self.decode_offload_manager.offload_kv_cache(req)
                 self.decode_offload_manager.finalize_release_on_finish(req)
             else:
-                self._prepare_kv_cache_release(req)
                 checkpoint = (
                     req.mamba_lazy_checkpoint
                     if get_exec().mamba.enable_mamba_extra_buffer_lazy
                     else True
                 )
-                self.request_retirer.release(req, checkpoint=checkpoint)
+                # The send fills a None finished_len, which the release reads.
+                # An abort's release also detaches it, so it keeps its order.
+                if (
+                    releases_after_send is not None
+                    and req.finished_len is not None
+                    and not isinstance(req.finished_reason, FINISH_ABORT)
+                ):
+                    releases_after_send.append((req, checkpoint))
+                else:
+                    self._prepare_kv_cache_release(req)
+                    self.request_retirer.release(req, checkpoint=checkpoint)
 
             req.time_stats.set_completion_time()
 
