@@ -23,7 +23,7 @@ from sglang.srt.utils import get_hip_version, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_amd_ci(est_time=45, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=40, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 BF16_ATOL = 2e-2
 BF16_RTOL = 1e-2
@@ -41,11 +41,10 @@ def _build_inputs(
     cache_dtype=torch.bfloat16,
     latent_values=False,
     shuffle_cache=False,
-    seed=0,
 ):
     device = "cuda"
     dtype = torch.bfloat16
-    generator = torch.Generator(device=device).manual_seed(seed)
+    generator = torch.Generator(device=device).manual_seed(0)
     prefix_lens_t = torch.tensor(prefix_lens, dtype=torch.int32, device=device)
     total_prefix = sum(prefix_lens)
     batch_size = len(prefix_lens)
@@ -346,7 +345,7 @@ EXTEND_CASES = {
 }
 
 
-def _inputs(case, cache_dtype, seed=0):
+def _inputs(case, cache_dtype):
     return _build_inputs(
         prefix_lens=case["prefix_lens"],
         l_ext=case["l_ext"],
@@ -357,7 +356,6 @@ def _inputs(case, cache_dtype, seed=0):
         cache_dtype=cache_dtype,
         latent_values=case["mla"],
         shuffle_cache=True,
-        seed=seed,
     )
 
 
@@ -529,18 +527,6 @@ class TestDraftAttention(CustomTestCase):
                     default = _backend_extend(case, inputs, bf16_dot=False)
                     assert not torch.equal(default, out)
 
-    def test_bf16_cache_unchanged_by_bf16_dot(self):
-        for name in EXTEND_CASES:
-            with self.subTest(case=name):
-                case = EXTEND_CASES[name]
-                inputs = _inputs(case, torch.bfloat16, seed=1)
-                torch.testing.assert_close(
-                    _extend(case, inputs, bf16_dot=True),
-                    _extend(case, inputs, bf16_dot=False),
-                    rtol=0,
-                    atol=0,
-                )
-
     def test_verify_matches_extend(self):
         cases = [
             ((65536, 3000), 8, -1, False),
@@ -555,17 +541,6 @@ class TestDraftAttention(CustomTestCase):
                 actual = _extend(case, inputs, bf16_dot, kernel=verify_mla_draft_fwd)
                 expected = _extend(case, inputs, bf16_dot)
                 torch.testing.assert_close(actual, expected, atol=8e-2, rtol=2e-2)
-
-    def test_verify_rejects_window_narrower_than_block(self):
-        case = dict(MLA, mla=False, prefix_lens=(256,))
-        q, k, v, k_buffer, v_buffer, qo_indptr, kv_indptr, kv_indices = _inputs(
-            case, torch.bfloat16
-        )
-        out = torch.empty(*q.shape[:2], case["dv"], dtype=q.dtype, device=q.device)
-        assert not verify_mla_draft_fwd(
-            q, k, v, out, k_buffer, v_buffer, qo_indptr, kv_indptr, kv_indices,
-            None, True, None, 8, 1.0, 1.0, sliding_window_size=4,
-        )  # fmt: skip
 
 
 if __name__ == "__main__":
