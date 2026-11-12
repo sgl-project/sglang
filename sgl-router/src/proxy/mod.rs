@@ -137,6 +137,9 @@ pub struct Proxy {
     pub request_timeout: Duration,
     /// Maximum silence between streamed upstream chunks; `None` waits forever.
     pub stream_idle_timeout: Option<Duration>,
+    /// Whether a POST that loses its worker connection before any response may
+    /// be replayed once (see [`Self::with_non_idempotent_retry`]).
+    pub retry_non_idempotent: bool,
 }
 
 /// Build a forwarding client for `protocol`, sharing pool/connect tuning
@@ -164,15 +167,15 @@ fn build_client(protocol: WireProtocol) -> Result<Client, anyhow::Error> {
 
 /// Sends `req`, and once more if the worker closed an HTTP/1.1 connection before
 /// answering: an engine closing an idle keep-alive connection never read the request.
-/// Not for h2c, where one connection carries many requests.
+/// Not for h2c, where one connection carries many requests. `retry` gates the
+/// replay entirely: a worker that read the request and died while producing is
+/// indistinguishable from one that never read it, so callers forwarding
+/// non-idempotent bodies can turn the replay off.
 async fn send_retrying_closed_connection(
     req: RequestBuilder,
     protocol: WireProtocol,
+    retry: Option<RequestBuilder>,
 ) -> reqwest::Result<reqwest::Response> {
-    let retry = match protocol {
-        WireProtocol::Http1 => req.try_clone(),
-        WireProtocol::H2c => None,
-    };
     match (req.send().await, retry) {
         (Err(e), Some(retry)) if closed_before_response(&e) => {
             tracing::debug!(error = ?e, "worker closed the connection before answering; resending");
@@ -211,7 +214,43 @@ impl Proxy {
             h2c_client: build_client(WireProtocol::H2c)?,
             request_timeout,
             stream_idle_timeout: None,
+            retry_non_idempotent: true,
         })
+    }
+
+    /// Replay policy for POSTs whose worker connection dies before any
+    /// response (`see send_retrying_closed_connection`). Replaying is what
+    /// keeps an idle keep-alive close transparent, but a worker that read the
+    /// request and died while producing is indistinguishable from one that
+    /// never read it, so the replay can run the model twice for one request.
+    /// Operators who prefer no duplicate inference over keep-alive resilience
+    /// construct the proxy with `retry_non_idempotent = false` via
+    /// `--disable-non-idempotent-retry` (issue #50132).
+    pub fn with_non_idempotent_retry(
+        request_timeout: Duration,
+        retry_non_idempotent: bool,
+    ) -> Result<Self, anyhow::Error> {
+        Ok(Self {
+            default_client: build_client(WireProtocol::Http1)?,
+            h2c_client: build_client(WireProtocol::H2c)?,
+            request_timeout,
+            stream_idle_timeout: None,
+            retry_non_idempotent,
+        })
+    }
+
+    /// `Some(clone)` when a POST replay after a closed worker connection is
+    /// allowed by this proxy's policy, on HTTP/1.1 only (h2c multiplexes, and
+    /// a lost h2c stream must not be replayed).
+    fn replay_for_closed_connection(
+        &self,
+        protocol: WireProtocol,
+        req: &RequestBuilder,
+    ) -> Option<RequestBuilder> {
+        match (self.retry_non_idempotent, protocol) {
+            (true, WireProtocol::Http1) => req.try_clone(),
+            _ => None,
+        }
     }
 
     pub fn with_stream_idle_timeout(mut self, timeout: Duration) -> Self {
@@ -311,7 +350,8 @@ impl Proxy {
             .timeout(self.request_timeout);
         let mut abort =
             AbortOnDrop::new(self.client_for(protocol), &worker_url, headers, abort_rid);
-        let resp = send_retrying_closed_connection(req, protocol)
+        let retry = self.replay_for_closed_connection(protocol, &req);
+        let resp = send_retrying_closed_connection(req, protocol, retry)
             .await
             .map_err(|e| {
                 breaker.record_failure();
@@ -413,9 +453,10 @@ impl Proxy {
         let mut abort =
             AbortOnDrop::new(self.client_for(protocol), &worker_url, headers, abort_rid);
         // A worker that never answers is a fault, unlike a long stream once it answers.
+        let retry = self.replay_for_closed_connection(protocol, &req);
         let resp = match tokio::time::timeout(
             self.request_timeout,
-            send_retrying_closed_connection(req, protocol),
+            send_retrying_closed_connection(req, protocol, retry),
         )
         .await
         {
@@ -1048,6 +1089,34 @@ mod tests {
         ] {
             let (url, accepted) = spawn_failing_worker(failing, failure).await;
             let proxy = Proxy::new(Duration::from_millis(500)).unwrap();
+            let result = proxy
+                .forward_json_to(
+                    &url,
+                    WireProtocol::Http1,
+                    &CircuitBreaker::new(),
+                    "/generate",
+                    &HeaderMap::new(),
+                    Bytes::new(),
+                    None,
+                )
+                .await;
+            let got = result.map_or_else(|e| e.status_code(), |r| r.status());
+            let conns = accepted.load(Ordering::SeqCst);
+            assert_eq!((got, conns), (status, connections), "{failure:?}");
+        }
+    }
+
+    /// With the replay disabled, a POST whose worker read it and then closed
+    /// is not resent: one connection, and the failure surfaces as a 502.
+    #[tokio::test]
+    async fn non_idempotent_replay_can_be_disabled() {
+        for (failing, failure, status, connections) in [
+            (1, Failure::Reset, StatusCode::BAD_GATEWAY, 1),
+            (1, Failure::Close, StatusCode::BAD_GATEWAY, 1),
+        ] {
+            let (url, accepted) = spawn_failing_worker(failing, failure).await;
+            let proxy =
+                Proxy::with_non_idempotent_retry(Duration::from_millis(500), false).unwrap();
             let result = proxy
                 .forward_json_to(
                     &url,

@@ -382,9 +382,12 @@ fn build_app_context(
 ) -> Result<AppContext> {
     let block_size_oracle = engine_state.block_size_oracle();
     let proxy = Arc::new(
-        Proxy::new(Duration::from_secs(config.proxy.request_timeout_secs))
-            .context("build proxy client")?
-            .with_stream_idle_timeout(Duration::from_secs(config.proxy.stream_idle_timeout_secs)),
+        Proxy::with_non_idempotent_retry(
+            Duration::from_secs(config.proxy.request_timeout_secs),
+            !config.proxy.disable_non_idempotent_retry,
+        )
+        .context("build proxy client")?
+        .with_stream_idle_timeout(Duration::from_secs(config.proxy.stream_idle_timeout_secs)),
     );
 
     let mut app_context = AppContext::with_router_inflight_load(
