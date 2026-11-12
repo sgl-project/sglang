@@ -93,10 +93,9 @@ def create_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--qr-quant",
-        nargs="+",
-        default=["INT4"],
+        default="INT4",
         choices=list(QR_QUANT_REGIMES),
-        help="QuickReduce codecs to time. Default INT4.",
+        help="QuickReduce codec to time. One codec; default INT4.",
     )
     parser.add_argument(
         "--qr-cast-bf16-to-fp16",
@@ -249,7 +248,7 @@ def main(argv: list[str] | None = None) -> None:
             mode="graph" if args.graph else "eager",
             output_dir=args.output_dir if rank == 0 else None,
             verbose=(rank == 0),
-            qr_quants=args.qr_quant,
+            qr_quant=args.qr_quant,
             num_iters=args.num_iters,
             ingraph_calls=args.ingraph_calls,
             ignore_acr_max_size=args.ignore_acr_max_size,
