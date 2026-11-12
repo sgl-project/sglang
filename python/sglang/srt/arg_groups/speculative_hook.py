@@ -457,13 +457,6 @@ def _handle_uno(server_args: ServerArgs) -> None:
     is_xpu = cfg.device == "xpu"
     if not (cfg.device.startswith("cuda") or is_xpu):
         raise ValueError("UNO only supports CUDA and XPU.")
-    if is_xpu and cfg.cuda_graph_config.decode.backend != Backend.DISABLED:
-        # The XPU graph runner is not UNO's runner, so a captured draft would
-        # replay without its LoRA routing.
-        raise ValueError(
-            "UNO on XPU does not support decode graphs yet; "
-            "drop --cuda-graph-backend-decode."
-        )
     if cfg.speculative_draft_model_path is not None:
         raise ValueError(
             "UNO reuses the target model and does not accept "
@@ -621,6 +614,19 @@ def _handle_uno(server_args: ServerArgs) -> None:
             "UNO requires the same attention backend for prefill and decode, "
             f"one of {supported_backends} on {cfg.device}; "
             f"got prefill={prefill_backend!r}, decode={decode_backend!r}."
+        )
+    if (
+        is_xpu
+        and candidate_top_k > 1
+        and decode_backend == "intel_xpu"
+        and cfg.cuda_graph_config.decode.backend != Backend.DISABLED
+    ):
+        # intel_xpu builds tree-verify (topk > 1) metadata only eagerly, so a
+        # captured tree verify would read stale cascade metadata.
+        raise ValueError(
+            "UNO tree mode with XPU decode graphs requires "
+            "--attention-backend triton; intel_xpu graphs do not support "
+            "tree verification yet."
         )
 
 

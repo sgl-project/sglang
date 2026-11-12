@@ -95,23 +95,31 @@ def register_fake_ops():
         return
 
 
+def _apply_xpu_compile_config() -> None:
+    """Apply XPU-specific torch.compile / dynamo settings.
+
+    Applied before any XPU graph runner initializes, so that the settings are
+    in place regardless of whether --enable-torch-compile is passed. The
+    critical flag is suppress_errors: when the Intel IGC compiler crashes with
+    SIGFPE on certain reduction kernels (ocloc -device bmg returns exit code
+    245), dynamo falls back to eager for that subgraph instead of propagating
+    the crash.
+    """
+    import torch._dynamo.config
+
+    torch._dynamo.config.suppress_errors = True
+
+
+def prepare_xpu_graph_capture() -> None:
+    """Process-wide setup every XPU decode graph runner needs before capture,
+    including runner subclasses that do not derive from XPUGraphRunner."""
+    register_fake_ops()
+    _apply_xpu_compile_config()
+    register_xpu_device_properties_for_dynamo()
+
+
 class XPUGraphRunner(DecodeCudaGraphRunner):
     """A XPUGraphRunner runs the forward pass of a model with xpu graph and torch.compile."""
-
-    @staticmethod
-    def _apply_xpu_compile_config() -> None:
-        """Apply XPU-specific torch.compile / dynamo settings.
-
-        Called unconditionally before super().__init__() so that the settings
-        are in place regardless of whether --enable-torch-compile is passed.
-        The critical flag is suppress_errors: when the Intel IGC compiler
-        crashes with SIGFPE on certain reduction kernels (ocloc -device bmg
-        returns exit code 245), dynamo falls back to eager for that subgraph
-        instead of propagating the crash.
-        """
-        import torch._dynamo.config
-
-        torch._dynamo.config.suppress_errors = True
 
     def __init__(self, model_runner: ModelRunner):
         if get_exec().features.enable_memory_saver:
@@ -120,9 +128,7 @@ class XPUGraphRunner(DecodeCudaGraphRunner):
                 "weights and KV cache memory saving is supported, but XPU graph "
                 "allocations themselves cannot be paused on Intel XPU."
             )
-        register_fake_ops()
-        self._apply_xpu_compile_config()
-        register_xpu_device_properties_for_dynamo()
+        prepare_xpu_graph_capture()
         super().__init__(model_runner)
 
         assert not self.enable_two_batch_overlap, (

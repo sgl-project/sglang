@@ -36,6 +36,7 @@ from sglang.srt.model_executor.graph_memory_usage import (
 from sglang.srt.model_executor.graph_shared_output import GraphSharedOutput
 from sglang.srt.model_executor.hook_manager import register_forward_hooks
 from sglang.srt.model_executor.runner import (
+    DecodeCudaGraphRunner,
     EagerRunner,
     PrefillCudaGraphRunner,
     get_batch_sizes_to_capture,
@@ -827,14 +828,14 @@ def capture_decode_graph(
             hook="get_graph_runner_cls()",
             subsystem="CUDA graph runner",
         )
-        graph_runners = defaultdict(
-            model_runner._decode_cuda_graph_runner_cls,
-            {
+        GraphRunnerCls = model_runner._decode_cuda_graph_runner_cls()
+        # Platform runners specialize only the stock runner; a model runner's
+        # own subclass (UNO's) does its platform setup itself.
+        if GraphRunnerCls is DecodeCudaGraphRunner:
+            GraphRunnerCls = {
                 "cpu": CPUGraphRunner,
                 "xpu": XPUGraphRunner,
-            },
-        )
-        GraphRunnerCls = graph_runners[model_runner.device]
+            }.get(model_runner.device, GraphRunnerCls)
     runner = GraphRunnerCls(model_runner)
 
     after_mem = get_available_gpu_memory(model_runner.device, model_runner.gpu_id)
