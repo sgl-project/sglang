@@ -33,15 +33,25 @@ if TYPE_CHECKING:
 # ACL format IDs, kept here so importing this module does not load torch_npu.
 _FORMAT_NCHW = 0
 _FORMAT_ND = 2
+_FORMAT_FRACTAL_NZ = 29
+_FORMAT_FRACTAL_NZ_C0_16 = 50
+_FORMAT_FRACTAL_NZ_C0_32 = 51
+_FORMAT_FRACTAL_NZ_C0_2 = 52
+_FORMAT_FRACTAL_NZ_C0_4 = 53
+_FORMAT_FRACTAL_NZ_C0_8 = 54
 _BASE_FORMATS = (_FORMAT_NCHW, _FORMAT_ND)
 _SUPPORTED_NZ_FORMATS = (
-    29,  # FRACTAL_NZ
-    50,  # FRACTAL_NZ_C0_16 (also used for packed FP4 storage)
-    51,  # FRACTAL_NZ_C0_32
-    52,  # FRACTAL_NZ_C0_2
-    53,  # FRACTAL_NZ_C0_4
-    54,  # FRACTAL_NZ_C0_8
+    _FORMAT_FRACTAL_NZ,
+    _FORMAT_FRACTAL_NZ_C0_16,
+    _FORMAT_FRACTAL_NZ_C0_32,
+    _FORMAT_FRACTAL_NZ_C0_2,
+    _FORMAT_FRACTAL_NZ_C0_4,
+    _FORMAT_FRACTAL_NZ_C0_8,
 )
+# NZ expert weights retain the logical axes [experts, M, N].
+_NZ_EXPERT_WEIGHT_NDIM = 3
+# Per-peer warmup payload in bytes, independent of HCCL buffer capacity.
+_EPLB_WARMUP_BYTES_PER_PEER = 4 << 20
 
 
 def migrate_expert_weights(
@@ -303,7 +313,10 @@ def _validate_nz_expert_blocks(
     weight: torch.Tensor, full_storage_tensor: torch.Tensor, storage_elements: int
 ) -> int:
     """Validate NZ expert boundaries and return the full storage's expert count."""
-    if full_storage_tensor.ndim != 3 or weight.ndim != 3:
+    if (
+        full_storage_tensor.ndim != _NZ_EXPERT_WEIGHT_NDIM
+        or weight.ndim != _NZ_EXPERT_WEIGHT_NDIM
+    ):
         raise ValueError("NPU EPLB requires 3D batched NZ expert weights.")
     if (
         weight.element_size() != full_storage_tensor.element_size()
@@ -399,7 +412,7 @@ def prewarm_eplb_communication() -> None:
     _validate_migration_topology(dist.get_world_size(group))
     if tp.world_size == 1:
         return
-    send = torch.empty(4 << 20, dtype=torch.uint8, device="npu")
+    send = torch.empty(_EPLB_WARMUP_BYTES_PER_PEER, dtype=torch.uint8, device="npu")
     recv = torch.empty(
         (tp.world_size - 1, send.numel()), dtype=send.dtype, device=send.device
     )
