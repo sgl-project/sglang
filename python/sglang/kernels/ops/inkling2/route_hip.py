@@ -10,13 +10,7 @@ from sglang.kernels.ops.inkling2.experts_sm90 import (
     _fake_quantize_mxfp8_chunk,
     _fake_quantize_row_chunk,
 )
-from sglang.kernels.ops.inkling2.portability import (
-    IS_HIP,
-    gdc_launch_dependents,
-    gdc_wait,
-    pdl_launch,
-)
-from sglang.kernels.ops.inkling2.route import PDL, _metadata, _topk_row
+from sglang.kernels.ops.inkling2.route import _metadata, _topk_row
 from sglang.kernels.ops.moe.gate_topk import fpval_to_key, key_to_indx
 
 # route_topk_metadata fuses the routing (and quantization) of up to this many tokens;
@@ -145,8 +139,6 @@ def _route_topk_metadata(
     # the rows' top-k together), the metadata reading the ids and weights the top-k
     # just wrote. Programs 1..: the tokens' NVFP4 (QUANT 1) or MXFP8 (QUANT 2) fake
     # quantization, one (row, chunk) each.
-    gdc_wait()
-    gdc_launch_dependents()
     pid = tl.program_id(0)
     if pid == 0:
         if M == 1:
@@ -270,7 +262,6 @@ def route_topk_metadata(
         # Swept on MI350X: the top-k of 3-4 rows in one program wants 8 warps.
         num_warps=4 if m <= 2 else 8,
         enable_fp_fusion=False,
-        **pdl_launch(PDL),
     )
     metadata = (
         src2dst,
@@ -317,8 +308,6 @@ def _route_metadata_quantize(
 ):
     # Program 0: route_metadata. Programs 1..: the rows' NVFP4 (QUANT 1) or MXFP8
     # (QUANT 2) fake quantization, one (row, chunk) each, as fake_quantize runs it.
-    gdc_wait()
-    gdc_launch_dependents()
     pid = tl.program_id(0)
     if pid == 0:
         _metadata(
@@ -401,9 +390,8 @@ def route_metadata_quantize(
         amax_block,
         quant_block,
         # route_metadata's warps for this block.
-        num_warps=min(16 if IS_HIP else 32, max(4, block_n // 128)),
+        num_warps=min(16, max(4, block_n // 128)),
         enable_fp_fusion=False,
-        **pdl_launch(PDL),
     )
     metadata = (
         src2dst,
