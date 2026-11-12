@@ -385,10 +385,13 @@ def dispatch_custom_allreduce(
 
     On CUDA, the JIT-compiled v2 implementation is used by default.
     Set SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2=0 to fall back to the legacy CustomAllreduce.
-    Multi-node v2 is admitted only for a single NVLink clique (see
-    can_use_custom_all_reduce_v2); other cross-node groups fall back to NCCL.
+    On ROCm, v2 is opt-in: set SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2=1.
+    Multi-node v2 is admitted only for a single NVLink clique, or on ROCm a
+    single gfx1250 fabric clique (see can_use_custom_all_reduce_v2); other
+    cross-node groups fall back to NCCL.
     """
-    if _is_cuda and envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2.get():
+    use_v2 = envs.SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2
+    if (_is_cuda and use_v2.get()) or (_is_hip and use_v2.is_set() and use_v2.get()):
         from .custom_all_reduce_v2 import (
             CustomAllReduceV2,
             can_use_custom_all_reduce_v2,

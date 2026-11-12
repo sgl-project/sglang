@@ -17,6 +17,7 @@ from functools import lru_cache
 from typing import Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 import triton
 import triton.language as tl
 
@@ -127,6 +128,158 @@ def saturate_to_fp8_range(value: torch.Tensor, dtype: torch.dtype) -> torch.Tens
     # kernel returns the input early for NaN, and the CPU one leaves it to
     # std::min/std::max, which return the NaN operand.
     return value.clamp(-limit, limit)
+
+
+@triton.jit
+def _block_quant_fp8_kernel(
+    x_ptr,
+    output_ptr,
+    scale_ptr,
+    num_rows,
+    num_columns,
+    stride_x_row,
+    stride_x_column,
+    stride_output_row,
+    stride_output_column,
+    stride_scale_row,
+    stride_scale_column,
+    eps,
+    quant_min,
+    quant_max,
+    BLOCK_ROWS: tl.constexpr,
+    BLOCK_COLUMNS: tl.constexpr,
+    TILE_COLUMNS: tl.constexpr,
+):
+    """Quantize one logical 2D block per Triton program."""
+    block_row = tl.program_id(0)
+    block_column = tl.program_id(1)
+    row_start = block_row * BLOCK_ROWS
+    column_offsets = block_column * BLOCK_COLUMNS + tl.arange(0, TILE_COLUMNS)
+    column_mask = (column_offsets < num_columns) & (
+        column_offsets < (block_column + 1) * BLOCK_COLUMNS
+    )
+
+    block_amax = 0.0
+    for row_offset in tl.range(0, BLOCK_ROWS):
+        row = row_start + row_offset
+        values = tl.load(
+            x_ptr + row * stride_x_row + column_offsets * stride_x_column,
+            mask=(row < num_rows) & column_mask,
+            other=0.0,
+        ).to(tl.float32)
+        block_amax = tl.maximum(block_amax, tl.max(tl.abs(values)))
+
+    scale = tl.maximum(block_amax, eps) / quant_max
+    inverse_scale = 1.0 / scale
+    for row_offset in tl.range(0, BLOCK_ROWS):
+        row = row_start + row_offset
+        mask = (row < num_rows) & column_mask
+        values = tl.load(
+            x_ptr + row * stride_x_row + column_offsets * stride_x_column,
+            mask=mask,
+            other=0.0,
+        ).to(tl.float32)
+        quantized = tl.clamp(values * inverse_scale, quant_min, quant_max).to(
+            output_ptr.dtype.element_ty
+        )
+        tl.store(
+            output_ptr
+            + row * stride_output_row
+            + column_offsets * stride_output_column,
+            quantized,
+            mask=mask,
+        )
+
+    tl.store(
+        scale_ptr + block_row * stride_scale_row + block_column * stride_scale_column,
+        scale,
+    )
+
+
+def _block_quant_fp8_torch(
+    x: torch.Tensor,
+    block_shape: Tuple[int, int],
+    eps: float,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Torch reference and non-CUDA fallback for :func:`block_quant_fp8`."""
+    block_rows, block_columns = block_shape
+    num_rows, num_columns = x.shape
+    padded_rows = triton.cdiv(num_rows, block_rows) * block_rows
+    padded_columns = triton.cdiv(num_columns, block_columns) * block_columns
+    padded = F.pad(x, (0, padded_columns - num_columns, 0, padded_rows - num_rows))
+    blocks = padded.view(
+        padded_rows // block_rows,
+        block_rows,
+        padded_columns // block_columns,
+        block_columns,
+    )
+    scales = blocks.abs().float().amax(dim=(1, 3)).clamp(min=eps) / fp8_max
+    quantized = (
+        (blocks.float() / scales[:, None, :, None])
+        .clamp(min=fp8_min, max=fp8_max)
+        .to(fp8_dtype)
+        .reshape(padded_rows, padded_columns)
+    )
+    return quantized[:num_rows, :num_columns].contiguous(), scales.contiguous()
+
+
+def block_quant_fp8(
+    x: torch.Tensor,
+    block_shape: Tuple[int, int],
+    eps: float = 1e-10,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Dynamically quantize a 2D tensor into FP8 blocks.
+
+    The quantized tensor retains its logical shape, including partial row or
+    column blocks. The returned scale tensor has shape
+    ``(ceil(M / block_rows), ceil(K / block_columns))``.
+    """
+    if x.ndim != 2:
+        raise ValueError(f"block_quant_fp8 expects a 2D tensor, got shape {x.shape}.")
+    if len(block_shape) != 2 or min(block_shape) <= 0:
+        raise ValueError(
+            f"block_shape must contain two positive values, got {block_shape}."
+        )
+    if not x.is_floating_point():
+        raise TypeError(f"block_quant_fp8 expects floating-point input, got {x.dtype}.")
+    if 0 in x.shape:
+        raise ValueError(f"block_quant_fp8 expects a non-empty tensor, got {x.shape}.")
+
+    block_rows, block_columns = int(block_shape[0]), int(block_shape[1])
+    normalized_block_shape = (block_rows, block_columns)
+    if not x.is_cuda:
+        return _block_quant_fp8_torch(x, normalized_block_shape, eps)
+
+    num_rows, num_columns = x.shape
+    output = torch.empty(x.shape, dtype=fp8_dtype, device=x.device)
+    scales = torch.empty(
+        (triton.cdiv(num_rows, block_rows), triton.cdiv(num_columns, block_columns)),
+        dtype=torch.float32,
+        device=x.device,
+    )
+    tile_columns = triton.next_power_of_2(block_columns)
+    _block_quant_fp8_kernel[scales.shape](
+        x,
+        output,
+        scales,
+        num_rows,
+        num_columns,
+        x.stride(0),
+        x.stride(1),
+        output.stride(0),
+        output.stride(1),
+        scales.stride(0),
+        scales.stride(1),
+        eps,
+        fp8_min,
+        fp8_max,
+        BLOCK_ROWS=block_rows,
+        BLOCK_COLUMNS=block_columns,
+        TILE_COLUMNS=tile_columns,
+        num_warps=min(max(tile_columns // 32, 1), 8),
+        num_stages=1,
+    )
+    return output, scales
 
 
 @triton.jit
@@ -414,8 +567,6 @@ def _run_per_token_group_quant_8bit_kernel(
     x_s: torch.Tensor,
     group_size: int,
     eps: float,
-    fp8_min: float,
-    fp8_max: float,
     *,
     scale_ue8m0: bool,
     fuse_silu_and_mul: bool,
@@ -423,35 +574,10 @@ def _run_per_token_group_quant_8bit_kernel(
 ) -> None:
     """Quantize into caller-owned ``x_q`` / ``x_s``.
 
-    CUDA routes to the JIT per_token_group_quant kernel; MUSA stays on the AOT
-    v2 op (the JIT kernel is CUDA-only), and the fp32-pow-2 storage flavor of
-    row-major UE8M0 (float32 ``x_s``, deep_gemm ``ceil_to_ue8m0`` convention)
-    stays on the JIT v2 baseline — per_token_group_quant only packs UE8M0 as
-    int32. The kernel bakes the quant constants in at compile time, so
-    drifted constants are rejected loudly here instead of silently quantizing
-    with different ones; unsupported shapes/layouts error inside its host
-    checks. Whole-row (per-token) quantization is a different op:
-    ``sglang_per_token_quant_fp8``.
+    CUDA uses JIT kernels with a fixed absmax floor and dtype-derived range.
+    The trait kernel handles FP32 power-of-two scales for flat BF16 group32
+    on Hopper; other FP32 power-of-two cases use v2. MUSA keeps the AOT op.
     """
-    if scale_ue8m0 and x_s.dtype == torch.float32 and not _is_musa:
-        from sglang.kernels.ops.quantization.per_token_group_quant_8bit_v2 import (
-            per_token_group_quant_8bit_v2,
-        )
-
-        per_token_group_quant_8bit_v2(
-            input=x,
-            output_q=x_q,
-            output_s=x_s,
-            group_size=group_size,
-            eps=eps,
-            min_8bit=fp8_min,
-            max_8bit=fp8_max,
-            scale_ue8m0=scale_ue8m0,
-            fuse_silu_and_mul=fuse_silu_and_mul,
-            masked_m=masked_m,
-        )
-        return
-
     if _is_musa:
         sgl_per_token_group_quant_8bit(
             x,
@@ -468,13 +594,37 @@ def _run_per_token_group_quant_8bit_kernel(
         )
         return
 
+    if (
+        scale_ue8m0
+        and x_s.dtype == torch.float32
+        and not (
+            x.dtype == torch.bfloat16
+            and x.ndim == 2
+            and x_s.is_contiguous()
+            and x_q.dtype == fp8_dtype
+            and group_size == 32
+            and eps == 1e-10
+            and not fuse_silu_and_mul
+            and masked_m is None
+        )
+    ):
+        from sglang.kernels.ops.quantization.per_token_group_quant_8bit_v2 import (
+            per_token_group_quant_8bit_v2,
+        )
+
+        per_token_group_quant_8bit_v2(
+            input=x,
+            output_q=x_q,
+            output_s=x_s,
+            group_size=group_size,
+            scale_ue8m0=scale_ue8m0,
+            fuse_silu_and_mul=fuse_silu_and_mul,
+            masked_m=masked_m,
+        )
+        return
+
     assert eps == 1e-10, (
         f"per_token_group_quant bakes the absmax floor in at 1e-10, got {eps}"
-    )
-    expected_range = (-448.0, 448.0) if x_q.dtype == fp8_dtype else (-128.0, 127.0)
-    assert (fp8_min, fp8_max) == expected_range, (
-        f"per_token_group_quant bakes the {x_q.dtype} quant range in at {expected_range}, "
-        f"got ({fp8_min}, {fp8_max})"
     )
     per_token_group_quant(
         x,
@@ -551,8 +701,6 @@ def sglang_per_token_group_quant_fp8(
             x_s,
             group_size,
             eps,
-            fp8_min,
-            fp8_max,
             scale_ue8m0=scale_ue8m0,
             fuse_silu_and_mul=fuse_silu_and_mul,
             masked_m=masked_m,
@@ -609,8 +757,6 @@ def sglang_per_token_group_quant_fp8_row_padded(
             x_s[:m],
             group_size,
             eps,
-            fp8_min,
-            fp8_max,
             scale_ue8m0=False,
             fuse_silu_and_mul=False,
             masked_m=None,

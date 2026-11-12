@@ -1,4 +1,4 @@
-"""Causal verify metadata and routing with no ordinary prefill metadata."""
+"""ROCm MiniMax sparse attention: verify metadata and routing."""
 
 import unittest
 from types import SimpleNamespace

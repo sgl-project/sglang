@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from contextlib import suppress
 from typing import (
     TYPE_CHECKING,
@@ -52,6 +53,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsW8A8Fp8,
     CompressedTensorsW8A8Fp8MoE,
     CompressedTensorsW8A8Int8,
+    CompressedTensorsW8A8MXFp8,
     CompressedTensorsW8A16Fp8,
     CompressedTensorsWNA16,
     CompressedTensorsWNA16MoE,
@@ -116,6 +118,19 @@ class DeviceCapability(NamedTuple):
         return self.major * 10 + self.minor
 
 
+# The MLP prefix of a plain `ignore` entry that names its layer.
+_LAYER_MLP_PREFIX = re.compile(r"^(?!re:)(.*\.layers\.\d+\.mlp)\.")
+# Layers probed for `ignore` entries that name none (regexes, bare suffixes).
+_FUSION_PROBE_LAYERS = 256
+_EXPERT_PROJS = ("gate_proj", "up_proj", "down_proj")
+_SHARED_EXPERT_NAMES = ("shared_experts", "shared_expert")
+_EXPERT_PROBE_TAILS = tuple(
+    f"mlp.{expert}.{proj}"
+    for expert in ("experts.0", *_SHARED_EXPERT_NAMES)
+    for proj in _EXPERT_PROJS
+)
+
+
 class CompressedTensorsConfig(QuantizationConfig):
     def __init__(
         self,
@@ -167,6 +182,48 @@ class CompressedTensorsConfig(QuantizationConfig):
 
     def get_scaled_act_names(self) -> List[str]:
         return []
+
+    def can_fuse_shared_expert(self) -> bool:
+        """Whether shared experts can fuse into the routed-expert FusedMoE.
+
+        Not where `ignore` gives any projection of a layer's shared expert a
+        different precision from the same projection of its routed experts,
+        in either direction: fusion would load BF16 weights into quantized
+        expert buffers, or quantized weights into BF16 ones. Each projection
+        is resolved per MoE layer with should_ignore_layer, so names and
+        regexes match alike.
+        """
+        prefixes = set()
+        for name in self.ignore:
+            match = _LAYER_MLP_PREFIX.match(name)
+            if match is not None:
+                prefixes.add(match.group(1))
+            elif name.startswith("re:") or any(
+                f".{tail}".endswith(f".{name}") for tail in _EXPERT_PROBE_TAILS
+            ):
+                # Names no layer but may match expert modules: probe them all.
+                prefixes.update(
+                    f"model.layers.{i}.mlp" for i in range(_FUSION_PROBE_LAYERS)
+                )
+
+        def ignored(layer_name: str) -> bool:
+            return should_ignore_layer(
+                layer_name,
+                ignore=self.ignore,
+                fused_mapping=self.packed_modules_mapping,
+            )
+
+        for prefix in prefixes:
+            for proj in _EXPERT_PROJS:
+                routed = ignored(f"{prefix}.experts.0.{proj}")
+                # A model names its shared expert one way, so an ignored
+                # projection under either name counts as ignored.
+                shared = any(
+                    ignored(f"{prefix}.{name}.{proj}") for name in _SHARED_EXPERT_NAMES
+                )
+                if shared != routed:
+                    return False
+        return True
 
     def apply_weight_name_mapper(self, hf_to_sglang_mapper: WeightsMapper):
         self.target_scheme_map = hf_to_sglang_mapper.apply_dict(self.target_scheme_map)
@@ -251,13 +308,12 @@ class CompressedTensorsConfig(QuantizationConfig):
 
             layer.scheme = self.get_moe_scheme(layer=layer, layer_name=prefix)
             if layer.scheme is None:  # ignored layer
-                use_triton_kernels = get_moe_runner_backend().is_triton_kernels()
                 use_flashinfer_trtllm_moe = (
                     get_moe_runner_backend().is_flashinfer_trtllm()
                 )
                 use_deep_gemm = get_moe_runner_backend().is_deep_gemm()
                 return UnquantizedFusedMoEMethod(
-                    use_triton_kernels, use_flashinfer_trtllm_moe, use_deep_gemm
+                    use_flashinfer_trtllm_moe, use_deep_gemm
                 )
             return CompressedTensorsFusedMoEMethod(self)
         return None
@@ -414,14 +470,13 @@ class CompressedTensorsConfig(QuantizationConfig):
 
     def _check_scheme_supported(self, min_capability: int, error: bool = True) -> bool:
         if _is_xpu:
-            if error:
-                raise RuntimeError(
-                    f"Quantization scheme requiring compute capability "
-                    f"{min_capability} is not supported on XPU."
-                )
-            return False
+            # TODO: torch.xpu.get_device_capability
+            device = torch.xpu.current_device()
+            device_capability = torch.ops.sgl_kernel.query_device.default(device)
+        else:
+            device_capability = torch.cuda.get_device_capability()
 
-        capability_tuple = DeviceCapability(*torch.cuda.get_device_capability())
+        capability_tuple = DeviceCapability(*device_capability)
 
         if capability_tuple is not None:
             capability = capability_tuple.to_int()
@@ -531,6 +586,34 @@ class CompressedTensorsConfig(QuantizationConfig):
         # Both symmetric and asymmetric input quantization supported.
         # Only symmetric weight quantization supported.
         return is_8_bits and is_token and weight_quant.symmetric and is_dynamic
+
+    def _is_mxfp8_w8a8(
+        self,
+        weight_quant: QuantizationArgs,
+        input_quant: QuantizationArgs,
+        quant_format: Optional[str],
+    ) -> bool:
+        """OCP MXFP8: e4m3 weights and dynamic e4m3 activations, both with
+        UE8M0 (uint8) scales over 32-element groups along K."""
+        if weight_quant is None or input_quant is None:
+            return False
+        # FLOAT/GROUP/32 alone also describes ordinary grouped FP8, whose scales are
+        # floating point; only this format stores UE8M0 exponent bytes.
+        if quant_format != CompressionFormat.mxfp8_quantized.value:
+            return False
+        args = (weight_quant, input_quant)
+        return (
+            all(a.num_bits == 8 for a in args)
+            and all(a.type == QuantizationType.FLOAT for a in args)
+            and all(a.strategy == QuantizationStrategy.GROUP for a in args)
+            and all(a.group_size == 32 for a in args)
+            and all(a.symmetric for a in args)
+            # Configs written before scale_dtype existed omit it; the format is
+            # then the only record of the UE8M0 encoding.
+            and all(a.scale_dtype in (None, torch.uint8) for a in args)
+            and not weight_quant.dynamic
+            and input_quant.dynamic is True
+        )
 
     def _is_fp8_w8a8(
         self, weight_quant: QuantizationArgs, input_quant: QuantizationArgs
@@ -846,13 +929,24 @@ class CompressedTensorsConfig(QuantizationConfig):
                     f"group_size={weight_quant.group_size}."
                 )
 
-            if self._is_fp8_w8a8(weight_quant, input_quant):
-                if _is_xpu:
-                    is_fp8_w8a8_supported = True
-                else:
-                    is_fp8_w8a8_supported = self._check_scheme_supported(
-                        CompressedTensorsW8A8Fp8.get_min_capability(), error=False
+            if self._is_mxfp8_w8a8(weight_quant, input_quant, quant_format):
+                _is_mxfp8_w8a8_supported = self._check_scheme_supported(
+                    CompressedTensorsW8A8MXFp8.get_min_capability(), error=False
+                )
+                if _is_mxfp8_w8a8_supported:
+                    return CompressedTensorsW8A8MXFp8(
+                        weight_quant=weight_quant,
+                        input_quant=input_quant,
                     )
+                else:
+                    raise NotImplementedError(
+                        "Current platform does not support w8a8 mxfp8 quantization."
+                    )
+
+            if self._is_fp8_w8a8(weight_quant, input_quant):
+                is_fp8_w8a8_supported = self._check_scheme_supported(
+                    CompressedTensorsW8A8Fp8.get_min_capability(), error=False
+                )
                 if is_fp8_w8a8_supported:
                     return CompressedTensorsW8A8Fp8(
                         weight_quant=weight_quant,
@@ -1136,15 +1230,7 @@ class CompressedTensorsConfig(QuantizationConfig):
         # Raise error if device does not support the scheme
         # (e.g. fp8 needs ada lovelace)
         # Note: NPU devices do not support min_capability function
-        if _is_xpu:
-            if not isinstance(
-                scheme, (CompressedTensorsW8A8Fp8, XPUCompressedTensorsWNA16)
-            ):
-                raise RuntimeError(
-                    f"{scheme.__class__.__name__} is not supported on XPU "
-                    "(no XPU kernel implementation)."
-                )
-        elif not _is_npu:
+        if not _is_npu:
             self._check_scheme_supported(scheme.get_min_capability())
         logger.debug("Using scheme: %s for %s", scheme.__class__.__name__, layer_name)
         return scheme
