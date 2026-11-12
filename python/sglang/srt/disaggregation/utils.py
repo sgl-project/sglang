@@ -1842,7 +1842,9 @@ def setup_state_kv_args(
     """Register the storage's state entries in its wire order, and the flags
     peers read from its token KV layout. ``window_tails`` gives the tail each
     window sub-pool carries (`KVStorage.retained_window_lengths`); peers agree on it.
-    A DFLASH draft KV ring's rows and floor go last, so peers pair them by position."""
+    A DFLASH draft KV ring's rows and floor go after the storage's entries:
+    readers that zip against the storage's wire entries skip them, and the wire
+    check and the checksum filter find them there."""
     from sglang.srt.disaggregation.base.conn import StateType
     from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool

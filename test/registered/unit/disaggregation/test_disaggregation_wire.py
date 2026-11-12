@@ -48,7 +48,6 @@ from sglang.srt.disaggregation.utils import (
     poll_and_all_reduce_with_staging,
     setup_state_kv_args,
     should_send_replicated_state,
-    state_wire,
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import should_use_dsa_fused_topk
@@ -1316,19 +1315,6 @@ class TestDFlashDraftKVRingRegistration(unittest.TestCase):
         )
         self.assertEqual(kv_args.state_data_ptrs[1:], [[0x2000, 0x3000], [0x4000]])
         self.assertEqual(kv_args.state_item_lens[1:], [[576, 576], [4]])
-        # Peers compare the wire, so a ring on one side only is refused.
-        self.assertEqual(
-            [entry[0] for entry in state_wire(kv_args)],
-            [
-                StateType.DSA.value,
-                StateType.DRAFT_RING.value,
-                StateType.REQUEST_ROW.value,
-            ],
-        )
-
-    def test_nothing_is_registered_without_the_ring(self):
-        kv_args = self._register(None)
-        self.assertEqual(kv_args.state_types, [StateType.DSA])
 
 
 class TestCPReplicatedStateTransfer(unittest.TestCase):

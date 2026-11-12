@@ -282,7 +282,7 @@ class PrefillBootstrapQueue:
         scheduler: Scheduler,
         scheduler_stage_metrics: SchedulerStageMetricsRecorder,
         transfer_backend: TransferBackend,
-        draft_kv_ring: Optional[DFlashDraftKVRing] = None,
+        draft_kv_ring: Optional[DFlashDraftKVRing],
     ):
         parallel = get_parallel()
         self.token_to_kv_pool = token_to_kv_pool

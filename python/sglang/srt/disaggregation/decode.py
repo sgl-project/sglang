@@ -489,7 +489,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         max_total_num_tokens: int,
         num_reserved_decode_tokens: int,
         transfer_backend: TransferBackend,
-        draft_kv_ring: Optional[DFlashDraftKVRing] = None,
+        draft_kv_ring: Optional[DFlashDraftKVRing],
     ):
         parallel = get_parallel()
         self.req_to_token_pool = req_to_token_pool
