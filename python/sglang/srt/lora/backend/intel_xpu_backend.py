@@ -286,6 +286,7 @@ class IntelXpuLoRABackend(TritonLoRABackend):
             use_cuda_graph,
             use_prefill_cuda_graph,
         )
+        sgemm = self.sgemm_batch_info
         if use_cuda_graph:
             # XPU kernels size grids from seg_indptr / permutation, not bs, so the
             # max_bs-sized static buffers are sliced to the captured batch (views).
@@ -296,8 +297,16 @@ class IntelXpuLoRABackend(TritonLoRABackend):
                 seg_indptr=self.batch_info.seg_indptr[: bs + 1],
                 weight_indices=self.batch_info.weight_indices[:bs],
             )
-            if self.sgemm_batch_info is not None:
-                self.sgemm_batch_info = dataclasses.replace(
-                    self.sgemm_batch_info,
-                    permutation=self.sgemm_batch_info.permutation[:bs],
-                )
+            if sgemm is not None:
+                sgemm = dataclasses.replace(sgemm, permutation=sgemm.permutation[:bs])
+        elif sgemm is not None:
+            # Chunked kernels cast non-int64 permutations per call; cast once per batch.
+            sgemm = dataclasses.replace(
+                sgemm, permutation=sgemm.permutation.to(torch.int64)
+            )
+        self.sgemm_batch_info = sgemm
+
+    def _allocate_cuda_graph_sgemm_batch_info(self, max_tokens: int) -> LoRABatchInfo:
+        # int64 so the chunked kernels read the static permutation without a cast.
+        info = super()._allocate_cuda_graph_sgemm_batch_info(max_tokens)
+        return dataclasses.replace(info, permutation=info.permutation.to(torch.int64))
