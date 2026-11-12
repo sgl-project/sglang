@@ -16,8 +16,9 @@ from dataclasses import dataclass
 import torch
 import triton
 import triton.language as tl
-from flashinfer import top_k as _flashinfer_top_k
 from torch import Tensor
+
+from sglang.kernels.ops.sampling.topk import radix_topk
 
 
 @dataclass(frozen=True)
@@ -423,8 +424,8 @@ def build_uno_tree_proposal(
             "draft_logits must have shape [B, depth, vocab] with the same B "
             f"as root_tokens; got {tuple(draft_logits.shape)}"
         )
-    if not root_tokens.is_cuda or not draft_logits.is_cuda:
-        raise ValueError("UNO tree construction requires CUDA tensors")
+    if root_tokens.is_cpu or draft_logits.is_cpu:
+        raise ValueError("UNO tree construction requires GPU tensors")
     if root_tokens.device != draft_logits.device:
         raise ValueError("tree roots and draft logits must share a device")
     if root_tokens.dtype not in (torch.int32, torch.int64):
@@ -527,10 +528,9 @@ def build_uno_tree_proposal(
 
     candidate_shape = (batch_size, num_depths, candidate_top_k)
     flat_logits = draft_logits.contiguous().view(batch_size * num_depths, vocab_size)
-    flat_top_values, flat_top_token_ids = _flashinfer_top_k(
+    flat_top_values, flat_top_token_ids = radix_topk(
         flat_logits,
         candidate_top_k,
-        sorted=True,
         deterministic=False,
     )
     top_values = flat_top_values.view(candidate_shape)

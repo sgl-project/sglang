@@ -57,6 +57,29 @@ class TestUnoTreeSparseSampling(CustomTestCase):
                 _can_use_sparse_uno_tree_target_sampling(128, sampling_info)
             )
 
+    def test_sparse_dispatch_platforms(self):
+        """XPU verify is otherwise forced greedy, so losing XPU here would
+        silently commit argmax for sampled tree requests."""
+        sampling_info = SimpleNamespace(sampling_seed=None, need_min_p_sampling=False)
+        spec_config = SimpleNamespace(speculative_use_rejection_sampling=False)
+        for is_cuda, is_xpu, expected in (
+            (False, True, True),
+            (False, False, False),
+        ):
+            with (
+                self.subTest(is_cuda=is_cuda, is_xpu=is_xpu),
+                patch("sglang.srt.speculative.eagle_utils._is_cuda", is_cuda),
+                patch("sglang.srt.speculative.eagle_utils._is_xpu", is_xpu),
+                patch(
+                    "sglang.srt.speculative.eagle_utils.get_spec",
+                    return_value=spec_config,
+                ),
+            ):
+                self.assertEqual(
+                    _can_use_sparse_uno_tree_target_sampling(50, sampling_info),
+                    expected,
+                )
+
     def test_targets_are_sampled_from_compact_support(self):
         support_ids = torch.tensor(
             [

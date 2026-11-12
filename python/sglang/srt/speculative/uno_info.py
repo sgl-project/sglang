@@ -11,6 +11,7 @@ from sglang.srt.mem_cache.allocation_sizing import (
 )
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
+from sglang.srt.utils.device import is_pin_memory_available
 
 
 @dataclass
@@ -145,15 +146,20 @@ class UnoDraftInput(SpecInput):
                 f"needed={max(next_lengths)}, available={row_width}."
             )
 
+        # Pinned so the non_blocking copies below are stream-ordered; a pageable
+        # source is copied synchronously on CUDA but races on XPU.
+        pin_memory = is_pin_memory_available(batch.device)
         current_cpu = torch.tensor(
             current_lengths,
             dtype=torch.int32,
             device="cpu",
+            pin_memory=pin_memory,
         )
         next_cpu = torch.tensor(
             next_lengths,
             dtype=torch.int32,
             device="cpu",
+            pin_memory=pin_memory,
         )
         current_device = current_cpu.to(
             batch.device,
