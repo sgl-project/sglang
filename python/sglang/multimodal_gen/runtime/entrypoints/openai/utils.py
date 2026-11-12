@@ -16,7 +16,10 @@ import httpx
 from fastapi import HTTPException, UploadFile
 from pydantic import BaseModel
 
-from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.configs.sample.sampling_params import (
+    SamplingParams,
+    validate_served_postprocess_model_path,
+)
 from sglang.multimodal_gen.configs.task_type import DataType
 from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
     ListLorasReq,
@@ -260,18 +263,18 @@ def choose_output_image_ext(
 _MODEL_PATH_FIELDS = ("upscaling_model_path", "frame_interpolation_model_path")
 
 
-def _reject_remote_model_paths(kwargs: dict[str, Any]) -> None:
-    """Reject URL model paths so a client cannot make the server fetch them (SSRF).
+def _reject_unlisted_model_paths(kwargs: dict[str, Any], server_args: Any) -> None:
+    """Reject model paths the operator did not list, so a client cannot make the
+    server download or load weights of its choosing (URL, repo id or local path).
 
-    Only network entry points call this; the CLI and Python API still accept URLs.
+    Only network entry points call this; the CLI and Python API accept any path.
     """
+    allowed = getattr(server_args, "postprocess_model_paths", None)
     for name in _MODEL_PATH_FIELDS:
-        value = kwargs.get(name)
-        if isinstance(value, str) and "://" in value:
-            raise HTTPException(
-                status_code=400,
-                detail=f"{name} must be a local path or a HuggingFace repo id, not a URL",
-            )
+        try:
+            validate_served_postprocess_model_path(name, kwargs.get(name), allowed)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 def build_sampling_params(request_id: str, **kwargs) -> SamplingParams:
@@ -298,7 +301,7 @@ def build_sampling_params(request_id: str, **kwargs) -> SamplingParams:
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    _reject_remote_model_paths(kwargs)
+    _reject_unlisted_model_paths(kwargs, server_args)
     has_explicit_compression = kwargs.get("output_compression") is not None
 
     # parse "WxH" size string if provided
