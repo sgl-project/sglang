@@ -55,6 +55,7 @@ from sglang.srt.runtime_context import (
     get_serving,
     get_spec,
     is_scheduler_io_rank,
+    is_scheduler_rpc_rank,
     publish,
     spawn_world_rank,
 )
@@ -888,6 +889,7 @@ class Scheduler(
         self.ipc_channels = SchedulerIpcChannels.create(
             port_args=port_args,
             is_rank_zero=is_rank_zero,
+            is_rpc_rank=is_scheduler_rpc_rank(),
             # The snapshot taken at construction, not a second bag read: this
             # scheduler gates its tokenizer init on the same value, and the two
             # must not be able to disagree.
@@ -925,11 +927,12 @@ class Scheduler(
             and get_parallel().attn_cp_rank == 0
             and get_device().sleep_on_idle
         ):
+            io_sockets = (
+                self.ipc_channels.recv_from_tokenizer,
+                self.ipc_channels.recv_from_rpc,
+            )
             self.idle_sleeper = IdleSleeper(
-                sockets=[
-                    self.ipc_channels.recv_from_tokenizer,
-                    self.ipc_channels.recv_from_rpc,
-                ],
+                sockets=[s for s in io_sockets if s is not None],
                 can_empty_cache=lambda: not self.pause_state.paused,
             )
         else:

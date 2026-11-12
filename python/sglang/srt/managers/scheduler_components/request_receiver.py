@@ -155,7 +155,7 @@ class SchedulerRequestReceiver:
                         break
                     recv_reqs.append(recv_req)
 
-                while True:
+                while self.recv_from_rpc is not None:
                     try:
                         if self.recv_limit_reached(len(recv_reqs)):
                             break

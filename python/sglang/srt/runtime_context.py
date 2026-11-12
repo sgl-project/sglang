@@ -520,6 +520,13 @@ def is_scheduler_io_rank() -> bool:
     )
 
 
+def is_scheduler_rpc_rank() -> bool:
+    """Whether this scheduler rank serves the engine's RPC channel: the io rank
+    of the first attention-DP group, the only one whose control requests are
+    broadcast to the whole TP group."""
+    return is_scheduler_io_rank() and get_parallel().attn_dp_rank == 0
+
+
 class _FlagGroupBase(msgspec.Struct):
     """Shared flag-group behavior: typo-safe writes + transactional ``override()``.
 
