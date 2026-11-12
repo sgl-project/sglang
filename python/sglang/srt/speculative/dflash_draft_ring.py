@@ -16,7 +16,7 @@ compute this layout and change together.
 KV the ring never had.
 
 Under PD disaggregation prefill sends a request's last window of ring rows
-(``transfer_rows``, positionally matched like DeepSeek-V4's SWA ring) and its
+(``transfer_rows``, positionally matched like the SWA_RING state) and its
 ``min_pos`` row; a decode rank keeps the positions it owns.
 """
 
@@ -36,14 +36,21 @@ def draft_kv_ring_unsupported_reason(
     *,
     draft_backend: Optional[str],
     disaggregation_mode: str = "null",
+    disaggregation_transfer_backend: str = "mooncake",
+    disaggregation_decode_host_receive_threshold: float = 1.0,
     enable_unified_memory: bool = False,
     dcp_size: int = 1,
     draft_window_size: Optional[int] = None,
 ) -> Optional[str]:
     """Why a ring cannot serve this draft, or None. Loads the draft config only
     once the launch flags allow a ring."""
-    if disaggregation_mode != "null":
-        return "PD disaggregation does not transfer the ring yet"
+    if disaggregation_mode != "null" and disaggregation_transfer_backend != "mooncake":
+        return (
+            f"the {disaggregation_transfer_backend} PD transfer backend does not "
+            "send the ring"
+        )
+    if disaggregation_decode_host_receive_threshold < 1:
+        return "decode host KV buffering receives only SWA state"
     if enable_unified_memory:
         return "--enable-unified-memory places the draft KV in the target's pool"
     if draft_backend not in DFLASH_MLA_ONLY_DRAFT_BACKENDS:
@@ -121,10 +128,9 @@ class DFlashDraftKVRing:
         dcp_size: int,
         req_to_token_rows: int,
         device: torch.device,
-        window_left: int = 0,
-        dcp_rank: int = 0,
-        pool=None,
-        mem_pool: Optional[torch.cuda.MemPool] = None,
+        window_left: int,
+        dcp_rank: int,
+        pool,
     ):
         self.rows_per_req = rows_per_req
         self.dcp_size = dcp_size
@@ -135,6 +141,7 @@ class DFlashDraftKVRing:
         self.span = rows_per_req * dcp_size
         # PD writes min_pos rows remotely; Mooncake's NVLink transport only
         # reaches memory from the KV pools' cuMemCreate pool.
+        mem_pool = pool.maybe_get_custom_mem_pool()
         with torch.cuda.use_mem_pool(mem_pool) if mem_pool else nullcontext():
             self.min_pos = torch.zeros(
                 req_to_token_rows, dtype=torch.int32, device=device
@@ -207,21 +214,17 @@ class DFlashDraftKVRing:
     def transfer_rows(self, req_pool_idx: int, seq_len: int) -> np.ndarray:
         """This rank's ring rows of the last window before ``seq_len``, in
         position order; row 0 (the sink) for a position another rank owns."""
-        positions = np.arange(
-            max(0, seq_len - self.window_left - 1), seq_len, dtype=np.int64
+        positions = torch.arange(
+            max(0, seq_len - self.window_left - 1), seq_len, dtype=torch.int64
         )
-        rows = (
-            1
-            + req_pool_idx * self.rows_per_req
-            + (positions // self.dcp_size) % self.rows_per_req
-        )
+        rows = self.locs(torch.full_like(positions, req_pool_idx), positions)
+        rows = rows // self.dcp_size
         rows[positions % self.dcp_size != self.dcp_rank] = 0
-        return rows.astype(np.int32)
+        return rows.to(torch.int32).numpy()
 
     def reset_floor(self, req_pool_idx: int, seq_len: int) -> None:
-        """PD decode, at preallocation: no draft context until prefill's floor
-        row lands, so a prefill that ships no ring leaves an empty window
-        rather than a stale one."""
+        """PD decode, only for a request no transfer sends a floor to: prefill's
+        remote write must be the floor's only writer."""
         self.min_pos[req_pool_idx].fill_(seq_len)
 
     def ring_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
@@ -236,16 +239,3 @@ class DFlashDraftKVRing:
             [self.min_pos.nbytes],
             [self.min_pos.element_size()],
         )
-
-
-_active_ring: Optional[DFlashDraftKVRing] = None
-
-
-def set_draft_kv_ring(ring: Optional[DFlashDraftKVRing]) -> None:
-    global _active_ring
-    _active_ring = ring
-
-
-def get_draft_kv_ring() -> Optional[DFlashDraftKVRing]:
-    """This process's draft KV ring, for PD state registration and payloads."""
-    return _active_ring

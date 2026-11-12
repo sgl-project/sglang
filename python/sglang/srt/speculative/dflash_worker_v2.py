@@ -93,7 +93,6 @@ from sglang.srt.speculative.dflash_draft_l2_prefetch import (
 from sglang.srt.speculative.dflash_draft_ring import (
     DFlashDraftKVRing,
     draft_kv_ring_rows_per_req_from_config,
-    set_draft_kv_ring,
 )
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
@@ -973,20 +972,18 @@ class DFlashWorkerV2(BaseSpecWorker):
         parallel = get_parallel()
         dcp_size = parallel.attn_dcp_size
         pool = self.draft_model_runner.token_to_kv_pool
-        req_to_token_rows = self.model_runner.req_to_token_pool.req_to_token.shape[0]
         draft_hf_config = self.draft_model_runner.model_config.hf_config
+        req_to_token_rows = self.model_runner.req_to_token_pool.req_to_token.shape[0]
         self.draft_kv_ring = DFlashDraftKVRing(
             rows_per_req=draft_kv_ring_rows_per_req_from_config(draft_hf_config),
             dcp_size=dcp_size,
             req_to_token_rows=req_to_token_rows,
             device=self.device,
             window_left=get_dflash_attention_sliding_window_size(draft_hf_config),
-            dcp_rank=parallel.dcp_rank if parallel.dcp_enabled else 0,
+            dcp_rank=parallel.attn_dcp_rank,
             pool=pool,
-            mem_pool=pool.maybe_get_custom_mem_pool(),
         )
-        set_draft_kv_ring(self.draft_kv_ring)
-        if get_parallel().tp_rank == 0:
+        if parallel.tp_rank == 0:
             logger.info(
                 "DFLASH draft KV ring: %d rows per request per rank (%d positions), "
                 "%d req_to_token rows, draft pool %d rows.",
