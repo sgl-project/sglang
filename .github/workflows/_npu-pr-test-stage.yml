@@ -54,6 +54,10 @@ on:
         description: 'Coverage-recommended test files for this suite (one repo-relative path per line, from recommend-tests-from-coverage). Empty = run the full suite.'
         type: string
         default: ''
+      sgl_router:
+        description: 'Download sgl-router for the PD disaggregation tests in this suite.'
+        type: boolean
+        default: false
       sgl_router_artifact:
         description: "sgl-router-build's artifact; empty falls back as download-sgl-router describes."
         type: string
@@ -204,6 +208,7 @@ jobs:
 
       # Before the install: its build output under rust/ would change the hashed key.
       - name: Download prebuilt sgl-router
+        if: inputs.sgl_router
         uses: ./.github/actions/download-sgl-router
         with:
           artifact_name: ${{ inputs.sgl_router_artifact }}
