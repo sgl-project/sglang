@@ -12,7 +12,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=1770, stage="weekly", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=2300, stage="weekly", runner_config="4-gpu-b200")
 
 
 class FlashinferTrtllmGenMoeBackendFP8Base:
@@ -345,6 +345,20 @@ class TestFlashinferTrtllmGenMoeBackendNvFp4PerTokenActivationRelu2(
     extra_env = {"SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION": "1"}
     backend = "flashinfer_trtllm"
     gsm8k_threshold = 0.93
+
+
+class TestFlashinferTrtllmGenMoeBackendNVFP4NemotronNano(
+    FlashinferTrtllmGenMoeBackendNVFP4Base, CustomTestCase
+):
+    """Static NVFP4 at hidden size 2688, a multiple of 128 but not of 256: the
+    kernels return wrong outputs unless the hidden size is padded to 256."""
+
+    model = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4"
+    backend = "flashinfer_trtllm"
+    # Nano is a chat reasoning model, so this completion-mode eval scores low even
+    # when correct: BF16 on Triton 0.485, NVFP4 on CUTLASS 0.45, padded trtllm
+    # 0.435-0.455. Unpadded (wrong) trtllm scores 0.17.
+    gsm8k_threshold = 0.35
 
 
 if __name__ == "__main__":
