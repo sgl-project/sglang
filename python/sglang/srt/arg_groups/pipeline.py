@@ -7,11 +7,11 @@ from typing import Any
 
 from sglang.srt.arg_groups.arg_utils import record_fields
 from sglang.srt.arg_groups.kv_shard_hook import handle_kv_cache_sharding
+from sglang.srt.arg_groups.model_override_base import resolving_view
 from sglang.srt.arg_groups.overrides import (
     _page_size_default,
     _pipeline_parallel_overlap_disable,
     _sampling_backend_default,
-    resolving_view,
     run_post_process_pass,
 )
 from sglang.srt.arg_groups.resolution_hooks import run_hook
@@ -47,6 +47,14 @@ def run_resolution_pipeline(server_args: Any) -> None:
     from sglang.srt.arg_groups.mega_moe_hook import handle_mega_moe
 
     run_hook(handle_mega_moe, server_args)
+
+    from sglang.srt.arg_groups.validation_hook import (
+        validate_rust_server_unsupported_args,
+    )
+
+    # Early, on the arguments as given: before the handlers below derive
+    # others from them (e.g. `--lora-paths` turning on `enable_lora`).
+    run_hook(validate_rust_server_unsupported_args, server_args)
     from sglang.srt.arg_groups.serving_hook import (
         handle_asr_validation,
         handle_crash_dump_env,
@@ -85,10 +93,12 @@ def run_resolution_pipeline(server_args: Any) -> None:
         validate_prefill_decode_interval,
         validate_response_store,
         validate_sampling_mask_max_tokens,
+        validate_uocr_document_config,
     )
 
     run_hook(validate_prefill_decode_interval, server_args)
     run_hook(validate_response_store, server_args)
+    run_hook(validate_uocr_document_config, server_args)
     run_hook(validate_sampling_mask_max_tokens, server_args)
     # Before any reader of speculative_algorithm: the flag may reset it.
     run_hook(handle_aux_hidden_state_capture, server_args)
@@ -177,6 +187,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
         apply_inkling_prefill_cuda_graph_default,
         apply_muse_glimmer_prefill_cuda_graph_max_bs_default,
         apply_prefill_cp_cuda_graph_default,
+        apply_unlimited_ocr_v2_cuda_graph_default,
         disable_prefill_cuda_graph_for_deepseek_trtllm_mla,
         finalize_cuda_graph_prefill_max_context,
         handle_cuda_graph_config,
@@ -184,6 +195,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
 
     run_hook(apply_inkling_prefill_cuda_graph_default, server_args)
     run_hook(apply_muse_glimmer_prefill_cuda_graph_max_bs_default, server_args)
+    run_hook(apply_unlimited_ocr_v2_cuda_graph_default, server_args)
 
     # must run before _handle_cuda_graph_config and _handle_data_parallelism
     run_hook(handle_dwdp, server_args)

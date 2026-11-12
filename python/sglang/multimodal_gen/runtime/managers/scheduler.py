@@ -78,6 +78,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
     BatchMetricsWindow,
     OutputBatch,
 )
+from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
+    slice_rollout_trajectory_range,
+)
 from sglang.multimodal_gen.runtime.post_training.scheduler_post_training_mixin import (
     SchedulerPostTrainingMixin,
 )
@@ -149,7 +152,6 @@ class Scheduler(
         local_rank: int | None = None,
     ):
         self.server_args = server_args
-        self.port_args = port_args
 
         # local_rank is the physical GPU index for torch.cuda.set_device.
         # In non-disagg mode, it equals gpu_id. In disagg mode, it may differ
@@ -1285,6 +1287,9 @@ class Scheduler(
                 noise_pred=self._slice_batched_value(
                     output_batch.noise_pred, start, end, total_items
                 ),
+                rollout_trajectory_data=slice_rollout_trajectory_range(
+                    output_batch.rollout_trajectory_data, start, end
+                ),
                 peak_memory_mb=output_batch.peak_memory_mb,
             )
             if split.metrics is not None:
@@ -1449,7 +1454,7 @@ class Scheduler(
     def recv_reqs(self) -> List[tuple[bytes, Any]]:
         """
         For non-main schedulers, reqs are broadcasted from main using
-        broadcast_pyobj. ``--comfyui-mode`` multi-rank instead keeps CUDA
+        broadcast_pyobj. ``comfyui_mode`` multi-rank instead keeps CUDA
         tensors on NCCL so per-step latents do not pickle onto the gloo group.
         """
         if self.receiver is not None:

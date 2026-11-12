@@ -31,8 +31,10 @@ from sglang.multimodal_gen.runtime.managers import scheduler as scheduler_module
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
 from sglang.multimodal_gen.runtime.managers.request_cancel import (
     CancelListener,
-    RequestCancelledError,
     raise_if_cancelled,
+)
+from sglang.multimodal_gen.runtime.managers.request_cancel_error import (
+    RequestCancelledError,
 )
 from sglang.multimodal_gen.runtime.managers.scheduler import Scheduler
 from sglang.multimodal_gen.runtime.pipelines_core.executors import (
@@ -855,10 +857,10 @@ def test_cancel_publisher_failures(monkeypatch):
 
 
 def test_cancel_backpressure_does_not_drop_accepted_commands():
-    endpoint = _cancel_endpoint()
+    # inproc has no OS socket buffer that can absorb the burst
+    endpoint = f"inproc://cancel-backpressure-{uuid.uuid4().hex}"
     publisher = video_cancel.CancelPublisher(endpoint)
-    context = zmq.Context()
-    listener = CancelListener(context, endpoint)
+    listener = CancelListener(publisher._context, endpoint)
     try:
         _deliver_cancel(publisher.publish, listener, "ready")
         accepted = set()
@@ -881,7 +883,6 @@ def test_cancel_backpressure_does_not_drop_accepted_commands():
             _deliver_cancel(publisher.publish, listener, request_id)
         assert all(listener._is_cancelled(f"job-{i}") for i in range(3500))
     finally:
-        context.destroy(linger=0)
         publisher.close()
 
 

@@ -8,11 +8,9 @@ supported without runtime shape gates.
 
 from __future__ import annotations
 
-import contextlib
-import contextvars
 import logging
 import threading
-from collections.abc import Iterator, Mapping
+from collections.abc import Mapping
 from functools import lru_cache
 from importlib.metadata import PackageNotFoundError, version
 from typing import Any
@@ -22,9 +20,6 @@ import torch
 logger = logging.getLogger(__name__)
 
 _SHORT_NUM_TOKENS = 256
-_config_bucket: contextvars.ContextVar[str | None] = contextvars.ContextVar(
-    "muse_spark_helion_config_bucket", default=None
-)
 _compiled_lock = threading.Lock()
 _compiled: dict[tuple[Any, str], Any] = {}
 
@@ -70,25 +65,6 @@ def token_count_specialization_key(first_tensor: torch.Tensor, *_: Any) -> int:
     return 1 if num_tokens == 1 else 2
 
 
-@contextlib.contextmanager
-def helion_config_bucket(bucket: str) -> Iterator[None]:
-    """Temporarily force a pinned config bucket for tests and benchmarks."""
-    if bucket not in ("short", "long"):
-        raise ValueError(f"Unsupported Helion config bucket: {bucket}")
-    token = _config_bucket.set(bucket)
-    try:
-        yield
-    finally:
-        _config_bucket.reset(token)
-
-
-def current_helion_config_bucket(num_tokens: int) -> str:
-    bucket = _config_bucket.get()
-    if bucket is not None:
-        return bucket
-    return "short" if num_tokens <= _SHORT_NUM_TOKENS else "long"
-
-
 def _pdl_launcher(
     triton_kernel: Any,
     grid: tuple[int, ...],
@@ -122,7 +98,7 @@ def run_pinned_helion(
     """Run a dynamic-shape kernel with its token-length tuned config."""
     if num_tokens <= 0:
         raise ValueError("Helion kernels require at least one token")
-    bucket = current_helion_config_bucket(num_tokens)
+    bucket = "short" if num_tokens <= _SHORT_NUM_TOKENS else "long"
     config = configs.get(bucket)
     kernel_name = getattr(kernel, "__name__", type(kernel).__name__)
     if config is None:
@@ -156,8 +132,6 @@ def run_pinned_helion(
 
 __all__ = [
     "base_package_version",
-    "current_helion_config_bucket",
-    "helion_config_bucket",
     "helion_supported",
     "run_pinned_helion",
     "token_count_specialization_key",

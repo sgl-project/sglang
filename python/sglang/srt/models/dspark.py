@@ -19,20 +19,16 @@ from sglang.srt.distributed.device_communicators.vocab_gather import make_vocab_
 from sglang.srt.environ import envs
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import should_apply_lm_head_quant_method
-from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc, layer_window_locs
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.dflash import DFlashDraftModel, DFlashMLAAttention
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, get_spec
 from sglang.srt.speculative.dflash_utils import can_dflash_slice_qkv_weight
 from sglang.srt.speculative.dspark_components.dspark_config import (
+    builds_confidence_head,
     get_dspark_sample_from_anchor,
     parse_dspark_draft_config,
 )
-from sglang.srt.speculative.ragged_verify import (
-    RaggedVerifyMode,
-    read_ragged_verify_mode,
-)
-from sglang.srt.utils import is_gfx95_supported
 from sglang.srt.utils.invariants import Bucket, InClosedRange, Invariant, expect
 
 if TYPE_CHECKING:
@@ -40,26 +36,6 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# fp8 target lm_head GEMM for the DSPARK verify logits, opt-in via
-# SGLANG_ROCM_OPT_DSPARK_FP8_LM_HEAD. The bf16 head matmul
-# [num_verify_tokens, hidden] x [hidden, vocab_slice] is a per-decode-step cost
-# that grows with the verify batch; running it in fp8 (per-token activation
-# scale + per-output-channel weight scale) roughly halves that GEMM. The weight
-# is fp8-quantized once and cached on the module. Evaluated once at import to
-# keep the per-token decode path free of env lookups.
-#
-# Platform guard: the fp8 _scaled_mm path is validated on gfx95x (MI355X). On
-# gfx942 (MI300X) it produces an accuracy regression, so gate the flag on the
-# arch -- a user who sets the env on gfx942 keeps the safe bf16 head matmul
-# (the flag stays inert) rather than silently hitting the accuracy issue.
-_DSPARK_FP8_LM_HEAD = (
-    envs.SGLANG_ROCM_OPT_DSPARK_FP8_LM_HEAD.get() and is_gfx95_supported()
-)
-if envs.SGLANG_ROCM_OPT_DSPARK_FP8_LM_HEAD.get() and not _DSPARK_FP8_LM_HEAD:
-    logger.warning(
-        "SGLANG_ROCM_OPT_DSPARK_FP8_LM_HEAD is set but the fp8 lm_head path is only "
-        "supported on gfx95x; keeping the bf16 head matmul on this device."
-    )
 _FP8_DTYPE = torch.float8_e4m3fn
 _FP8_MAX = 448.0
 
@@ -91,6 +67,26 @@ def _fp8_lm_head_matmul(hidden: torch.Tensor, lm_head: nn.Module) -> torch.Tenso
         scale_b=w_scale.t(),
         out_dtype=hidden.dtype,
     )
+
+
+def _mxfp8_lm_head_matmul(hidden: torch.Tensor, lm_head: nn.Module) -> torch.Tensor:
+    from flashinfer import block_scale_interleave, mm_mxfp8, mxfp8_quantize
+
+    weight = lm_head.weight
+    cache = getattr(lm_head, "_mxfp8_weight_cache", None)
+    if cache is None or cache[0].shape != weight.shape:
+        n, k = weight.shape
+        w_q, w_sf = mxfp8_quantize(
+            weight.to(torch.bfloat16), is_sf_swizzled_layout=False
+        )
+        w_sf = block_scale_interleave(
+            w_sf.view(torch.uint8).reshape(n, k // 32).contiguous()
+        ).contiguous()
+        cache = (w_q, w_sf)
+        lm_head._mxfp8_weight_cache = cache
+    h_q, h_sf = mxfp8_quantize(hidden.to(torch.bfloat16), is_sf_swizzled_layout=True)
+    logits = mm_mxfp8(h_q, cache[0].t(), h_sf, cache[1], backend="cute-dsl")
+    return logits if logits.dtype == hidden.dtype else logits.to(hidden.dtype)
 
 
 def _is_pow2(n: int) -> bool:
@@ -132,13 +128,17 @@ def project_through_lm_head(hidden: torch.Tensor, lm_head: nn.Module) -> torch.T
     if should_apply_lm_head_quant_method(lm_head, quant_method):
         return quant_method.apply(lm_head, hidden, None)
     weight = lm_head.weight
-    if (
-        _DSPARK_FP8_LM_HEAD
-        and weight.is_floating_point()
-        and hidden.shape[0] > 0
-        and weight.shape[-1] % 16 == 0
-    ):
-        return _fp8_lm_head_matmul(hidden, lm_head)
+    dtype = get_spec().speculative_dspark_lm_head_dtype
+    if dtype is not None and weight.is_floating_point() and hidden.shape[0] > 0:
+        if dtype == "fp8" and weight.shape[-1] % 16 == 0:
+            return _fp8_lm_head_matmul(hidden, lm_head)
+        if (
+            dtype == "mxfp8"
+            and hidden.is_cuda
+            and weight.shape[-1] % 32 == 0
+            and weight.shape[0] % 128 == 0
+        ):
+            return _mxfp8_lm_head_matmul(hidden, lm_head)
     return torch.matmul(hidden.to(weight.dtype), weight.T)
 
 
@@ -486,13 +486,8 @@ class DSparkConfidenceHead(nn.Module):
 
 
 def build_confidence_head(config) -> Optional[nn.Module]:
-    if read_ragged_verify_mode() is RaggedVerifyMode.STATIC:
+    if not builds_confidence_head(config):
         return None
-    if not hasattr(config, "enable_confidence_head"):
-        logger.warning(
-            "DSpark draft config has no enable_confidence_head field; treating the "
-            "confidence head as enabled."
-        )
     hidden_size = int(config.hidden_size)
     markov_rank = int(getattr(config, "markov_rank", 0))
     with_markov = bool(getattr(config, "confidence_head_with_markov", markov_rank > 0))
@@ -698,7 +693,7 @@ class DSparkDraftMixin:
             raise ValueError(
                 f"DSpark confidence head is enabled but the checkpoint is missing "
                 f"{sorted(missing)}. Provide a checkpoint with trained confidence weights, "
-                f"or disable the confidence head (enable_confidence_head=False)."
+                f"or set SGLANG_DSPARK_USE_ONLINE_ESTIMATOR=1."
             )
 
     def _fused_kv_write_bundle(self, pool):
@@ -739,6 +734,12 @@ class DSparkDraftMixin:
         layers = list(self.layers)
         if not layers or not (
             hasattr(pool, "get_key_buffer") and hasattr(pool, "get_value_buffer")
+        ):
+            return None
+        # The fused kernel shares one location vector across every layer.
+        if any(
+            not pool.layer_router.layer(layer.self_attn.attn.layer_id).owner
+            for layer in layers
         ):
             return None
         k_norm_weights = self._fused_k_norm_weights()
@@ -851,6 +852,7 @@ class DSparkDraftMixin:
         cache_loc_2d: Optional[torch.Tensor] = None,
         commit_lens: Optional[torch.Tensor] = None,
         target_hidden_is_projected: bool = False,
+        swa_loc: Optional[torch.Tensor] = None,
     ) -> None:
         ctx_hidden = (
             target_hidden
@@ -903,6 +905,7 @@ class DSparkDraftMixin:
                     positions=positions,
                     hidden_states=ctx_hidden,
                     cache_loc=cache_loc,
+                    swa_cache_loc=swa_loc,
                     cache_loc_2d=cache_loc_2d,
                     commit_lens=commit_lens,
                 )
@@ -917,9 +920,17 @@ class DSparkDraftMixin:
                 k = k.view(-1, attn.num_kv_heads, attn.head_dim)
                 v = v.view(-1, attn.num_kv_heads, attn.head_dim)
             if cache_loc_2d is not None and commit_lens is not None:
-                pool.set_kv_buffer_prefix_valid(
+                pool.layer_router.layer(attn.attn.layer_id).store_prefix(
                     attn.attn,
-                    cache_loc_2d,
+                    KVWriteLoc(
+                        cache_loc_2d,
+                        window_locs=layer_window_locs(
+                            pool,
+                            attn.attn.layer_id,
+                            None if swa_loc is None else swa_loc.view_as(cache_loc_2d),
+                        ),
+                        physical=True,
+                    ),
                     commit_lens,
                     k,
                     v,
@@ -931,7 +942,13 @@ class DSparkDraftMixin:
                 # already in the ids the draft pool indexes.
                 pool.layer_router.layer(attn.attn.layer_id).store(
                     attn.attn,
-                    KVWriteLoc(cache_loc, physical=True),
+                    KVWriteLoc(
+                        cache_loc,
+                        window_locs=layer_window_locs(
+                            pool, attn.attn.layer_id, swa_loc
+                        ),
+                        physical=True,
+                    ),
                     k,
                     v,
                     attn.attn.k_scale,
