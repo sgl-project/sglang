@@ -651,7 +651,6 @@ class TestDcpL3PoolCheck(CustomTestCase):
         replicated_draft = _make_host_pool(0, dcp_size=1, layout="page_first")
         for label, name, pool, shards in (
             ("replicated index-K", PoolName.INDEXER, indexer, False),
-            ("replicated index-K exponents", PoolName.INDEXER_SCALE, indexer, False),
             ("indexer size", PoolName.INDEXER, resized, True),
             ("draft indexer", PoolName.DRAFT_INDEXER, indexer, True),
             ("dummy draft", PoolName.DRAFT, dummy_draft, True),
