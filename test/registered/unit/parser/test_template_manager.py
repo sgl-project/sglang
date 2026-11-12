@@ -557,6 +557,18 @@ class TestTemplateDetectionRuleMatrix(unittest.TestCase):
             "enable_thinking",
         ),
         (
+            "minicpm_v47_explicit_enable_thinking",
+            "<|im_start|>assistant\n"
+            "{% if enable_thinking is defined and enable_thinking is true %}"
+            "<think>\n{% else %}<think>\n\n</think>\n\n{% endif %}\n"
+            "<|image_pad|>\n"
+            "<tool_call><function=example_function_name>"
+            "<parameter=example_parameter_1>",
+            [],
+            "minicpm",
+            "enable_thinking",
+        ),
+        (
             "kimi_unicode_markers",
             "\u25c1think\u25b7some text\u25c1/think\u25b7",
             [],
@@ -639,6 +651,40 @@ class TestTemplateDetectionRuleMatrix(unittest.TestCase):
 
         self.assertIsNone(config)
         self.assertIsNone(parser)
+
+    MINICPM_V47_TEMPLATE = (
+        "<|im_start|>user\n<|image_pad|>\n<|im_end|>\n"
+        "{% if add_generation_prompt %}"
+        "<|im_start|>assistant\n"
+        "{% if enable_thinking is defined and enable_thinking is true %}"
+        "<think>\n"
+        "{% else %}"
+        "<think>\n\n</think>\n\n"
+        "{% endif %}"
+        "{% endif %}\n"
+        "<tool_call>\n<function=example_function_name>\n"
+        "<parameter=example_parameter_1>\n"
+    )
+
+    def test_minicpm_v47_thinking_is_opt_in_and_keeps_qwen_tool_calls(self):
+        """Closed think block is prefilled, so this must not be deepseek-r1 or mimo."""
+        force, config, parser = self._detect(self.MINICPM_V47_TEMPLATE)
+        tokenizer = _DummyTokenizer([])
+
+        self.assertFalse(force)
+        self.assertEqual(
+            config,
+            ReasoningToggleConfig(
+                toggle_param="enable_thinking", default_enabled=False
+            ),
+        )
+        self.assertEqual(parser, "minicpm")
+        self.assertEqual(
+            detect_tool_call_parser(
+                self.MINICPM_V47_TEMPLATE, tokenizer, config, force
+            ),
+            "qwen3_coder",
+        )
 
     def test_qwen3_precedence_over_deepseek_r1(self):
         """Template with enable_thinking=true but no <think> tag should be qwen3, not deepseek_r1."""

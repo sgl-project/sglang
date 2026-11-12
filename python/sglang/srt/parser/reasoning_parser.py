@@ -1620,6 +1620,21 @@ class _MimoDetector(Qwen3Detector):
         self.reasoning_default = "explicit_enable_thinking"
 
 
+class MiniCPMDetector(Qwen3Detector):
+    """MiniCPM-V 4.7 reuses Qwen3 think tags, but thinking is opt-in.
+
+    Unless ``enable_thinking`` is explicitly true, the chat template prefills
+    ``<think>\\n\\n</think>\\n\\n``. The closing tag is in the prompt, and the
+    completion is the answer. ``reasoning_default`` is therefore explicit, and
+    ``force_reasoning`` must follow the request: forcing it files that answer
+    into reasoning_content and leaves content empty.
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.reasoning_default = "explicit_enable_thinking"
+
+
 class _PoolsideV1Detector(Qwen3Detector):
     """Poolside v1 (Laguna-XS.2) reuses Qwen3 <think> tokens but the HF chat template
     defaults `enable_thinking=False`; reasoning is opt-in via `enable_thinking=True`."""
@@ -2371,6 +2386,7 @@ class ReasoningParser:
         "kimi_k2": KimiK2Detector,
         "kimi_k3": KimiK3Detector,
         "mimo": _MimoDetector,
+        "minicpm": MiniCPMDetector,
         "muse": MuseGlimmerDetector,
         "poolside_v1": _PoolsideV1Detector,
         "qwen3": Qwen3Detector,

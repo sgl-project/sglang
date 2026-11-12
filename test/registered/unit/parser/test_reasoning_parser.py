@@ -1744,6 +1744,29 @@ class TestErnie5_5ReasoningParser(CustomTestCase):
         self.assertIn("<ernie:tool_call>", content)
 
 
+class TestMiniCPMDetector(CustomTestCase):
+    """Thinking-off completions are the answer; the closing tag is in the prompt."""
+
+    def test_thinking_off_answer_is_content(self):
+        parser = ReasoningParser("minicpm", force_reasoning=False)
+        reasoning, content = parser.parse_non_stream("391")
+        self.assertEqual(reasoning, "")
+        self.assertEqual(content, "391")
+
+    def test_thinking_on_splits_at_close_tag(self):
+        parser = ReasoningParser("minicpm", force_reasoning=True)
+        reasoning, content = parser.parse_non_stream(
+            "23 times 17 is 391.</think>\n\n391"
+        )
+        self.assertIn("23 times 17", reasoning)
+        self.assertEqual(content.strip(), "391")
+
+    def test_reasoning_default_is_explicit(self):
+        parser = ReasoningParser("minicpm")
+        self.assertEqual(parser.detector.reasoning_default, "explicit_enable_thinking")
+        self.assertFalse(parser.detector.force_reasoning)
+
+
 class TestReasoningParserNames(CustomTestCase):
     def test_matches_registry(self):
         # `server_args` builds the --reasoning-parser choices from this list to

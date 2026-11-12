@@ -208,6 +208,14 @@ REASONING_MODE_RULES = (
         ),
     ),
     DetectionRule(
+        name="minicpm_explicit_enable_thinking",
+        value=ReasoningToggleConfig(
+            toggle_param="enable_thinking", default_enabled=False
+        ),
+        # Defined below; lambda so this tuple can be built at import time.
+        predicate=lambda ctx: _is_minicpm_explicit_thinking(ctx),
+    ),
+    DetectionRule(
         name="nemotron_3_super_low_effort",
         value=ReasoningToggleConfig(
             toggle_param="enable_thinking",
@@ -460,6 +468,24 @@ def _is_mimo(ctx):
     )
 
 
+def _is_minicpm_explicit_thinking(ctx):
+    """MiniCPM-V 4.7 thinks only when ``enable_thinking`` is explicitly true.
+
+    The generation prompt otherwise prefills a closed ``<think></think>`` block.
+    That closing tag is in the prompt, not the completion, so a generic
+    ``<think>`` rule (deepseek-r1, or mimo via the shared default-off config)
+    would file the answer into reasoning_content and leave content empty.
+    """
+    return (
+        ctx.has_text("<|image_pad|>")
+        and ctx.has_text("<|im_start|>")
+        and ctx.has_pattern(
+            r"enable_thinking\s+is\s+defined\s+and\s+enable_thinking\s+is\s+true"
+        )
+        and (ctx.has_text("<think>") or ctx.has_text("</think>"))
+    )
+
+
 def _is_minimax(ctx):
     return ctx.has_text("<minimax:tool_call>")
 
@@ -560,6 +586,13 @@ REASONING_PARSER_RULES = (
     DetectionRule(name="glm45", value="glm45", predicate=_is_glm_family),
     DetectionRule(name="hunyuan", value="hunyuan", predicate=_is_hunyuan),
     DetectionRule(name="poolside_v1", value="poolside_v1", predicate=_is_poolside_v1),
+    # Before mimo: both are default-off enable_thinking, and mimo matches that
+    # config alone. MiniCPM-V 4.7 must use its own opt-in reasoning parser.
+    DetectionRule(
+        name="minicpm_explicit_thinking",
+        value="minicpm",
+        predicate=_is_minicpm_explicit_thinking,
+    ),
     DetectionRule(name="mimo", value="mimo", predicate=_is_mimo),
     DetectionRule(name="minimax_m3", value="minimax-m3", predicate=_is_minimax_m3),
     DetectionRule(name="minimax", value="minimax", predicate=_is_minimax),
@@ -610,6 +643,13 @@ TOOL_CALL_PARSER_RULES = (
     DetectionRule(name="minicpm5", value="minicpm5", predicate=_is_minicpm5),
     DetectionRule(name="hunyuan", value="hunyuan", predicate=_is_hunyuan),
     DetectionRule(name="poolside_v1", value="poolside_v1", predicate=_is_poolside_v1),
+    # Before mimo, same reason as the reasoning-parser rule. Keep the Qwen-style
+    # <function=><parameter=> calls this template already emits.
+    DetectionRule(
+        name="minicpm_explicit_thinking",
+        value="qwen3_coder",
+        predicate=_is_minicpm_explicit_thinking,
+    ),
     DetectionRule(name="step3p5", value="step3p5", predicate=_is_step3p5),
     DetectionRule(name="step3", value="step3", predicate=_is_step3),
     DetectionRule(name="ling3", value="ling3", predicate=_is_ling3),
