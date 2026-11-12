@@ -11,7 +11,9 @@ Two rewrites, both applied inside the disposable /tmp copy of the toolkit:
 2. ``write_data`` pads (or truncates) the rows to the requested count. With
    repeat_rate >= 1 the dataset is just the dp x prefix_num prefix copies, so
    without padding every run is pinned to C=dp no matter what num_prompts
-   says.
+   says. The cached copy's writer takes only ``(path, dataset)``, so the
+   target count comes from the ``-num<N>-`` tag in the dataset filename when
+   no count argument is passed.
 
 The cached toolkit on the shared PVC is a different revision from the public
 repo, so body text cannot be matched reliably. Each function is located with
@@ -90,15 +92,29 @@ NEW_BODY = """\
 
 # repeat_rate >= 1 writes the dp x prefix_num prefix copies as the dataset, so
 # the row count equals dp x prefix_num unless the writer pads it to data_num.
-# The baked copy does not pad, which pins every run to C=dp no matter what
-# num_prompts says. Pad (or truncate) to num here so num_prompts is honoured.
+# The baked copy's writer takes only (path, dataset) and never pads, which pins
+# every run to C=dp no matter what num_prompts says. Pad (or truncate) to the
+# requested count here: from the third argument when the copy has one, else
+# from the "-num<N>-" tag the caller already puts in the dataset filename.
 NEW_WRITE_BODY = """\
-    if __NUM__ is not None and len(__DATASET__) < __NUM__:
+    name = __PATH__.rsplit("/", 1)[-1]
+    if __NUM__ is None and not name.startswith("prefix-") and "-num" in name:
+        tail = name.split("-num", 1)[1]
+        digits = ""
+        for ch in tail:
+            if not ("0" <= ch <= "9"):
+                break
+            digits = digits + ch
+        if digits:
+            __NUM__ = int(digits)
+    if __NUM__ is not None and 0 < len(__DATASET__) < __NUM__:
         repeats = __NUM__ // len(__DATASET__)
         remainder = __NUM__ % len(__DATASET__)
         __DATASET__ = __DATASET__ * repeats + __DATASET__[:remainder]
-    elif __NUM__ is not None:
-        __DATASET__ = __DATASET__[:__NUM__]
+    elif __NUM__ is not None and len(__DATASET__) > __NUM__:
+        __DATASET__ = __DATASET__[: __NUM__]
+    if not name.startswith("prefix-"):
+        print("[prefix-pool] %s rows=%d" % (name, len(__DATASET__)))
     with open(__PATH__, "w", encoding="utf-8") as f:
         for item in __DATASET__:
             f.write(json.dumps({"question": item, "answer": "none"}, ensure_ascii=False))
@@ -167,20 +183,25 @@ def _rewrite_toolkit(path):
     text = text[: parts["start"]] + sig + "\n" + body + text[parts["end"] :]
 
     parts = _function_parts(text, path, WRITE_FUNC_NAME)
-    if len(parts["params"]) != 3:
+    params = parts["params"]
+    if len(params) == 2:
+        write_sig = f"def {WRITE_FUNC_NAME}({params[0]}, {params[1]}, num=None):"
+        num_name = "num"
+    elif len(params) == 3:
+        write_sig = parts["sig"]
+        num_name = params[2]
+    else:
         raise SystemExit(
-            f"{WRITE_FUNC_NAME}{tuple(parts['params'])} is not the 3-arg row writer"
+            f"{WRITE_FUNC_NAME}{tuple(params)} is not the row writer we expect"
         )
     write_body = (
-        NEW_WRITE_BODY.replace("__PATH__", parts["params"][0])
-        .replace("__DATASET__", parts["params"][1])
-        .replace("__NUM__", parts["params"][2])
+        NEW_WRITE_BODY.replace("__PATH__", params[0])
+        .replace("__DATASET__", params[1])
+        .replace("__NUM__", num_name)
     )
-    write_marker = f"{parts['params'][1]} * repeats"
+    write_marker = "[prefix-pool]"
     write_lines = (len(parts["orig"].splitlines()), len(write_body.splitlines()) + 1)
-    text = (
-        text[: parts["start"]] + parts["sig"] + "\n" + write_body + text[parts["end"] :]
-    )
+    text = text[: parts["start"]] + write_sig + "\n" + write_body + text[parts["end"] :]
 
     ast.parse(text)
     if text.count(f"def {FUNC_NAME}") != 1 or "pool_tokens" not in text:
