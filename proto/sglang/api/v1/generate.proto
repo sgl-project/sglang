@@ -89,6 +89,8 @@ message GenerateRequest {
   OptionalStringList modalities = 40;
   // Return output_ids and metadata without decoding generated text. This is
   // request-local and also leaves logprob text unset, even when requested.
+  // Rust server only: the Python server rejects `true` with a 400 instead of
+  // returning decoded text.
   optional bool skip_detokenize = 41;
 }
 

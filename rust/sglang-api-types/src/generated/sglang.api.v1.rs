@@ -432,6 +432,8 @@ pub struct GenerateRequest {
     pub modalities: ::core::option::Option<OptionalStringList>,
     /// Return output_ids and metadata without decoding generated text. This is
     /// request-local and also leaves logprob text unset, even when requested.
+    /// Rust server only: the Python server rejects `true` with a 400 instead of
+    /// returning decoded text.
     #[prost(bool, optional, tag = "41")]
     pub skip_detokenize: ::core::option::Option<bool>,
 }
