@@ -870,9 +870,6 @@ def handle_page_major_kv_layout(server_args: Any):
         assert cfg.speculative_algorithm is None, (
             "--enable-unified-memory with aiter does not support speculative decoding."
         )
-        assert cfg.disaggregation_mode == "null", (
-            "--enable-unified-memory with aiter does not support PD disaggregation."
-        )
         assert cfg.dcp_size == cfg.attn_cp_size == 1 and not cfg.enable_prefill_cp, (
             "--enable-unified-memory with aiter does not support context parallelism."
         )

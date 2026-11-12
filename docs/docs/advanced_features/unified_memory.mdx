@@ -108,7 +108,7 @@ python3 -m sglang.launch_server \
 
 The arena selects AITER unified attention automatically; `SGLANG_USE_AITER_UNIFIED_ATTN` is not required. Decode can use eager execution or full CUDA-graph replay. This AITER path does not support MLA, asymmetric K/V dimensions, FP8 KV, speculative decoding, context parallelism or deterministic inference. These restrictions apply even where the general unified-memory feature table below lists support.
 
-HiCache can be enabled with `--enable-hierarchical-cache`. PD disaggregation remains unqualified for this AITER path and is rejected at startup.
+HiCache can be enabled with `--enable-hierarchical-cache`. PD disaggregation uses the shared unified-memory path, subject to the PD restrictions and failed-transfer limitation below.
 
 ## Flags and environment variables
 

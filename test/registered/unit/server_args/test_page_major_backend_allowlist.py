@@ -299,21 +299,30 @@ class TestPageMajorBackendAllowlist(unittest.TestCase):
                         )
                     )
 
-    def test_aiter_pd_remains_rejected_with_or_without_hicache(self):
+    def test_aiter_pd_backend_admission_with_or_without_hicache(self):
         with envs.SGLANG_ENABLE_AITER_UNIFIED_MEMORY.override(True):
             for mode in ("prefill", "decode"):
                 for hicache in (False, True):
-                    with self.subTest(mode=mode, hicache=hicache):
-                        self.assertFalse(
-                            _accepts(
-                                "aiter",
-                                use_mla=False,
-                                dtype="bfloat16",
-                                kv_cache_dtype="bf16",
-                                disaggregation_mode=mode,
-                                enable_hierarchical_cache=hicache,
-                            )
-                        )
+                    for is_hybrid_swa in (False, True):
+                        for page_size in (1, 16):
+                            with self.subTest(
+                                mode=mode,
+                                hicache=hicache,
+                                swa=is_hybrid_swa,
+                                page_size=page_size,
+                            ):
+                                self.assertTrue(
+                                    _accepts(
+                                        "aiter",
+                                        use_mla=False,
+                                        dtype="bfloat16",
+                                        kv_cache_dtype="bf16",
+                                        disaggregation_mode=mode,
+                                        enable_hierarchical_cache=hicache,
+                                        is_hybrid_swa=is_hybrid_swa,
+                                        page_size=page_size,
+                                    )
+                                )
 
     def test_aiter_rejects_unimplemented_arena_contracts(self):
         cases = [
