@@ -651,6 +651,9 @@ def fused_experts_deepep_to_flashinfer_cutedsl_fp4(
     ), (
         f"CuteDSL masked MoE supports 'silu' or 'relu2', got {runner_config.activation!r}."
     )
+    assert runner_config.swiglu_limit is None, (
+        f"CuteDSL masked MoE does not support swiglu_limit, got {runner_config.swiglu_limit}."
+    )
     assert not runner_config.apply_router_weight_on_input, (
         "apply_router_weight_on_input is not supported for Flashinfer"
     )
@@ -687,7 +690,6 @@ def fused_experts_deepep_to_flashinfer_cutedsl_fp4(
         w2_alpha=quant_info.w2_alpha,
         masked_m=masked_m,
         activation=runner_config.activation,
-        swiglu_limit=runner_config.swiglu_limit,
         **(
             dict(
                 down_sm_count=overlap.num_sms,

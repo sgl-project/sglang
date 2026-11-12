@@ -386,7 +386,7 @@ def torch_moe(a, w1, w2, score, topk, expert_map):
     ).sum(dim=1)
 
 
-def torch_moe_nvfp4(a, w1, w2, topk, topk_weight, topk_ids, swiglu_limit=None):
+def torch_moe_nvfp4(a, w1, w2, topk, topk_weight, topk_ids):
     B, D = a.shape
     a = a.view(B, -1, D).repeat(1, topk, 1).reshape(-1, D)
     out = torch.zeros(B * topk, w2.shape[1], dtype=a.dtype, device=a.device)
@@ -401,11 +401,7 @@ def torch_moe_nvfp4(a, w1, w2, topk, topk_weight, topk_ids, swiglu_limit=None):
             assert m % 2 == 0
             # The first and second W13 halves feed the two SwiGLU branches.
             w3_expert, w1_expert = w1[i][m // 2 :, :], w1[i][: m // 2, :]
-            gate, up = a[mask] @ w1_expert.t(), a[mask] @ w3_expert.t()
-            if swiglu_limit is not None:
-                gate = gate.clamp(max=swiglu_limit)
-                up = up.clamp(-swiglu_limit, swiglu_limit)
-            inter = F.silu(gate) * up
+            inter = F.silu(a[mask] @ w1_expert.t()) * (a[mask] @ w3_expert.t())
             inter_gs = torch.tensor(1.0).cuda()
             inter_q, inter_blockscale = fp4_quantize(inter, inter_gs)
             inter = dequantize_nvfp4_to_dtype(
@@ -759,24 +755,18 @@ class TestCuteDslV1(unittest.TestCase):
         does NOT pre-quantize activations (MOE_NVFP4_DISPATCH is off).
         """
         test_cases = [
-            # (bs, hidden_dim, inter_dim, topk, swiglu_limit)
-            (2, 128, 256, 1, None),
-            (2, 128, 256, 2, None),
-            (2, 128, 256, 4, None),
-            (16, 128, 512, 1, None),
-            (16, 128, 512, 2, None),
-            (16, 128, 512, 4, None),
-            # Inside the GEMM1 outputs' spread (std ~0.2), so the clamp binds.
-            (16, 128, 512, 2, 0.1),
+            # (bs, hidden_dim, inter_dim, topk)
+            (2, 128, 256, 1),
+            (2, 128, 256, 2),
+            (2, 128, 256, 4),
+            (16, 128, 512, 1),
+            (16, 128, 512, 2),
+            (16, 128, 512, 4),
         ]
 
-        for bs, hidden_dim, inter_dim, topk, swiglu_limit in test_cases:
+        for bs, hidden_dim, inter_dim, topk in test_cases:
             with self.subTest(
-                bs=bs,
-                hidden_dim=hidden_dim,
-                inter_dim=inter_dim,
-                topk=topk,
-                swiglu_limit=swiglu_limit,
+                bs=bs, hidden_dim=hidden_dim, inter_dim=inter_dim, topk=topk
             ):
                 with torch.inference_mode():
                     torch.manual_seed(42)
@@ -859,7 +849,6 @@ class TestCuteDslV1(unittest.TestCase):
                         w2_blockscale,
                         w2_alpha,
                         masked_m.to(hidden_states.device),
-                        swiglu_limit=swiglu_limit,
                     )
 
                     a_global_scale = input_global_scale[:1]
@@ -913,7 +902,6 @@ class TestCuteDslV1(unittest.TestCase):
                         topk,
                         routing_weights.to(a_in_dtype.device),
                         topk_idx.to(a_in_dtype.device),
-                        swiglu_limit,
                     )
                     out_weighted = torch.zeros_like(
                         ref_output, device=out.device, dtype=out.dtype
