@@ -1053,6 +1053,24 @@ class TestDeclaredParts(CustomTestCase):
         storage.release_row(req)
         self.assertEqual(request_usage(), (rows, rows))
 
+    def test_request_usage_counts_rows_past_a_larger_state_entry(self):
+        """The arena's padding sink spans the largest unit, so with a state
+        entry larger than a request entry the request band's first physical
+        unit lies past 1. That padding is physical: the free request rows are
+        still the request table's rows past its padding row 0."""
+        big = TensorPartDecl(
+            name="wide", shape=(512,), dtype=torch.float32, layer_ids=(1, 2)
+        )
+        storage, plan, _ = _build(
+            extra=(big,), state=True, gamma=3, replay=_GDN_SPEC_REPLAY
+        )
+        (request,) = plan.requests()
+        (snapshot, *_) = storage.allocator._stage_snapshots()
+        self.assertGreater(snapshot.band(request.name).min_page, 1)
+        rows = storage.requests.available_size()
+        (usage,) = [u for u in storage.usage() if u.metrics == "request"]
+        self.assertEqual((usage.capacity, usage.available), (rows, rows))
+
     def test_request_rows_are_priced_with_the_other_units(self):
         """A demand's request rows take a unit of every request sub-pool, priced
         in the same layout as its tokens and state slots; nothing evictable
