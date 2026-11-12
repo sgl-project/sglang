@@ -198,8 +198,8 @@ def floor_by_factor(number: int, factor: int) -> int:
 # (it holds resized, normalized and patchified copies, then torch.cat's them).
 # Bound each processor call by an estimated byte budget so a request with many
 # or very large images cannot spike GPU memory.
-_PREPROCESS_BYTES_PER_PIXEL = 24
-_PREPROCESS_PEAK_FACTOR = 3
+_PREPROCESS_SOURCE_BYTES_PER_PIXEL = 18
+_PREPROCESS_TARGET_BYTES_PER_PIXEL = 24
 _PREPROCESS_GPU_BUDGET_BYTES = 512 * 1024 * 1024
 
 
@@ -245,10 +245,13 @@ def _estimate_preprocess_bytes(
         h_bar, w_bar = smart_resize(
             height, width, factor=factor, min_pixels=min_pixels, max_pixels=max_pixels
         )
-        pixels = h_bar * w_bar
+        target_pixels = h_bar * w_bar
     except ValueError:
-        pixels = min(height * width, max_pixels)
-    return pixels * _PREPROCESS_BYTES_PER_PIXEL * _PREPROCESS_PEAK_FACTOR
+        target_pixels = min(height * width, max_pixels)
+    return (
+        height * width * _PREPROCESS_SOURCE_BYTES_PER_PIXEL
+        + target_pixels * _PREPROCESS_TARGET_BYTES_PER_PIXEL
+    )
 
 
 def _chunk_by_byte_budget(
@@ -885,12 +888,25 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
         ip = processor.image_processor
         patch = getattr(ip, "patch_size", 14)
         merge = getattr(ip, "merge_size", self._spatial_merge_size)
-        size = getattr(ip, "size", None) or {}
-        min_pixels = image_kwargs.get("min_pixels") or getattr(ip, "min_pixels", None)
-        max_pixels = image_kwargs.get("max_pixels") or getattr(ip, "max_pixels", None)
-        if isinstance(size, dict):
-            min_pixels = min_pixels or size.get("shortest_edge")
-            max_pixels = max_pixels or size.get("longest_edge")
+        size = getattr(ip, "size", None)
+
+        def size_field(name):
+            if size is None:
+                return None
+            if isinstance(size, dict):
+                return size.get(name)
+            return getattr(size, name, None)  # transformers SizeDict
+
+        min_pixels = (
+            image_kwargs.get("min_pixels")
+            or getattr(ip, "min_pixels", None)
+            or size_field("shortest_edge")
+        )
+        max_pixels = (
+            image_kwargs.get("max_pixels")
+            or getattr(ip, "max_pixels", None)
+            or size_field("longest_edge")
+        )
         return (
             int(patch) * int(merge),
             int(min_pixels or MIN_PIXELS),

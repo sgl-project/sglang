@@ -39,10 +39,18 @@ class TestChunkByByteBudget(CustomTestCase):
 class TestEstimate(CustomTestCase):
     kw = dict(factor=28, min_pixels=4 * 28 * 28, max_pixels=1280 * 28 * 28)
 
-    def test_capped_by_max_pixels(self):
-        big = _estimate_preprocess_bytes(Image.new("RGB", (8000, 8000)), **self.kw)
-        cap = _estimate_preprocess_bytes(Image.new("RGB", (3000, 3000)), **self.kw)
-        self.assertEqual(big, cap)
+    def test_cost_grows_with_source_size(self):
+        small = _estimate_preprocess_bytes(Image.new("RGB", (1000, 1000)), **self.kw)
+        big = _estimate_preprocess_bytes(Image.new("RGB", (4000, 4000)), **self.kw)
+        self.assertGreater(big, small)
+
+    def test_target_pixels_capped_by_max_pixels(self):
+        kw = dict(self.kw, max_pixels=28 * 28 * 100)
+        cost = _estimate_preprocess_bytes(Image.new("RGB", (4000, 4000)), **kw)
+        src = 4000 * 4000 * qwen_vl._PREPROCESS_SOURCE_BYTES_PER_PIXEL
+        self.assertLessEqual(
+            cost - src, 28 * 28 * 100 * qwen_vl._PREPROCESS_TARGET_BYTES_PER_PIXEL
+        )
 
     def test_unknown_media_isolated(self):
         self.assertGreaterEqual(
