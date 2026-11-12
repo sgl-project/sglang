@@ -168,7 +168,7 @@ Kimi K3.1 Pro always thinks; set the depth with the top-level `reasoning_effort`
 ### Tuning notes
 
 - **Memory.** The KDA state pool (FP32, ~52 MB per request per rank at TP8) sets the concurrency ceiling; the MLA + indexer KV (~18.9 KB per token) fills the rest. TP and PCP replicate the MLA KV; DCP is the only axis that shards it.
-- **DFLASH.** Decode needs `--enable-linear-replayssm-spec` (the cells carry it) and an explicit `--max-running-requests`. The draft KV ring is on by default and adds ~15% target KV.
+- **DFLASH.** Decode needs `--enable-linear-replayssm-spec` (the cells carry it) and an explicit `--max-running-requests`. On NVIDIA colocated deployments, the draft KV ring is on by default and adds ~15% target KV.
 - **MegaMoE.** Non-prefill roles must set `--max-running-requests`; do not add `--enable-symm-mem` (it deadlocks).
 - **PP prefill.** Keep `SGLANG_PP_LAYER_PARTITION=24,24,24,21` and `CUDA_MODULE_LOADING=EAGER` (both in the High-Throughput prefill cell).
 - **HiCache.** Use `--hicache-io-backend direct --hicache-mem-layout page_first_direct` with `--mamba-max-states-per-path 1` (the HiCache overlay adds them).
@@ -261,7 +261,7 @@ Pending update...
 ### 3.3 PD Disaggregation
 
 - **Transfer**: Mooncake (DCP rejects other backends on either role). Prefill listens on `30000`, decode on `30100`; the `8998` after `--prefill` must match `--disaggregation-bootstrap-port`.
-- **When using DFLASH, run it on both roles**: the prefill writes the draft KV ring that decode reads.
+- **When using DFLASH, run it on both roles**: the prefill writes the draft KV that decode reads.
 - **Restart the prefill role whenever the decode role restarts**: prefill keeps the old decode's Mooncake mapping.
 
 <Accordion title="Router">
@@ -337,3 +337,35 @@ python3 -m benchmark.tpu.launch_server --config recipe/configs/kimi_k3_1/server.
 Single request, all 93 layers: 133 tok/s at 8K input (TPOT 7.52 ms) and 112 tok/s at 128K. With the experimental decode megakernel and DFlash, single-user decode reaches up to about 590 tok/s.
 
 DFlash ([`RadixArk/Kimi-K3.1-Dflash2-Preview`](https://huggingface.co/RadixArk/Kimi-K3.1-Dflash2-Preview)) serves one request at a time. Structured output, tool-call grammar and image input are not yet supported on TPU7x.
+
+### 3.5 Video Input
+
+Kimi K3.1 Pro shares K3's multimodal processor: each `video_url` is sampled into
+timestamped 4-frame chunks, laid out as Moonshot's hosted API does. See
+[Kimi K3 video input](./Kimi-K3#video-input) for sampling details.
+
+<Accordion title="Video Input Example (Python)">
+
+```python Example
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:30000/v1", api_key="EMPTY")
+resp = client.chat.completions.create(
+    model="moonshotai/Kimi-K3.1-Pro",
+    messages=[
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "video_url",
+                    "video_url": {"url": "https://example.com/clip.mp4"},
+                },
+                {"type": "text", "text": "What happens in this video?"},
+            ],
+        }
+    ],
+)
+print(resp.choices[0].message.content)
+```
+
+</Accordion>

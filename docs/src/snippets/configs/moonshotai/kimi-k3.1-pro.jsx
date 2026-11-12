@@ -126,9 +126,9 @@ export const config = {
             "--speculative-draft-model-path RadixArk/Kimi-K3.1-Dflash2-Preview",
             `--speculative-dflash-block-size ${config.dflashBlock(s)}`,
             "--speculative-draft-kv-cache-dtype fp8_e4m3",
-            // The draft KV ring (default on) needs an MLA draft backend; DCP forces this one
-            // anyway, so pinning it keeps DCP and non-DCP recipes on the same path. ROCm runs the
-            // same ring on the Triton draft backend.
+            // The draft KV ring (default on, colocated only) needs an MLA draft backend; DCP
+            // forces this one anyway, so pinning it keeps DCP and non-DCP recipes on the same
+            // path. ROCm's Triton draft backend keeps the per-token draft pool.
             `--speculative-draft-attention-backend ${config.isAmd(s) ? "triton" : "cutedsl_mla"}`,
             // Without ReplaySSM, DFLASH keeps one intermediate KDA state per draft token and the
             // KV pool collapses (5.13M -> 0.77M tokens measured on decode). The PD prefill role
@@ -682,8 +682,6 @@ sgl-router \\
         "--mem-fraction-static 0.84",
         "--chunked-prefill-size 16384",
         "--max-prefill-tokens 16384",
-        "--pp-min-chunked-prefill-size 4096",
-        "--pp-chunk-overhead-tokens 2000",
         "--cuda-graph-backend-prefill breakable",
         "--cuda-graph-max-bs-prefill 8192",
         "--schedule-policy fcfs",
@@ -864,8 +862,6 @@ sgl-router \\
         "--mem-fraction-static 0.84",
         "--chunked-prefill-size 16384",
         "--max-prefill-tokens 16384",
-        "--pp-min-chunked-prefill-size 4096",
-        "--pp-chunk-overhead-tokens 2000",
         "--cuda-graph-backend-prefill breakable",
         "--cuda-graph-max-bs-prefill 8192",
         "--schedule-policy fcfs",
@@ -1069,7 +1065,6 @@ sgl-router \\
         "HSA_USERPTR_FOR_PAGED_MEM=0",
         "SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_ROUTED_FRONT=1",
         "SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_STREAM=1",
-        "SGLANG_OPT_DFLASH_RING_LOCS_FUSED=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -1112,7 +1107,6 @@ sgl-router \\
         "HSA_USERPTR_FOR_PAGED_MEM=0",
         "SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_ROUTED_FRONT=1",
         "SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_STREAM=1",
-        "SGLANG_OPT_DFLASH_RING_LOCS_FUSED=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -1156,7 +1150,6 @@ sgl-router \\
         "SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION=0.1",
         "SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_ROUTED_FRONT=1",
         "SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_STREAM=1",
-        "SGLANG_OPT_DFLASH_RING_LOCS_FUSED=1",
         "SGLANG_SPEC_TP_SYNC=init,dflash-accept-greedy",
         "SGLANG_TIMEOUT_KEEP_ALIVE=7200",
         "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=3600",
@@ -1209,7 +1202,6 @@ sgl-router \\
         "PYTORCH_HIP_ALLOC_CONF=garbage_collection_threshold:0.99",
         "SGLANG_ROCM_RUNTIME_RESERVE_GB=10",
         "SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK=1",
-        "SGLANG_OPT_DFLASH_RING_LOCS_FUSED=1",
         "SGLANG_SPEC_TP_SYNC=init,dflash-accept-greedy",
         "SGLANG_TIMEOUT_KEEP_ALIVE=7200",
         "RUSTUP_TOOLCHAIN=stable",
@@ -1261,7 +1253,6 @@ sgl-router \\
         "HSA_USERPTR_FOR_PAGED_MEM=0",
         "SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_ROUTED_FRONT=1",
         "SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_STREAM=1",
-        "SGLANG_OPT_DFLASH_RING_LOCS_FUSED=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -1304,7 +1295,6 @@ sgl-router \\
         "HSA_USERPTR_FOR_PAGED_MEM=0",
         "SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_ROUTED_FRONT=1",
         "SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_STREAM=1",
-        "SGLANG_OPT_DFLASH_RING_LOCS_FUSED=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -1348,7 +1338,6 @@ sgl-router \\
         "SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION=0.1",
         "SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_ROUTED_FRONT=1",
         "SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_STREAM=1",
-        "SGLANG_OPT_DFLASH_RING_LOCS_FUSED=1",
         "SGLANG_SPEC_TP_SYNC=init,dflash-accept-greedy",
         "SGLANG_TIMEOUT_KEEP_ALIVE=7200",
         "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=3600",
@@ -1401,7 +1390,6 @@ sgl-router \\
         "PYTORCH_HIP_ALLOC_CONF=garbage_collection_threshold:0.99",
         "SGLANG_ROCM_RUNTIME_RESERVE_GB=10",
         "SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK=1",
-        "SGLANG_OPT_DFLASH_RING_LOCS_FUSED=1",
         "SGLANG_SPEC_TP_SYNC=init,dflash-accept-greedy",
         "SGLANG_TIMEOUT_KEEP_ALIVE=7200",
         "RUSTUP_TOOLCHAIN=stable",

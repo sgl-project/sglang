@@ -16,7 +16,7 @@ Multi-step denoising amplifies a per-step rounding difference into visible quali
 
 **Same math, different rounding — request-gated at `lossless`.** These keep the reference function and the precision of every operand and accumulator; only the place or the order of the rounding moves, so the result is within rounding error of the reference rather than equal to it. They are mounted for `quality="lossless"` (the default) and `quality="high"` requests, at batch boundaries, all-or-nothing per transformer. `quality="exact"` runs the unmodified reference chain instead.
 
-**Approximate — request-gated at `high`.** A fusion that quantizes, lowers an operand or accumulator precision, or sits upstream of a quantizer or threshold is no longer a rounding difference, so it needs model-level quality evaluation and is mounted only for `quality="high"`. Today that is the FLUX.2 NVFP4 FC1+SwiGLU+quant path (it quantizes FC2's input before the reference BF16 intermediate exists), Ideogram's BF16-native gate RMSNorm (the reference keeps the norm statistics in fp32), and SANA-Video's BF16-input linear attention (the reference promotes those inputs to FP32).
+**Approximate — request-gated at `high`.** A fusion that quantizes, lowers an operand or accumulator precision, or sits upstream of a quantizer or threshold is no longer a rounding difference, so it needs model-level quality evaluation and is mounted only for `quality="high"`. Today that is the FLUX.2 NVFP4 FC1+SwiGLU+quant path (it quantizes FC2's input before the reference BF16 intermediate exists), Ideogram's BF16-native gate RMSNorm (the reference keeps the norm statistics in fp32), SANA-Video's BF16-input linear attention (the reference promotes those inputs to FP32), and SANA-Video 2.0's BF16-input softmax attention in its anchor layers (the reference promotes Q/K/V to FP32, which also forces the FP32 memory-efficient SDPA kernel).
 
 **Model/checkpoint-native.** Generic close-contract kernels, sparse operators, and FP8/NVFP4 producers can be part of a model implementation or a separately selected deployment path. They are documented in the inventory, but `quality` does not select or undo those choices.
 
@@ -100,6 +100,7 @@ These fusion families mount under both `quality="lossless"` and
 | LingBot Video fused RMSNorm | Replaces the handwritten cast, square, mean, rsqrt, and multiply chain with existing Triton RMSNorm kernels |
 | LingBot Video per-token gated residual + RMSNorm modulate | Folds `residual + gate * update` (per-token `[B, S, 1]` gate) and the `rmsnorm(x) * (1 + scale) + shift` adaLN chain (strided `[B, S, 6D]` chunk views) into single kernels |
 | SANA-Video BF16-input linear attention | Keeps the first linear-attention GEMM's inputs in BF16 with FP32 accumulation/output; the second GEMM remains FP32 |
+| SANA-Video 2.0 BF16-input softmax attention | Hands the anchor layers' BF16-valued Q/K/V to SDPA without the FP32 upcast, so flash attention is eligible; QK^T, softmax and PV still accumulate in FP32, and only the probabilities round to BF16 before the PV GEMM |
 | Dynamic LoRA delta | An unmerged adapter's scaled update accumulated onto the base output by its second GEMM (`addmm`, one rounding), and a row-parallel layer's bias added in the base GEMM's epilogue, instead of materializing the `[tokens, out]` delta and scaling and adding it in separate passes |
 | FLUX-family VAE fast paths | Channels-last decode, GroupNorm(+SiLU), upsample, and attention replacements for FLUX.2 and AutoencoderKL-based FLUX.1, Z-Image, and SD3 pipelines |
 | Wan VAE RMSNorm + SiLU | Replaces the channel-first RMSNorm/SiLU chain while keeping the decode in `channels_last_3d` |
@@ -133,6 +134,7 @@ These fusion families mount under both `quality="lossless"` and
 | --- | --- | --- | --- |
 | `modulate_scale_shift` | JIT CUDA | bit-exact | `x * (1 + scale) + shift` |
 | `residual_gate_add` | KDA (JIT CUDA) | bit-exact | `residual + gate * update` |
+| `residual_gate_fp32` | Triton | bit-exact against the verified native `addcmul` dispatch | Joy Image Edit large BF16 residual updates on SM103; keeps the product in FP32 until the final cast |
 | `try_fused_scaled_residual_bf16` | Triton | bit-exact against the verified native dispatch | LingBot World causal BF16 residual with an FP32 per-frame gate; skips the unused normalized output before camera conditioning |
 | `timestep_embedding` | JIT CUDA | close | sinusoidal timestep embedding |
 | `temb_table_slices` | Triton | bit-exact | see note below |
@@ -143,6 +145,11 @@ affine row per token. The causal normalization and residual paths verify each
 new signature outside CUDA graph capture and fall back to their native chains
 on mismatch or unsupported layouts. These paths preserve `lossless` arithmetic;
 kernel replay support does not enable BCG for a model configuration that disables it.
+
+Joy uses `residual_gate_fp32` for contiguous BF16 residual updates with at least
+16,777,216 elements on SM103. Each new shape and gate-stride signature is
+verified against `torch.addcmul`. Small text updates, other layouts and
+architectures, gradient-enabled calls, and compilation retain the native path.
 
 <Tip>
 `temb_table_slices` is worth knowing about. The eager `(scale_shift_table + temb.float()).chunk(6, dim=2)` materializes roughly 8 GB of fp32 at 704p/121f *and* hands six **strided** slices downstream, whose `.contiguous()` calls then copy each one again. The fused kernel produces the six slices in one pass, each naturally contiguous, so the downstream copies become no-ops.
@@ -244,7 +251,7 @@ Kernels are written against a specific eager chain in a specific model, so cover
 | Qwen-Image | linear+GELU, select-0/1 LN modulation, added-QKV fusion, QK RMSNorm+RoPE+joint QKV writes, residual norm/modulate+NVFP4 producer |
 | GLM-Image | LN+modulate, per-head qk LN, residual-gate add, linear+GELU |
 | ERNIE-Image | RMSNorm+scale/shift, residual-gated variant, rotate-half RoPE, residual-gate add |
-| Joy Image Edit | Bitwise image/text QKV concatenation; strided image QK-Norm + RoPE on Hopper |
+| Joy Image Edit | Bitwise image/text QKV concatenation; strided image QK-Norm + RoPE on Hopper; FP32-intermediate BF16 image residual updates on SM103 |
 | Z-Image | BF16-native RMSNorm scale / tanh-residual, per-head QK RMSNorm |
 | Ideogram 4 | gate RMSNorm, SwiGLU, rotate-half RoPE, modulate, residual-gate add |
 | LTX-2 | QK-norm + split RoPE, ada-values split, RMSNorm+modulate, modulate, residual-gate add, linear+GELU |
@@ -253,6 +260,7 @@ Kernels are written against a specific eager chain in a specific model, so cover
 | LingBot Video MoE | Default-on group-limited top-k expert selection; fused RMSNorm, per-token gated residual, and fused RMSNorm+modulate at `quality=lossless` or `quality=high` |
 | Sana | LN+modulate, GLUMB bias+SiLU / bias+GLU, residual-gate add |
 | SANA-Video | Packed QKV/KV; paired fp64 interleaved RoPE; GLUMB bias+SiLU / bias+GLU in eager and BCG; LN+modulate and residual-gate add during BCG; BF16-input linear attention at `quality=lossless` or `quality=high` |
+| SANA-Video 2.0 | BF16-input softmax attention in the anchor layers at `quality=high` |
 | Sana-WM | bidirectional gated delta-net, fused QK inverse-RMS |
 | Wan / LongLive 2 VAE | temb table slices (Wan); VAE cat+pad and DupUp3D add; lossless FP32 normalization post-ops; full `channels_last_3d` RMSNorm+SiLU at `quality=lossless` or `quality=high` |
 | Cosmos3 | QK-norm + RoPE + KV packing; rounded T2I fusion also supports Hopper TP2/SP1 Super-Text2Image with the 5120-wide SwiGLU architecture |
