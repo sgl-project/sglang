@@ -13,9 +13,14 @@ from sglang.kernels.ops.attention.mla_window_indices import (
     mla_window_sparse_indices,
     mla_window_top_k,
 )
+from sglang.srt.speculative.dflash_draft_ring import (
+    DFlashDraftKVRing,
+    draft_kv_ring_pool_rows,
+    draft_kv_ring_rows_per_req,
+)
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 PAGE = 64
 
@@ -95,6 +100,50 @@ def test_window_indices(dcp, window_left, with_v2p):
             union[r] += [(rank, k) for k in keys]
     for r, p in enumerate(positions.tolist()):
         assert len(union[r]) == min(p, window_left) + 1
+
+
+@pytest.mark.parametrize("dcp", [1, 8])
+def test_ring_window_reads_the_rows_the_ring_writes(dcp):
+    window_left, q_len, req_to_token_rows = 1023, 8, 9
+    ring = DFlashDraftKVRing(
+        rows_per_req=draft_kv_ring_rows_per_req(
+            window_left=window_left, block_size=q_len, dcp_size=dcp
+        ),
+        dcp_size=dcp,
+        req_to_token_rows=req_to_token_rows,
+        device="cuda",
+    )
+    pool_rows = draft_kv_ring_pool_rows(
+        req_to_token_rows=req_to_token_rows,
+        rows_per_req=ring.rows_per_req,
+        page_size=PAGE,
+    )
+    req_pool_indices = torch.tensor([3, 7, 1], dtype=torch.int32, device="cuda")
+    prefix = torch.tensor([5000, 700, 3], dtype=torch.int64, device="cuda")
+    ring.min_pos[1] = 2  # a 2-token prefix hit
+    ring.min_pos[3] = 4100
+    positions = (prefix.unsqueeze(1) + torch.arange(q_len, device="cuda")).reshape(-1)
+    for rank in range(dcp):
+        indices, counts = mla_window_sparse_indices(
+            req_to_token=torch.empty((1, 1), dtype=torch.int32, device="cuda"),
+            req_pool_indices=req_pool_indices,
+            positions=positions,
+            window_left=window_left,
+            dcp_size=dcp,
+            dcp_rank=rank,
+            page_size=PAGE,
+            ring_rows_per_req=ring.rows_per_req,
+            min_pos=ring.min_pos,
+        )
+        for row, p in enumerate(positions.tolist()):
+            req = int(req_pool_indices[row // q_len])
+            lo = max(p - window_left, 0, int(ring.min_pos[req]))
+            keys = torch.arange(lo, p + 1, device="cuda")
+            locs = ring.locs(torch.full_like(keys, req), keys)
+            expected = (locs[locs % dcp == rank] // dcp).tolist()
+            got = indices[row, : int(counts[row])].tolist()
+            assert got == expected, (rank, row)
+            assert all(0 < r < pool_rows for r in got)
 
 
 if __name__ == "__main__":
