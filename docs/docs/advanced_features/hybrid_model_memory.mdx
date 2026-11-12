@@ -45,7 +45,7 @@ The residency cliff is sharp. GLM-5.3-Flash on an AgentX trace replay (48 sessio
 3. Raise `--mem-fraction-static` first if the boot log shows idle memory after the pools; it grows both.
 4. Verify on your traffic: hit rate (`--enable-cache-report`, or `sglang:cached_tokens_total` with `--enable-metrics`) and whether startup still caps `max_running_requests`.
 
-The right ratio depends on the model: it scales with the size of one state slot relative to one KV token, so a model with compact attention KV (MLA / DSA) can need a ratio above `0.9`, while a model with large per-token KV needs one far below. Do not copy a ratio between models.
+The right ratio depends on the model and the deployment: it scales with the size of one state slot relative to one KV token, with the context per session and with the concurrency. Tuned values range from `0.1` to above `1`. Do not copy a ratio between models.
 
 ## Model defaults
 
