@@ -58,7 +58,7 @@ Completion requires all of the following:
 | --- | --- | --- |
 | 0. Behavioral inventory and contracts | Complete (baseline) | Public method groups, startup owners, runtime-context reads, IPC families, and initial parity gaps are recorded below. Contract detail is tracked at the feature/method-family level; per-model and per-argument parity is expanded with each implementation slice. |
 | 1. Rust crate, configuration, and runtime foundation | Complete | `sglang-engine` has typed seed config, lifecycle/error types, and a process supervisor with explicit readiness, startup timeout/early-exit handling, and child cleanup. Scheduler-specific `ServerArgs` and runtime context are Phase 2 inputs because their semantics are implemented by the scheduler/model runtime being migrated there. |
-| 2. Rust scheduler and model execution | In progress | Rust has queue ordering policies, bounded pending/running admission, a `SchedulerRuntime`, a typed model-execution contract, and CPU reference sampling for greedy, temperature, top-k, and top-p paths. The only executor is test-only; Python still owns production admission, cache matching, batching, and all model loading/execution. |
+| 2. Rust scheduler and model execution | In progress | Rust has queue ordering policies, bounded pending/running admission, a `SchedulerRuntime`, typed model-execution contracts, CPU reference sampling, memory-mapped safetensors indexing, and validated dense Llama config parsing. The only executor is test-only; Python still owns production admission, cache matching, batching, and all model compute. |
 | 3. Offline Engine API parity | Not started | Existing Rust server is not an offline Engine API. |
 | 4. Python compatibility adapter and migration | Not started | Python `sglang.Engine` remains the implementation. |
 | 5. Qualification, rollout, and removal | Not started | No Rust offline Engine qualification or rollout. |
@@ -250,6 +250,18 @@ temperature/top-k/top-p sampling. Greedy selection preserves the first index
 on ties; stochastic filtering retains the token crossing the nucleus threshold.
 This is not yet calibrated against SGLang's FlashInfer/platform kernels and is
 not wired into a production accelerator executor or Python's sampler.
+
+`sglang_engine::checkpoint::SafeTensorCheckpoint` now indexes local single-file
+or sharded safetensors checkpoints, detects duplicate tensor names, and returns
+zero-copy borrowed tensor views from read-only memory maps. It does not yet
+resolve/download Hub repositories, parse model configs, convert checkpoint
+layouts, or create device tensors; those remain model-loader work.
+
+`sglang_engine::model_config::LlamaConfig` reads local `config.json`, validates
+dense Llama dimensions and grouped-query attention, and rejects unsupported
+architectures, activations, and RoPE scaling before weight allocation. It is
+the first model-family config slice only; it does not imply a Llama forward
+executor or support for other model families.
 
 - Port scheduler request admission, batching, scheduling policy, queueing,
   preemption, cancellation, token/KV accounting, cache interaction, and

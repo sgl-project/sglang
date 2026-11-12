@@ -15,7 +15,9 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 
 pub mod admission;
+pub mod checkpoint;
 pub mod model;
+pub mod model_config;
 pub mod runtime;
 pub mod sampling;
 pub mod scheduler;
