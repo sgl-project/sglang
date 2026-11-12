@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import logging
+import os
 import threading
 from typing import Any, Callable, Optional
 
@@ -117,6 +118,10 @@ def _asm_fp4_prequantized_input(
 # This trades a little memory for correctness on hardware that cannot execute
 # the fp4 kernel at all.
 _dequant_linear_to_bf16 = is_gfx1250_supported()
+# SGLANG_OPT_QUARK_BF16_TGEMM=1: run those dequantized bf16 linears via aiter tgemm.mm (tuned BF16 GEMM CSV) instead of
+# F.linear, for inputs of at most SGLANG_OPT_QUARK_BF16_TGEMM_MAX_M rows (default 128, decode); larger M keeps F.linear.
+_dequant_bf16_use_tgemm = _dequant_linear_to_bf16 and os.environ.get("SGLANG_OPT_QUARK_BF16_TGEMM", "0") == "1"
+_dequant_bf16_tgemm_max_m = int(os.environ.get("SGLANG_OPT_QUARK_BF16_TGEMM_MAX_M", "128"))
 
 # MXFP4 (OCP MX FP4 / e2m1) decode table, indexed by the 4-bit code.
 _MXFP4_VALUES = [
@@ -872,6 +877,17 @@ class QuarkW4A4MXFP4(QuarkLinearScheme):
         if getattr(layer, "dequantized_bf16", False):
             if isinstance(x, tuple):
                 x = x[0]
+            if _dequant_bf16_use_tgemm:
+                # Route small-M calls through aiter tgemm so the tuned BF16 GEMM CSV applies: F.linear takes torch's
+                # hipBLASLt heuristic, 11-17 us per call at decode M on the TP16 shared-expert shapes vs 3-5 us tuned.
+                from aiter.tuned_gemm import tgemm
+
+                x2 = x.reshape(-1, x.shape[-1])
+                # Larger M stays on F.linear: tuned hipBLASLt rows reused at a padded M can fault on gfx1250 (a solution
+                # tuned at M=2048 faulted at M=1536).
+                if x2.shape[0] <= _dequant_bf16_tgemm_max_m:
+                    out = tgemm.mm(x2, layer.weight, bias, otype=x.dtype)
+                    return out.view(*x.shape[:-1], out.shape[-1])
             return torch.nn.functional.linear(x, layer.weight, bias)
 
         if getattr(layer, "use_aiter_asm_fp4_gemm", False):
