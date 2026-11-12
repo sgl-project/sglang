@@ -427,7 +427,6 @@ def _graph_backend(mode, max_bs, **attrs):
     backend.speculative_num_draft_tokens = 8
     backend.hisparse_coordinator = None
     backend.use_fused_topk = True
-    backend._flashmla_kv_pad_q_in_place = False
     backend._memory_saver_adapter = TorchMemorySaverAdapter.create(enable=False)
     backend.req_to_token = torch.arange(
         max_bs * 512, device="cuda", dtype=torch.int32
