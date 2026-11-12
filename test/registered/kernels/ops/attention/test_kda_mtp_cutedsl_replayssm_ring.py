@@ -15,6 +15,8 @@ Tolerance is bf16-bound: production rings store rawk/rawv in conv dtype
 in fp32 registers.
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -38,17 +40,46 @@ from sglang.kernels.ops.attention.kda_decode_mtp import (  # noqa: E402
 from sglang.kernels.ops.attention.linear.kda_replayssm_spec_decode import (  # noqa: E402
     commit_kda_replayssm_spec,
 )
+from sglang.srt.mem_cache.kv.decl import (  # noqa: E402
+    StateGeometry,
+    StateReplay,
+    with_state_replay,
+)
+from sglang.srt.mem_cache.kv.layout.request import RequestSubPoolSpec  # noqa: E402
 
 DEV = "cuda"
 K = 128
 W = 4  # KERNEL_WIDTH
+L = 16  # ring length
+# The kernel's ring arguments, by the names _run returns them under.
+RING_PARTS = (
+    ("rawv", "replayssm_rawv"),
+    ("rawk", "replayssm_rawk"),
+    ("gring", "replayssm_g"),
+    ("betar", "replayssm_beta"),
+)
 
 
-def _run(arm, *, N, H, num_spec, seed, onorm=False, pad_last=False, ring_rows=None):
+def _run(
+    arm,
+    *,
+    N,
+    H,
+    num_spec,
+    seed,
+    onorm=False,
+    pad_last=False,
+    pad=0,
+    ring_rows=None,
+    rings=None,
+    ring_count=None,
+):
+    """One verify step; the last ``pad`` requests are CUDA-graph padding (state
+    slot -1). The ring arm writes the given rings, or new zeroed ones of
+    ``ring_count`` rows."""
     torch.manual_seed(seed)
     T = N * (1 + num_spec)
     num_slots = N + 2
-    L = 16
     assert L >= 1 + num_spec
 
     x_q = torch.randn(1, T, H, K, device=DEV, dtype=torch.bfloat16)
@@ -67,8 +98,9 @@ def _run(arm, *, N, H, num_spec, seed, onorm=False, pad_last=False, ring_rows=No
     h0 = torch.randn(num_slots, H, K, K, device=DEV, dtype=torch.float32)
 
     slots = torch.arange(1, N + 1, device=DEV, dtype=torch.int32)
-    if pad_last:
-        slots[-1] = -1
+    pad = max(pad, int(pad_last))
+    if pad:
+        slots[N - pad :] = -1
     scratch = torch.arange(N, device=DEV, dtype=torch.int32)
     cu_seqlens = torch.arange(0, T + 1, 1 + num_spec, device=DEV, dtype=torch.int32)
 
@@ -115,22 +147,59 @@ def _run(arm, *, N, H, num_spec, seed, onorm=False, pad_last=False, ring_rows=No
         inter = torch.zeros(N, 1 + num_spec, H, K, K, device=DEV, dtype=torch.float32)
         out = fused_kda_decode_mtp_dspark(intermediate_ssm=inter, **kwargs)
         return out, dict(inter=inter, slots=slots, scratch=scratch, **norm)
-    # With ring_rows, the rings have rows of their own: ring_rows[j] for request j.
-    rows = num_slots if ring_rows is None else int(ring_rows.max()) + 1
-    rawv = torch.zeros(rows, H, L, K, device=DEV, dtype=torch.bfloat16)
-    rawk = torch.zeros_like(rawv)
-    gring = torch.zeros(rows, H, L, K, device=DEV, dtype=torch.float32)
-    betar = torch.zeros(rows, H, L, device=DEV, dtype=torch.float32)
+    if rings is None:
+        # With ring_rows, the rings have rows of their own: ring_rows[j] for
+        # request j.
+        rows = ring_count or (
+            num_slots if ring_rows is None else int(ring_rows.max()) + 1
+        )
+        rings = dict(
+            rawv=torch.zeros(rows, H, L, K, device=DEV, dtype=torch.bfloat16),
+            rawk=torch.zeros(rows, H, L, K, device=DEV, dtype=torch.bfloat16),
+            gring=torch.zeros(rows, H, L, K, device=DEV, dtype=torch.float32),
+            betar=torch.zeros(rows, H, L, device=DEV, dtype=torch.float32),
+        )
     out = fused_kda_decode_mtp_dspark(
         intermediate_ssm=None,
-        replayssm_rawv=rawv,
-        replayssm_rawk=rawk,
-        replayssm_g=gring,
-        replayssm_beta=betar,
+        **{arg: rings[name] for name, arg in RING_PARTS},
         replayssm_ring_indices=ring_rows,
         **kwargs,
     )
-    return out, dict(rawv=rawv, rawk=rawk, gring=gring, betar=betar, h0=h0, slots=slots)
+    return out, dict(**rings, h0=h0, slots=slots)
+
+
+def _request_sub_pool_rings(backing, *, rows, H, num_spec, layer):
+    """The KDA speculative ring of one layer as the unified request sub-pool lays
+    it out: each part a strided view inside per-unit entries that hold every ring
+    part of every layer. The units start one entry into ``backing``, so a store
+    to unit -1 stays in bounds and shows up as a changed byte."""
+    geometry = with_state_replay(
+        StateGeometry(
+            conv_state_shapes=((3 * H * K, W - 1),),
+            conv_dtype=torch.bfloat16,
+            temporal_state_shape=(H, K, K),
+            temporal_dtype=torch.float32,
+        ),
+        StateReplay(
+            decode=False, speculative=True, is_kda=True, cache_len=L, key_heads=H
+        ),
+        layer_ids=(0, 1),
+        speculative_num_draft_tokens=1 + num_spec,
+    )
+    spec = RequestSubPoolSpec(
+        name="request",
+        layer_num=2,
+        grow_direction="float",
+        parts=geometry.request_parts,
+    )
+    entry = spec.entry_bytes()
+    if backing is None:
+        backing = torch.randint(
+            0, 256, ((rows + 1) * entry,), device=DEV, dtype=torch.uint8
+        )
+    arena = SimpleNamespace(raw=backing[entry:], extent_entries=lambda name: rows)
+    views = spec.part_views(arena)
+    return backing, {name: views[part][layer] for name, part in RING_PARTS}
 
 
 @pytest.mark.parametrize(
@@ -190,6 +259,76 @@ def test_cutedsl_ring_rows_follow_their_own_index(N):
             atol=0,
         )
         assert torch.count_nonzero(by_row[name][~written]).item() == 0
+
+
+@pytest.mark.parametrize("N", [4, 32], ids=["small-grid", "large-grid"])
+def test_cutedsl_ring_rows_in_request_sub_pool_entries_with_graph_padding(N):
+    """The production arrangement under unified memory: the rings are strided
+    views inside the request sub-pool's per-unit entries (another layer's and
+    the decay rings' parts in between), indexed by each request's own unit, and
+    a CUDA-graph replay pads the batch with state slot -1 and ring unit -1.
+    Each live request's window lands in its own unit exactly as a contiguous
+    ring records it at the same rows, and no other byte of the entries, nor the
+    entry before unit 0, changes."""
+    H, num_spec, seed = 2, 3, 13
+    pad = max(1, N // 4)
+    live = N - pad
+    rows = 2 * N + 4
+    spare = rows - 1
+    window = 1 + num_spec
+    ring_rows = torch.arange(2 * N + 2, N + 2, -1, device=DEV, dtype=torch.int32)
+    ring_rows[live:] = -1  # as the graph runner fills its padded rows
+    backing, rings = _request_sub_pool_rings(
+        None, rows=rows, H=H, num_spec=num_spec, layer=1
+    )
+    for name, _ in RING_PARTS:
+        assert not rings[name].is_contiguous(), name
+        assert rings[name].stride(0) * rings[name].element_size() > (
+            rings[name][0].numel() * rings[name].element_size()
+        ), name
+    before = backing.clone()
+    out, _ = _run(
+        "ring",
+        N=N,
+        H=H,
+        num_spec=num_spec,
+        seed=seed,
+        pad=pad,
+        ring_rows=ring_rows,
+        rings=rings,
+    )
+    # Reference: contiguous rings at the same rows; its padded rows point at a
+    # spare row, which must stay zero.
+    ref_rows = torch.where(ring_rows < 0, spare, ring_rows)
+    out_ref, ref = _run(
+        "ring",
+        N=N,
+        H=H,
+        num_spec=num_spec,
+        seed=seed,
+        pad=pad,
+        ring_rows=ref_rows,
+        ring_count=rows,
+    )
+    torch.cuda.synchronize()
+    torch.testing.assert_close(out, out_ref, rtol=0, atol=0)
+    assert torch.count_nonzero(out[0, live * window :]).item() == 0
+
+    expected = before.clone()
+    _, expected_rings = _request_sub_pool_rings(
+        expected, rows=rows, H=H, num_spec=num_spec, layer=1
+    )
+    live_rows = ring_rows[:live].long()
+    for name, _ in RING_PARTS:
+        assert torch.count_nonzero(ref[name][spare]).item() == 0, name
+        assert torch.count_nonzero(ref[name][:, :, window:]).item() == 0, name
+        assert torch.count_nonzero(ref[name][live_rows, :, :window]).item() > 0, name
+        expected_rings[name][live_rows, :, :window] = ref[name][live_rows, :, :window]
+    changed = torch.nonzero(backing != expected).flatten()
+    assert changed.numel() == 0, (
+        f"{changed.numel()} bytes differ from the reference, first at byte "
+        f"{changed[:4].tolist()}"
+    )
 
 
 @pytest.mark.parametrize("N", [4, 32], ids=["small-grid", "large-grid"])
