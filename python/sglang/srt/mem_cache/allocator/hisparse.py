@@ -23,6 +23,10 @@ if TYPE_CHECKING:
 
 
 class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
+    _reclaimer = (
+        None  # HS_RESIDENT (class default for allocators built without __init__)
+    )
+
     def __init__(
         self,
         size: int,
@@ -34,7 +38,8 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         host_to_device_ratio: int = 2,
     ):
         self._kvcache = kvcache
-        self._size_full = size * host_to_device_ratio
+        # HS_CAP: a fractional ratio gives a page-aligned integer logical size (the index-K buffer uses the same rule)
+        self._size_full = int(size * host_to_device_ratio) // page_size * page_size
         self._size_hisparse = size
         self.compress_ratio = 1
         self.dtype = dtype
@@ -43,6 +48,9 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.need_sort = need_sort
         self._spec_scratch_capacity = 0
         self._spec_device_buffer_size = 0
+        self._reclaimer = (
+            None  # HS_RESIDENT: the coordinator, which can demote resident requests
+        )
 
         paged_allocator_cls = (
             current_platform.get_paged_allocator_cls() or PagedTokenToKVPoolAllocator
@@ -113,10 +121,17 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def size(self) -> int:
         return self._size_full
 
+    def set_reclaimer(self, reclaimer) -> None:  # HS_RESIDENT
+        self._reclaimer = reclaimer
+
     def available_size(self) -> int:
+        # HS_RESIDENT: device slots that demoting resident requests would free count as available for admission.
+        reclaimable = (
+            self._reclaimer.reclaimable_slots() if self._reclaimer is not None else 0
+        )
         return min(
             self.logical_attn_allocator.available_size(),
-            self.hisparse_attn_allocator.available_size(),
+            self.hisparse_attn_allocator.available_size() + reclaimable,
         )
 
     def get_kvcache(self):
@@ -232,6 +247,13 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             > self.logical_attn_allocator.available_size() // self.page_size
         ):
             return None
+        if (
+            self._reclaimer
+            is not None  # HS_RESIDENT: demote resident requests to make room
+            and num_new_pages
+            > self.hisparse_attn_allocator.available_size() // self.page_size
+        ):
+            self._reclaimer.reclaim_device(num_new_pages * self.page_size)
         if (
             num_new_pages
             > self.hisparse_attn_allocator.available_size() // self.page_size

@@ -374,7 +374,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     target_kv_num_layers = get_glm_dsa_layer_split_effective_num_layers(
                         kvc, num_layers
                     )
-                    draft_kv_size = (
+                    draft_kv_size = int(  # HS_CAP: an int for a fractional ratio
                         int(target_kv_size * draft_num_layers / target_kv_num_layers)
                         * draft_loc_space_scale
                     )
@@ -400,7 +400,9 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     draft_kv_size = int(
                         draft_cell_size * draft_num_layers / int(num_layers)
                     )
-                    self._cell_size += draft_kv_size * draft_loc_space_scale * dcp_size
+                    self._cell_size += int(
+                        draft_kv_size * draft_loc_space_scale * dcp_size
+                    )  # HS_CAP
 
         # DFLASH/DSPARK: the draft's per-token KV cost can differ from the target's
         # (e.g. MLA target, per-head K/V draft), so size from the draft config.
@@ -715,7 +717,10 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
         if (
             allocate_all_layers
-            or kvc.server_args.enable_hisparse
+            or (
+                kvc.server_args.enable_hisparse
+                and not envs.SGLANG_HISPARSE_ELIDE_INDEX_K.get()
+            )  # HS_CAP
             or not _should_elide_dsa_index_k(is_draft_worker=kvc.is_draft_worker)
         ):
             num_indexer_layers = num_layers

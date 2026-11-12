@@ -74,7 +74,8 @@ class HiSparseDSATokenToKVPool(HiSparseDevicePoolMappingMixin, DSATokenToKVPool)
             kv_cache_dim=kv_cache_dim,
             start_layer=start_layer,
             end_layer=end_layer,
-            index_buf_size=size * host_to_device_ratio,
+            # HS_CAP: page-aligned integer for a fractional ratio (= the allocator's logical size)
+            index_buf_size=int(size * host_to_device_ratio) // page_size * page_size,
             index_kpool=index_kpool,
             index_kpool_compress=index_kpool_compress,
             tail_extra_slots=tail_extra_slots,
@@ -123,7 +124,7 @@ class HiSparseDSATokenToKVPool(HiSparseDevicePoolMappingMixin, DSATokenToKVPool)
         layer_id_override: Optional[int] = None,
     ):
         loc, _, _ = unwrap_write_loc(loc_info)
-        loc = self.translate_loc_to_hisparse_device(loc)
+        loc = self._translate_write_loc(loc, layer.layer_id)  # HS_CAP
         super().set_mla_kv_buffer(
             layer,
             loc,
@@ -131,6 +132,39 @@ class HiSparseDSATokenToKVPool(HiSparseDevicePoolMappingMixin, DSATokenToKVPool)
             cache_k_rope,
             layer_id_override=layer_id_override,
         )
+
+    _hs_write_memo = None
+
+    def _translate_write_loc(self, loc: torch.Tensor, layer_id: int) -> torch.Tensor:
+        """HS_CAP: the write locations' translation, once per forward with SGLANG_HISPARSE_TRANSLATE_ONCE=1.
+
+        Reused only within one forward: same location tensor object, same version, same capture state, and a layer id
+        above the previous call's (a forward walks its layers upwards; the next forward, a CUDA graph's warm-up and
+        its capture each start again from the first layer, so each records its own translation)."""
+        from sglang.srt.environ import envs
+
+        if not envs.SGLANG_HISPARSE_TRANSLATE_ONCE.get():
+            return self.translate_loc_to_hisparse_device(loc)
+        try:
+            version = loc._version
+        except (
+            RuntimeError
+        ):  # inference-mode tensors track no version: no memo, translate per layer
+            return self.translate_loc_to_hisparse_device(loc)
+        capturing = torch.cuda.is_current_stream_capturing()
+        memo = self._hs_write_memo
+        if (
+            memo is not None
+            and memo[0] is loc
+            and memo[1] == version
+            and memo[2] == capturing
+            and layer_id > memo[3]
+        ):
+            self._hs_write_memo = (loc, version, capturing, layer_id, memo[4])
+            return memo[4]
+        translated = self.translate_loc_to_hisparse_device(loc)
+        self._hs_write_memo = (loc, version, capturing, layer_id, translated)
+        return translated
 
     def get_mla_kv_buffer(
         self,

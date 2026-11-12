@@ -439,7 +439,11 @@ __global__ void load_cache_to_device_buffer_kernel(
     int32_t* __restrict__ miss_count_out,
     int64_t plan_stride,
     int16_t* __restrict__ host_map,
-    int8_t* __restrict__ map_init) {
+    int8_t* __restrict__ map_init,
+    const int8_t* __restrict__ resident,
+    const int32_t* __restrict__ req_to_token,
+    int64_t req_to_token_stride,
+    const int64_t* __restrict__ full_to_device) {
   static_assert(!IsDsv4Layout || IsMLA, "DSv4 page-padded layout is K-only (MLA).");
   static_assert(SPARSE_BLOCK_SIZE > 0, "SPARSE_BLOCK_SIZE must be positive.");
   // Cache residency and LRU replacement remain token-granular even when the
@@ -481,6 +485,38 @@ __global__ void load_cache_to_device_buffer_kernel(
   const int64_t* req_host_cache_locs = host_cache_locs + rid * host_stride;
   int16_t* req_lru_slots = lru_slots + rid * lru_slot_stride_0;
   const int32_t* req_device_locs = PassThroughDeviceLocs ? device_locs + rid * device_locs_stride : nullptr;
+
+  // HS_RESIDENT: the request's whole KV is in the device pool (no buffer). Translate each selected position through
+  // req_to_token and the logical-to-device map; no lookup, no LRU, no copy, and an empty plan for the skip layers.
+  if (resident != nullptr && resident[rid] != 0) {
+    const int32_t* req_r2t = req_to_token + rid * req_to_token_stride;
+    constexpr int RES_ITERS = (NUM_TOP_K_TOKENS + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    int32_t res_pos[RES_ITERS];
+    int32_t res_log[RES_ITERS];
+#pragma unroll
+    for (int r = 0; r < RES_ITERS; ++r) {
+      const int i = tid + r * BLOCK_SIZE;
+      res_pos[r] = i < NUM_TOP_K_TOKENS ? resolve_selected_token<SPARSE_BLOCK_SIZE, TopKIsBlocks>(req_top_k, i) : -1;
+    }
+#pragma unroll
+    for (int r = 0; r < RES_ITERS; ++r) {
+      res_log[r] = (res_pos[r] >= 0 && res_pos[r] < seq_len) ? req_r2t[res_pos[r]] : 0;
+    }
+#pragma unroll
+    for (int r = 0; r < RES_ITERS; ++r) {
+      const int i = tid + r * BLOCK_SIZE;
+      if (i < NUM_TOP_K_TOKENS) {
+        req_top_k_device_locs[i] =
+            (res_pos[r] >= 0 && res_pos[r] < seq_len) ? static_cast<int32_t>(full_to_device[res_log[r]]) : -1;
+      }
+    }
+    if constexpr (RecordMissPlan) {
+      if (tid == 0) {
+        miss_count_out[bid] = 0;
+      }
+    }
+    return;
+  }
 
   // Fast path: short sequences have all tokens in the device buffer in order.
   if (!PassThroughDeviceLocs && seq_len <= HOT_BUFFER_SIZE) {
@@ -1148,8 +1184,29 @@ void load_cache_to_device_buffer(
     tvm::ffi::TensorView miss_dst_out,
     tvm::ffi::TensorView miss_count_out,
     tvm::ffi::TensorView host_map,
-    tvm::ffi::TensorView map_init) {
+    tvm::ffi::TensorView map_init,
+    tvm::ffi::TensorView resident,
+    tvm::ffi::TensorView req_to_token,
+    tvm::ffi::TensorView full_to_device) {
   using namespace host;
+  // HS_RESIDENT: optional resident-request translation (empty tensors = disabled)
+  const bool has_resident = !(resident.ndim() == 0 || resident.shape()[0] == 0);
+  const int8_t* const resident_ptr = has_resident ? static_cast<const int8_t*>(resident.data_ptr()) : nullptr;
+  const int32_t* const req_to_token_ptr = has_resident ? static_cast<const int32_t*>(req_to_token.data_ptr()) : nullptr;
+  const int64_t req_to_token_stride = has_resident ? req_to_token.strides()[0] : 0;
+  const int64_t* const full_to_device_ptr =
+      has_resident ? static_cast<const int64_t*>(full_to_device.data_ptr()) : nullptr;
+  if (has_resident) {
+    const auto rd = resident.dtype();
+    const auto td = req_to_token.dtype();
+    const auto fd = full_to_device.dtype();
+    if (!(rd.code == kDLInt && rd.bits == 8) || !(td.code == kDLInt && td.bits == 32) ||
+        !(fd.code == kDLInt && fd.bits == 64) || req_to_token.ndim() != 2 || req_to_token.strides()[1] != 1) {
+      throw std::runtime_error(
+          "load_cache_to_device_buffer: resident must be int8, req_to_token row-contiguous int32 [slots, len], "
+          "full_to_device int64");
+    }
+  }
   // HS_PATCH v4: optional persistent map (empty tensors = disabled)
   int16_t* const host_map_ptr =
       (host_map.ndim() == 0 || host_map.shape()[0] == 0) ? nullptr : static_cast<int16_t*>(host_map.data_ptr());
@@ -1229,7 +1286,11 @@ void load_cache_to_device_buffer(
         miss_count_ptr,
         plan_stride,
         host_map_ptr,
-        map_init_ptr);
+        map_init_ptr,
+        resident_ptr,
+        req_to_token_ptr,
+        req_to_token_stride,
+        full_to_device_ptr);
   };
 
   const auto seq_dtype = seq_lens.dtype();

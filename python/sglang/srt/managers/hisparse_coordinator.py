@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import types
 import weakref
 from typing import (
     TYPE_CHECKING,
@@ -541,7 +542,25 @@ class HiSparseSpecSwapManager:
         ]
 
 
+_HS_I64_MAX = (
+    2**63 - 1
+)  # HS_LEAN: hs_lazy_from of a request whose host copy is complete
+
+
 class HiSparseCoordinator:
+    _hs_anchor_copy_blocks = 0
+    _hs_stats_every = 0
+    _hs_step = 0
+    _hs_map = None
+    _hs_map_init = None
+    _hs_group_of_layer = types.MappingProxyType({})
+    enable_resident = False
+    hs_lazy = False
+    hs_lazy_from = None
+    _resident = types.MappingProxyType({})
+    resident_demotions = 0
+    _resident_steps = 0
+
     def __init__(
         self,
         req_to_token_pool: ReqToTokenPool,
@@ -738,6 +757,52 @@ class HiSparseCoordinator:
         # Updated before each graph replay so padded blocks early-return.
         self.num_real_reqs = torch.zeros(1, dtype=torch.int32, device=device)
 
+        # HS_RESIDENT: a long request keeps its whole KV in the device pool after staging while there is room, and is
+        # demoted to the normal LRU buffer on demand (a new prefill or a resident request's growth needs the space).
+        self.enable_resident = bool(
+            envs.SGLANG_HISPARSE_RESIDENT.get()
+            and not self.is_dsv4_hisparse
+            and not self.is_m3_hisparse
+            and num_draft_tokens == 0
+            and not envs.SGLANG_HISPARSE_HOST_MAP.get()
+        )
+        if envs.SGLANG_HISPARSE_RESIDENT.get() and not self.enable_resident:
+            logger.warning(
+                "HiSparse: SGLANG_HISPARSE_RESIDENT ignored (DSv4, MiniMax, speculative decoding or host map)"
+            )
+        self.req_resident = torch.zeros(
+            max_num_req_slots, dtype=torch.int8, device=device
+        )
+        self._resident: dict = {}  # req_pool_idx -> Req
+        self.resident_demotions = 0
+        self._resident_steps = 0
+        # HS_LEAN: lazy host backup of resident requests (+ lean all-resident prep)
+        self.hs_lazy = bool(
+            self.enable_resident and envs.SGLANG_HISPARSE_LAZY_BACKUP.get()
+        )
+        self._hs_staged_len = {}  # req_pool_idx -> tokens backed up by staging (the host copy's prefix)
+        self.hs_lazy_from = None  # first position without a host copy, per request slot (resident requests)
+        if self.hs_lazy:
+            self.hs_lazy_from = torch.full(
+                (max_num_req_slots,), _HS_I64_MAX, dtype=torch.int64, device=device
+            )
+            logger.info(
+                "HiSparse: lazy host backup of resident requests (at demotion), lean all-resident decode prep"
+            )
+        self.hs_lazy_backups = 0
+        self.hs_lazy_tokens = 0
+        self._hs_lean = [
+            0,
+            0,
+        ]  # decode steps prepared by the lean all-resident path, by the general path
+        if self.enable_resident:
+            self.token_to_kv_pool_allocator.set_reclaimer(self)
+            logger.info(
+                "HiSparse: resident requests on (whole KV in the device pool while it fits; demoted on demand to the "
+                "%d-token buffer)",
+                self.device_buffer_size,
+            )
+
         # CPU flag: True means "skip backup on the next decode step" because
         # staging already backed up all prefill tokens.  Cleared after one step.
         self._skip_first_backup = [False] * max_num_req_slots
@@ -926,6 +991,10 @@ class HiSparseCoordinator:
         )
 
         prefill_len = len(device_indices)
+        if (
+            self.hs_lazy
+        ):  # HS_LEAN: the host copy's prefix if the request becomes resident
+            self._hs_staged_len[req.kv.req_pool_idx] = prefill_len
         host_indices = self.mem_pool_host.alloc_paged_token_slots(
             self.req_to_host_pool,
             self.req_to_host_pool_allocated_len,
@@ -1109,6 +1178,8 @@ class HiSparseCoordinator:
                 total_grow += grow_size
 
             if total_grow > 0:
+                if self._resident:  # HS_RESIDENT: demote resident requests to make room
+                    self.reclaim_device(total_grow)
                 all_new_indices = (
                     self.token_to_kv_pool_allocator.hisparse_attn_allocator.alloc(
                         total_grow
@@ -1139,6 +1210,234 @@ class HiSparseCoordinator:
         reserved_positions = (seq_lens - 1).clamp(max=self.device_buffer_size)
         return self.req_to_device_buffer[req_pool_indices, reserved_positions]
 
+    # ---- HS_RESIDENT ----------------------------------------------------------------------------------------------
+    def _gpu_rows(self, rows) -> torch.Tensor:
+        # Pinned, non-blocking H2D: a plain torch.tensor(..., device=) would wait for the schedule stream's queued work.
+        return torch.tensor(rows, dtype=torch.int64, pin_memory=True).to(
+            self.device, non_blocking=True
+        )
+
+    def _can_stay_resident(self, req: Req) -> bool:
+        # Short requests already live wholly in their buffer (the kernel's short fast path).
+        return (
+            self.enable_resident
+            and self.host_token_len(req.kv.kv_allocated_len) > self.device_buffer_size
+        )
+
+    def _make_resident(self, req: Req) -> None:
+        rid = req.kv.req_pool_idx
+        self._resident[rid] = req
+        self.req_resident[rid] = 1
+        self.req_device_buffer_size[rid] = 0
+        if self.hs_lazy:  # HS_LEAN: decode tokens stay on the device only, until a demotion backs them up
+            self.hs_lazy_from[rid] = self._hs_staged_len[rid]
+
+    def _owned_device_slots(self, req: Req) -> int:
+        page = self.mem_pool_device.page_size
+        return -(-req.kv.kv_allocated_len // page) * page
+
+    def reclaimable_slots(self) -> int:
+        """Device slots that demoting every resident request would free (the allocator's admission budget)."""
+        return sum(
+            max(self._owned_device_slots(r) - self.padded_buffer_size, 0)
+            for r in self._resident.values()
+        )
+
+    def reclaim_device(self, need_slots: int) -> bool:
+        """Demote resident requests, largest first, until `need_slots` device slots are free."""
+        dev = self.token_to_kv_pool_allocator.hisparse_attn_allocator
+        while dev.available_size() < need_slots:
+            if not self._resident:
+                return False
+            rid = max(
+                self._resident, key=lambda r: self._resident[r].kv.kv_allocated_len
+            )
+            self._demote(rid)
+        return True
+
+    def _demote(self, rid: int) -> None:
+        """Turn resident request `rid` into a buffered one: its host copy is complete up to the newest token with KV,
+        which moves to the reserved slot (where the next step backs it up from, as for any buffered request)."""
+        req = self._resident.pop(rid)
+        # Ordered after the in-flight batch (it may still read these slots) and after the pending host backup.
+        if self.decode_producer_stream is not None:
+            device_module.current_stream().wait_stream(self.decode_producer_stream)
+        self.wait_for_pending_backup()
+        allocated_len = req.kv.kv_allocated_len
+        logical = self.req_to_token_pool.req_to_token[rid, :allocated_len].to(
+            torch.int64
+        )
+        mapping = self.token_to_kv_pool_allocator.full_to_hisparse_device_index_mapping
+        device_locs = mapping[logical]
+        if self.hs_lazy:  # HS_LEAN: back up the tokens after the staged prefix first
+            self._hs_lazy_backup(rid, device_locs)
+        newest_src = device_locs[device_locs > 0][-1:].clone()
+        # Keeps the first padded slots (tokens 0..padded-1 hold their own KV), frees the rest, unmaps every token.
+        buffer_locs = self.token_to_kv_pool_allocator.alloc_device_buffer(
+            logical, self.padded_buffer_size
+        )
+        reserved = buffer_locs[self.device_buffer_size : self.device_buffer_size + 1]
+        self.mem_pool_device.transfer_values_on_device(reserved, newest_src)
+        buf32 = buffer_locs.to(torch.int32)
+        self.req_to_device_buffer[rid, : self.padded_buffer_size] = buf32
+        self.req_device_buffer_size[rid] = self.padded_buffer_size
+        self.req_device_buffer_tokens[:, rid, : self.device_buffer_size] = (
+            self._device_buffer_arange_i32
+        )
+        self.req_device_buffer_tokens[:, rid, self.device_buffer_size :] = -1
+        self.req_device_buffer_token_locs[:, rid, : self.padded_buffer_size] = buf32
+        self.lru_slots[:, rid, :].copy_(self._lru_init)
+        self.req_resident[rid] = 0
+        self.resident_demotions += 1
+        logger.info(
+            "HiSparse: demoted request %s (%d tokens) to the buffer; %d resident, %d demotions so far",
+            req.rid,
+            allocated_len,
+            len(self._resident),
+            self.resident_demotions,
+        )
+
+    def _hs_lazy_backup(self, rid: int, device_locs: torch.Tensor) -> None:
+        """HS_LEAN: copy resident request `rid`'s tokens [staged, m) to its host slots (m = tokens with a device slot,
+        which for a resident request are a prefix). On the current stream: after the in-flight batch and the pending
+        backup (the caller waited for both), before the demotion frees any slot."""
+        staged = self._hs_staged_len[rid]
+        mapped = device_locs > 0
+        m = int(mapped.sum())  # host sync; demotions are rare
+        if m < staged or not bool(mapped[:m].all()):
+            raise RuntimeError(
+                f"HiSparse lazy backup: device slots of request slot {rid} are not a prefix (m={m}, staged={staged})"
+            )
+        n = m - staged
+        host_locs = None
+        if n > 0:
+            host_locs = self.mem_pool_host.alloc_paged_token_slots(
+                self.req_to_host_pool,
+                self.req_to_host_pool_allocated_len,
+                rid,
+                staged,
+                n,
+            )
+            self.mem_pool_host.backup_from_device_all_layer(
+                self.mem_pool_device,
+                host_locs,
+                device_locs[staged:m],
+                io_backend="kernel",
+            )
+        self._hs_lazy_done(rid, staged, m, host_locs, device_locs)
+        self.hs_lazy_from[rid] = _HS_I64_MAX
+        self.hs_lazy_backups += 1
+        self.hs_lazy_tokens += n
+
+    def _hs_lazy_done(self, rid, staged, m, host_locs, device_locs) -> None:
+        """HS_LEAN: validation anchor (the in-situ hooks compare the lazy copy with the per-step backup)."""
+        return
+
+    def _hs_lean_decode(
+        self,
+        seq_lens,
+        out_cache_loc,
+        req_pool_indices,
+        seq_lens_cpu,
+        req_pool_indices_cpu,
+    ) -> bool:
+        """HS_LEAN: decode prep of a batch whose requests are all resident: what _resident_decode_locs does for such a
+        batch (each new token's paged device slot next to the previous token's, or a fresh page), mapped from its
+        logical slot. Returns False, having done nothing, for any other batch or when the free device pages do not
+        cover the step (the general path reclaims)."""
+        rpi = req_pool_indices_cpu.tolist()
+        res = self._resident
+        if not rpi or any(r not in res for r in rpi):
+            self._hs_lean[1] += 1
+            return False
+        page = self.mem_pool_device.page_size
+        dev = self.token_to_kv_pool_allocator.hisparse_attn_allocator
+        need_pages = sum(1 for s in seq_lens_cpu.tolist() if (s - 1) % page == 0)
+        if need_pages * page > dev.available_size():
+            self._hs_lean[1] += 1
+            return False
+        self._hs_lean[0] += 1
+        self._resident_steps += 1
+        if self._resident_steps % 1000 == 0:
+            logger.info(
+                "HiSparse resident: %d of %d running requests resident, %d demotions so far; lean prep %d steps, "
+                "general %d; lazy backups %d (%d tokens)",
+                len(rpi),
+                len(rpi),
+                self.resident_demotions,
+                self._hs_lean[0],
+                self._hs_lean[1],
+                self.hs_lazy_backups,
+                self.hs_lazy_tokens,
+            )
+        mapping = self.token_to_kv_pool_allocator.full_to_hisparse_device_index_mapping
+        prev_logical = self.req_to_token_pool.req_to_token[
+            req_pool_indices, seq_lens - 2
+        ].to(torch.int64)
+        new_locs = dev.alloc_decode(seq_lens, seq_lens_cpu, mapping[prev_logical])
+        if new_locs is None:
+            raise RuntimeError("HiSparse lean decode allocation failed")
+        compressed_locs = self.token_to_kv_pool_allocator.get_last_loc_compressed(
+            out_cache_loc
+        )
+        self.mem_pool_device.full_to_hisparse_device_index_mapping[compressed_locs] = (
+            new_locs
+        )
+        return True
+
+    def _resident_decode_locs(
+        self,
+        reserved_buffer_loc: torch.Tensor,
+        seq_lens: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        req_pool_indices_cpu: torch.Tensor,
+    ) -> torch.Tensor:
+        """Device slots for this step's new tokens of resident requests (paged, next to the previous token)."""
+        rpi_cpu = req_pool_indices_cpu.tolist()
+        rows = [i for i, r in enumerate(rpi_cpu) if r in self._resident]
+        self._resident_steps += 1
+        if self._resident_steps % 1000 == 0:
+            logger.info(
+                "HiSparse resident: %d of %d running requests resident, %d demotions so far",
+                len(rows),
+                len(rpi_cpu),
+                self.resident_demotions,
+            )
+        if not rows:
+            return reserved_buffer_loc
+        page = self.mem_pool_device.page_size
+        dev = self.token_to_kv_pool_allocator.hisparse_attn_allocator
+        need_pages = sum(1 for i in rows if (int(seq_lens_cpu[i]) - 1) % page == 0)
+        if need_pages * page > dev.available_size():
+            self.reclaim_device(need_pages * page)
+            demoted = [i for i in rows if rpi_cpu[i] not in self._resident]
+            if demoted:  # these take the buffered path this step: the reserved slot of their new buffer
+                d = self._gpu_rows(demoted)
+                reserved_buffer_loc[d] = self.req_to_device_buffer[
+                    req_pool_indices[d],
+                    (seq_lens[d] - 1).clamp(max=self.device_buffer_size),
+                ]
+            rows = [i for i in rows if rpi_cpu[i] in self._resident]
+            if not rows:
+                return reserved_buffer_loc
+        idx = self._gpu_rows(rows)
+        rr = req_pool_indices[idx]
+        sl = seq_lens[idx]
+        prev_logical = self.req_to_token_pool.req_to_token[rr, sl - 2].to(torch.int64)
+        prev_dev = (
+            self.token_to_kv_pool_allocator.full_to_hisparse_device_index_mapping[
+                prev_logical
+            ]
+        )
+        new_locs = dev.alloc_decode(sl, seq_lens_cpu[rows], prev_dev)
+        if new_locs is None:
+            raise RuntimeError(
+                "HiSparse resident decode allocation failed after reclaim"
+            )
+        reserved_buffer_loc[idx] = new_locs.to(reserved_buffer_loc.dtype)
+        return reserved_buffer_loc
+
     def request_lists(self) -> Dict[ListKind, ReqList]:
         return {ListKind.HISPARSE_STAGING: self.ack_staging_queue}
 
@@ -1166,8 +1465,15 @@ class HiSparseCoordinator:
         finish_count = int(queue_size.item())
         move([req for _, _, req in staged[:finish_count]], dst)
         for _, _, req in staged[:finish_count]:
-            # prepare device buffer and update req
-            self.alloc_device_buffer(req)
+            # prepare device buffer and update req (HS_RESIDENT: or keep the whole prefill resident)
+            if self._can_stay_resident(req):
+                self._make_resident(req)
+            else:
+                if (
+                    self._resident
+                ):  # a prompt just under the buffer size takes one extra page
+                    self.reclaim_device(self.mem_pool_device.page_size)
+                self.alloc_device_buffer(req)
             self._skip_first_backup[req.kv.req_pool_idx] = True
             req.hisparse_staging = False
             ready_reqs.append(req)
@@ -1195,10 +1501,28 @@ class HiSparseCoordinator:
         )
 
         if not self.is_dsv4_hisparse:
+            if self.hs_lazy and self._hs_lean_decode(  # HS_LEAN
+                seq_lens,
+                out_cache_loc,
+                req_pool_indices,
+                seq_lens_cpu,
+                req_pool_indices_cpu,
+            ):
+                return
             # Grow device buffers if needed and resolve the latest-token slot.
             reserved_buffer_loc = self._grow_device_buffers(
                 seq_lens, req_pool_indices, seq_lens_cpu, req_pool_indices_cpu
             )
+            if (
+                self._resident
+            ):  # HS_RESIDENT: resident requests' new tokens get their own device slots
+                reserved_buffer_loc = self._resident_decode_locs(
+                    reserved_buffer_loc,
+                    seq_lens,
+                    req_pool_indices,
+                    seq_lens_cpu,
+                    req_pool_indices_cpu,
+                )
             self.req_device_buffer_token_locs[
                 :, req_pool_indices, self.device_buffer_size
             ] = reserved_buffer_loc.to(torch.int32)
@@ -1273,13 +1597,21 @@ class HiSparseCoordinator:
         # Skip the first decode step after staging (prefill already backed up),
         # and skip non-aligned steps that did not produce a new compressed token.
         backup_indices = []
+        lazy_rows = []  # HS_LEAN: resident rows due for a backup; their tokens stay on the device until a demotion
+        lazy = self._resident if self.hs_lazy else None
         for i in range(len(seq_lens_cpu)):
             req_idx = int(req_pool_indices_cpu[i])
             if self._skip_first_backup[req_idx]:
                 self._skip_first_backup[req_idx] = False
                 continue
             if (int(seq_lens_cpu[i]) - 1) % self.compress_ratio == 0:
-                backup_indices.append(i)
+                if lazy and req_idx in lazy:
+                    lazy_rows.append(i)
+                else:
+                    backup_indices.append(i)
+        self._hs_lazy_rows_hook(
+            lazy_rows, seq_lens, req_pool_indices, seq_lens_cpu, req_pool_indices_cpu
+        )
 
         if not backup_indices:
             return
@@ -1302,6 +1634,24 @@ class HiSparseCoordinator:
         buffer_slot = actual_compressed_pos.clamp(max=self.device_buffer_size)
 
         device_locs = self.req_to_device_buffer[backup_req_indices, buffer_slot]
+        if self._resident:  # HS_RESIDENT: a resident request's previous token sits in its own device slot
+            res_rows = [
+                j
+                for j, i in enumerate(backup_indices)
+                if int(req_pool_indices_cpu[i]) in self._resident
+            ]
+            if res_rows:
+                res_mask = torch.zeros(
+                    len(backup_indices), dtype=torch.bool, pin_memory=True
+                )
+                res_mask[res_rows] = True
+                res_mask = res_mask.to(self.device, non_blocking=True)
+                own_locs = self.token_to_kv_pool_allocator.full_to_hisparse_device_index_mapping[
+                    self.req_to_token_pool.req_to_token[
+                        backup_req_indices, actual_compressed_pos
+                    ].to(torch.int64)
+                ]
+                device_locs = torch.where(res_mask, own_locs, device_locs)
 
         host_locs_list = []
         for i in backup_indices:
@@ -1346,6 +1696,12 @@ class HiSparseCoordinator:
             if device_locs.is_cuda:
                 device_locs.record_stream(self.decode_backup_stream)
         self._has_pending_backup = True
+
+    def _hs_lazy_rows_hook(
+        self, lazy_rows, seq_lens, req_pool_indices, seq_lens_cpu, req_pool_indices_cpu
+    ) -> None:
+        """HS_LEAN: validation anchor (the in-situ hooks shadow the per-step backup the lazy rows skipped)."""
+        return
 
     def wait_for_pending_backup(self) -> None:
         if not self._has_pending_backup:
@@ -1482,6 +1838,11 @@ class HiSparseCoordinator:
         if self.decode_producer_stream is not None:
             device_module.current_stream().wait_stream(self.decode_producer_stream)
         self.wait_for_pending_backup()
+        if self._resident and self._resident.pop(req.kv.req_pool_idx, None) is not None:
+            # HS_RESIDENT: its device slots stay mapped; release_kv_cache frees them as it does a prefill's.
+            self.req_resident[req.kv.req_pool_idx] = 0
+            if self.hs_lazy:  # HS_LEAN
+                self.hs_lazy_from[req.kv.req_pool_idx] = _HS_I64_MAX
 
         # Use kv_allocated_len (not seqlen): under speculative decoding the
         # allocator can over-allocate beyond the committed seqlen, and those
@@ -1633,6 +1994,12 @@ class HiSparseCoordinator:
             g = self._hs_group_of_layer[layer_id]
             skip_io_kwargs.update(
                 host_map=self._hs_map[g], map_init=self._hs_map_init[g]
+            )
+        if self.enable_resident:  # HS_RESIDENT
+            skip_io_kwargs.update(
+                resident=self.req_resident,
+                req_to_token=self.req_to_token_pool.req_to_token,
+                full_to_device=self.token_to_kv_pool_allocator.full_to_hisparse_device_index_mapping,
             )
         swap_in_fn(
             top_k_tokens=top_k_result,

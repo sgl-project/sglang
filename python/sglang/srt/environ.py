@@ -790,6 +790,14 @@ class Envs:
     SGLANG_HISPARSE_ANCHOR_COPY_BLOCKS = EnvInt(0)
     SGLANG_HISPARSE_STATS_EVERY = EnvInt(0)
     SGLANG_HISPARSE_HOST_MAP = EnvBool(False)
+    # HiSparse: no index-K cache for layers that reuse an anchor's top-k.
+    SGLANG_HISPARSE_ELIDE_INDEX_K = EnvBool(False)
+    # HiSparse: translate the KV write locations once per forward instead of per layer.
+    SGLANG_HISPARSE_TRANSLATE_ONCE = EnvBool(False)
+    # HiSparse: keep a long request's whole KV in the device pool while it fits; demote it on demand.
+    SGLANG_HISPARSE_RESIDENT = EnvBool(False)
+    # HiSparse: resident requests back up to host when demoted, not every step.
+    SGLANG_HISPARSE_LAZY_BACKUP = EnvBool(False)
     SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS = EnvBool(True)
     # Decode batches between SWA out-of-window evictions.
     SGLANG_SWA_EVICTION_INTERVAL = EnvInt(128)
