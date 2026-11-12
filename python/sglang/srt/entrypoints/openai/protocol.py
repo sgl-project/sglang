@@ -1106,6 +1106,9 @@ class ChatCompletionRequest(PDRoutingFields):
     return_flat_raw_output_top_logprobs: bool = False
     # Base64 by default on chat, unlike /generate; false returns plain JSON lists.
     return_flat_raw_top_logprobs_b64: bool = True
+    # Flat sampling masks in choices[].meta_info (requires return_meta_info); base64 by default as above.
+    return_flat_raw_sampling_mask: bool = False
+    return_flat_raw_sampling_mask_b64: bool = True
     reasoning_effort: ReasoningEffortType = Field(
         default=None,
         description="Constrains effort on reasoning for reasoning models. "

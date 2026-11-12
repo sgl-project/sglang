@@ -75,6 +75,8 @@ PYTHON_ONLY_REQUEST_FIELDS = frozenset(
         "return_flat_raw_output_top_logprobs",
         "return_flat_raw_top_logprobs",
         "return_flat_raw_top_logprobs_b64",
+        "return_flat_raw_sampling_mask",
+        "return_flat_raw_sampling_mask_b64",
         "return_indexer_topk",
         "return_routed_experts",
         "sampling_logprobs_mode",
