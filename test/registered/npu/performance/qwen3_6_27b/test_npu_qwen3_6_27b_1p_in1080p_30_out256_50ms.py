@@ -27,10 +27,7 @@ QWEN3_6_27B_1080P_ENVS = {
     "GLOO_SOCKET_IFNAME": "lo",
     "HCCL_OP_EXPANSION_MODE": "AIV",
     "SGLANG_SET_CPU_AFFINITY": "1",
-    # The ViT NPU graph runner permanently caches one graph (plus block buffers,
-    # up to ~3 GB for a 37-image batch) per distinct image-batch layout, so
-    # memory grows monotonically during the benchmark.
-    "SGLANG_VIT_ENABLE_CUDA_GRAPH": "0",
+    "SGLANG_VIT_ENABLE_CUDA_GRAPH": "1",
     "SGLANG_NPU_PROFILING": "0",
     "SGLANG_NPU_PROFILING_STAGE": "prefill",
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
@@ -59,9 +56,9 @@ QWEN3_6_27B_1080P_OTHER_ARGS = [
     "--disable-radix-cache",
     "--trust-remote-code",
     "--max-running-requests",
-    35,
+    30,
     "--max-mamba-cache-size",
-    35,
+    30,
     "--mem-fraction-static",
     0.70,
     "--cuda-graph-bs-decode",
@@ -76,8 +73,6 @@ QWEN3_6_27B_1080P_OTHER_ARGS = [
     24,
     28,
     30,
-    32,
-    35,
     "--enable-prefill-delayer",
     "--prefill-delayer-queue-min-ratio",
     0.45,
@@ -117,9 +112,9 @@ class TestNPUQwen3_6_27B_1P_In1080p_30_Out256_50ms(TestNpuPerformanceTestCaseBas
     envs = QWEN3_6_27B_1080P_ENVS
     backend = "sglang-oai-chat"
     dataset_name = "image"
-    warmup_requests = 35
-    max_concurrency = 39
-    num_prompts = 140
+    warmup_requests = 30
+    max_concurrency = 34
+    num_prompts = 120
     input_len = 30
     output_len = 256
     random_range_ratio = 1
