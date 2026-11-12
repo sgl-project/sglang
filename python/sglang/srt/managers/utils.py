@@ -22,6 +22,7 @@ from sglang.srt.managers.io_struct import AbortReq, FinishReasonDict
 from sglang.srt.mem_cache.kv_weight_version_tracker import KvWeightVersionRecord
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.runtime_context import (
+    get_memory,
     get_serving,
     get_spec,
     max_speculative_num_draft_tokens,
@@ -66,12 +67,13 @@ def allocate_distinct_stream(device_module, avoid_streams):
 
 
 def is_war_barrier_enabled() -> bool:
-    # FIXME: off CUDA (ROCm included) the barrier is off unless
-    # SGLANG_ENABLE_WAR_BARRIER is set. Unified memory frees ids and rewrites
-    # request rows on the schedule stream at once and relies on this barrier to
-    # order those writes after the overlapped forward's shared reads; without
-    # it that forward can read unbound or rebound mappings.
-    return is_cuda() or envs.SGLANG_ENABLE_WAR_BARRIER.get()
+    # On by default on CUDA. Unified memory frees ids and rewrites request rows on the
+    # schedule stream at once, so it needs the barrier on every device.
+    return (
+        is_cuda()
+        or get_memory().enable_unified_memory
+        or envs.SGLANG_ENABLE_WAR_BARRIER.get()
+    )
 
 
 @dataclasses.dataclass
@@ -312,9 +314,16 @@ def validate_input_length(
             req.origin_input_ids = req.origin_input_ids[:max_req_input_len]
             return None
         else:
+            # OpenAI-compatible clients (e.g. LiteLLM) recognize a context
+            # overflow by OpenAI's "This model's maximum context length is"
+            # sentence; without it this is a generic 400 to them.
+            # Both sentences quote the largest accepted prompt.
+            max_prompt_len = max_req_input_len - 1
             error_msg = (
                 f"Input length ({len(req.origin_input_ids)} tokens) exceeds "
-                f"the maximum allowed length ({max_req_input_len} tokens). "
+                f"the maximum allowed length ({max_prompt_len} tokens). "
+                f"This model's maximum context length is {max_prompt_len} "
+                f"tokens on this server. "
                 f"Use a shorter input or enable --allow-auto-truncate."
             )
             return error_msg

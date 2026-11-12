@@ -72,27 +72,21 @@ def _get_allocator_type() -> str:
 
 def _evict_swa_for_device_alloc(cache: UnifiedRadixCache, required_size: int) -> None:
     """Make room for a host load of ``required_size`` rows of the target
-    window: its own shortfall, from its own entries. The load writes no other
-    window, so no other window is short."""
-    from sglang.srt.mem_cache.base_prefix_cache import EvictParams, window_sub_pool_of
+    window: a demand of the target alone, whose shortfall the cache measures
+    on the target's own room. The load writes no other window."""
+    from sglang.srt.mem_cache.base_prefix_cache import window_sub_pool_of
+    from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 
     allocator = cache.token_to_kv_pool_allocator
-    shortfall = max(0, required_size - allocator.swa_available_size())
-    if shortfall > 0:
-        cache.evict_for_alloc(
-            EvictParams(window_num_tokens={window_sub_pool_of(allocator): shortfall})
-        )
+    cache.evict_for_alloc(
+        KVDemand(window_tokens={window_sub_pool_of(allocator): required_size})
+    )
 
 
 def _evict_mamba_for_device_alloc(cache: UnifiedRadixCache, required_size: int) -> None:
-    from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+    from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 
-    available_size = (
-        cache.token_to_kv_pool_allocator.state_slots.schedulable_available_size()
-    )
-    shortfall = max(0, required_size - available_size)
-    if shortfall > 0:
-        cache.evict_for_alloc(EvictParams(mamba_num=shortfall))
+    cache.evict_for_alloc(KVDemand(state_slots=required_size))
 
 
 def _make_layer_mapper(
@@ -308,15 +302,8 @@ def _build_cache_controller(
 
 
 def _swa_allocation_callbacks(allocator) -> dict:
-    """Keep allocation and rollback in the same ID space for every SWA stack."""
-    from sglang.srt.mem_cache.kv.alloc.band import Band
-
-    if isinstance(allocator, Band):
-        # Unified SWA loads into physical reservations, bound before the H2D.
-        return dict(
-            device_alloc_fn=allocator.alloc_physical,
-            device_free_fn=allocator.cancel_physical_reservation,
-        )
+    """Keep allocation and rollback in the same ID space for every static SWA
+    stack (a unified pool's loads go through its storage, `host_load_alloc`)."""
     if allocator is None:
         return {}
     return dict(device_alloc_fn=allocator.alloc, device_free_fn=allocator.free)
@@ -1357,20 +1344,17 @@ def _packed_drafts(
 
 def _evict_for_host_load(
     cache: UnifiedRadixCache,
-    storage: KVStorage,
     sub_pool: str,
     component: ComponentType,
     required_size: int,
 ) -> None:
-    from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+    from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 
-    shortfall = max(0, required_size - storage.device_room(sub_pool))
-    if shortfall == 0:
-        return
     if component == ComponentType.MAMBA:
-        cache.evict_for_alloc(EvictParams(mamba_num=shortfall))
+        demand = KVDemand(state_slots=required_size)
     else:
-        cache.evict_for_alloc(EvictParams(window_num_tokens={sub_pool: shortfall}))
+        demand = KVDemand(window_tokens={sub_pool: required_size})
+    cache.evict_for_alloc(demand)
 
 
 def build_unified_host_stack(
@@ -1498,11 +1482,17 @@ def build_unified_host_stack(
         device_translate=storage.host_ids(owner),
     )
     component_host_pools = {owner_component: host_pools[owner]}
+    draft_window_entry = False
     for s in sub_pools:
         if s.name == owner:
             continue
         view = storage.view(s.name)
         component = slot_ids[s.external.tree_component]
+        if not s.holds_state and s.external.host_pool in PoolName._value2member_map_:
+            raise ValueError(
+                f"window sub-pool {s.name!r} would share a host pool name with a "
+                "well-known host pool"
+            )
         drafts = params.mtp_draft_mamba_pools if s.holds_state else token_drafts[s.name]
         if s.name not in host_pools:
             host_pools[s.name] = build_host(s.name, drafts)
@@ -1510,7 +1500,7 @@ def build_unified_host_stack(
         alloc = storage.host_load_alloc(s.name)
         entries.append(
             build_pool_entry(
-                name=PoolName(s.external.host_pool),
+                name=s.external.host_pool,
                 host_pool=host_pools[s.name],
                 device_pool=view,
                 layer_mapping=with_packed_draft_layer_mapping(
@@ -1524,9 +1514,7 @@ def build_unified_host_stack(
                 device_evict_fn=(
                     None
                     if cache is None
-                    else partial(
-                        _evict_for_host_load, cache, storage, s.name, component
-                    )
+                    else partial(_evict_for_host_load, cache, s.name, component)
                 ),
                 device_alloc_fn=alloc[0],
                 device_free_fn=alloc[1],
@@ -1534,7 +1522,10 @@ def build_unified_host_stack(
                 device_translate=storage.host_ids(s.name),
             )
         )
-        if owner_id_drafts and not s.holds_state:
+        if owner_id_drafts and not s.holds_state and not draft_window_entry:
+            # One sidecar for every draft window that addresses the owner's
+            # ids, whichever of the target's windows it reads beside.
+            draft_window_entry = True
             entries.append(
                 _draft_swa_entry(
                     drafts=owner_id_drafts,
@@ -1569,7 +1560,7 @@ def build_unified_host_stack(
         sidecars=[c.sidecar_spec() for c in owner_config.sidecars]
         + _mtp_swa_sidecar_specs(host_pool_group),
         loads_state_layer_wise=any(s.holds_state for s in sub_pools),
-        pools_desc=" + ".join(e.name.value.upper() for e in entries),
+        pools_desc=" + ".join(str(e.name).upper() for e in entries),
         device_pool_names=owner_config.pool_names,
     )
 
@@ -1837,9 +1828,16 @@ def build_swa_draft_pools(
     *,
     draft_kv_pool: Any,
     tree_cache: Any,
+    target_window_host: str,
 ) -> tuple[list[SidecarPoolSpec], list[PoolEntry]]:
-    """Build a draft SWA sidecar whose indices follow target SWA."""
-    draft_swa_pool = draft_kv_pool.swa_kv_pool
+    """Build a draft SWA sidecar whose indices follow the target's window,
+    backed up to host pool ``target_window_host`` (`target_window_host_pool`)."""
+    # A pool already on the target's SWA ids is the SWA component itself.
+    draft_swa_pool = (
+        draft_kv_pool
+        if draft_kv_pool.follows_target_swa_ids
+        else draft_kv_pool.swa_kv_pool
+    )
     if draft_swa_pool is None:
         raise NotImplementedError(
             "HiCache draft SWA sidecar requires a non-unified draft SWA pool."
@@ -1848,7 +1846,7 @@ def build_swa_draft_pools(
         return [], []
     controller = tree_cache.cache_controller
     host_pool_group = controller.mem_pool_host
-    target_swa_host_pool = host_pool_group.entry_map[PoolName.SWA].host_pool
+    target_swa_host_pool = host_pool_group.entry_map[target_window_host].host_pool
 
     if isinstance(target_swa_host_pool, DeepSeekV4PagedHostPool):
         _require_single_row_dsv4_swa_pages(
@@ -1881,7 +1879,7 @@ def build_swa_draft_pools(
     layer_mapping = {i: i for i in range(draft_swa_pool.layer_num)}
     spec = SidecarPoolSpec(
         pool_name=PoolName.DRAFT_SWA,
-        indices_from_pool=PoolName.SWA,
+        indices_from_pool=target_window_host,
         hit_policy=PoolHitPolicy.TRAILING_PAGES,
     )
     entry = build_pool_entry(
@@ -1921,6 +1919,17 @@ def validate_fused_hicache_draft(
             )
 
 
+def target_window_host_pool(tree_cache: Any) -> str:
+    """The host pool the target's window backs up to: the static pools'
+    ``swa``, or a unified window sub-pool's own name."""
+    from sglang.srt.mem_cache.base_prefix_cache import window_sub_pool_of
+    from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
+
+    allocator = tree_cache.token_to_kv_pool_allocator
+    storage = kv_storage_of(tree_cache.req_to_token_pool, allocator)
+    return storage.host_pool_name(window_sub_pool_of(allocator))
+
+
 def build_hicache_draft_sidecars(
     *,
     draft_device_pools: tuple[Any, ...],
@@ -1932,13 +1941,17 @@ def build_hicache_draft_sidecars(
 
     assert len(draft_device_pools) == 1
     draft_kv_pool = draft_device_pools[0]
-    builder = (
-        build_swa_draft_pools
-        if draft_kv_pool.layer_router.sub_pool(IdSpaceKind.SLIDING_WINDOW) is not None
+    if (
+        draft_kv_pool.layer_router.sub_pool(IdSpaceKind.SLIDING_WINDOW) is not None
         or isinstance(draft_kv_pool, DeepSeekV4TokenToKVPool)
-        else build_full_draft_pools
-    )
-    return builder(
+        or draft_kv_pool.follows_target_swa_ids
+    ):
+        return build_swa_draft_pools(
+            draft_kv_pool=draft_kv_pool,
+            tree_cache=tree_cache,
+            target_window_host=target_window_host_pool(tree_cache),
+        )
+    return build_full_draft_pools(
         draft_kv_pool=draft_kv_pool,
         tree_cache=tree_cache,
     )
@@ -2550,10 +2563,15 @@ def attach_hybrid_pool_to_unified_cache(
     storage_prefetch_threshold: int = 256,
 ) -> None:
     """Attach HostPoolGroup + HybridCacheController to UnifiedRadixCache."""
+    from sglang.srt.mem_cache.kv.storage import KVStorage
+    from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
+
     try:
         kvcache = params.token_to_kv_pool_allocator.get_kvcache()
-        storage = params.token_to_kv_pool_allocator.storage
-        if storage is not None:
+        storage = kv_storage_of(
+            params.req_to_token_pool, params.token_to_kv_pool_allocator
+        )
+        if isinstance(storage, KVStorage):
             # A unified pool: one host pool per sub-pool of its plan.
             result = build_unified_host_stack(
                 storage=storage,

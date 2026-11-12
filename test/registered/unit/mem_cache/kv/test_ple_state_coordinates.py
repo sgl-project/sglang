@@ -133,6 +133,7 @@ class TestPLEStateCoordinates(unittest.TestCase):
                         token_to_kv_pool=pool,
                         runner_ids=reader,
                         linear_attn_backend=backend,
+                        forward_state_slots=backend.forward_state_slots,
                     )
                 )
             ),
@@ -257,6 +258,7 @@ class TestPLEStateCoordinates(unittest.TestCase):
                                 token_to_kv_pool=pool,
                                 runner_ids=reader,
                                 linear_attn_backend=backend,
+                                forward_state_slots=backend.forward_state_slots,
                             )
                         )
                     ),
