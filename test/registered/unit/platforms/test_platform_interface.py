@@ -637,49 +637,76 @@ class TestMluSRTPlatform(CustomTestCase):
         self.assertTrue(base.is_pin_memory_available(device="mlu"))
         self.assertFalse(base.is_pin_memory_available(device="cpu"))
 
-    def test_incompatible_attention_backend_rejected_for_each_phase(self):
-        """A valid base backend must not hide an incompatible phase override."""
-        from sglang.srt.arg_groups.overrides import record_foreign_defaults
+    def test_supported_attention_backend_resolution(self):
+        """Unset phases inherit the base backend; explicit phase choices survive."""
+        from sglang.srt.arg_groups.overrides import (
+            record_foreign_defaults,
+            resolution_result,
+        )
         from sglang.srt.server_args import ServerArgs
 
-        for field in (
-            "attention_backend",
-            "prefill_attention_backend",
-            "decode_attention_backend",
-        ):
-            with self.subTest(field=field):
-                fields = dict.fromkeys(
-                    (
-                        "attention_backend",
-                        "prefill_attention_backend",
-                        "decode_attention_backend",
-                    ),
-                    "mlu",
-                )
-                fields[field] = "triton"
-                args = ServerArgs(model_path="unused", device="mlu", **fields)
-                with self.assertRaisesRegex(ValueError, f"{field}='mlu'"):
-                    record_foreign_defaults(
-                        args,
-                        "platform:mlu",
-                        MluSRTPlatform().apply_server_args_defaults,
-                    )
-
-    def test_unsupported_runtime_settings_fail_during_resolution(self):
-        from sglang.srt.arg_groups.overrides import record_foreign_defaults
-        from sglang.srt.server_args import ServerArgs
-
-        for fields, message in (
-            ({"sampling_backend": "flashinfer"}, "pytorch sampling backend"),
-            ({"quantization": "awq"}, "unquantized weights"),
-            ({"speculative_algorithm": "EAGLE"}, "speculative decoding"),
-        ):
+        cases = (
+            # Unspecified backends default to MLU and PyTorch sampling.
+            ({}, ("mlu", "mlu", "mlu")),
+            # Explicit MLU and PyTorch sampling choices are accepted.
+            (
+                {"attention_backend": "mlu", "sampling_backend": "pytorch"},
+                ("mlu", "mlu", "mlu"),
+            ),
+            # Both phases inherit an explicit Triton base backend.
+            ({"attention_backend": "triton"}, ("triton", "triton", "triton")),
+            # An explicit prefill backend overrides the base; decode inherits it.
+            (
+                {"attention_backend": "triton", "prefill_attention_backend": "mlu"},
+                ("triton", "mlu", "triton"),
+            ),
+            # An explicit decode backend leaves the base and prefill defaults intact.
+            ({"decode_attention_backend": "triton"}, ("mlu", "mlu", "triton")),
+        )
+        for fields, expected in cases:
             with self.subTest(fields=fields):
                 args = ServerArgs(model_path="unused", device="mlu", **fields)
-                with self.assertRaisesRegex(
-                    ValueError if "sampling_backend" in fields else NotImplementedError,
-                    message,
-                ):
+                record_foreign_defaults(
+                    args,
+                    "platform:mlu",
+                    MluSRTPlatform().apply_server_args_defaults,
+                )
+                self.assertEqual(
+                    tuple(
+                        resolution_result(args, field)
+                        for field in (
+                            "attention_backend",
+                            "prefill_attention_backend",
+                            "decode_attention_backend",
+                        )
+                    ),
+                    expected,
+                )
+                self.assertEqual(resolution_result(args, "sampling_backend"), "pytorch")
+
+    def test_unsupported_runtime_settings_fail_during_resolution(self):
+        """Reject unsupported runtime settings before model loading or execution."""
+        from sglang.srt.arg_groups.overrides import record_foreign_defaults
+        from sglang.srt.server_args import ServerArgs
+
+        for field, value, error_type in (
+            ("attention_backend", "flashinfer", ValueError),
+            ("prefill_attention_backend", "flashinfer", ValueError),
+            ("decode_attention_backend", "flashinfer", ValueError),
+            ("sampling_backend", "flashinfer", ValueError),
+            ("quantization", "awq", NotImplementedError),
+            ("speculative_algorithm", "EAGLE", NotImplementedError),
+        ):
+            with self.subTest(field=field, value=value):
+                # A valid base backend must not hide an incompatible phase override.
+                fields = dict(
+                    attention_backend="mlu",
+                    prefill_attention_backend="mlu",
+                    decode_attention_backend="mlu",
+                )
+                fields[field] = value
+                args = ServerArgs(model_path="unused", device="mlu", **fields)
+                with self.assertRaises(error_type):
                     record_foreign_defaults(
                         args,
                         "platform:mlu",
