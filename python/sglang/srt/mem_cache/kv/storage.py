@@ -85,9 +85,10 @@ class StorageSubPool(msgspec.Struct, frozen=True, kw_only=True):
 
 class SubPoolUsage(msgspec.Struct, frozen=True, kw_only=True):
     """A sub-pool's occupancy as observers report it, in its own units: tokens,
-    or slots for a sub-pool that holds state. ``metrics`` is the family its
-    numbers are published under (``full``, ``window`` or ``mamba``), and
-    ``label`` the name that tells one window's numbers from another's."""
+    slots for a sub-pool that holds state, or request rows for a request
+    sub-pool. ``metrics`` is the family its numbers are published under
+    (``full``, ``window``, ``mamba`` or ``request``), and ``label`` the name
+    that tells one window's numbers from another's."""
 
     name: str
     metrics: str
@@ -736,7 +737,8 @@ class KVStorage:
         return self._allocator.verify_byte_accounting()
 
     def usage(self) -> Tuple[SubPoolUsage, ...]:
-        """Every sub-pool's capacity and free units now, owner first."""
+        """Every sub-pool's capacity and free units now, owner first, request
+        sub-pools included (they have no view of their own here)."""
         units = self._allocator.usage()
         return tuple(
             SubPoolUsage(
@@ -746,7 +748,7 @@ class KVStorage:
                 capacity=units[s.name][0],
                 available=units[s.name][1],
             )
-            for s in self._sub_pools
+            for s in self._plan.owner_first()
         )
 
     def page_envelope_pair(self) -> Optional[Tuple[str, str]]:

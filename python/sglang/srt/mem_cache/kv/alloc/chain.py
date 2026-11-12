@@ -751,6 +751,10 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             # the token owner's.
             if b.name in self.window_pool_names():
                 id_room = owner_snap.num_virtual_pages - owner_snap.min_page
+            elif b.name in self.request_allocators:
+                # A request band mints no ids: each live unit binds one
+                # request table row, its id.
+                id_room = b.num_virtual_pages - b.min_page - b.live
             else:
                 id_room = b.free_virtual_pages
             pages = min(pages, b.num_pages - b.min_page - b.live, id_room)
@@ -762,7 +766,8 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
 
     def estimated_units_available(self, sub_pool: str) -> int:
         """An estimate of what ``sub_pool`` alone could still take, in tokens (slots for
-        state), for observers; reading it inside a capacity decision is a violation."""
+        state, rows for a request sub-pool), for observers; reading it inside a
+        capacity decision is a violation."""
         observe_only_read("ChainAllocator.estimated_units_available")
         band = self.bands[self._band_positions[sub_pool]]
         pages = self._estimated_pages((sub_pool,))

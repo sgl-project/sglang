@@ -1027,6 +1027,32 @@ class TestDeclaredParts(CustomTestCase):
         unit = int(ids.ids(torch.tensor([row]))[0])
         self.assertEqual(int(cursor[unit]), 0)
 
+    def test_usage_reports_the_request_sub_pool(self):
+        """Usage lists every sub-pool, the request sub-pool included, though
+        views and the prefix tree's components leave it out. A request unit
+        binds a request row, so the rows bound and free are its usage."""
+        storage, plan, _ = _build(state=True, gamma=3, replay=_GDN_SPEC_REPLAY)
+        (request,) = plan.requests()
+        self.assertNotIn(request.name, storage.sub_pool_names())
+        self.assertEqual(
+            [u.name for u in storage.usage()],
+            [s.name for s in plan.owner_first()],
+        )
+
+        def request_usage():
+            (usage,) = [u for u in storage.usage() if u.metrics == "request"]
+            self.assertEqual((usage.name, usage.label), (request.name, "request"))
+            return usage.capacity, usage.available
+
+        rows = storage.requests.available_size()
+        self.assertGreater(rows, 0)
+        self.assertEqual(request_usage(), (rows, rows))
+        req = SimpleNamespace(rid="r0", kv=_StateRequestKV())
+        storage.acquire([req])
+        self.assertEqual(request_usage(), (rows, rows - 1))
+        storage.release_row(req)
+        self.assertEqual(request_usage(), (rows, rows))
+
     def test_request_rows_are_priced_with_the_other_units(self):
         """A demand's request rows take a unit of every request sub-pool, priced
         in the same layout as its tokens and state slots; nothing evictable
