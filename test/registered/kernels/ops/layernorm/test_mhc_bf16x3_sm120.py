@@ -4,8 +4,8 @@ arg_groups/model_hook.py turns SGLANG_OPT_DEEPGEMM_HC_PRENORM off on SM120 behin
 ``is_set()`` guard, so a user can still opt in. The load-time gate in deepseek_v4.py
 then decides whether that opt-in builds anything. These tests pin both halves of the
 contract: SM120 takes the pure-Triton bf16x3 route and never the DeepGEMM tf32 one,
-the row band is the only thing that selects it, and the coefficients match an fp64
-mirror of the reduce arithmetic.
+the row band and the architecture gate select which route runs, and the coefficients
+match an fp64 mirror of the reduce arithmetic.
 
 Registered on ``1-gpu-small``, which scripts/ci/runner_configs.yml maps to a 5090, so
 the SM120 branch executes in CI instead of skipping on a mismatched card.
@@ -180,9 +180,43 @@ def test_in_band_rows_use_the_compensated_projection(monkeypatch, num_tokens):
         torch.testing.assert_close(result.double(), expected, rtol=1e-5, atol=2e-6)
 
 
-@pytest.mark.parametrize("num_tokens", [1, 64])
+@pytest.mark.parametrize("num_tokens", [32, 128, 256])
+def test_decode_band_uses_the_compensated_projection(monkeypatch, num_tokens):
+    """Rows in [32, 256] take bf16x3 on the 64x64 decode grid, not the partial path.
+
+    Measured on 8x RTX PRO 5000 (sm_120), CUDA-graph batched timing: the decode grid is
+    0.80/0.68/0.58 of the partial path at 32/128/256 rows. Below 32 no weight triple is
+    built at all, so the band starts where `parts` starts.
+    """
+    from sglang.srt.environ import envs
+    from sglang.srt.models import deepseek_v4_mhc as model_mhc
+    from sglang.srt.models.deepseek_v4 import DeepseekV4DecoderLayer
+
+    x, w, scale, base, layer = _material(num_tokens, seed=29)
+    calls = []
+    real = kernels_mhc.hc_mix_stats_sinkhorn_bf16x3
+
+    def spy(*args, **kwargs):
+        calls.append(kwargs)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(kernels_mhc, "hc_mix_stats_sinkhorn_bf16x3", spy)
+    with _sm120_platform(), envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.override(True):
+        DeepseekV4DecoderLayer.refresh_mhc_norm_weight_cache(layer)
+        actual = model_mhc.mix_stats(layer.attn_hc, x)
+
+    assert calls, f"num_tokens={num_tokens} stayed on the partial path"
+    assert calls[0].get("decode_grid") is True, (
+        "the decode band reached bf16x3 without the decode grid, which asserts "
+        "on rows below 4096"
+    )
+    for result, expected in zip(actual, _fp64_triplet(x, w, scale, base)):
+        torch.testing.assert_close(result.double(), expected, rtol=1e-5, atol=2e-6)
+
+
+@pytest.mark.parametrize("num_tokens", [1, 512])
 def test_out_of_band_rows_stay_on_the_partial_path(monkeypatch, num_tokens):
-    """Decode and small prefill keep the split-K partial kernel and stay correct."""
+    """Decode (below the `parts` guard) and 257..4095 keep the split-K partial kernel."""
     from sglang.srt.environ import envs
     from sglang.srt.models import deepseek_v4_mhc as model_mhc
     from sglang.srt.models.deepseek_v4 import DeepseekV4DecoderLayer
@@ -192,7 +226,8 @@ def test_out_of_band_rows_stay_on_the_partial_path(monkeypatch, num_tokens):
     def refuse(*args, **kwargs):
         raise AssertionError(
             f"num_tokens={num_tokens} entered the compensated projection, which "
-            "only applies to hopper_medium rows or [4096, 65536]"
+            "only applies to hopper_medium rows, the SM100/SM120 decode band, or "
+            "[4096, 65536]"
         )
 
     partial = []
