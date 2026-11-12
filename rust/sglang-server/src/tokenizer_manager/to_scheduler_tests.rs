@@ -721,6 +721,54 @@ fn abort_deregisters_and_bypasses_request_ring_capacity() {
     assert_eq!(consumer.drain(8).len(), 2, "both aborts must be delivered");
 }
 
+/// A one-way control message is never retried, so a full request ring must
+/// not drop it: it takes the reserved lane and its sender learns it is queued.
+#[test]
+fn one_way_control_bypasses_request_ring_capacity() {
+    let (producer, consumer) = to_scheduler(1);
+    assert!(producer.try_push(SchedulerRequest {
+        header: bytes::Bytes::from_static(b"filler"),
+        buffers: Vec::new(),
+    }));
+    let (tm_tx, tm_rx) = flume::unbounded();
+    let (sd_tx, sd_rx) = flume::unbounded::<()>();
+    std::mem::forget(sd_tx);
+    let (abort_tx, abort_rx) = flume::unbounded::<AbortSource>();
+    std::mem::forget(abort_tx);
+    let intake = Intake::new(
+        tm_rx,
+        abort_rx,
+        Senders {
+            tok_manager_tx: flume::unbounded().0,
+            abort_tx: flume::unbounded().0,
+            tokenizer_tx: flume::unbounded().0,
+            detokenizer_tx: vec![flume::unbounded().0],
+        },
+        producer,
+        test_limits(),
+        test_mm(flume::unbounded().0, true),
+        sd_rx,
+    );
+    let (queued, queued_rx) = tokio::sync::oneshot::channel();
+    tm_tx
+        .send(TmEvent::OneWay {
+            control: ControlRequest::FreezeGCReq(crate::message::io_struct::FreezeGCReq::new(
+                "freeze".into(),
+                None,
+            )),
+            queued,
+        })
+        .unwrap();
+    drop(tm_tx);
+    intake.run();
+
+    assert!(matches!(queued_rx.blocking_recv(), Ok(Ok(()))));
+    let pushed = consumer.drain(8);
+    assert_eq!(pushed.len(), 2, "the full ring must not drop the message");
+    let header = rmpv::decode::read_value(&mut &pushed[0].header[..]).unwrap();
+    assert_eq!(header[0].as_str(), Some("FreezeGCReq"));
+}
+
 /// The rid keys the detok table and rides on every chunk of every decode step,
 /// so an unbounded client-supplied one is a recurring cost, not a one-off.
 #[test]
@@ -1174,6 +1222,7 @@ fn abort_while_in_tokenizer_pool_drops_on_return() {
 #[test]
 fn mm_request_goes_to_pool_then_encoded_pushes_to_channel() {
     let (mut intake, _detok_rx, consumer, _tm_tx, mm_rx) = make_intake();
+    let queued_after = std::time::Instant::now();
     intake.drive(mm_pretokenized_req("mm-1"));
 
     // The whole request is in the pool, in `Encoding`; nothing on the channel yet.
@@ -1197,6 +1246,8 @@ fn mm_request_goes_to_pool_then_encoded_pushes_to_channel() {
         mm.image_data.first().and_then(|item| item.source()),
         Some("data:image/jpeg;base64,xxxx")
     );
+    // The processor learns when the request queued for a worker.
+    assert!(mm.admission.queued_at.is_some_and(|at| at >= queued_after));
     assert!(consumer.drain(16).is_empty(), "in the pool, not queued");
 
     // The worker returns the final expanded ids -> pushed to the channel.

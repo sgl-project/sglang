@@ -11,7 +11,7 @@ from sglang.test.test_utils import CustomTestCase
 register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 # backend-specific: the HIP kernel replaces SM100 TMA on ROCm.
-register_amd_ci(est_time=15, stage="jit-kernel-unit", runner_config="amd")
+register_amd_ci(est_time=10, stage="jit-kernel-unit", runner_config="amd")
 
 _HIDDEN_SIZE = 7168
 _EPS = 1e-6
@@ -89,44 +89,44 @@ class TestAttnResHip(CustomTestCase):
 
         cw = randn(_HIDDEN_SIZE) * _HIDDEN_SIZE**-0.5
         ow = (1 + 0.1 * randn(_HIDDEN_SIZE)).to(torch.bfloat16)
-        # Token count only changes the grid; keep every bank/add/norm specialization.
-        for tokens, nvb in ((1, 1), (8, 5), (33, 8)):
-            for with_add in (False, True):
-                for norm in (ow, None):
-                    prefix = randn(tokens, _HIDDEN_SIZE).to(torch.bfloat16)
-                    bank = randn(tokens, 9, _HIDDEN_SIZE).to(torch.bfloat16)
-                    addend = (
-                        randn(tokens, _HIDDEN_SIZE).to(torch.bfloat16)
-                        if with_add
-                        else None
-                    )
-                    out = torch.empty_like(prefix)
-                    prefix_out = torch.empty_like(prefix)
-                    attn_res_hip(
-                        prefix,
-                        bank,
-                        cw,
-                        norm,
-                        out,
-                        nvb,
-                        _EPS,
-                        _EPS,
-                        addend=addend,
-                        prefix_out=prefix_out if with_add else None,
-                        write_prefix=True,
-                    )
-                    want, want_prefix = _reference(prefix, bank, nvb, cw, norm, addend)
-                    msg = f"tokens={tokens} nvb={nvb} add={with_add} norm={norm is not None}"
-                    torch.testing.assert_close(
-                        out.float(), want, atol=2e-2, rtol=2e-2, msg=msg
-                    )
-                    torch.testing.assert_close(
-                        bank[:, nvb], want_prefix, atol=0, rtol=0, msg=msg
-                    )
-                    if with_add:
-                        torch.testing.assert_close(
-                            prefix_out, want_prefix, atol=0, rtol=0, msg=msg
-                        )
+        # Each pair of the kernel's specializations -- NVB 1 / 5 (4 / 8 warps), HAS_ADD,
+        # APPLY_OUT_NORM -- runs once; token count only changes the grid.
+        for tokens, nvb, with_add, norm in (
+            (1, 1, False, ow),
+            (1, 1, True, None),
+            (8, 5, False, None),
+            (8, 5, True, ow),
+        ):
+            prefix = randn(tokens, _HIDDEN_SIZE).to(torch.bfloat16)
+            bank = randn(tokens, 9, _HIDDEN_SIZE).to(torch.bfloat16)
+            addend = (
+                randn(tokens, _HIDDEN_SIZE).to(torch.bfloat16) if with_add else None
+            )
+            out = torch.empty_like(prefix)
+            prefix_out = torch.empty_like(prefix)
+            attn_res_hip(
+                prefix,
+                bank,
+                cw,
+                norm,
+                out,
+                nvb,
+                _EPS,
+                _EPS,
+                addend=addend,
+                prefix_out=prefix_out if with_add else None,
+                write_prefix=True,
+            )
+            want, want_prefix = _reference(prefix, bank, nvb, cw, norm, addend)
+            msg = f"tokens={tokens} nvb={nvb} add={with_add} norm={norm is not None}"
+            torch.testing.assert_close(out.float(), want, atol=2e-2, rtol=2e-2, msg=msg)
+            torch.testing.assert_close(
+                bank[:, nvb], want_prefix, atol=0, rtol=0, msg=msg
+            )
+            if with_add:
+                torch.testing.assert_close(
+                    prefix_out, want_prefix, atol=0, rtol=0, msg=msg
+                )
 
 
 if __name__ == "__main__":

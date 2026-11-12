@@ -23,10 +23,10 @@ import numpy as np
 import torch
 from torch import nn
 
+from sglang.kernels.ops.communication.engram_gather_peer import engram_gather_peer
 from sglang.kernels.ops.embeddings.engram_gate import fused_engram_gate
 from sglang.kernels.ops.embeddings.engram_gather import (
     engram_gather,
-    engram_gather_peer,
     engram_rows_to_token_major,
     unpack_mxfp4_rows,
 )
@@ -54,6 +54,7 @@ from sglang.srt.distributed.device_communicators.cuda_wrapper import (
 )
 from sglang.srt.distributed.parallel_state import inplace_all_reduce
 from sglang.srt.environ import envs
+from sglang.srt.hf_transformers.tokenizer import get_tokenizer
 from sglang.srt.layers.dp_attention import (
     attn_cp_all_gather_into_tensor,
     dp_gather_replicate,
@@ -66,6 +67,7 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.managers.req_types import MM_PAD_SHIFT_VALUE
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
@@ -84,8 +86,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_serving,
 )
-from sglang.srt.utils import add_prefix, is_cuda, is_gfx95_supported, is_hip
-from sglang.srt.utils.hf_transformers.tokenizer import get_tokenizer
+from sglang.srt.utils import is_cuda, is_gfx95_supported, is_hip
 
 logger = logging.getLogger(__name__)
 

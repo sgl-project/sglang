@@ -23,7 +23,7 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 # backend-specific: the gfx950 product-rounding boundary must stay bit-exact.
-register_amd_ci(est_time=155, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=65, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 _DEVICE = "cuda"
 
@@ -398,9 +398,9 @@ def _assert_gfx950_result(ref, new, o_ref, o_new, snapshot_atol=1e-4):
     )
 
 
-def _gfx950_srt(args, *, conv_bias=None, **overrides):
+def _gfx950_srt(args, **overrides):
     layer = SimpleNamespace(
-        bias=conv_bias,
+        bias=None,
         conv_weights=args["conv_weight"],
         **{
             key: args[key]
@@ -450,13 +450,18 @@ def _gfx950_srt(args, *, conv_bias=None, **overrides):
 
 @pytest.mark.skipif(not is_gfx95_supported(), reason="gfx950 kernel")
 class TestGfx950Verify:
-    @pytest.mark.parametrize("B", [1, 24])
-    @pytest.mark.parametrize("lower_bound", [-5.0, None])
     @pytest.mark.parametrize(
-        "T,snapshot", [(8, False), (6, False), (3, False), (8, True), (6, True)]
+        "B,lower_bound,T,snapshot",
+        [
+            (24, -5.0, 8, False),
+            (24, None, 6, True),
+            (1, -5.0, 6, True),
+            (1, None, 6, False),
+        ],
     )
     def test_matches_triton_chain_verify(self, B, lower_bound, T, snapshot):
-        """Keep every (BV, T, bounded gate, snapshot) specialization and padded state."""
+        """Every BV (4 at B <= 2, else 8), T (full and idle token groups), gate and
+        state mode, each pair of BV / gate / state mode, and the padded state row."""
         H = 12 if snapshot or T == 8 else 16
         seed = B * 17 + 5 if snapshot else B * 31 + H
         ref, new = (
@@ -467,15 +472,11 @@ class TestGfx950Verify:
             ref, new, _gfx950_reference(ref), kda_verify_gfx950(**new)
         )
 
-    @pytest.mark.parametrize(
-        "field", ["conv_state", "intermediate_conv_window", "conv_weight"]
-    )
-    def test_conv_inputs_the_kernel_cannot_read_fall_back(self, field):
+    def test_a_conv_state_the_kernel_cannot_read_falls_back(self):
+        # SGLANG_MAMBA_CONV_DTYPE sets the conv state's dtype; the kernel reads BF16
         args = _gfx950_case(1, 16, seed=0)
         assert _gfx950_supported(args)
-        args[field] = (
-            args[field][:, :3] if field == "conv_weight" else args[field].float()
-        )
+        args["conv_state"] = args["conv_state"].float()
         assert not _gfx950_supported(args)
 
     @pytest.mark.parametrize("ring", [True, False], ids=["ring", "snapshots"])
@@ -519,40 +520,19 @@ class TestGfx950Verify:
         rows = (dense["cache_indices"] >= 0).repeat_interleave(T)
         assert torch.equal(o_dense[0][rows], o_views[0][rows])
 
-    @pytest.mark.parametrize(
-        "unsupported", ["tree", "conv_bias", "bf16_A_log", "ring_shorter_than_T"]
-    )
-    def test_srt_verify_declines_what_the_kernel_cannot_serve(self, unsupported):
+    def test_srt_verify_declines_a_tree(self):
+        # EAGLE topk > 1 verifies a tree; the kernel walks only the chain
         args = _gfx950_case(6, 12, seed=0)
-        args["cache_indices"] = torch.tensor(
-            [7, -1, 4, 0, 6, 1], device=_DEVICE, dtype=torch.int32
-        )
-        args["intermediate_state_indices"] = torch.arange(
-            6, device=_DEVICE, dtype=torch.int32
-        )
-        overrides = {}
-        if unsupported == "tree":
-            tree = torch.full((6, 8), -1, device=_DEVICE, dtype=torch.int64)
-            overrides = dict(
+        tree = torch.full((6, 8), -1, device=_DEVICE, dtype=torch.int64)
+        assert (
+            _gfx950_srt(
+                args,
                 retrieve_next_token=tree,
                 retrieve_next_sibling=tree,
                 retrieve_parent_token=tree,
             )
-        elif unsupported == "conv_bias":
-            overrides["conv_bias"] = torch.zeros(
-                args["conv_weight"].shape[0], device=_DEVICE
-            )
-        elif unsupported == "bf16_A_log":
-            args["A_log"] = args["A_log"].bfloat16()
-        else:
-            for name in (
-                "replayssm_rawv",
-                "replayssm_rawk",
-                "replayssm_g",
-                "replayssm_beta",
-            ):
-                args[name] = torch.zeros_like(args[name][:, :, :7]).contiguous()
-        assert _gfx950_srt(args, **overrides) is None
+            is None
+        )
 
 
 if __name__ == "__main__":

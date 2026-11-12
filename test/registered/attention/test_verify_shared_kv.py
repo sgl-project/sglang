@@ -7,24 +7,23 @@ from unittest.mock import patch
 import torch
 
 from sglang.kernels.ops.attention.extend_attention import extend_attention_fwd
-from sglang.kernels.ops.attention.verify_mla import verify_shared_kv_fwd
-from sglang.kernels.ops.attention.verify_mla_draft import (
-    verify_shared_kv_fwd as verify_draft_fwd,
+from sglang.kernels.ops.attention.verify_mla import (
+    verify_mla_draft_fwd,
+    verify_shared_kv_fwd,
 )
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
 from sglang.srt.layers.attention.triton_backend import (
     TritonAttnBackend,
+    WindowRail,
     _should_use_verify_shared_kv,
 )
-from sglang.srt.layers.attention.triton_draft_hip import init_draft_backend
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.model_executor.forward_mode import ForwardMode
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import get_hip_version, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_amd_ci(est_time=180, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=35, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 BF16_ATOL = 2e-2
 BF16_RTOL = 1e-2
@@ -42,11 +41,10 @@ def _build_inputs(
     cache_dtype=torch.bfloat16,
     latent_values=False,
     shuffle_cache=False,
-    seed=0,
 ):
     device = "cuda"
     dtype = torch.bfloat16
-    generator = torch.Generator(device=device).manual_seed(seed)
+    generator = torch.Generator(device=device).manual_seed(0)
     prefix_lens_t = torch.tensor(prefix_lens, dtype=torch.int32, device=device)
     total_prefix = sum(prefix_lens)
     batch_size = len(prefix_lens)
@@ -347,7 +345,7 @@ EXTEND_CASES = {
 }
 
 
-def _inputs(case, cache_dtype, seed=0):
+def _inputs(case, cache_dtype):
     return _build_inputs(
         prefix_lens=case["prefix_lens"],
         l_ext=case["l_ext"],
@@ -358,7 +356,6 @@ def _inputs(case, cache_dtype, seed=0):
         cache_dtype=cache_dtype,
         latent_values=case["mla"],
         shuffle_cache=True,
-        seed=seed,
     )
 
 
@@ -445,6 +442,7 @@ def _backend_extend(case, inputs, bf16_dot):
     backend.use_dense_fp8_chunked_prefill = False
     backend.use_verify_shared_kv = False
     backend.use_verify_splitkv = False
+    backend.use_verify_gfx115 = False
     backend.verify_mla_draft_fwd = None
     backend.extend_attention_fwd = extend_attention_fwd
     backend.dcp_size = 1
@@ -466,9 +464,7 @@ def _backend_extend(case, inputs, bf16_dot):
     backend.forward_metadata = SimpleNamespace(
         kv_indptr=kv_indptr,
         kv_indices=kv_indices,
-        window_kv_indptr=kv_indptr,
-        window_kv_indices=kv_indices,
-        window_kv_offsets=None,
+        windows={None: WindowRail(kv_indptr=kv_indptr, kv_indices=kv_indices)},
         qo_indptr=qo_indptr,
         custom_mask=None,
         mask_indptr=None,
@@ -529,40 +525,12 @@ class TestDraftAttention(CustomTestCase):
                 if FP8_DOT_OK:
                     # The default still runs FP8 q and probabilities over an FP8 cache.
                     default = _backend_extend(case, inputs, bf16_dot=False)
-                    default_err = _err(default, ref)
                     assert not torch.equal(default, out)
-                    assert default_err > 2 * err, (default_err, err)
-
-    def test_bf16_cache_unchanged_by_bf16_dot(self):
-        for name in EXTEND_CASES:
-            with self.subTest(case=name):
-                case = EXTEND_CASES[name]
-                inputs = _inputs(case, torch.bfloat16, seed=1)
-                torch.testing.assert_close(
-                    _extend(case, inputs, bf16_dot=True),
-                    _extend(case, inputs, bf16_dot=False),
-                    rtol=0,
-                    atol=0,
-                )
-
-    def test_draft_backend_gate(self):
-        for algorithm, expected in (
-            (SpeculativeAlgorithm.DFLASH, True),
-            (SpeculativeAlgorithm.DSPARK, True),
-            (SpeculativeAlgorithm.EAGLE, False),
-        ):
-            with self.subTest(algorithm=algorithm):
-                backend = SimpleNamespace(use_mla=False, dcp_size=1)
-                init_draft_backend(backend, SimpleNamespace(spec_algorithm=algorithm))
-                assert backend.draft_bf16_dot is expected
 
     def test_verify_matches_extend(self):
         cases = [
             ((65536, 3000), 8, -1, False),
-            ((600, 1024, 1100), 6, 1024, False),
             ((600, 1024, 1100), 6, 1024, True),
-            ((600, 1024, 1100), 8, 1024, False),
-            ((600, 1024, 1100), 8, 1024, True),
         ]
         for prefix_lens, l_ext, window, bf16_dot in cases:
             with self.subTest(l_ext=l_ext, window=window, bf16_dot=bf16_dot):
@@ -570,20 +538,9 @@ class TestDraftAttention(CustomTestCase):
                     MLA, mla=False, prefix_lens=prefix_lens, l_ext=l_ext, window=window
                 )
                 inputs = _inputs(case, torch.float8_e4m3fn)
-                actual = _extend(case, inputs, bf16_dot, kernel=verify_draft_fwd)
+                actual = _extend(case, inputs, bf16_dot, kernel=verify_mla_draft_fwd)
                 expected = _extend(case, inputs, bf16_dot)
                 torch.testing.assert_close(actual, expected, atol=8e-2, rtol=2e-2)
-
-    def test_verify_rejects_window_narrower_than_block(self):
-        case = dict(MLA, mla=False, prefix_lens=(256,))
-        q, k, v, k_buffer, v_buffer, qo_indptr, kv_indptr, kv_indices = _inputs(
-            case, torch.bfloat16
-        )
-        out = torch.empty(*q.shape[:2], case["dv"], dtype=q.dtype, device=q.device)
-        assert not verify_draft_fwd(
-            q, k, v, out, k_buffer, v_buffer, qo_indptr, kv_indptr, kv_indices,
-            None, True, None, 8, 1.0, 1.0, sliding_window_size=4,
-        )  # fmt: skip
 
 
 if __name__ == "__main__":

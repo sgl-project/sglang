@@ -22,6 +22,7 @@ from sglang.srt.function_call.deepseekv31_detector import DeepSeekV31Detector
 from sglang.srt.function_call.deepseekv32_detector import DeepSeekV32Detector
 from sglang.srt.function_call.deepseekv41_detector import DeepSeekV41Detector
 from sglang.srt.function_call.dots_detector import DotsToolDetector
+from sglang.srt.function_call.ernie55_detector import Ernie5_5Detector
 from sglang.srt.function_call.gemma4_detector import Gemma4Detector
 from sglang.srt.function_call.gigachat3_detector import GigaChat3Detector
 from sglang.srt.function_call.gigachat35_detector import GigaChat35Detector
@@ -85,6 +86,7 @@ class FunctionCallParser:
         "deepseekv4": DeepSeekV4Detector,
         "deepseekv41": DeepSeekV41Detector,
         "dots": DotsToolDetector,
+        "ernie55": Ernie5_5Detector,
         "glm": Glm4MoeDetector,
         "glm45": Glm4MoeDetector,
         "glm47": Glm47MoeDetector,
@@ -329,7 +331,6 @@ class FunctionCallParser:
         tool_choice: Union[ToolChoice, Literal["auto", "required"]],
         parallel_tool_calls: bool = True,
         thinking_mode: bool = False,
-        response_channel_open: bool = False,
     ) -> Optional[ToolCallConstraint]:
         """
         Returns the appropriate structure constraint for tool calls based on the tool_choice.
@@ -399,23 +400,11 @@ class FunctionCallParser:
                     return ("structural_tag", structural_tag)
 
             if is_required or should_constrain_auto:
-                # Only the K3 tag depends on which channel the generation
-                # prompt left open; the other detectors keep the narrower
-                # signature. Guarded like the `tokenizer` kwarg in __init__,
-                # because a TypeError here is swallowed below and would silently
-                # drop the constraint for whichever detector did not accept it.
-                tag_kwargs = {}
-                if (
-                    "response_channel_open"
-                    in inspect.signature(self.detector.get_structural_tag).parameters
-                ):
-                    tag_kwargs["response_channel_open"] = response_channel_open
                 structural_tag = self.detector.get_structural_tag(
                     tools=structural_tag_tools,
                     thinking_mode=thinking_mode,
                     tool_choice=tool_choice,
                     parallel_tool_calls=parallel_tool_calls,
-                    **tag_kwargs,
                 )
                 if structural_tag is not None:
                     return ("structural_tag", structural_tag)

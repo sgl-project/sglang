@@ -67,7 +67,7 @@ def _get_state() -> Optional[_State]:
     else:
         # Auto-probe: only SM100/SM103, and not under --enable-symm-mem or EP
         # a2a (their allocator contexts misroute the buffers the pull needs).
-        from sglang.srt.utils.common import get_device_sm
+        from sglang.srt.utils.device import get_device_sm
 
         if get_device_sm() not in (100, 103):
             return None
@@ -340,10 +340,6 @@ def gemm_ag_up_fits(num_tokens: int) -> bool:
     return (
         0 < num_tokens <= max_tokens
         and num_tokens * (2 * NORM_DIM // state.world_size) * 2 <= comm.max_push_size
-        # The GEMV producer reads a single phase counter, so its grid is not
-        # bound to the counter array; the consumers stride over the output with
-        # at most one block per counter slot plus the cleanup block.
-        and comm.config.num_push_blocks >= 2
     )
 
 
@@ -368,8 +364,9 @@ def slice_gemm(
             return torch.nn.functional.linear(x, weight)
         return torch.mm(x, weight.t(), out_dtype=out_dtype)
     out = x.new_empty((m, n), dtype=out_dtype)
-    # warp split-K compiles per M: only captured batches (a fixed set of M) take it
-    if m <= _SLICE_WARP_SPLITK_MAX_TOKENS and get_is_capture_mode():
+    # warp split-K compiles per M: only captured batches (a fixed set of M) take it,
+    # and its 16- or 32-column output tiles must divide N (not the TP16 front's 1048)
+    if m <= _SLICE_WARP_SPLITK_MAX_TOKENS and n % 16 == 0 and get_is_capture_mode():
         from sglang.kernels.ops.gemm.dense_bf16_gemm_warp_splitk import (
             default_tactic,
             run_warp_splitk_dense,
@@ -412,8 +409,7 @@ def gemm_ag_up_proj(
 
 def moe_front_all_gather_fits(num_tokens: int, n_local: int) -> bool:
     """Whether :func:`moe_front_all_gather` covers a ``[num_tokens, n_local]``
-    fp32 block: it fits a push slot, and the plane has a work block plus the
-    counter-update block."""
+    fp32 block: it fits a push slot."""
     state = _get_state()
     assert state is not None
     comm = state.comm
@@ -421,7 +417,6 @@ def moe_front_all_gather_fits(num_tokens: int, n_local: int) -> bool:
         num_tokens > 0
         and n_local % 4 == 0
         and num_tokens * n_local * 4 <= comm.max_push_size
-        and comm.config.num_push_blocks >= 2
     )
 
 

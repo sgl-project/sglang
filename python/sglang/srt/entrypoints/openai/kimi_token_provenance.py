@@ -25,15 +25,21 @@ _CHANNEL_MARKERS = re.compile(
 )
 
 
+def token_byte_decoder(tokenizer):
+    """The tokenizer's tiktoken byte decoder, or None when it has none."""
+    # Both the HF Kimi tokenizer and SGLang's tiktoken wrapper expose the
+    # actual Encoding. Its byte API preserves partial UTF-8 tokens.
+    encoding = getattr(tokenizer, "model", None)
+    if not callable(getattr(encoding, "decode_single_token_bytes", None)):
+        encoding = getattr(tokenizer, "tokenizer", None)
+    decode = getattr(encoding, "decode_single_token_bytes", None)
+    return decode if callable(decode) else None
+
+
 class KimiTokenProvenance:
     def __init__(self, tokenizer):
-        # Both the HF Kimi tokenizer and SGLang's tiktoken wrapper expose the
-        # actual Encoding. Its byte API preserves partial UTF-8 tokens.
-        encoding = getattr(tokenizer, "model", None)
-        if not callable(getattr(encoding, "decode_single_token_bytes", None)):
-            encoding = getattr(tokenizer, "tokenizer", None)
-        self.decode = getattr(encoding, "decode_single_token_bytes", None)
-        if not callable(self.decode):
+        self.decode = token_byte_decoder(tokenizer)
+        if self.decode is None:
             raise ValueError("K3 internal_content requires a tiktoken byte decoder")
         self.raw = bytearray()
         self.ids = []

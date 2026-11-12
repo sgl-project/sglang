@@ -25,6 +25,31 @@ class StagedRead(msgspec.Struct, frozen=True):
     normed: torch.Tensor
     wrote_bank: bool
 
+    def take(
+        self,
+        bank: AttnResidual,
+        hidden_states: torch.Tensor,
+        prefix_sum: Optional[torch.Tensor],
+        score_proj: ReplicatedLinear,
+        rows: Optional[slice],
+        write: bool,
+    ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+        """bank.forward()'s result when this read stands in for that call, else
+        None. Either way the bank no longer holds it."""
+        bank.staged = None
+        if (
+            prefix_sum is None
+            and rows is None
+            and self.score_proj is score_proj
+            and self.wrote_bank == write
+            and self.prefix.data_ptr() == hidden_states.data_ptr()
+            and self.prefix.shape == hidden_states.shape
+        ):
+            if write:
+                bank._count_write(rows)  # row nvb written in-kernel
+            return self.normed, hidden_states
+        return None
+
 
 def get_fp32_norm_weight(norm: RMSNorm) -> torch.Tensor:
     """Cached fp32 copy of an output RMSNorm weight, the dtype the fused gfx950

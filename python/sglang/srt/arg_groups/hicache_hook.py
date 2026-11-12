@@ -20,19 +20,19 @@ def handle_hicache(server_args: Any):
     2) Storage <-> layout compatibility (may rewrite layout).
     """
     cfg = resolving_view(server_args)
+    from sglang.srt.mem_cache.unified_cache.linker_config import (
+        UnifiedCacheLinkerConfig,
+        parse_linker_load_options,
+    )
+
     config = cfg.unified_cache_external_linker_config
-    if config is not None and not isinstance(config, dict):
-        raise ValueError(
-            "--unified-cache-external-linker-config must be a JSON object."
-        )
+    _, _, backend_config = parse_linker_load_options(config)
     if cfg.unified_cache_external_linker_backend == "dynamic" and (
         cfg.enable_unified_cache_external_linker or config is not None
     ):
-        from sglang.srt.mem_cache.unified_cache.linker_config import (
-            UnifiedCacheLinkerConfig,
+        UnifiedCacheLinkerConfig.from_dict(
+            backend_config if config is not None else None
         )
-
-        UnifiedCacheLinkerConfig.from_dict(config)
     if cfg.enable_linker_mla_dedup and (
         not cfg.enable_unified_cache_external_linker
         or cfg.unified_cache_external_linker_backend != "mooncake"
@@ -143,13 +143,10 @@ def resolve_hicache_dcp_compatibility(server_args: Any):
         raise NotImplementedError(
             "HiCache L3 with DCP does not support buffer_only host memory."
         )
-    # A DFLASH MLA draft holds this rank's rows; its sidecar host pool
-    # translates with dcp_size like the target's.
-    if cfg.speculative_algorithm not in (None, "DSPARK", "EAGLE3", "DFLASH"):
+    if cfg.speculative_algorithm not in (None, "DSPARK", "DFLASH"):
         raise NotImplementedError(
-            "HiCache with --dcp-size > 1 only supports DSPARK, EAGLE3 and "
-            "DFLASH speculative decoding; other speculative algorithms are not "
-            "supported."
+            "HiCache with --dcp-size > 1 only supports DSPARK and DFLASH "
+            "speculative decoding."
         )
     if cfg.enable_lmcache:
         raise NotImplementedError(

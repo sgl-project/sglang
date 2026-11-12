@@ -1,15 +1,8 @@
-"""The Mooncake direct linker shares one object per pool across attention-TP
-ranks when its pages are byte-identical (MLA-family pools, which have no head
-dimension to shard). A hybrid K3.1 group holds both kinds at once, so the
-choice is per pool: KV, indexer and an MLA draft are shared, while TP-sharded
-KDA state keeps its own rank namespace."""
-
 import unittest
 from types import SimpleNamespace
 
 from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
-    _shared_pool_suffix,
     _storage_sharing,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -17,21 +10,17 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
-
-def _k31_pools(dcp_sharded=False):
-    """A K3.1 hybrid group: replicated KV / indexer / MLA draft, sharded KDA."""
-    return {
-        name: SimpleNamespace(tp_replicated=tp, dcp_sharded=dcp_sharded and tp)
-        for name, tp in (
-            (PoolName.KV, True),
-            (PoolName.INDEXER, True),
-            (PoolName.DRAFT, True),
-            (PoolName.MAMBA, False),
-        )
-    }
+_REPLICATED = {PoolName.KV, PoolName.INDEXER, PoolName.DRAFT}
 
 
 def _sharing(dcp_size=1, **kwargs):
+    pools = {
+        name: SimpleNamespace(
+            tp_replicated=name in _REPLICATED,
+            dcp_sharded=dcp_size > 1 and name in _REPLICATED,
+        )
+        for name in (*_REPLICATED, PoolName.MAMBA)
+    }
     args = dict(
         rank_replicated=False,
         tp_rank=0,
@@ -42,114 +31,50 @@ def _sharing(dcp_size=1, **kwargs):
     )
     args.update(kwargs)
     return _storage_sharing(
-        _k31_pools(dcp_size > 1),
-        dcp_size=dcp_size,
-        dcp_rank=args["tp_rank"] % dcp_size,
-        **args,
+        pools, dcp_size=dcp_size, dcp_rank=args["tp_rank"] % dcp_size, **args
     )
 
 
-class TestSharedPoolSuffix(CustomTestCase):
-    def test_the_dropped_tp_axis_collapses_its_ranks(self):
-        self.assertEqual(
-            {
-                _shared_pool_suffix(
-                    tp_shared=True,
-                    tp_rank=rank,
-                    attn_cp_rank=0,
-                    pp_rank=0,
-                    dcp_sharded=False,
-                    dcp_size=1,
-                    dcp_rank=0,
-                )
-                for rank in range(8)
-            },
-            {"tpshared_v1_cp0_pp0"},
-        )
-
-    def test_a_pool_shared_on_no_axis_keeps_every_rank_term(self):
-        suffixes = {
-            _shared_pool_suffix(
-                tp_shared=False,
-                tp_rank=rank,
-                attn_cp_rank=1,
-                pp_rank=2,
-                dcp_sharded=False,
-                dcp_size=1,
-                dcp_rank=0,
-            )
-            for rank in range(4)
-        }
-        self.assertEqual(len(suffixes), 4)
-        self.assertIn("tp3_cp1_pp2", suffixes)
-
-
 class TestStorageSharing(CustomTestCase):
-    def test_pure_tp_shares_the_replicated_pools_and_writes_them_once(self):
-        # The case this fixes: 8 attention-TP ranks each wrote a full copy of
-        # the same MLA KV, indexer and draft pages.
-        keys, owners = {}, {}
+    def test_replicated_pools_share_one_key_and_one_writer(self):
+        writers = {}
         for rank in range(8):
             suffixes, offload, tp_shared = _sharing(tp_rank=rank, tp_size=8)
-            self.assertEqual(tp_shared, {PoolName.KV, PoolName.INDEXER, PoolName.DRAFT})
-            for name, suffix in suffixes.items():
-                keys.setdefault(name, set()).add(suffix)
-            owners[rank] = offload
-        for name in (PoolName.KV, PoolName.INDEXER, PoolName.DRAFT):
-            self.assertEqual(keys[name], {"tpshared_v1_cp0_pp0"}, name)
-        self.assertNotIn(PoolName.MAMBA, keys)  # keeps the group's tp{rank} suffix
-        self.assertEqual(
-            owners[0], {PoolName.KV, PoolName.INDEXER, PoolName.DRAFT, PoolName.MAMBA}
-        )
+            self.assertEqual(tp_shared, _REPLICATED)
+            self.assertEqual(
+                suffixes, dict.fromkeys(_REPLICATED, "tpshared_v1_cp0_pp0")
+            )
+            writers[rank] = offload
+        self.assertEqual(writers[0], _REPLICATED | {PoolName.MAMBA})
         for rank in range(1, 8):
-            self.assertEqual(owners[rank], {PoolName.MAMBA}, rank)
+            self.assertEqual(writers[rank], {PoolName.MAMBA})
 
-    def test_sharded_state_stays_one_object_per_rank(self):
-        # Every rank must still write its own KDA shard, or ranks 1-7 would
-        # read rank 0's state.
-        total = sum(
-            PoolName.MAMBA in _sharing(tp_rank=rank, tp_size=8)[1] for rank in range(8)
-        )
-        self.assertEqual(total, 8)
+    def test_each_cp_rank_keeps_its_own_shared_object(self):
+        for cp in range(2):
+            suffixes, _, _ = _sharing(tp_rank=1, tp_size=2, attn_cp_rank=cp)
+            self.assertEqual(suffixes[PoolName.KV], f"tpshared_v1_cp{cp}_pp0")
 
-    def test_each_cp_rank_keeps_its_own_tp_shared_object(self):
-        writers = set()
-        for tp in range(2):
-            for cp in range(2):
-                suffixes, offload, _ = _sharing(tp_rank=tp, tp_size=2, attn_cp_rank=cp)
-                self.assertEqual(suffixes[PoolName.KV], f"tpshared_v1_cp{cp}_pp0")
-                if PoolName.KV in offload:
-                    writers.add((tp, cp))
-        self.assertEqual(writers, {(0, 0), (0, 1)})
-
-    def test_tp_size_one_changes_nothing(self):
-        suffixes, offload, tp_shared = _sharing(tp_size=1)
-        self.assertEqual(tp_shared, set())
-        self.assertEqual(suffixes, {})
-        self.assertEqual(
-            offload, {PoolName.KV, PoolName.INDEXER, PoolName.DRAFT, PoolName.MAMBA}
-        )
-
-    def test_a_rank_replicated_group_is_left_to_its_group_suffix(self):
-        # No sharded pool, so the group's own suffix already drops the tp term.
-        suffixes, _, tp_shared = _sharing(rank_replicated=True, tp_rank=3, tp_size=8)
-        self.assertEqual(tp_shared, set())
-        self.assertEqual(suffixes, {})
-
-    def test_a_non_owner_rank_offloads_nothing(self):
-        _, offload, _ = _sharing(tp_rank=3, tp_size=8, offload_owner=False)
-        self.assertEqual(offload, set())
+    def test_single_tp_rank_or_replicated_group_keeps_group_keys(self):
+        for kwargs in ({"tp_size": 1}, {"rank_replicated": True, "tp_size": 8}):
+            suffixes, offload, tp_shared = _sharing(**kwargs)
+            self.assertEqual((suffixes, tp_shared), ({}, set()))
+            self.assertEqual(offload, _REPLICATED | {PoolName.MAMBA})
 
     def test_dcp_keys_each_rank_and_the_first_block_writes(self):
-        sharded = {PoolName.KV, PoolName.INDEXER, PoolName.DRAFT}
         for rank in range(16):
             suffixes, offload, _ = _sharing(tp_rank=rank, tp_size=16, dcp_size=8)
-            for name in sharded:
-                self.assertEqual(suffixes[name], f"tpshared_v1_dcp8r{rank % 8}_cp0_pp0")
-            self.assertNotIn(PoolName.MAMBA, suffixes)
             self.assertEqual(
-                offload, sharded | {PoolName.MAMBA} if rank < 8 else {PoolName.MAMBA}
+                suffixes,
+                dict.fromkeys(_REPLICATED, f"tpshared_v1_dcp8r{rank % 8}_cp0_pp0"),
             )
+            self.assertEqual(
+                offload,
+                _REPLICATED | {PoolName.MAMBA} if rank < 8 else {PoolName.MAMBA},
+            )
+
+    def test_non_owner_rank_offloads_nothing(self):
+        _, offload, _ = _sharing(tp_rank=3, tp_size=8, offload_owner=False)
+        self.assertEqual(offload, set())
 
 
 if __name__ == "__main__":

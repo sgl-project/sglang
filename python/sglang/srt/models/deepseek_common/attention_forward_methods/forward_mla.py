@@ -65,9 +65,6 @@ from sglang.srt.utils import BumpAllocator
 logger = logging.getLogger(__name__)
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 _ENABLE_DSA_Q8KV8_BORN_FP8_Q = envs.SGLANG_ENABLE_DSA_Q8KV8_BORN_FP8_Q.get()
-# ROCm defaults to 32: over xGMI the unprojected exchange bottlenecks bs48 (5x tok/s
-# at 32 vs 512 rows, measured on MI350X DCP8).
-_DCP_V_PREPROJECT_MIN_ROWS = 32 if _is_hip else 512
 _ENABLE_DSA_Q8KV8_QPREP_OVERLAP = envs.SGLANG_ENABLE_DSA_Q8KV8_QPREP_OVERLAP.get()
 
 from sglang.srt.model_executor.runner_utils.forward_batch import get_forward_batch
@@ -102,8 +99,7 @@ def _select_local_dcp_heads_for_autotune(
 
 def is_mla_dcp_lse_base_on_e(attention_backend: Optional[str]) -> bool:
     if attention_backend == "dsa":
-        # Kimi-K3.1's sharded DSA DCP merges FlashMLA partials (natural log);
-        # trtllm-gen partials are base 2.
+        # trtllm-gen partials carry a base-2 LSE.
         return dsa_shards_index_k() and get_exec().kernel.dsa_decode_backend != "trtllm"
     return attention_backend in {"flashmla", "cutedsl_mla", "aiter"}
 
@@ -186,10 +182,13 @@ class DeepseekMLAForwardMixin:
     dsa_decode_absorb_under_indexer = False
     # set by forward_absorb_prepare when that overlap wrote the layer's KV
     _kv_cache_saved_early = False
+    # Apply W_UV to the DCP decode partials before the reduce (DSA layers only)
+    dcp_v_preproject = False
+    _dcp_v_weights: Optional[torch.Tensor] = None
 
     def _prepare_dcp_v_weights(self, group):
         weights = group.all_gather(self.w_vc.contiguous(), dim=0)
-        cached = getattr(self, "_dcp_v_weights", None)
+        cached = self._dcp_v_weights
         if cached is None:
             self._dcp_v_weights = weights
         else:
@@ -219,8 +218,18 @@ class DeepseekMLAForwardMixin:
         if not get_parallel().dcp_replicate_q_proj or self.dcp_size == 1:
             return False
         mode = forward_batch.forward_mode
-        # the ROCm DSA extend attends the gathered KV with this rank's heads
-        return mode.is_decode() or mode.is_target_verify()
+        if mode.is_decode() or mode.is_target_verify():
+            return True
+        # DSA extend on HIP merges owned partials like decode, so replicating
+        # q_b_proj replaces the per-layer [T, H, 576] Q all-gather there too.
+        # Kimi-K3.1's sharded index-K prefill attends the gathered KV with this
+        # rank's heads instead.
+        return (
+            self.use_dsa
+            and _is_hip
+            and mode.is_extend(include_draft_extend_v2=True)
+            and not dsa_shards_index_k()
+        )
 
     def init_mla_forward(self: DeepseekV2AttentionMLA):
         self.flashinfer_mla_disable_ragged = (
@@ -846,7 +855,7 @@ class DeepseekMLAForwardMixin:
                     q_fp8, q_nope, self.w_kc, q_pe, self.num_local_heads
                 )
             born_q_backend.q8kv8_stash_born_q(
-                padded_extend_real_tokens(q_nope, forward_batch) or num_tokens,
+                padded_extend_real_tokens(q_nope.shape[0], forward_batch) or num_tokens,
                 self.attn_mqa.layer_id,
             )
             q_nope_out = born_q_backend.q8kv8_born_q_sentinel(
@@ -880,7 +889,7 @@ class DeepseekMLAForwardMixin:
                         q_pe=q_pe,
                     )
             elif forward_batch.forward_mode.is_extend():
-                # for extend, gather kv (K3.1's DSA backend gathers its own cache)
+                # for extend, gather kv
                 if not self.use_dsa:
                     bcg_dcp_extend_kv_gather(
                         get_token_to_kv_pool(),
@@ -1042,10 +1051,11 @@ class DeepseekMLAForwardMixin:
                     # A head's linear V projection commutes with its LSE-weighted
                     # reduction. Exchange the narrower projected partials.
                     if (
-                        getattr(self, "dcp_v_preproject", False)
+                        self.dcp_v_preproject
                         and self.use_dsa
                         and (
-                            attn_output.shape[0] >= _DCP_V_PREPROJECT_MIN_ROWS
+                            # ROCm: over xGMI the unprojected exchange bottlenecks decode
+                            attn_output.shape[0] >= (32 if _is_hip else 512)
                             # the push-combine reduce wins at any batch size
                             or dcp_push_combine_fits(
                                 attn_output.shape[0] * self.num_local_heads
@@ -1058,7 +1068,7 @@ class DeepseekMLAForwardMixin:
                         and not _SGLANG_EXPERIMENTAL_LORA_OPTI
                         and not is_kv_b_lora_active(self)
                     ):
-                        weights = getattr(self, "_dcp_v_weights", None)
+                        weights = self._dcp_v_weights
                         if (
                             weights is None
                             and not torch.cuda.is_current_stream_capturing()

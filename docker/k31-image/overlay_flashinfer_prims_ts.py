@@ -1,10 +1,10 @@
 """Overlay FlashInfer main's Prims-TS sparse MLA onto the image's FlashInfer 0.7.2.
 
 The opt-in `prims_ts` DSA backend needs FlashInfer's `flashinfer/attention/prims_ts/` from main
-26bb6dc9 (flashinfer-ai/flashinfer #7410 and #7984); 0.7.2 ships an older copy that fails at
-startup. This replaces only that directory's Python files (CuTe DSL; no csrc, AOT or jit-cache
-module changes), the same tree as the earlier GB300 runs used. Everything else in
-FlashInfer, including the DynBlock-rebuilt modules, stays 0.7.2.
+784bfaf5 (flashinfer-ai/flashinfer #7410 and #7984; #8186 for the SM107 sparse MLA); 0.7.2 ships
+an older copy that fails at startup. This replaces only that directory's Python files (CuTe DSL;
+no csrc, AOT or jit-cache module changes). Everything else in FlashInfer, including the
+DynBlock-rebuilt modules, stays 0.7.2.
 
 Idempotent: a marker records the overlaid tree, so a rerun is a no-op unless a reinstall
 replaced the files. Needs network access only when it overlays.
@@ -19,7 +19,7 @@ import urllib.request
 from importlib.metadata import version
 from pathlib import Path
 
-FLASHINFER_COMMIT = "26bb6dc93831c0192e524357dd25d7092917ae9b"
+FLASHINFER_COMMIT = "784bfaf5bda80259d11a41955ab8c979914197f1"
 FLASHINFER_BASE_VERSION = "0.7.2"
 SUBDIR = "flashinfer/attention/prims_ts"
 

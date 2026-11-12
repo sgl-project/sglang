@@ -32,11 +32,12 @@ from sglang.srt.speculative.dflash_utils import (
     is_dflash_mla_draft_config,
 )
 from sglang.srt.utils import is_hip
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.parallel_groups import publish
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-small")
 
 HIDDEN, HEADS, KV_LORA, NOPE, ROPE, VDIM, THETA, EPS = 16, 2, 8, 8, 8, 6, 1e4, 1e-6
 Q_LORA = 16
@@ -326,11 +327,6 @@ class TestDFlashMLA(CustomTestCase):
             for parameter in attn.parameters():
                 parameter.fill_(0.1)
         attn.rotary_emb = copy.deepcopy(attn.rotary_emb)
-        # The layer allocates its weights with torch.empty, whose bytes can be NaN.
-        torch.manual_seed(0)
-        with torch.no_grad():
-            for param in attn.parameters():
-                param.copy_(torch.randn_like(param))
         for module in (attn.rotary_emb, attn.kv_a_layernorm):
             module.forward = module.forward_native
         # A real MLA pool also exposes the K/V buffer getters the GQA bundle probes.
@@ -371,7 +367,7 @@ class TestTritonDcpMlaDraft(CustomTestCase):
     SLIDING = (["mla"] * 2, ["sliding_attention"] * 2)  # MLA5
     FULL = (["mla"] * 2, ["full_attention"] * 2)  # MLA7
 
-    def _resolve(self, draft, *, is_hip=True, use_aiter=True, window_size=None):
+    def _resolve(self, draft, *, is_hip=True, use_aiter=True):
         modes, layer_types = draft
         draft_config = {
             "num_hidden_layers": 2,
@@ -385,7 +381,6 @@ class TestTritonDcpMlaDraft(CustomTestCase):
             speculative_algorithm="DFLASH",
             speculative_draft_model_path="draft",
             speculative_draft_attention_backend="triton",
-            speculative_draft_window_size=window_size,
             dcp_size=8,
         )
         hook = "sglang.srt.arg_groups.speculative_hook"
@@ -401,21 +396,12 @@ class TestTritonDcpMlaDraft(CustomTestCase):
     def test_rocm_with_aiter_takes_the_sliding_draft(self):
         self.assertEqual(self._resolve(self.SLIDING), "triton")
 
-    def test_other_rocm_setups_refuse(self):
-        for setup in (
-            dict(use_aiter=False),
-            # The owner rows are read through the shared req_to_token, not
-            # a compact draft one.
-            dict(window_size=1024),
-        ):
-            with (
-                self.subTest(**setup),
-                self.assertRaisesRegex(ValueError, "only with SGLANG_USE_AITER=1"),
-            ):
-                self._resolve(self.SLIDING, **setup)
+    def test_rocm_without_aiter_refuses(self):
+        with self.assertRaisesRegex(ValueError, "only with SGLANG_USE_AITER=1"):
+            self._resolve(self.SLIDING, use_aiter=False)
 
     def test_cuda_keeps_dev_resolution(self):
-        self.assertEqual(self._resolve(self.SLIDING, is_hip=False), "triton")
+        self.assertEqual(self._resolve(self.FULL, is_hip=False), "triton")
 
     def test_full_attention_draft_refuses(self):
         with self.assertRaisesRegex(ValueError, "only sliding_attention"):

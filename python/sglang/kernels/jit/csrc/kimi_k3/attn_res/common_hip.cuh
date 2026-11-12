@@ -1,4 +1,4 @@
-// Row layout and wave64 helpers shared by the Kimi-K3 attention-residual HIP kernels.
+// Row layout and wave64 helpers of the Kimi-K3 attention-residual read (read_hip.cuh).
 
 #pragma once
 

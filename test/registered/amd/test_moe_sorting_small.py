@@ -1,6 +1,7 @@
 """Small-batch MoE sorting patch (sglang.kernels.ops.moe.moe_sorting_small) vs stock aiter sorting."""
 
 import unittest
+from unittest import mock
 
 import torch
 
@@ -110,6 +111,33 @@ class TestMoeSortingSmall(CustomTestCase):
                     f"E={E} m={m} bs={bs}",
                 )
 
+    def test_small_sort_takes_a_caller_owned_output(self):
+        """aiter passes a published moe_buf as output=; the small sort zeroes and
+        returns it rather than leaving the sort to aiter."""
+        ids, w = self._routing(4, 4)
+        out = torch.ones(4, self.DIM, dtype=torch.bfloat16, device=self.dev)
+        run_small_sort = self.S._run_small_sort
+        with mock.patch.object(self.S, "_run_small_sort", wraps=run_small_sort) as run:
+            sort = self.fm._moe_sorting_impl(
+                ids,
+                w,
+                self.E,
+                self.DIM,
+                torch.bfloat16,
+                32,
+                None,
+                None,
+                0,
+                True,
+                output=out,
+            )
+        run.assert_called_once()
+        self.assertEqual(sort[4].data_ptr(), out.data_ptr())
+        self.assertFalse(out.any())
+        self._assert_same_sort(
+            self._sort(self.orig_sort, ids, w, 32), sort, 32, "output="
+        )
+
     def test_fused_mxfp8_quant_matches_aiter(self):
         bs = 32
         # compact at E=513; distributed at MiniMax-M3's E=129 / top-4 + shared
@@ -141,7 +169,7 @@ class TestMoeSortingSmall(CustomTestCase):
         E, topk, dim = 896, 16, 3584  # 3584 % 2048 != 0: 512-column quant chunks
         # [shared gate_up (TP8) | router logits | routed input] of the fused front GEMM
         front_width, routed_start = 1536 + E + dim, 1536 + E
-        for bs, m, hot in ((32, 5, E), (32, 16, 24), (16, 16, 16)):
+        for bs, m, hot in ((32, 5, E), (16, 16, 16)):
             msg = f"bs={bs} m={m} hot={hot}"
             g = torch.Generator(device="cpu").manual_seed(m * 1000 + hot)
             # hot < E crowds the pairs onto few experts: ranks within an expert matter

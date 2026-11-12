@@ -2,6 +2,7 @@
 
 import queue
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -42,6 +43,9 @@ def _linker(log_load_timing):
     linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
     linker.log_load_timing = log_load_timing
     linker.num_layers = 2
+    linker.load_layer_group = 1
+    linker.load_threads = 1
+    linker.load_io_executor = ThreadPoolExecutor(1)
     linker.pools = {name: _Pool(name) for name in KEY_BYTES}
     linker.layer_done_counter = MagicMock()
     store = MagicMock()
@@ -65,7 +69,7 @@ class TestMooncakeLinkerLoadTiming(CustomTestCase):
             [_transfer(PoolName.KV, 3)],
         ]
         with self.assertLogs(LOGGER, level="INFO") as logs:
-            linker.load_layer_wise(7, requests, [("a", 0.0), ("b", None)])
+            linker.load_layer_wise(7, requests, requests=[("a", 0.0), ("b", None)])
         lines = [line for line in logs.output if "linker load" in line]
         self.assertEqual(len(lines), 2)
         # Two layers: (2 x 100 + 1 x 10) x 2 and 3 x 100 x 2.
@@ -87,7 +91,7 @@ class TestMooncakeLinkerLoadTiming(CustomTestCase):
                 with patch.object(mooncake_direct_linker.logger, "info") as info:
                     with patch.object(mooncake_direct_linker.logger, "exception"):
                         linker.load_layer_wise(
-                            1, [[_transfer(PoolName.KV, 1)]], [("a", 0.0)]
+                            1, [[_transfer(PoolName.KV, 1)]], requests=[("a", 0.0)]
                         )
                 info.assert_not_called()
                 self.assertEqual(linker.layer_done_counter.fail.called, fail)

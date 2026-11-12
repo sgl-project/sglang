@@ -218,6 +218,8 @@ def triton_sparse_mla_decode_splitk(
                     and topk >= 2048
                     and _page_offsets_fit_i32(kv.shape[0], kv_dim)
                 ),
+                # a runtime per-row key bound under 3 stages corrupts rows past two tiles
+                PIPE_STAGES=1 if use_topk_length else 3,
                 num_warps=fused_num_warps,
                 num_stages=2,
             )
@@ -291,6 +293,13 @@ def triton_sparse_mla_decode_splitk(
         num_warps=4,
     )
     return (out.unsqueeze(0), lse) if return_lse else out.unsqueeze(0)
+
+
+def lse_base2_for_dcp_merge(lse: torch.Tensor) -> torch.Tensor:
+    """The natural-log LSE returned above, as the replicated-index-K DCP merge reads it:
+    base 2, and a finite floor for a row with no key (the merge weights a rank by
+    exp2(lse - max), which is NaN when every rank of a row is -inf)."""
+    return torch.where(torch.isfinite(lse), lse * _LOG2E, -1073741824.0)
 
 
 # ---------------------------------------------------------------------------

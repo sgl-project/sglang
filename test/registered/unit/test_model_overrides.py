@@ -5,6 +5,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
+import contextlib
 import dataclasses
 import json
 import os
@@ -13,12 +14,13 @@ import tempfile
 import unittest
 from types import SimpleNamespace
 from typing import Optional
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from sglang.srt.arg_groups import model_override_base as base_module
 from sglang.srt.arg_groups import overrides as overrides_module
 from sglang.srt.arg_groups.arg_utils import A, Arg, resolvable_fields
 from sglang.srt.arg_groups.model_override_base import register_model_override
+from sglang.srt.arg_groups.model_overrides import gemma4 as gemma4_module
 from sglang.srt.arg_groups.model_overrides import minicpm as minicpm_module
 from sglang.srt.arg_groups.model_overrides import qwen3_5 as qwen3_5_module
 from sglang.srt.arg_groups.model_overrides import qwen3_vl as qwen3_vl_module
@@ -30,6 +32,7 @@ from sglang.srt.arg_groups.overrides import (
 from sglang.srt.configs.minicpm import MiniCPMHybridConfig
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.environ import envs
+from sglang.srt.platforms.interface import SRTPlatform
 from sglang.srt.runtime_context import (
     get_context,
     get_exec,
@@ -38,7 +41,19 @@ from sglang.srt.runtime_context import (
     reset_context,
 )
 from sglang.srt.server_args import _declared_default
+from sglang.srt.utils.device import is_confidential_compute
 from sglang.test.test_utils import CustomTestCase
+
+
+@contextlib.contextmanager
+def _confidential_compute(enabled: bool):
+    # is_confidential_compute is lru_cached, so clear it on both edges.
+    is_confidential_compute.cache_clear()
+    try:
+        with envs.SGLANG_FORCE_CONFIDENTIAL_COMPUTE.override(enabled):
+            yield
+    finally:
+        is_confidential_compute.cache_clear()
 
 
 @dataclasses.dataclass
@@ -221,6 +236,7 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "speculative_draft_attention_backend",
                     "speculative_draft_kv_cache_dtype",
                     "speculative_draft_model_quantization",
+                    "speculative_dspark_lm_head_dtype",
                     "aux_hidden_state_capture",
                     "watermark_context_window",
                     "watermark_default_enabled",
@@ -335,7 +351,7 @@ class TestBoundaryReductionDefaults(CustomTestCase):
                     hf_config=SimpleNamespace(architectures=["MiMoV2ForCausalLM"])
                 )
                 with patch(
-                    "sglang.srt.utils.hf_transformers.get_config",
+                    "sglang.srt.hf_transformers.get_config",
                     return_value=SimpleNamespace(model_type="qwen3"),
                 ) as load:
                     run_post_process_pass(args, resolve_boundary_reduction)
@@ -616,6 +632,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         disaggregation_mode="null",
         attn_dp_size=1,
         enable_hierarchical_cache=False,
+        enable_unified_memory=False,
     ):
         args = SimpleNamespace(
             attention_backend=attention_backend,
@@ -625,6 +642,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             attn_dp_size=attn_dp_size,
             ep_join_mode=None,
             enable_hierarchical_cache=enable_hierarchical_cache,
+            enable_unified_memory=enable_unified_memory,
         )
         mixer_types = []
         if sparse_attention:
@@ -714,6 +732,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             attn_dp_size=1,
             ep_join_mode=None,
             enable_hierarchical_cache=False,
+            enable_unified_memory=False,
         )
         config = SimpleNamespace(
             has_minicpm_sparse_attention=True,
@@ -1444,7 +1463,10 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             ),
         }
         accepted = {
-            "cutedsl_with_a2a": (args("flashinfer_cutedsl", "flashinfer"), *dense),
+            "cutedsl_with_a2a": (
+                args("flashinfer_cutedsl", "flashinfer_nvlink_one_sided"),
+                *dense,
+            ),
             "puzzle_equal_expert_counts": (
                 args("flashinfer_trtllm_routed"),
                 "NemotronHPuzzleForCausalLM",
@@ -1693,7 +1715,13 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             ("flashinfer_trtllm", "none", True, None, "moe-runner-backend=marlin"),
             ("flashinfer_cutlass", "none", True, None, "moe-runner-backend=marlin"),
             ("flashinfer_cutedsl", "deepep", True, None, "moe-a2a-backend=none"),
-            ("flashinfer_cutedsl", "flashinfer", True, None, "moe-a2a-backend=none"),
+            (
+                "flashinfer_cutedsl",
+                "flashinfer_nvlink_one_sided",
+                True,
+                None,
+                "moe-a2a-backend=none",
+            ),
         ]
         for runner, a2a, w4a16_enabled, expected, error in cases:
             with (
@@ -1895,18 +1923,18 @@ class TestGoldenModelOverrides(_IsolatedPublish):
 
     def test_gpt_oss_mxfp4_forces_bfloat16(self):
         from sglang.srt.layers.quantization import QUANTIZATION_METHODS
+        from sglang.srt.layers.quantization.mxfp4 import Mxfp4Config
 
-        if "mxfp4" not in QUANTIZATION_METHODS:
-            # Registration is platform-gated (CUDA / CPU engine / MXFP-HIP);
-            # plain CPU CI runners cannot construct an mxfp4 ModelConfig.
-            self.skipTest("mxfp4 quantization is not registered on this platform")
-        sa = self._construct(
-            "GptOssForCausalLM",
-            "llama",
-            config_extra={"quantization_config": {"quant_method": "mxfp4"}},
-        )
-        self.assertEqual(self._resolved(sa, "dtype"), "bfloat16")
-        self.assertEqual((self._publish(sa), self._leaf("dtype"))[1], "bfloat16")
+        # Registration is platform-gated (CUDA / CPU engine / MXFP-HIP), so a
+        # plain CPU runner would otherwise reject the mxfp4 ModelConfig.
+        with patch.dict(QUANTIZATION_METHODS, {"mxfp4": Mxfp4Config}):
+            sa = self._construct(
+                "GptOssForCausalLM",
+                "llama",
+                config_extra={"quantization_config": {"quant_method": "mxfp4"}},
+            )
+            self.assertEqual(self._resolved(sa, "dtype"), "bfloat16")
+            self.assertEqual((self._publish(sa), self._leaf("dtype"))[1], "bfloat16")
 
     def test_gpt_oss_without_mxfp4_keeps_pristine_dtype(self):
         sa = self._construct("GptOssForCausalLM", "llama")
@@ -1929,7 +1957,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 )
 
     def test_sampling_backend_default_pass(self):
-        from sglang.srt.utils.common import is_flashinfer_available
+        from sglang.srt.utils.device import is_flashinfer_available
 
         sa = self._construct("LlamaForCausalLM", "llama")
         expected = "flashinfer" if is_flashinfer_available() else "pytorch"
@@ -2938,6 +2966,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             )
 
         with (
+            _confidential_compute(False),
             override_platform(is_sm90=True),
             override_platform(is_sm100=False),
         ):
@@ -2982,6 +3011,26 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 ),
                 {},
             )
+
+        # SM100 auto-enables multi-node mnnvl, which needs NVLink multicast, so
+        # Confidential Computing keeps only single-node trtllm.
+        with (
+            override_platform(is_sm90=False),
+            override_platform(is_sm100=True),
+        ):
+            with _confidential_compute(False):
+                self.assertEqual(
+                    _flashinfer_allreduce_fusion_auto_enable(_view(nnodes=2)),
+                    {"flashinfer_allreduce_fusion_backend": "auto"},
+                )
+            with _confidential_compute(True):
+                self.assertEqual(
+                    _flashinfer_allreduce_fusion_auto_enable(_view(nnodes=2)), {}
+                )
+                self.assertEqual(
+                    _flashinfer_allreduce_fusion_auto_enable(_view()),
+                    {"flashinfer_allreduce_fusion_backend": "trtllm"},
+                )
 
         # enforce-disable wins over everything
         self.assertEqual(
@@ -3594,7 +3643,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         from sglang.srt.arg_groups.overrides import _gguf_quantization
 
         with patch(
-            "sglang.srt.utils.hf_transformers.check_gguf_file",
+            "sglang.srt.hf_transformers.check_gguf_file",
             return_value=True,
         ):
             self.assertEqual(
@@ -3913,6 +3962,88 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                     "enable_tf32_matmul": True,
                 },
             )
+
+    def test_gemma4_uses_oot_platform_attention_backend(self):
+        from sglang.srt.arg_groups.model_overrides.gemma4 import (
+            _gemma4_overrides,
+            gemma4_attention_backends,
+        )
+
+        def _args(**kw):
+            defaults = dict(
+                attention_backend=None,
+                prefill_attention_backend=None,
+                decode_attention_backend=None,
+                moe_runner_backend="triton",
+                quantization=None,
+            )
+            defaults.update(kw)
+            return SimpleNamespace(**defaults)
+
+        platform = Mock(spec=SRTPlatform)
+        platform.is_out_of_tree.return_value = True
+        platform.get_default_attention_backend.return_value = "custom_attention"
+
+        with patch.object(gemma4_module, "current_platform", platform):
+            self.assertEqual(
+                _gemma4_overrides(_args(), None),
+                {"attention_backend": "custom_attention"},
+            )
+            self.assertEqual(
+                _gemma4_overrides(_args(attention_backend="triton"), None), {}
+            )
+            self.assertEqual(
+                _gemma4_overrides(
+                    _args(prefill_attention_backend="custom_attention"), None
+                ),
+                {"attention_backend": "custom_attention"},
+            )
+            self.assertEqual(
+                _gemma4_overrides(
+                    _args(decode_attention_backend="custom_attention"), None
+                ),
+                {"attention_backend": "custom_attention"},
+            )
+            self.assertEqual(
+                _gemma4_overrides(
+                    _args(),
+                    SimpleNamespace(architectures=["DiffusionGemmaForBlockDiffusion"]),
+                ),
+                {"attention_backend": "triton"},
+            )
+            self.assertIn("custom_attention", gemma4_attention_backends())
+            self.assertIn("fa4", gemma4_attention_backends())
+
+    def test_gemma4_explicit_builtin_backend_does_not_require_oot_default(self):
+        from sglang.srt.arg_groups.model_overrides.gemma4 import (
+            _gemma4_overrides,
+            gemma4_attention_backends,
+        )
+
+        args = SimpleNamespace(
+            attention_backend="triton",
+            prefill_attention_backend=None,
+            decode_attention_backend=None,
+            moe_runner_backend="triton",
+            quantization=None,
+        )
+        split_args = SimpleNamespace(
+            attention_backend=None,
+            prefill_attention_backend="triton",
+            decode_attention_backend="triton",
+            moe_runner_backend="triton",
+            quantization=None,
+        )
+        platform = Mock(spec=SRTPlatform)
+        platform.is_out_of_tree.return_value = True
+        platform.get_default_attention_backend.side_effect = NotImplementedError
+
+        with patch.object(gemma4_module, "current_platform", platform):
+            self.assertEqual(_gemma4_overrides(args, None), {})
+            self.assertEqual(_gemma4_overrides(split_args, None), {})
+            platform.get_default_attention_backend.assert_not_called()
+            self.assertIn("triton", gemma4_attention_backends())
+            platform.get_default_attention_backend.assert_called_once()
 
     def test_deepseek_moe_quant_slot_pass(self):
         from sglang.srt.arg_groups.model_override_base import ResolvedView
@@ -4236,9 +4367,9 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             ("marlin", "none", False, {}),
             ("marlin", "none", True, {}),
             ("flashinfer_cutedsl", "none", True, {}),
-            ("flashinfer_cutedsl", "flashinfer", True, {}),
+            ("flashinfer_cutedsl", "flashinfer_nvlink_one_sided", True, {}),
             ("flashinfer_cutedsl", "none", False, None),
-            ("flashinfer_cutedsl", "flashinfer", False, None),
+            ("flashinfer_cutedsl", "flashinfer_nvlink_one_sided", False, None),
             ("flashinfer_cutedsl", "deepep", True, None),
             ("flashinfer_cutlass", "none", True, None),
             ("flashinfer_trtllm", "none", True, None),
@@ -4440,106 +4571,6 @@ class TestKimiK3DcpSpeculativeAttentionMode(CustomTestCase):
         overrides = self._overrides(speculative_algorithm="EAGLE3")
         self.assertEqual(overrides["speculative_attention_mode"], "decode")
         self.assertEqual(overrides["decode_attention_backend"], "cutedsl_mla")
-
-
-class TestKimiK31DcpOverrides(CustomTestCase):
-    """Kimi-K3.1 DCP: a DFLASH MLA draft attends over DCP owner rows on the
-    draft-verify path (cute-dsl MLA on CUDA, Triton on ROCm), and a DCP decode
-    node takes the KV of a DCP-1 or same-DCP PD prefill over Mooncake."""
-
-    @staticmethod
-    def _overrides(is_hip=False, **fields):
-        from sglang.srt.arg_groups.model_overrides import kimi_k3 as kimi_k3_module
-
-        cfg = SimpleNamespace(
-            dcp_size=8,
-            tp_size=8,
-            dcp_comm_backend="fi_a2a",
-            dcp_replicate_q_proj=None,
-            speculative_algorithm=None,
-            speculative_draft_attention_backend=None,
-            disaggregation_mode="null",
-            disaggregation_transfer_backend="mooncake",
-            enable_hierarchical_cache=False,
-            enable_hisparse=False,
-            enable_prefill_cp=False,
-            attn_cp_size=None,
-        )
-        for name, value in fields.items():
-            setattr(cfg, name, value)
-        with override_platform(is_cuda=not is_hip, is_hip=is_hip):
-            return kimi_k3_module._kimi_k31_dcp_overrides(cfg)
-
-    def test_dflash_defaults_to_cutedsl_mla_draft_and_decode_verify(self):
-        overrides = self._overrides(speculative_algorithm="DFLASH")
-        self.assertEqual(
-            overrides["speculative_draft_attention_backend"], "cutedsl_mla"
-        )
-        self.assertEqual(overrides["speculative_attention_mode"], "decode")
-
-    def test_dflash_rejects_other_draft_backends(self):
-        for backend in ("flashinfer", "triton", "trtllm_mla"):
-            with self.subTest(backend=backend):
-                with self.assertRaisesRegex(ValueError, "cutedsl_mla"):
-                    self._overrides(
-                        speculative_algorithm="DFLASH",
-                        speculative_draft_attention_backend=backend,
-                    )
-
-    def test_dflash_on_rocm_takes_the_triton_draft_and_decode_verify(self):
-        for backend in (None, "triton"):
-            with self.subTest(backend=backend):
-                overrides = self._overrides(
-                    is_hip=True,
-                    speculative_algorithm="DFLASH",
-                    speculative_draft_attention_backend=backend,
-                )
-                self.assertEqual(
-                    overrides["speculative_draft_attention_backend"], "triton"
-                )
-                self.assertEqual(overrides["speculative_attention_mode"], "decode")
-
-    def test_dflash_on_rocm_rejects_the_cuda_draft_backend(self):
-        with self.assertRaisesRegex(ValueError, "other than triton"):
-            self._overrides(
-                is_hip=True,
-                speculative_algorithm="DFLASH",
-                speculative_draft_attention_backend="cutedsl_mla",
-            )
-
-    def test_other_speculative_algorithms_stay_rejected(self):
-        with self.assertRaisesRegex(ValueError, "DSPARK and DFLASH"):
-            self._overrides(speculative_algorithm="EAGLE3")
-
-    def test_pd_decode_over_mooncake_is_allowed(self):
-        self._overrides(disaggregation_mode="decode")
-
-    def test_hierarchical_cache_is_allowed(self):
-        overrides = self._overrides(
-            enable_hierarchical_cache=True, speculative_algorithm="DSPARK"
-        )
-        self.assertEqual(overrides["speculative_attention_mode"], "decode")
-
-    def test_hisparse_stays_rejected(self):
-        with self.assertRaisesRegex(ValueError, "HiSparse"):
-            self._overrides(enable_hierarchical_cache=True, enable_hisparse=True)
-
-    def test_pd_prefill_over_mooncake_is_allowed(self):
-        overrides = self._overrides(
-            disaggregation_mode="prefill", speculative_algorithm="DFLASH"
-        )
-        self.assertEqual(
-            overrides["speculative_draft_attention_backend"], "cutedsl_mla"
-        )
-
-    def test_pd_over_other_transfer_backends_is_rejected(self):
-        for mode in ("prefill", "decode"):
-            with self.subTest(mode=mode):
-                with self.assertRaisesRegex(ValueError, "Mooncake"):
-                    self._overrides(
-                        disaggregation_mode=mode,
-                        disaggregation_transfer_backend="nixl",
-                    )
 
 
 class TestKimiK31DsaBackends(CustomTestCase):

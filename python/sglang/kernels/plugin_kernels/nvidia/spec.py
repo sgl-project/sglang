@@ -90,7 +90,7 @@ class Numerics(msgspec.Struct, frozen=True):
 
 
 class BuildContext(msgspec.Struct, frozen=True):
-    widths: tuple[int, ...]  # step rows to build, ascending
+    widths: tuple[int, ...]  # decode step rows to build, ascending
     tokens_per_request: int
     deadline_s: float  # every cross-GPU wait's deadline, below --watchdog-timeout
     # SGLang's runtime state for this model (sglang.srt.kernel_plugins.nvidia.binding)
@@ -98,9 +98,15 @@ class BuildContext(msgspec.Struct, frozen=True):
 
 
 class Step(msgspec.Struct, frozen=True):
-    """A covered step, decided from host state alike on every rank."""
+    """A covered step, decided from host state alike on every rank.
 
-    mode: str  # "decode", "target_verify" or "prefill"
+    mode is one of:
+      "decode"        – autoregressive single-token decode; runs in a CUDA graph.
+      "target_verify" – speculative-decoding target verify; runs in a CUDA graph.
+      "prefill"       – context prefill; runs eagerly (never captured in a graph).
+    """
+
+    mode: str
     rows: int
     # the running forward's ForwardView, set by SGLang before forward runs the step
     view: Any = None
@@ -426,11 +432,13 @@ class BuiltMegakernel(Protocol):
         self, input_ids: Any, forward_batch: Any, *args: Any, **kwargs: Any
     ) -> Optional[Step]:
         """The step to run, or None for the model's own forward; host-only, so a
-        captured graph replays the decision made at capture."""
+        captured graph replays the decision made at capture.  A "prefill" step
+        is always eager and is never replayed from a captured graph."""
 
     def forward(self, step: Step, original: Callable, *args: Any, **kwargs: Any) -> Any:
         """Run step in place of original (the model's bound forward), taking and
-        returning what it does; capturable in a CUDA graph."""
+        returning what it does; capturable in a CUDA graph for decode and
+        target_verify steps (prefill runs eagerly)."""
 
 
 # The optional entries of a built megakernel, beyond draft_sampler the EAGLE ones

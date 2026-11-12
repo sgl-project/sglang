@@ -114,14 +114,12 @@ class KimiK3Detector(BaseFormatDetector):
         tool_choice: Union[ToolChoice, Literal["auto", "required", "none"]] = "auto",
         thinking_mode: bool = False,
         parallel_tool_calls: bool = True,
-        response_channel_open: bool = False,
     ) -> StructuralTag:
         return get_kimik3_structural_tag(
             tools=tools or [],
             tool_choice=tool_choice,
             thinking_mode=thinking_mode,
             parallel_tool_calls=parallel_tool_calls,
-            response_channel_open=response_channel_open,
         )
 
     def _decode_call(self, attrs: str, body: str) -> dict | None:
@@ -214,11 +212,8 @@ class KimiK3Detector(BaseFormatDetector):
             return StreamingParseResult()
 
     def _stream_calls(self) -> list[ToolCallItem]:
-        """Convert XTML incrementally; never wait for a complete string argument.
-
-        Non-string arguments are buffered until their closing marker so invalid
-        JSON retains the same string fallback as the non-streaming decoder.
-        """
+        """Convert XTML to JSON as it arrives; a non-string argument waits for its
+        close marker so invalid JSON falls back to a string as in `_decode_call`."""
         calls = []
         argument_close = "<|close|>argument<|sep|>"
         call_close = "<|close|>call<|sep|>"
@@ -295,7 +290,12 @@ class KimiK3Detector(BaseFormatDetector):
             if not self._in_call:
                 name = attrs.get("tool", "")
                 if not name:
-                    break
+                    # Skip the whole call, as the non-streaming decoder does.
+                    end = remaining.find(call_close, header.end())
+                    if end < 0:
+                        break
+                    self._tool_pos += end + len(call_close)
+                    continue
                 self.current_tool_id += 1
                 self.prev_tool_call_arr.append({"name": name})
                 self.streamed_args_for_tool.append("")

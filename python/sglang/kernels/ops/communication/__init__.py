@@ -54,6 +54,14 @@ del _mod, _fn
 
 register_kernel(
     KernelSpec(
+        op="communication.engram_gather_peer",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.communication.engram_gather_peer:engram_gather_peer",
+    )
+)
+
+register_kernel(
+    KernelSpec(
         op="communication.beam_all_reduce_norm",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.communication.beam_all_reduce:beam_all_reduce_norm",

@@ -21,7 +21,7 @@ from sglang.srt.layers.dcp.layout import get_dcp_lens
 from sglang.srt.utils import is_gfx95_supported
 from sglang.test.ci.ci_register import register_amd_ci
 
-register_amd_ci(est_time=15, stage="stage-b", runner_config="1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=10, stage="stage-b", runner_config="1-gpu-small-amd-mi35x")
 
 PAGE = 64
 _GARBAGE = 1e30
@@ -118,8 +118,7 @@ def _case(world, lengths, make_scores, seed):
 
 
 @pytest.mark.skipif(not is_gfx95_supported(), reason="gfx950 kernel")
-@pytest.mark.parametrize("world", [2, 8])
-@pytest.mark.parametrize("kind", ["spread", "one_exponent"])
+@pytest.mark.parametrize("world,kind", [(2, "one_exponent"), (8, "spread")])
 def test_selects_the_global_topk_slots(world, kind):
     """The slots of exactly the top-min(len, 2048) global positions, -1 after them,
     whichever local path (copy, radix, register tail) each rank's share takes."""
@@ -142,7 +141,7 @@ def test_selects_the_global_topk_slots(world, kind):
 
 
 @pytest.mark.skipif(not is_gfx95_supported(), reason="gfx950 kernel")
-@pytest.mark.parametrize("world", [2, 8])
+@pytest.mark.parametrize("world", [8])
 def test_ties_at_the_threshold_resolve_deterministically(world):
     """Mostly exact-zero scores tie at both thresholds: a valid top-k, the same
     one on every call (TP peers and graph replays must agree), and every rank

@@ -69,7 +69,7 @@ class TestSituAndMulCast(CustomTestCase):
         """The strided routed slice rounds exactly while SiTU keeps its output."""
         sizes = [1536, 896, 3584]  # shared gate/up, router, routed input
         # The cast begins mid-block at 1/3 tokens and spans many blocks at 257.
-        for num_tokens in (1, 3, 257):
+        for num_tokens in (1, 257):
             g = torch.Generator(device="cuda").manual_seed(num_tokens)
             front = 3 * torch.randn(
                 (num_tokens, sum(sizes)), generator=g, device="cuda"

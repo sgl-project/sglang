@@ -53,6 +53,14 @@ def run_resolution_pipeline(server_args: Any) -> None:
     from sglang.srt.arg_groups.mega_moe_hook import handle_mega_moe
 
     run_hook(handle_mega_moe, server_args)
+
+    from sglang.srt.arg_groups.validation_hook import (
+        validate_rust_server_unsupported_args,
+    )
+
+    # Early, on the arguments as given: before the handlers below derive
+    # others from them (e.g. `--lora-paths` turning on `enable_lora`).
+    run_hook(validate_rust_server_unsupported_args, server_args)
     from sglang.srt.arg_groups.serving_hook import (
         handle_asr_validation,
         handle_crash_dump_env,

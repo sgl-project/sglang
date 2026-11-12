@@ -76,7 +76,11 @@ class TestDSAHiCacheTransfer(unittest.TestCase):
         return torch.cat(parts, dim=0)
 
     def _run_indexer_round_trip(
-        self, io_backend: str, dcp_size: int = 1, dcp_rank: int = 0
+        self,
+        io_backend: str,
+        dcp_size: int = 1,
+        dcp_rank: int = 0,
+        use_fp4_indexer: bool = False,
     ):
         page_size = 1 if is_hip() else 64
         logical_page_size = page_size * dcp_size
@@ -94,6 +98,7 @@ class TestDSAHiCacheTransfer(unittest.TestCase):
             enable_memory_saver=False,
             kv_cache_dim=576,
             index_head_dim=128,
+            use_fp4_indexer=use_fp4_indexer,
         )
         pin_memory = io_backend == "kernel"
         mla_host = MLATokenToKVPoolHost(
@@ -228,7 +233,9 @@ class TestDSAHiCacheTransfer(unittest.TestCase):
         "The other 62 tests in this file pass on AMD.",
     )
     def test_device_to_host_indexer_kernel(self):
-        self._run_indexer_round_trip(io_backend="kernel")
+        for fp4 in (False, True):
+            with self.subTest(fp4=fp4):
+                self._run_indexer_round_trip(io_backend="kernel", use_fp4_indexer=fp4)
 
     @unittest.skipIf(
         is_hip(),
@@ -248,7 +255,9 @@ class TestDSAHiCacheTransfer(unittest.TestCase):
         "(seen on pr-test-amd-rocm720). The rest of this file passes on AMD.",
     )
     def test_device_to_host_indexer_direct(self):
-        self._run_indexer_round_trip(io_backend="direct")
+        for fp4 in (False, True):
+            with self.subTest(fp4=fp4):
+                self._run_indexer_round_trip(io_backend="direct", use_fp4_indexer=fp4)
 
     @unittest.skipIf(
         is_hip(),

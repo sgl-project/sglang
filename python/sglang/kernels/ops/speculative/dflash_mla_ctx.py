@@ -1,11 +1,14 @@
 """Every DFLASH MLA draft layer's context-KV rows from one GEMM, one norm launch and one RoPE."""
 
+import logging
 from typing import Optional, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
 import triton
 import triton.language as tl
+
+logger = logging.getLogger(__name__)
 
 
 @triton.jit
@@ -73,6 +76,45 @@ class MlaContextKV:
         self.norm_w = torch.stack([a.kv_a_layernorm.weight for a in attns]).contiguous()
         self.rotary_emb = a0.rotary_emb
 
+    @classmethod
+    def for_worker(cls, worker) -> Optional["MlaContextKV"]:
+        """The writer of a DFLASH worker's draft layers under --enable-amd-monokernel,
+        or None. Build it on first use: it stacks the draft's kv_a rows, which load
+        after the worker's init."""
+        from sglang.srt.models.dflash import DFlashDraftModel, DFlashMLAAttention
+        from sglang.srt.runtime_context import get_exec, get_parallel
+
+        if not get_exec().kernel.enable_amd_monokernel:
+            return None
+        draft = worker.draft_model
+        attns = [layer.self_attn for layer in draft.layers]
+        # one GEMM serves every layer only when each reads the same projected row
+        if (
+            type(draft).prepare_context_hidden_for_kv
+            is not DFlashDraftModel.prepare_context_hidden_for_kv
+            or not all(
+                isinstance(a, DFlashMLAAttention) and a.q_lora_rank is not None
+                for a in attns
+            )
+        ):
+            blocker = "not low-rank-q MLA layers reading one projected context row"
+        else:
+            blocker = cls.blocker(attns)
+        ctx = None
+        if blocker is None:
+            ctx = cls(attns)
+            # the stacked kv_a copy would keep serving the old weights
+            draft._derived_weight_cache_error = (
+                "Online weight updates are not supported with the stacked DFLASH MLA "
+                "context KV of --enable-amd-monokernel."
+            )
+        if get_parallel().tp_rank == 0:
+            status = (
+                f"{len(attns)} layers" if blocker is None else f"disabled: {blocker}"
+            )
+            logger.info("DFLASH MLA fused context KV: %s", status)
+        return ctx
+
     @staticmethod
     def blocker(attns: Sequence[torch.nn.Module]) -> Optional[str]:
         """Why one stacked GEMM, norm launch and RoPE cannot write these low-rank-q
@@ -107,3 +149,24 @@ class MlaContextKV:
         _, k_pe = self.rotary_emb(positions, torch.empty_like(k_pe), k_pe)
         k_pe = k_pe.view(n, L, P).transpose(0, 1).contiguous()
         return k_nope.unsqueeze(2), k_pe.unsqueeze(2)
+
+    def write(
+        self,
+        pool,
+        positions: torch.Tensor,
+        hidden: torch.Tensor,
+        cache_loc_2d: torch.Tensor,
+        commit_lens: torch.Tensor,
+    ) -> None:
+        """Every layer's context-KV rows into the committed prefix of each
+        cache_loc_2d row; set_mla_kv_buffer_prefix_valid's masking, built once."""
+        from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+
+        k_nope, k_pe = self.project_all(positions, hidden)
+        offsets = torch.arange(cache_loc_2d.shape[1], device=cache_loc_2d.device)
+        loc = KVWriteLoc(
+            torch.where(offsets < commit_lens[:, None], cache_loc_2d, 0).reshape(-1),
+            physical=True,
+        )
+        for i, attn in enumerate(self.attns):
+            pool.set_mla_kv_buffer(attn.attn_mqa, loc, k_nope[i], k_pe[i])

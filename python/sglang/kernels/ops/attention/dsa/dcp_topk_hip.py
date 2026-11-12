@@ -173,26 +173,3 @@ def _candidates_to_slots_kernel(
         out + row.to(tl.int64) * TOPK + offs,
         tl.where(valid, page * span + p % span, -1),
     )
-
-
-@triton.jit
-def _all_visible_slots_kernel(
-    global_lens,
-    page_table,
-    page_table_stride,
-    out,
-    span,
-    TOPK: tl.constexpr,
-):
-    row = tl.program_id(0)
-    offs = tl.arange(0, TOPK)
-    valid = offs < tl.load(global_lens + row)
-    page = tl.load(
-        page_table + row.to(tl.int64) * page_table_stride + offs // span,
-        mask=valid,
-        other=0,
-    )
-    tl.store(
-        out + row.to(tl.int64) * TOPK + offs,
-        tl.where(valid, page * span + offs % span, -1),
-    )

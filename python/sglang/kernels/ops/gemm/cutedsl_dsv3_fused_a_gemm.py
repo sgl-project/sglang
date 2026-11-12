@@ -34,7 +34,7 @@ from cutlass.utils import get_smem_capacity_in_bytes
 
 from sglang.kernels.arch import current_arch
 from sglang.kernels.kernel_api_logging import debug_kernel_api
-from sglang.srt.utils.common import direct_register_custom_op
+from sglang.srt.utils.custom_op import direct_register_custom_op
 
 TILE_M = 16
 TILE_K = 256

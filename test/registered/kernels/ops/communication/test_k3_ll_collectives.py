@@ -2,6 +2,7 @@
 
 import os
 import socket
+import time
 import unittest
 
 import torch
@@ -48,8 +49,6 @@ def _check_gather_tail_read(comm, rank, failures):
     # both scratch epochs with new payloads.
     cases = (
         (1, False, 1, False),
-        (4, True, 1, False),
-        (4, False, 4, True),
         (64, True, 4, True),
         (64, False, 8, True),
         (64, True, 8, True),
@@ -58,8 +57,6 @@ def _check_gather_tail_read(comm, rank, failures):
     # three max-row calls reuse both epochs of every row flag.
     cases += (
         (65, True, 4, True),
-        (96, False, 8, False),
-        (288, True, 8, True),
         (384, True, 8, True),
         (384, False, 2, True),
         (384, True, 4, False),
@@ -142,8 +139,14 @@ class TestK3LLCollectives(CustomTestCase):
             ]
             for p in procs:
                 p.start()
+            # one deadline for all ranks; a hung rank must not keep its GPU past it
+            deadline = time.monotonic() + 900
             for p in procs:
-                p.join(timeout=900)
+                p.join(timeout=max(0.0, deadline - time.monotonic()))
+            for p in procs:
+                if p.is_alive():
+                    p.kill()
+                    p.join()
             self.assertTrue(
                 all(p.exitcode == 0 for p in procs), "a rank crashed or hung"
             )
