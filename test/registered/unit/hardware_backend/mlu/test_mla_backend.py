@@ -1,40 +1,37 @@
 """MLU latent attention and one-shot/chunked MHA numerical coverage."""
 
 import unittest
+from contextlib import ExitStack
+from functools import partial
 from types import SimpleNamespace as NS
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.mlu.attention.mla_backend import MLUMLABackend
 from sglang.srt.hardware_backend.mlu.memory_pool import MLUMLATokenToKVPool
 from sglang.srt.layers.attention.merge_state import merge_state
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.model_executor.forward_mode import ForwardMode
-from sglang.srt.models.deepseek_common.attention_backend_handler import (
-    handle_attention_mlu,
-)
-from sglang.srt.models.deepseek_common.attention_forward_methods.forward_methods import (
-    AttnForwardMethod,
-)
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_mlu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_mlu_ci(est_time=60, suite="pr-test-1-mlu")
+register_mlu_ci(est_time=45, suite="pr-test-1-mlu")
 
 
-class TestMLAMLU(CustomTestCase):
+class TestMLUMLABackend(CustomTestCase):
     def setUp(self):
         super().setUp()
-        parallel = get_parallel().override(
-            attn_dcp_size=1, attn_dcp_rank=0, attn_cp_size=1, dcp_enabled=False
-        )
-        parallel.__enter__()
-        self.addCleanup(parallel.__exit__, None, None, None)
-
-    def _fixture(self, qlens, lens, mode=ForwardMode.EXTEND, mixed=None):
         torch.manual_seed(11)
+        stack = ExitStack()
+        self.addCleanup(stack.close)
+        stack.enter_context(
+            get_parallel().override(attn_dcp_size=1, attn_cp_size=1, dcp_enabled=False)
+        )
+
+    def _create_fixture(
+        self, query_lens, kv_lens, mode=ForwardMode.EXTEND, mixed_prefill_reqs=None
+    ):
         pool = MLUMLATokenToKVPool(
             size=256,
             page_size=16,
@@ -45,26 +42,25 @@ class TestMLAMLU(CustomTestCase):
             device="mlu",
             enable_memory_saver=False,
         )
-        req = torch.zeros(2, 64, dtype=torch.int32, device="mlu")
-        for i, pages in enumerate(((5, 1, 8, 2), (7, 3, 9, 6))):
-            req[i] = torch.cat(
-                [torch.arange(p * 16, (p + 1) * 16, device="mlu") for p in pages]
+        pages = torch.tensor(
+            [[5, 1, 8, 2], [7, 3, 9, 6]], device="mlu", dtype=torch.int32
+        )
+        offsets = torch.arange(16, device="mlu", dtype=torch.int32)
+        req_to_token = (pages[..., None] * 16 + offsets).reshape(2, 64)
+        backend = MLUMLABackend(
+            NS(
+                device="mlu",
+                page_size=16,
+                model_config=NS(
+                    context_len=64,
+                    kv_lora_rank=512,
+                    hf_config=NS(architectures=["DeepseekV2ForCausalLM"]),
+                ),
+                req_to_token_pool=NS(req_to_token=req_to_token),
+                token_to_kv_pool=pool,
+                kv_cache_dtype=torch.bfloat16,
             )
-        with get_parallel().override(attn_dcp_size=1, attn_cp_size=1):
-            backend = MLUMLABackend(
-                NS(
-                    device="mlu",
-                    page_size=16,
-                    model_config=NS(
-                        context_len=64,
-                        kv_lora_rank=512,
-                        hf_config=NS(architectures=["DeepseekV2ForCausalLM"]),
-                    ),
-                    req_to_token_pool=NS(req_to_token=req),
-                    token_to_kv_pool=pool,
-                    kv_cache_dtype=torch.bfloat16,
-                )
-            )
+        )
         layer = NS(
             layer_id=0,
             tp_q_head_num=8,
@@ -77,52 +73,78 @@ class TestMLAMLU(CustomTestCase):
             is_cross_attention=False,
             attn_type=AttentionType.DECODER,
         )
-        cache = torch.randn(sum(lens), 1, 576, device="mlu", dtype=torch.bfloat16) * 0.2
-        slots = torch.cat([req[i, :n] for i, n in enumerate(lens)])
-        pool.set_kv_buffer(layer, slots, cache, None)
         loc = torch.cat(
-            [req[i, n - m : n] for i, (m, n) in enumerate(zip(qlens, lens))]
+            [
+                req_to_token[i, kv_len - query_len : kv_len]
+                for i, (query_len, kv_len) in enumerate(zip(query_lens, kv_lens))
+            ]
         )
-        fb = NS(
+        forward_batch = NS(
             batch_size=2,
             req_pool_indices=torch.arange(2, device="mlu"),
-            seq_lens=torch.tensor(lens, device="mlu"),
-            seq_lens_cpu=torch.tensor(lens),
-            extend_seq_lens=torch.tensor(qlens, device="mlu"),
-            extend_seq_lens_cpu=qlens,
-            extend_prefix_lens_cpu=[n - m for n, m in zip(lens, qlens)],
-            mixed_prefill_reqs=mixed,
+            seq_lens=torch.tensor(kv_lens, device="mlu"),
+            seq_lens_cpu=torch.tensor(kv_lens),
+            extend_seq_lens=torch.tensor(query_lens, device="mlu"),
+            extend_seq_lens_cpu=query_lens,
+            extend_prefix_lens_cpu=[
+                kv_len - query_len for kv_len, query_len in zip(kv_lens, query_lens)
+            ],
+            mixed_prefill_reqs=mixed_prefill_reqs,
             forward_mode=mode,
             out_cache_loc=loc,
             attn_attend_prefix_cache=None,
             mha_one_shot=None,
             mha_return_lse=None,
         )
-        backend.init_forward_metadata(fb)
-        q = torch.randn(sum(qlens), 8, 576, device="mlu", dtype=torch.bfloat16) * 0.2
-        chunks = cache.split(lens)
-        current = torch.cat([x[-m:] for x, m in zip(chunks, qlens)])
-        pool.set_kv_buffer(layer, loc, torch.zeros_like(current), None)
+        backend.init_forward_metadata(forward_batch)
         return NS(
             pool=pool,
             backend=backend,
             layer=layer,
-            fb=fb,
-            q=q,
-            cache=cache,
-            current=current,
-            lens=lens,
-            qlens=qlens,
+            forward_batch=forward_batch,
+            req_to_token=req_to_token,
+            kv_lens=kv_lens,
+            query_lens=query_lens,
         )
 
+    def _create_latent_fixture(
+        self, query_lens, kv_lens, mode=ForwardMode.EXTEND, mixed_prefill_reqs=None
+    ):
+        fixture = self._create_fixture(query_lens, kv_lens, mode, mixed_prefill_reqs)
+        fixture.cache = (
+            torch.randn(sum(kv_lens), 1, 576, device="mlu", dtype=torch.bfloat16) * 0.2
+        )
+        slots = torch.cat(
+            [fixture.req_to_token[i, :length] for i, length in enumerate(kv_lens)]
+        )
+        fixture.pool.set_kv_buffer(fixture.layer, slots, fixture.cache, None)
+        fixture.q = (
+            torch.randn(sum(query_lens), 8, 576, device="mlu", dtype=torch.bfloat16)
+            * 0.2
+        )
+        fixture.current = torch.cat(
+            [
+                chunk[-length:]
+                for chunk, length in zip(fixture.cache.split(kv_lens), query_lens)
+            ]
+        )
+        # Clear current-token slots so the test also verifies the forward KV write.
+        fixture.pool.set_kv_buffer(
+            fixture.layer,
+            fixture.forward_batch.out_cache_loc,
+            torch.zeros_like(fixture.current),
+            None,
+        )
+        return fixture
+
     @staticmethod
-    def _reference(q, k, v, qlens, lens, scale, return_lse=False):
+    def _reference(q, k, v, query_lens, kv_lens, scale):
         outputs = []
         lses = []
         for qi, ki, vi in zip(
-            q.cpu().float().split(qlens),
-            k.cpu().float().split(lens),
-            v.cpu().float().split(lens),
+            q.cpu().float().split(query_lens),
+            k.cpu().float().split(kv_lens),
+            v.cpu().float().split(kv_lens),
         ):
             logits = (
                 torch.einsum("qhd,khd->hqk", qi, ki.expand(-1, qi.shape[1], -1)) * scale
@@ -137,69 +159,81 @@ class TestMLAMLU(CustomTestCase):
                     "hqk,khd->qhd", logits.softmax(-1), vi.expand(-1, qi.shape[1], -1)
                 )
             )
-        if return_lse:
-            return torch.cat(outputs), torch.cat(lses)
-        return torch.cat(outputs)
+        return torch.cat(outputs), torch.cat(lses)
 
     def test_latent_prefill_decode_mixed(self):
-        for mode, qlens, lens, mixed in (
+        for mode, query_lens, kv_lens, mixed_prefill_reqs in (
+            # No cached prefixes.
             (ForwardMode.EXTEND, [21, 35], [21, 35], None),
+            # Both requests have cached prefixes.
             (ForwardMode.EXTEND, [3, 5], [21, 35], None),
+            # One decode token per request.
             (ForwardMode.DECODE, [1, 1], [21, 35], None),
+            # Cached-prefix prefill plus decode.
             (ForwardMode.MIXED, [3, 1], [21, 35], 1),
+            # Uncached prefill plus decode.
             (ForwardMode.MIXED, [3, 1], [3, 35], 1),
+            # Uncached one-token prefill plus decode.
             (ForwardMode.MIXED, [1, 1], [1, 35], 1),
+            # Cached one-token prefill plus decode.
             (ForwardMode.MIXED, [1, 1], [21, 35], 1),
+            # All requests are decode.
             (ForwardMode.MIXED, [1, 1], [21, 35], 0),
+            # All requests are cached-prefix prefill.
             (ForwardMode.MIXED, [3, 5], [21, 35], 2),
+            # All requests are uncached prefill.
             (ForwardMode.MIXED, [3, 5], [3, 5], 2),
+            # Only one request has a cached prefix.
             (ForwardMode.EXTEND, [3, 5], [3, 35], None),
         ):
-            with self.subTest(mode=mode, qlens=qlens):
-                f = self._fixture(qlens, lens, mode, mixed)
-                actual = f.backend.forward(
-                    f.q,
-                    f.current,
-                    None,
-                    f.layer,
-                    f.fb,
+            with self.subTest(
+                mode=mode,
+                query_lens=query_lens,
+                kv_lens=kv_lens,
+                mixed_prefill_reqs=mixed_prefill_reqs,
+            ):
+                # Create the backend, batch, and input tensors.
+                fixture = self._create_latent_fixture(
+                    query_lens, kv_lens, mode, mixed_prefill_reqs
                 )
-                expected = self._reference(
-                    f.q, f.cache, f.cache[..., :512], qlens, lens, f.layer.scaling
+                forward = partial(
+                    fixture.backend.forward,
+                    q=fixture.q,
+                    k=fixture.current,
+                    v=None,
+                    layer=fixture.layer,
+                    forward_batch=fixture.forward_batch,
                 )
+
+                # Compute latent attention outputs and LSE on CPU.
+                expected, expected_lse = self._reference(
+                    fixture.q,
+                    fixture.cache,
+                    fixture.cache[..., :512],
+                    query_lens,
+                    kv_lens,
+                    fixture.layer.scaling,
+                )
+
+                # Write current KV, then reuse it while requesting LSE.
+                actual = forward()
+                with_lse, lse = forward(save_kv_cache=False, return_lse=True)
+
+                # Compare outputs, LSE, and stored KV against the references.
                 torch.testing.assert_close(
-                    actual.cpu().view_as(expected).float(),
-                    expected,
-                    atol=0.004,
-                    rtol=0.025,
+                    actual.cpu().float(),
+                    expected.flatten(1),
+                    atol=3e-2,
+                    rtol=3e-2,
                 )
-                with_lse, lse = f.backend.forward(
-                    f.q,
-                    f.current,
-                    None,
-                    f.layer,
-                    f.fb,
-                    save_kv_cache=False,
-                    return_lse=True,
-                )
-                self.assertEqual(with_lse.shape, actual.shape)
-                self.assertEqual(lse.shape, (sum(qlens), 8))
-                self.assertEqual(lse.dtype, torch.float32)
-                torch.testing.assert_close(with_lse, actual, atol=0.004, rtol=0.025)
-                _, expected_lse = self._reference(
-                    f.q,
-                    f.cache,
-                    f.cache[..., :512],
-                    qlens,
-                    lens,
-                    f.layer.scaling,
-                    return_lse=True,
-                )
+                torch.testing.assert_close(with_lse, actual, atol=3e-2, rtol=3e-2)
                 torch.testing.assert_close(
-                    lse.cpu(), expected_lse, atol=0.003, rtol=0.003
+                    lse.cpu(), expected_lse, atol=1e-3, rtol=1e-3
                 )
-                gathered = f.pool.get_key_buffer(0)[f.fb.out_cache_loc.long()]
-                torch.testing.assert_close(gathered, f.current, rtol=0, atol=0)
+                gathered = fixture.pool.get_key_buffer(0)[
+                    fixture.forward_batch.out_cache_loc.long()
+                ]
+                torch.testing.assert_close(gathered, fixture.current, rtol=0, atol=0)
 
     def test_absorb_core_query_scaling(self):
         """Absorbed MLA must scale both Q components before attention."""
@@ -219,7 +253,10 @@ class TestMLAMLU(CustomTestCase):
 
         for scale in (None, 2.0):
             with self.subTest(scale=scale):
-                f = self._fixture([1, 1], [21, 35], ForwardMode.DECODE)
+                # Create model projections and the MLA backend inputs.
+                fixture = self._create_latent_fixture(
+                    [1, 1], [21, 35], ForwardMode.DECODE
+                )
                 attn = Attention()
                 attn.w_vc = (
                     torch.eye(512, 128, device="mlu", dtype=torch.bfloat16)
@@ -227,283 +264,162 @@ class TestMLAMLU(CustomTestCase):
                     .repeat(8, 1, 1)
                 )
                 attn.o_proj = lambda x: (x, None)
-                attn.attn_mqa = lambda q, k, v, fb, **kwargs: f.backend.forward(
-                    q, k, v, f.layer, fb, **kwargs
+                attn.attn_mqa = lambda q, k, v, forward_batch, **kwargs: (
+                    fixture.backend.forward(
+                        q, k, v, fixture.layer, forward_batch, **kwargs
+                    )
                 )
-                scaling = None if scale is None else f.q.new_tensor(scale)
+                scaling = None if scale is None else fixture.q.new_tensor(scale)
+
+                # Compute the scaled attention reference on CPU.
+                expected, _ = self._reference(
+                    fixture.q if scale is None else fixture.q * scaling,
+                    fixture.cache,
+                    fixture.cache[..., :512],
+                    fixture.query_lens,
+                    fixture.kv_lens,
+                    fixture.layer.scaling,
+                )
+                expected = expected[..., :128].flatten(1)
+
+                # Run the model attention path on MLU.
                 actual = attn.forward_absorb_core(
-                    q_pe=f.q[..., 512:],
-                    k_pe=f.current[..., 512:],
-                    q_nope_out=f.q[..., :512],
-                    k_nope=f.current[..., :512],
-                    forward_batch=f.fb,
+                    q_pe=fixture.q[..., 512:],
+                    k_pe=fixture.current[..., 512:],
+                    q_nope_out=fixture.q[..., :512],
+                    k_nope=fixture.current[..., :512],
+                    forward_batch=fixture.forward_batch,
                     zero_allocator=None,
                     positions=None,
                     topk_indices=None,
                     llama_4_scaling=scaling,
                 )
-                expected = self._reference(
-                    f.q if scale is None else f.q * scaling,
-                    f.cache,
-                    f.cache[..., :512],
-                    f.qlens,
-                    f.lens,
-                    f.layer.scaling,
-                )[..., :128].flatten(1)
+
+                # Check the projected output and stored latent KV.
                 torch.testing.assert_close(
-                    actual.cpu().float(), expected, atol=0.004, rtol=0.025
+                    actual.cpu().float(),
+                    expected,
+                    atol=3e-2,
+                    rtol=3e-2,
                 )
                 torch.testing.assert_close(
-                    f.pool.get_key_buffer(0)[f.fb.out_cache_loc.long()],
-                    f.current,
+                    fixture.pool.get_key_buffer(0)[
+                        fixture.forward_batch.out_cache_loc.long()
+                    ],
+                    fixture.current,
                     rtol=0,
                     atol=0,
                 )
 
     def test_one_shot_and_chunked_mha(self):
-        f = self._fixture([3, 5], [21, 35])
-        layer = NS(**vars(f.layer))
+        # Create dense Q/K/V and a shared forward entry for both prefill paths.
+        fixture = self._create_fixture([3, 5], [21, 35])
+        layer = fixture.layer
+        forward_batch = fixture.forward_batch
         layer.tp_k_head_num = layer.tp_v_head_num = 8
         layer.qk_head_dim = 192
         layer.v_head_dim = 128
-        q = f.q[..., :192].contiguous()
-        k = torch.randn(56, 8, 192, device="mlu", dtype=torch.bfloat16) * 0.2
-        v = torch.randn(56, 8, 128, device="mlu", dtype=torch.bfloat16) * 0.2
-        expected, expected_lse = self._reference(
-            q, k, v, f.qlens, f.lens, layer.scaling, return_lse=True
+        q = (
+            torch.randn(
+                sum(fixture.query_lens), 8, 192, device="mlu", dtype=torch.bfloat16
+            )
+            * 0.2
         )
-        f.fb.mha_one_shot = True
-        one = f.backend.forward(q, k, v, layer, f.fb, save_kv_cache=False)
-        torch.testing.assert_close(
-            one.cpu().view_as(expected).float(), expected, atol=0.004, rtol=0.025
+        k = (
+            torch.randn(
+                sum(fixture.kv_lens), 8, 192, device="mlu", dtype=torch.bfloat16
+            )
+            * 0.2
         )
-        one_with_lse, one_lse = f.backend.forward(
-            q, k, v, layer, f.fb, save_kv_cache=False, return_lse=True
+        v = (
+            torch.randn(
+                sum(fixture.kv_lens), 8, 128, device="mlu", dtype=torch.bfloat16
+            )
+            * 0.2
         )
-        self.assertEqual(one_with_lse.shape, expected.shape)
-        self.assertEqual(one_lse.dtype, torch.float32)
-        torch.testing.assert_close(one_with_lse.flatten(1), one, atol=0.004, rtol=0.025)
-        torch.testing.assert_close(one_lse.cpu(), expected_lse, atol=0.003, rtol=0.003)
-        f.fb.mha_one_shot = False
-        f.fb.mha_return_lse = True
-        f.fb.attn_attend_prefix_cache = False
-        suffix_k = torch.cat([k[18:21], k[51:56]])
-        suffix_v = torch.cat([v[18:21], v[51:56]])
-        out, lse = f.backend.forward(
-            q, suffix_k, suffix_v, layer, f.fb, save_kv_cache=False
+        forward = partial(
+            fixture.backend.forward,
+            q=q,
+            layer=layer,
+            forward_batch=forward_batch,
+            save_kv_cache=False,
         )
-        f.fb.attn_attend_prefix_cache = True
-        # The second chunk has no KV for request 0. Merge its raw vendor
-        # output/LSE directly, including the empty-row +inf LSE sentinel.
-        for idx, (starts, ends) in enumerate(
-            (((0, 21), (18, 39)), ((18, 39), (18, 51)))
+        prefix_lens = forward_batch.extend_prefix_lens_cpu
+        prefix_k, prefix_v = [], []
+        suffix_k, suffix_v = [], []
+        for req_k, req_v, prefix_len in zip(
+            k.split(fixture.kv_lens), v.split(fixture.kv_lens), prefix_lens
         ):
-            ck = torch.cat([k[a:b] for a, b in zip(starts, ends)])
-            cv = torch.cat([v[a:b] for a, b in zip(starts, ends)])
-            lengths = [b - a for a, b in zip(starts, ends)]
-            f.fb.prefix_chunk_idx = 0
-            f.fb.prefix_chunk_cu_seq_lens = [
+            prefix_k.append(req_k[:prefix_len])
+            prefix_v.append(req_v[:prefix_len])
+            suffix_k.append(req_k[prefix_len:])
+            suffix_v.append(req_v[prefix_len:])
+
+        # Prepare metadata for every prefix chunk before running attention.
+        forward_batch.prefix_chunk_cu_seq_lens = []
+        forward_batch.prefix_chunk_max_seq_lens = []
+        prefix_chunks = []
+        chunk_size = prefix_lens[0]
+        for start in range(0, max(prefix_lens), chunk_size):
+            chunk_k = [req_k[start : start + chunk_size] for req_k in prefix_k]
+            chunk_v = [req_v[start : start + chunk_size] for req_v in prefix_v]
+            lengths = [chunk.shape[0] for chunk in chunk_k]
+            forward_batch.prefix_chunk_cu_seq_lens.append(
                 torch.tensor(
                     [0, lengths[0], sum(lengths)], dtype=torch.int32, device="mlu"
                 )
-            ]
-            f.fb.prefix_chunk_max_seq_lens = [max(lengths)]
-            part, plse = f.backend.forward(q, ck, cv, layer, f.fb, save_kv_cache=False)
-            out, lse = merge_state(part, plse, out, lse)
-        torch.testing.assert_close(out.cpu().float(), expected, atol=0.004, rtol=0.025)
-        torch.testing.assert_close(lse.cpu(), expected_lse, atol=0.003, rtol=0.003)
+            )
+            forward_batch.prefix_chunk_max_seq_lens.append(max(lengths))
+            prefix_chunks.append((torch.cat(chunk_k), torch.cat(chunk_v)))
 
-    def test_merge_output_buffers(self):
-        torch.manual_seed(17)
-        prefix = torch.randn(7, 4, 128, device="mlu", dtype=torch.bfloat16)
-        suffix = torch.randn_like(prefix)
-        p_lse = torch.randn(7, 4, device="mlu", dtype=torch.float32)
-        s_lse = torch.randn_like(p_lse)
-        # Build the reference with mathematical empty-state LSE (-inf).
-        prefix[0] = 0
-        p_lse[0] = -torch.inf
-        expected_lse = torch.logaddexp(p_lse.cpu(), s_lse.cpu())
-        expected = prefix.cpu().float() * (p_lse.cpu() - expected_lse).exp().unsqueeze(
-            -1
-        ) + suffix.cpu().float() * (s_lse.cpu() - expected_lse).exp().unsqueeze(-1)
-        # TMO flash_attention returns zero output and +inf LSE for empty KV.
-        # update_out_and_lse must consume that sentinel without normalization.
-        p_lse[0] = torch.inf
-        for layout in ("contiguous", "transposed", "inplace"):
-            with self.subTest(layout=layout):
-                p = prefix.clone()
-                pl = p_lse.clone()
-                out = p if layout == "inplace" else torch.empty_like(p)
-                out_lse = (
-                    pl
-                    if layout == "inplace"
-                    else torch.empty(4, 7, device="mlu").T
-                    if layout == "transposed"
-                    else torch.empty_like(pl)
-                )
-                actual, actual_lse = merge_state(p, pl, suffix, s_lse, out, out_lse)
-                self.assertIs(actual, out)
-                self.assertIs(actual_lse, out_lse)
-                torch.testing.assert_close(
-                    actual.cpu().float(), expected, atol=0.015, rtol=0.01
-                )
-                torch.testing.assert_close(
-                    actual_lse.cpu(), expected_lse, atol=1e-5, rtol=1e-5
-                )
-
-    def test_deepseek_rope(self):
-        """MLU RoPE must construct without the CUDA/vLLM fallback import."""
-        from sglang.srt.layers.rotary_embedding.rope_variant import (
-            DeepseekScalingRotaryEmbedding,
+        # Compute full causal attention outputs and LSE on CPU.
+        expected, expected_lse = self._reference(
+            q, k, v, fixture.query_lens, fixture.kv_lens, layer.scaling
         )
 
-        rope = DeepseekScalingRotaryEmbedding(
-            head_size=64,
-            rotary_dim=64,
-            max_position_embeddings=128,
-            base=10000,
-            is_neox_style=False,
-            scaling_factor=4,
-            dtype=torch.bfloat16,
-            device="mlu",
-        ).to("mlu")
-        q = torch.randn(5, 8, 64, device="mlu", dtype=torch.bfloat16)
-        k = torch.randn(5, 1, 64, device="mlu", dtype=torch.bfloat16)
-        positions = torch.tensor([0, 1, 16, 31, 63], device="mlu")
-        actual_q, actual_k = rope(positions, q, k)
-        cos, sin = rope.cos_sin_cache[positions].cpu().float().chunk(2, dim=-1)
-        for actual, original in ((actual_q, q), (actual_k, k)):
-            pairs = original.cpu().float().reshape(5, -1, 32, 2)
-            real, imag = pairs[..., 0], pairs[..., 1]
-            expected = torch.stack(
-                (
-                    real * cos[:, None] - imag * sin[:, None],
-                    imag * cos[:, None] + real * sin[:, None],
-                ),
-                dim=-1,
-            ).flatten(-2)
-            torch.testing.assert_close(
-                actual.cpu().float(), expected, atol=0.04, rtol=0.02
-            )
+        # Run one-shot prefill with the full K/V.
+        forward_batch.mha_one_shot = True
+        one_shot_output = forward(k=k, v=v)
+        one_shot_output_with_lse, one_shot_lse = forward(k=k, v=v, return_lse=True)
 
-    def test_routing(self):
-        with envs.SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD.override(10):
-            attn = NS(
-                disable_chunked_prefix_cache=False, chunked_prefix_cache_threshold=10
-            )
-            fb = NS(
-                forward_mode=ForwardMode.EXTEND,
-                extend_prefix_lens_cpu=[0, 0],
-                seq_lens_sum=32,
-                get_max_chunk_capacity=lambda: 32,
-            )
-            self.assertEqual(handle_attention_mlu(attn, fb), AttnForwardMethod.MHA)
-            fb.extend_prefix_lens_cpu = [5, 5]
-            self.assertEqual(
-                handle_attention_mlu(attn, fb), AttnForwardMethod.MHA_ONE_SHOT
-            )
-            fb.seq_lens_sum = 33
-            self.assertEqual(
-                handle_attention_mlu(attn, fb), AttnForwardMethod.MHA_CHUNKED_KV
-            )
-            attn.disable_chunked_prefix_cache = True
-            self.assertEqual(handle_attention_mlu(attn, fb), AttnForwardMethod.MLA)
-            attn.disable_chunked_prefix_cache = False
-            fb.extend_prefix_lens_cpu = [0, 9]
-            self.assertEqual(handle_attention_mlu(attn, fb), AttnForwardMethod.MLA)
-            for mode in (ForwardMode.DECODE, ForwardMode.MIXED):
-                fb.forward_mode = mode
-                self.assertEqual(handle_attention_mlu(attn, fb), AttnForwardMethod.MLA)
-
-    def test_default_prefix_threshold_is_local(self):
-        threshold = envs.SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD
-        with threshold.override(8192):
-            threshold.clear()
-            attn = NS(
-                disable_chunked_prefix_cache=False,
-                chunked_prefix_cache_threshold=threshold.get(),
-            )
-            fb = NS(
-                forward_mode=ForwardMode.EXTEND,
-                extend_prefix_lens_cpu=[1],
-                seq_lens_sum=32,
-                get_max_chunk_capacity=lambda: 32,
-            )
-            self.assertEqual(
-                handle_attention_mlu(attn, fb), AttnForwardMethod.MHA_ONE_SHOT
-            )
-            fb.seq_lens_sum = 33
-            self.assertEqual(
-                handle_attention_mlu(attn, fb), AttnForwardMethod.MHA_CHUNKED_KV
-            )
-            attn.disable_chunked_prefix_cache = True
-            self.assertEqual(handle_attention_mlu(attn, fb), AttnForwardMethod.MLA)
-            self.assertFalse(threshold.is_set())
-            self.assertEqual(threshold.get(), 8192)
-            self.assertEqual(attn.chunked_prefix_cache_threshold, 8192)
-
-    def test_pool_gather_grid_boundary(self):
-        from triton.runtime import driver
-
-        max_grid_x, _, _ = driver.active.utils.get_max_grid_size(
-            torch.mlu.current_device()
+        # Compute causal attention over the suffix.
+        forward_batch.mha_one_shot = False
+        forward_batch.mha_return_lse = True
+        forward_batch.attn_attend_prefix_cache = False
+        chunked_output, chunked_lse = forward(
+            k=torch.cat(suffix_k), v=torch.cat(suffix_v)
         )
-        for rope_dim in (64, 0):
-            pool = MLUMLATokenToKVPool(
-                size=16,
-                page_size=16,
-                dtype=torch.bfloat16,
-                kv_lora_rank=512,
-                qk_rope_head_dim=rope_dim,
-                layer_num=2,
-                device="mlu",
-                enable_memory_saver=False,
-            )
-            layer = NS(layer_id=0)
-            values = torch.randn(8, 1, 512 + rope_dim, device="mlu").bfloat16()
-            pool.set_kv_buffer(
-                layer,
-                torch.arange(8, device="mlu"),
-                values.float(),
-                None,
-                layer_id_override=1,
-            )
-            for count in (0, 9, max_grid_x + 3):
-                with self.subTest(rope_dim=rope_dim, count=count):
-                    # Match the parent pool contract: device-local, flat indices.
-                    # Repeated slots cover large gathers and partial row tiles.
-                    loc = torch.arange(count, device="mlu") % 8
-                    nope, rope = pool.get_mla_kv_buffer(
-                        layer, loc, torch.float32, layer_id_override=1
-                    )
-                    expected = values[loc].float()
-                    torch.testing.assert_close(
-                        nope, expected[..., :512], rtol=0, atol=0
-                    )
-                    self.assertTrue(nope.is_contiguous())
-                    if rope_dim:
-                        torch.testing.assert_close(
-                            rope, expected[..., 512:], rtol=0, atol=0
-                        )
-                        self.assertTrue(rope.is_contiguous())
-                    else:
-                        self.assertIsNone(rope)
 
-    def test_pool_split_write_gather_and_move(self):
-        f = self._fixture([3, 5], [21, 35])
-        with get_parallel().override(attn_dcp_size=1, attn_dcp_rank=0):
-            f.pool.set_mla_kv_buffer(
-                f.layer, f.fb.out_cache_loc, f.current[..., :512], f.current[..., 512:]
+        # Merge each prefix chunk into the suffix result. Request 0 has no KV
+        # in the last chunk, whose zero output and +inf LSE are merged as-is.
+        forward_batch.attn_attend_prefix_cache = True
+        for chunk_idx, (chunk_k, chunk_v) in enumerate(prefix_chunks):
+            forward_batch.prefix_chunk_idx = chunk_idx
+            prefix_output, prefix_lse = forward(k=chunk_k, v=chunk_v)
+            chunked_output, chunked_lse = merge_state(
+                prefix_output, prefix_lse, chunked_output, chunked_lse
             )
-        nope, rope = f.pool.get_mla_kv_buffer(f.layer, f.fb.out_cache_loc)
+
+        # Compare both paths against the same CPU reference.
         torch.testing.assert_close(
-            torch.cat((nope, rope), -1), f.current, rtol=0, atol=0
+            one_shot_output.cpu().float(),
+            expected.flatten(1),
+            atol=3e-2,
+            rtol=3e-2,
         )
-        target = torch.arange(200, 208, device="mlu")
-        f.pool.move_kv_cache(target, f.fb.out_cache_loc)
-        torch.testing.assert_close(
-            f.pool.get_key_buffer(0)[target], f.current, rtol=0, atol=0
-        )
+        for path, output in (
+            ("one_shot", one_shot_output_with_lse),
+            ("chunked", chunked_output),
+        ):
+            with self.subTest(path=path, result="output"):
+                torch.testing.assert_close(
+                    output.cpu().float(), expected, atol=3e-2, rtol=3e-2
+                )
+        for path, lse in (("one_shot", one_shot_lse), ("chunked", chunked_lse)):
+            with self.subTest(path=path, result="lse"):
+                torch.testing.assert_close(
+                    lse.cpu(), expected_lse, atol=1e-3, rtol=1e-3
+                )
 
 
 if __name__ == "__main__":

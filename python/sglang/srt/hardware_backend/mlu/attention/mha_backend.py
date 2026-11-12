@@ -1,4 +1,4 @@
-"""BF16 paged GQA attention for Cambricon MLUs.
+"""BF16 paged MHA and GQA attention for Cambricon MLUs.
 
 Uses ragged flash attention for extend and cached single-query attention for
 decode. Mixed batches preserve the shared scheduler's prefill-then-decode order;
