@@ -11,7 +11,7 @@ from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
     AscendAttnMultiStepDraftBackend,
     ForwardMetadata,
 )
-from sglang.srt.layers.attention.dsa.dsa_indexer import BaseIndexerMetadata
+from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import BaseIndexerMetadata
 from sglang.srt.layers.attention.dsa.kpool_plan import (
     KPoolExtendPlan,
     KPoolWritePlan,
@@ -19,7 +19,8 @@ from sglang.srt.layers.attention.dsa.kpool_plan import (
     init_kpool_write_plan_capture,
     update_kpool_write_plan,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
 
 if TYPE_CHECKING:

@@ -265,7 +265,7 @@ def _prep_update_kpool_write_plan_launch(
     # N > kpool where one write closes multiple pools.
     max_closed_pools = kpool_max_closed_pools(num_draft_tokens, kpool)
     bs = write_start.shape[0]
-    page_table_rows = real_page_table.shape[0] # in [bs*N, bs]
+    page_table_rows = real_page_table.shape[0]  # in [bs*N, bs]
     assert page_table_rows % bs == 0, f"{real_page_table.shape=}, {bs=}"
     page_table_batch_stride = page_table_rows // bs
 
