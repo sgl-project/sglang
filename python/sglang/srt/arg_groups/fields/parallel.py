@@ -134,17 +134,20 @@ class Parallel(msgspec.Struct):
             help="Communication backend for the decode context-parallel (DCP) "
             "attention reduction: 'ag_rs' (AllGather + ReduceScatter), 'a2a' "
             "(one All-to-All exchange of output+LSE, then a local LSE combine), "
+            "'ag_delay_reduce' (all-gather only LSE and delay the attention "
+            "reduction into the output projection's TP all-reduce; replicates "
+            "output weights within DCP), "
             "or 'fi_a2a' (FlashInfer MNNVL All-to-All kernel; requires "
             "Blackwell and a DCP group within one MNNVL domain). Unset resolves "
             "to 'fi_a2a' where supported, else 'a2a' on CUDA/ROCm/XPU, else 'ag_rs'.",
-            choices=["ag_rs", "a2a", "fi_a2a"],
+            choices=["ag_rs", "ag_delay_reduce", "a2a", "fi_a2a"],
             resolvable=True,
         ),
     ] = None
     dcp_replicate_q_proj: A[
         Optional[bool],
         Arg(
-            help="For MLA decode context parallelism with the a2a/fi_a2a "
+            help="For MLA decode context parallelism with the ag_delay_reduce/a2a/fi_a2a "
             "backend: replicate the Q projection so each DCP rank computes the "
             "full-head query locally (redundant projection compute), eliminating "
             "the per-layer head-dim all-gather of Q. Trades a small amount of "

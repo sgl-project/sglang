@@ -194,6 +194,117 @@ class TestLinearParallelGroups(CustomTestCase):
                     tp.all_reduce.assert_not_called()
                     attn.all_reduce.assert_not_called()
 
+    def test_qwen3_dcp_kv_heads_and_weight_loaders_match_cache_layout(self):
+        from transformers import Qwen3NextConfig
+
+        from sglang.srt.models.qwen3 import Qwen3Attention
+        from sglang.srt.models.qwen3_moe import Qwen3MoeAttention
+        from sglang.srt.models.qwen3_next import Qwen3HybridAttentionDecoderLayer
+
+        hidden, heads, dim, tp_size = 32, 8, 4, 4
+        for model in (
+            Qwen3Attention,
+            Qwen3MoeAttention,
+            Qwen3HybridAttentionDecoderLayer,
+        ):
+            for dcp_size in (1, 2, 4):
+                for kv_heads in (1, 4):
+                    for rank in range(tp_size):
+                        with (
+                            self.subTest(
+                                model=model.__name__,
+                                dcp=dcp_size,
+                                kv=kv_heads,
+                                rank=rank,
+                            ),
+                            parallel_scope(
+                                tp_rank=rank,
+                                attn_dp_rank=0,
+                                attn_dp_size=1,
+                                attn_tp_rank=rank,
+                                attn_tp_size=tp_size,
+                                attn_dcp_size=dcp_size,
+                            ),
+                        ):
+                            if model is Qwen3HybridAttentionDecoderLayer:
+                                config = Qwen3NextConfig(
+                                    hidden_size=hidden,
+                                    num_attention_heads=heads,
+                                    num_key_value_heads=kv_heads,
+                                    head_dim=dim,
+                                    max_position_embeddings=16,
+                                    partial_rotary_factor=1.0,
+                                )
+                                # Only the attention constructor and its real
+                                # QKV loader are relevant to this partition test.
+                                with (
+                                    patch(
+                                        "sglang.srt.models.qwen3_next.Qwen2MoeSparseMoeBlock",
+                                        return_value=torch.nn.Identity(),
+                                    ),
+                                    patch(
+                                        "sglang.srt.models.qwen3_next.append_stages",
+                                        return_value=(None, None),
+                                    ),
+                                ):
+                                    attention = model(config, layer_id=0)
+                                q_heads = heads * 2  # interleaved query/output gate
+                            else:
+                                attention = model(
+                                    hidden_size=hidden,
+                                    num_heads=heads,
+                                    num_kv_heads=kv_heads,
+                                    head_dim=dim,
+                                    rms_norm_eps=1e-6,
+                                    max_position_embeddings=16,
+                                )
+                                q_heads = heads
+                            kv_tp_size = tp_size // dcp_size
+                            kv_rank = rank // dcp_size
+                            local_kv_heads = max(1, kv_heads // kv_tp_size)
+                            self.assertEqual(attention.num_heads, heads // tp_size)
+                            self.assertEqual(attention.num_kv_heads, local_kv_heads)
+                            self.assertEqual(
+                                attention.attn.tp_k_head_num, local_kv_heads
+                            )
+                            self.assertEqual(attention.kv_size, local_kv_heads * dim)
+                            qkv = attention.qkv_proj
+                            self.assertEqual(rank_size(qkv), (rank, tp_size))
+                            self.assertEqual(
+                                rank_size(qkv, kv=True), (kv_rank, kv_tp_size)
+                            )
+
+                            q = (
+                                torch.arange(q_heads * dim * hidden)
+                                .reshape(-1, hidden)
+                                .float()
+                            )
+                            k = (
+                                torch.arange(kv_heads * dim * hidden)
+                                .reshape(-1, hidden)
+                                .float()
+                                + 1
+                            )
+                            v = k + 2
+                            # Retained construction groups must survive reload
+                            # under a different rank's runtime scope.
+                            with parallel_scope(tp_rank=0, attn_tp_rank=0):
+                                for name, weight in (("q", q), ("k", k), ("v", v)):
+                                    qkv.weight.weight_loader(qkv.weight, weight, name)
+                            if kv_heads >= kv_tp_size:
+                                kv_start = kv_rank * local_kv_heads * dim
+                            else:
+                                kv_start = (kv_rank // (kv_tp_size // kv_heads)) * dim
+                            kv_end = kv_start + local_kv_heads * dim
+                            expected = torch.cat(
+                                (
+                                    q.chunk(tp_size)[rank],
+                                    k[kv_start:kv_end],
+                                    v[kv_start:kv_end],
+                                )
+                            )
+                            torch.testing.assert_close(qkv.weight, expected)
+
     def test_attention_rows_keep_their_existing_execution_policy(self):
         from sglang.srt.layers.dp_attention import initialize_dp_attention_flags
         from sglang.srt.models.nemotron_h import NemotronHAttention

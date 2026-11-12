@@ -36,7 +36,11 @@ def _dsa_dcp_overrides(cfg: Any) -> dict:
                 if getattr(cfg, name) is None
             }
         )
-    if cfg.dcp_replicate_q_proj is None and cfg.dcp_comm_backend in ("a2a", "fi_a2a"):
+    if cfg.dcp_replicate_q_proj is None and cfg.dcp_comm_backend in (
+        "ag_delay_reduce",
+        "a2a",
+        "fi_a2a",
+    ):
         overrides["dcp_replicate_q_proj"] = True
     return overrides
 

@@ -1607,6 +1607,9 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         attn_output = self.attn(q, k, v, forward_batch)
 
         if self.attn_output_gate:
+            # ag_delay_reduce decode returns the DCP group's heads; the gate is TP-sharded.
+            if attn_output.shape[-1] != gate.shape[-1]:
+                gate = get_parallel().dcp_group.all_gather(gate.contiguous(), dim=1)
             if _fp8_tuple_input(self.o_proj, attn_output.shape[0]):
                 attn_output = fused_sigmoid_mul(attn_output, gate, quant=True)
             elif not _is_npu:

@@ -259,6 +259,8 @@ def _correct_attn_cp_out_kernel(
     new_outputs_stride_D,
     lse_idx,
     HEAD_DIM: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    N: tl.constexpr,
     N_ROUNDED: tl.constexpr,
     IS_LSE_BASE_ON_E: tl.constexpr,
 ):
@@ -291,7 +293,7 @@ def _correct_attn_cp_out_kernel(
     )
 
     # Compute final LSE using online softmax algorithm (more numerically stable)
-    lse = tl.load(lses_ptr + lse_offsets)
+    lse = tl.load(lses_ptr + lse_offsets, num_n_offsets < N, other=-float("inf"))
 
     # Replace NaN and inf with -inf for numerical stability
     neg_inf = float("-inf")
@@ -320,7 +322,7 @@ def _correct_attn_cp_out_kernel(
     tl.store(vlse_ptr + b_i32 * lses_stride_B + h_i32 * lses_stride_H, final_lse)
 
     # Load output with vectorized access: shape = [D]
-    d_offsets = tl.arange(0, HEAD_DIM)
+    d_offsets = tl.arange(0, BLOCK_D)
     output_offsets = (
         batch_idx * outputs_stride_B
         + head_idx * outputs_stride_H
@@ -333,9 +335,11 @@ def _correct_attn_cp_out_kernel(
         + d_offsets * new_outputs_stride_D
     )
     # Apply correction and store
-    output = tl.load(outputs_ptr + output_offsets)
-    output = output * factor
-    tl.store(new_output_ptr + new_output_offsets, output)
+    output = tl.load(outputs_ptr + output_offsets, d_offsets < HEAD_DIM, other=0)
+    # Empty KV shards may return NaN output alongside -inf LSE. They
+    # contribute zero, including when every shard is empty (graph padding).
+    output = tl.where(factor == 0, 0.0, output * factor)
+    tl.store(new_output_ptr + new_output_offsets, output, d_offsets < HEAD_DIM)
 
 
 class CPTritonContext:
@@ -423,7 +427,9 @@ def correct_attn_out(
     )
     const_args = {
         "HEAD_DIM": D,
-        "N_ROUNDED": N,
+        "BLOCK_D": triton.next_power_of_2(D),
+        "N": N,
+        "N_ROUNDED": triton.next_power_of_2(N),
         "IS_LSE_BASE_ON_E": is_lse_base_on_e,
     }
 
