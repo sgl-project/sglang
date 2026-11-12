@@ -270,7 +270,11 @@ class DSANPUIndexerMixin:
             if is_prefill and not uses_prefill_cp
             else None
         )
-        q_sliced_early = shard is not None and self.rotary_emb.is_neox_style
+        q_sliced_early = (
+            shard is not None
+            and self.rotary_emb is not None
+            and self.rotary_emb.is_neox_style
+        )
         if q_sliced_early:
             if dynamic_scale is not None:
                 dynamic_scale = shard.take(dynamic_scale)
@@ -279,7 +283,30 @@ class DSANPUIndexerMixin:
         else:
             bs_q = bs
 
-        if self.rotary_emb.is_neox_style:
+        if self.rotary_emb is None:
+            # skip_rope (index_rope_dim == 0, e.g. Kimi K3.1): the indexer
+            # q/k carry no rope part at all, so skip the rope split/apply
+            # entirely; q is all-nope and k needs no rotation.
+            if envs.SGLANG_NPU_USE_MULTI_STREAM.get():
+                indexer_weight_stream = get_indexer_weight_stream()
+                indexer_weight_stream.wait_stream(torch.npu.current_stream())
+                with torch.npu.stream(indexer_weight_stream):
+                    x = x.view(-1, self.hidden_size)
+                    weights = self.weights_proj(x.to(self.weights_proj.weight.dtype))[0]
+                    weights.record_stream(indexer_weight_stream)
+                    weights_event = indexer_weight_stream.record_event()
+            else:
+                x = x.view(-1, self.hidden_size)
+                weights = self.weights_proj(x.to(self.weights_proj.weight.dtype))[0]
+
+            q_lora = (q_lora, dynamic_scale) if dynamic_scale is not None else q_lora
+            q = self.wq_b(q_lora)[0]  # [bs, 1536] @ [1536, 64 * 128] = [bs, 64 * 128]
+            q = q.view(bs, self.n_heads, self.head_dim)  # [bs, 64, 128]
+
+            k_proj = self.wk(x)[0]  # [bs, 7168] @ [7168, 128] = [bs, 128]
+            k = self.k_norm(k_proj).unsqueeze(1)  # [bs, 1, 128]
+
+        elif self.rotary_emb.is_neox_style:
             if not hasattr(forward_batch, "npu_indexer_sin_cos_cache"):
                 cos_sin = self.rotary_emb.cos_sin_cache[positions]
                 cos, sin = cos_sin.chunk(2, dim=-1)
@@ -493,7 +520,11 @@ class DSANPUIndexerMixin:
 
         past_key_states = pool.get_index_k_buffer(layer_id)
 
-        if self.rotary_emb.is_neox_style and self.alt_stream is not None:
+        if (
+            self.rotary_emb is not None
+            and self.rotary_emb.is_neox_style
+            and self.alt_stream is not None
+        ):
             torch.npu.current_stream().wait_event(q_rope_event)
         if envs.SGLANG_NPU_USE_MULTI_STREAM.get():
             torch.npu.current_stream().wait_event(weights_event)

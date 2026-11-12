@@ -1357,7 +1357,14 @@ class NPUDSATokenToKVPool(NPUMLATokenToKVPool):
         tail_extra_slots: int = 0,
         max_running_requests: Optional[int] = None,
         skip_topk_layers: Optional[Sequence[bool]] = None,
+        kv_scale_ue8m0: bool = False,
+        use_fp4_indexer: bool = False,
     ):
+        # Accepted for signature compatibility with the in-tree DSATokenToKVPool
+        # contract; the NPU indexer kernels manage fp8 latent + fp32 per-tile
+        # scales internally and do not use the GPU-side ue8m0 / fp4 layouts.
+        self.kv_scale_ue8m0 = kv_scale_ue8m0
+        self.use_fp4_indexer = use_fp4_indexer
         assert index_kpool == 1, (
             "The Ascend hybrid DSA pool does not support index_kpool > 1 yet"
         )

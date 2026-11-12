@@ -4399,6 +4399,10 @@ class HybridLinearKVPool(KVCache):
         return getattr(self.full_kv_pool, "kv_scale_ue8m0", False)
 
     @property
+    def use_fp4_indexer(self) -> bool:
+        return getattr(self.full_kv_pool, "use_fp4_indexer", False)
+
+    @property
     def kv_cache_dim(self):
         return getattr(self.full_kv_pool, "kv_cache_dim", None)
 
