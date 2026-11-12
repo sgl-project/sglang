@@ -83,7 +83,7 @@ jobs:
             export PPU_JIT_CACHE_SHARED=/root/.cache/tvm-ffi
             export PPU_JIT_CACHE_LOCAL="/tmp/ppu-known-issues-tvm-ffi-${{ github.job }}"
             source scripts/ci/ppu/use_local_jit_cache.sh
-            bash scripts/ci/ppu/run_nightly_suite.sh known-issues-1-ppu "" "$PPU_EVIDENCE_DIR" 2400
+            bash scripts/ci/ppu/run_nightly_suite.sh known-issues-1-ppu "" "$PPU_EVIDENCE_DIR" 1800
           container_options: |
             privileged: true
             host_ipc: true
@@ -147,7 +147,7 @@ jobs:
             export PPU_JIT_CACHE_SHARED=/root/.cache/tvm-ffi
             export PPU_JIT_CACHE_LOCAL="/tmp/ppu-known-issues-tvm-ffi-${{ github.job }}"
             source scripts/ci/ppu/use_local_jit_cache.sh
-            bash scripts/ci/ppu/run_nightly_suite.sh known-issues-2-ppu "" "$PPU_EVIDENCE_DIR" 3600
+            bash scripts/ci/ppu/run_nightly_suite.sh known-issues-2-ppu "" "$PPU_EVIDENCE_DIR" 3000
           container_options: |
             privileged: true
             host_ipc: true

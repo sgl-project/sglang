@@ -1,6 +1,7 @@
 import io
 import multiprocessing
 import os
+import queue
 import re
 import sys
 import threading
@@ -1612,14 +1613,33 @@ class TestReset:
 
 def _dumper_worker(rank, http_port: int, stop_event):
     """Minimal distributed dumper worker: configure, step (triggers ZMQ setup), then wait."""
-    dumper.configure(enable=False, server_port=str(http_port))
-    dumper.step()
+    try:
+        dumper.configure(enable=False, server_port=str(http_port))
+        dumper.step()
+    except BaseException:
+        # Release the peer rank so the thread can return the real startup error.
+        stop_event.set()
+        raise
     stop_event.wait()
 
 
-def _wait_for_dumper_http(url: str, timeout: float = 30) -> None:
+def _run_dumper_instance(http_port: int, stop_event, error_queue):
+    try:
+        run_distributed_test(_dumper_worker, http_port=http_port, stop_event=stop_event)
+    except Exception as exc:
+        error_queue.put((http_port, f"{type(exc).__name__}: {exc}"))
+
+
+def _wait_for_dumper_http(url: str, timeout: float = 30, error_queue=None) -> None:
     deadline = time.time() + timeout
     while time.time() < deadline:
+        if error_queue is not None:
+            try:
+                port, error = error_queue.get_nowait()
+            except queue.Empty:
+                pass
+            else:
+                raise RuntimeError(f"Dumper startup failed on port {port}: {error}")
         try:
             requests.post(f"{url}/dumper/configure", json={}, timeout=2)
             return
@@ -1634,42 +1654,58 @@ class TestZmqPortIsolation:
     NUM_INSTANCES = 3
 
     def test_concurrent_instances_no_port_conflict(self):
-        ports = [
-            find_available_port(40000 + i * 1000) for i in range(self.NUM_INSTANCES)
-        ]
-        stop_events = []
-        threads = []
         ctx = multiprocessing.get_context("spawn")
+        for attempt in range(3):
+            ports = [
+                find_available_port(40000 + i * 1000) for i in range(self.NUM_INSTANCES)
+            ]
+            stop_events = []
+            threads = []
+            errors = queue.Queue()
 
-        for port in ports:
-            stop_event = ctx.Event()
-            stop_events.append(stop_event)
-            thread = threading.Thread(
-                target=run_distributed_test,
-                args=(_dumper_worker,),
-                kwargs={"http_port": port, "stop_event": stop_event},
-            )
-            thread.start()
-            threads.append(thread)
-
-        try:
             for port in ports:
-                _wait_for_dumper_http(f"http://127.0.0.1:{port}")
-
-            for i, port in enumerate(ports):
-                resp = requests.post(
-                    f"http://127.0.0.1:{port}/dumper/get_state", json={}
+                stop_event = ctx.Event()
+                stop_events.append(stop_event)
+                thread = threading.Thread(
+                    target=_run_dumper_instance,
+                    args=(port, stop_event, errors),
+                    daemon=True,
                 )
-                resp.raise_for_status()
-                states = resp.json()
-                assert (
-                    len(states) == 2
-                ), f"Instance {i} (port {port}): expected 2 ranks, got {len(states)}"
-        finally:
-            for event in stop_events:
-                event.set()
-            for thread in threads:
-                thread.join(timeout=10)
+                thread.start()
+                threads.append(thread)
+
+            try:
+                for port in ports:
+                    _wait_for_dumper_http(
+                        f"http://127.0.0.1:{port}", error_queue=errors
+                    )
+
+                for i, port in enumerate(ports):
+                    resp = requests.post(
+                        f"http://127.0.0.1:{port}/dumper/get_state", json={}
+                    )
+                    resp.raise_for_status()
+                    states = resp.json()
+                    assert (
+                        len(states) == 2
+                    ), f"Instance {i} (port {port}): expected 2 ranks, got {len(states)}"
+                return
+            except RuntimeError as exc:
+                if "Address already in use" not in str(exc) or attempt == 2:
+                    raise
+            finally:
+                for event in stop_events:
+                    event.set()
+                for thread in threads:
+                    thread.join(timeout=10)
+
+    def test_wait_surfaces_startup_error_before_timeout(self):
+        errors = queue.Queue()
+        errors.put((41554, "AssertionError: Rank 0: [Errno 98] Address already in use"))
+        with self.assertRaisesRegex(RuntimeError, "Address already in use"):
+            _wait_for_dumper_http(
+                "http://127.0.0.1:41554", timeout=0.01, error_queue=errors
+            )
 
 
 class TestDumperHttp:

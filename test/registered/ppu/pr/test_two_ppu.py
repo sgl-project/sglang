@@ -9,7 +9,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from sglang.test.ci.ci_register import register_ppu_ci
-from sglang.test.ppu_pr_utils import free_port
+from sglang.test.ppu_pr_utils import free_port, generate, prompt_ids, server
 
 register_ppu_ci(est_time=240, suite="stage-c-test-2-gpu-ppu")
 
@@ -65,6 +65,17 @@ def test_collectives():
             if process.is_alive():
                 process.kill()
             process.join(timeout=10)
+
+
+def test_tp2_serving_smoke():
+    ids = prompt_ids(128)
+    with server(tp=2) as base:
+        single = generate(base, ids)
+        batch = generate(base, [ids] * 4)
+        assert len(batch) == 4
+        for item in [single, *batch]:
+            assert isinstance(item["text"], str)
+            assert 0 < item["meta_info"]["completion_tokens"] <= 16
 
 
 if __name__ == "__main__":
