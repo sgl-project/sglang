@@ -805,14 +805,23 @@ class KVCacheConfigurator:
                             draft_virtual_id_space
                         )
                 sizes = msgspec.structs.replace(sizes, **size_overrides)
-            elif (
-                isinstance(token_to_kv_pool_allocator, HiSparseTokenToKVPoolAllocator)
-                and not self._uses_dflash_draft_kv_ring()
-            ):
+            elif get_spec().speculative_dflash_draft_kv_ring:
+                from sglang.srt.speculative.dflash_draft_ring import (
+                    draft_kv_ring_pool_rows_from_config,
+                )
+
+                sizes = msgspec.structs.replace(
+                    sizes,
+                    max_total_num_tokens=draft_kv_ring_pool_rows_from_config(
+                        self.model_config.hf_config,
+                        req_to_token_rows=req_to_token_pool.req_to_token.shape[0],
+                        page_size=max(int(self.pool_page_size or 1), 1),
+                    ),
+                )
+            elif isinstance(token_to_kv_pool_allocator, HiSparseTokenToKVPoolAllocator):
                 # HiSparse's target allocator hands out logical IDs from its
                 # host-expanded address space. Draft KV is direct-indexed by
                 # those shared IDs, so its GPU pool must span the same space.
-                # A DFLASH draft KV ring is addressed by ring rows instead.
                 draft_virtual_id_space = token_to_kv_pool_allocator.size_full
                 page = max(int(self.pool_page_size or 1), 1)
                 draft_virtual_id_space = (
@@ -821,16 +830,6 @@ class KVCacheConfigurator:
                 sizes = msgspec.structs.replace(
                     sizes, max_total_num_tokens=draft_virtual_id_space
                 )
-
-        if self._uses_dflash_draft_kv_ring() and req_to_token_pool is not None:
-            sizes = msgspec.structs.replace(
-                sizes,
-                max_total_num_tokens=self._dflash_draft_kv_ring_rows(
-                    draft_hf_config=self.model_config.hf_config,
-                    req_to_token_rows=req_to_token_pool.req_to_token.shape[0],
-                    page_size=max(int(self.pool_page_size or 1), 1),
-                ),
-            )
 
         # Initialize req_to_token_pool
         draft_owns_state = False
@@ -2742,51 +2741,24 @@ class KVCacheConfigurator:
         )
         return token_to_kv_pool
 
-    def _uses_dflash_draft_kv_ring(self) -> bool:
-        return self.is_draft_worker and get_spec().speculative_dflash_draft_kv_ring
-
-    def _dflash_draft_kv_ring_rows(
-        self, *, draft_hf_config, req_to_token_rows: int, page_size: int
-    ) -> int:
-        """The target's budget charge and the draft's allocation both size the
-        ring pool here."""
-        from sglang.srt.speculative.dflash_draft_ring import (
-            draft_kv_ring_pool_rows,
-            draft_kv_ring_rows_per_req,
-        )
-        from sglang.srt.speculative.dflash_utils import (
-            get_dflash_attention_sliding_window_size,
-        )
-
-        rows_per_req = draft_kv_ring_rows_per_req(
-            window_left=get_dflash_attention_sliding_window_size(draft_hf_config),
-            block_size=int(get_spec().speculative_num_draft_tokens),
-            dcp_size=get_parallel().attn_dcp_size,
-        )
-        return draft_kv_ring_pool_rows(
-            req_to_token_rows=req_to_token_rows,
-            rows_per_req=rows_per_req,
-            page_size=page_size,
-        )
-
     def _dflash_draft_kv_ring_bytes(self) -> int:
         if self.is_draft_worker or not get_spec().speculative_dflash_draft_kv_ring:
             return 0
-        draft_model_config = self.spec_aux_config.draft_model_config
-        cell_size = self.dflash_draft_cell_size_per_token
-        if draft_model_config is None or not cell_size:
-            return 0
+        from sglang.srt.speculative.dflash_draft_ring import (
+            draft_kv_ring_pool_rows_from_config,
+        )
+
         max_num_reqs = max(1, get_schedule().max_running_requests // self.attn_dp_size)
         page_size = get_schedule().page_size * self.dflash_draft_loc_space_scale
-        rows = self._dflash_draft_kv_ring_rows(
-            draft_hf_config=draft_model_config.hf_config,
+        rows = draft_kv_ring_pool_rows_from_config(
+            self.spec_aux_config.draft_model_config.hf_config,
             # Request rows plus the padding row: the ring is off under PD, so no
             # pre-alloc rows.
             req_to_token_rows=self._req_pool_rows(max_num_reqs) + 1,
             page_size=page_size,
         )
         # The pool adds one padding page.
-        ring_bytes = (rows + page_size) * int(cell_size)
+        ring_bytes = (rows + page_size) * int(self.dflash_draft_cell_size_per_token)
         logger.info(
             "DFLASH draft KV ring: %d rows, %.2f GB charged to the KV budget.",
             rows,

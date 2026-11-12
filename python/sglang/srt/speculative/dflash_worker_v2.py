@@ -61,7 +61,7 @@ from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, HiCacheDraft
 from sglang.srt.speculative.dflash_dp import gather_draft_embedding
 from sglang.srt.speculative.dflash_draft_ring import (
     DFlashDraftKVRing,
-    draft_kv_ring_rows_per_req,
+    draft_kv_ring_rows_per_req_from_config,
 )
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
@@ -71,7 +71,6 @@ from sglang.srt.speculative.dflash_utils import (
     apply_dflash_verify_logits_adjustments,
     can_dflash_use_fused_qkv_proj,
     compute_dflash_sampling_correct_drafts_and_bonus,
-    get_dflash_attention_sliding_window_size,
     is_dense_head_weight,
     is_dflash_sampling_verify_available,
     parse_dflash_draft_config,
@@ -717,15 +716,10 @@ class DFlashWorkerV2(BaseSpecWorker):
     def _init_draft_kv_ring(self) -> None:
         dcp_size = get_parallel().attn_dcp_size
         pool = self.draft_model_runner.token_to_kv_pool
-        window_left = get_dflash_attention_sliding_window_size(
-            self.draft_model_runner.model_config.hf_config
-        )
         req_to_token_rows = self.model_runner.req_to_token_pool.req_to_token.shape[0]
         self.draft_kv_ring = DFlashDraftKVRing(
-            rows_per_req=draft_kv_ring_rows_per_req(
-                window_left=window_left,
-                block_size=int(self.block_size),
-                dcp_size=dcp_size,
+            rows_per_req=draft_kv_ring_rows_per_req_from_config(
+                self.draft_model_runner.model_config.hf_config
             ),
             dcp_size=dcp_size,
             req_to_token_rows=req_to_token_rows,
@@ -2567,7 +2561,11 @@ class DFlashWorkerV2(BaseSpecWorker):
                 int(sum(batch.extend_lens)),
             )
             if self.draft_kv_ring is not None:
-                self.draft_kv_ring.record_floors(batch.reqs, batch.prefix_lens)
+                self.draft_kv_ring.record_floors(
+                    batch.reqs,
+                    batch.prefix_lens,
+                    self.model_runner.req_to_token_pool.req_generation,
+                )
                 draft_cache_loc = self.draft_kv_ring.extend_locs(
                     req_pool_indices=batch.req_pool_indices,
                     positions=positions,
@@ -2580,8 +2578,12 @@ class DFlashWorkerV2(BaseSpecWorker):
             self._append_target_hidden_to_draft_kv_by_loc(
                 target_hidden=logits_output.hidden_states,
                 cache_loc=draft_cache_loc,
-                swa_cache_loc=self._draft_write_ids(
-                    iteration_ids, IdSpaceKind.SLIDING_WINDOW
+                swa_cache_loc=(
+                    None
+                    if self.draft_kv_ring is not None
+                    else self._draft_write_ids(
+                        iteration_ids, IdSpaceKind.SLIDING_WINDOW
+                    )
                 ),
                 positions=positions,
                 extend_lens=ctx_lens,
@@ -3173,8 +3175,10 @@ class DFlashWorkerV2(BaseSpecWorker):
             target_hidden=hidden.reshape(-1, hidden.shape[-1]),
             cache_loc=cache_loc,
             cache_loc_2d=cache_loc.view(verify_out_cache_loc_2d.shape),
-            swa_cache_loc=self._draft_write_ids(
-                iteration_ids, IdSpaceKind.SLIDING_WINDOW
+            swa_cache_loc=(
+                None
+                if ring_block_locs is not None
+                else self._draft_write_ids(iteration_ids, IdSpaceKind.SLIDING_WINDOW)
             ),
             positions=positions,
             commit_lens=commit_lens,

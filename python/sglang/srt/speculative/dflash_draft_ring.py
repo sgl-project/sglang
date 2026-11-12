@@ -16,20 +16,19 @@ compute this layout and change together.
 KV the ring never had.
 """
 
-import weakref
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Optional
 
 import torch
 
 from sglang.kernels.ops.speculative.dflash_ring_locs import dflash_ring_block_locs
 from sglang.srt.arg_groups.choices import DFLASH_MLA_ONLY_DRAFT_BACKENDS
+from sglang.srt.runtime_context import get_parallel, get_spec
 
 
 def draft_kv_ring_unsupported_reason(
     load_draft_hf_config: Callable[[], Any],
     *,
     draft_backend: Optional[str],
-    draft_window_size: Optional[int],
     disaggregation_mode: str = "null",
     enable_unified_memory: bool = False,
     dcp_size: int = 1,
@@ -42,8 +41,6 @@ def draft_kv_ring_unsupported_reason(
         return "--enable-unified-memory places the draft KV in the target's pool"
     if draft_backend not in DFLASH_MLA_ONLY_DRAFT_BACKENDS:
         return f"draft backend {draft_backend!r} has no window index path"
-    if draft_window_size is not None:
-        return "--speculative-draft-window-size keeps the compact draft table"
 
     from sglang.srt.configs.model_config import mla_attention_dcp_size
     from sglang.srt.speculative.dflash_utils import (
@@ -74,11 +71,37 @@ def draft_kv_ring_rows_per_req(
     return -(-span // dcp_size) + 1
 
 
+def draft_kv_ring_rows_per_req_from_config(draft_hf_config) -> int:
+    """For this launch's draft, block size and DCP; the draft pool's size and
+    the ring's locs both take it from here."""
+    from sglang.srt.speculative.dflash_utils import (
+        get_dflash_attention_sliding_window_size,
+    )
+
+    return draft_kv_ring_rows_per_req(
+        window_left=get_dflash_attention_sliding_window_size(draft_hf_config),
+        block_size=int(get_spec().speculative_num_draft_tokens),
+        dcp_size=get_parallel().attn_dcp_size,
+    )
+
+
 def draft_kv_ring_pool_rows(
     *, req_to_token_rows: int, rows_per_req: int, page_size: int
 ) -> int:
     rows = 1 + req_to_token_rows * rows_per_req
     return -(-rows // page_size) * page_size
+
+
+def draft_kv_ring_pool_rows_from_config(
+    draft_hf_config, *, req_to_token_rows: int, page_size: int
+) -> int:
+    """The target's budget charge and the draft's allocation both size the
+    ring pool here."""
+    return draft_kv_ring_pool_rows(
+        req_to_token_rows=req_to_token_rows,
+        rows_per_req=draft_kv_ring_rows_per_req_from_config(draft_hf_config),
+        page_size=page_size,
+    )
 
 
 class DFlashDraftKVRing:
@@ -95,7 +118,8 @@ class DFlashDraftKVRing:
         # Positions a ring holds without wrapping onto each other.
         self.span = rows_per_req * dcp_size
         self.min_pos = torch.zeros(req_to_token_rows, dtype=torch.int32, device=device)
-        self._floor_owners: Dict[int, weakref.ref] = {}
+        # The req_generation each slot's floor was recorded at.
+        self._floor_generation = torch.full((req_to_token_rows,), -1, dtype=torch.int64)
 
     def locs(
         self, req_pool_indices: torch.Tensor, positions: torch.Tensor
@@ -143,22 +167,18 @@ class DFlashDraftKVRing:
         keep = positions.to(torch.int64) >= end_of_token - self.span
         return torch.where(keep, locs, torch.zeros_like(locs))
 
-    def record_floors(self, reqs, prefix_lens) -> None:
-        """Sets a slot's floor on its request's first extend. A new Req object
-        marks a new request, not a new rid: a rid can repeat."""
-        slots, floors = [], []
-        for req, prefix_len in zip(reqs, prefix_lens):
-            slot = req.kv.req_pool_idx
-            owner = self._floor_owners.get(slot)
-            if owner is None or owner() is not req:
-                self._floor_owners[slot] = weakref.ref(req)
-                slots.append(slot)
-                floors.append(int(prefix_len))
-        if slots:
-            self.min_pos[
-                torch.tensor(slots, dtype=torch.int64).to(
-                    self.min_pos.device, non_blocking=True
-                )
-            ] = torch.tensor(floors, dtype=torch.int32).to(
-                self.min_pos.device, non_blocking=True
-            )
+    def record_floors(self, reqs, prefix_lens, req_generation: torch.Tensor) -> None:
+        """Sets a slot's floor on the first extend after the slot is allocated;
+        ``req_generation`` is the req pool's per-slot allocation count."""
+        slots = torch.tensor([req.kv.req_pool_idx for req in reqs], dtype=torch.int64)
+        generation = req_generation[slots]
+        fresh = self._floor_generation[slots] != generation
+        if not bool(fresh.any()):
+            return
+        slots = slots[fresh]
+        self._floor_generation[slots] = generation[fresh]
+        floors = torch.tensor([int(p) for p in prefix_lens], dtype=torch.int32)[fresh]
+        device = self.min_pos.device
+        self.min_pos[slots.to(device, non_blocking=True)] = floors.to(
+            device, non_blocking=True
+        )

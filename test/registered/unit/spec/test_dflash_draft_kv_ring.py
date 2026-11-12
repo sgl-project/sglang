@@ -8,6 +8,7 @@ import torch
 from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.arg_groups.speculative_hook import _resolve_dflash_draft_kv_ring
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.dflash_draft_ring import (
     DFlashDraftKVRing,
@@ -72,7 +73,6 @@ class TestResolveDraftKVRing(CustomTestCase):
             "prefill": _args(disaggregation_mode="prefill"),
             "unified": _args(enable_unified_memory=True),
             "flashinfer": _args(speculative_draft_attention_backend="flashinfer"),
-            "compact window": _args(speculative_draft_window_size=4096),
         }
         for name, args in cases.items():
             with self.subTest(name), _switch():
@@ -154,19 +154,21 @@ class TestDraftKVRingLayout(CustomTestCase):
         self.assertEqual(first[kept].unique().numel(), ring.span)
         self.assertTrue(bool((second != 0).all()))
 
-    def test_a_new_request_with_a_reused_rid_resets_the_floor(self):
-        class Req:
-            def __init__(self):
-                self.rid = "same"
-                self.kv = SimpleNamespace(req_pool_idx=2)
-
+    def test_the_floor_resets_when_the_slot_is_allocated_again(self):
+        pool = ReqToTokenPool(
+            size=3, max_context_len=8, device="cpu", enable_memory_saver=False
+        )
         ring = _ring(1)
-        first = Req()
-        ring.record_floors([first], [100])
-        ring.record_floors([first], [3000])
-        self.assertEqual(int(ring.min_pos[2]), 100)
-        ring.record_floors([Req()], [5])
-        self.assertEqual(int(ring.min_pos[2]), 5)
+        slot = pool.alloc_rows(1)[0]
+        req = SimpleNamespace(kv=SimpleNamespace(req_pool_idx=slot))
+        ring.record_floors([req], [100], pool.req_generation)
+        ring.record_floors([req], [3000], pool.req_generation)
+        self.assertEqual(int(ring.min_pos[slot]), 100)
+        # The same request gets the same slot back, as after a retraction.
+        pool.free_rows([slot])
+        self.assertEqual(pool.alloc_rows(1), [slot])
+        ring.record_floors([req], [5], pool.req_generation)
+        self.assertEqual(int(ring.min_pos[slot]), 5)
 
 
 if __name__ == "__main__":
