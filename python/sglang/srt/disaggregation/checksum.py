@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-from typing import List, Sequence, Union
+from typing import List, Optional, Sequence, Union
 
 import torch
 
 from sglang.kernels.ops.memory.adler32 import adler32_strided_checksum
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
-from sglang.srt.layers.dcp.layout import dsa_index_k_page_tokens
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, MiniMaxSparseKVPool
@@ -90,12 +89,12 @@ def state_indices_for_request(
 
 def _state_indices(
     scheduler, req: Req, seq_len: int, start_idx: int = 0
-) -> Union[None, torch.Tensor, List[torch.Tensor]]:
+) -> Optional[torch.Tensor]:
     pool = scheduler.token_to_kv_pool_allocator.get_kvcache()
     router = pool.layer_router
     # A pool wrapping one token KV view keeps its other layers' state per request.
     if router.wrapped_view() is not None:
-        mamba_indices = (
+        return (
             scheduler.req_to_token_pool.req_index_to_mamba_index_mapping[
                 req.kv.req_pool_idx
             ]
@@ -103,17 +102,6 @@ def _state_indices(
             .contiguous()
             .reshape(-1)
         )
-        # uncompressed hybrid DSA registers index-K pages as a second state
-        # component, indexed by page rather than by Mamba slot
-        if getattr(pool, "use_dsa", False) and not pool.full_kv_pool.kpool_use_compress:
-            kv_indices = scheduler.req_to_token_pool.req_to_token[
-                req.kv.req_pool_idx, start_idx:seq_len
-            ]
-            dsa_indices = _to_page_indices_gpu(
-                kv_indices, dsa_index_k_page_tokens(pool.full_kv_pool.page_size)
-            )
-            return [mamba_indices, dsa_indices]
-        return mamba_indices
     if router.sub_pool(IdSpaceKind.SLIDING_WINDOW) is not None:
         from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
 

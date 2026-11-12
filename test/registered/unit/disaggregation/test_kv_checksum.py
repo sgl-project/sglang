@@ -12,7 +12,6 @@ from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.checksum import (
     KvChecksumComputer,
     is_health_check_req,
-    state_indices_for_request,
 )
 from sglang.srt.disaggregation.decode import (
     DecodeTransferQueue,
@@ -28,7 +27,6 @@ from sglang.srt.managers.scheduler_components.request_list import (
 )
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.router import PlainPoolRouter
-from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.scheduler_test_utils import FakeReq, release_only_retirer
 
@@ -176,68 +174,6 @@ class TestKvChecksumComputer(unittest.TestCase):
         if not torch.cuda.is_available():
             self.skipTest("CUDA not available")
         self.device = torch.device("cuda:0")
-
-    def test_hybrid_dsa_uses_component_specific_indices(self):
-        pool = object.__new__(HybridLinearKVPool)
-        pool.use_dsa = True
-        pool.full_kv_pool = SimpleNamespace(page_size=2, kpool_use_compress=False)
-        # one wrapped token KV view: the Mamba-slot branch
-        pool.layer_router = SimpleNamespace(wrapped_view=lambda: pool.full_kv_pool)
-        scheduler = SimpleNamespace(
-            token_to_kv_pool_allocator=SimpleNamespace(
-                get_kvcache=lambda: pool, storage=None
-            ),
-            req_to_token_pool=SimpleNamespace(
-                req_to_token=torch.tensor([[4, 5, 8, 9]], device=self.device),
-                req_index_to_mamba_index_mapping=torch.tensor([1], device=self.device),
-            ),
-        )
-        req = SimpleNamespace(kv=SimpleNamespace(req_pool_idx=0))
-        indices = state_indices_for_request(scheduler, req, 4, start_idx=2)
-        self.assertEqual([idx.tolist() for idx in indices], [[1], [4]])
-        mamba = torch.arange(4 * 16, device=self.device, dtype=torch.int32).view(4, 16)
-        dsa = torch.arange(8 * 32, device=self.device, dtype=torch.int32).view(8, 32)
-        computer = KvChecksumComputer(
-            self.device,
-            [],
-            [],
-            state_data_ptrs=[[mamba.data_ptr()], [dsa.data_ptr()]],
-            state_item_lens=[[64], [128]],
-        )
-        expected = _ref_strided_adler32([mamba, dsa], indices, [64, 128])
-        self.assertEqual(computer.compute(indices[1], indices), expected)
-        # A changed DSA page must be checked even when it is not the Mamba slot.
-        dsa[4, 0] += 1
-        self.assertNotEqual(computer.compute(indices[1], indices), expected)
-
-    def test_hybrid_dsa_checksum_pages_under_dcp(self):
-        pool = object.__new__(HybridLinearKVPool)
-        pool.use_dsa = True
-        pool.full_kv_pool = SimpleNamespace(page_size=64, kpool_use_compress=False)
-        # one wrapped token KV view: the Mamba-slot branch
-        pool.layer_router = SimpleNamespace(wrapped_view=lambda: pool.full_kv_pool)
-        scheduler = SimpleNamespace(
-            token_to_kv_pool_allocator=SimpleNamespace(
-                get_kvcache=lambda: pool, storage=None
-            ),
-            req_to_token_pool=SimpleNamespace(
-                req_to_token=torch.arange(512, 1024, device=self.device).view(1, -1),
-                req_index_to_mamba_index_mapping=torch.tensor([2], device=self.device),
-            ),
-        )
-        # DCP8 widens a physical 64-row page into 512 logical slots. Index-K
-        # still registers one item per physical page, like the transferred KV.
-        with (
-            patch("sglang.srt.layers.dcp.layout._dsa_shards_index_k", True),
-            patch(
-                "sglang.srt.layers.dcp.layout.get_parallel",
-                return_value=SimpleNamespace(attn_dcp_size=8),
-            ),
-        ):
-            indices = state_indices_for_request(
-                scheduler, SimpleNamespace(kv=SimpleNamespace(req_pool_idx=0)), 512
-            )
-        self.assertEqual([idx.tolist() for idx in indices], [[2], [1]])
 
     def test_kv_only_matches_reference(self):
         kv = _make_kv(num_layers=4, num_pages=32, page_elems=128, dtype=torch.bfloat16)
