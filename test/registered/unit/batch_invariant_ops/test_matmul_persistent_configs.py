@@ -74,5 +74,37 @@ class TestSegmentedMatmulLaunch(CustomTestCase):
                         self.assertEqual(num_stages, 1)
 
 
+class TestMatmulPersistentDispatch(CustomTestCase):
+    def test_column_slice_takes_one_kernel_for_every_batch_size(self):
+        """The DeepGEMM and Triton paths round the bias differently, so the rows of a
+        column-slice input must reach the same path whatever the number of rows."""
+        K, N = 48, 64
+        x = torch.randn(8, K + 32, dtype=torch.bfloat16)[:, :K]
+        weight_t = torch.randn(N, K, dtype=torch.bfloat16).t()
+        bias = torch.randn(N, dtype=torch.bfloat16)
+        paths = []
+
+        def fake_kernel(name):
+            def run(a, b, out_dtype, bias=None):
+                paths.append(name)
+                return torch.empty(a.shape[0], b.shape[1], dtype=out_dtype)
+
+            return run
+
+        with patch.multiple(
+            batch_invariant_ops,
+            ENABLE_JIT_DEEPGEMM=True,
+            _ENABLE_MM_DEEPGEMM=True,
+            _is_gfx95=False,
+            _matmul_persistent_deepgemm=fake_kernel("deepgemm"),
+            _matmul_persistent_triton=fake_kernel("triton"),
+        ):
+            for batch_size in (1, 2, 8):
+                batch_invariant_ops.matmul_persistent(
+                    a=x[:batch_size], b=weight_t, bias=bias
+                )
+        self.assertEqual(paths, ["deepgemm"] * 3)
+
+
 if __name__ == "__main__":
     unittest.main()
