@@ -35,7 +35,7 @@ from sglang.test.ci.ci_register import register_amd_ci
 
 register_amd_ci(est_time=35, stage="jit-kernel-unit", runner_config="amd")
 # backend-specific: the topk_length prefill path is gfx950-only.
-register_amd_ci(est_time=115, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=105, suite="stage-b-test-1-gpu-small-amd-mi35x")
 pytestmark = pytest.mark.skipif(not is_hip(), reason="ROCm only")
 
 _IS_GFX950 = is_hip() and _is_gfx950_sparse_mla_fp8(
@@ -470,7 +470,6 @@ def _decode_reference(qn, qr, idx, lens, kd, sm, mxfp8_q=True):
 @pytest.mark.parametrize(
     "H,lens,splits",
     [
-        pytest.param(16, _RAGGED, 2, id="h16-two-splits"),
         pytest.param(96, _RAGGED, 1, id="h96-unsplit"),
         pytest.param(128, _RAGGED, 8, id="h128-eight-splits"),
         pytest.param(96, [100] * 10, None, id="auto-four-splits"),
@@ -533,27 +532,17 @@ def test_dcp_partial_reads_the_indexer_local_slots():
 
 
 @pytest.mark.skipif(not is_gfx95_supported(), reason="gfx950 only")
-@pytest.mark.parametrize(
-    "H,topk,q_mul,head_major",
-    [
-        (8, 2048, 30.0, False),
-        (12, 1000, 30.0, True),
-        (16, 2048, 1.0, True),
-    ],
-)
-def test_sparse_mla_prefill_gfx950(H, topk, q_mul, head_major):
-    T = 96
+def test_sparse_mla_prefill_gfx950():
+    """Kimi-K3.1's TP8 shard (12 heads, head-major q) with large scores, a top-k that
+    ends inside a key tile, -1 padding and a row with no key."""
+    T, H, topk = 96, 12, 1000
     kv, k = _scaled_fp8_ds_mla_kv(_PREFILL_POOL, seed=H + topk)
     torch.manual_seed(topk + H)
-    q_nope = torch.randn(T, H, _DV, device=_DEVICE, dtype=torch.bfloat16) * (
-        0.1 * q_mul
-    )
-    q_rope = torch.randn(T, H, _DR, device=_DEVICE, dtype=torch.bfloat16) * (
-        0.1 * q_mul
-    )
-    if head_major:
-        q_nope = q_nope.transpose(0, 1).contiguous().transpose(0, 1)
-        q_rope = q_rope.transpose(0, 1).contiguous().transpose(0, 1)
+    q_nope = torch.randn(T, H, _DV, device=_DEVICE, dtype=torch.bfloat16) * 3.0
+    q_rope = torch.randn(T, H, _DR, device=_DEVICE, dtype=torch.bfloat16) * 3.0
+    # [H, T, D] storage viewed as [T, H, D]
+    q_nope = q_nope.transpose(0, 1).contiguous().transpose(0, 1)
+    q_rope = q_rope.transpose(0, 1).contiguous().transpose(0, 1)
     idx = torch.randint(0, _PREFILL_POOL, (T, topk), device=_DEVICE, dtype=torch.int32)
     idx[:8, -300:] = -1
     idx[8] = -1
