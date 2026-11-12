@@ -120,11 +120,6 @@ class SchedulerPPMixin:
 
     @DynamicGradMode()
     def event_loop_pp(self: Scheduler):
-        # FIXME: this loop never applies the write-after-read barrier
-        # (`Scheduler._apply_war_barrier`). Unified memory frees ids and
-        # rewrites request rows on the schedule stream at once and relies on
-        # this barrier, so an in-flight microbatch can read unbound or rebound
-        # mappings.
         """
         A scheduler loop for pipeline parallelism.
         Notes:
@@ -235,6 +230,8 @@ class SchedulerPPMixin:
                         self._pp_send_proxy_to_next_stage(result)
 
                 self.pp_outputs = next_pp_outputs
+                if cur_batch:
+                    self._pp_apply_war_barrier()
 
                 # `self.last_batch` is the one reloaded for this micro-batch, so
                 # pass the batch this iteration launched.
@@ -316,6 +313,7 @@ class SchedulerPPMixin:
                 self._pp_commit_comm_work(send_transfer_work)
                 tmbs[mb_id] = transferred_rids
 
+                self.process_pending_chunked_abort()
                 self.process_prefill_chunk(
                     last_batch=self.last_batch, running_batch=self.running_batch
                 )
@@ -391,6 +389,8 @@ class SchedulerPPMixin:
 
                 self.pp_outputs = next_pp_outputs
                 release_rids = next_release_rids
+                if cur_batch:
+                    self._pp_apply_war_barrier()
 
                 self.running_batch.batch_is_full = False
 
@@ -593,6 +593,8 @@ class SchedulerPPMixin:
                 release_rids = next_release_rids
                 consensus_retract_rids = next_consensus_retract_rids
                 consensus_prealloc_rids = next_consensus_prealloc_rids
+                if cur_batch:
+                    self._pp_apply_war_barrier()
 
                 self.running_batch.batch_is_full = False
 
@@ -617,6 +619,12 @@ class SchedulerPPMixin:
         unprocessed."""
         has_unprocessed_mb = any(mb is not None for mb in self.mbs)
         return self.ingest_requests(stop_at_pause=has_unprocessed_mb)
+
+    def _pp_apply_war_barrier(self: Scheduler) -> None:
+        """Order later schedule-stream writes after the launched forward's reads.
+        Result processing may run first: its result is another micro-batch's, and
+        what it releases is only reused at the next schedule, behind this wait."""
+        self._apply_war_barrier()
 
     def _pp_retract_microbatches(self: Scheduler) -> None:
         """Retract the requests of every micro-batch, none of them in flight."""
@@ -684,12 +692,6 @@ class SchedulerPPMixin:
         if get_parallel().pp_size == 1 or not isinstance(allocator, ChainAllocator):
             return
         checks = resolve_level() >= InvariantCheckLevel.WARN
-        if checks and self.recv_skipper is not None:
-            raise ValueError(
-                "the pipeline stages compare their capacity decisions with "
-                "every iteration's requests under invariant checks; that needs "
-                "--scheduler-recv-interval 1"
-            )
         geometries = [None] * get_parallel().pp_size
         torch.distributed.all_gather_object(
             geometries, allocator.stage_geometry(), group=self.pp_group.cpu_group
@@ -740,8 +742,7 @@ class SchedulerPPMixin:
         )
 
     def process_bootstrapped_queue(self: Scheduler):
-        reqs = self.disagg_prefill_bootstrap_queue.pop_bootstrapped()
-        self.waiting_queue.join(reqs)
+        self.disagg_prefill_bootstrap_queue.move_bootstrapped(self.waiting_queue)
 
     def _pp_pd_get_prefill_transferred_ids(self: Scheduler) -> Dict[str, bool]:
         """Return {rid: failed} for the transfers every stage so far has concluded.
@@ -1335,6 +1336,7 @@ class SchedulerPPMixin:
         from sglang.srt.speculative.spec_utils import (
             commit_mamba_states_after_verify,
             move_accept_tokens_to_target_kvcache,
+            relayed_commit_state_slots,
         )
 
         # Preserve the forward batch's row order after live-batch recomposition.
@@ -1366,6 +1368,7 @@ class SchedulerPPMixin:
                 accept_lens,
                 accept_index,
                 get_spec().speculative_num_draft_tokens,
+                state_slots=relayed_commit_state_slots(self.tp_worker, fwd_batch),
             )
 
         if verify_out_cache_loc is None:
@@ -1986,10 +1989,9 @@ class SchedulerPPMixin:
     def process_retract_queue(self: Scheduler, retract_rids: Optional[List[str]]):
         if retract_rids is not None:
             # try to resume retracted requests if there are enough space for another `num_reserved_decode_tokens` decode steps
-            resumed_reqs = self.disagg_decode_prealloc_queue.resume_retracted_reqs(
-                retract_rids
+            resumed_reqs = self.disagg_decode_prealloc_queue.move_resumed(
+                self.waiting_queue, retract_rids
             )
-            self.waiting_queue.join(resumed_reqs)
             return [req.rid for req in resumed_reqs]
         return None
 
@@ -2003,11 +2005,13 @@ class SchedulerPPMixin:
                 good_consensus_prealloc_rids,
                 bad_consensus_prealloc_rids,
             ) = prealloc_rids
-            good_reqs, failed_reqs = self.disagg_decode_prealloc_queue.pop_preallocated(
-                pp_good_rids=good_consensus_prealloc_rids,
-                pp_bad_rids=bad_consensus_prealloc_rids,
+            good_reqs, failed_reqs = (
+                self.disagg_decode_prealloc_queue.move_preallocated(
+                    self.disagg_decode_transfer_queue.queue,
+                    pp_good_rids=good_consensus_prealloc_rids,
+                    pp_bad_rids=bad_consensus_prealloc_rids,
+                )
             )
-            self.disagg_decode_transfer_queue.extend(good_reqs)
             return [
                 [req.req.rid for req in good_reqs],
                 [req.req.rid for req in failed_reqs],
@@ -2025,13 +2029,12 @@ class SchedulerPPMixin:
         self.disagg_decode_transfer_queue.resolve_deferred_releases()
         if release_rids is not None:
             released_reqs, outcomes = (
-                self.disagg_decode_transfer_queue.pop_transferred_with_outcomes(
-                    release_rids
+                self.disagg_decode_transfer_queue.move_transferred_with_outcomes(
+                    self.waiting_queue, release_rids
                 )
             )
             if self.enable_hisparse:
                 for req in released_reqs:
                     self.hisparse_coordinator.admit_request_direct(req)
-            self.waiting_queue.join(released_reqs)
             return outcomes
         return None

@@ -57,8 +57,12 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
+from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, HiCacheDraftPlan
 from sglang.srt.speculative.dflash_dp import gather_draft_embedding
+from sglang.srt.speculative.dflash_draft_ring import (
+    DFlashDraftKVRing,
+    draft_kv_ring_rows_per_req_from_config,
+)
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import (
@@ -132,6 +136,12 @@ def _get_fused_kv_materialize_helper():
 
         _FusedKVMaterializeHelper = FusedKVMaterializeHelper
     return _FusedKVMaterializeHelper
+
+
+def _unit_scale_on_hip(scale):
+    """ROCm: a missing draft KV scale becomes 1.0, which takes the fused fp8 write (bit-exact
+    with the eager saturating cast it replaces); other platforms keep None."""
+    return 1.0 if scale is None and is_hip() else scale
 
 
 class _DflashDraftSampler:
@@ -407,6 +417,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         self.draft_window_size: Optional[int] = get_spec().speculative_draft_window_size
         self.use_compact_draft_cache = self.draft_window_size is not None
         self.device = target_worker.device
+        self.draft_kv_ring: Optional[DFlashDraftKVRing] = None
 
         self._warned_sampling_fallback = False
         self._warned_lilicorr_eager = False
@@ -622,6 +633,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._bonus_id_bufs: List[torch.Tensor] = []
         self._out_tokens_bufs: List[torch.Tensor] = []
         self._new_seq_lens_bufs: List[torch.Tensor] = []
+        self._sharded_greedy_logits = (
+            is_hip() and envs.SGLANG_ROCM_MUSE_SHARDED_GREEDY_LOGITS.get()
+        )
         self._target_logits_processor = self._defer_target_verify_gather()
 
     def _defer_target_verify_gather(self) -> Optional[LogitsProcessor]:
@@ -636,23 +650,29 @@ class DFlashWorkerV2(BaseSpecWorker):
         return processors[0]
 
     def _can_skip_verify_logits(self, batch: ScheduleBatch, sampling_info) -> bool:
-        if (
-            self._selector_sample is not None
-            or batch.has_grammar
-            or batch.return_logprob
-        ):
+        """The accept reads only the target argmax: the vocab shards stay ungathered."""
+        if batch.has_grammar or batch.return_logprob:
             return False
         if sampling_info is None:
-            return True
+            return self._selector_sample is None
         penalizer = sampling_info.penalizer_orchestrator
-        return (
-            sampling_info.is_all_greedy
-            and not sampling_info.has_custom_logit_processor
-            and getattr(sampling_info, "acc_linear_penalties", None) is None
-            and (penalizer is None or not penalizer.is_required)
-            and getattr(sampling_info, "grammar_mask", None) is None
-            and getattr(sampling_info, "logit_bias", None) is None
-            and sampling_info.sampling_mask_batch_indices is None
+        if (
+            sampling_info.has_custom_logit_processor
+            or getattr(sampling_info, "acc_linear_penalties", None) is not None
+            or (penalizer is not None and penalizer.is_required)
+            or getattr(sampling_info, "grammar_mask", None) is not None
+            or getattr(sampling_info, "logit_bias", None) is not None
+            or sampling_info.sampling_mask_batch_indices is not None
+        ):
+            return False
+        if sampling_info.is_all_greedy:
+            return self._selector_sample is None
+        if not self._sharded_greedy_logits:
+            return False
+        # A sampling batch whose accept is the argmax anyway: a simulated acceptance
+        # overrides it, and without a sampling verify kernel it falls back to greedy.
+        return SIMULATE_ACC_LEN > 0 or (
+            self._selector_sample is None and not is_dflash_sampling_verify_available()
         )
 
     @property
@@ -690,6 +710,36 @@ class DFlashWorkerV2(BaseSpecWorker):
                 ),
                 token_to_kv_pool_allocator=token_to_kv_pool_allocator,
             )
+        if get_spec().speculative_dflash_draft_kv_ring:
+            self._init_draft_kv_ring()
+
+    def _init_draft_kv_ring(self) -> None:
+        dcp_size = get_parallel().attn_dcp_size
+        pool = self.draft_model_runner.token_to_kv_pool
+        req_to_token_rows = self.model_runner.req_to_token_pool.req_to_token.shape[0]
+        self.draft_kv_ring = DFlashDraftKVRing(
+            rows_per_req=draft_kv_ring_rows_per_req_from_config(
+                self.draft_model_runner.model_config.hf_config
+            ),
+            dcp_size=dcp_size,
+            req_to_token_rows=req_to_token_rows,
+            device=self.device,
+        )
+        if get_parallel().tp_rank == 0:
+            logger.info(
+                "DFLASH draft KV ring: %d rows per request per rank (%d positions), "
+                "%d req_to_token rows, draft pool %d rows.",
+                self.draft_kv_ring.rows_per_req,
+                self.draft_kv_ring.span,
+                req_to_token_rows,
+                pool.size,
+            )
+
+    def _build_hicache_draft_plan(self) -> HiCacheDraftPlan:
+        # A ring holds no prefix: a cached prefix brings no draft KV back.
+        if self.draft_kv_ring is not None:
+            return HiCacheDraftPlan()
+        return super()._build_hicache_draft_plan()
 
     def init_attention_backends(self):
         with (
@@ -697,6 +747,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_tp_context(self.draft_parallel_layout),
         ):
             self._draft_worker.init_attention_backends()
+        if self.draft_kv_ring is not None:
+            self.draft_model_runner.attn_backend.set_draft_kv_ring(self.draft_kv_ring)
         self._need_mamba_verify_commit = mambaish_config(
             self.model_runner.model_config
         ) is not None and hasattr(
@@ -1285,6 +1337,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         """Write the draft-local compact req->token rows: the committed suffix
         window at [0, draft_prefix_len) plus the verify block slots after it."""
         suffix_start = prefix_lens.to(torch.int64) - draft_prefix_lens.to(torch.int64)
+        full_to_swa = self._draft_kv_full_to_swa_mapping()
         if self._use_triton_compact_rebuild:
             rebuild_compact_draft_req_to_token_func(
                 draft_req_to_token=self.draft_model_runner.req_to_token_pool.req_to_token,
@@ -1295,6 +1348,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 verify_out_cache_loc_2d=verify_out_cache_loc_2d,
                 batch_size=bs,
                 block_size=block_size,
+                full_to_swa=full_to_swa,
             )
         else:
             suffix_cache_loc = self._gather_req_to_token_segments(
@@ -1303,6 +1357,9 @@ class DFlashWorkerV2(BaseSpecWorker):
                 start=suffix_start,
                 lengths=draft_prefix_lens,
             )
+            if full_to_swa is not None:
+                suffix_cache_loc = full_to_swa[suffix_cache_loc]
+                verify_out_cache_loc_2d = full_to_swa[verify_out_cache_loc_2d]
             assign_req_to_token_pool_func(
                 req_pool_indices,
                 self.draft_model_runner.req_to_token_pool.req_to_token,
@@ -1323,6 +1380,17 @@ class DFlashWorkerV2(BaseSpecWorker):
                 verify_out_cache_loc_2d.reshape(-1),
                 bs,
             )
+
+    def _draft_kv_full_to_swa_mapping(self) -> Optional[torch.Tensor]:
+        """The target's full->SWA id table when the draft pool's rows are the
+        target's sliding-window ids (SGLANG_ROCM_ENABLE_DFLASH_SWA_DRAFT_KV), else
+        None. Its compact rows must name those ids, like its writes do."""
+        if not self.draft_model_runner.token_to_kv_pool.follows_target_swa_ids:
+            return None
+        assert self.use_compact_draft_cache, (
+            "a draft pool on the target's SWA ids needs the compact window"
+        )
+        return self.model_runner.token_to_kv_pool_allocator.full_to_swa_index_mapping
 
     def _maybe_merge_trained_mask_embedding(self) -> None:
         """Merge a trained mask embedding (mask_embedding.pt) into the target table.
@@ -2024,8 +2092,10 @@ class DFlashWorkerV2(BaseSpecWorker):
                         commit_lens,
                         k,
                         v,
-                        attn.attn.k_scale,
-                        attn.attn.v_scale,
+                        # ROCm: a unit scale where the layer has none, so the fused fp8
+                        # write (one launch) replaces the eager clamp / cast / write fallback
+                        _unit_scale_on_hip(attn.attn.k_scale),
+                        _unit_scale_on_hip(attn.attn.v_scale),
                     )
                 return
 
@@ -2141,8 +2211,8 @@ class DFlashWorkerV2(BaseSpecWorker):
                     commit_lens,
                     cache_k,
                     cache_v,
-                    attn.k_scale,
-                    attn.v_scale,
+                    _unit_scale_on_hip(attn.k_scale),
+                    _unit_scale_on_hip(attn.v_scale),
                 )
             else:
                 token_to_kv_pool.layer_router.layer(attn.layer_id).store(
@@ -2280,7 +2350,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         target_predict: Optional[torch.Tensor] = None,
     ):
         new_seq_lens = None
-        if self._selector_sample is not None:
+        # A resolved argmax (vocab-sharded verify) means the accept is greedy.
+        if target_predict is None and self._selector_sample is not None:
             selector_candidate_ids, selector_q_rows = self._selector_sample
             accept_len, bonus = self._selector_sampling_accept(
                 candidates=candidates,
@@ -2350,7 +2421,9 @@ class DFlashWorkerV2(BaseSpecWorker):
                 )
                 out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
         if SIMULATE_ACC_LEN > 0:
-            apply_dflash_simulated_acceptance(
+            # new_seq_lens, if the Triton accept wrote it, holds the real
+            # accept; it comes back rewritten from the forced lengths, or None.
+            new_seq_lens = apply_dflash_simulated_acceptance(
                 candidates=candidates,
                 target_predict=target_predict,
                 accept_len=accept_len,
@@ -2362,10 +2435,9 @@ class DFlashWorkerV2(BaseSpecWorker):
                 simulate_acc_token_mode=SIMULATE_ACC_TOKEN_MODE,
                 next_token_logits=next_token_logits,
                 generator=self._simulated_acc_len_rng,
+                prefix_lens=prefix_lens,
+                new_seq_lens=new_seq_lens,
             )
-            # The Triton path may have written new_seq_lens from the real
-            # accept_len; recompute it from the forced commit_lens.
-            new_seq_lens = None
 
         return accept_len, commit_lens, bonus, out_tokens, new_seq_lens
 
@@ -2489,12 +2561,30 @@ class DFlashWorkerV2(BaseSpecWorker):
                 ctx_lens,
                 int(sum(batch.extend_lens)),
             )
-            # The draft KV goes to the slots the target prefill just wrote.
+            if self.draft_kv_ring is not None:
+                self.draft_kv_ring.record_floors(
+                    batch.reqs,
+                    batch.prefix_lens,
+                    self.model_runner.req_to_token_pool.req_generation,
+                )
+                draft_cache_loc = self.draft_kv_ring.extend_locs(
+                    req_pool_indices=batch.req_pool_indices,
+                    positions=positions,
+                    extend_lens=ctx_lens,
+                    seq_ends=draft_seq_lens + ctx_lens,
+                )
+            else:
+                # The draft KV goes to the slots the target prefill just wrote.
+                draft_cache_loc = self._draft_write_ids(iteration_ids)
             self._append_target_hidden_to_draft_kv_by_loc(
                 target_hidden=logits_output.hidden_states,
-                cache_loc=self._draft_write_ids(iteration_ids),
-                swa_cache_loc=self._draft_write_ids(
-                    iteration_ids, IdSpaceKind.SLIDING_WINDOW
+                cache_loc=draft_cache_loc,
+                swa_cache_loc=(
+                    None
+                    if self.draft_kv_ring is not None
+                    else self._draft_write_ids(
+                        iteration_ids, IdSpaceKind.SLIDING_WINDOW
+                    )
                 ),
                 positions=positions,
                 extend_lens=ctx_lens,
@@ -2760,6 +2850,13 @@ class DFlashWorkerV2(BaseSpecWorker):
             else iteration_ids
         )
         draft_plan.bind(forward_batch, draft_translator)
+        ring_block_locs = None
+        if self.draft_kv_ring is not None:
+            ring_block_locs = self.draft_kv_ring.block_locs(
+                batch.req_pool_indices, positions, block_size
+            )
+            forward_batch.out_cache_loc = ring_block_locs
+            forward_batch.out_cache_loc_virtual = None
 
         if self.selector is not None or self.lilicorr is not None:
             self._selector_sample = None
@@ -3070,13 +3167,19 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         # Consume in this step: every decode graph size shares one aux output,
         # which the next target forward overwrites (resolve_aux_hidden_states_width).
-        cache_loc = self._draft_write_ids(iteration_ids)
+        cache_loc = (
+            ring_block_locs
+            if ring_block_locs is not None
+            else self._draft_write_ids(iteration_ids)
+        )
         self._append_target_hidden_to_draft_kv_by_loc(
             target_hidden=hidden.reshape(-1, hidden.shape[-1]),
             cache_loc=cache_loc,
             cache_loc_2d=cache_loc.view(verify_out_cache_loc_2d.shape),
-            swa_cache_loc=self._draft_write_ids(
-                iteration_ids, IdSpaceKind.SLIDING_WINDOW
+            swa_cache_loc=(
+                None
+                if ring_block_locs is not None
+                else self._draft_write_ids(iteration_ids, IdSpaceKind.SLIDING_WINDOW)
             ),
             positions=positions,
             commit_lens=commit_lens,

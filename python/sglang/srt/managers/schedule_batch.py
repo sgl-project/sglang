@@ -160,6 +160,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.engram_staging import StagedRows
     from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
     from sglang.srt.managers.scheduler_components.metrics_reporter import PrefillStats
+    from sglang.srt.managers.scheduler_components.request_list import ReqList
     from sglang.srt.managers.scheduler_components.request_retirer import (
         RequestRetirer,
     )
@@ -191,7 +192,7 @@ def sanity_check_mm_pad_shift_value(vocab_size: int) -> None:
         raise ValueError(
             f"Model vocab_size ({vocab_size}) exceeds MM_PAD_SHIFT_VALUE ({MM_PAD_SHIFT_VALUE}). "
             f"MM pad_values may overlap with valid token IDs. "
-            f"Please increase MM_PAD_SHIFT_VALUE in schedule_batch.py."
+            f"Please increase MM_PAD_SHIFT_VALUE in req_types.py."
         )
 
 
@@ -428,6 +429,9 @@ class ReqKvInfo:
 
 class Req(ReqDllmMixin):
     """The input and output status of a request."""
+
+    # The scheduler list holding the request; `ReqList` keeps it.
+    owner_list: Optional[ReqList] = None
 
     def __init__(
         self,

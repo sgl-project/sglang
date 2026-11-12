@@ -460,6 +460,14 @@ def handle_cache_compatibility(server_args: Any) -> None:
             "_handle_cache_compatibility",
             _swa_full_tokens_ratio_explicitly_set=cfg.swa_full_tokens_ratio is not None,
         )
+    if cfg._max_running_requests_explicitly_set is None:
+        # The record, not the view: a model's default (DeepSeek-V4's) is declared earlier.
+        declare_resolution(
+            server_args,
+            "_handle_cache_compatibility",
+            _max_running_requests_explicitly_set=server_args.max_running_requests
+            is not None,
+        )
 
     # Validate the effective ratio: model branches may declare a reset
     # (e.g. Step3p forces 1.0 under hierarchical cache) that supersedes
@@ -788,6 +796,15 @@ def handle_page_major_kv_layout(server_args: Any):
 
     cfg = resolving_view(server_args)
     if cfg.enable_unified_memory:
+        # Unified memory relies on the scheduler's write-after-read barrier, a device
+        # stream wait; on MPS (MLX included) the scheduler has no device streams.
+        if cfg.device == "mps":
+            raise ValueError(
+                "--enable-unified-memory is not supported on MPS: it orders the "
+                "scheduler's writes after the running forward's reads with "
+                "device stream waits, and the scheduler has no device streams "
+                "on MPS or MLX."
+            )
         declare_resolution(
             server_args,
             "_handle_page_major_kv_layout",

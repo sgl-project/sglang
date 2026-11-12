@@ -32,6 +32,18 @@ IMAGE_VAE_WEIGHTS_NAME = "diffusion_pytorch_model.safetensors"
 _IMAGE_TASK_TYPES = {"t2i": ModelTaskType.T2I, "edit": ModelTaskType.I2I}
 
 
+def _dense_attention_backend() -> AttentionBackendEnum:
+    """The DiT's dense packed-varlen FlashAttention on this platform.
+
+    ROCm has no FA3 build (FA falls back to torch SDPA, which the deferred DiT
+    selection rejects); AITer runs the same packed varlen attention on gfx942
+    and gfx950.
+    """
+    if current_platform.is_rocm():
+        return AttentionBackendEnum.AITER
+    return AttentionBackendEnum.FA
+
+
 @dataclass
 class MiniMaxH3ImagePipelineConfig(MiniMaxH3PipelineConfig):
     """H3 DiT, Qwen and VAE with the image release's deployment contract.
@@ -218,14 +230,15 @@ class MiniMaxH3ImagePipelineConfig(MiniMaxH3PipelineConfig):
         if self._server_arg_value(server_args.backend) not in ("auto", "sglang"):
             raise ValueError("MiniMax H3 image requires the native SGLang backend")
         selected_backend = self.resolve_transformer_attention_backend(server_args)
-        if selected_backend not in (
-            None,
-            AttentionBackendEnum.FA,
-            AttentionBackendEnum.FP8_FA_SM120,
-        ):
+        dense_backend = _dense_attention_backend()
+        supported_backends = (None, dense_backend)
+        if dense_backend is AttentionBackendEnum.FA:
+            supported_backends += (AttentionBackendEnum.FP8_FA_SM120,)
+        if selected_backend not in supported_backends:
             raise ValueError(
-                "MiniMax H3 image supports dense FlashAttention or explicit "
-                "fp8_fa_sm120 attention"
+                "MiniMax H3 image requires dense FlashAttention "
+                f"(--attention-backend {dense_backend.name.lower()} on this platform); "
+                "CUDA also supports explicit fp8_fa_sm120 attention"
             )
         if (
             server_args.ring_degree > 1
@@ -233,6 +246,12 @@ class MiniMaxH3ImagePipelineConfig(MiniMaxH3PipelineConfig):
         ):
             raise ValueError(
                 "MiniMax H3 image Ring parallelism requires FlashAttention"
+            )
+        if dense_backend is not AttentionBackendEnum.FA and server_args.ring_degree > 1:
+            # the DiT's ring exchange is built on the FA backend only
+            raise ValueError(
+                "MiniMax H3 image ring parallelism requires FA; use --ulysses-degree "
+                f"or --tp-size with {dense_backend.name.lower()}"
             )
         for name in ("nnodes", "dp_size"):
             value = getattr(server_args, name)
@@ -300,9 +319,8 @@ class MiniMaxH3ImagePipelineConfig(MiniMaxH3PipelineConfig):
             "transformer"
         )
         if component_backend is None:
-            # Preserve global/forced choices through the component loader's
-            # strict explicit-request path. Native FlashAttention is the default.
-            backend = (selected_backend or AttentionBackendEnum.FA).name.lower()
+            # preserve explicit choices through the component loader's strict path
+            backend = (selected_backend or dense_backend).name.lower()
             server_args.component_attention_backends["transformer"] = backend
             server_args._requested_component_attention_backends["transformer"] = backend
 
