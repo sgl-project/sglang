@@ -432,7 +432,12 @@ class SchedulePolicy:
         ):
             return None
         remaining = len(chunked_req.full_untruncated_fill_ids) - chunked_req.prefix_len
-        replay = get_exec().features.enable_encoder_swa_bounded_replay
+        # A policy used before the server config is published, as in unit
+        # tests, reserves without replay rows.
+        replay = (
+            get_context().is_config_namespace_published("exec")
+            and get_exec().features.enable_encoder_swa_bounded_replay
+        )
         reserved = 0
         for req in waiting_queue:
             work = self._shortest_prefill_work(req)
