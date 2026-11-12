@@ -57,6 +57,16 @@ def test_projection_and_activation_rounding(m, n, k, bias, group):
     _equal(ops.convrot_int8_swiglu(*args, group), _reference(*args, group))
 
 
+@pytest.mark.parametrize(
+    "m,n,k,group",
+    [(1, 16, 64, 64), (65, 48, 192, 64), (513, 80, 320, 64), (31, 144, 384, 128)],
+)
+@pytest.mark.parametrize("bias", [False, True])
+def test_projection_column_and_reduction_tails(m, n, k, group, bias):
+    args = _inputs(m, n, k, bias, group)
+    _equal(ops.convrot_int8_swiglu(*args, group), _reference(*args, group))
+
+
 def test_all_bf16_bias_values_and_underflow():
     values = (
         torch.arange(65536, device="cuda", dtype=torch.int32)
