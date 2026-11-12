@@ -1306,6 +1306,13 @@ def _deterministic_attention_backend(view: Any) -> dict:
             f"You can explicitly set --attention-backend to one of {DETERMINISTIC_ATTENTION_BACKEND_CHOICES}."
         )
         return {"attention_backend": backend}
+    elif view.attention_backend == "dsa":
+        if not _deterministic_dsa_accepted(view):
+            raise ValueError(
+                "The dsa attention backend is supported for deterministic inference only "
+                "on gfx950 with --dsa-prefill-backend tilelang and --dsa-decode-backend "
+                "tilelang, without speculative decoding."
+            )
     elif view.attention_backend not in DETERMINISTIC_ATTENTION_BACKEND_CHOICES:
         # User explicitly specified an incompatible attention backend
         raise ValueError(
@@ -1313,6 +1320,17 @@ def _deterministic_attention_backend(view: Any) -> dict:
             f"but you explicitly specified '{view.attention_backend}'."
         )
     return {}
+
+
+def _deterministic_dsa_accepted(view: Any) -> bool:
+    # Verified on gfx950 with GLM-5.3 (DSA k-pool indexer): with the TileLang prefill
+    # and decode kernels every deterministic check passes, the radix cache included.
+    return (
+        is_gfx95_supported()
+        and view.dsa_prefill_backend == "tilelang"
+        and view.dsa_decode_backend == "tilelang"
+        and view.speculative_algorithm is None
+    )
 
 
 @register_post_process

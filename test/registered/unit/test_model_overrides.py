@@ -2019,6 +2019,45 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         with self.assertRaises(ValueError):
             _deterministic_attention_backend(view)
 
+    def test_deterministic_dsa_only_with_tilelang_on_gfx950(self):
+        """dsa is batch-invariant only with the TileLang prefill and decode kernels on
+        gfx950; every other dsa setup must still be refused."""
+        from sglang.srt.arg_groups.model_override_base import ResolvedView
+        from sglang.srt.arg_groups.overrides import _deterministic_attention_backend
+
+        cases = [
+            # (gfx950, dsa prefill, dsa decode, speculative algorithm, accepted)
+            (True, "tilelang", "tilelang", None, True),
+            (False, "tilelang", "tilelang", None, False),
+            (True, "flashmla_sparse", "tilelang", None, False),
+            (True, "tilelang", None, None, False),
+            (True, "tilelang", "tilelang", "EAGLE", False),
+        ]
+        for gfx950, prefill, decode, spec, accepted in cases:
+            with (
+                self.subTest(gfx950=gfx950, prefill=prefill, decode=decode, spec=spec),
+                patch(
+                    "sglang.srt.arg_groups.overrides.is_gfx95_supported",
+                    return_value=gfx950,
+                ),
+            ):
+                view = ResolvedView(
+                    SimpleNamespace(
+                        enable_deterministic_inference=True,
+                        attention_backend="dsa",
+                        prefill_attention_backend=None,
+                        decode_attention_backend=None,
+                        dsa_prefill_backend=prefill,
+                        dsa_decode_backend=decode,
+                        speculative_algorithm=spec,
+                    )
+                )
+                if accepted:
+                    self.assertEqual(_deterministic_attention_backend(view), {})
+                else:
+                    with self.assertRaisesRegex(ValueError, "dsa"):
+                        _deterministic_attention_backend(view)
+
     def test_deterministic_incompatible_phase_backend_raises(self):
         from sglang.srt.arg_groups.model_override_base import ResolvedView
         from sglang.srt.arg_groups.overrides import _deterministic_attention_backend
