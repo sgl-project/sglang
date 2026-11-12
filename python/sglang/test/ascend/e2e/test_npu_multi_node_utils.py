@@ -190,6 +190,29 @@ def build_meta_service_config(host: Optional[str] = None):
     }
 
 
+def build_hicache_storage_extra_config(
+    world_size: int, protocol: str, dram_size: str
+):
+    """Return the npu_memcache L3 backend config for
+    ``--hicache-storage-backend-extra-config``.
+
+    The MetaService/config-store endpoints are derived from
+    ``build_meta_service_config`` so the L3 backend connects to the
+    MetaService that ``launch_pd_separation_node`` starts for the same pod.
+    """
+    meta_service_config = build_meta_service_config()
+    return json.dumps(
+        {
+            "meta_service_url": meta_service_config["meta_service_url"],
+            "config_store_url": meta_service_config["config_store_url"],
+            "log_level": "info",
+            "world_size": world_size,
+            "protocol": protocol,
+            "dram_size": dram_size,
+        }
+    )
+
+
 def get_k8s_api():
     from kubernetes import client, config
 

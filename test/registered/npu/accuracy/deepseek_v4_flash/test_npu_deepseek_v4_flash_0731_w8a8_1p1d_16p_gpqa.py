@@ -1,4 +1,3 @@
-import json
 import logging
 import os
 import subprocess
@@ -15,7 +14,7 @@ from sglang.test.ascend.e2e.test_npu_performance_utils import (
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.ascend.e2e.test_npu_multi_node_utils import (
     NIC_NAME,
-    build_meta_service_config,
+    build_hicache_storage_extra_config,
 )
 
 logger = logging.getLogger(__name__)
@@ -26,43 +25,15 @@ register_npu_ci(
     nightly=True,
 )
 
-# npu_memcache MetaService must be started before the model server so the L3
-# cache backend can connect to it. Its ports follow the same per-pod offset
-# convention as SERVICE_PORT (first visible NPU id) so that concurrent test
-# pods sharing a host (hostNetwork) do not collide.
-def _get_first_visible_device():
-    devices = os.environ.get("ASCEND_RT_VISIBLE_DEVICES") or os.environ.get(
-        "ASCEND_VISIBLE_DEVICES"
-    )
-    if not devices:
-        return 0
-    return int(devices.strip().split(",")[0])
-
-
-# DEVICE_OFFSET = _get_first_visible_device()
-# META_SERVICE_PORT = 5007 + DEVICE_OFFSET
-# CONFIG_STORE_PORT = 6007 + DEVICE_OFFSET
-# META_METRICS_PORT = 8007 + DEVICE_OFFSET
-#
-# METASERVICE_CONFIG = {
-#     "meta_service_url": f"tcp://127.0.0.1:{META_SERVICE_PORT}",
-#     "config_store_url": f"tcp://127.0.0.1:{CONFIG_STORE_PORT}",
-#     "metrics_url": f"http://127.0.0.1:{META_METRICS_PORT}",
-# }
-
-
-METASERVICE_CONFIG = build_meta_service_config()
-
-
-HICACHE_STORAGE_EXTRA_CONFIG = json.dumps(
-    {
-        "meta_service_url": METASERVICE_CONFIG["meta_service_url"],
-        "config_store_url": METASERVICE_CONFIG["config_store_url"],
-        "log_level": "info",
-        "world_size": 16,
-        "protocol": "device_sdma",
-        "dram_size": "4GB",
-    }
+# npu_memcache L3 backend config (--hicache-storage-backend-extra-config);
+# the MetaService/config-store endpoints match the service started by
+# launch_pd_separation_node. world_size is the prefill instance's
+# tp_size*pp_size and dram_size is the per-rank host DRAM contribution (all
+# 16 ranks live on the prefill node, so the node donates 16 x 4GB = 64GB).
+HICACHE_STORAGE_EXTRA_CONFIG = build_hicache_storage_extra_config(
+    world_size=16,
+    protocol="device_sdma",
+    dram_size="4GB",
 )
 
 DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_COMMON_ENVS = {
