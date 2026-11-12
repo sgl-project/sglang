@@ -20,7 +20,7 @@ realizes the selected reservation before a host transfer pins device rows.
 """
 
 from contextlib import nullcontext
-from typing import Dict, Mapping, Optional
+from typing import Dict, Mapping, Optional, Sequence, Tuple
 
 from sglang.srt.layers.cp.base import get_cp_strategy, is_cp_sharded_padded
 from sglang.srt.layers.cp.utils import (
@@ -100,6 +100,9 @@ class PrefillBudget:
     # Set when `check_prefill` refuses a request no wait can admit;
     # the scheduler aborts it instead of keeping it queued.
     unschedulable = False
+    # True when admission prices each demand on the allocator rather than
+    # against a remaining token count; such a budget has no `remaining_total`.
+    prices_by_demand = False
 
     def __init__(self, allocator, tree_cache, *, num_mixed_decode_tokens: int = 0):
         self.allocator = allocator
@@ -213,6 +216,28 @@ class PrefillBudget:
         return paged_input + state_slots * self.state_slot_cost <= min(
             self.remaining_current, self.remaining_total
         )
+
+    def ignore_eos_decode_fits(
+        self,
+        req_states: Sequence[Tuple[float, int]],
+        *,
+        paged_input: int,
+        reserve_tokens: int,
+        **request,
+    ) -> bool:
+        """Whether admitting ``paged_input`` rows lets every running request decode
+        to its end, fewest-left first (``req_states``), plus ``reserve_tokens`` each."""
+        cur_rem_tokens = self.remaining_current - paged_input
+        tokens_freed = 0
+        for i, (tokens_left, tokens_occupied) in enumerate(req_states):
+            # tokens_left gives a reservative calculation as the last token is not stored
+            bs = len(req_states) - i
+            min_free_tokens = cur_rem_tokens + tokens_freed - tokens_left * bs
+            # reserve tokens for corner cases
+            if min_free_tokens <= reserve_tokens * bs:
+                return False
+            tokens_freed += tokens_occupied
+        return True
 
     def available_chunk_tokens(self, chunk_limit: int) -> int | None:
         available_tokens = int(self.remaining_total)
@@ -506,6 +531,7 @@ class ChainPrefillBudget(PrefillBudget):
     load_back_needs_full_tokens = True
     requires_final_shape_check = True
     admits_whole_requests = True
+    prices_by_demand = True
 
     def __init__(self, allocator, tree_cache, *, num_mixed_decode_tokens: int = 0):
         super().__init__(
@@ -533,12 +559,12 @@ class ChainPrefillBudget(PrefillBudget):
         self.window_current_offsets = dict(self.window_offsets)
 
     def _available_and_evictable(self):
-        # The scalar budget counts owner (FULL) tokens: admission prices every
-        # sub-pool itself, and `available_size` understates small-window needs.
-        available = self.allocator.full_available_size()
-        if is_cp_sharded_padded():
-            available = from_cp_sharded(available)
-        return available + self.tree_cache.full_evictable_size()
+        # Sub-pools share bytes, so no token count says whether a demand fits;
+        # every question this budget answers prices a demand (`_fits`).
+        raise TypeError(
+            "a budget over a shared memory has no remaining token count; ask "
+            "it whether a demand fits"
+        )
 
     def request_demand(
         self,
@@ -634,7 +660,13 @@ class ChainPrefillBudget(PrefillBudget):
         return {name: 0 for name, _ in self.windows}
 
     def _fits(
-        self, full_tokens, window_tokens, state_slots=0, *, empty_pool=False, now=False
+        self,
+        full_tokens,
+        window_tokens,
+        state_slots=0,
+        *,
+        empty_pool=False,
+        now=False,
     ):
         """Whether the pending work plus this demand is admitted (the demand alone
         with ``empty_pool``); with ``now``, pending is only this pass's forward rows."""
@@ -658,15 +690,10 @@ class ChainPrefillBudget(PrefillBudget):
             state_slots + state_pending,
         )
 
-        return self.allocator.admits(
-            demand,
-            evictable=(
-                None
-                if empty_pool
-                else evictable_by_sub_pool(self.tree_cache, self.allocator)
-            ),
-            empty_pool=empty_pool,
-        )
+        evictable = None
+        if not empty_pool:
+            evictable = evictable_by_sub_pool(self.tree_cache, self.allocator)
+        return self.allocator.admits(demand, evictable=evictable, empty_pool=empty_pool)
 
     def _admits(self, demand: KVDemand, **kwargs) -> bool:
         return self._fits(
@@ -675,15 +702,74 @@ class ChainPrefillBudget(PrefillBudget):
 
     @property
     def remaining_window_tokens(self):
-        # Token view for paths that size work by a token count (dLLM): the
-        # fewest tokens any window can still take, less what is pending on it.
-        if not self.windows:
-            return 0
-        return min(
-            self.allocator.window_available_size(name)
-            + self.tree_cache.window_evictable_size(name)
-            - self.window_offsets[name]
-            for name, _ in self.windows
+        return self._available_and_evictable()
+
+    def largest_chunk_tokens(
+        self, max_tokens: int, *, now: bool = False, granule: int = 1
+    ) -> int:
+        """The most tokens, up to ``max_tokens`` and on ``granule``, a chunk with no
+        cached prefix or decode can run beside pending work (and this pass's
+        writes, with ``now``)."""
+        return self._chunk_cap(
+            max_chunk_tokens=max_tokens,
+            chunk_limit=None,
+            host_hit_lengths=None,
+            state_slots=0,
+            now=now,
+            granule=granule,
+        )
+
+    def largest_block_tokens(
+        self,
+        max_tokens: int,
+        *,
+        prefix_tokens: int,
+        extra_tokens: int = 0,
+        now: bool = False,
+        granule: int = 1,
+    ) -> int:
+        """The most tokens, up to ``max_tokens`` and on ``granule``, a block that
+        extends ``prefix_tokens`` held rows can run beside pending work (and
+        this pass's writes, with ``now``): it takes exactly the pages past those
+        the prefix fills, in the token sub-pool and every window."""
+        page = self.page_size
+
+        def fits(tokens):
+            pages_end = -(-(prefix_tokens + tokens) // page) * page
+            rows = pages_end - -(-prefix_tokens // page) * page + extra_tokens
+            return self._admits(KVDemand.same_tokens(self.allocator, rows), now=now)
+
+        return largest_fitting_chunk(fits, max_tokens, granule)
+
+    def ignore_eos_decode_fits(
+        self,
+        req_states: Sequence[Tuple[float, int]],
+        *,
+        paged_input: int,
+        reserve_tokens: int,
+        extend_input_len: int,
+        max_new_tokens: int,
+        chunk_limit: Optional[int],
+        state_slots: int,
+        cached_tokens: int,
+    ) -> bool:
+        """The static rule's staged finish as one demand: the worst stage's token rows
+        beside the prompt rows, windows and state slots (admission is monotone)."""
+        peak = 0
+        tokens_freed = 0
+        for i, (tokens_left, tokens_occupied) in enumerate(req_states):
+            bs = len(req_states) - i
+            peak = max(peak, (tokens_left + reserve_tokens) * bs - tokens_freed)
+            tokens_freed += tokens_occupied
+        request = self.request_demand(
+            extend_input_len,
+            max_new_tokens,
+            chunk_limit=chunk_limit,
+            state_slots=state_slots,
+            cached_tokens=cached_tokens,
+        )
+        return self._fits(
+            paged_input + peak, request.window_tokens, request.state_slots, now=True
         )
 
     def has_capacity(self) -> bool:

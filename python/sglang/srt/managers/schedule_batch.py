@@ -123,6 +123,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     TreeLock,
 )
+from sglang.srt.mem_cache.capacity import capacity_decision
 from sglang.srt.mem_cache.common import (
     RetractionBackup,
     evict_from_tree_cache,
@@ -159,6 +160,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.engram_staging import StagedRows
     from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
     from sglang.srt.managers.scheduler_components.metrics_reporter import PrefillStats
+    from sglang.srt.managers.scheduler_components.request_list import ReqList
     from sglang.srt.managers.scheduler_components.request_retirer import (
         RequestRetirer,
     )
@@ -190,7 +192,7 @@ def sanity_check_mm_pad_shift_value(vocab_size: int) -> None:
         raise ValueError(
             f"Model vocab_size ({vocab_size}) exceeds MM_PAD_SHIFT_VALUE ({MM_PAD_SHIFT_VALUE}). "
             f"MM pad_values may overlap with valid token IDs. "
-            f"Please increase MM_PAD_SHIFT_VALUE in schedule_batch.py."
+            f"Please increase MM_PAD_SHIFT_VALUE in req_types.py."
         )
 
 
@@ -428,6 +430,9 @@ class ReqKvInfo:
 class Req(ReqDllmMixin):
     """The input and output status of a request."""
 
+    # The scheduler list holding the request; `ReqList` keeps it.
+    owner_list: Optional[ReqList] = None
+
     def __init__(
         self,
         rid: str,
@@ -541,12 +546,14 @@ class Req(ReqDllmMixin):
         self._think_end_match_len = 0
         self._think_start_match_len = 0
 
+        # The request clips its limits in place; the incoming params stay as
+        # received, since pipeline stages relay them onward.
+        sampling_params = copy.copy(sampling_params)
         # Only custom logit processors read "__req__", and the reference is weak
         # so the request still dies by refcount.
         if custom_logit_processor is not None and isinstance(
             sampling_params.custom_params, dict
         ):
-            sampling_params = copy.copy(sampling_params)
             sampling_params.custom_params = sampling_params.custom_params | {
                 "__req__": weakref.proxy(self)
             }
@@ -1138,6 +1145,8 @@ class Req(ReqDllmMixin):
         self,
         tree_cache: Optional[BasePrefixCache] = None,
         cow_mamba: Optional[bool] = None,
+        *,
+        defer_cow_slot: bool = False,
     ):
         if self.is_dllm():
             self._init_fill_ids_for_dllm()
@@ -1181,6 +1190,7 @@ class Req(ReqDllmMixin):
                 tree_cache,
                 token_ids_to_match,
                 cow_mamba=cow_mamba,
+                defer_cow_slot=defer_cow_slot,
                 max_prefix_len=key_limit,
             )
             self.mamba_branching_seqlen = match_result.mamba_branching_seqlen
@@ -2923,6 +2933,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             total += ceil_align(nxt, page_size) - ceil_align(cur, page_size)
         return total
 
+    @capacity_decision
     def check_decode_mem(self, selected_indices: Optional[List[int]] = None):
         """Whether the next decode step fits in the KV pool. The ALLOCATOR owns
         the capacity gate (eviction + any per-step reservations of its own) —
@@ -2945,6 +2956,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             spec_algorithm=self.spec_algorithm,
         )
 
+    @capacity_decision
     def retract_decode(
         self, request_retirer: RequestRetirer
     ) -> Tuple[List[Req], float, List[Req]]:
