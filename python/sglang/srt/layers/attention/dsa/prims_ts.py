@@ -13,8 +13,8 @@ from typing import Optional
 
 import torch
 
-# Decode/verify graphs plan their exact row count; eager batches above this share
-# power-of-two capacity plans, so prefill chunks do not plan one kernel per size.
+# Each row count up to this gets its own kept plan, for graph shapes and eager
+# batches alike; larger batches share power-of-two capacity plans.
 _EXACT_PLAN_MAX_ROWS = 1024
 
 # B200, B300/GB300 and Rubin; SM107 needs flashinfer-ai/flashinfer#8186.

@@ -4763,6 +4763,13 @@ class DeepseekSparseAttnBackend(
         row_plan: _RowPlan,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         assert self._prims_ts is not None
+        if k_scale != 1.0:
+            # The raw FP8 store casts K/V unscaled (quant_scale_kv=1.0), and
+            # trtllm-gen applies the scale to the logits only.
+            raise ValueError(
+                "--dsa-*-backend prims_ts does not support a checkpoint KV scale "
+                f"(k_scale={k_scale}); the raw FP8 MLA cache is stored unscaled."
+            )
         rows = q_all.shape[0]
         assert q_all.shape[1] == layer.tp_q_head_num
         lengths = metadata.cache_seqlens_int32 if seq_lens is None else seq_lens
