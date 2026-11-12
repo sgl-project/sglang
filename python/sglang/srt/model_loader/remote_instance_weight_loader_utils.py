@@ -118,7 +118,11 @@ def get_remote_instance_transfer_engine_info_per_rank(seed_url: str, rank: int):
 
 
 def register_memory_region(model, transfer_engine):
-    if importlib.util.find_spec("torch") is None:
+    from sglang.srt.utils.device import is_xpu
+
+    # v2 merges blocks from the CUDA caching allocator's snapshot; XPU registers
+    # each weight on its own.
+    if importlib.util.find_spec("torch") is None or is_xpu():
         return register_memory_region_v1(model, transfer_engine)
     else:
         return register_memory_region_v2(model, transfer_engine)

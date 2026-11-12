@@ -9,7 +9,7 @@ import torch.distributed as dist
 
 from sglang.srt.platforms import current_platform
 from sglang.srt.utils import init_custom_process_group
-from sglang.srt.utils.device import is_npu
+from sglang.srt.utils.device import is_npu, is_xpu
 from sglang.srt.utils.network import NetworkAddress
 
 logger = logging.getLogger(__name__)
@@ -64,6 +64,10 @@ class WeightExporter:
         group_name = f"{group_name}_{group_port}_{self.tp_rank}"
         backend = "hccl" if backend == "nccl" and is_npu() else backend
         device_type = "cuda" if not is_npu() else "npu"
+        if is_xpu():
+            # The client side picks xccl too; see RemoteInstanceConnector.build_group.
+            backend = "xccl" if backend == "nccl" else backend
+            device_type = "xpu"
 
         logger.info(
             f"init custom process group: tp_rank={self.tp_rank}, gpu_id={self.gpu_id}, master_address={master_address}, master_port={group_port}, "

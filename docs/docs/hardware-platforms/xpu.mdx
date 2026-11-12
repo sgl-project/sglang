@@ -337,6 +337,40 @@ Unsupported features are refused at startup. If startup fails with
 With P/D disaggregation, DCP on XPU skips the DCP pack fast path: the pack
 kernel runs only on CUDA, so KV is transferred per token instead.
 
+## R-Fork (Remote Instance Weight Loading) on Intel XPU [Experimental]
+
+[R-Fork](/docs/advanced_features/rfork) loads a new server's weights from a running
+seed server instead of from disk. On XPU:
+
+- The `nccl` backend builds an XCCL group between each seed and client TP rank.
+- The `transfer_engine` backend uses Mooncake TransferEngine with its TENT engine
+  (`MC_USE_TENT=1`, as for [P/D disaggregation](#mooncake-backend)). The seed
+  registers each weight tensor with the engine separately.
+- The `modelexpress` backend is not supported on XPU.
+
+The client calls the seed's admin endpoints, so start both servers with the same admin
+key (`--admin-api-key` or `SGLANG_ADMIN_API_KEY`); a seed without one refuses the request.
+
+```bash
+export SGLANG_ADMIN_API_KEY=<admin_api_key>   # in both shells
+
+# Seed (XPU 0)
+python -m sglang.launch_server --model-path <model> --device xpu --base-gpu-id 0 --port 30000
+
+# Client (XPU 1), loading the seed's weights over XCCL
+python -m sglang.launch_server --model-path <model> --device xpu --base-gpu-id 1 --port 30100 \
+    --load-format remote_instance --remote-instance-weight-loader-backend nccl \
+    --remote-instance-weight-loader-seed-instance-ip 127.0.0.1 \
+    --remote-instance-weight-loader-seed-instance-service-port 30000 \
+    --remote-instance-weight-loader-send-weights-group-ports "[60000]"
+```
+
+For `transfer_engine`, set `MC_USE_TENT=1` on both servers and pass
+`--remote-instance-weight-loader-start-seed-via-transfer-engine` to both. Pass
+`--remote-instance-weight-loader-backend transfer_engine` to the client, and give it
+its own `--engine-info-bootstrap-port`. Seed and client must use the same model and
+TP size.
+
 ## Memory Saver (release/resume memory occupation) on Intel XPU [Experimental]
 
 SGLang can temporarily release most of the GPU memory it holds — model weights
