@@ -202,6 +202,10 @@ pub struct InsertParams<'k, K: ChildKeyType> {
     pub mamba_host_value: Option<Tensor>,
     /// Both mamba values stay empty and the leaf already holds the checkpoint.
     pub allow_missing_mamba: bool,
+    /// The seqlen the donated mamba value was produced at. A leaf truncated to
+    /// a shorter component boundary (e.g. the SWA branch) is not that
+    /// position, and stamping it would attach a later state to an earlier key.
+    pub mamba_value_seqlen: Option<usize>,
     /// The inserting request already inserted [0, here); only the nodes past it
     /// count a hit (and get threshold-checked), so a request counts each node once.
     pub inserted_len: usize,
@@ -306,6 +310,7 @@ pub(crate) struct InsertWalkState<K: ChildKeyType> {
     mamba_value: Option<Tensor>,
     mamba_host_value: Option<Tensor>,
     allow_missing_mamba: bool,
+    mamba_value_seqlen: Option<usize>,
     inserted_len: usize,
     priority: i64,
     track_adopted_ranges: bool,
@@ -1942,6 +1947,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             mamba_value: params.mamba_value.as_ref().map(Tensor::shallow_clone),
             mamba_host_value: params.mamba_host_value.as_ref().map(Tensor::shallow_clone),
             allow_missing_mamba: params.allow_missing_mamba,
+            mamba_value_seqlen: params.mamba_value_seqlen,
             inserted_len: params.inserted_len,
             priority: params.priority,
             track_adopted_ranges: params.track_adopted_ranges,
@@ -2110,6 +2116,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             mamba_value: state.mamba_value.as_ref().map(Tensor::shallow_clone),
             mamba_host_value: state.mamba_host_value.as_ref().map(Tensor::shallow_clone),
             allow_missing_mamba: state.allow_missing_mamba,
+            mamba_value_seqlen: state.mamba_value_seqlen,
             inserted_len: state.inserted_len,
             priority: state.priority,
             track_adopted_ranges: state.track_adopted_ranges,
@@ -2168,6 +2175,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             mamba_value: state.mamba_value.as_ref().map(Tensor::shallow_clone),
             mamba_host_value: state.mamba_host_value.as_ref().map(Tensor::shallow_clone),
             allow_missing_mamba: state.allow_missing_mamba,
+            mamba_value_seqlen: state.mamba_value_seqlen,
             inserted_len: state.inserted_len,
             priority: state.priority,
             track_adopted_ranges: state.track_adopted_ranges,
@@ -2306,6 +2314,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             mamba_value: state.mamba_value.as_ref().map(Tensor::shallow_clone),
             mamba_host_value: state.mamba_host_value.as_ref().map(Tensor::shallow_clone),
             allow_missing_mamba: state.allow_missing_mamba,
+            mamba_value_seqlen: state.mamba_value_seqlen,
             inserted_len: state.inserted_len,
             priority: state.priority,
             track_adopted_ranges: state.track_adopted_ranges,

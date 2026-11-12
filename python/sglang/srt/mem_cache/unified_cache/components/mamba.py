@@ -250,6 +250,19 @@ class MambaComponent(TreeComponent):
         req.kv.mamba_needs_clear = False
         return result
 
+    def _mamba_value_misaligned(self, params: InsertParams) -> bool:
+        # The state was produced at mamba_value_seqlen; a leaf truncated to a
+        # shorter component boundary (e.g. the SWA branch) is not that
+        # position, and stamping it would attach a later state to an earlier
+        # key (#38815). This also covers host-only checkpoints after the
+        # source slot has been released or the copy was deliberately skipped.
+        return (
+            params.mamba_value_seqlen is not None
+            and params.key is not None
+            and len(params.key) + int(self.tree_core.is_eagle)
+            != params.mamba_value_seqlen
+        )
+
     def _mamba_host_only_checkpoint(self) -> bool:
         return self.host_only_checkpoint
 
@@ -318,6 +331,11 @@ class MambaComponent(TreeComponent):
         src = insert_params.mamba_host_src
         if src is None:
             return False
+        if self._mamba_value_misaligned(insert_params):
+            # The request still owns the source slot. Do not pay for a host
+            # copy that the commit hook would refuse to attach to this key.
+            insert_params.mamba_host_src = None
+            return False
         if self._destination_has_mamba(key):
             insert_params.mamba_host_src = None
             return True
@@ -349,7 +367,11 @@ class MambaComponent(TreeComponent):
     ) -> None:
         if insert_params is None or insert_params.mamba_host_value is None:
             return
-        inserted = insert_result is not None and not insert_result.mamba_exist
+        inserted = (
+            insert_result is not None
+            and not insert_result.mamba_exist
+            and not self._mamba_value_misaligned(insert_params)
+        )
         if not inserted:
             self.free_host_values([insert_params.mamba_host_value])
 
@@ -382,6 +404,8 @@ class MambaComponent(TreeComponent):
         result: InsertResult,
         cache_actions: list[CacheAction | ComponentAction],
     ) -> None:
+        if self._mamba_value_misaligned(params):
+            return
         if params.mamba_host_value is not None:
             assert params.mamba_value is None
             self._commit_host_only_checkpoint(node, params, result, cache_actions)
@@ -823,11 +847,13 @@ class MambaComponent(TreeComponent):
                 active_value = req.kv.mamba_pool_idx.unsqueeze(-1).clone()
             if self._mamba_host_only_checkpoint():
                 self._stash_host_checkpoint_source(insert_params, active_value)
+                insert_params.mamba_value_seqlen = cache_len
                 return cache_len
             if self.quantizes_checkpoints:
                 insert_params.mamba_value = self._commit_int8_checkpoint(active_value)
             else:
                 insert_params.mamba_value = active_value
+            insert_params.mamba_value_seqlen = cache_len
             return cache_len
         else:
             if cache_len is None:
@@ -843,6 +869,7 @@ class MambaComponent(TreeComponent):
                 if int(src_slot.reshape(-1)[0].item()) < 0:
                     return 0
                 self._stash_host_checkpoint_source(insert_params, src_slot)
+                insert_params.mamba_value_seqlen = cache_len
                 return cache_len
             # Donate the mamba index to the radix cache instead of copying.
             if self.quantizes_checkpoints:
@@ -875,6 +902,7 @@ class MambaComponent(TreeComponent):
                     sub_pool, req.kv.mamba_pool_idx.unsqueeze(0), mamba_value_donated
                 )
             insert_params.mamba_value = mamba_value_donated
+            insert_params.mamba_value_seqlen = cache_len
             return cache_len
 
     def cleanup_after_caching_req(
@@ -888,7 +916,12 @@ class MambaComponent(TreeComponent):
             self._release_unused_host_checkpoint(insert_result, insert_params)
         if is_finished:
             mamba_value_inserted = (
-                insert_result is not None and not insert_result.mamba_exist
+                insert_result is not None
+                and not insert_result.mamba_exist
+                and not (
+                    insert_params is not None
+                    and self._mamba_value_misaligned(insert_params)
+                )
             )
 
             if self.quantizes_checkpoints:
@@ -923,7 +956,9 @@ class MambaComponent(TreeComponent):
                 storage.release_state(sub_pool, req)
         else:
             if insert_params.mamba_value is not None and (
-                insert_result is None or insert_result.mamba_exist
+                insert_result is None
+                or insert_result.mamba_exist
+                or self._mamba_value_misaligned(insert_params)
             ):
                 self._free_mamba_value(insert_params.mamba_value)
             req.kv.mamba_last_track_seqlen = None

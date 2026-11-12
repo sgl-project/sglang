@@ -67,6 +67,7 @@ fn insert_params_mamba<'k>(
         mamba_value: mamba_slot.map(|slot| Tensor::from_slice(&[slot])),
         mamba_host_value: None,
         allow_missing_mamba: false,
+        mamba_value_seqlen: None,
         prev_prefix_len: 0,
         swa_evicted_seqlen: 0,
         swa_branching_seqlen: None,
@@ -2719,4 +2720,68 @@ fn release_after_a_restore_and_relock_keeps_the_other_lock() {
     assert_eq!(tc.arena.node(a).device_lock_ref(MAMBA), 0);
     assert_eq!(tc.evictable_size_(MAMBA), 1);
     assert_eq!(tc.protected_size_(MAMBA), 0);
+}
+
+// #38815: a leaf truncated to a shorter component boundary (e.g. the SWA
+// branch) must not receive a mamba value produced at a later track seqlen.
+#[test]
+fn misaligned_mamba_value_is_not_stamped() {
+    let mut tc = mamba_core(/* page_size = */ 1);
+    let key = (0..96).collect::<Vec<i64>>();
+    let value = (0..96).collect::<Vec<i64>>();
+    let result = tc.insert(&InsertParams {
+        mamba_value_seqlen: Some(192),
+        ..insert_params_mamba(&key, &value, Some(7))
+    });
+
+    assert_eq!(result.prefix_len, 0);
+    assert_eq!(
+        tc.all_mamba_values_flatten().size()[0],
+        0,
+        "state192 must not be stamped on key96"
+    );
+
+    // The same leaf accepts the value once the seqlen matches its position.
+    let result = tc.insert(&InsertParams {
+        mamba_value_seqlen: Some(96),
+        ..insert_params_mamba(&key, &value, Some(8))
+    });
+    assert_eq!(result.prefix_len, 96);
+    assert!(
+        tc.all_mamba_values_flatten()
+            .equal(&Tensor::from_slice(&[8i64])),
+        "state at the leaf's own seqlen must attach"
+    );
+}
+
+#[test]
+fn misaligned_mamba_host_value_is_not_stamped() {
+    let mut tc = UnifiedTreeCore::new(host_only_params(), vec![FULL, MAMBA]);
+    let key = (0..96).collect::<Vec<i64>>();
+    let value = (0..96).collect::<Vec<i64>>();
+    let mut params = insert_params_mamba(&key, &value, None);
+    params.mamba_host_value = Some(Tensor::from_slice(&[42i64]));
+    params.mamba_value_seqlen = Some(192);
+    let result = tc.insert(&params);
+    let leaf = tc
+        .arena
+        .resolve(result.last_device_node_id.expect("inserted leaf"))
+        .expect("live leaf");
+    assert!(tc.arena.node(leaf).try_device_value(MAMBA).is_none());
+    assert!(tc.arena.node(leaf).try_host_value(MAMBA).is_none());
+    assert!(!tc.host_lru_list(MAMBA).in_list(Some(leaf)));
+
+    let mut aligned = insert_params_mamba(&key, &value, None);
+    aligned.mamba_host_value = Some(Tensor::from_slice(&[43i64]));
+    aligned.mamba_value_seqlen = Some(96);
+    let result = tc.insert(&aligned);
+    assert_eq!(result.prefix_len, 96);
+    assert!(
+        tc.arena
+            .node(leaf)
+            .try_host_value(MAMBA)
+            .expect("aligned host checkpoint")
+            .equal(&Tensor::from_slice(&[43i64]))
+    );
+    assert!(tc.host_lru_list(MAMBA).in_list(Some(leaf)));
 }
