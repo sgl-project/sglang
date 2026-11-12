@@ -461,7 +461,8 @@ def test_parallel_group_construction_tp8_moe_ep4_cp2():
             parallel_state.destroy_model_parallel()
 
 
-def test_dcp_disables_quick_allreduce_without_changing_tp_default():
+@pytest.mark.parametrize("dcp_size", [4, 8])
+def test_dcp_disables_quick_allreduce_without_changing_tp_default(dcp_size):
     world_size = 8
 
     with (
@@ -504,10 +505,15 @@ def test_dcp_disables_quick_allreduce_without_changing_tp_default():
             mock_world.local_rank = 0
             mock_world_group.return_value = mock_world
 
-            publish_build_topology(tp_size=8, pp_size=1, dcp_size=8)
+            publish_build_topology(tp_size=8, pp_size=1, dcp_size=dcp_size)
             parallel_state.initialize_model_parallel()
 
-            assert created_group_kwargs["dcp"]["use_quick_allreduce"] is False
+            if dcp_size == 8:
+                # DCP spans each whole TP group: ROCm shares the TP communicators
+                assert "dcp" not in created_group_kwargs
+                assert parallel_state._DCP is parallel_state._TP
+            else:
+                assert created_group_kwargs["dcp"]["use_quick_allreduce"] is False
             assert "use_quick_allreduce" not in created_group_kwargs["tp"]
 
             parallel_state.destroy_model_parallel()
