@@ -1381,14 +1381,12 @@ class EngramEmbedding(nn.Module):
             elif _needs_fp8_byte_view():
                 # A5 has neither an fp8 index nor an e8m0 cast, so both tables are
                 # read as bytes and the scale's float bits are built directly.
-                weight = weight.view(torch.uint8)[local]
-                if not self.mxfp4:
-                    weight = weight.view(torch.float8_e4m3fn)
+                weight = weight.view(torch.uint8)[local].view(torch.float8_e4m3fn)
                 scale = _e8m0_to_float(scale.view(torch.uint8)[local])
             else:
                 weight, scale = weight[local], scale[local]
-            if self.mxfp4:
-                weight = unpack_mxfp4_rows(weight)
+                if self.mxfp4:
+                    weight = unpack_mxfp4_rows(weight)
             values = (
                 weight.float().unflatten(-1, (-1, FP8_BLOCK_SIZE))
                 * scale.float().unsqueeze(-1)

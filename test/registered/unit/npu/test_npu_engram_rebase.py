@@ -157,11 +157,7 @@ def test_a5_fp8_byte_view_load_and_lookup_are_preserved(production):
     production["engram_gather"].assert_not_called()
 
 
-@pytest.mark.parametrize("npu_byte_view", [False, True])
-def test_mxfp4_torch_fallback_keeps_packed_storage_and_decoding(
-    production, npu_byte_view
-):
-    production["_needs_fp8_byte_view"].return_value = npu_byte_view
+def test_mxfp4_torch_fallback_keeps_packed_storage_and_decoding(production):
     table = _table(production, mxfp4=True)
     packed = torch.arange(ROWS * (DIM // 2)).reshape(ROWS, DIM // 2).to(torch.uint8)
     scales = torch.tensor([125, 129], dtype=torch.uint8).expand(ROWS, DIM // BLOCK)

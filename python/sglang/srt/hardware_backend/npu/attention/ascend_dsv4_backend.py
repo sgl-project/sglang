@@ -2836,8 +2836,13 @@ class LowRatioCompressAscendBackendMixin:
         if raw_out_loc.numel() > 0:
             m = min(int(raw_out_loc.numel()), n)
             out_loc[:m] = raw_out_loc[:m]
-        # start_pos/seqused are written by _refresh_graph_verify_rows.
-        row_live = fm.seqused.repeat_interleave(w)
+        # A3 uses the query mask to exclude TP-padded request rows. Preserve
+        # the upstream A5 live-prefix convention.
+        row_live = (
+            ctx.live_seq_lens[: ctx.bs].to(torch.int64)
+            if is_npu_arch35()
+            else fm.seqused
+        ).repeat_interleave(w)
         for ratio in self._dsv41_low_ratios():
             keep, pos_values, slot_values = self._dsv41_ratio_row_values(
                 positions, out_loc, ratio, int(self.page_size), row_live=row_live
@@ -3339,10 +3344,10 @@ class DeepseekV4AscendAttnBackend(
             )
 
         if self._is_dspark_draft_worker:
-            # Drafts clear the compression ratios but still consume SWA metadata.
-            self.graph_metadata["kernel_metadata_c1a"] = torch.zeros(
-                1024 if is_npu_arch35() else 2048, dtype=torch.int32, device=device
-            )
+            if not is_npu_arch35():
+                self.graph_metadata["kernel_metadata_c1a"] = torch.zeros(
+                    2048, dtype=torch.int32, device=device
+                )
             block_size = self._dsv4_graph_tokens_per_req
             sparse_width = (
                 (self._dsv4_sliding_window_size + block_size + 127) // 128 * 128
@@ -3524,20 +3529,12 @@ class DeepseekV4AscendAttnBackend(
             metadata.ori_sparse_indices[:, :, 0] = 0
             metadata.ori_win_left = self._dsv4_sliding_window_size + tokens_per_req - 1
 
-        if self._is_dspark_draft_worker:
+        if self._is_dspark_draft_worker and not is_npu_arch35():
             metadata.kernel_metadata["c1a_metadata"] = self.graph_metadata[
                 "kernel_metadata_c1a"
             ]
-            # A5's host metadata ABI needs a stable CPU mirror even for capture.
-            metadata.seq_lens_cpu_int = self._seq_lens_cpu_int_view(bs)
-            metadata.seq_lens_cpu_int.fill_(1)
             metadata.kernel_metadata["c1a_metadata"].copy_(
-                self._kernel_metadata_from_parts(
-                    bs=bs,
-                    actual_seq_lengths_q_pa=metadata.actual_seq_lengths_q_pa,
-                    actual_seq_lengths_kv=metadata.actual_seq_lengths_kv,
-                    metadata=metadata,
-                )["c1a_metadata"]
+                self._dsv41_a3_draft_kernel_metadata(bs, metadata=metadata)
             )
 
         self.graph_metadata[metadata_key] = metadata
@@ -3846,11 +3843,15 @@ class DeepseekV4AscendAttnBackend(
             return
         fm = ctx.fm
         valid = ctx.live_seq_lens[: ctx.bs] > 0
-        if self._dsv4_has_low_ratio:
+        if self._dsv4_has_low_ratio and not is_npu_arch35():
             valid &= torch.arange(ctx.bs, device=ctx.device) < ctx.raw_bs
-        fm.start_pos.copy_(
-            torch.where(valid, ctx.live_seq_lens, torch.zeros_like(ctx.live_seq_lens))
-        )
+            fm.start_pos.copy_(
+                torch.where(
+                    valid, ctx.live_seq_lens, torch.zeros_like(ctx.live_seq_lens)
+                )
+            )
+        else:
+            fm.start_pos.copy_(ctx.live_seq_lens.to(torch.int32))
         if ctx.ragged_layout is not None:
             fm.seqused.copy_(
                 torch.where(valid, ctx.verify_lens, torch.zeros_like(ctx.verify_lens))
@@ -4096,7 +4097,8 @@ class DeepseekV4AscendAttnBackend(
         ):
             if key in kernel_metadata_new:
                 fm.kernel_metadata[key].copy_(kernel_metadata_new[key])
-        if self._dsv4_has_c4:
+        # A3 drafts have no C4 pool; retain the upstream A5 refresh behavior.
+        if is_npu_arch35() or self._dsv4_has_c4:
             fm.c4_topk_indices.fill_(-1)
 
     def _apply_dsv4_graph_metadata(
@@ -4317,13 +4319,10 @@ class DeepseekV4AscendAttnBackend(
         bs: int,
         actual_seq_lengths_q_pa: torch.Tensor,
         actual_seq_lengths_kv: torch.Tensor,
-        metadata=None,
     ) -> dict:
-        fm = self.forward_metadata if metadata is None else metadata
+        fm = self.forward_metadata
         if self._is_dspark_draft_worker and not is_npu_arch35():
-            return {
-                "c1a_metadata": self._dsv41_a3_draft_kernel_metadata(bs, metadata=fm)
-            }
+            return {"c1a_metadata": self._dsv41_a3_draft_kernel_metadata(bs)}
         common = {
             **_sparse_attn_kv_quant_kwargs(),
             "cu_seqlens_q": actual_seq_lengths_q_pa,

@@ -240,8 +240,13 @@ def test_shared_verify_capture_idle_live_idle_lifecycle(
         batch = _batch(prefixes, width, raw_bs=raw_bs, idle=idle)
         _refresh(b, batch)
         live_count = 0 if idle else raw_bs
-        assert fm.seqused.tolist() == [width] * live_count + [0] * (bs - live_count)
-        assert fm.start_pos.tolist() == prefixes[:live_count] + [0] * (bs - live_count)
+        # A5 keeps upstream prefix-derived scalars; A3 also masks raw_bs
+        # padding. Both filter absent output slots in the shared row planner.
+        scalar_rows = 0 if idle else (bs if arch35 else raw_bs)
+        assert fm.seqused.tolist() == [width] * scalar_rows + [0] * (bs - scalar_rows)
+        assert fm.start_pos.tolist() == prefixes[:scalar_rows] + [0] * (
+            bs - scalar_rows
+        )
         for ratio in (1, 2):
             keep = []
             positions = []
@@ -279,22 +284,20 @@ def test_target_verify_tp_tail_is_a3_only(build_backend, arch35):
         assert fm.actual_seq_lengths_q_pa.tolist() == [0, 6]
 
 
-@pytest.mark.parametrize("arch35", [False, True])
-def test_draft_capture_initializes_own_metadata_and_replay_keeps_addresses(
-    build_backend, arch35
+def test_a3_draft_capture_initializes_own_metadata_and_replay_keeps_addresses(
+    build_backend,
 ):
-    b = build_backend(arch35, 5, draft=True, bs=2)
+    b = build_backend(False, 5, draft=True, bs=2)
     stale = b.forward_metadata
     batch = _batch([128, 129], 5)
     fm = _capture(b, batch)
     assert not hasattr(stale, "kernel_metadata")
     assert set(fm.kernel_metadata) == {"c1a_metadata"}
     tensor = fm.kernel_metadata["c1a_metadata"]
-    assert tensor.numel() == (1024 if arch35 else 2048)
+    assert tensor.numel() == 2048
     assert torch.all(tensor != 0)
-    assert b._dsv41_seq_lens_cpu_buf.shape == (512,)
     pointer = tensor.data_ptr()
-    cpu_pointer = fm.seq_lens_cpu_int.data_ptr()
+    cpu_pointer = None
     for idle in (False, True, False):
         replay = _batch([130, 131], 5, idle=idle)
         ctx = b._build_dsv4_graph_replay_ctx(replay)
@@ -302,6 +305,8 @@ def test_draft_capture_initializes_own_metadata_and_replay_keeps_addresses(
         # No c4 pool exists: refresh must not unconditionally clear c4 indices.
         b._refresh_graph_kernel_metadata(ctx)
         assert tensor.data_ptr() == pointer
+        if cpu_pointer is None:
+            cpu_pointer = fm.seq_lens_cpu_int.data_ptr()
         assert fm.seq_lens_cpu_int.data_ptr() == cpu_pointer
         q = torch.zeros(10, b._dsv4_q_head_num, 512, dtype=torch.bfloat16)
         result = b._forward_swa(
@@ -311,10 +316,18 @@ def test_draft_capture_initializes_own_metadata_and_replay_keeps_addresses(
             torch.zeros(b._dsv4_q_head_num),
         )
         assert result.shape == q.shape
-        operator = b.test_ops.legacy if arch35 else b.test_ops.a3.attention
+        operator = b.test_ops.a3.attention
         assert operator.call_args.kwargs["metadata"].data_ptr() == pointer
-    if arch35:
-        assert b.test_ops.host.call_args.kwargs["cu_seqlens_q"].device.type == "cpu"
-        assert b.test_ops.host.call_args.kwargs["seqused_kv"].tolist() == [135, 136]
-    else:
-        assert b.test_ops.a3.attention.call_args.kwargs["ori_mask_mode"] == 0
+    assert b.test_ops.a3.attention.call_args.kwargs["ori_mask_mode"] == 0
+    b.test_ops.host.assert_not_called()
+
+
+def test_a5_draft_capture_preserves_upstream_initialization(build_backend):
+    # A3's standalone metadata initialization must not be imposed on A5. This
+    # checks the unchanged upstream contract, not an end-to-end A5 graph run.
+    b = build_backend(True, 5, draft=True, bs=2)
+    fm = _capture(b, _batch([128, 129], 5))
+    assert "kernel_metadata_c1a" not in b.graph_metadata
+    assert fm.kernel_metadata == {}
+    b.test_ops.host.assert_not_called()
+    b.test_ops.a3.metadata.assert_not_called()
