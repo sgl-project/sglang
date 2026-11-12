@@ -1021,9 +1021,10 @@ class DeepseekV4AscendAttnBackend(
             if getattr(pool, "_npu_dspark_context_start", None) is None:
                 # Allocate before graph capture. This local cold-start boundary
                 # is not a transferred component of the draft's paged SWA.
+                # Match prefix_lens to avoid int64 promotion on every draft step.
                 pool._npu_dspark_context_start = torch.zeros(
                     pool.num_req_slots,
-                    dtype=torch.int64,
+                    dtype=torch.int32,
                     device=self.req_to_token.device,
                 )
 
