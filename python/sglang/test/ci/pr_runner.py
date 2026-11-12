@@ -33,6 +33,21 @@ def sanitize(text):
     return text
 
 
+FILE_ENV = {
+    "registered/radix_cache/test_radix_attention.py": {
+        "SGLANG_TEST_RETRACT": "true",
+        "SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY": "1",
+    }
+}
+
+
+def environment_for_file(filename, env):
+    for suffix, values in FILE_ENV.items():
+        if filename.endswith("/" + suffix):
+            env.update(values)
+    return env
+
+
 class InvalidResults(ValueError):
     def __init__(self, counts, bad_skips):
         self.counts = counts
@@ -88,6 +103,7 @@ def run_pytest_files(
     suite_timeout=None,
     continue_on_error=False,
     allowed_skips=(),
+    deselect=(),
 ):
     directory = Path(report_dir)
     directory.mkdir(parents=True, exist_ok=True)
@@ -97,6 +113,7 @@ def run_pytest_files(
         "files": [],
         "success": False,
         "allowed_skips": list(allowed_skips),
+        "deselect": list(deselect),
     }
     summary = directory / "summary.json"
 
@@ -146,6 +163,16 @@ def run_pytest_files(
             env = dict(
                 os.environ, PYTEST_DISABLE_PLUGIN_AUTOLOAD="1", PYTEST_ADDOPTS=""
             )
+            # Match direct-script imports for objects serialized into server children.
+            env["PYTHONPATH"] = os.pathsep.join(
+                filter(None, [str(Path(filename).parent), env.get("PYTHONPATH")])
+            )
+            env = environment_for_file(filename, env)
+            if deselect:
+                env["PPU_CI_EXACT_DESELECT"] = json.dumps(list(deselect))
+                env["PYTHONPATH"] = os.pathsep.join(
+                    [str(Path(__file__).parent), env["PYTHONPATH"]]
+                )
             # -o addopts= prevents repository configuration from changing selection.
             command = [
                 sys.executable,
@@ -159,6 +186,8 @@ def run_pytest_files(
                 "junit_family=xunit2",
                 f"--junitxml={junit}",
             ]
+            if deselect:
+                command.extend(["-p", "exact_deselect"])
             with log.open("w+", errors="replace") as output:
                 process = subprocess.Popen(
                     command,

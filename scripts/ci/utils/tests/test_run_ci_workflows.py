@@ -631,6 +631,9 @@ class PpuPathSelectionTest(unittest.TestCase):
             ),
             (["python/sglang/srt/new_module.py", "README.md"], single),
             (["python/sglang/srt/layers/attention/new.py"], kernel),
+            (["test/registered/kernels/ops/activation/test_activation.py"], kernel),
+            (["python/sglang/kernels/ops/diffusion/timestep_embedding.py"], kernel),
+            (["python/sglang/kernels/ops/diffusion/triton/varlen_pack_pad.py"], kernel),
             (["python/sglang/srt/mem_cache/radix_cache.py"], kernel),
             (["sgl-kernel/csrc/attention.cu"], kernel),
             (["python/sglang/srt/hardware_backend/ppu/moe/ppu_deepep_hooks.py"], multi),
@@ -642,7 +645,7 @@ class PpuPathSelectionTest(unittest.TestCase):
             (["python/pyproject_other.toml"], multi),
             (["docker/Dockerfile.ppu"], multi),
             ([".github/actions/ppu-pr-suite/action.yml"], multi),
-            (["python/sglang/kernels/ops/diffusion/attention.py"], set()),
+            (["python/sglang/kernels/ops/diffusion/attention.py"], kernel),
             (["test/registered/diffusion/test_model.py"], set()),
             (["sgl-model-gateway/src/main.rs"], set()),
             (["python/sglang/srt/distributed/deep/README.MD"], set()),
@@ -685,7 +688,8 @@ class PpuPathSelectionTest(unittest.TestCase):
             self.assertEqual(jobs[job]["runs-on"], "k8s-runner-group-cpu-flytiger")
             action = next(s for s in jobs[job]["steps"] if s.get("id") == "worker")
             self.assertRegex(
-                action["uses"], r"^flytiger-eco/shared-workflows/cluster-task@[a-f0-9]{40}$"
+                action["uses"],
+                r"^flytiger-eco/shared-workflows/cluster-task@[a-f0-9]{40}$",
             )
             self.assertEqual(
                 action["with"]["timeout_minutes"], {smoke: 40, body: 55, multi: 55}[job]

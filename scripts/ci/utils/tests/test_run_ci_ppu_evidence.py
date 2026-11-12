@@ -58,6 +58,36 @@ class StrictRunnerTest(unittest.TestCase):
         self.assertTrue((self.root / "results" / record["junit"]).is_file())
         self.assertGreater(record["elapsed"], 0)
 
+    def test_file_directory_is_inherited_by_test_subprocesses(self):
+        (self.root / "serialized_fixture.py").write_text("VALUE = 42\n")
+        result, report = self.run_fixture(
+            "import subprocess,sys\n"
+            "def test_child_import():\n"
+            " subprocess.run([sys.executable, '-c', "
+            "'import serialized_fixture; assert serialized_fixture.VALUE == 42'], check=True)\n"
+        )
+        self.assertEqual(result, 0)
+        self.assertTrue(report["success"])
+
+    def test_explicit_deselect_preserves_other_tests(self):
+        result, report = self.run_fixture(
+            "def test_legacy(missing_fixture): pass\n"
+            "def test_legacy_extra(): pass\n"
+            "def test_ok(): pass\n",
+            deselect=("test_fixture.py::test_legacy",),
+        )
+        self.assertEqual(result, 0)
+        self.assertTrue(report["success"])
+        self.assertEqual(report["files"][0]["executed"], 2)
+        self.assertEqual(report["deselect"], ["test_fixture.py::test_legacy"])
+
+    def test_radix_environment_is_file_scoped(self):
+        path = "/workspace/source/test/registered/radix_cache/test_radix_attention.py"
+        env = RUNNER.environment_for_file(path, {})
+        self.assertEqual(env["SGLANG_TEST_RETRACT"], "true")
+        self.assertEqual(env["SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY"], "1")
+        self.assertEqual(RUNNER.environment_for_file("/tmp/test_other.py", {}), {})
+
     def test_failure_retains_counts(self):
         result, report = self.run_fixture("def test_bad():\n    assert False\n")
         self.assertEqual(result, 1)
@@ -295,6 +325,15 @@ class StrictRunnerTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "registration"):
             REPORT.verify(self.root, "cpu")
 
+    def test_deselected_case_cannot_verify(self):
+        suite, _ = self.build_cpu_evidence()
+        summary = self.root / suite / "summary.json"
+        report = json.loads(summary.read_text())
+        report["deselect"] = ["test_required_failure"]
+        summary.write_text(json.dumps(report))
+        with self.assertRaisesRegex(ValueError, "Deselection"):
+            REPORT.verify(self.root, "cpu")
+
 
 class EvidenceExportTest(unittest.TestCase):
     def test_read_only_source_redaction_and_writable_summary(self):
@@ -322,6 +361,7 @@ class EvidenceExportTest(unittest.TestCase):
                 source
                 / "environment-pods.timing.tsv": "2026-01-01T00:00:00Z\t2026-01-01T00:00:03Z\t2026-01-01T00:00:11Z\n",
                 source / "environment-pods.status": "export-fixture-value",
+                source / "checkout_sha.txt": "export-fixture-value",
                 nested / "case.xml": '<testsuite><testcase name="ok"/></testsuite>',
                 nested / "case.log": "password=export-fixture-value",
                 source / "ignored.bin": "export-fixture-value",
@@ -336,6 +376,7 @@ class EvidenceExportTest(unittest.TestCase):
                 destination = root / "export"
                 REPORT.export_evidence(source, destination)
                 self.assertFalse((destination / "ignored.bin").exists())
+                self.assertTrue((destination / "checkout_sha.txt").is_file())
                 for path in destination.rglob("*"):
                     if path.is_file():
                         text = path.read_text()

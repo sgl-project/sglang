@@ -279,6 +279,12 @@ OTHER_SUITES = {
         # readability only; validation reads their union.
         "weekly-test-8-gpu-h200",
     ],
+    HWBackend.PPU: [
+        # Manual-only known regressions. These never join the PR gate or the
+        # scheduled nightly inventory.
+        "known-issues-1-ppu",
+        "known-issues-2-ppu",
+    ],
 }
 
 
@@ -471,6 +477,7 @@ def run_a_suite(args):
                 "junit_dir": args.junit_dir,
                 "suite_timeout": args.suite_timeout,
                 "allowed_skips": tuple(args.allow_skip),
+                "deselect": tuple(args.deselect),
             }
             if getattr(args, "pytest", False)
             or getattr(args, "require_nonempty", False)
@@ -573,6 +580,12 @@ def main():
         default=[],
         help="Exact JUnit classname.method of a documented platform skip.",
     )
+    parser.add_argument(
+        "--deselect",
+        action="append",
+        default=[],
+        help="Exact pytest node to exclude for legacy unittest compatibility.",
+    )
     args = parser.parse_args()
     if args.pytest and (
         not args.junit_dir or args.enable_retry or args.timeout_from_est_time
@@ -580,8 +593,10 @@ def main():
         parser.error(
             "--pytest requires --junit-dir and fixed timeouts, without retries"
         )
-    if not args.pytest and (args.junit_dir or args.suite_timeout or args.allow_skip):
-        parser.error("JUnit, suite budget, and skip policy require --pytest")
+    if not args.pytest and (
+        args.junit_dir or args.suite_timeout or args.allow_skip or args.deselect
+    ):
+        parser.error("JUnit, suite budget, and selection policy require --pytest")
     if args.timeout_per_file <= 0 or (
         args.suite_timeout is not None and args.suite_timeout <= 0
     ):

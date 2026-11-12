@@ -1,0 +1,175 @@
+name: PPU Known Issues (K8s)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Git ref (branch, tag, or SHA) to test.'
+        required: false
+        type: string
+        default: ''
+
+concurrency:
+  group: ppu-known-issues-${{ inputs.ref || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  PPU_BASE_IMAGE: pkg.flytiger-eco.com/docker_release/llm:sdk2.2.0-pytorch2.11.0-ubuntu24.04-cuda13.0-sglang0.5.17-py312-20261001
+  PPU_SDK_VERSION: 2.2.0
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      ref: ${{ steps.source.outputs.ref }}
+    steps:
+      - name: Validate the requested source ref
+        id: source
+        env:
+          REQUESTED_REF: ${{ inputs.ref || github.sha }}
+        run: |
+          if [[ "$REQUESTED_REF" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            :
+          elif [[ "$REQUESTED_REF" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]] &&
+            git check-ref-format --allow-onelevel "$REQUESTED_REF" >/dev/null; then
+            :
+          else
+            echo 'ref must be a full commit SHA or a valid branch/tag ref' >&2
+            exit 1
+          fi
+          printf 'ref=%s\n' "$REQUESTED_REF" >> "$GITHUB_OUTPUT"
+
+  known-rmsnorm-fp32:
+    needs: [prepare]
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 50
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.ref }}
+          fetch-depth: 2
+      - name: Resolve the base image digest
+        run: bash scripts/ci/ppu/resolve_image_digest.sh
+      - name: Run the RMSNorm FP32 regression via K8s
+        uses: flytiger-eco/shared-workflows/cluster-task@4692d51c552e8cdf4f267adfdef1e484ca685a6a
+        with:
+          image: ${{ env.PPU_BASE_IMAGE_REF || env.PPU_BASE_IMAGE }}
+          nnodes: 0
+          nproc_per_node: 1
+          node_selector: board-type=ZW-810E
+          namespace: ppu-sched
+          job_suffix: ${{ github.job }}
+          host_volumes: "/wl_nas/cache/sglang-jit-ci:/root/.cache/tvm-ffi,/wl_nas/cache/sglang-dg-cache:/root/.cache/sglang/deep_gemm,/wl_nas/cache/sglang-jit:/root/.cache/sglang/jit"
+          extra_env: "PPU_EXPECTED_DEVICES=1,SGLANG_IS_IN_CI=true,SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1,SGL_KERNEL_WHEEL_CACHE_DIR=/nas_aisw/cache/sgl-kernel-wheels,PPU_BASE_IMAGE_REF=${{ env.PPU_BASE_IMAGE_REF || env.PPU_BASE_IMAGE }},PPU_BASE_IMAGE_DIGEST=${{ env.PPU_BASE_IMAGE_DIGEST }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_SDK_VERSION=${{ env.PPU_SDK_VERSION }},SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1,SGLANG_SAIL_PLA_CUDA=0,CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include,HF_HUB_OFFLINE=1,HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_SUPPORTS_FP8=0,PIP_INDEX_URL=https://pypi.org/simple"
+          command: |
+            set -euo pipefail
+            cd /workspace/source
+            export GITHUB_WORKSPACE=/workspace/source
+            git config --global --add safe.directory /workspace/source
+            export CUDA_VISIBLE_DEVICES="${NVIDIA_VISIBLE_DEVICES:?Assigned devices are unavailable}"
+            export PPU_EVIDENCE_DIR="/wl_nas/devops/ppu-known-issues-evidence/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}"
+            mkdir -p "$PPU_EVIDENCE_DIR"
+            bash scripts/ci/ppu/ppu_install_dependency.sh 2>&1 | tee "$PPU_EVIDENCE_DIR/setup.log"
+            export PPU_JIT_CACHE_SHARED=/root/.cache/tvm-ffi
+            export PPU_JIT_CACHE_LOCAL="/tmp/ppu-known-issues-tvm-ffi-${{ github.job }}"
+            source scripts/ci/ppu/use_local_jit_cache.sh
+            bash scripts/ci/ppu/run_nightly_suite.sh known-issues-1-ppu "" "$PPU_EVIDENCE_DIR" 1800
+          container_options: |
+            privileged: true
+            host_ipc: true
+            host_network: false
+            shm_size: 8Gi
+          timeout_minutes: 40
+          cleanup_policy: always
+      - name: Export sanitized regression evidence
+        if: always()
+        env:
+          PPU_EVIDENCE_DIR: /wl_nas/devops/ppu-known-issues-evidence/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}
+          PPU_ARTIFACTORY_USER: ${{ secrets.PPU_ARTIFACTORY_USER }}
+          PPU_ARTIFACTORY_PASSWORD: ${{ secrets.PPU_ARTIFACTORY_PASSWORD }}
+        run: |
+          python3 scripts/ci/ppu/pr_report.py export \
+            --directory "$PPU_EVIDENCE_DIR" \
+            --destination "/tmp/ppu-known-issues-evidence-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}"
+      - name: Upload regression evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-known-issues-evidence-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}
+          path: /tmp/ppu-known-issues-evidence-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}
+          if-no-files-found: error
+          retention-days: 14
+
+  known-tp2-logprobs:
+    needs: [prepare]
+    runs-on: k8s-runner-group-cpu-flytiger
+    container:
+      image: ghcr.io/actions/actions-runner:latest
+    timeout-minutes: 70
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.ref }}
+          fetch-depth: 2
+      - name: Resolve the base image digest
+        run: bash scripts/ci/ppu/resolve_image_digest.sh
+      - name: Run the TP2/TP1 logprob regression via K8s
+        uses: flytiger-eco/shared-workflows/cluster-task@4692d51c552e8cdf4f267adfdef1e484ca685a6a
+        with:
+          image: ${{ env.PPU_BASE_IMAGE_REF || env.PPU_BASE_IMAGE }}
+          nnodes: 0
+          nproc_per_node: 2
+          node_selector: board-type=ZW-810E
+          namespace: ppu-sched
+          job_suffix: ${{ github.job }}
+          host_volumes: "/wl_nas/cache/sglang-jit-ci:/root/.cache/tvm-ffi,/wl_nas/cache/sglang-dg-cache:/root/.cache/sglang/deep_gemm,/wl_nas/cache/sglang-jit:/root/.cache/sglang/jit"
+          extra_env: "PPU_EXPECTED_DEVICES=2,SGLANG_IS_IN_CI=true,SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1,SGL_KERNEL_WHEEL_CACHE_DIR=/nas_aisw/cache/sgl-kernel-wheels,PPU_BASE_IMAGE_REF=${{ env.PPU_BASE_IMAGE_REF || env.PPU_BASE_IMAGE }},PPU_BASE_IMAGE_DIGEST=${{ env.PPU_BASE_IMAGE_DIGEST }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_SDK_VERSION=${{ env.PPU_SDK_VERSION }},SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1,SGLANG_SAIL_PLA_CUDA=0,CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include,HF_HUB_OFFLINE=1,HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_SUPPORTS_FP8=0,PIP_INDEX_URL=https://pypi.org/simple"
+          command: |
+            set -euo pipefail
+            cd /workspace/source
+            export GITHUB_WORKSPACE=/workspace/source
+            git config --global --add safe.directory /workspace/source
+            export CUDA_VISIBLE_DEVICES="${NVIDIA_VISIBLE_DEVICES:?Assigned devices are unavailable}"
+            export PPU_EVIDENCE_DIR="/wl_nas/devops/ppu-known-issues-evidence/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}"
+            mkdir -p "$PPU_EVIDENCE_DIR"
+            bash scripts/ci/ppu/ppu_install_dependency.sh 2>&1 | tee "$PPU_EVIDENCE_DIR/setup.log"
+            export PPU_JIT_CACHE_SHARED=/root/.cache/tvm-ffi
+            export PPU_JIT_CACHE_LOCAL="/tmp/ppu-known-issues-tvm-ffi-${{ github.job }}"
+            source scripts/ci/ppu/use_local_jit_cache.sh
+            bash scripts/ci/ppu/run_nightly_suite.sh known-issues-2-ppu "" "$PPU_EVIDENCE_DIR" 3000
+          container_options: |
+            privileged: true
+            host_ipc: true
+            host_network: false
+            shm_size: 8Gi
+          timeout_minutes: 60
+          cleanup_policy: always
+      - name: Export sanitized regression evidence
+        if: always()
+        env:
+          PPU_EVIDENCE_DIR: /wl_nas/devops/ppu-known-issues-evidence/${{ github.run_id }}-${{ github.run_attempt }}/${{ github.job }}
+          PPU_ARTIFACTORY_USER: ${{ secrets.PPU_ARTIFACTORY_USER }}
+          PPU_ARTIFACTORY_PASSWORD: ${{ secrets.PPU_ARTIFACTORY_PASSWORD }}
+        run: |
+          python3 scripts/ci/ppu/pr_report.py export \
+            --directory "$PPU_EVIDENCE_DIR" \
+            --destination "/tmp/ppu-known-issues-evidence-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}"
+      - name: Upload regression evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ppu-known-issues-evidence-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}
+          path: /tmp/ppu-known-issues-evidence-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}
+          if-no-files-found: error
+          retention-days: 14

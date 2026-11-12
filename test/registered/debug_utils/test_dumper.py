@@ -1,10 +1,13 @@
+import errno
 import io
 import multiprocessing
 import os
+import queue
 import re
 import sys
 import threading
 import time
+import traceback
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Optional
@@ -41,7 +44,11 @@ from sglang.srt.debug_utils.dumper import (
 )
 from sglang.srt.utils import kill_process_tree
 from sglang.srt.utils.common import temp_set_env
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_ppu_ci,
+)
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -51,6 +58,7 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=30, stage="nightly", runner_config="2-gpu-large")
+register_ppu_ci(est_time=372, suite="nightly-2-ppu", nightly=True)
 register_amd_ci(est_time=60, suite="nightly-amd", nightly=True)
 
 
@@ -1605,16 +1613,56 @@ class TestReset:
         assert len(captured_b) == 0
 
 
+class _DumperHttpPortCollision(RuntimeError):
+    pass
+
+
+def _is_http_port_collision(error):
+    return "_DumperHttpPortCollision" in str(error)
+
+
 def _dumper_worker(rank, http_port: int, stop_event):
     """Minimal distributed dumper worker: configure, step (triggers ZMQ setup), then wait."""
-    dumper.configure(enable=False, server_port=str(http_port))
-    dumper.step()
+    try:
+        dumper.configure(enable=False, server_port=str(http_port))
+        dumper.step()
+    except OSError as exc:
+        # Only a bind failure in the HTTP server is safe to retry. ZMQ and
+        # distributed port collisions must remain visible as test failures.
+        if exc.errno == errno.EADDRINUSE and any(
+            frame.name == "_start_http_server"
+            for frame in traceback.extract_tb(exc.__traceback__)
+        ):
+            stop_event.set()
+            raise _DumperHttpPortCollision(
+                f"HTTP port {http_port} is already in use"
+            ) from exc
+        stop_event.set()
+        raise
+    except BaseException:
+        # Release the peer rank so the thread can return the real startup error.
+        stop_event.set()
+        raise
     stop_event.wait()
 
 
-def _wait_for_dumper_http(url: str, timeout: float = 30) -> None:
+def _run_dumper_instance(http_port: int, stop_event, error_queue):
+    try:
+        run_distributed_test(_dumper_worker, http_port=http_port, stop_event=stop_event)
+    except Exception as exc:
+        error_queue.put((http_port, f"{type(exc).__name__}: {exc}"))
+
+
+def _wait_for_dumper_http(url: str, timeout: float = 30, error_queue=None) -> None:
     deadline = time.time() + timeout
     while time.time() < deadline:
+        if error_queue is not None:
+            try:
+                port, error = error_queue.get_nowait()
+            except queue.Empty:
+                pass
+            else:
+                raise RuntimeError(f"Dumper startup failed on port {port}: {error}")
         try:
             requests.post(f"{url}/dumper/configure", json={}, timeout=2)
             return
@@ -1629,42 +1677,72 @@ class TestZmqPortIsolation:
     NUM_INSTANCES = 3
 
     def test_concurrent_instances_no_port_conflict(self):
-        ports = [
-            find_available_port(40000 + i * 1000) for i in range(self.NUM_INSTANCES)
-        ]
-        stop_events = []
-        threads = []
         ctx = multiprocessing.get_context("spawn")
+        for attempt in range(3):
+            ports = [
+                find_available_port(40000 + i * 1000) for i in range(self.NUM_INSTANCES)
+            ]
+            stop_events = []
+            threads = []
+            errors = queue.Queue()
 
-        for port in ports:
-            stop_event = ctx.Event()
-            stop_events.append(stop_event)
-            thread = threading.Thread(
-                target=run_distributed_test,
-                args=(_dumper_worker,),
-                kwargs={"http_port": port, "stop_event": stop_event},
-            )
-            thread.start()
-            threads.append(thread)
-
-        try:
             for port in ports:
-                _wait_for_dumper_http(f"http://127.0.0.1:{port}")
-
-            for i, port in enumerate(ports):
-                resp = requests.post(
-                    f"http://127.0.0.1:{port}/dumper/get_state", json={}
+                stop_event = ctx.Event()
+                stop_events.append(stop_event)
+                thread = threading.Thread(
+                    target=_run_dumper_instance,
+                    args=(port, stop_event, errors),
+                    daemon=True,
                 )
-                resp.raise_for_status()
-                states = resp.json()
-                assert (
-                    len(states) == 2
-                ), f"Instance {i} (port {port}): expected 2 ranks, got {len(states)}"
-        finally:
-            for event in stop_events:
-                event.set()
-            for thread in threads:
-                thread.join(timeout=10)
+                thread.start()
+                threads.append(thread)
+
+            try:
+                for port in ports:
+                    _wait_for_dumper_http(
+                        f"http://127.0.0.1:{port}", error_queue=errors
+                    )
+
+                for i, port in enumerate(ports):
+                    resp = requests.post(
+                        f"http://127.0.0.1:{port}/dumper/get_state", json={}
+                    )
+                    resp.raise_for_status()
+                    states = resp.json()
+                    assert (
+                        len(states) == 2
+                    ), f"Instance {i} (port {port}): expected 2 ranks, got {len(states)}"
+                return
+            except RuntimeError as exc:
+                if not _is_http_port_collision(exc) or attempt == 2:
+                    raise
+            finally:
+                for event in stop_events:
+                    event.set()
+                for thread in threads:
+                    thread.join(timeout=10)
+
+    def test_wait_surfaces_startup_error_before_timeout(self):
+        errors = queue.Queue()
+        errors.put(
+            (
+                41554,
+                "AssertionError: Rank 0: _DumperHttpPortCollision: "
+                "HTTP port 41554 is already in use",
+            )
+        )
+        with pytest.raises(RuntimeError, match="_DumperHttpPortCollision"):
+            _wait_for_dumper_http(
+                "http://127.0.0.1:41554", timeout=0.01, error_queue=errors
+            )
+
+    def test_only_http_port_collision_is_retryable(self):
+        assert _is_http_port_collision(
+            RuntimeError("Rank 0: _DumperHttpPortCollision: HTTP port 41554")
+        )
+        assert not _is_http_port_collision(
+            RuntimeError("Rank 0: [ZmqRpc] [Errno 98] Address already in use")
+        )
 
 
 class TestDumperHttp:
