@@ -203,6 +203,23 @@ _PREPROCESS_PEAK_FACTOR = 3
 _PREPROCESS_GPU_BUDGET_BYTES = 512 * 1024 * 1024
 
 
+_PREPROCESS_CACHE_RELEASE_BYTES = 1024 * 1024 * 1024
+
+
+def _release_preprocess_cache() -> None:
+    """Return idle cached GPU blocks to the driver after image preprocessing.
+
+    The HF image processor's transient buffers leave the CUDA caching allocator
+    holding reserved-but-unused memory that other work in the process cannot
+    reuse, so reserved memory only ever grows.
+    """
+    if not torch.cuda.is_available():
+        return
+    idle = torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
+    if idle > _PREPROCESS_CACHE_RELEASE_BYTES:
+        torch.cuda.empty_cache()
+
+
 def _media_size(media) -> Optional[tuple[int, int]]:
     """Return (height, width) of a decoded image, or None if unknown."""
     size = getattr(media, "size", None)
@@ -400,6 +417,9 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
     supports_transformers_backend = True
     generates_input_ids_from_raw_prompt = True
     artifact_modality = Modality.IMAGE
+    # Requests that bypass the chunked artifact path still fall back to CPU
+    # instead of failing with a 500 when GPU preprocessing runs out of memory.
+    retry_on_cpu_after_gpu_oom = True
     models = [
         Qwen2VLForConditionalGeneration,
         Qwen2_5_VLForConditionalGeneration,
@@ -980,6 +1000,7 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
         features, image_grid_thw = self._run_image_processor_chunked(
             processor, entries, image_kwargs, processor_device
         )
+        _release_preprocess_cache()
 
         if not isinstance(features, torch.Tensor):
             raise TypeError("Qwen-VL image processor must return pixel_values")
@@ -1218,6 +1239,7 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
         mm_items, input_ids, ret = await self.process_and_combine_mm_data_async(
             base_output, self.mm_tokens, **processor_kwargs
         )
+        _release_preprocess_cache()
 
         self._mark_cuda_ipc_features_for_deferred_reconstruction(mm_items)
 

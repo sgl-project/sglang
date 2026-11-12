@@ -51,6 +51,35 @@ class TestEstimate(CustomTestCase):
         )
 
 
+class TestReleasePreprocessCache(CustomTestCase):
+    def _run(self, reserved, allocated):
+        with patch.object(torch.cuda, "is_available", return_value=True), patch.object(
+            torch.cuda, "memory_reserved", return_value=reserved
+        ), patch.object(torch.cuda, "memory_allocated", return_value=allocated), patch.object(
+            torch.cuda, "empty_cache"
+        ) as empty:
+            qwen_vl._release_preprocess_cache()
+        return empty
+
+    def test_releases_when_idle_cache_large(self):
+        self._run(3 << 30, 1 << 30).assert_called_once()
+
+    def test_keeps_small_idle_cache(self):
+        self._run(1 << 30, 1 << 29).assert_not_called()
+
+    def test_noop_without_cuda(self):
+        with patch.object(torch.cuda, "is_available", return_value=False), patch.object(
+            torch.cuda, "empty_cache"
+        ) as empty:
+            qwen_vl._release_preprocess_cache()
+        empty.assert_not_called()
+
+
+class TestOomFallbackEnabled(CustomTestCase):
+    def test_qwen_vl_retries_on_cpu_after_gpu_oom(self):
+        self.assertTrue(QwenVLImageProcessor.retry_on_cpu_after_gpu_oom)
+
+
 class TestChunkedRun(CustomTestCase):
     def _make(self, fail_on_gpu=False):
         proc = QwenVLImageProcessor.__new__(QwenVLImageProcessor)
