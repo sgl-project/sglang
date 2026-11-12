@@ -499,6 +499,9 @@ def _uses_ep_a2a() -> bool:
 class KimiK3MoE(nn.Module):
     """K3 MoE with Latent MoE (experts run in moe_hidden_size space)."""
 
+    # Set per instance by k3_rocm_prefill_fp8.build_prefill_fp8_copies.
+    _prefill_fp8_sdown = None
+
     def __init__(
         self,
         config: KimiLinearConfig,
@@ -1519,11 +1522,13 @@ class KimiK3MoE(nn.Module):
                 shared.down_proj.weight, torch.Tensor
             )
         assert shared is not None
-        _k3_bf16_gemm(
-            shared.act_fn(gate_up),
-            shared.down_proj.weight,
-            out=shared_output,
-        )
+        shared_input = shared.act_fn(gate_up)
+        if self._prefill_fp8_sdown is None or not (
+            self._prefill_fp8_sdown.apply_raw_into(
+                shared.down_proj, shared_input, shared_output
+            )
+        ):
+            _k3_bf16_gemm(shared_input, shared.down_proj.weight, out=shared_output)
 
     def _get_fused_norm_params(self) -> tuple[torch.Tensor, float]:
         norm = self.routed_expert_norm
@@ -4192,6 +4197,12 @@ class KimiK3LinearForCausalLM(nn.Module):
             ):
                 rank0_log("Precompiled the Kimi-K3 KDA prefill kernel.")
             break
+
+        from sglang.srt.layers.quantization.k3_rocm_prefill_fp8 import (
+            build_prefill_fp8_copies,
+        )
+
+        build_prefill_fp8_copies(self)
 
 
 class KimiK3ForConditionalGeneration(nn.Module):

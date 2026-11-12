@@ -1131,6 +1131,10 @@ class Envs:
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ = EnvBool(True)
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ_MAX_TOKENS = EnvInt(256)
     SGLANG_K3_TARGET_DENSE_FP8 = EnvStr("off")
+    # Kimi-K3 on ROCm: comma list of dense groups that get a prefill-only FP8
+    # copy next to their BF16 weight (k3_rocm_prefill_fp8); empty = off.
+    SGLANG_K3_PREFILL_DENSE_FP8 = EnvStr("")
+    SGLANG_K3_PREFILL_DENSE_FP8_MIN_TOKENS = EnvInt(1024)
     SGLANG_DRAFT_FP8_ACTIVATION_SCHEME = EnvStr("dynamic")
     # Kimi-K3 fused KDA decode on ROCm: "gfx950" (in-tree kernel) or "aiter";
     # any other value keeps the unfused decode.

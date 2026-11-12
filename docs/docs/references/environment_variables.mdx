@@ -1953,6 +1953,16 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>256</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_K3_PREFILL_DENSE_FP8</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Kimi-K3 on ROCm: comma list of dense layer groups (<code>in_proj</code>, <code>o_proj</code>, <code>sdown</code>, <code>up</code>, <code>qkv_a</code>, <code>g_proj</code>, <code>q_b</code>, <code>kv_b</code>) that get a per-channel FP8 copy next to their BF16 weight, used only for calls of at least the row threshold. Decode keeps the BF16 weights. Costs extra HBM (7.2 GiB per GPU for all eight groups at TP8). Empty: off.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>""</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_K3_PREFILL_DENSE_FP8_MIN_TOKENS</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Row threshold of <code>SGLANG_K3_PREFILL_DENSE_FP8</code>; some groups use a higher per-group threshold.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>1024</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ROCM_K3_KDA_FUSED_BACKEND</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Kimi-K3 fused KDA decode on ROCm: <code>gfx950</code> runs the in-tree gfx950 kernel, <code>aiter</code> runs AITER's FlyDSL kernel. Any other value keeps the unfused decode.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>gfx950</code></td>
