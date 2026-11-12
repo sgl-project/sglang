@@ -1475,7 +1475,24 @@ class ModelRunner:
 
         if dumper.may_enable:
             dumper.apply_source_patches()
-            dumper.register_non_intrusive_dumper(self.model)
+            dumper.register_non_intrusive_dumper(
+                self.model,
+                # Which model a forward belongs to is a property of the runner,
+                # not of the forward: ForwardMode (see forward_mode.py) names
+                # the execution shape, and a draft path may borrow a target
+                # mode (DSPARK's draft block runs as TARGET_VERIFY), so the
+                # mode cannot name the model. Every role-aware consumer
+                # therefore reads is_draft_worker directly -- the
+                # debug_tensor_dump hook above splits its output folder on it,
+                # build_step_span_name labels profile spans DRAFT vs VERIFY
+                # with it, and this tags dumps.
+                # None when non-speculative, keeping dump names unchanged.
+                spec_role=(
+                    ("draft" if self.is_draft_worker else "target")
+                    if self.spec_algorithm.is_speculative()
+                    else None
+                ),
+            )
 
         # Pre-expand RoPE cache before CUDA Graph capture
         reserve_rope_cache_for_long_sequences(
