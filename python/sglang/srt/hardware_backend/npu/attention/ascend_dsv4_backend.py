@@ -26,7 +26,7 @@ from sglang.srt.layers.cp.base import get_cp_strategy
 from sglang.srt.model_executor.forward_batch_info import DSV4OutCacheLoc
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_executor.forward_mode import ForwardMode
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_disagg, get_parallel
 from sglang.srt.speculative.spec_info import SpecInputType
 from sglang.srt.state_capturer.indexer_topk import maybe_capture_indexer_topk
 
@@ -1016,7 +1016,11 @@ class DeepseekV4AscendAttnBackend(
         self._graph_table_high_water: dict[str, int] = {}
 
     def _init_dspark_context_start(self):
-        if self._is_dspark_draft_worker and not is_npu_arch35():
+        if (
+            self._is_dspark_draft_worker
+            and not is_npu_arch35()
+            and get_disagg().disaggregation_mode == "decode"
+        ):
             pool = self.token_to_kv_pool
             if getattr(pool, "_npu_dspark_context_start", None) is None:
                 # Allocate before graph capture. This local cold-start boundary
