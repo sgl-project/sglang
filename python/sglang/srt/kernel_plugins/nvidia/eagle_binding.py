@@ -129,9 +129,9 @@ class EagleForwardView(msgspec.Struct, frozen=True):
     """The running forward's attention data; built at capture for a graph step, so
     its tensors are the ones the graph replays."""
 
-    attn: AttnStepMetadata  # the full-attention layers'
+    attn: msgspec.Struct  # AttnStepMetadata or the backend's megakernel_step_view
     gdn: Optional[GdnStepMetadata]  # None for a model without GDN layers (the draft)
-    kv: KvPoolBuffers
+    kv: msgspec.Struct  # KvPoolBuffers or the backend's megakernel_pool_view
     mamba: Optional[MambaPoolBuffers]  # None for a model without GDN layers
 
 
@@ -264,12 +264,12 @@ class EagleBinding:
     def page_size(self) -> int:
         return get_schedule().page_size
 
-    def forward_view(self) -> EagleForwardView:
+    def forward_view(self, forward_batch: Optional[Any] = None) -> EagleForwardView:
         """The view of the forward running now."""
         backend = get_attn_backend()
         full, linear = split_backend(backend)
         return EagleForwardView(
-            attn=attn_step_metadata(full),
+            attn=attn_step_view(full, forward_batch),
             gdn=None if linear is None else gdn_step_metadata(linear),
             kv=self._read("kv", self._kv, backend),
             mamba=None if linear is None else self._read("mamba", self._mamba, backend),
@@ -322,11 +322,12 @@ class EagleBinding:
             self._sealed[name] = _identity(self._pools[name])
         return self._pools[name]
 
-    def _kv(self, backend: Any) -> KvPoolBuffers:
+    def _kv(self, backend: Any) -> msgspec.Struct:
+        full = split_backend(backend)[0]
+        if hasattr(full, "megakernel_pool_view"):
+            return full.megakernel_pool_view()
         return kv_pool_buffers(
-            pool=backend.token_to_kv_pool,
-            backend=split_backend(backend)[0],
-            model=self._model,
+            pool=backend.token_to_kv_pool, backend=full, model=self._model
         )
 
     def _prefill(self, backend: Any) -> LinearPrefillBuffers:
@@ -351,6 +352,14 @@ def split_backend(backend: Any) -> tuple[Any, Optional[Any]]:
     if isinstance(backend, HybridLinearAttnBackend):
         return backend.full_attn_backend, backend.linear_attn_backend
     return backend, None
+
+
+def attn_step_view(backend: Any, forward_batch: Optional[Any]) -> msgspec.Struct:
+    """A backend's own step struct (megakernel_step_view, with megakernel_pool_view
+    for its pool) where it offers one, else the TRT-LLM MHA metadata."""
+    if hasattr(backend, "megakernel_step_view"):
+        return backend.megakernel_step_view(forward_batch)
+    return attn_step_metadata(backend)
 
 
 def attn_step_metadata(backend: Any) -> AttnStepMetadata:
