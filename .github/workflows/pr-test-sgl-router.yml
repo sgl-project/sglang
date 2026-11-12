@@ -13,12 +13,19 @@ name: PR Test (sgl-router)
 #
 #   * `push` on `main` keeps firing so post-merge runs still record
 #     against the default branch.
+#
+#   * No `labeled` trigger, as in `pr-test.yml` and `pr-test-extra.yml`:
+#     every label event (`highest-priority`, `keep-open`, ...) would
+#     join the concurrency group below, cancel the tiers in progress and
+#     start them over from scratch. Adding `run-ci` after a push takes a
+#     rerun (`/tag-and-rerun-ci`, or a manual rerun of the failed gate),
+#     which the live label gate in `pr-gate.yml` then passes.
 on:
   push:
     branches: [main]
   pull_request:
     branches: [main]
-    types: [opened, synchronize, reopened, labeled]
+    types: [opened, synchronize, reopened]
   workflow_dispatch:
 
 concurrency:
@@ -58,6 +65,7 @@ jobs:
               - 'rust/Cargo.toml'
               - 'rust/sglang-processor/**'
               - 'rust/sglang-api-types/**'
+              - 'rust/sglang-runtime-v1-types/**'
               - 'proto/**'
               - '.github/workflows/pr-test-sgl-router.yml'
               - 'docker/sgl-router.Dockerfile'

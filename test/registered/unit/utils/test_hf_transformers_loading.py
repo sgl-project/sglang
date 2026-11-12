@@ -19,7 +19,7 @@ from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import WhitespaceSplit
 from transformers import CLIPImageProcessor, LlavaProcessor, PreTrainedTokenizerFast
 
-from sglang.srt.utils.hf_transformers import (
+from sglang.srt.hf_transformers import (
     get_config,
     get_context_length,
     get_hf_text_config,
@@ -27,7 +27,7 @@ from sglang.srt.utils.hf_transformers import (
     get_rope_config,
     get_tokenizer,
 )
-from sglang.srt.utils.hf_transformers.config import POINTER_ADAPTER_BASES
+from sglang.srt.hf_transformers.config import POINTER_ADAPTER_BASES
 from sglang.srt.utils.patch_tokenizer import unpatch_tokenizer
 from sglang.test.ci.ci_register import register_cpu_ci
 

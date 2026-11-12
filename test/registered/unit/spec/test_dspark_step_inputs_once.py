@@ -118,6 +118,7 @@ class TestDraftSamplerVerifyIds(unittest.TestCase):
         s.out = torch.zeros(max_bs * gamma, dtype=torch.int64)
         s.verify_ids = torch.full((max_bs, gamma + 1), -1, dtype=torch.int64)
         s.confidence_out = None
+        s.acceptance_estimator = None
         draft = torch.arange(bs * gamma, dtype=torch.int64).view(bs, gamma) + 100
 
         def step(model_hidden, anchor):
@@ -211,6 +212,8 @@ class TestPostFoldRelay(unittest.TestCase):
         self.assertIs(overlap_utils._offered_relay, relay)
 
         fm = overlap_utils.FutureMap.__new__(overlap_utils.FutureMap)
+        # Deferred relays arrive in R7; production initializes this in __init__.
+        fm._deferred_relay = None
         fm.needs_confidence_relay = False
         fm.spec_algo = SimpleNamespace(is_some=lambda: False, is_ngram=lambda: False)
         fm._adopt_relay(relay)

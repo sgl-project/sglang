@@ -20,13 +20,16 @@ This file implements HTTP APIs for the inference engine via fastapi.
 import asyncio
 import dataclasses
 import errno
+import inspect
 import logging
 import os
+import signal
 import socket
 import ssl
 import tempfile
 import threading
 import time
+import traceback
 import uuid
 from contextlib import asynccontextmanager
 from functools import partial
@@ -68,6 +71,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 from fastapi.routing import APIRoute
+from pydantic import ValidationError
 from uvicorn.supervisors.multiprocess import Multiprocess
 
 from sglang.srt.configs.model_config import load_joint_head_config, load_pointer_head
@@ -120,6 +124,12 @@ from sglang.srt.entrypoints.openai.serving_transcription import (
     OpenAIServingTranscription,
 )
 from sglang.srt.entrypoints.request_headers import apply_header_overrides
+from sglang.srt.entrypoints.server_utils import (
+    add_prometheus_middleware,
+    build_model_info_fields,
+    build_server_info,
+    set_uvicorn_logging_configs,
+)
 from sglang.srt.entrypoints.sidecar import rust_server_sidecar
 from sglang.srt.entrypoints.systemone.protocol import SystemOneRequest
 from sglang.srt.entrypoints.systemone.serving import SystemOneServing
@@ -149,6 +159,7 @@ from sglang.srt.managers.io_struct import (
     ParseFunctionCallReq,
     PauseGenerationReqInput,
     PdRoleSwitchReqInput,
+    PluginWeightUpdateReqInput,
     ProfileReq,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
@@ -192,17 +203,13 @@ from sglang.srt.parser.template_manager import TemplateManager
 from sglang.srt.sampling.watermarking.core import redact_watermark_secrets
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.utils import (
-    add_prometheus_middleware,
-    build_model_info_fields,
-    build_server_info,
     delete_directory,
     freeze_gc,
     get_bool_env_var,
     is_mps,
     kill_process_tree,
-    set_uvicorn_logging_configs,
 )
-from sglang.srt.utils.auth import AuthLevel, app_has_admin_force_endpoints, auth_level
+from sglang.srt.utils.auth import AuthLevel, add_api_key_middleware, auth_level
 from sglang.srt.utils.json_response import (
     SGLangORJSONResponse,
     dumps_json,
@@ -211,7 +218,6 @@ from sglang.srt.utils.json_response import (
 )
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.srt.utils.watchdog import SubprocessWatchdog
-from sglang.utils import get_exception_traceback
 from sglang.version import __version__
 
 logger = logging.getLogger(__name__)
@@ -257,11 +263,6 @@ async def init_multi_tokenizer() -> ServerArgs:
     port_args: PortArgs
 
     publish(server_args, role="tokenizer")
-
-    # API key authentication is not supported in multi-tokenizer mode
-    assert get_serving().api_key is None, (
-        "API key is not supported in multi-tokenizer mode"
-    )
 
     # Create a new ipc name for the current process
     port_args.tokenizer_ipc_name = (
@@ -417,7 +418,7 @@ async def lifespan(fast_api_app: FastAPI):
             f"OpenAIServingResponses init failed ({type(e).__name__}: {e})"
         )
         logger.debug(
-            f"OpenAIServingResponses init traceback:\n{get_exception_traceback()}"
+            f"OpenAIServingResponses init traceback:\n{traceback.format_exc()}"
         )
 
     # Execute custom warmups
@@ -543,6 +544,11 @@ from sglang.srt.runtime_context import (
 elastic_ep_router.route_class = ORJSONRoute
 app.include_router(elastic_ep_router)
 
+# Outermost, and registered at import so that tokenizer workers get it too.
+add_api_key_middleware(
+    app, get_keys=lambda: (get_serving().api_key, get_serving().admin_api_key)
+)
+
 
 def _anthropic_validation_message(raw_errors) -> str:
     """Render Pydantic-style errors for an Anthropic /v1/messages route.
@@ -578,6 +584,27 @@ def _anthropic_error_response(*, status_code: int, error_type: str, message: str
             "error": {"type": error_type, "message": message},
         },
     )
+
+
+def _chat_route_error_response(
+    request: Request, message: str, err_type: str, status_code: int
+) -> Optional[ORJSONResponse]:
+    """A chat error raised before the handler runs, in its wire's envelope;
+    None when the wire keeps the stock body."""
+    route_path = request.url.path.removeprefix(request.scope.get("root_path", ""))
+    if route_path != "/v1/chat/completions":
+        return None
+    error = ErrorResponse(
+        object="error",
+        message=message,
+        type=err_type,
+        param=None,
+        code=status_code,
+    )
+    body = request.app.state.openai_serving_chat.chat_wire.error_body(error)
+    if body is None:
+        return None
+    return ORJSONResponse(content=body, status_code=status_code)
 
 
 @app.exception_handler(HTTPException)
@@ -626,6 +653,12 @@ async def validation_exception_handler(request: Request, exc: HTTPException):
         return ORJSONResponse(
             content={"error": nested_error}, status_code=exc.status_code
         )
+
+    chat_error = _chat_route_error_response(
+        request, str(exc.detail), str(exc.status_code), exc.status_code
+    )
+    if chat_error is not None:
+        return chat_error
 
     error = ErrorResponse(
         object="error",
@@ -684,6 +717,12 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
             "code": HTTPStatus.BAD_REQUEST.value,
         }
         return ORJSONResponse(status_code=400, content={"error": nested_error})
+
+    chat_error = _chat_route_error_response(
+        request, message, "BadRequest", HTTPStatus.BAD_REQUEST.value
+    )
+    if chat_error is not None:
+        return chat_error
 
     err = ErrorResponse(
         message=message,
@@ -1481,6 +1520,24 @@ async def end_weight_update(
     )
 
 
+@app.post("/plugin_weight_update")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def plugin_weight_update(
+    obj: Annotated[PluginWeightUpdateReqInput, Body()], request: Request
+):
+    """Receive weights through a platform transport and load them, as /update_weights_from_distributed does."""
+    reply = await _global_state.tokenizer_manager.plugin_weight_update(obj, request)
+    content = {
+        "success": reply.success,
+        "message": reply.message,
+        "received_tensor_counts": reply.received_tensor_counts,
+    }
+    if reply.success:
+        return ORJSONResponse(content, status_code=200)
+    else:
+        return ORJSONResponse(content, status_code=HTTPStatus.BAD_REQUEST)
+
+
 @app.post("/update_weights_from_distributed")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def update_weights_from_distributed(
@@ -2197,16 +2254,52 @@ async def sagemaker_health() -> Response:
     return Response(status_code=status_code)
 
 
+# Checked in order, so a body with `messages` always reaches chat. Dispatch is by key
+# rather than by trying each model, because `input` is shared by
+# embeddings/classify/responses and ScoringRequest accepts any body.
+_SAGEMAKER_INVOCATION_ROUTES = (
+    ("messages", ChatCompletionRequest, openai_v1_chat_completions),
+    ("prompt", CompletionRequest, openai_v1_completions),
+    ("input", EmbeddingRequest, openai_v1_embeddings),
+)
+_SAGEMAKER_NO_MATCH_MSG = (
+    "Cannot determine the request type: expected one of 'messages' "
+    "(chat completions), 'prompt' (completions) or 'input' (embeddings)"
+)
+
+
 @app.post("/invocations")
-async def sagemaker_chat_completions(
-    request: ChatCompletionRequest, raw_request: Request
+async def sagemaker_invocations(
+    body: Annotated[Dict[str, Any], Body()], raw_request: Request
 ):
-    """OpenAI-compatible chat completion endpoint."""
-    return model_json_response(
-        await raw_request.app.state.openai_serving_chat.handle_request(
-            request, raw_request
+    """SageMaker's only inference route: dispatch by body key to the matching OpenAI route."""
+    for key, request_cls, route in _SAGEMAKER_INVOCATION_ROUTES:
+        if key in body:
+            break
+    else:
+        # The body is not echoed back: SageMaker request bodies can be up to 6 MB.
+        raise RequestValidationError(
+            errors=[
+                {
+                    "type": "value_error",
+                    "loc": ("body",),
+                    "msg": _SAGEMAKER_NO_MATCH_MSG,
+                }
+            ]
         )
-    )
+    try:
+        request = request_cls.model_validate(body)
+    except ValidationError as e:
+        raise RequestValidationError(
+            errors=[
+                {**err, "loc": ("body", *err["loc"])}
+                for err in e.errors(include_url=False)
+            ]
+        ) from e
+    # Route functions are called directly, so their route-level Depends (e.g.
+    # validate_json_request) and response_class do not apply; the wrapper replaces
+    # the ORJSONResponse that /v1/embeddings would otherwise get.
+    return model_json_response(await route(request, raw_request))
 
 
 ## Vertex AI API
@@ -2376,7 +2469,7 @@ def _execute_server_warmup(server_args: ServerArgs):
             success = True
             break
         except (AssertionError, requests.exceptions.RequestException):
-            last_traceback = get_exception_traceback()
+            last_traceback = traceback.format_exc()
             pass
 
     if not success:
@@ -2528,7 +2621,7 @@ def _execute_server_warmup(server_args: ServerArgs):
             )
 
     except Exception:
-        last_traceback = get_exception_traceback()
+        last_traceback = traceback.format_exc()
         logger.error(f"Initialization failed. warmup error: {last_traceback}")
         kill_process_tree(os.getpid())
         return False
@@ -2629,7 +2722,43 @@ def _wait_weights_ready():
     )
 
 
-class _ReusePortMultiprocess(Multiprocess):
+class _SigquitForwardingMultiprocess(Multiprocess):
+    """uvicorn supervisor that keeps SIGQUIT meaning "a child failed".
+
+    ``Multiprocess.__init__`` replaces the SIGQUIT handler with a queue that has
+    no ``handle_quit``, so a scheduler's SIGQUIT to this process is dropped and
+    the server outlives its schedulers. The handler installed before uvicorn
+    took over is called from the supervisor loop instead.
+    """
+
+    def __init__(self, *args, **kwargs):
+        self._sigquit_handler = signal.getsignal(signal.SIGQUIT)
+        super().__init__(*args, **kwargs)
+
+    def handle_quit(self) -> None:
+        if callable(self._sigquit_handler):
+            self._sigquit_handler(signal.SIGQUIT, None)
+        else:
+            logger.error("Received SIGQUIT from a child process; exiting.")
+            kill_process_tree(os.getpid())
+
+
+def _run_uvicorn_workers(app_path: str, **uvicorn_options) -> None:
+    """What ``uvicorn.run()`` does for workers > 1, minus its SIGQUIT trap."""
+    config = uvicorn.Config(app_path, **uvicorn_options)
+    sockets = [config.bind_socket()]
+    if "target" in inspect.signature(Multiprocess.__init__).parameters:
+        # uvicorn < 0.51 (not pinned on every platform): the supervisor is
+        # given the server's run().
+        supervisor = _SigquitForwardingMultiprocess(
+            config, target=uvicorn.Server(config=config).run, sockets=sockets
+        )
+    else:
+        supervisor = _SigquitForwardingMultiprocess(config, sockets=sockets)
+    supervisor.run()
+
+
+class _ReusePortMultiprocess(_SigquitForwardingMultiprocess):
     """Give each uvicorn worker a private SO_REUSEPORT listener.
 
     uvicorn's supervisor reads ``self.sockets`` once per worker it spawns, so a
@@ -2777,8 +2906,6 @@ def _run_granian_server(
     The event loop is uvloop. The default backlog and backpressure values are set
     exactly like uvicorn's defaults.
     """
-    import signal
-
     from granian import Granian
     from granian.constants import HTTPModes, Interfaces, Loops
     from granian.http import HTTP2Settings
@@ -2875,26 +3002,6 @@ def _setup_and_run_http_server(
             launch_callback=launch_callback,
             execute_warmup_func=execute_warmup_func,
         )
-
-        # Add api key authorization
-        # This is only supported in single tokenizer mode.
-        #
-        # Backward compatibility:
-        # - api_key only: behavior matches legacy (all endpoints require api_key)
-        # - no keys: legacy had no restriction; ADMIN_FORCE endpoints must still be rejected when
-        #   admin_api_key is not configured.
-        if (
-            get_serving().api_key
-            or get_serving().admin_api_key
-            or app_has_admin_force_endpoints(app)
-        ):
-            from sglang.srt.utils.auth import add_api_key_middleware
-
-            add_api_key_middleware(
-                app,
-                api_key=get_serving().api_key,
-                admin_api_key=get_serving().admin_api_key,
-            )
     else:
         # If it is multi-tokenizer mode, we need to write the arguments to shared memory
         # for other worker processes to read.
@@ -3073,7 +3180,7 @@ def _setup_and_run_http_server(
                     )
                     supervisor.run()
                 else:
-                    uvicorn.run(app_path, **uvicorn_options)
+                    _run_uvicorn_workers(app_path, **uvicorn_options)
     finally:
         if get_serving().tokenizer_worker_num > 1:
             if multi_tokenizer_args_shm is not None:
@@ -3167,7 +3274,8 @@ def launch_server(
         # The Rust server serves api-server, tokenizer, and detokenizer, so the
         # main process has no Python HTTP server / tokenizer manager to run.
         # Each Rust listener runs its own startup warmup and keeps /health at
-        # 503 until it succeeds, so the main process does not warm up here.
+        # 503 until it succeeds, so the main process does not warm up here. A
+        # failed warmup signals this process as a crashed scheduler does.
         from sglang.srt.rust_server.server import drain_notify_name
         from sglang.srt.rust_server.shutdown import RustServerSigtermDrain
 
