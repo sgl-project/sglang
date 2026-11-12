@@ -302,3 +302,12 @@ class Spec(msgspec.Struct):
         int,
         "Fail startup if the tokenized external ngram corpus exceeds this many tokens. Tune this based on your CPU memory budget.",
     ] = 10000000
+    speculative_dflash_overlap_ctx_projection: A[
+        bool,
+        "DFLASH only. Project the verify hidden states into the draft's context "
+        "features on a side CUDA stream, issued once the verify logits gather is "
+        "queued, so it runs concurrently with accept and sampling instead of "
+        "after them. The projection is the same call on the same input, so the "
+        "result is unchanged; it costs one extra stream and keeps the verify "
+        "hidden states alive until the draft KV write joins it.",
+    ] = False
