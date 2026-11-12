@@ -566,5 +566,10 @@ POSITIONAL_FIELD_ORDER = (
     "speculative_dspark_lm_head_dtype",
     "media_url_timeout",
     "allow_local_media_files",
+    "disaggregation_enable_reverse_kv",
+    "disaggregation_reverse_kv_min_tokens",
+    "disaggregation_reverse_kv_max_tokens",
+    "disaggregation_reverse_kv_control_timeout",
+    "disaggregation_reverse_kv_ticket_ttl",
 )
 # fmt: on

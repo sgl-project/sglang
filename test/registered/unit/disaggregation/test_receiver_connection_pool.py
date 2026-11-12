@@ -5,13 +5,14 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
+import asyncio
 import struct
 import threading
 import unittest
 from collections import defaultdict
 from itertools import product
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import msgspec
 import numpy as np
@@ -19,6 +20,7 @@ import zmq
 
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.common.conn import (
+    _MAX_REVERSE_KV_TICKET_TTL_SECONDS,
     CommonKVBootstrapServer,
     CommonKVManager,
     CommonKVReceiver,
@@ -139,6 +141,51 @@ class TestReceiverConnectionPool(CustomTestCase):
         self.assertEqual(receiver.kv_mgr.connection_pool, {})
 
 
+class TestReverseKVTicketRegistry(CustomTestCase):
+    def _register(self, data):
+        server = CommonKVBootstrapServer.__new__(CommonKVBootstrapServer)
+        server.lock = asyncio.Lock()
+        server.reverse_kv_tickets = {}
+        request = SimpleNamespace(json=AsyncMock(return_value=data))
+        response = asyncio.run(server._handle_register_reverse_kv_ticket(request))
+        return server, response
+
+    def test_registration_rejects_non_finite_expiry(self):
+        _, response = self._register(
+            {
+                "version": 1,
+                "bootstrap_room": 7,
+                "expires_at": float("nan"),
+                "prompt_tokens": 16,
+                "nonce": "nonce",
+                "fingerprint": "fingerprint",
+                "control_endpoint": "tcp://prefill:1234",
+            }
+        )
+
+        self.assertEqual(response.status, 400)
+
+    @patch("sglang.srt.disaggregation.common.conn.time.time", return_value=100.0)
+    def test_registration_caps_remote_expiry(self, _mock_time):
+        server, response = self._register(
+            {
+                "version": 1,
+                "bootstrap_room": 7,
+                "expires_at": 100.0 + 2 * _MAX_REVERSE_KV_TICKET_TTL_SECONDS,
+                "prompt_tokens": 16,
+                "nonce": "nonce",
+                "fingerprint": "fingerprint",
+                "control_endpoint": "tcp://prefill:1234",
+            }
+        )
+
+        self.assertEqual(response.status, 200)
+        self.assertEqual(
+            server.reverse_kv_tickets[7]["expires_at"],
+            100.0 + _MAX_REVERSE_KV_TICKET_TTL_SECONDS,
+        )
+
+
 class TestReceiverControlMessages(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -177,7 +224,12 @@ class TestReceiverControlMessages(CustomTestCase):
             engine_rank=0,
             gpu_id=0,
             draft_rows_dcp_collapsed=True,
+            page_size=16,
+            num_draft_entries=0,
+            state_types=[],
         )
+        manager.kv_cache_dtype_str = "bfloat16"
+        manager.kv_layout = "page_first"
         manager.agent = SimpleNamespace(
             name="nixl-peer", get_agent_metadata=lambda: b"agent-desc"
         )
@@ -298,6 +350,16 @@ class TestReceiverControlMessages(CustomTestCase):
                         expected_frames.index(aux) + 1,
                         struct.pack("Q", 64) if enabled else b"",
                     )
+                if backend == "nixl":
+                    legacy_frames = list(expected_frames)
+                    reverse_layout_frames = [
+                        b"16",
+                        b"bfloat16",
+                        b"page_first",
+                        b"0",
+                        b"[]",
+                    ]
+                    expected_frames.extend(reverse_layout_frames)
                 self.assertTrue(receiver._register_kv_args())
                 self.assertEqual(
                     sent, [(port, expected_frames) for port in (6000, 6001, 6002)]
@@ -316,7 +378,23 @@ class TestReceiverControlMessages(CustomTestCase):
                 self.assertEqual(info.dst_state_item_lens, [[32]])
                 self.assertTrue(info.dst_draft_rows_dcp_collapsed)
                 if backend == "nixl":
+                    self.assertEqual(sent[0][1][: len(legacy_frames)], legacy_frames)
+                    self.assertEqual(
+                        sent[0][1][len(legacy_frames) :], reverse_layout_frames
+                    )
                     self.assertEqual(info.dst_state_data_lens, [[512]])
+                    self.assertEqual(info.dst_page_size, 16)
+                    self.assertEqual(info.dst_kv_cache_dtype, "bfloat16")
+                    self.assertEqual(info.dst_kv_layout, "page_first")
+                    self.assertEqual(info.dst_num_draft_entries, 0)
+                    self.assertEqual(info.dst_state_types, [])
+
+                    legacy_info = NixlKVArgsRegisterInfo.from_zmq(legacy_frames[1:])
+                    self.assertEqual(legacy_info.dst_page_size, 1)
+                    self.assertIsNone(legacy_info.dst_kv_cache_dtype)
+                    self.assertIsNone(legacy_info.dst_kv_layout)
+                    self.assertEqual(legacy_info.dst_num_draft_entries, 0)
+                    self.assertEqual(legacy_info.dst_state_types, [])
 
     def test_metadata_wire_is_preserved_for_all_peers(self):
         for backend in self.backends:

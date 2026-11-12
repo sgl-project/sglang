@@ -78,6 +78,33 @@ class Disagg(msgspec.Struct):
         "whose KV layout differs (TP width, PP stage, page size, dtype) is "
         "admitted unverified with one warning. Disabled by default.",
     ] = False
+    disaggregation_enable_reverse_kv: A[
+        bool,
+        "Return page-aligned committed decode KV to the prefill radix cache after "
+        "a request finishes. Experimental and currently limited to NIXL with one "
+        "TP1/DP1/PP1 prefill engine and one TP1/DP1/PP1 decode engine, without "
+        "recurrent or sliding-window state entries.",
+    ] = False
+    disaggregation_reverse_kv_min_tokens: A[
+        int,
+        "Minimum number of generated tokens covered by a reverse-KV return. "
+        "Shorter suffixes are released without transfer.",
+    ] = 64
+    disaggregation_reverse_kv_max_tokens: A[
+        int,
+        "Maximum total page-aligned prefix length eligible for reverse-KV return.",
+    ] = 8192
+    disaggregation_reverse_kv_control_timeout: A[
+        float,
+        "Timeout in seconds for reverse-KV ticket lookup, control responses, and "
+        "NIXL polling. An admitted transfer that cannot be proven terminal keeps "
+        "its source and destination pages reserved.",
+    ] = 5.0
+    disaggregation_reverse_kv_ticket_ttl: A[
+        float,
+        "Lifetime in seconds of a reverse-KV capability issued by prefill. It "
+        "must cover the request's decode duration.",
+    ] = 600.0
     disaggregation_bootstrap_port: A[
         int, "Bootstrap server port on the prefill server. Default is 8998."
     ] = 8998

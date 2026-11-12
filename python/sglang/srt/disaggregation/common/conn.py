@@ -4,6 +4,7 @@ import asyncio
 import concurrent.futures
 import dataclasses
 import logging
+import math
 import threading
 import time
 from collections import defaultdict
@@ -80,6 +81,7 @@ logger = logging.getLogger(__name__)
 
 ABORT_TAG = b"ABORT"
 ABORT_ACK_TAG = b"ABORT_ACK"
+_MAX_REVERSE_KV_TICKET_TTL_SECONDS = 24 * 60 * 60
 
 
 # Reuse a keep-alive session per bootstrap_addr for decode-side bootstrap queries
@@ -440,6 +442,8 @@ class CommonKVManager(BaseKVManager):
         self._monitor_cache: Dict[str, zmq.Socket] = {}
         self._socket_send_locks: Dict[str, threading.Lock] = {}
         self._socket_lock = threading.Lock()
+        self.reverse_kv_import_manager = None
+        self.reverse_kv_return_manager = None
         self.failure_records: Dict[int, str] = {}
         self.failure_lock = threading.Lock()
         self._staging_outstanding: Dict[int, int] = defaultdict(int)
@@ -3208,6 +3212,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             int, Dict[int, Dict[int, Dict[int, PrefillRankInfo]]]
         ] = {}
         self.room_to_dp_rank: Dict[int, Dict[str, Union[int, float]]] = {}
+        self.reverse_kv_tickets: Dict[int, dict] = {}
         self._registered_count = 0
         self.entry_cleanup_interval = (
             envs.SGLANG_DISAGGREGATION_BOOTSTRAP_ENTRY_CLEANUP_INTERVAL.get()
@@ -3240,6 +3245,12 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.app.router.add_route("*", "/route", self._handle_route)
         self.app.router.add_post("/register_dp_rank", self._handle_register_dp_rank)
         self.app.router.add_post("/query_dp_ranks", self._handle_query_dp_ranks)
+        self.app.router.add_post(
+            "/register_reverse_kv_ticket", self._handle_register_reverse_kv_ticket
+        )
+        self.app.router.add_post(
+            "/query_reverse_kv_ticket", self._handle_query_reverse_kv_ticket
+        )
         self.app.router.add_get("/health", self._handle_health_check)
 
     async def _handle_health_check(self, request):
@@ -3504,8 +3515,54 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                     result[str(room_int)] = self.room_to_dp_rank[room_int]["dp_rank"]
         return web.json_response(result, status=200)
 
+    async def _handle_register_reverse_kv_ticket(self, request: web.Request):
+        try:
+            data = await request.json()
+            bootstrap_room = int(data["bootstrap_room"])
+            expires_at = float(data["expires_at"])
+            prompt_tokens = int(data["prompt_tokens"])
+            now = time.time()
+            if int(data["version"]) != 1:
+                raise ValueError("unsupported protocol version")
+            for field in ("nonce", "fingerprint", "control_endpoint"):
+                if not isinstance(data[field], str) or not data[field]:
+                    raise ValueError(f"{field} must be a non-empty string")
+            if (
+                bootstrap_room < 0
+                or not math.isfinite(expires_at)
+                or expires_at <= now
+                or prompt_tokens < 0
+            ):
+                raise ValueError("ticket is already expired or has invalid prompt size")
+        except (KeyError, TypeError, ValueError) as error:
+            return web.Response(text=str(error), status=400)
+
+        ticket = dict(data)
+        ticket["bootstrap_room"] = bootstrap_room
+        ticket["expires_at"] = min(expires_at, now + _MAX_REVERSE_KV_TICKET_TTL_SECONDS)
+        ticket["prompt_tokens"] = prompt_tokens
+        async with self.lock:
+            self.reverse_kv_tickets[bootstrap_room] = ticket
+        return web.Response(text="OK", status=200)
+
+    async def _handle_query_reverse_kv_ticket(self, request: web.Request):
+        try:
+            data = await request.json()
+            bootstrap_room = int(data["bootstrap_room"])
+        except (KeyError, TypeError, ValueError) as error:
+            return web.Response(text=str(error), status=400)
+
+        async with self.lock:
+            ticket = self.reverse_kv_tickets.get(bootstrap_room)
+            if ticket is not None and float(ticket["expires_at"]) <= time.time():
+                del self.reverse_kv_tickets[bootstrap_room]
+                ticket = None
+        if ticket is None:
+            return web.Response(text="Reverse KV ticket not found", status=404)
+        return web.json_response(ticket, status=200)
+
     async def _cleanup_expired_entries(self):
-        """Remove entries older than cleanup interval from room_to_dp_rank."""
+        """Remove expired per-request bootstrap state."""
         while True:
             await asyncio.sleep(self.entry_cleanup_interval)
             current_time = time.time()
@@ -3517,9 +3574,21 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 ]
                 for key in expired_keys:
                     del self.room_to_dp_rank[key]
+                expired_ticket_keys = [
+                    key
+                    for key, value in self.reverse_kv_tickets.items()
+                    if float(value["expires_at"]) <= current_time
+                ]
+                for key in expired_ticket_keys:
+                    del self.reverse_kv_tickets[key]
             if expired_keys:
                 logger.debug(
                     f"Cleaned up {len(expired_keys)} expired entries from room_to_dp_rank"
+                )
+            if expired_ticket_keys:
+                logger.debug(
+                    "Cleaned up %d expired reverse KV tickets",
+                    len(expired_ticket_keys),
                 )
 
     def _run_server(self):

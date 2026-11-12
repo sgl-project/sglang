@@ -43,6 +43,11 @@ from sglang.srt.disaggregation.common.utils import (
     unpack_int_lists,
 )
 from sglang.srt.disaggregation.mode import DisaggregationMode
+from sglang.srt.disaggregation.reverse_kv import (
+    REVERSE_KV_PREPARE_TAG,
+    REVERSE_KV_RESPONSE_TAG,
+    ReverseKVTransferUnsettled,
+)
 from sglang.srt.disaggregation.utils import (
     align_window_tails,
     build_dsa_tail_transfer_blocks,
@@ -375,6 +380,11 @@ class KVArgsRegisterInfo:
     staging_total_size: int = 0
     dst_state_data_lens: List[List[int]] = dataclasses.field(default_factory=list)
     dst_aux_item_lens: Optional[List[int]] = None
+    dst_page_size: int = 1
+    dst_kv_cache_dtype: Optional[str] = None
+    dst_kv_layout: Optional[str] = None
+    dst_num_draft_entries: int = 0
+    dst_state_types: List[str] = dataclasses.field(default_factory=list)
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
@@ -460,6 +470,21 @@ class KVArgsRegisterInfo:
                 unpack_int_lists(msg[24], "Q")
                 if len(msg) > 24 and len(msg[24]) > 0
                 else []
+            ),
+            dst_page_size=(
+                int(msg[26].decode("ascii")) if len(msg) > 26 and msg[26] != b"" else 1
+            ),
+            dst_kv_cache_dtype=(
+                msg[27].decode("utf-8") if len(msg) > 27 and msg[27] != b"" else None
+            ),
+            dst_kv_layout=(
+                msg[28].decode("utf-8") if len(msg) > 28 and msg[28] != b"" else None
+            ),
+            dst_num_draft_entries=(
+                int(msg[29].decode("ascii")) if len(msg) > 29 and msg[29] != b"" else 0
+            ),
+            dst_state_types=(
+                json.loads(msg[30]) if len(msg) > 30 and msg[30] != b"" else []
             ),
         )
 
@@ -1069,6 +1094,10 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     continue
                 if self.handle_abort_ack_message(msg):
                     continue
+                if msg[0] == REVERSE_KV_RESPONSE_TAG:
+                    if self.reverse_kv_return_manager is not None:
+                        self.reverse_kv_return_manager.enqueue_response(msg)
+                    continue
                 parsed = self.parse_kv_status_message(msg)
                 if parsed is not None:
                     room, status, prefill_rank, reason = parsed
@@ -1138,17 +1167,25 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             raise _NixlPostError(error_msg)
 
     def _await_handles(
-        self, handles: List[Any], *, failure_seen: bool
+        self,
+        handles: List[Any],
+        *,
+        failure_seen: bool,
+        healthy_timeout_s: Optional[float] = None,
     ) -> Tuple[bool, bool]:
         """Poll until every handle settled. Returns ``(settled, any_failed)``.
 
-        The wait is unbounded while every handle is still healthy, and bounded
-        to NIXL_ERR_SETTLE_TIMEOUT_S from the moment the batch is known broken.
+        The wait is unbounded while every handle is still healthy unless
+        ``healthy_timeout_s`` is provided, and bounded to
+        NIXL_ERR_SETTLE_TIMEOUT_S from the moment the batch is known broken.
         ``failure_seen`` arms that deadline up front, for a batch that raised
         before the barrier ran. A state that cannot be read counts as running,
         since it does not prove the write into the decode's pages is over.
         """
         deadline = time.time() + NIXL_ERR_SETTLE_TIMEOUT_S if failure_seen else None
+        healthy_deadline = (
+            time.time() + healthy_timeout_s if healthy_timeout_s is not None else None
+        )
         while True:
             all_settled = True
             any_failed = failure_seen
@@ -1165,6 +1202,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             if all_settled:
                 return True, any_failed
             if not any_failed:
+                if healthy_deadline is not None and time.time() >= healthy_deadline:
+                    return False, False
                 time.sleep(0)
                 continue
             # This room is already lost, so trade its notification for the
@@ -2185,6 +2224,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         src_layer_ids: Optional[List[int]] = None,
         dst_layer_ids: Optional[List[int]] = None,
         dst_item_lens: Optional[List[int]] = None,
+        operation: str = "WRITE",
+        post_xfer: bool = True,
     ):
         """Generic KV cache transfer supporting both MHA and MLA architectures.
         Used by both send_kvcache and maybe_send_extra.
@@ -2192,9 +2233,12 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         ``force_flat`` uses the MLA-style flat (single-buffer-per-layer) layout
         even on a non-MLA backend, for K-only state buffers (e.g. MiniMax sparse
         index) whose per-layer list must not be half-split into K/V."""
+        if operation not in ("READ", "WRITE"):
+            raise ValueError(f"Unsupported NIXL transfer operation: {operation}")
         # Prepped path (KV only; state transfers use the non-prepped path below).
         if (
-            not bypass_prepped
+            operation == "WRITE"
+            and not bypass_prepped
             and src_data_ptrs is self.kv_args.kv_data_ptrs
             and "" in self.prep_handles
             and peer_name in self.prep_handles
@@ -2223,7 +2267,8 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             )
             if not xfer_handle:
                 raise Exception("KVSender failed to create prepped transfer")
-            self._post_xfer(xfer_handle, "KVSender failed to post prepped transfer")
+            if post_xfer:
+                self._post_xfer(xfer_handle, "KVSender failed to post prepped transfer")
             return xfer_handle
 
         # Non-prepped path: used for state transfers (SWA/NSA) via maybe_send_extra.
@@ -2369,15 +2414,80 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         dst_descs = self.agent.get_xfer_descs(dst_reqs, dst_mem_kind)
         # Transfer data
         xfer_handle = self.agent.initialize_xfer(
-            "WRITE",
+            operation,
             src_descs,
             dst_descs,
             peer_name,
         )
         if not xfer_handle:
             raise Exception("KVSender failed to create transfer")
-        self._post_xfer(xfer_handle, "KVSender failed to post transfer")
+        if post_xfer:
+            self._post_xfer(xfer_handle, "KVSender failed to post transfer")
         return xfer_handle
+
+    def read_kvcache_from_peer(
+        self,
+        peer_name: str,
+        remote_source_indices: npt.NDArray[np.int32],
+        local_destination_indices: npt.NDArray[np.int32],
+        timeout_s: Optional[float] = None,
+    ) -> None:
+        peer = self.decode_kv_args_table[peer_name]
+        if peer.dst_page_size != self.kv_args.page_size:
+            raise ValueError("Reverse KV page size mismatch")
+        if peer.dst_kv_cache_dtype != self.kv_cache_dtype_str:
+            raise ValueError("Reverse KV cache dtype mismatch")
+        if peer.dst_kv_layout != self.kv_layout:
+            raise ValueError("Reverse KV layout mismatch")
+        if peer.dst_kv_item_lens != self.kv_args.kv_item_lens:
+            raise ValueError("Reverse KV item length mismatch")
+        if peer.dst_kv_layer_ids != self.kv_args.kv_layer_ids:
+            raise ValueError("Reverse KV layer mapping mismatch")
+        if peer.dst_num_draft_entries or peer.dst_state_types:
+            raise ValueError("Reverse KV supports dense target KV only")
+
+        assert self.src_mem_kind is not None
+        remote_mem_kind = _homogeneous_kv_mem_kind(
+            peer.dst_kv_mem_kinds, "reverse source"
+        )
+        # NIXL READ uses local descriptors as destinations and remote descriptors
+        # as sources; keep the generic transfer's descriptor positions unchanged.
+        handle = self._send_kvcache_generic(
+            peer_name=peer_name,
+            src_data_ptrs=self.kv_args.kv_data_ptrs,
+            dst_data_ptrs=peer.dst_kv_ptrs,
+            item_lens=self.kv_args.kv_item_lens,
+            prefill_data_indices=local_destination_indices,
+            dst_data_indices=remote_source_indices,
+            dst_gpu_id=peer.gpu_id,
+            src_mem_kind=self.src_mem_kind,
+            dst_mem_kind=remote_mem_kind,
+            bypass_prepped=True,
+            operation="READ",
+            post_xfer=False,
+        )
+        if handle is None:
+            raise RuntimeError("Reverse KV read produced no NIXL handle")
+        try:
+            self._post_xfer(handle, "Reverse KV read failed to post")
+        except Exception as error:
+            settled, _ = self._await_handles([handle], failure_seen=True)
+            if not settled:
+                raise ReverseKVTransferUnsettled(
+                    "Reverse KV read post failed without quiescence"
+                ) from error
+            raise
+        settled, failed = self._await_handles(
+            [handle],
+            failure_seen=False,
+            healthy_timeout_s=timeout_s,
+        )
+        if not settled:
+            raise ReverseKVTransferUnsettled(
+                "Reverse KV read state could not be proven terminal"
+            )
+        if failed:
+            raise RuntimeError("Reverse KV NIXL read failed")
 
     def send_kvcache(
         self,
@@ -3546,6 +3656,13 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                         handle_staging_rsp(waiting_req_bytes, self.transfer_infos)
                     continue
 
+                if waiting_req_bytes[0] == REVERSE_KV_PREPARE_TAG:
+                    if self.reverse_kv_import_manager is not None:
+                        self.reverse_kv_import_manager.enqueue_prepare(
+                            waiting_req_bytes
+                        )
+                    continue
+
                 if self._handle_abort_notification(waiting_req_bytes):
                     continue
 
@@ -3672,6 +3789,11 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             str(self.dcp_rank).encode("ascii"),
             packed_state_data_lens,
             b"1" if self.kv_args.draft_rows_dcp_collapsed else b"0",
+            str(self.kv_args.page_size).encode("ascii"),
+            self.kv_cache_dtype_str.encode("utf-8"),
+            (self.kv_layout or "").encode("utf-8"),
+            str(self.kv_args.num_draft_entries).encode("ascii"),
+            json.dumps([str(x) for x in self.kv_args.state_types or []]).encode(),
         ]
 
     def build_receiver_metadata_message(

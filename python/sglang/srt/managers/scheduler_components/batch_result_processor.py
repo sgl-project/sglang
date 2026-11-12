@@ -56,6 +56,7 @@ if TYPE_CHECKING:
     from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
         DecodeKVCacheOffloadManager,
     )
+    from sglang.srt.disaggregation.reverse_kv import ReverseKVReturnManager
     from sglang.srt.managers.auxiliary_output import HostAuxiliaryOutput
     from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
     from sglang.srt.managers.scheduler_components.logprob_result_processor import (
@@ -157,6 +158,7 @@ class SchedulerBatchResultProcessor:
     # staging.
     prefill_launched_reqs: ReqList
     uocr_runtime: Optional[UocrSchedulerRuntime] = None
+    reverse_kv_return_manager: Optional[ReverseKVReturnManager] = None
 
     def process_batch_result_prebuilt(self, batch: ScheduleBatch):
         assert self.disaggregation_mode == DisaggregationMode.DECODE
@@ -1607,6 +1609,11 @@ class SchedulerBatchResultProcessor:
                 # The release waits for every Device->Host copy of the request to land.
                 self.decode_offload_manager.offload_kv_cache(req)
                 self.decode_offload_manager.finalize_release_on_finish(req)
+            elif (
+                self.reverse_kv_return_manager is not None
+                and self.reverse_kv_return_manager.claim(req)
+            ):
+                pass
             else:
                 self._prepare_kv_cache_release(req)
                 checkpoint = (

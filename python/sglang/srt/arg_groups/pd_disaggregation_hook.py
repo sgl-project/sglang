@@ -150,6 +150,9 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
         if envs.SGLANG_RUST_SERVER.get():
             _alias_bootstrap_port_to_api_port(server_args)
 
+    if cfg.disaggregation_enable_reverse_kv:
+        _validate_reverse_kv(server_args)
+
     if cfg.disaggregation_mode in ("prefill", "decode"):
         if (
             envs.SGLANG_DISAGG_STAGING_BUFFER.get()
@@ -204,6 +207,70 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                     + ", ".join(unsupported)
                     + ". Remove these options or drop --enable-pd-role-switch."
                 )
+
+
+def _validate_reverse_kv(server_args: ServerArgs) -> None:
+    cfg = resolving_view(server_args)
+    if cfg.disaggregation_reverse_kv_min_tokens < 0:
+        raise ValueError("--disaggregation-reverse-kv-min-tokens must be non-negative")
+    if cfg.disaggregation_reverse_kv_max_tokens <= 0:
+        raise ValueError("--disaggregation-reverse-kv-max-tokens must be positive")
+    if (
+        cfg.disaggregation_reverse_kv_min_tokens
+        > cfg.disaggregation_reverse_kv_max_tokens
+    ):
+        raise ValueError(
+            "--disaggregation-reverse-kv-min-tokens cannot exceed "
+            "--disaggregation-reverse-kv-max-tokens"
+        )
+    if cfg.disaggregation_reverse_kv_control_timeout <= 0:
+        raise ValueError("--disaggregation-reverse-kv-control-timeout must be positive")
+    if cfg.disaggregation_reverse_kv_ticket_ttl <= 0:
+        raise ValueError("--disaggregation-reverse-kv-ticket-ttl must be positive")
+
+    unsupported = []
+    if cfg.disaggregation_mode not in ("prefill", "decode"):
+        unsupported.append("aggregated serving")
+    if cfg.disaggregation_transfer_backend != "nixl":
+        unsupported.append("transfer backends other than NIXL")
+    if (
+        cfg.tp_size != 1
+        or cfg.dp_size != 1
+        or cfg.ep_size != 1
+        or cfg.pp_size != 1
+        or cfg.attn_cp_size != 1
+        or cfg.dcp_size != 1
+    ):
+        unsupported.append("TP, DP, EP, PP, attention CP, or DCP greater than one")
+    if cfg.speculative_algorithm is not None:
+        unsupported.append("speculative decoding")
+    if cfg.enable_pd_role_switch:
+        unsupported.append("runtime PD role switching")
+    if cfg.enable_hisparse:
+        unsupported.append("HiSparse")
+    if cfg.enable_hierarchical_cache:
+        unsupported.append("HiCache")
+    if cfg.enable_unified_memory or cfg.enable_unified_cache_external_linker:
+        unsupported.append("unified KV cache modes")
+    if cfg.enable_kv_cache_sharding:
+        unsupported.append("KV cache sharding")
+    if cfg.disaggregation_decode_enable_offload_kvcache:
+        unsupported.append("decode KV offload")
+    if cfg.disaggregation_decode_enable_radix_cache:
+        unsupported.append("decode radix cache")
+    if cfg.disaggregation_decode_host_receive_threshold < 1:
+        unsupported.append("decode host KV buffering")
+    if cfg.disable_radix_cache and cfg.disaggregation_mode == "prefill":
+        unsupported.append("a disabled prefill radix cache")
+    if envs.SGLANG_DISAGG_STAGING_BUFFER.get():
+        unsupported.append("staging buffers")
+    if envs.SGLANG_RUST_SERVER.get():
+        unsupported.append("the Rust bootstrap registry")
+    if unsupported:
+        raise ValueError(
+            "--disaggregation-enable-reverse-kv does not yet support "
+            + ", ".join(unsupported)
+        )
 
 
 def _validate_prefill_complete(server_args: ServerArgs) -> None:

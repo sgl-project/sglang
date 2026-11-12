@@ -799,6 +799,8 @@ class Scheduler(
 
         self.maybe_init_decode_offload_manager()
 
+        self.init_reverse_kv_transfer()
+
         self.init_batch_result_processor()
 
         self.init_internal_state()
@@ -2931,6 +2933,32 @@ class Scheduler(
                 request_retirer=self.request_retirer,
             )
 
+    def init_reverse_kv_transfer(self) -> None:
+        self.reverse_kv_manager = None
+        if not get_disagg().disaggregation_enable_reverse_kv:
+            return
+
+        from sglang.srt.disaggregation.reverse_kv import (
+            ReverseKVImportManager,
+            ReverseKVReturnManager,
+        )
+
+        if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            self.reverse_kv_manager = ReverseKVImportManager(
+                kv_manager=self.disagg_prefill_bootstrap_queue.kv_manager,
+                tree_cache=self.tree_cache,
+                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            )
+        elif self.disaggregation_mode == DisaggregationMode.DECODE:
+            self.reverse_kv_manager = ReverseKVReturnManager(
+                kv_manager=self.disagg_decode_prealloc_queue.kv_manager,
+                req_to_token_pool=self.req_to_token_pool,
+                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                request_retirer=self.request_retirer,
+                device_module=self.device_module,
+                forward_stream=self.forward_stream,
+            )
+
     def init_batch_result_processor(self) -> None:
         self.batch_result_processor = SchedulerBatchResultProcessor(
             is_generation=self.is_generation,
@@ -2952,6 +2980,11 @@ class Scheduler(
             output_streamer=self.output_streamer,
             beam_coordinator=self.beam_coordinator,
             request_retirer=self.request_retirer,
+            reverse_kv_return_manager=(
+                self.reverse_kv_manager
+                if self.disaggregation_mode == DisaggregationMode.DECODE
+                else None
+            ),
             abort_request=self.abort_request,
             uocr_runtime=self.uocr_runtime,
             prefill_launched_reqs=self.prefill_launched_reqs,
@@ -4931,6 +4964,7 @@ class Scheduler(
             self.uocr_runtime,
             self.deferred_responses,
             self.decode_offload_manager,
+            self.reverse_kv_manager,
         )
         for component in components:
             if component is None:

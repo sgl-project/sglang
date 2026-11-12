@@ -508,6 +508,12 @@ class PrefillBootstrapQueue:
             bootstrap_room=req.bootstrap_room,
             req_has_disagg_prefill_dp_rank=req.disagg_prefill_dp_rank is not None,
         )
+        if self.scheduler.reverse_kv_manager is not None:
+            self.scheduler.reverse_kv_manager.issue_ticket(
+                bootstrap_addr=f"{req.bootstrap_host}:{self.bootstrap_port}",
+                bootstrap_room=req.bootstrap_room,
+                prompt_tokens=len(req.origin_input_ids),
+            )
         req.pending_bootstrap = True
 
     def ensure_metadata_buffer(self, req: Req) -> bool:
@@ -786,6 +792,8 @@ class SchedulerDisaggregationPrefillMixin:
             if self.gracefully_exit:
                 break
             self.increment_scheduler_iterations()
+            if self.reverse_kv_manager is not None:
+                self.reverse_kv_manager.process_pending()
 
             # Receive requests
             self.ingest_requests()
@@ -917,6 +925,8 @@ class SchedulerDisaggregationPrefillMixin:
             if self.gracefully_exit:
                 break
             self.increment_scheduler_iterations()
+            if self.reverse_kv_manager is not None:
+                self.reverse_kv_manager.process_pending()
 
             # A result wait takes new work only with continuous input polling.
             should_ingest_requests = (

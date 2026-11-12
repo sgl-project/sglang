@@ -107,3 +107,4 @@ def empty_request_lists(scheduler: Scheduler) -> None:
         send_abort=None,
     )
     scheduler.decode_offload_manager = None
+    scheduler.reverse_kv_manager = None

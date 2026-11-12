@@ -34,6 +34,7 @@ class ListKind(enum.Enum):
     PD_HELD = enum.auto()
     PD_RECEIVING = enum.auto()
     PD_RELEASING = enum.auto()
+    PD_RETURNING = enum.auto()
     PD_OFFLOADING = enum.auto()
     HISPARSE_STAGING = enum.auto()
     GRAMMAR = enum.auto()
@@ -52,6 +53,7 @@ PD_KINDS = frozenset(
         ListKind.PD_HELD,
         ListKind.PD_RECEIVING,
         ListKind.PD_RELEASING,
+        ListKind.PD_RETURNING,
         ListKind.PD_OFFLOADING,
     }
 )

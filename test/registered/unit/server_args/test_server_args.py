@@ -1730,6 +1730,200 @@ class TestLoraForwardDomains(unittest.TestCase):
                     check_lora_server_args(args)
 
 
+class TestReverseKVServerArgs(CustomTestCase):
+    _UNSUPPORTED_PREFIX = "--disaggregation-enable-reverse-kv does not yet support "
+
+    def _make_args(self, **overrides):
+        kwargs = {
+            "model_path": "dummy",
+            "disaggregation_mode": "prefill",
+            "disaggregation_transfer_backend": "nixl",
+            "disaggregation_enable_reverse_kv": True,
+        }
+        kwargs.update(overrides)
+        return ServerArgs(**kwargs)
+
+    def _assert_reverse_failure(self, expected, **overrides):
+        with self.assertRaises(ValueError) as raised:
+            handle_pd_disaggregation(self._make_args(**overrides))
+        message = str(raised.exception)
+        self.assertTrue(
+            message.startswith(expected),
+            f"expected reverse-KV validation beginning with {expected!r}, got {message!r}",
+        )
+        return message
+
+    def test_supported_prefill_and_decode_configurations(self):
+        with (
+            patch.object(
+                pd_disaggregation_hook.envs.SGLANG_DISAGG_STAGING_BUFFER,
+                "get",
+                return_value=False,
+            ),
+            patch.object(
+                pd_disaggregation_hook.envs.SGLANG_RUST_SERVER,
+                "get",
+                return_value=False,
+            ),
+        ):
+            for mode in ("prefill", "decode"):
+                with self.subTest(mode=mode):
+                    handle_pd_disaggregation(self._make_args(disaggregation_mode=mode))
+
+    def test_reverse_kv_numeric_bounds(self):
+        cases = (
+            (
+                {"disaggregation_reverse_kv_min_tokens": -1},
+                "--disaggregation-reverse-kv-min-tokens must be non-negative",
+            ),
+            (
+                {"disaggregation_reverse_kv_max_tokens": 0},
+                "--disaggregation-reverse-kv-max-tokens must be positive",
+            ),
+            (
+                {
+                    "disaggregation_reverse_kv_min_tokens": 65,
+                    "disaggregation_reverse_kv_max_tokens": 64,
+                },
+                "--disaggregation-reverse-kv-min-tokens cannot exceed "
+                "--disaggregation-reverse-kv-max-tokens",
+            ),
+            (
+                {"disaggregation_reverse_kv_control_timeout": 0},
+                "--disaggregation-reverse-kv-control-timeout must be positive",
+            ),
+            (
+                {"disaggregation_reverse_kv_ticket_ttl": 0},
+                "--disaggregation-reverse-kv-ticket-ttl must be positive",
+            ),
+        )
+        with (
+            patch.object(
+                pd_disaggregation_hook.envs.SGLANG_DISAGG_STAGING_BUFFER,
+                "get",
+                return_value=False,
+            ),
+            patch.object(
+                pd_disaggregation_hook.envs.SGLANG_RUST_SERVER,
+                "get",
+                return_value=False,
+            ),
+        ):
+            for overrides, expected in cases:
+                with self.subTest(overrides=overrides):
+                    self._assert_reverse_failure(expected, **overrides)
+
+    def test_reverse_kv_incompatibility_families(self):
+        cases = (
+            ({"disaggregation_mode": "null"}, "aggregated serving"),
+            (
+                {"disaggregation_transfer_backend": "mooncake"},
+                "transfer backends other than NIXL",
+            ),
+            (
+                {"tp_size": 2},
+                "TP, DP, EP, PP, attention CP, or DCP greater than one",
+            ),
+            (
+                {"dp_size": 2},
+                "TP, DP, EP, PP, attention CP, or DCP greater than one",
+            ),
+            (
+                {"ep_size": 2},
+                "TP, DP, EP, PP, attention CP, or DCP greater than one",
+            ),
+            (
+                {"pp_size": 2},
+                "TP, DP, EP, PP, attention CP, or DCP greater than one",
+            ),
+            (
+                {"attn_cp_size": 2},
+                "TP, DP, EP, PP, attention CP, or DCP greater than one",
+            ),
+            (
+                {"dcp_size": 2},
+                "TP, DP, EP, PP, attention CP, or DCP greater than one",
+            ),
+            ({"speculative_algorithm": "EAGLE"}, "speculative decoding"),
+            ({"enable_pd_role_switch": True}, "runtime PD role switching"),
+            ({"enable_hisparse": True}, "HiSparse"),
+            ({"enable_hierarchical_cache": True}, "HiCache"),
+            ({"enable_unified_memory": True}, "unified KV cache modes"),
+            (
+                {"enable_unified_cache_external_linker": True},
+                "unified KV cache modes",
+            ),
+            ({"enable_kv_cache_sharding": True}, "KV cache sharding"),
+            (
+                {
+                    "disaggregation_mode": "decode",
+                    "disaggregation_decode_enable_offload_kvcache": True,
+                },
+                "decode KV offload",
+            ),
+            (
+                {
+                    "disaggregation_mode": "decode",
+                    "disaggregation_decode_enable_radix_cache": True,
+                },
+                "decode radix cache",
+            ),
+            (
+                {
+                    "disaggregation_mode": "decode",
+                    "disaggregation_decode_host_receive_threshold": 0.5,
+                    "disaggregation_decode_retraction_backup": "host_pool",
+                },
+                "decode host KV buffering",
+            ),
+            ({"disable_radix_cache": True}, "a disabled prefill radix cache"),
+        )
+        with (
+            patch.object(
+                pd_disaggregation_hook.envs.SGLANG_DISAGG_STAGING_BUFFER,
+                "get",
+                return_value=False,
+            ),
+            patch.object(
+                pd_disaggregation_hook.envs.SGLANG_RUST_SERVER,
+                "get",
+                return_value=False,
+            ),
+        ):
+            for overrides, expected_family in cases:
+                with self.subTest(overrides=overrides):
+                    message = self._assert_reverse_failure(
+                        self._UNSUPPORTED_PREFIX, **overrides
+                    )
+                    self.assertIn(expected_family, message)
+
+    def test_reverse_kv_environment_incompatibilities(self):
+        cases = (
+            ("SGLANG_DISAGG_STAGING_BUFFER", "staging buffers"),
+            ("SGLANG_RUST_SERVER", "the Rust bootstrap registry"),
+        )
+        for enabled_env, expected_family in cases:
+            staging_enabled = enabled_env == "SGLANG_DISAGG_STAGING_BUFFER"
+            rust_enabled = enabled_env == "SGLANG_RUST_SERVER"
+            with (
+                self.subTest(environment=enabled_env),
+                patch.object(
+                    pd_disaggregation_hook.envs.SGLANG_DISAGG_STAGING_BUFFER,
+                    "get",
+                    return_value=staging_enabled,
+                ),
+                patch.object(
+                    pd_disaggregation_hook.envs.SGLANG_RUST_SERVER,
+                    "get",
+                    return_value=rust_enabled,
+                ),
+            ):
+                message = self._assert_reverse_failure(
+                    self._UNSUPPORTED_PREFIX, disaggregation_mode="decode"
+                )
+                self.assertIn(expected_family, message)
+
+
 class TestLoadBalanceMethod(unittest.TestCase):
     def _load_balance_args(self, **kwargs):
         server_args = ServerArgs(model_path="dummy", **kwargs)

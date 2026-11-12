@@ -501,6 +501,122 @@ python -m sglang.launch_server \
 python -m sglang_router.launch_router --pd-disaggregation --prefill http://127.0.0.1:30000 --decode http://127.0.0.1:30001 --host 0.0.0.0 --port 8000
 ```
 
+### Experimental reverse KV transfer
+
+Reverse KV transfer returns the KV produced by a decode worker to the prefill
+worker after a request finishes. A later turn whose prompt contains the prior
+assistant response can then reuse that KV in the prefill radix cache. The
+return is asynchronous and does not delay the final response.
+
+Enable the feature on both workers:
+
+```bash
+--disaggregation-enable-reverse-kv
+```
+
+The initial experimental implementation supports NIXL with one TP1/DP1/PP1
+prefill worker and one TP1/DP1/PP1 decode worker, for models without recurrent
+or sliding-window state entries. It does not yet support speculative decoding,
+runtime PD role switching, HiCache, unified or sharded KV caches, staging
+buffers, decode KV offload, or decode radix caching. The prefill radix cache
+must remain enabled.
+
+The decode worker retains eligible finished-request KV until the prefill worker
+pulls it with a NIXL READ. The prefill worker publishes the imported pages only
+after the transfer completes, using the normal radix-cache insertion and KV
+event path. Ticket registration is asynchronous; if registration is unavailable
+or saturated, that request falls back to ordinary release without reverse
+transfer. If transfer quiescence or a terminal control response cannot be proven,
+the affected pages remain reserved rather than being reused while a DMA may
+still be active. The worker disables new reverse transfers after such an
+unsettled attempt, while ordinary serving continues. The quarantined pages remain
+retained until restart.
+
+The following options tune admission and control behavior:
+
+- `--disaggregation-reverse-kv-min-tokens`: minimum generated tokens required
+  for a return; default `64`.
+- `--disaggregation-reverse-kv-max-tokens`: maximum total prefix length eligible
+  for a return; default `8192`.
+- `--disaggregation-reverse-kv-control-timeout`: timeout in seconds for control
+  operations, terminal responses, and reverse NIXL polling; default `5`. A
+  timeout after submission quarantines the affected pages instead of releasing
+  them.
+- `--disaggregation-reverse-kv-ticket-ttl`: lifetime in seconds of the
+  single-attempt return ticket; default `600`.
+
+#### Validate with NVIDIA Dynamo
+
+Use a cold two-GPU Dynamo deployment with exactly one prefill and one decode
+worker. The frontend must consume SGLang KV events so the imported radix blocks
+are visible to its KV router. The commands below are based on Dynamo's
+`examples/backends/sglang/launch/disagg_router.sh`; run them from a Dynamo
+environment that uses this SGLang checkout. The cold enabled/disabled,
+multi-turn TTFT comparison follows the methodology in
+[AWS's bi-directional KV transfer evaluation](https://aws.amazon.com/blogs/machine-learning/improve-ttft-for-multi-turn-agentic-workloads-with-bi-directional-kv-transfer-in-vllm/).
+
+```bash
+# Terminal 1: frontend
+python -m dynamo.frontend \
+  --router-mode kv \
+  --router-kv-events \
+  --http-host 0.0.0.0 \
+  --http-port 8000
+
+# Terminal 2: prefill
+CUDA_VISIBLE_DEVICES=0 python -m dynamo.sglang \
+  --model-path Qwen/Qwen3-0.6B \
+  --served-model-name Qwen/Qwen3-0.6B \
+  --page-size 64 \
+  --tp-size 1 \
+  --disaggregation-mode prefill \
+  --disaggregation-transfer-backend nixl \
+  --disaggregation-enable-reverse-kv \
+  --host 0.0.0.0 \
+  --kv-events-config \
+    '{"publisher":"zmq","topic":"kv-events","endpoint":"tcp://*:5557"}'
+
+# Terminal 3: decode
+CUDA_VISIBLE_DEVICES=1 python -m dynamo.sglang \
+  --model-path Qwen/Qwen3-0.6B \
+  --served-model-name Qwen/Qwen3-0.6B \
+  --page-size 64 \
+  --tp-size 1 \
+  --disaggregation-mode decode \
+  --disaggregation-transfer-backend nixl \
+  --disaggregation-enable-reverse-kv \
+  --host 0.0.0.0 \
+  --kv-events-config \
+    '{"publisher":"zmq","topic":"kv-events","endpoint":"tcp://*:5558"}'
+```
+
+Run the multi-turn benchmark from the SGLang checkout:
+
+```bash
+python benchmark/disaggregation/bench_reverse_kv_dynamo.py \
+  --url http://127.0.0.1:8000 \
+  --model Qwen/Qwen3-0.6B \
+  --label enabled \
+  --turns 4 \
+  --output-tokens 256 \
+  --inter-turn-delay 1 \
+  --result /tmp/reverse-kv-enabled.json
+```
+
+The benchmark finds a tokenizer token whose decoded text re-encodes to the same
+token ID when repeated, forces the model to emit that token, and verifies that
+the next chat-template prompt preserves all generated token IDs. This avoids
+mistaking text-level similarity for an exact KV-cache prefix match. It reports
+streaming TTFT for every turn and summarizes turns after the cold first turn.
+
+For the baseline, restart the entire deployment to clear all cache state,
+remove `--disaggregation-enable-reverse-kv` from both workers, and rerun with
+`--label disabled --result /tmp/reverse-kv-disabled.json`. Compare
+`ttft_p50_ms` and `ttft_p95_ms` across the two JSON files. The enabled run
+should also show `BlockStored` KV events after completed decode requests and a
+larger prefill cache hit on subsequent turns. Use the same model, prompts,
+output length, and inter-turn delay for both runs.
+
 ### DeepSeek Multi-Node
 
 ```bash
