@@ -1165,11 +1165,8 @@ class SchedulerBatchResultProcessor:
             )
 
         self.token_to_kv_pool_allocator.free_group_begin()
-        # Finished requests whose release runs after the send below. A consumer
-        # of auxiliary output may defer a response, which requires it released.
-        releases_after_send: Optional[List[Tuple[Req, bool]]] = (
-            [] if auxiliary_output is None else None
-        )
+        # Releases of the requests finishing in this step, run after their send.
+        pending_releases: List[Tuple[Req, bool]] = []
 
         # Folds the relay point's selection into the DAG and sets the finish
         # states the loop below observes. Beam + spec is rejected at admission.
@@ -1225,7 +1222,7 @@ class SchedulerBatchResultProcessor:
                 i,
                 logits_output,
                 new_accept_len,
-                releases_after_send=releases_after_send,
+                pending_releases=pending_releases,
             )
 
             if req.return_logprob:
@@ -1264,6 +1261,8 @@ class SchedulerBatchResultProcessor:
                 req.grammar.finished = req.finished()
 
         if auxiliary_output is not None:
+            # A consumer may defer_response a finished request: release first.
+            self._run_pending_releases(pending_releases)
             self.consume_auxiliary_output(
                 batch,
                 auxiliary_output,
@@ -1271,9 +1270,7 @@ class SchedulerBatchResultProcessor:
             )
 
         self.output_streamer.stream_output(reqs_still_in_batch, batch.return_logprob)
-        for req, checkpoint in releases_after_send or ():
-            self._prepare_kv_cache_release(req)
-            self.request_retirer.release(req, checkpoint=checkpoint)
+        self._run_pending_releases(pending_releases)
         self.token_to_kv_pool_allocator.free_group_end()
 
         self.metrics_reporter.forward_ct_decode = (
@@ -1533,6 +1530,12 @@ class SchedulerBatchResultProcessor:
         if callable(prepare_release):
             prepare_release(req)
 
+    def _run_pending_releases(self, pending_releases: List[Tuple[Req, bool]]) -> None:
+        for req, checkpoint in pending_releases:
+            self._prepare_kv_cache_release(req)
+            self.request_retirer.release(req, checkpoint=checkpoint)
+        pending_releases.clear()
+
     def _handle_sampling_mask_abort(self, req: Req) -> None:
         """Release a request whose sampled token must not be committed."""
         if req.multimodal_inputs is not None and req.session is None:
@@ -1553,10 +1556,10 @@ class SchedulerBatchResultProcessor:
         logits_output: LogitsProcessorOutput,
         num_new_tokens: int = 1,
         *,
-        releases_after_send: Optional[List[Tuple[Req, bool]]] = None,
+        pending_releases: Optional[List[Tuple[Req, bool]]] = None,
     ):
-        """``releases_after_send``, when given, takes a finished request's
-        release for the caller to run after it sends the step's outputs."""
+        """A finished request's release goes to ``pending_releases``, which the
+        caller runs after sending the step's outputs; without it, it runs here."""
         lazy = get_exec().mamba.enable_mamba_extra_buffer_lazy
         known_mamba_boundary = None
         completed_mamba_boundary = None
@@ -1632,13 +1635,8 @@ class SchedulerBatchResultProcessor:
                     else True
                 )
                 # The send fills a None finished_len, which the release reads.
-                # An abort's release also detaches it, so it keeps its order.
-                if (
-                    releases_after_send is not None
-                    and req.finished_len is not None
-                    and not isinstance(req.finished_reason, FINISH_ABORT)
-                ):
-                    releases_after_send.append((req, checkpoint))
+                if pending_releases is not None and req.finished_len is not None:
+                    pending_releases.append((req, checkpoint))
                 else:
                     self._prepare_kv_cache_release(req)
                     self.request_retirer.release(req, checkpoint=checkpoint)

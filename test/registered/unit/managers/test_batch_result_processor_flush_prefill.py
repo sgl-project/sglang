@@ -203,8 +203,9 @@ class TestFlushPrefill(CustomTestCase):
         )
 
     def test_decode_keeps_release_first_where_the_send_depends_on_it(self):
-        # An abort leaves finished_len for the send to fill, and the release reads
-        # it; a consumer of auxiliary output may defer_response a released request.
+        # A requested finish (here an abort) leaves finished_len for the send to
+        # fill, and the release reads it; a consumer of auxiliary output may
+        # defer_response only a released request.
         for to_finish, auxiliary in ((FINISH_ABORT(), False), (None, True)):
             with self.subTest(auxiliary=auxiliary):
                 log = _run(
