@@ -504,6 +504,11 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             bits = (bits << 1) | bool(band.lazy_compaction)
         return (epoch << len(self.bands)) | bits
 
+    def pricing_key(self) -> int:
+        """What every capacity answer depends on besides its question: the key
+        `pricing_snapshot` (and each stage's snapshot) is kept under."""
+        return self._snapshot_key_now()
+
     def pricing_snapshot(self) -> ChainSnapshot:
         """The bands' snapshot every capacity decision prices on, kept until
         the epoch moves."""
