@@ -236,6 +236,8 @@ def _batch(num_tokens, req_rows):
 
 
 def _verify(backend, layers, batch, inputs):
+    # The ring rows the verify resolves; on static pools, the request rows.
+    backend.forward_metadata.replayssm_ring_indices = batch.req_pool_indices
     return [
         backend.forward_extend(layer, batch, mixed_qkv, a, b)
         for layer, (mixed_qkv, a, b) in zip(layers, inputs)
@@ -710,6 +712,8 @@ class TestGDNReplaySSMDirectCommit(CustomTestCase):
         ]
         graph_arm = self._replayssm(template)
         graph_backend = graph_arm.backend(qsl, static_cache)
+        # The captured ring rows: the request rows, refilled in place per replay.
+        graph_backend.forward_metadata.replayssm_ring_indices = static_rows
         capture_batch = _batch(num_tokens, static_rows)
 
         def run():
