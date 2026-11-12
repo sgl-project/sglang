@@ -376,6 +376,7 @@ class TestLateReadsUseTheForwardSlots(CustomTestCase):
                             "sglang.kernels.ops.mamba.mamba_state_scatter_triton."
                             "fused_conv_window_scatter_with_mask"
                         ) as conv_scatter,
+                        patch(_HLA + ".commit_ple_states_after_verify"),
                     ):
                         spec_utils.commit_mamba_states_after_verify(
                             self._target_worker(f, mamba_pool),

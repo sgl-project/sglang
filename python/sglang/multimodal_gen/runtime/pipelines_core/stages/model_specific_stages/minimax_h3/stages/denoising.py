@@ -786,6 +786,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
             sampling=sampling,
             imgvid_noise_aug=imgvid_noise_aug,
             audio_noise_aug=audio_noise_aug,
+            stochastic_sampling=self.stochastic_sampling,
         )
         attn_metadata = _build_cube_attn_metadata(
             server_args,
@@ -1425,8 +1426,16 @@ def _apply_condition_noise_aug(
     sampling: Any,
     imgvid_noise_aug: float,
     audio_noise_aug: float,
+    stochastic_sampling: bool = False,
 ) -> None:
     """Apply condition noise augmentation to cond rows."""
+
+    if stochastic_sampling and ctx.cond_rows is not None:
+        # Cached anchors are on CPU; the release draws and mixes on the DiT device.
+        ctx.cond_rows = ctx.cond_rows.to(current_platform.get_local_torch_device())
+        if not ctx.is_ref2va:
+            # The released FL2VA adapter rounds clean conditioning to BF16 first.
+            ctx.cond_rows = ctx.cond_rows.to(torch.bfloat16).float()
 
     noise_visual_conditions = (
         ctx.cond_rows is not None and float(imgvid_noise_aug) < 1.0
@@ -1466,6 +1475,13 @@ def _apply_condition_noise_aug(
             imgvid_cond_num_frames=imgvid_cond_num_frames,
             seed=int(noise_seed),
             noise_aug=float(imgvid_noise_aug),
+            generator=(
+                torch.Generator(device=ctx.cond_rows.device).manual_seed(
+                    int(noise_seed) + 7919
+                )
+                if stochastic_sampling
+                else None
+            ),
         )
 
     if noise_audio_conditions:
