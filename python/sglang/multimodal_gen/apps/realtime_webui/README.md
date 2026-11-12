@@ -3,8 +3,9 @@
 Standalone browser demo for `/v1/realtime_video/generate`.
 
 Open `index.html` directly in a browser, point it at an SGLang Diffusion server,
-and generate. The app sends msgpack init / event messages and renders lossless
-raw RGB frame batches on a canvas.
+and generate. The app sends msgpack init / event messages and renders the
+returned frame batches on a canvas: WebP preview by default (lossy, quality set
+by the Quality field), with JPEG or lossless raw RGB selectable under Transport.
 
 The first version is intentionally static: no npm install, no build step, and no
 server-side dependencies. Presets are UI-side templates for prompt, LingBot
