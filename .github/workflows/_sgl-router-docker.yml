@@ -3,9 +3,10 @@ name: Build sgl-router Docker Image
 # Reusable: builds docker/sgl-router.Dockerfile for amd64 and arm64, each
 # natively (no QEMU emulation), pushes both by digest, then stitches them into
 # one multi-arch manifest per requested tag so `docker pull` resolves the right
-# arch automatically. Callers: nightly-sgl-router-docker.yml (`:nightly` from
-# main) and release-sgl-router-docker.yml (`:v<version>` + `:latest` from a
-# `router-v*` tag; a no-push build on pull requests that touch the image).
+# arch automatically. Callers: nightly-sgl-router-docker.yml
+# (lmsysorg/sglang-staging:sgl-router from main) and
+# release-sgl-router-docker.yml (lmsysorg/sgl-router:v<version> + :latest from
+# a `router-v*` tag; a no-push build on pull requests that touch the image).
 
 on:
   workflow_call:

@@ -16,9 +16,9 @@
 # below runs with `--locked`, so the image ships exactly the dependency
 # graph CI checked, tested, and license-audited.
 #
-# Published as lmsysorg/sgl-router (`:nightly` from main by
-# nightly-sgl-router-docker.yml; `:v<version>` and `:latest` from `router-v*`
-# tags by release-sgl-router-docker.yml).
+# Published as lmsysorg/sglang-staging:sgl-router (main, nightly, by
+# nightly-sgl-router-docker.yml) and lmsysorg/sgl-router:v<version> + :latest
+# (`router-v*` tags, by release-sgl-router-docker.yml).
 #
 # Build (from the repo root):
 #   docker build -f docker/sgl-router.Dockerfile -t sgl-router:dev .

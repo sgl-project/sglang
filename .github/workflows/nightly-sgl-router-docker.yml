@@ -1,8 +1,9 @@
 name: Nightly sgl-router Docker Image
 
-# Builds lmsysorg/sgl-router:nightly from main every night. Versioned
-# releases (`router-v*` tags) go through release-sgl-router-docker.yml; both
-# share the multi-arch build in _sgl-router-docker.yml.
+# Builds lmsysorg/sglang-staging:sgl-router from main every night. Versioned
+# releases (`router-v*` tags) publish lmsysorg/sgl-router through
+# release-sgl-router-docker.yml; both share the multi-arch build in
+# _sgl-router-docker.yml.
 
 on:
   schedule:
@@ -18,6 +19,6 @@ jobs:
     if: github.repository == 'sgl-project/sglang'
     uses: ./.github/workflows/_sgl-router-docker.yml
     with:
-      image_repo: lmsysorg/sgl-router
-      tags: nightly
+      image_repo: lmsysorg/sglang-staging
+      tags: sgl-router
     secrets: inherit

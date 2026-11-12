@@ -62,8 +62,8 @@ Pull the container image (multi-arch, amd64 and arm64; see
 [Releases and versions](#releases-and-versions)):
 
 ```bash
-docker pull lmsysorg/sgl-router:latest     # latest release
-docker pull lmsysorg/sgl-router:nightly    # built from main every night
+docker pull lmsysorg/sgl-router:latest            # latest release
+docker pull lmsysorg/sglang-staging:sgl-router    # built from main every night
 docker run --rm -p 30000:30000 lmsysorg/sgl-router:latest --help
 ```
 
@@ -403,9 +403,10 @@ docker build -f docker/sgl-router.Dockerfile --build-arg CARGO_FEATURES=fips .
 ## Releases and versions
 
 `sgl-router` is versioned on its own semver track, independent of SGLang
-releases. It ships as a container image, `lmsysorg/sgl-router`, tagged
-`v<version>`, `latest` (the newest release) and `nightly` (main, rebuilt every
-night). The crate is binary-only and is not published to crates.io or PyPI.
+releases. It ships as a container image: `lmsysorg/sgl-router` tagged
+`v<version>` and `latest` (the newest release), and
+`lmsysorg/sglang-staging:sgl-router` (main, rebuilt every night). The crate is
+binary-only and is not published to crates.io or PyPI.
 `sgl-router --version` prints the version an image was built from.
 
 Releases are made manually:
