@@ -769,10 +769,12 @@ class PureSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             self.swa_attn_allocator = TokenToKVPoolAllocator(
                 size_swa, dtype, device, kvcache.swa_kv_pool, need_sort
             )
-        else:
+        elif _is_npu:
             self.swa_attn_allocator = NPUPagedTokenToKVPoolAllocator(
                 size_swa, page_size, dtype, device, kvcache.swa_kv_pool, need_sort
             )
+        else:
+            raise ValueError("PureSWA page_size > 1 requires NPU")
         self.full_attn_allocator = self.swa_attn_allocator
 
         self.full_to_swa_index_mapping = torch.cat(
@@ -837,9 +839,17 @@ class PureSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         return self.swa_attn_allocator.alloc(need_size)
 
     def alloc_extend(self, *args, **kwargs):
+        if not _is_npu:
+            raise NotImplementedError(
+                "PureSWATokenToKVPoolAllocator does not support page_size > 1."
+            )
         return self.swa_attn_allocator.alloc_extend(*args, **kwargs)
 
     def alloc_decode(self, *args, **kwargs):
+        if not _is_npu:
+            raise NotImplementedError(
+                "PureSWATokenToKVPoolAllocator does not support page_size > 1."
+            )
         return self.swa_attn_allocator.alloc_decode(*args, **kwargs)
 
     def alloc_extend_swa_tail(self, *args, **kwargs):

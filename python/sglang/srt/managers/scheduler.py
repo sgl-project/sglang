@@ -4767,7 +4767,7 @@ class Scheduler(
 
         new_batch.prepare_for_extend()
 
-        if self.tp_worker.model_runner.prefill_aware_swa:
+        if self.tp_worker.model_runner.prefill_aware_swa and _is_npu:
             for req in can_run_list:
                 req.kv.shield_window_prefill(len(req.origin_input_ids))
 
