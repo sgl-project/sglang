@@ -4019,8 +4019,13 @@ class DeepseekV4Model(nn.Module):
         ):
             attn_backend = get_attn_backend()
             # None inside a HIP prefill CUDA graph: the late layers run every row.
+            # On CUDA the tail is required, so a missing one is a bug.
             tail_metadata = attn_backend.tail_forward_metadata
-            if tail_metadata is not None:
+            if tail_metadata is None:
+                assert not (
+                    _is_cuda and attn_backend.enable_decoder_swa_bounded_replay
+                ), "CUDA prefill is missing the SWA tail"
+            else:
                 tail = tail_metadata.late_layer_tail
                 self._check_late_layer_tail_readers(forward_batch, tail)
         tail_in_graph = (
@@ -4960,34 +4965,40 @@ class DeepseekV4ForCausalLM(nn.Module):
             self.capture_aux_hidden_states
             and self.model.late_layer_start is not None
             and forward_batch.forward_mode.is_extend_without_speculative()
-            and get_attn_backend().tail_forward_metadata is not None
         ):
-            tail = get_attn_backend().tail_forward_metadata.late_layer_tail
-            input_ids = tail.rows(input_ids)
-            if tail.real_rows_count is not None:
-                # Fixed-capacity tail block from the prefill CUDA graph: drop padding.
-                n = tail.real_rows_count
-                input_ids = input_ids[:n]
-                hidden_states = hidden_states[:n]
-                pre_hc_head = pre_hc_head[:n]
-                if aux_hidden_states is not None:
-                    aux_hidden_states = aux_hidden_states[:n]
-            logits_metadata = LogitsMetadata.from_forward_batch(forward_batch)
-            logits_metadata.extend_seq_lens = tail.extend_seq_lens
-            logits_metadata.extend_seq_lens_cpu = tail.extend_seq_lens_cpu
-            logits_metadata.extend_logprob_start_lens_cpu = (
-                # A prompt-logprob reader's tail is its whole extend, so its start
-                # stands; every other start is the extend's end.
-                [
-                    min(start, t)
-                    for start, t in zip(
-                        forward_batch.extend_logprob_start_lens_cpu,
-                        tail.extend_seq_lens_cpu,
-                    )
-                ]
-                if forward_batch.return_logprob
-                else tail.extend_seq_lens_cpu
-            )
+            attn_backend = get_attn_backend()
+            tail_metadata = attn_backend.tail_forward_metadata
+            if tail_metadata is None:
+                assert not (
+                    _is_cuda and attn_backend.enable_decoder_swa_bounded_replay
+                ), "CUDA prefill is missing the SWA tail"
+            else:
+                tail = tail_metadata.late_layer_tail
+                input_ids = tail.rows(input_ids)
+                if tail.real_rows_count is not None:
+                    # Fixed-capacity tail block from the prefill CUDA graph: drop padding.
+                    n = tail.real_rows_count
+                    input_ids = input_ids[:n]
+                    hidden_states = hidden_states[:n]
+                    pre_hc_head = pre_hc_head[:n]
+                    if aux_hidden_states is not None:
+                        aux_hidden_states = aux_hidden_states[:n]
+                logits_metadata = LogitsMetadata.from_forward_batch(forward_batch)
+                logits_metadata.extend_seq_lens = tail.extend_seq_lens
+                logits_metadata.extend_seq_lens_cpu = tail.extend_seq_lens_cpu
+                logits_metadata.extend_logprob_start_lens_cpu = (
+                    # A prompt-logprob reader's tail is its whole extend, so its start
+                    # stands; every other start is the extend's end.
+                    [
+                        min(start, t)
+                        for start, t in zip(
+                            forward_batch.extend_logprob_start_lens_cpu,
+                            tail.extend_seq_lens_cpu,
+                        )
+                    ]
+                    if forward_batch.return_logprob
+                    else tail.extend_seq_lens_cpu
+                )
 
         output = self.logits_processor(
             input_ids,

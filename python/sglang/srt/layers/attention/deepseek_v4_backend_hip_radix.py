@@ -902,13 +902,11 @@ class DeepseekV4HipRadixBackend(
     # This attribute is used in python/sglang/srt/model_executor/runner/prefill_cuda_graph_runner.py.
     # PrefillCudaGraphRunner looks this up via getattr; contexts over prefill.max_seq_len run eager.
     def can_run_prefill_cuda_graph(self, forward_batch: ForwardBatch) -> bool:
-        # Graph-run prefills skip the late-layer tail, so no tail capacity applies.
+        # The runner already rejects a sequence past the prefill graph limit.
+        # The HIP graph has no SWA tail, so a long batch stays eager.
         seq_lens_cpu = forward_batch.seq_lens_cpu
         if seq_lens_cpu is None or seq_lens_cpu.numel() == 0:
             return True
-        max_seq_len = self._prefill_graph_seq_limit()
-        if max_seq_len is not None and int(seq_lens_cpu.max().item()) > max_seq_len:
-            return False
         if self.enable_decoder_swa_bounded_replay:
             extend_lens_cpu = forward_batch.extend_seq_lens_cpu
             if (
@@ -2220,6 +2218,15 @@ class DeepseekV4HipRadixBackend(
     def late_layer_num_tokens(self, forward_batch: ForwardBatch) -> Optional[int]:
         if not self.enable_decoder_swa_bounded_replay or self.is_draft_worker:
             return None
+        runner = getattr(self.model_runner, "prefill_cuda_graph_runner", None)
+        if (
+            runner is not None
+            and forward_batch.input_ids is not None
+            and forward_batch.forward_mode.is_extend_without_speculative()
+            and runner.can_run_graph(forward_batch)
+        ):
+            # This graph does not build the SWA tail, so the late layers run every row.
+            return int(forward_batch.input_ids.shape[0])
         return late_layer_num_tokens(forward_batch, dspark=self.is_dspark)
 
     def _init_forward_metadata_prefill_from_batch(
