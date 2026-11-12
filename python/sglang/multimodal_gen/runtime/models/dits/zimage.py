@@ -51,6 +51,7 @@ except Exception:
 
 logger = init_logger(__name__)
 _is_cuda = current_platform.is_cuda()
+_is_rocm = current_platform.is_rocm()
 
 ADALN_EMBED_DIM = 256
 SEQ_MULTI_OF = 32
@@ -390,9 +391,10 @@ class ZImageAttention(nn.Module):
                 q, k, self.norm_q, self.norm_k, self.head_dim
             )
 
-        # Off CUDA only the batched 3D table (the one with positions) may take the
-        # fused QKNorm+RoPE kernels; a 2D table gets qk-norm, then the class.
-        rope_in_qk_norm = _is_cuda or rope_positions is not None
+        # The batched 3D table (the one with positions) may take the fused
+        # QKNorm+RoPE kernels anywhere; a 2D table reaches them on CUDA and ROCm,
+        # and gets qk-norm, then the class, on the other platforms.
+        rope_in_qk_norm = _is_cuda or _is_rocm or rope_positions is not None
         if self.qk_norm and fused_qk is None and rope_in_qk_norm:
             q, k = apply_qk_norm_with_optional_rope(
                 q=q.contiguous(),
