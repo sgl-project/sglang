@@ -95,7 +95,7 @@ from sglang.srt.model_executor.forward_context import (
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_forward, get_memory, get_parallel
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
-from sglang.srt.utils import is_cpu, use_intel_amx_backend
+from sglang.srt.utils import is_cpu, is_hip, use_intel_amx_backend
 from sglang.srt.utils.device import get_device_capability, is_cuda
 
 _is_cpu = is_cpu()
@@ -549,7 +549,10 @@ class MuseSpark1xMoE(nn.Module):
             self.pre_expert_proj is not None
             and self.tp_size in (4, 8)
             and torch.cuda.is_available()
-            and torch.cuda.get_device_capability() == (10, 3)
+            and (
+                torch.cuda.get_device_capability() == (10, 3)
+                or (self.tp_size == 8 and torch.cuda.get_device_capability() == (10, 0))
+            )
         ):
             ca_comm = get_parallel().tp_group.ca_comm
             reserve_projection_workspace(
@@ -813,7 +816,14 @@ class MuseSpark1xMoE(nn.Module):
             if (
                 self.tp_size in (4, 8)
                 and not sp_active
-                and torch.cuda.get_device_capability(hidden_states.device) == (10, 3)
+                and (
+                    torch.cuda.get_device_capability(hidden_states.device) == (10, 3)
+                    or (
+                        self.tp_size == 8
+                        and torch.cuda.get_device_capability(hidden_states.device)
+                        == (10, 0)
+                    )
+                )
                 and gemm_ag_supported(comm, hidden_states, self.pre_expert_proj.weight)
             ):
                 expert_input = gemm_ag(comm, hidden_states, self.pre_expert_proj.weight)
@@ -1142,7 +1152,7 @@ class MuseSpark1xModel(nn.Module):
                     or moe_layers[0].expert_hidden_size % 256
                     or comm.max_push_size < moe_layers[0].expert_hidden_size * 2
                     or not 0
-                    < comm._push_counter.numel()
+                    < comm.config.num_push_blocks
                     <= torch.cuda.get_device_properties(
                         comm.device
                     ).multi_processor_count
@@ -1212,7 +1222,11 @@ class MuseSpark1xModel(nn.Module):
         )
         if input_embeds is None and self.embed_norm is not None:
             hidden_states = self.embed_norm(hidden_states)
-        sp_active = layernorm_sp.runs_sp(forward_batch.forward_mode)
+        # the pass's own rows (the bucket at capture), so --layernorm-sp-min-tokens
+        # decides the entry as maybe_exit_gather decides the exit
+        sp_active = layernorm_sp.runs_sp(
+            forward_batch.forward_mode, hidden_states.shape[0]
+        )
         get_forward().set("sp_active", sp_active)
         if sp_active:
             hidden_states = layernorm_sp.sp_entry_scatter(hidden_states)
@@ -1302,15 +1316,15 @@ class MuseSparkTextForCausalLM(nn.Module):
         aux_hidden_states = None
         if self.capture_aux_hidden_states:
             hidden_states, aux_hidden_states = hidden_states
+        num_tokens = (
+            input_ids.shape[0] if input_ids is not None else input_embeds.shape[0]
+        )
         if aux_hidden_states is not None and layernorm_sp.runs_sp(
-            forward_batch.forward_mode
+            forward_batch.forward_mode, num_tokens
         ):
             # DFLASH consumes every prompt token in replicated token order.
             # Gather the taps before logits pruning applies full-token indices;
             # FULL capture also needs the entry-scatter padding removed.
-            num_tokens = (
-                input_ids.shape[0] if input_ids is not None else input_embeds.shape[0]
-            )
             # Pack while sequence-sharded so the logits processor does not
             # duplicate the full replicated draft context with torch.cat.
             # Release the tap list before allocating the gathered output.
@@ -1325,7 +1339,7 @@ class MuseSparkTextForCausalLM(nn.Module):
         if (
             input_ids is None
             and input_embeds is not None
-            and layernorm_sp.runs_sp(forward_batch.forward_mode)
+            and layernorm_sp.runs_sp(forward_batch.forward_mode, input_embeds.shape[0])
         ):
             hidden_states = layernorm_sp.sp_exit_gather(
                 hidden_states, num_tokens=input_embeds.shape[0]
@@ -1637,6 +1651,13 @@ class MuseSparkTextForCausalLM(nn.Module):
                 and not self.int4_checkpoint
             ):
                 module.experts.prepare_trtllm_weights(module.experts.post_expert_norm)
+
+
+# Preserve the CUDA implementation and its FlashInfer/JIT optimizations.
+# The independently validated MI355 implementation keeps the fused boundaries,
+# Quark loader, and kernel rounding points that were measured together.
+if is_hip():
+    from sglang.srt.rocm_muse_spark.model import MuseSparkTextForCausalLM
 
 
 __all__ = [

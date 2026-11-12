@@ -774,6 +774,31 @@ pub struct MmData {
     pub prefetched: Vec<bytes::Bytes>,
     /// See [`GenerateBody::mm_hashes`]; applied by the MM worker.
     pub mm_hashes: Vec<String>,
+    /// How admission handled the media, for the processor's own timing.
+    pub admission: MediaAdmission,
+}
+
+/// How admission handled one request's media before the MM processor runs:
+/// the media prefetch, and the hand-off to the MM worker pool.
+#[derive(Clone, Debug, Default)]
+pub struct MediaAdmission {
+    /// Wall time `core::prefetch` spent resolving the request's I/O-backed
+    /// sources; zero when it had none.
+    pub prefetch: std::time::Duration,
+    /// The sources the processor resolved itself
+    /// ([`crate::MmProcessor::fetch_media`]), in `payload::io_sources` order.
+    pub processor_fetches: Vec<ProcessorFetch>,
+    /// When the request was queued for the MM worker pool.
+    pub queued_at: Option<std::time::Instant>,
+}
+
+/// One source the processor fetched: when its `fetch_media` call started,
+/// how long it took, and the bytes it returned.
+#[derive(Clone, Copy, Debug)]
+pub struct ProcessorFetch {
+    pub started: std::time::Instant,
+    pub elapsed: std::time::Duration,
+    pub bytes: usize,
 }
 
 impl GenerateRequest {
@@ -856,6 +881,21 @@ fn flatten_column<T>(column: Vec<Option<Option<T>>>) -> Vec<Option<T>> {
 /// Reject `n` copies of one prompt (chat's `n` choices) before they are
 /// cloned: the batch cap, and the clone budget a broadcast is held to for its
 /// `ids` plus the list `fields` copied with them.
+/// Python's deprecated spelling (`GenerateReqInput.normalize_batch_and_arguments`):
+/// a set `data_parallel_rank` names the DP rank when `routed_dp_rank` does
+/// not, and is dropped either way.
+pub(crate) fn move_deprecated_dp_rank(fields: &mut serde_json::Map<String, serde_json::Value>) {
+    if let Some(rank) = fields
+        .remove("data_parallel_rank")
+        .filter(|rank| !rank.is_null())
+        && fields
+            .get("routed_dp_rank")
+            .is_none_or(serde_json::Value::is_null)
+    {
+        fields.insert("routed_dp_rank".into(), rank);
+    }
+}
+
 pub(crate) fn check_prompt_copies(
     ids: usize,
     fields: &[&serde_json::Value],

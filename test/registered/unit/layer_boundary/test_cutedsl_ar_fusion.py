@@ -9,6 +9,7 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.layers.flashinfer_mnnvl_cutedsl import (
     FlashInferMNNVLCuteDSLARFusion,
+    _config_for_shape,
     _retargeted_config,
     _with_early_finalize_shared_load,
 )
@@ -613,6 +614,25 @@ def test_ep_shape_profile_uses_runtime_tuning_only_at_its_capability_boundary(
         assert all(
             target.preset.collective.rms_threads == expected_threads for target in bt
         )
+
+
+@pytest.mark.parametrize(
+    ("compute_capability", "shipped"),
+    [((10, 3), True), ((10, 7), True), ((10, 0), False)],
+)
+def test_a_profile_shipped_for_this_arch_is_not_retargeted(compute_capability, shipped):
+    """FlashInfer ships tp=4 hidden=8192 top_k=10 for GB300 and Rubin only; on
+    those archs its measured routes must win over the re-targeted tp=8 presets."""
+    from flashinfer.comm.mnnvl_cutedsl import DEFAULT_CONFIG
+
+    config = _config_for_shape(
+        DEFAULT_CONFIG,
+        tp_size=4,
+        hidden_size=8192,
+        top_k=10,
+        compute_capability=compute_capability,
+    )
+    assert (config is DEFAULT_CONFIG) is shipped
 
 
 class TestDeferredLoraAllReduce(unittest.TestCase):
