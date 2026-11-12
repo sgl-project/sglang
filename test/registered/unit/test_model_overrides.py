@@ -2048,23 +2048,37 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 with self.assertRaisesRegex(ValueError, field.replace("_", "-")):
                     _deterministic_attention_backend(view)
 
-    def test_deterministic_aiter_decode_only_on_gfx950_without_mla(self):
-        """AITER decode attention is batch-invariant only for non-MLA models on gfx950,
-        and its speculative verify path is not."""
+    def test_deterministic_aiter_decode_only_on_gfx950(self):
+        """AITER decode attention is batch-invariant on gfx950: paged decode as is, MLA
+        decode with the backend's fixed split count, verified for the bf16 KV cache
+        without decode context parallelism. Its speculative verify path is not."""
         from sglang.srt.arg_groups.model_override_base import ResolvedView
         from sglang.srt.arg_groups.overrides import _deterministic_attention_backend
 
         cases = [
-            # (gfx950, MLA model, prefill backend, speculative algorithm, accepted)
-            (True, False, "triton", None, True),
-            (False, False, "triton", None, False),
-            (True, True, "triton", None, False),
-            (True, False, "aiter", None, True),
-            (True, False, "triton", "EAGLE", False),
+            # (gfx950, MLA model, prefill backend, speculative algorithm,
+            #  KV cache dtype, dcp size, accepted)
+            (True, False, "triton", None, "auto", 1, True),
+            (False, False, "triton", None, "auto", 1, False),
+            (True, False, "aiter", None, "auto", 1, True),
+            (True, False, "triton", "EAGLE", "auto", 1, False),
+            (True, True, "triton", None, "auto", 1, True),
+            (True, True, "triton", None, "bf16", 1, True),
+            (False, True, "triton", None, "auto", 1, False),
+            (True, True, "triton", "EAGLE", "auto", 1, False),
+            (True, True, "triton", None, "fp8_e4m3", 1, False),
+            (True, True, "triton", None, "auto", 2, False),
         ]
-        for gfx950, mla, prefill, spec, accepted in cases:
+        for gfx950, mla, prefill, spec, kv_dtype, dcp, accepted in cases:
             with (
-                self.subTest(gfx950=gfx950, mla=mla, prefill=prefill, spec=spec),
+                self.subTest(
+                    gfx950=gfx950,
+                    mla=mla,
+                    prefill=prefill,
+                    spec=spec,
+                    kv_dtype=kv_dtype,
+                    dcp=dcp,
+                ),
                 patch(
                     "sglang.srt.arg_groups.overrides.is_gfx95_supported",
                     return_value=gfx950,
@@ -2080,13 +2094,14 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                         prefill_attention_backend=prefill,
                         decode_attention_backend="aiter",
                         speculative_algorithm=spec,
-                        kv_cache_dtype="auto",
+                        kv_cache_dtype=kv_dtype,
+                        dcp_size=dcp,
                     )
                 )
                 if accepted:
                     self.assertEqual(_deterministic_attention_backend(view), {})
                 else:
-                    with self.assertRaises(ValueError):
+                    with self.assertRaisesRegex(ValueError, "aiter decode"):
                         _deterministic_attention_backend(view)
 
     def test_deterministic_aiter_prefill_only_on_gfx950_without_mla(self):
