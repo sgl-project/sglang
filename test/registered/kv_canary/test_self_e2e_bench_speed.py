@@ -16,7 +16,10 @@ from sglang.benchmark.one_batch_server import (
 from sglang.srt.entrypoints.http_server import launch_server
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.test_utils import DEFAULT_PORT_FOR_SRT_TEST_RUNNER
+from sglang.test.test_utils import (
+    ADMIN_API_KEY_FOR_TEST,
+    DEFAULT_PORT_FOR_SRT_TEST_RUNNER,
+)
 
 # CUDA-only: this self-bench asserts a 1.0% kv_canary overhead budget tuned on
 # the CUDA (H100) runner. On ROCm the measured overhead is ~1.26%, so the
@@ -46,6 +49,8 @@ def _make_server_args(
         "--cuda-graph-backend-prefill=disabled",
         "--gc-warning-threshold-secs",
         "0.5",
+        "--admin-api-key",
+        ADMIN_API_KEY_FOR_TEST,
     ]
     if disable_cuda_graph:
         extra.append("--disable-cuda-graph")

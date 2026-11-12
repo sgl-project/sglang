@@ -153,6 +153,7 @@ export SGLANG_SIMULATOR_OUTPUT_DIR="$SIMULATOR_OUTPUT_DIR"
 python3 -m sglang_simulator.simulation.sglang.launch_server \
   --model-path /absolute/path/to/model \
   --sim-config-path /absolute/path/to/simulator.json \
+  --admin-api-key "${ADMIN_API_KEY}" \
   --port 30000
 ```
 
@@ -174,6 +175,7 @@ python3 benchmark/simulator/bench_serving.py \
   --use-trace-timestamps \
   --num-prompts 100 \
   --profile \
+  --admin-api-key "${ADMIN_API_KEY}" \
   --output-file "$SIMULATOR_OUTPUT_DIR/benchmark.json"
 ```
 
