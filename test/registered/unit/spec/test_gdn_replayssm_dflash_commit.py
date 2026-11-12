@@ -135,6 +135,18 @@ class TestGDNReplaySSMRingLength(CustomTestCase):
 
 
 class TestGDNReplaySSMBackendCommit(CustomTestCase):
+    def test_deferred_route_retains_history_and_passes_capacity_margin(self):
+        pool, state = _gdn_pool(), _spec_state()
+        pool.replayssm_deferred_state = object()
+        pool.replayssm_commit_stats = torch.zeros(40, 9, dtype=torch.int64)
+        hybrid = _hybrid_backend(pool, state, torch.tensor([5, 9]))
+        with patch(_GDN_COMMIT) as commit:
+            self._commit(hybrid, torch.tensor([2, 0]), torch.tensor([17, 23]))
+        kwargs = commit.call_args.kwargs
+        self.assertIs(kwargs["fold_every_commit"], False)
+        self.assertEqual(kwargs["max_spec_len"], DRAFT_TOKENS)
+        self.assertIs(kwargs["stats"], pool.replayssm_commit_stats)
+
     def _commit(self, hybrid, last_correct, req_rows, **kwargs):
         hybrid.update_mamba_state_after_mtp_verify(
             last_correct_step_indices=last_correct,
