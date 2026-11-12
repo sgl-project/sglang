@@ -16,6 +16,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_schedule,
     get_server_args,
+    get_spec,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -1483,6 +1484,123 @@ class TestDflashDraftKvBudget(CustomTestCase):
                     cfg._cell_size,
                     target_kv_per_token + draft_kv_per_token * loc_space_scale,
                 )
+
+    def test_draft_kv_ring_drops_the_per_token_draft_charge(self):
+        mr = _make_model_runner(self)
+        mr.spec_algorithm.is_dflash.return_value = True
+        mr.spec_algorithm.is_dflash_family.return_value = True
+        mr.spec_aux_config = SimpleNamespace(
+            eagle_draft_num_layers=None,
+            dflash_draft_num_layers=5,
+        )
+        mr.dflash_draft_cell_size_per_token = 10_240
+        with (
+            mock_cpu_env(),
+            get_spec().override(speculative_dflash_draft_kv_ring=True),
+        ):
+            from sglang.srt.model_executor.pool_configurator import (
+                create_memory_pool_configurator,
+            )
+
+            cfg = create_memory_pool_configurator(mr)
+
+        self.assertEqual(cfg._cell_size, 4 * (64 + 64) * 32 * KV_SIZE)
+
+    def _ring_target_configurator(self, *, page_size, **publish):
+        import torch
+
+        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+        from sglang.srt.model_executor.model_runner_components.spec_aux_hidden_state import (
+            SpecAuxHiddenStateConfig,
+        )
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        runner = _make_model_runner(
+            self,
+            page_size=page_size,
+            speculative_num_draft_tokens=8,
+            **publish,
+        )
+        draft = SimpleNamespace(
+            dtype=torch.bfloat16,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
+            attention_arch=AttentionArch.MLA,
+            hf_config={
+                "architectures": ["DFlashDraftModel"],
+                "num_hidden_layers": 5,
+                "dflash_config": {"attention_mode": "mla"},
+                "layer_types": ["sliding_attention"] * 5,
+                "sliding_window": 1024,
+            },
+        )
+        return KVCacheConfigurator(
+            device="cpu",
+            gpu_id=0,
+            attn_dp_size=1,
+            pp_size=1,
+            pp_group=runner.pp_group,
+            model=None,
+            model_config=runner.model_config,
+            server_args=get_server_args(),
+            kv_cache_dtype=torch.bfloat16,
+            model_dtype=torch.bfloat16,
+            page_size=page_size,
+            sliding_window_size=None,
+            spec_algorithm=SpeculativeAlgorithm.DFLASH,
+            is_draft_worker=False,
+            post_capture_kv_active=False,
+            spec_aux_config=SpecAuxHiddenStateConfig(
+                draft_model_config=draft, dflash_draft_num_layers=5
+            ),
+            draft_parallel_layout=None,
+            is_hybrid_swa=False,
+            is_hybrid_swa_compress=False,
+            use_mla_backend=False,
+            layer_info=runner.layer_info,
+            forward_stream=None,
+            req_to_token_pool=None,
+            token_to_kv_pool_allocator=None,
+            memory_pool_config=None,
+        )
+
+    def test_draft_kv_ring_charge_matches_the_ring_pool(self):
+        from sglang.srt.speculative.dflash_draft_ring import (
+            draft_kv_ring_pool_rows_from_config,
+        )
+
+        for dcp_size, page_size in ((8, 1), (1, 64)):
+            with (
+                self.subTest(dcp=dcp_size, page=page_size),
+                mock_cpu_env(tp_size=8),
+                get_parallel().override(attn_dcp_size=dcp_size),
+            ):
+                config = self._ring_target_configurator(
+                    page_size=page_size, max_running_requests=48
+                )
+                with get_spec().override(speculative_dflash_draft_kv_ring=True):
+                    charged = config._dflash_draft_kv_ring_bytes()
+                req_pool = config._build_req_to_token_pool(
+                    max_num_reqs=config._req_pool_rows(48)
+                )
+                rows = draft_kv_ring_pool_rows_from_config(
+                    config.spec_aux_config.draft_model_config.hf_config,
+                    req_to_token_rows=req_pool.req_to_token.shape[0],
+                    page_size=page_size,
+                )
+                # 5 layers of a (512 + 64)-wide bf16 latent row.
+                self.assertEqual(config.dflash_draft_cell_size_per_token, 5 * 576 * 2)
+                self.assertEqual(
+                    charged,
+                    (rows + page_size) * config.dflash_draft_cell_size_per_token,
+                )
+
+    def test_draft_kv_ring_charges_nothing_when_off(self):
+        with mock_cpu_env(tp_size=8):
+            config = self._ring_target_configurator(
+                page_size=1, max_running_requests=48
+            )
+            self.assertEqual(config._dflash_draft_kv_ring_bytes(), 0)
 
     def test_draft_loc_space_scale(self):
         """An MLA draft that executes DCP keeps per-rank rows."""

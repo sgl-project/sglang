@@ -104,7 +104,8 @@ pub(super) struct PreparedRequest {
     pub(super) expected_peak_sequence_tokens: Option<u64>,
     pub(super) caller_set_rid: bool,
     pub(super) fans_out: bool,
-    /// Media items of chat `messages` or `/generate` media fields, for the access log.
+    /// Media items of chat `messages`, `/generate` or typed `Generate` media
+    /// fields, or multimodal embeddings and rerank inputs, for the access log.
     pub(super) media: MediaCounts,
     /// Whether chat forwards `tokens` as `input_ids`; `None` for `/generate`,
     /// embeddings, classify and rerank, which prepare their own body.
@@ -434,6 +435,7 @@ impl PreparedRequest {
         mut value: Value,
     ) -> Result<Self, ApiError> {
         let batch = is_embedding_batch(&value["input"]);
+        let media = embedding_media(&value["input"]);
         let text_ids = tokenize_input_text(ctx, &model, &value["input"]);
         let forward = !ctx.config.model.disable_input_ids_forwarding;
         // `ClassifyRequest` takes the token IDs of one prompt, not of a batch.
@@ -464,6 +466,7 @@ impl PreparedRequest {
             cache_namespace: cache_namespace(path, &value),
             caller_set_rid: !value["rid"].is_null(),
             fans_out: batch,
+            media,
             ..Self::no_output(path, model, body, &lengths)
         })
     }
@@ -483,6 +486,7 @@ impl PreparedRequest {
         Ok(Self {
             // Each document is its own engine request, and the engine reads no `rid`.
             fans_out: true,
+            media: rerank_media(&value),
             ..Self::no_output(RERANK_PATH, model, body, &lengths)
         })
     }
@@ -536,7 +540,7 @@ impl PreparedRequest {
                 .map(|output| (input as u64).saturating_add(output)),
             caller_set_rid,
             fans_out,
-            media: MediaCounts::default(),
+            media: view.media,
             input_ids_forwarding: None,
             forwarding_booked: false,
             responder: None,
@@ -724,17 +728,20 @@ pub(super) fn forwarded_prompt_ids(
 
 /// `text` as the engine's `input_ids`, of the same shape; `None` when the caller sent ids.
 fn tokenize_text(ctx: &AppContext, model: &ModelId, value: &Value) -> Option<Value> {
-    if has_caller_input_ids(value) {
+    if has_caller_input_ids(value) || !ctx.tokenizers.can_encode_prompt(&model.0) {
         return None;
     }
     let encode = |text: &Value| ctx.tokenizers.encode_prompt(&model.0, text.as_str()?);
     match &value["text"] {
         // An empty batch stays text; as `input_ids: []` it would read as one empty prompt.
-        Value::Array(texts) if !texts.is_empty() => texts
-            .iter()
-            .map(encode)
-            .collect::<Option<Vec<_>>>()
-            .map(Value::from),
+        // One handoff for the whole batch: each `encode_prompt` inside runs inline.
+        Value::Array(texts) if !texts.is_empty() => crate::off_worker::run(|| {
+            texts
+                .iter()
+                .map(encode)
+                .collect::<Option<Vec<_>>>()
+                .map(Value::from)
+        }),
         text => encode(text).map(Value::from),
     }
 }
@@ -847,13 +854,16 @@ fn tokenize_input_text(ctx: &AppContext, model: &ModelId, input: &Value) -> Opti
         text.trim_matches(|c: char| c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c))
             .is_empty()
     };
-    if texts.iter().any(blank) {
+    if texts.iter().any(blank) || !ctx.tokenizers.can_encode_prompt(&model.0) {
         return None;
     }
-    texts
-        .into_iter()
-        .map(|text| ctx.tokenizers.encode_prompt(&model.0, text))
-        .collect()
+    // One handoff for the whole batch: each `encode_prompt` inside runs inline.
+    crate::off_worker::run(|| {
+        texts
+            .into_iter()
+            .map(|text| ctx.tokenizers.encode_prompt(&model.0, text))
+            .collect()
+    })
 }
 
 /// Prompt text bytes of a string, a multimodal item or a list of content parts;
@@ -1542,6 +1552,35 @@ fn generate_media(value: &Value) -> MediaCounts {
     }
 }
 
+/// `MultimodalEmbeddingInput` items' `image` and `video`; text inputs have none.
+fn embedding_media(input: &Value) -> MediaCounts {
+    let mut counts = MediaCounts::default();
+    for item in input.as_array().into_iter().flatten() {
+        if !item["image"].is_null() {
+            counts.images = counts.images.saturating_add(1);
+        }
+        if !item["video"].is_null() {
+            counts.videos = counts.videos.saturating_add(1);
+        }
+    }
+    counts
+}
+
+/// Media content parts of a rerank `query` and its `documents`, counted once
+/// each as the client sent them; string contents have none.
+fn rerank_media(value: &Value) -> MediaCounts {
+    let documents = value["documents"].as_array().into_iter().flatten();
+    let mut counts = MediaCounts::default();
+    for content in std::iter::once(&value["query"]).chain(documents) {
+        for part in content.as_array().into_iter().flatten() {
+            if let Some(part_type) = part["type"].as_str() {
+                counts.add_part(part_type);
+            }
+        }
+    }
+    counts
+}
+
 /// Media content parts of chat `messages`, counted as they deserialize so the
 /// router never holds them. Shapes the engine rejects count nothing rather than
 /// failing the parse, so the engine's own error still reaches the client.
@@ -2009,11 +2048,38 @@ mod tests {
             }),
             stream: false,
             rid: None,
+            media: MediaCounts::default(),
         };
         let model = ModelId("stub-model".into());
         let r = PreparedRequest::typed(&ctx, GENERATE_PATH, model, &view).unwrap();
         assert_eq!((r.input_token_count, r.output_tokens), (12, Some(40)));
         assert!(r.fans_out);
+    }
+
+    #[test]
+    fn embeddings_and_rerank_count_media_inputs() {
+        let ctx = AppContext::stub();
+        let input = json!([{"text":"a","image":"x"},{"image":"y","video":"v"},{"text":"b"}]);
+        let (r, _) = prepare_embeddings(&ctx, input);
+        let want = MediaCounts {
+            images: 2,
+            videos: 1,
+            audios: 0,
+        };
+        assert_eq!(r.media, want);
+        assert_eq!(
+            prepare_embeddings(&ctx, json!("hi")).0.media,
+            MediaCounts::default()
+        );
+
+        let image = json!({"type":"image_url","image_url":{"url":"x"}});
+        let video = json!({"type":"video_url","video_url":{"url":"v"}});
+        let body = json!({
+            "query":[{"type":"text","text":"q"},image],
+            "documents":["text only",[image, video]]
+        });
+        let r = PreparedRequest::rerank(ModelId("stub-model".into()), body.to_string().into());
+        assert_eq!(r.unwrap().media, want);
     }
 
     #[test]

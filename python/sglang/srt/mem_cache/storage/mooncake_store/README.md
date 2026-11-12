@@ -84,6 +84,18 @@ page is a hit only when all of its chunks are present. It supports a single
 MHA or MLA KV pool; composite caches, speculative decoding, and DCP are not
 supported.
 
+### GPU staging capacity
+
+For Linker deployments using a transport that stages GPU data through host memory
+(such as TCP), set `local_buffer_size` in the SGLang Mooncake JSON configuration or
+storage extra configuration. The value is a non-negative byte count and defaults
+to 16 MiB. Size it for concurrent reads and writes, including large recurrent
+state objects. This is per-client transient memory, separate from the shared
+`global_segment_size`; include both in the host memory budget.
+
+To keep the storage engine independent of a PD NVLink engine, set
+`SGLANG_HICACHE_MOONCAKE_REUSE_TE=0`.
+
 ## Install Mooncake
 
 **Method 1: with pip**

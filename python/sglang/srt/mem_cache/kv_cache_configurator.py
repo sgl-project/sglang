@@ -805,6 +805,19 @@ class KVCacheConfigurator:
                             draft_virtual_id_space
                         )
                 sizes = msgspec.structs.replace(sizes, **size_overrides)
+            elif get_spec().speculative_dflash_draft_kv_ring:
+                from sglang.srt.speculative.dflash_draft_ring import (
+                    draft_kv_ring_pool_rows_from_config,
+                )
+
+                sizes = msgspec.structs.replace(
+                    sizes,
+                    max_total_num_tokens=draft_kv_ring_pool_rows_from_config(
+                        self.model_config.hf_config,
+                        req_to_token_rows=req_to_token_pool.req_to_token.shape[0],
+                        page_size=max(int(self.pool_page_size or 1), 1),
+                    ),
+                )
             elif isinstance(token_to_kv_pool_allocator, HiSparseTokenToKVPoolAllocator):
                 # HiSparse's target allocator hands out logical IDs from its
                 # host-expanded address space. Draft KV is direct-indexed by
@@ -958,20 +971,6 @@ class KVCacheConfigurator:
         )
         return has_window, has_state
 
-    def _validate_replay_spec_algorithm(self) -> None:
-        # DSPARK/DFLASH commit routes through the backend fold (KDA-only); a
-        # non-KDA model there would scatter a None intermediate_ssm and crash.
-        _algo = (get_spec().speculative_algorithm or "").upper()
-        if (
-            get_exec().mamba.enable_linear_replayssm_spec
-            and _algo in ("DSPARK", "DFLASH")
-            and self.hybrid_kda_config is None
-        ):
-            raise ValueError(
-                "--enable-linear-replayssm-spec with DSPARK/DFLASH requires a KDA "
-                "model; got a non-KDA model."
-            )
-
     def _kv_layer_decls(self) -> tuple:
         """This runner's per-layer KV and state declarations for the unified pool."""
         from sglang.srt.mem_cache.kv.decl import (
@@ -1046,7 +1045,6 @@ class KVCacheConfigurator:
             )
         state = {}
         if has_state:
-            self._validate_replay_spec_algorithm()
             from sglang.srt.mem_cache.kv.decl import (
                 StateReplay,
                 with_state_ple,
@@ -1297,7 +1295,9 @@ class KVCacheConfigurator:
                 resolve_draft_worker_attention_backend,
             )
 
-            draft_backend = resolve_draft_worker_attention_backend()
+            draft_backend = resolve_draft_worker_attention_backend(
+                algo_label="DFLASH" if self.spec_algorithm.is_dflash() else None
+            )
         else:
             draft_backend = get_spec().speculative_draft_attention_backend
         draft_backends = (
@@ -1632,7 +1632,6 @@ class KVCacheConfigurator:
         max_num_reqs: int,
         extra_max_context_len: int,
     ) -> ReqToTokenPool:
-        self._validate_replay_spec_algorithm()
         req_to_token_pool = HybridReqToTokenPool(
             size=max_num_reqs,
             mamba_size=get_schedule().max_mamba_cache_size,
@@ -1842,12 +1841,34 @@ class KVCacheConfigurator:
                     assert not enable_page_major, (
                         "page-major KV layout is not supported with fp4 KV cache"
                     )
+                follows_target_swa = self._draft_follows_target_swa()
                 token_to_kv_pool = self._build_mha_kv_pool(
-                    max_total_num_tokens=sizes.max_total_num_tokens,
+                    max_total_num_tokens=(
+                        self.memory_pool_config.swa_max_total_num_tokens
+                        if follows_target_swa
+                        else sizes.max_total_num_tokens
+                    ),
                     mha_pool_class=mha_pool_class,
                     quant_method=quant_method,
                 )
+                if follows_target_swa:
+                    token_to_kv_pool.follows_target_swa_ids = True
+                    logger.info(
+                        "DFLASH draft KV pool follows the target's SWA ids: "
+                        "%d rows (target full pool %d rows)",
+                        token_to_kv_pool.size,
+                        sizes.max_total_num_tokens,
+                    )
         return token_to_kv_pool
+
+    def _draft_follows_target_swa(self) -> bool:
+        """Whether this draft pool takes the target's sliding-window ids, as the
+        target decided when it priced the pools."""
+        return (
+            self.is_draft_worker
+            and self.memory_pool_config is not None
+            and self.memory_pool_config.dflash_draft_follows_swa
+        )
 
     def _build_mtp_kv_shard_pool(
         self, *, sizes: _PoolSizes, is_dsa_model: bool, is_compressed_kv_model: bool
@@ -2084,11 +2105,8 @@ class KVCacheConfigurator:
         if not self.is_draft_worker:
             # Fresh rows include beam slots and PD preallocation. Reused rows
             # retain their current history; retraction has its own replay reset.
-            # FIXME: the ring and request-window rows are reset on the schedule
-            # stream when a row is reused, while the forward of the row's
-            # previous request may still read or write them (the write-after-read
-            # barrier orders only shared reads). Order the reset after that
-            # forward.
+            # TODO(ch-wan): these C4 ring and request-window resets race the row's
+            # previous forward; run them in the next forward, as `reset_new_rows` does.
             def reset_request_rows(rows):
                 if token_to_kv_pool._unified_kv:
                     token_to_kv_pool.clear_c4_req_states(rows)
@@ -2707,6 +2725,31 @@ class KVCacheConfigurator:
         )
         return token_to_kv_pool
 
+    def _dflash_draft_kv_ring_bytes(self) -> int:
+        if self.is_draft_worker or not get_spec().speculative_dflash_draft_kv_ring:
+            return 0
+        from sglang.srt.speculative.dflash_draft_ring import (
+            draft_kv_ring_pool_rows_from_config,
+        )
+
+        max_num_reqs = max(1, get_schedule().max_running_requests // self.attn_dp_size)
+        page_size = get_schedule().page_size * self.dflash_draft_loc_space_scale
+        rows = draft_kv_ring_pool_rows_from_config(
+            self.spec_aux_config.draft_model_config.hf_config,
+            # Request rows plus the padding row: the ring is off under PD, so no
+            # pre-alloc rows.
+            req_to_token_rows=self._req_pool_rows(max_num_reqs) + 1,
+            page_size=page_size,
+        )
+        # The pool adds one padding page.
+        ring_bytes = (rows + page_size) * int(self.dflash_draft_cell_size_per_token)
+        logger.info(
+            "DFLASH draft KV ring: %d rows, %.2f GB charged to the KV budget.",
+            rows,
+            ring_bytes / (1 << 30),
+        )
+        return ring_bytes
+
     def _hybrid_full_attention_pool_class(
         self, *, mha_pool_class: type, mla_pool_class: type, dsa_pool_class: type
     ) -> type:
@@ -3031,6 +3074,7 @@ class KVCacheConfigurator:
         rest_memory = available_gpu_memory - slack_gb - mm_reservation_gb
         if self.mambaish_config is not None and not get_memory().enable_unified_memory:
             rest_memory = self._handle_max_mamba_cache(rest_memory)
+        rest_memory -= self._dflash_draft_kv_ring_bytes() / (1 << 30)
 
         # Loaded weights (target + draft) can exceed the static budget
         if rest_memory <= 0:
@@ -3333,10 +3377,6 @@ class KVCacheConfigurator:
                 ),
                 frozen=frozen,
             )
-        # PP stages select batches independently, so the synchronized share is
-        # also a live admission cap, even on the stage already at the minimum.
-        full_cap = full if get_parallel().pp_size > 1 else None
-        sized = msgspec.structs.replace(sized, full_cap_tokens=full_cap)
         self._unified_sized = sized
         return MemoryPoolConfig(
             max_total_num_tokens=sized.full_tokens,
