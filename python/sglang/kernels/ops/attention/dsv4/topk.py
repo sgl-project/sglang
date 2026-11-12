@@ -31,7 +31,7 @@ def _jit_topk_v1_module():
 
 
 @cache_once
-def _jit_topk_v2_module(deterministic: bool = False):
+def _jit_topk_v2_module(deterministic: bool = False, bf16_scores: bool = False):
     from sglang.kernels.jit.utils.occupancy import (
         NoSchedulableClustersError,
         get_max_active_clusters,
@@ -42,6 +42,8 @@ def _jit_topk_v2_module(deterministic: bool = False):
     mode = 2 if deterministic else envs.SGLANG_TOPK_V2_MODE.get()
     assert mode in (0, 1, 2), f"SGLANG_TOPK_V2_MODE must be 0, 1 or 2, got {mode}"
     extra_cuda_cflags = [f"-DSGL_TOPK_MODE={mode}"]
+    if bf16_scores:
+        extra_cuda_cflags.append("-DSGL_TOPK_SCORE_BF16")
     arch = current_arch()
     # on CUDA, ptxas schedules kernels in parallel to speed up compilation
     if arch.cuda is not None:
@@ -74,7 +76,7 @@ def _jit_topk_v2_module(deterministic: bool = False):
     return load_jit(
         make_name("topk_v2"),
         *args,
-        f"mode{mode}",
+        f"mode{mode}" + ("_bf16" if bf16_scores else ""),
         extra_cuda_cflags=extra_cuda_cflags,
         cuda_files=["deepseek_v4/topk_v2.cuh"],
         cuda_wrappers=wrappers,
@@ -215,7 +217,7 @@ def topk_transform_ragged_v2(
             row_starts,
         )
         return
-    module = _jit_topk_v2_module(deterministic)
+    module = _jit_topk_v2_module(deterministic, scores.dtype == torch.bfloat16)
     module.topk_transform_ragged(scores, seq_lens, row_starts, out_offsets, out_indices)
 
 
