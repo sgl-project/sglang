@@ -8,17 +8,17 @@ from unittest import mock
 import torch
 from PIL import Image
 
-from sglang.srt.utils.common import (
+from sglang.srt.multimodal.media_io import _load_image
+from sglang.srt.utils.common import flatten_arrays_to_int64_tensor
+from sglang.srt.utils.device import (
     _get_device_sm_via_nvml,
-    _load_image,
-    flatten_arrays_to_int64_tensor,
-    freeze_gc,
     get_nvidia_driver_version_str,
     is_gfx95_supported,
     is_gfx942_supported,
     is_gfx1250_supported,
     is_hip,
 )
+from sglang.srt.utils.log_utils import freeze_gc
 from sglang.test.ci.ci_register import (
     register_amd_ci,
     register_cpu_ci,

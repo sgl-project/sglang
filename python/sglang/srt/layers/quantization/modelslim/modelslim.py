@@ -31,6 +31,9 @@ from sglang.srt.layers.quantization.modelslim.schemes import (
     ModelSlimW8A8Int8,
     ModelSlimW8A8Int8MoE,
 )
+from sglang.srt.layers.quantization.modelslim.schemes.modelslim_qk_mxfp8_dynamic_v_mxfp8_per_channel import (
+    ModelSlimQKMXFP8DynamicVMXFP8PerChannelScheme,
+)
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.utils import apply_module_patch
 
@@ -237,6 +240,9 @@ class ModelSlimConfig(QuantizationConfig):
         # Map supported ModelSlim KV formats to their scheme classes.
         kv_quant_schemes = {
             "Q_FP8_DYNAMIC_KV_FP8": ModelSlimQFP8DynamicKVFP8Scheme,
+            "QK_MXFP8_DYNAMIC_V_MXFP8_PER_CHANNEL": (
+                ModelSlimQKMXFP8DynamicVMXFP8PerChannelScheme
+            ),
         }
         scheme_class = kv_quant_schemes.get(quant_type)
         if scheme_class is None:
@@ -292,6 +298,17 @@ class ModelSlimConfig(QuantizationConfig):
                 f"(quant_type={quant_type!r})"
             ) from error
         return scheme_class(resolved_prefix, self.requested_kv_cache_dtype)
+
+    def init_kv_cache(self, layer, prefix, **weight_attrs):
+        scheme = self.get_modelslim_kv_scheme(prefix)
+        if scheme is None:
+            return
+        layer.scheme = scheme
+        layer.quant_method = ModelSlimKVCacheMethod()
+        layer.quant_method.create_weights(
+            layer, params_dtype=torch.get_default_dtype(), **weight_attrs
+        )
+        return scheme
 
     def update_packed_modules_mapping(self, mapping: Dict[str, List[str]]) -> None:
         self.packed_modules_mapping.update(mapping)
@@ -381,13 +398,14 @@ class ModelSlimConfig(QuantizationConfig):
             prefix_in_quant_config = prefix
             proj_name = prefix.split(".")[-1]
             direct_prefix = self._resolve_quant_prefix(prefix)
+            shard_names = packed_modules_mapping_subset.get(
+                proj_name, self.packed_modules_mapping.get(proj_name)
+            )
             if (
                 direct_prefix + ".weight" not in self.quant_description
-                and proj_name in packed_modules_mapping_subset
+                and shard_names is not None
             ):
-                prefix_in_quant_config = prefix.replace(
-                    proj_name, packed_modules_mapping_subset[proj_name][0]
-                )
+                prefix_in_quant_config = prefix.replace(proj_name, shard_names[0])
             prefix_in_quant_config = self._resolve_quant_prefix(prefix_in_quant_config)
             if prefix_in_quant_config + ".weight" not in self.quant_description:
                 # Fused-layout checkpoints (e.g. MiMo-V2.5 fused_qkv) keep the
