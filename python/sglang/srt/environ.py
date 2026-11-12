@@ -339,6 +339,9 @@ class Envs:
     SGLANG_ENABLE_REQUEST_DECOMPRESSION = EnvBool(False)
     # Override parsed request fields from headers.
     SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES = EnvBool(False)
+    # Experimental, single-scheduler request-retirement receipts. This does not
+    # attest device-wide idleness or eviction of prefix-cache-owned KV pages.
+    SGLANG_ENABLE_CANCEL_RETIREMENT_RECEIPTS = EnvBool(False)
     # Name prefix of the usage accounting response headers on the kimi_k3 chat
     # surface (<prefix>-Prompt-Tokens, <prefix>-Cached-Tokens). Empty: not sent.
     SGLANG_USAGE_HEADER_PREFIX = EnvStr("")
