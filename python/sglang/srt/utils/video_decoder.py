@@ -35,7 +35,7 @@ def _try_cuda_backend() -> bool:
 
 def _is_cpu_engine() -> bool:
     # Lazy import to avoid circular dependency issues and unnecessary imports on module load
-    from sglang.srt.utils.common import is_cpu
+    from sglang.srt.utils.device import is_cpu
 
     return is_cpu()
 

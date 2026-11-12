@@ -20,12 +20,11 @@ from sglang.srt.mem_cache.common import (
 )
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
-from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd")
 
 
@@ -399,11 +398,12 @@ class _RowCache:
     def __init__(self, allocator, row):
         self.req_to_token_pool = SimpleNamespace(req_to_token=row.unsqueeze(0))
         self.token_to_kv_pool_allocator = allocator
+        self.logical_page_size = allocator.page_size
         self.page_size = allocator.page_size
 
 
 class TestFreeKvRow(CustomTestCase):
-    """A kv row is given back split at `swa_evicted_seqlen`: the full side
+    """A kv row is given back split at `window_evicted_seqlen`: the full side
     whole, the SWA side only from the floor up."""
 
     def setUp(self):
@@ -439,7 +439,7 @@ class TestFreeKvRow(CustomTestCase):
                     ),
                 )
                 free_kv_row_segments(
-                    self.allocator, [(indices, start_pos)], swa_evicted_seqlen=floor
+                    self.allocator, [(indices, start_pos)], window_evicted_seqlen=floor
                 )
                 self.assertEqual(self._sizes(), (self.full_baseline, self.swa_baseline))
 
@@ -458,7 +458,7 @@ class TestFreeKvRow(CustomTestCase):
             free_kv_row_segments(
                 allocator,
                 [(indices[:4], 0), (indices[4:], 4)],
-                swa_evicted_seqlen=8,
+                window_evicted_seqlen=8,
             )
 
         self.assertEqual(allocator.full_available_size(), after_alloc + 8)
@@ -476,7 +476,7 @@ class TestFreeKvRow(CustomTestCase):
         ):
             allocator.free_group_begin()
             # dead rows [0, 8) and the alive row [8, 12) from one request
-            free_kv_row_segments(allocator, [(indices, 0)], swa_evicted_seqlen=8)
+            free_kv_row_segments(allocator, [(indices, 0)], window_evicted_seqlen=8)
             self.assertEqual(allocator.full_available_size(), after_alloc)
             allocator.free_group_end()
 
@@ -485,7 +485,7 @@ class TestFreeKvRow(CustomTestCase):
     def test_free_kv_row_reads_the_record_row_and_its_floor(self):
         indices = _swa_alloc(self.allocator, 8)
         cache = _RowCache(self.allocator, indices)
-        kv = ReqKvInfo(req_pool_idx=0, component_evicted_seqlens={ComponentType.SWA: 3})
+        kv = ReqKvInfo(req_pool_idx=0, window_evicted_seqlens={"swa": 3})
         self.allocator.free_swa(indices[:3])
 
         cache.free_kv_row(kv, [(1, 5)])
@@ -497,7 +497,7 @@ class TestFreeKvRow(CustomTestCase):
     def test_single_pool_free_kv_row_still_frees_the_whole_range(self):
         allocator = _SinglePoolAllocator()
         cache = _RowCache(allocator, torch.arange(16, dtype=torch.int64))
-        kv = ReqKvInfo(req_pool_idx=0, component_evicted_seqlens={ComponentType.SWA: 4})
+        kv = ReqKvInfo(req_pool_idx=0, window_evicted_seqlens={"swa": 4})
 
         cache.free_kv_row(kv, [(2, 6)])
 
@@ -509,7 +509,7 @@ class TestFreeKvRow(CustomTestCase):
         self.assertEqual(len(allocator.freed), 2)
 
     def test_rows_below_the_dead_floor_are_still_alive(self):
-        # all-SWA: only [swa_dead_lo, cursor) is dead; [start, swa_dead_lo) is alive
+        # all-SWA: only [window_dead_lo, cursor) is dead; [start, window_dead_lo) is alive
         allocator = _build_pure_swa_allocator(size_swa=16)
         baseline = allocator.swa_available_size()
         indices = _swa_alloc(allocator, 8)
@@ -519,8 +519,8 @@ class TestFreeKvRow(CustomTestCase):
         cache = _RowCache(allocator, indices)
         kv = ReqKvInfo(
             req_pool_idx=0,
-            component_evicted_seqlens={ComponentType.SWA: 6},
-            swa_evict_floor=4,
+            window_evicted_seqlens={"swa": 6},
+            window_evict_floor=4,
         )
         cache.free_kv_row(kv, [(2, 8)])
 

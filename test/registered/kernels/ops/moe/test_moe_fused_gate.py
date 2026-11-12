@@ -12,7 +12,7 @@ from sglang.kernels.jit.utils import get_ci_test_range
 from sglang.kernels.ops.moe.moe_fused_gate import moe_fused_gate
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=8, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=8, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 DEVICE = "cuda"
 
@@ -524,6 +524,42 @@ def test_grouped_dispatch_flag_matches_default(
         _scatter_by_expert(jit_w[:, :topk_routed], jit_i[:, :topk_routed], num_experts),
         rtol=1e-3,
         atol=1e-3,
+    )
+
+
+@pytest.mark.parametrize("strided_bias", [False, True])
+def test_grouped_tied_group_max_through_biased_grouped_topk_gpu(
+    strided_bias: bool,
+) -> None:
+    """A group whose max appears twice scores max + max, not max + the next value.
+
+    A strided bias leaves moe_route_warp and reaches the Triton router.
+    """
+    from sglang.srt.layers.moe.topk import (
+        biased_grouped_topk_gpu,
+        biased_grouped_topk_impl,
+    )
+
+    num_experts, num_expert_group, topk_group, topk = 512, 8, 4, 8
+    group_size = num_experts // num_expert_group
+    gating = torch.full((4, num_experts), -10.0, device=DEVICE)
+    gating[:, [0, 1]] = 2.0  # group 0: tied max
+    for g in range(1, 5):  # groups 1-4: max + distinct lower second values
+        gating[:, g * group_size] = 2.0
+        gating[:, g * group_size + 1] = 2.0 - 0.1 * g
+    bias = torch.zeros(2 * num_experts, device=DEVICE)
+    bias = bias[::2] if strided_bias else bias[:num_experts]
+    hidden = torch.empty(4, 16, device=DEVICE)
+
+    kwargs = dict(num_expert_group=num_expert_group, topk_group=topk_group)
+    w, i = biased_grouped_topk_gpu(hidden, gating, bias, topk, True, **kwargs)
+    ref_w, ref_i = biased_grouped_topk_impl(hidden, gating, bias, topk, True, **kwargs)
+    assert (ref_i == 1).any(-1).all(), "input must make group 0 win"
+    torch.testing.assert_close(
+        _scatter_by_expert(w, i, num_experts),
+        _scatter_by_expert(ref_w, ref_i, num_experts),
+        rtol=1e-5,
+        atol=1e-6,
     )
 
 
