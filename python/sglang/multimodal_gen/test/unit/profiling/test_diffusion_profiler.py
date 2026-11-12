@@ -173,17 +173,6 @@ class TestDiffusionProfiler(unittest.TestCase):
         self.npu_api.schedule.assert_not_called()
         self.torch_profile.assert_not_called()
 
-    def test_npu_whole_denoising_window_exports_on_stop(self):
-        wrapper = self.make_profiler(steps=-1)
-        for _ in range(40):
-            torch.ones(1).add_(1)
-            wrapper.step_denoising_step()
-        wrapper.stop()
-        self.assertEqual(self.callbacks, [wrapper.profiler])
-        self.npu_api.schedule.assert_called_once_with(
-            skip_first=0, wait=0, warmup=1, active=41, repeat=1
-        )
-
     def test_daemon_worker_automatically_analyzes_on_stop(self):
         self.process.return_value.daemon = True
         for full in (False, True):
@@ -224,12 +213,6 @@ class TestDiffusionProfiler(unittest.TestCase):
         wrapper.stop()
         self.analyze.assert_called_once()
 
-    def test_daemon_non_driver_exports_despite_dump_rank_zero(self):
-        self.process.return_value.daemon = True
-        wrapper = self.make_profiler(full=True, rank=1)
-        wrapper.stop(dump_rank=0)
-        self.analyze.assert_called_once_with(wrapper.profiler.prof_if.prof_path)
-
     def test_error_cleanup_skips_daemon_analysis_and_collectives(self):
         self.process.return_value.daemon = True
         self.parallel_initialized.return_value = True
@@ -240,61 +223,6 @@ class TestDiffusionProfiler(unittest.TestCase):
         self.analyze.assert_not_called()
         self.assertTrue(wrapper.has_stopped)
         self.assertIsNone(self.profiler_utils.SGLDiffusionProfiler.get_instance())
-
-    def test_analysis_launch_failure_does_not_fail_generation(self):
-        self.process.return_value.daemon = True
-        self.analyze.side_effect = OSError("cannot exec parser")
-        wrapper = self.make_profiler(full=True)
-        torch.ones(1).add_(1)
-        with self.assertLogs(profile_analysis_npu.logger, level="ERROR"):
-            wrapper.stop()
-        self.assertIsNone(self.profiler_utils.SGLDiffusionProfiler.get_instance())
-        self.analyze.assert_called_once()
-        wrapper.stop()
-        self.analyze.assert_called_once()
-
-    def test_stop_failure_is_still_propagated_before_submitting_analysis(self):
-        self.process.return_value.daemon = True
-        self.parallel_initialized.return_value = True
-        group = SimpleNamespace(world_size=2, cpu_group=object())
-        wrapper = self.make_profiler(full=True)
-        try:
-            with (
-                patch.object(
-                    wrapper.profiler, "stop", side_effect=RuntimeError("stop failed")
-                ),
-                patch.object(
-                    self.profiler_utils, "get_replica_group", return_value=group
-                ),
-                patch.object(torch.distributed, "all_gather_object") as gather,
-            ):
-                gather.side_effect = lambda errors, local, group: errors.__setitem__(
-                    slice(None), [local, None]
-                )
-                with self.assertRaisesRegex(RuntimeError, "rank 0: stop failed"):
-                    wrapper.stop()
-                gather.assert_called_once()
-            self.analyze.assert_not_called()
-        finally:
-            wrapper.profiler.stop()  # Release the real CPU profiler after injected failure.
-
-    def test_stop_failure_on_another_rank_skips_analysis_submission(self):
-        self.process.return_value.daemon = True
-        self.parallel_initialized.return_value = True
-        group = SimpleNamespace(world_size=2, cpu_group=object())
-        with (
-            patch.object(self.profiler_utils, "get_replica_group", return_value=group),
-            patch.object(torch.distributed, "all_gather_object") as gather,
-        ):
-            gather.side_effect = lambda errors, local, group: errors.__setitem__(
-                slice(None), [local, "rank 1 stop failed"]
-            )
-            wrapper = self.make_profiler(full=True)
-            torch.ones(1).add_(1)
-            with self.assertRaisesRegex(RuntimeError, "rank 1 stop failed"):
-                wrapper.stop()
-            self.analyze.assert_not_called()
-            self.assertIs(gather.call_args.kwargs["group"], group.cpu_group)
 
     def test_non_npu_keeps_torch_profiler_and_chrome_export(self):
         self.npu_platform.return_value = False

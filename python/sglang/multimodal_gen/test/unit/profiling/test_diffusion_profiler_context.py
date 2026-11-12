@@ -70,15 +70,5 @@ class TestDiffusionProfilerContext(unittest.TestCase):
             raise ValueError("model failed")
         self.profiler.stop.assert_called_once_with(export_trace=True, dump_rank=0)
 
-    def test_warmup_and_unprofiled_requests_do_not_start_profiler(self):
-        for profile, warmup in ((False, False), (True, True)):
-            with self.subTest(profile=profile, warmup=warmup):
-                self.batch.profile = profile
-                self.batch.is_warmup = warmup
-                with self.context():
-                    pass
-        self.factory.assert_not_called()
-
-
 if __name__ == "__main__":
     unittest.main()

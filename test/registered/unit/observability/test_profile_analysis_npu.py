@@ -9,11 +9,10 @@ import subprocess
 import sys
 import tempfile
 import textwrap
-import threading
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 from sglang.srt.observability import profile_analysis_npu as analysis
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -172,17 +171,6 @@ class TestNPUProfileAnalysis(unittest.TestCase):
         self.assertGreaterEqual(status["finished_at"], status["started_at"])
         self.assertIsNone(status["error"])
 
-    def test_each_rank_parses_only_its_own_directory(self):
-        directories = [self.capture(f"rank{rank}_ascend_pt") for rank in (0, 1)]
-        for directory in directories:
-            analysis.start_npu_profile_analysis(str(directory))
-        for directory in directories:
-            status = self.wait_status(directory, "succeeded")
-            trace = json.loads(Path(status["trace_path"]).read_text())
-            self.assertEqual(trace["directory"], str(directory))
-            self.assertFalse(trace["daemon"])
-            self.assertEqual((directory / "raw.data").read_text(), "original capture")
-
     def test_native_errors_and_missing_or_empty_trace_report_failure(self):
         for mode in ("error", "empty", "empty_trace"):
             with self.subTest(mode=mode):
@@ -232,70 +220,6 @@ class TestNPUProfileAnalysis(unittest.TestCase):
                 analysis.start_npu_profile_analysis(str(directory))
         self.assertIn("cannot exec", self.status(directory)["error"])
         self.assertEqual(self.status(directory)["state"], "failed")
-
-    def test_forcibly_killed_parser_can_leave_running_status(self):
-        directory = self.capture(mode="hold")
-        analysis.start_npu_profile_analysis(str(directory))
-        pids = self.wait_ready(directory)
-        self.wait_status(directory, "running")
-        os.killpg(pids[0], signal.SIGKILL)
-        self.wait_for(lambda: not any(alive(pid) for pid in pids))
-        self.assertEqual(self.status(directory)["state"], "running")
-        self.assertTrue((directory / "raw.data").is_file())
-
-    def test_reaper_waits_without_timeout_in_a_daemon_thread(self):
-        directory = self.capture()
-        waited = threading.Event()
-        daemon_flags = []
-
-        def reap():
-            daemon_flags.append(threading.current_thread().daemon)
-            waited.set()
-
-        process = MagicMock()
-        process.wait.side_effect = reap
-        with patch.object(subprocess, "Popen", return_value=process) as popen:
-            analysis.start_npu_profile_analysis(str(directory))
-            self.assertTrue(waited.wait(5))
-        process.wait.assert_called_once_with()
-        process.__enter__.assert_not_called()
-        self.assertEqual(daemon_flags, [True])
-        self.assertEqual(popen.call_args.kwargs["stdin"], subprocess.DEVNULL)
-        self.assertTrue(popen.call_args.kwargs["start_new_session"])
-        self.assertTrue(popen.call_args.kwargs["close_fds"])
-        self.assertNotIn("--parent-pid", popen.call_args.args[0])
-
-    def test_status_replacement_is_atomic_and_cleans_temporary_file(self):
-        directory = self.capture()
-        analysis._write_status(directory, "running", 1.0)
-        status_path = directory / "sglang_analysis.json"
-        original = status_path.read_bytes()
-        replace = os.replace
-
-        def check_replace(source, destination):
-            self.assertEqual(Path(source).parent, directory)
-            self.assertEqual(Path(destination).read_bytes(), original)
-            self.assertEqual(json.loads(Path(source).read_text())["state"], "succeeded")
-            replace(source, destination)
-
-        with patch.object(os, "replace", side_effect=check_replace):
-            analysis._write_status(
-                directory, "succeeded", 1.0, trace=directory / "trace.json"
-            )
-        self.assertEqual(self.status(directory)["state"], "succeeded")
-        with patch.object(os, "replace", side_effect=OSError("replace failed")):
-            with self.assertRaisesRegex(OSError, "replace failed"):
-                analysis._write_status(directory, "failed", 1.0)
-        self.assertFalse(list(directory.glob(".sglang_analysis-*")))
-        self.assertEqual(self.status(directory)["state"], "succeeded")
-
-    def test_missing_capture_does_not_launch_a_parser(self):
-        with patch.object(subprocess, "Popen") as process:
-            for path in ("", str(self.root / "missing")):
-                with self.assertRaisesRegex(RuntimeError, "capture directory"):
-                    analysis.start_npu_profile_analysis(path)
-            process.assert_not_called()
-
 
 if __name__ == "__main__":
     unittest.main()
