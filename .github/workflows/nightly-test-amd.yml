@@ -2218,8 +2218,7 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
-      # Run perf only after correctness passes. Keeping both steps in this job
-      # reuses the cached checkpoint and one scarce MI35x slot.
+      # Reuse the cached checkpoint and scarce MI35x slot for performance diagnostics.
       - name: Performance Test MI35x ROCm (4-GPU MiniMax-M3 MXFP8)
         if: ${{ !cancelled() && steps.install-dependencies.outcome == 'success' }}
         timeout-minutes: 120
