@@ -37,6 +37,7 @@ from sglang.srt.mem_cache.multimodal_cache import MultiModalStaticCache
 from sglang.srt.multimodal.encoder_preprocessing import EncoderMediaProcessorConfig
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.utils.serialization import safe_pickle_loads
+from sglang.srt.utils.video_decoder import VideoDecoderWrapper
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -338,6 +339,38 @@ class TestEncoderMetaRegistry(CustomTestCase):
             note_send_done.assert_awaited_once_with("req", 2, "127.0.0.1:5000")
 
         asyncio.run(run())
+
+
+class TestEncoderVideoDecodeDevice(CustomTestCase):
+    def test_video_decode_follows_processor_gpu_setting(self) -> None:
+        """Enabling GPU preprocessing must not silently leave video decoding on CPU."""
+        preprocessor = EncoderPreprocessor.__new__(EncoderPreprocessor)
+        preprocessor.encoder_media_processor_config = EncoderMediaProcessorConfig(
+            preserve_media_metadata=True
+        )
+        source = b"encoded-video"
+        with (
+            ThreadPoolExecutor(max_workers=1) as preprocessor.io_executor,
+            patch("sglang.srt.utils.video_decoder._BACKEND", "torchcodec"),
+            patch(
+                "sglang.srt.utils.video_decoder._try_cuda_backend", return_value=True
+            ),
+            patch("sglang.srt.utils.video_decoder.VideoDecoder", create=True),
+        ):
+            for use_gpu, expected_device in ((True, "cuda"), (False, "cpu")):
+                with self.subTest(use_gpu=use_gpu):
+                    preprocessor.use_image_processor_gpu = use_gpu
+                    futures, _ = preprocessor._submit_data_loading_tasks(
+                        [{"url": source, "fps": 2.0}], [Modality.VIDEO]
+                    )
+                    result = futures[0].result(timeout=5)
+                    decoder = result["video"]
+                    self.assertIsInstance(decoder, VideoDecoderWrapper)
+                    self.assertEqual(
+                        decoder._tc_kwargs.get("device", "cpu"), expected_device
+                    )
+                    self.assertEqual(decoder.source_bytes, source)
+                    self.assertEqual(result["fps"], 2.0)
 
 
 class TestEncoderPreprocessorOffEventLoop(CustomTestCase):

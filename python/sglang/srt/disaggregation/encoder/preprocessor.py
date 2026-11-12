@@ -352,7 +352,7 @@ class EncoderPreprocessor:
                     }
                 return img
             elif modality == Modality.VIDEO:
-                vid = load_video(data, frame_count_limit)
+                vid = load_video(data, use_gpu=self.use_image_processor_gpu)
                 if (
                     media_metadata
                     and self.encoder_media_processor_config.preserve_media_metadata
