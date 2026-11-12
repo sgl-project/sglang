@@ -962,7 +962,10 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             )
             return layout
 
-        if self.mem_pool_host.kv_buffer is not None:
+        # A HiCache host pool describes KV here; the direct linker's device pool
+        # group has no kv_buffer, and its KV entry is described with the others.
+        kv_described = self.mem_pool_host.kv_buffer is not None
+        if kv_described:
             suffixes, _, _ = self._batch_preprocess(
                 [""],
                 torch.arange(
@@ -980,7 +983,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         specs = {spec.pool_name: spec for spec in sidecar_pool_specs}
         trailing_pages = {PoolName.MAMBA: 1, **window_trailing_pages}
         for pool_name in self.registered_pools:
-            if pool_name == PoolName.KV:
+            if pool_name == PoolName.KV and kv_described:
                 continue
             spec = specs.get(pool_name)
             policy = (
@@ -1045,7 +1048,10 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         if isinstance(host_pool, DevicePoolEntry):
             # A direct-linker entry packs every buffer of a page into one object.
             object_name = "k" if transfer.name == PoolName.KV else transfer.name
-            suffix = f"_{self.mla_suffix}_{object_name}"
+            pool_suffix = getattr(self, "pool_suffixes", {}).get(
+                transfer.name, self.mla_suffix
+            )
+            suffix = f"_{pool_suffix}_{object_name}"
             return [f"{page_key}{suffix}" for page_key in page_keys], 1
 
         # Suffix order must match get_page_buffer_meta() for one page, because
