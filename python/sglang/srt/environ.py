@@ -2222,6 +2222,8 @@ class Envs:
     SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = EnvInt(2048)
     SGLANG_DSA_HIP_DISABLE_PRESHUFFLE = EnvBool(False)
     SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION = EnvFloat(0.2)
+    # Prefill indexer: bf16 instead of fp32 MQA logits, read by a bf16 top-k.
+    SGLANG_DSA_INDEXER_BF16_LOGITS = EnvBool(False)
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
     # DCP8 decode: the indexer's local top-k, candidate exchange, merge and
