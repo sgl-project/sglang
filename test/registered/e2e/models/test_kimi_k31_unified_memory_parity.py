@@ -14,7 +14,12 @@ reuses the first one's prefix:
     the indexer keys and attend only the top-k they select. Wrong keys change
     which tokens attention reads.
 
-Prompt and output logprobs must agree, with CUDA graphs and in eager mode.
+With CUDA graphs and in eager mode, greedy tokens must agree, and logprobs
+predicted from a context within the top-k must agree token by token. Past the
+top-k, the static pools' own runs differ by about 0.03 on average (up to ~0.4
+at single tokens) because the sparse selection is not bitwise deterministic, so
+there the mean difference is bounded instead: wrong indexer keys would select
+other tokens and move it well past that.
 """
 
 import json
@@ -119,11 +124,18 @@ class TestKimiK31UnifiedMemoryParity(CustomTestCase):
         )
         response.raise_for_status()
         meta = response.json()["meta_info"]
-        return (
-            [lp for lp, _, _ in meta["input_token_logprobs"] if lp is not None],
-            [(lp, tid) for lp, tid, _ in meta["output_token_logprobs"]],
-            meta.get("cached_tokens", 0),
-        )
+        # Each logprob with the length of the context it was predicted from:
+        # the prompt's position `logprob_start_len + i` sees that many tokens.
+        prompt = [
+            (logprob_start_len + i, lp)
+            for i, (lp, _, _) in enumerate(meta["input_token_logprobs"])
+            if lp is not None
+        ]
+        output = [
+            (len(input_ids) + i, lp, tid)
+            for i, (lp, tid, _) in enumerate(meta["output_token_logprobs"])
+        ]
+        return prompt, output, meta.get("cached_tokens", 0)
 
     def _run(self, extra_args):
         process = popen_launch_server(
@@ -151,16 +163,31 @@ class TestKimiK31UnifiedMemoryParity(CustomTestCase):
     def _assert_close(self, unified, static, what):
         unified_input, unified_output, _ = unified
         static_input, static_output, _ = static
-        self.assertEqual(len(unified_input), len(static_input), what)
-        for i, (u, s) in enumerate(zip(unified_input, static_input)):
-            self.assertAlmostEqual(u, s, delta=0.05, msg=f"{what}: prompt token {i}")
         self.assertEqual(
-            [tid for _, tid in unified_output],
-            [tid for _, tid in static_output],
+            [tid for _, _, tid in unified_output],
+            [tid for _, _, tid in static_output],
             f"{what}: greedy tokens diverged",
         )
-        for (u, _), (s, _) in zip(unified_output, static_output):
-            self.assertAlmostEqual(u, s, delta=0.05, msg=f"{what}: output")
+        pairs = [
+            (context, u, s, f"prompt token at {context}")
+            for (context, u), (_, s) in zip(unified_input, static_input)
+        ] + [
+            (context, u, s, f"output token at {context}")
+            for (context, u, _), (_, s, _) in zip(unified_output, static_output)
+        ]
+        self.assertEqual(len(unified_input), len(static_input), what)
+        sparse = []
+        for context, u, s, where in pairs:
+            if context <= self.index_topk:
+                # Every token attended: the same rows, read the same way.
+                self.assertAlmostEqual(u, s, delta=0.01, msg=f"{what}: {where}")
+            else:
+                sparse.append(abs(u - s))
+        if sparse:
+            mean = sum(sparse) / len(sparse)
+            self.assertLessEqual(
+                mean, 0.1, f"{what}: mean difference past the top-k {mean:.4f}"
+            )
 
     def test_unified_matches_static(self):
         static = self._run([])
