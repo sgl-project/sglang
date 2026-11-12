@@ -239,6 +239,9 @@ export const config = {
         "--cuda-graph-max-bs-decode 64",
         "--reasoning-parser auto",
         "--tool-call-parser auto",
+        "--flashinfer-mxfp4-moe-precision fp8",
+        "--speculative-algorithm DSPARK",
+        "--speculative-dspark-block-size 5",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -265,8 +268,7 @@ export const config = {
       ],
     },
 
-    // ---------- B200: 4x B200, TP4 + EP4. Mirrors the GB300 recipe — the
-    // kernels dispatch by architecture family. ----------
+    // ---------- B200: 4x B200, TP4 + EP4. ----------
     {
       match: { hw: "b200", variant: "flash", quant: "fp4", strategy: "low-latency", nodes: "single" },
       nnodes: 1,
@@ -280,9 +282,13 @@ export const config = {
         "--speculative-algorithm DSPARK",
         "--speculative-dspark-block-size 5",
         // Decode CUDA graphs: the derived batch list does not fit here.
-        "--cuda-graph-max-bs-decode 64",
+        "--cuda-graph-max-bs-decode 96",
         "--reasoning-parser auto",
         "--tool-call-parser auto",
+        "--dsv4-attn-backend trtllm",
+        "--max-running-requests 96",
+        "--prefill-decode-interval 8",
+        "--swa-prefix-tails 512",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
