@@ -20,7 +20,6 @@ from sglang.srt.managers.scheduler_components.request_list import (
 )
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams
-from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.kv.advance import TrackingAdvance
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.static_kv_storage import acquire_rows, kv_storage_of
@@ -206,8 +205,8 @@ class TestRequestEndCheckpoints(CustomTestCase):
 
 
 # The decode checkpoint grid is lcm(chunk, page, interval) = the interval. It is
-# twice the draft length, as the default 256 is for MTP, so two verifies in a
-# row never both cross a boundary.
+# twice the draft length so two verifies in a row never both cross a boundary,
+# as with a served model, whose grid is at least the 64-token FLA chunk.
 SPEC_PAGE = 4
 SPEC_GRID = 8
 SPEC_DRAFT = 4
@@ -362,7 +361,8 @@ class _SpecRequest:
 
     def process(self, batch, accept_len, stop_at=None):
         """The result path: commit the whole accepted run, finish on a stop at
-        ``stop_at`` inside it, and release a finished request into the tree."""
+        ``stop_at`` inside it, and let the result handler track the boundary and
+        release a finished request into the tree."""
         req = self.req
         tokens = list(range(self.next_token, self.next_token + accept_len))
         self.next_token += accept_len
@@ -379,11 +379,9 @@ class _SpecRequest:
         result.num_correct_drafts_per_req_cpu = [accept_len - 1]
         result.num_non_draft_tokens_per_req = 1
         result.grammar_retained_tokens = None
-        self.processor._mamba_prefix_cache_update(req, batch, result, 0)
-        if req.finished():
-            if not self.processor._mamba_can_cache_finished_req(req, result, 0):
-                req.skip_radix_cache_insert = True
-            release_kv_cache(req, self.cache, checkpoint=True)
+        self.processor._handle_finish_state_updated_req(
+            req, batch, result, 0, None, accept_len
+        )
 
     def run(self, accept_lens, stop_at):
         self.prefill()
@@ -467,6 +465,14 @@ class TestSpecDecodeRequestEndState(CustomTestCase):
             with self.subTest(strategy=strategy):
                 states = _spec_request_states(2, strategy, overlap, 11, (1, 1, 1), 0)
                 self.assertEqual(states, [(8, 8)])
+
+    def test_level2_finish_keeps_the_latest_decode_state(self):
+        # The second verify runs 15 -> 19 past 16; the finish keeps that state
+        # and drops the prompt's at 8 (one state per path).
+        for strategy in ("extra_buffer", "extra_buffer_lazy"):
+            with self.subTest(strategy=strategy):
+                states = _spec_request_states(2, strategy, True, 11, (4, 4, 1), 0)
+                self.assertEqual(states, [(16, 16)])
 
     def test_level2_stop_before_the_crossing_falls_back_to_the_prompt_state(self):
         # The second verify runs 13 -> 17 past 16, but the stop at its first token
