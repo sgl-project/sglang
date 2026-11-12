@@ -124,7 +124,7 @@ class DenseBlocksBackend:
 
     def publish_prefill(self, inputs: PrefillInputs):
         if is_xpu():
-            return self._xpu_prefill(inputs, None)
+            return self._xpu_publish_prefill(inputs)
         if self.use_deep_gemm_prefill:
             return self._deep_gemm_publish_prefill(inputs)
         return self._torch_publish_prefill(inputs)
@@ -136,7 +136,7 @@ class DenseBlocksBackend:
     ) -> None:
         if is_xpu():
             assert published is not None
-            self._xpu_prefill(inputs, published)
+            self._xpu_consume_prefill(inputs, published)
             return
         if self.use_deep_gemm_prefill:
             self._deep_gemm_consume_prefill(inputs, published)
@@ -216,7 +216,11 @@ class DenseBlocksBackend:
         out_raw,
         published_blocks,
     ):
-        from sgl_kernel import fp4_paged_mqa_logits
+        from sgl_kernel import (
+            fp4_paged_mqa_logits,
+            topk_transform,
+            topk_transform_ragged,
+        )
 
         rows = q.shape[0]
         result = None
@@ -254,15 +258,31 @@ class DenseBlocksBackend:
                 result[start:end] = select_candidate_block_ids(
                     scores, chunk_lengths[:, None], self.topk_blocks, self.block_size
                 )
-                candidates = torch.arange(
-                    max_len, dtype=torch.int32, device=q.device
-                ).expand(end - start, -1)
-                candidate_size = 1
-            else:
-                candidates = published_blocks[start:end]
-                candidate_size = self.block_size
+                if out_pages is not None:
+                    topk_transform(
+                        scores,
+                        chunk_lengths,
+                        chunk_pages,
+                        out_pages[start:end],
+                        page_size,
+                        out_raw[start:end] if out_raw is not None else None,
+                    )
+                else:
+                    assert out_raw is not None
+                    topk_transform_ragged(
+                        scores,
+                        chunk_lengths,
+                        out_raw[start:end],
+                        torch.zeros_like(chunk_lengths),
+                    )
+                continue
+
             selected = topk_among_blocks(
-                scores, chunk_lengths, candidates, topk, block_size=candidate_size
+                scores,
+                chunk_lengths,
+                published_blocks[start:end],
+                topk,
+                block_size=self.block_size,
             )
             if topk:
                 page_out = out_pages[start:end] if out_pages is not None else None
@@ -285,7 +305,17 @@ class DenseBlocksBackend:
                 )
         return result
 
-    def _xpu_prefill(self, inputs: PrefillInputs, published: Optional[BlockIds]):
+    def _xpu_publish_prefill(self, inputs: PrefillInputs):
+        return self._xpu_prefill_impl(inputs, None)
+
+    def _xpu_consume_prefill(
+        self, inputs: PrefillInputs, published: BlockIds
+    ) -> None:
+        self._xpu_prefill_impl(inputs, published)
+
+    def _xpu_prefill_impl(
+        self, inputs: PrefillInputs, published: Optional[BlockIds]
+    ):
         inputs.reset_outputs()
         assert inputs.seq_lens_cpu is not None and inputs.rows_per_request is not None
         rows = inputs.positions.numel()
