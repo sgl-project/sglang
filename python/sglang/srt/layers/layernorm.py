@@ -164,11 +164,19 @@ if _is_cuda:
     from sglang.kernels.ops.layernorm.norm import rmsnorm as _jit_rmsnorm
     from sglang.kernels.ops.layernorm.norm import rmsnorm_quant as _jit_rmsnorm_quant
 
-    # The JIT rmsnorm family is tuned on SM100 (B200 / B300); other archs keep flashinfer.
+    # The JIT rmsnorm family is tuned on SM100 / SM103 (B200 / B300); other archs,
+    # including the other SM10x devices, keep the sgl_kernel / flashinfer kernels.
     _JIT_RMSNORM_DTYPES = (torch.bfloat16, torch.float16)
 
+    @lru_cache(maxsize=1)
+    def _is_jit_rmsnorm_arch() -> bool:
+        return is_sm100_supported() and torch.cuda.get_device_capability() in (
+            (10, 0),
+            (10, 3),
+        )
+
     def _jit_rmsnorm_family_available(hidden_size: int) -> bool:
-        return is_sm100_supported() and _is_supported_jit_rmsnorm_hidden_size(
+        return _is_jit_rmsnorm_arch() and _is_supported_jit_rmsnorm_hidden_size(
             hidden_size
         )
 

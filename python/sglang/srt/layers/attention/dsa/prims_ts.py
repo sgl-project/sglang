@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the SGLang project
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 """FlashInfer Prims-TS sparse MLA for the DSA backend (``prims_ts``).
 
 The kernel reads the raw FP8 MLA cache rows that the ``trtllm`` DSA backend writes
@@ -9,13 +12,63 @@ localization; only the attention kernel differs.
 
 from __future__ import annotations
 
+import contextlib
+import dataclasses
+import os
+import sys
+import logging
 from typing import Optional
 
 import torch
 
+from sglang.srt.environ import envs
+
+logger = logging.getLogger(__name__)
+
 # Decode/verify graphs plan their exact row count; eager batches above this share
 # power-of-two capacity plans, so prefill chunks do not plan one kernel per size.
 _EXACT_PLAN_MAX_ROWS = 1024
+
+
+# --- K31HT_MLA_PROFILE (default off = served) -------------------------------------------
+# 'br': exact (non-packed) decode / verify plans with rows >= _K31HT_MLA_BR_MIN_ROWS whose served FP8 schedule is the
+# '2cta static, 1 gather warp' profile get the same profile with balanced_registers=True (a shipped schedule option of
+# the same kernel; bitwise to served). Every other plan resolves exactly as served.
+# Read once at import; any other value raises.
+_K31HT_MLA_PROFILE = os.environ.get("K31HT_MLA_PROFILE", "0")
+if _K31HT_MLA_PROFILE not in ("0", "br"):
+    raise ValueError(f"K31HT_MLA_PROFILE must be '0' or 'br', got {_K31HT_MLA_PROFILE!r}")
+_K31HT_MLA_BR_MIN_ROWS = 192
+K31HT_MLA_ENGAGED_ROWS: set[int] = set()
+
+
+@contextlib.contextmanager
+def _k31ht_mla_profile(*, rows: int, packed: bool):
+    if _K31HT_MLA_PROFILE == "0" or packed or rows < _K31HT_MLA_BR_MIN_ROWS:
+        yield
+        return
+    # Fail closed: a missing policy module or profile type raises here instead of silently serving.
+    import flashinfer.attention.prims_ts.kernels.mla_decode.sparse_policy as sp
+
+    served_form = sp.SparseMlaProfile(family="2cta", scheduler="static", gather_issue_warps=1)
+    orig = sp.choose_fp8_profile
+
+    def choose(r, heads, query_length, capacity, sm_count, rope_dim):
+        prof = orig(r, heads, query_length, capacity, sm_count, rope_dim)
+        if prof != served_form:
+            return prof
+        new = dataclasses.replace(prof, balanced_registers=True)
+        if not K31HT_MLA_ENGAGED_ROWS:
+            print(f"K31HT_MLA_PROFILE ENGAGE form=br rows_min={_K31HT_MLA_BR_MIN_ROWS} "
+                  f"pid={os.getpid()}", file=sys.stderr, flush=True)
+        K31HT_MLA_ENGAGED_ROWS.add(rows)
+        return new
+
+    sp.choose_fp8_profile = choose
+    try:
+        yield
+    finally:
+        sp.choose_fp8_profile = orig
 
 
 def _plan_capacity(rows: int) -> Optional[int]:
@@ -23,6 +76,20 @@ def _plan_capacity(rows: int) -> Optional[int]:
     if rows <= _EXACT_PLAN_MAX_ROWS:
         return None
     return 1 << (rows - 1).bit_length()
+
+
+# SM107 (VR200, Rubin) is opt-in: its sparse MLA planning needs FlashInfer with
+# flashinfer-ai/flashinfer#8186.
+_PRIMS_TS_SM107 = (10, 7)
+_logged_capabilities: set[tuple[int, int]] = set()
+
+
+def prims_ts_supports_capability(capability: tuple[int, int]) -> bool:
+    """SM100/SM103, plus SM107 when SGLANG_ENABLE_PRIMS_TS_SM107=1."""
+    capability = tuple(capability)
+    if capability in ((10, 0), (10, 3)):
+        return True
+    return capability == _PRIMS_TS_SM107 and envs.SGLANG_ENABLE_PRIMS_TS_SM107.get()
 
 
 def check_prims_ts_sparse_mla_support(
@@ -36,8 +103,12 @@ def check_prims_ts_sparse_mla_support(
             f"(kv_lora_rank 512, qk_rope_head_dim 64); got {kv_lora_rank}, "
             f"{qk_rope_head_dim}."
         )
-    if torch.cuda.get_device_capability(device) not in ((10, 0), (10, 3)):
-        raise ValueError("Prims-TS sparse MLA requires SM100 or SM103.")
+    capability = tuple(torch.cuda.get_device_capability(device))
+    if not prims_ts_supports_capability(capability):
+        raise ValueError(
+            "Prims-TS sparse MLA requires SM100 or SM103 (SM107 with "
+            "SGLANG_ENABLE_PRIMS_TS_SM107=1)."
+        )
     try:
         from flashinfer.attention.prims_ts import (
             get_prims_ts_sparse_mla_decode_workspace_size,
@@ -54,10 +125,21 @@ def check_prims_ts_sparse_mla_support(
             return_lse=True,
         )
     except (ImportError, TypeError, ValueError, NotImplementedError) as exc:
+        needs = "#7410 and #7984"
+        if capability == _PRIMS_TS_SM107:
+            needs += ", and #8186 for SM107"
         raise RuntimeError(
             "--dsa-*-backend prims_ts needs FlashInfer Prims-TS with D576 native-FP8 "
-            "sparse MLA (flashinfer-ai/flashinfer#7410 and #7984)."
+            f"sparse MLA (flashinfer-ai/flashinfer {needs}); "
+            f"device capability {capability}: {exc}"
         ) from exc
+    if capability == _PRIMS_TS_SM107 and capability not in _logged_capabilities:
+        _logged_capabilities.add(capability)
+        logger.info(
+            "prims_ts sparse MLA enabled on SM107 (%d heads; "
+            "SGLANG_ENABLE_PRIMS_TS_SM107=1)",
+            num_heads,
+        )
 
 
 class PrimsTSSparseMLA:
@@ -91,18 +173,33 @@ class PrimsTSSparseMLA:
                 "graph capture must follow an eager run of the same shape."
             )
         wrapper = BatchSparseMLADecodePagedTSWrapper()
-        wrapper.plan(
-            self.device,
-            1 if packed else rows,
-            heads,
-            max_topk=width,
-            max_q_len=capacity if packed else 1,
-            packed_query=packed,
-            q_dtype=torch.float8_e4m3fn,
-            qk_rope_head_dim=64,
-            kv_cache_format="native",
-            return_lse=True,
-        )
+        if _K31HT_MLA_PROFILE != "0":
+            with _k31ht_mla_profile(rows=rows, packed=packed):
+                wrapper.plan(
+                    self.device,
+                    1 if packed else rows,
+                    heads,
+                    max_topk=width,
+                    max_q_len=capacity if packed else 1,
+                    packed_query=packed,
+                    q_dtype=torch.float8_e4m3fn,
+                    qk_rope_head_dim=64,
+                    kv_cache_format="native",
+                    return_lse=True,
+                )
+        else:
+            wrapper.plan(
+                self.device,
+                1 if packed else rows,
+                heads,
+                max_topk=width,
+                max_q_len=capacity if packed else 1,
+                packed_query=packed,
+                q_dtype=torch.float8_e4m3fn,
+                qk_rope_head_dim=64,
+                kv_cache_format="native",
+                return_lse=True,
+            )
         self._plans[key] = wrapper
         if packed:
             self._qo_indptr[key] = torch.zeros(2, dtype=torch.int32, device=self.device)

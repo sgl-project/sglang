@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the SGLang project
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 import base64
 import functools
 import json
@@ -706,6 +709,14 @@ class Envs:
     # Internal/testing only - users should not need to change this.
     SGLANG_PREFILL_TILE_BUDGET_MODE = EnvStr("compact")
     SGLANG_PREFILL_DELAYER_MAX_PREFILL_BS_WINDOW_SIZE = EnvInt(16)
+    # shortest-prefill-first: order the in-batch shared-prefix dedupe shortest
+    # first, so the shortest request of a shared-prefix group runs and the rest
+    # wait for it. Off: queue order.
+    SGLANG_SPF_SHORTEST_FIRST_DEDUPE = EnvBool(False)
+    # Opt-in, shortest-prefill-first: hold a truncated chunked request's uncomputed
+    # tail in the prefill budget, so requests admitted beside it (whose KV stays
+    # locked until sent) cannot leave its later chunks without KV.
+    SGLANG_K31_PF_SPF_RESERVE_CHUNKED_TAIL = EnvBool(False)
 
     # ===================================================================
     # Scheduler polling, timeouts, and output
@@ -771,6 +782,11 @@ class Envs:
     SGLANG_DISAGG_PREFILL_POLL_TRANSFERS_WHILE_WAITING = EnvBool(False)
     # Opt-in: drain HiCache L3 events while a prefill forward result is pending.
     SGLANG_DISAGG_PREFILL_POLL_HICACHE_WHILE_WAITING = EnvBool(False)
+    # Opt-in, PD prefill overlap loop: when the newest forward ran eagerly (no CUDA
+    # graph) and the oldest result copy is complete on every TP rank, process it
+    # before the next launch instead of one forward later. Unfinished forwards keep
+    # the overlap; ignored with continuous input polling.
+    SGLANG_DISAGG_PREFILL_EAGER_RESULT_FIRST = EnvBool(False)
     # Override NVML Confidential Computing autodetection. None = autodetect.
     SGLANG_FORCE_CONFIDENTIAL_COMPUTE = EnvBool(None)
 
@@ -918,6 +934,19 @@ class Envs:
     SGLANG_HUGEPAGE_SIZE = EnvStr("")
     # >0: prefault host pools with a private THP mapping using this many threads; 0 disables.
     SGLANG_HICACHE_HOST_PARALLEL_ALLOC_THREADS = EnvInt(0)
+    # Opt-in: size the Mamba pool's HiCache host share by its conv/temporal
+    # checkpoint only, not by the device-only spec-verify scratch and ReplaySSM
+    # rings it also holds.
+    SGLANG_K31_PF_HICACHE_MAMBA_STATE_BYTES = EnvBool(False)
+    # Opt-in, explicit --hicache-size: size every host pool from one per-rank
+    # host-memory budget, sampled on all ranks before any pool is built
+    # (host-local minimum), instead of re-sampling host memory per pool.
+    SGLANG_K31_HICACHE_BUDGET = EnvBoolWithAlias(False, deprecated_name="K31P_HCBUDGET")
+    # With SGLANG_K31_HICACHE_BUDGET: malloc_trim(0) before the snapshot, so freed
+    # weight-loading heap pages count as available host memory.
+    SGLANG_K31_HICACHE_BUDGET_TRIM = EnvBoolWithAlias(
+        False, deprecated_name="K31P_HCBUDGET_TRIM"
+    )
     SGLANG_TEST_HICACHE_BACKEND_RANDOM_DELAY = EnvFloat(None)
     SGLANG_TEST_HICACHE_BACKEND_RANDOM_FAILURE = EnvFloat(None)
 
@@ -948,6 +977,10 @@ class Envs:
     SGLANG_FAILED_SESSION_PROBE_INTERVAL_S = EnvFloat(30.0)
     SGLANG_FAILED_SESSION_PROBE_MAX_INTERVAL_S = EnvFloat(300.0)
     SGLANG_FAILED_SESSION_IDLE_TIMEOUT_S = EnvFloat(600.0)
+    # Opt-in: shard Mooncake prefill transfers across the transfer queues by a
+    # SplitMix64 hash of the bootstrap room instead of by the destination
+    # sessions' port sum (cherry-pick of sgl-project/sglang#42163).
+    SGLANG_K31_PF_MOONCAKE_ROOM_SHARD = EnvBool(False)
 
     # ===================================================================
     # Mooncake store
@@ -1419,6 +1452,13 @@ class Envs:
     # Native FP8 prefill for exact gfx950 Kimi-K3 zero-prefix and absorbed
     # cached-prefix shapes. Validated at 98% GSM8K accuracy.
     SGLANG_TRITON_FP8_PREFILL_ATTN = EnvBool(True)
+    # CUDA absorbed-MLA extend (12 heads, 576/512): value-column programs per head,
+    # and leading prefix tiles scored in parallel; both exact, 1 / 0 = stock launch.
+    SGLANG_TRITON_ABSORBED_MLA_DV_SPLIT = EnvInt(1)
+    SGLANG_TRITON_ABSORBED_MLA_PREFIX_TILES = EnvInt(0)
+    # Triton target-verify metadata: a length copy instead of a bs = 1 cumsum,
+    # and no mask indptr without a custom mask; the kernels read the same values.
+    SGLANG_OPT_TRITON_VERIFY_METADATA_TRIM = EnvBool(False)
     SGLANG_ENABLE_TORCH_COMPILE = EnvBool(False)
     SGLANG_TORCH_DYNAMIC_SHAPE = EnvBool(False)
     # torch.compile backend for CPU graphs (defaults to "inductor"; "eager" or "aot_eager" for debugging)
@@ -1578,6 +1618,9 @@ class Envs:
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_RESERVED_SMS = EnvInt(2)
     SGLANG_OPT_DEEPGEMM_MEGA_GATE = EnvBool(False)
     SGLANG_OPT_DEEPGEMM_MEGA_MOE_LOCALIZE = EnvBool(False)
+    # Opt-in: raise DeepGEMM's BLOCK_M (16/32 -> 64, 64 -> 96) for FP8xFP4 calls in
+    # decode and target-verify CUDA graphs.
+    SGLANG_OPT_DEEPGEMM_MEGA_MOE_RAISE_DECODE_BLOCK_M = EnvBool(False)
 
     # ===================================================================
     # Top-k kernels
@@ -1790,6 +1833,226 @@ class Envs:
     SGLANG_OPT_DFLASH_BATCHED_SMALL_COPY = EnvBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_K31_GB_OPTIMIZATION.get
     )
+    # With AUX_OVERLAP: create the aux side stream with the highest stream priority (its CTAs are dispatched ahead of pending
+    # lower-priority work, e.g. the side-stream KDA commit kernel). Scheduling only: same kernels, same values.
+    SGLANG_OPT_DFLASH_AUX_STREAM_HIGH_PRIORITY = EnvBool(False)
+    # Opt-in: the DFLASH verify's post-section (acceptance, target mamba state
+    # commit on a side stream, draft-KV append) in per-batch-size CUDA graphs
+    # (speculative/dflash_post_verify_graphs.py).
+    SGLANG_DFLASH_GRAPH_POST_VERIFY = EnvBool(False)
+    # With SGLANG_DFLASH_GRAPH_POST_VERIFY: shard the draft context fc across TP.
+    SGLANG_DFLASH_SHARD_DRAFT_FC = EnvBool(False)
+
+    # DFLASH draft, context-stage and commit switches (NVIDIA K3.1 host); all default off.
+    # DFLASH decode: the post-verify Mamba/KDA commit runs on a side stream,
+    # beside the draft-KV append; the step joins it before returning.
+    SGLANG_OPT_DFLASH_COMMIT_FORK = EnvBool(False)
+    # With COMMIT_FORK: the step does not join the forked commit; the next target verify (or the next extend / idle
+    # forward) joins it, so the draft prep and the draft run beside it. The commit reads a copy of its state indices
+    # made before the fork, and the result read-back (copy_done) waits for it. Engages only on the overlap scheduler with
+    # the KDA ReplaySSM exact-fold commit and the extra_buffer radix strategy, without unified memory, HiCache, PD or PP.
+    SGLANG_OPT_DFLASH_COMMIT_JOIN_LATE = EnvBool(False)
+    # DFLASH decode aux stage split in three graphs (dflash_shadow_ctx.py): the fc shard GEMM, gather, hidden norm and
+    # context kv_a GEMM read only the verify's rows, so they run before the accept; only the context KV store waits for
+    # it. 1 = the pre-accept part after the accept's TP sync; 2 = the fc GEMM at verify end, the rest after that sync.
+    # Engages only with the served context fusion (fc shard, context GEMM, store norm fold) on the aux side stream.
+    SGLANG_OPT_DFLASH_SHADOW_CTX = EnvInt(0)
+    # SHADOW_CTX's largest aux batch (rows) split in three graphs; 0 = 64 (the original decode cap). Never above the fc
+    # shard's own cap (FC_SHARD_MAX_ROWS, else CTX_FUSED_MAX_ROWS): A2 needs the shard's gather. Same kernels, same bits.
+    SGLANG_OPT_DFLASH_SHADOW_CTX_MAX_ROWS = EnvInt(0)
+    # Test hook for SHADOW_CTX. CHECK: the first N split rounds compare the stored draft KV bytes with the eager
+    # stock stage on the same inputs (committed rows) and with a snapshot (rejected rows).
+    SGLANG_TEST_DFLASH_SHADOW_CTX_CHECK = EnvInt(0)
+    # DFLASH MLA draft: skip the per-forward zeroed fp8-scale buffer;
+    # unquantized drafts never take one, and a request for one raises.
+    SGLANG_OPT_DFLASH_MLA_DRAFT_SKIP_ZERO_ALLOC = EnvBool(False)
+    # DFLASH draft at one request per step: the layers' all-reduces and the selector's
+    # top-k gather use one-shot epoch-tagged mailboxes (dflash_draft_collectives.py).
+    SGLANG_OPT_DFLASH_DRAFT_PK3_ALL_REDUCE = EnvBool(False)
+    SGLANG_OPT_DFLASH_PACKED_TOPK_GATHER = EnvBool(False)
+    # With the packed gather: also take it at every draft batch size up to this many requests (one mailbox per
+    # batch size); 1 keeps it at one request, other batch sizes use the group's all-gather.
+    SGLANG_OPT_DFLASH_PACKED_TOPK_GATHER_MAX_BS = EnvInt(1)
+    # DFLASH context stage, each bitwise to stock (speculative/dflash_context_fusion.py): column-sharded
+    # draft fc + multimem gather; all MLA layers' context kv_a in one GEMM; RoPE + FP8 store in one kernel.
+    SGLANG_OPT_DFLASH_FC_SHARD = EnvBool(False)
+    SGLANG_OPT_DFLASH_CTX_KV_GEMM = EnvBool(False)
+    # Row cap of the fc shard and the context GEMM (default 64 = decode B8). Wide draft batches (graphs to 16-64 requests, 128-512
+    # rows) raise it to their largest graph rows; each row count still pins only an algorithm bitwise equal to F.linear.
+    SGLANG_OPT_DFLASH_CTX_FUSED_MAX_ROWS = EnvInt(64)
+    # Separate, lower row cap for the fc shard alone (0 = the cap above). Above ~96 rows the sharded fc + multimem gather loses
+    # to the replicated fc while the context GEMM keeps winning (TP4 microbenchmark), so wide batches cap the fc lower.
+    SGLANG_OPT_DFLASH_FC_SHARD_MAX_ROWS = EnvInt(0)
+    SGLANG_OPT_DFLASH_CTX_KV_STORE = EnvBool(False)
+    # With CTX_KV_STORE: the layers' kv_a RMSNorms folded into the store kernel (flashinfer's H = 512 BF16 order); accepted
+    # only after a bitwise probe against the served norm modules. Test hook: CHECK = compare the stored k_nope FP8 bytes with
+    # the served norm + cast after each of the first N aux replays.
+    SGLANG_OPT_DFLASH_CTX_KV_STORE_NORM = EnvBool(False)
+    SGLANG_TEST_DFLASH_CTX_KV_STORE_NORM_CHECK = EnvInt(0)
+    # DFLASH draft: the draft grouped convs and the draft layers' input and post-attention RMSNorms trigger their PDL dependents
+    # before their own wait, so the GEMMs after them launch and stage weights earlier (q_a / kv_a norms: routed, but their inputs fail
+    # the wrapper's 2-D contiguous input check, so they run the served kernel; the final norm is not routed). One
+    # int32 device flag, fixed at 1, enables the trigger; arithmetic unchanged. The convs need
+    # SGLANG_OPT_DFLASH_DRAFT_PDL_GLUE.
+    SGLANG_OPT_DFLASH_DRAFT_EARLY_TRIGGER = EnvBool(False)
+    SGLANG_OPT_DFLASH_COMPACT_WINDOW_FUSED = EnvBool(False)
+    # DFLASH MLA draft: draft-layer GEMMs of <= 8 rows on the megakernel plugin's
+    # split-K projection (an FP32 accumulation reorder of the stock GEMMs).
+    SGLANG_OPT_DFLASH_DRAFT_SPLITK = EnvBool(False)
+    # With SGLANG_OPT_DFLASH_DRAFT_SPLITK: the MLP's SiLU-mul in the gate_up split-K epilogue (bitwise to the
+    # split-K gate_up + stock act_and_mul pair; one kernel fewer per draft layer).
+    SGLANG_OPT_DFLASH_DRAFT_SPLITK_ACT = EnvBool(False)
+    # With SGLANG_OPT_DFLASH_DRAFT_SPLITK: also the 9-64-row draft blocks (batches of 2-8 requests) whose row count has a
+    # tactic in dflash_draft_splitk.WIDE_TACTICS, instead of the stock GEMMs (and, with _ACT, the fused SiLU-mul).
+    SGLANG_OPT_DFLASH_DRAFT_SPLITK_WIDE = EnvBool(False)
+    # With SGLANG_OPT_DFLASH_DRAFT_SPLITK: the 96-row draft blocks (12 requests x block 8) of the K=7168 linears (conv kernel
+    # projections, fused qkv_a, unfused gate_up) on SK3B, a streaming cluster split-K (weights through their own shared-memory
+    # ring from kernel entry, x after the PDL wait; speculative/dflash_sk3b.py, dflash_draft_splitk.SK3B_TACTICS), bitwise to the
+    # stock cuBLAS GEMM at that row count.
+    SGLANG_OPT_DFLASH_DRAFT_SPLITK_SK3B = EnvBool(False)
+    # With SGLANG_OPT_DFLASH_DRAFT_SPLITK_ACT: the fused gate_up + SiLU-mul at the dflash_draft_splitk.SK3B_ACT_TACTICS row counts (96)
+    # on SK3B with an act epilogue (speculative/dflash_sk3b_act.py):
+    # bitwise to the same SK3B gate_up + the stock act, so bitwise to the stock cuBLAS gate_up + act at 96 rows; saves the act kernel.
+    SGLANG_OPT_DFLASH_DRAFT_SPLITK_SK3B_ACT = EnvBool(False)
+    # With SGLANG_OPT_DFLASH_DRAFT_SPLITK_SK3B (and _SK3B_ACT): the SK3B rows of the fused qkv_a and gate_up projections also prefetch
+    # the next GEMM's weight (o_proj, down) into L2 after their own weight stream (dflash_draft_splitk.PF_FLAG). A cache hint: outputs unchanged.
+    SGLANG_OPT_DFLASH_DRAFT_SPLITK_SK3B_PF = EnvBool(False)
+    # With SGLANG_OPT_DFLASH_DRAFT_SPLITK_SK3B: the conv kernel projections of the draft's grouped convs at their
+    # SK3B row counts run with the SIDE-0 grouped conv in the projection's epilogue (speculative/dflash_sk3b_conv.py): the
+    # projection output is SK3B's and the conv output bitwise to the stock Triton grouped conv of it; saves one conv kernel per sublayer.
+    SGLANG_OPT_DFLASH_DRAFT_SPLITK_SK3B_CONV = EnvBool(False)
+    # With SGLANG_OPT_DFLASH_DRAFT_SPLITK: the 24-88-row draft blocks (3-11 requests x block 8) of the K=7168 linears on SK3B too
+    # (dflash_draft_splitk.SK3B_LOW_TACTICS; with _SK3B_ACT also the fused gate_up + SiLU-mul, with _SK3B_CONV the conv epilogue): bitwise to the
+    # stock cuBLAS GEMM at these rows; these rows take precedence over SGLANG_OPT_DFLASH_DRAFT_SPLITK_WIDE's and
+    # SGLANG_OPT_DFLASH_DRAFT_SPLITK_OV_WIDE_ROWS' rows.
+    SGLANG_OPT_DFLASH_DRAFT_SPLITK_SK3B_LOW = EnvBool(False)
+    # With SGLANG_OPT_DFLASH_DRAFT_SPLITK: the 104-128-row draft blocks (13-16 requests x block 8) of the K=7168 linears on SK3B with split 4
+    # (dflash_draft_splitk.SK3B_B4_TACTICS; with _SK3B_ACT also the fused gate_up + SiLU-mul, with _SK3B_CONV the conv epilogue): the stock cuBLAS
+    # GEMM's four K slices and rank-order FP32 sum at these rows -> bitwise to it.
+    SGLANG_OPT_DFLASH_DRAFT_SPLITK_SK3B_B4 = EnvBool(False)
+    # With SGLANG_OPT_DFLASH_DRAFT_SPLITK (16 rows also _OV_WIDE_ROWS with 16): the conv kernel projections of the draft's grouped convs at
+    # 8 rows (split-K (128, 8, 7, 5)) and 16 rows (OV-wide (64, 16, 4, 11)) run with the SIDE-0 grouped conv in the projection's epilogue
+    # (speculative/dflash_splitk_conv.py): same tactic, same reduction -> the projection output is the served one
+    # bit for bit and the conv output bitwise to the stock Triton grouped conv of it; saves one conv kernel per sublayer. SK3B rows keep SK3B.
+    SGLANG_OPT_DFLASH_DRAFT_SPLITK_WCONV = EnvBool(False)
+    # With SGLANG_OPT_DFLASH_DRAFT_SPLITK_WIDE: at these draft-row counts (comma list, e.g. "16,24,32" = 2 / 3 / 4 requests at
+    # 7 drafted; each needs an entry in dflash_draft_splitk.OV_WIDE_TACTICS) the K = 7168 wide projections (conv kernel
+    # projections, fused qkv_a, gate_up and the fused gate_up + SiLU-mul) keep their wide tactic's tiles, split and trigger
+    # but hold more pipeline stages (fewer than their K tiles) in the plugin's extended shared-memory mode. "" = off. Outputs
+    # unchanged (same partial sums, same reduction order).
+    SGLANG_OPT_DFLASH_DRAFT_SPLITK_OV_WIDE_ROWS = EnvTuple(())
+    # With SGLANG_OPT_DFLASH_DRAFT_SPLITK: the <= 8-row (1792, 7168) and (2112, 7168) draft GEMMs (conv kernel projections,
+    # gate_up, fused qkv_a) take a tactic with as many stages as K tiles per split, in the extended shared-memory mode, so every weight
+    # tile is issued before the PDL wait (dflash_draft_splitk.OV_TACTICS). Same split, same sum: bitwise to off. The conv
+    # projections trigger after their wait (SplitKGemm fenced mode 2), as the draft AR site's early trigger requires.
+    SGLANG_OPT_DFLASH_DRAFT_SPLITK_OV = EnvBool(False)
+    # With SGLANG_OPT_DFLASH_DRAFT_SPLITK and the draft AR sites, <= 8 rows: each draft sublayer's grouped conv (side 0) runs
+    # inside the next GEMM (fused qkv_a, gate_up or the fused gate_up + SiLU-mul): the GEMM loads the raw rows and convolves
+    # its B stages in shared memory before the MMA (speculative/dflash_draft_conv_prologue.py). Same arithmetic as the
+    # served conv kernel then the served projection: bitwise to off.
+    SGLANG_OPT_DFLASH_DRAFT_CONV_PROLOGUE = EnvBool(False)
+    # With SGLANG_OPT_DFLASH_DRAFT_CONV_PROLOGUE: only the MLP conv (side 0) runs inside gate_up (or the fused gate_up +
+    # SiLU-mul); the attention conv and fused qkv_a keep the served conv kernel and projection, where the folded form
+    # costs more than the conv kernel it removes. Bitwise to off.
+    SGLANG_OPT_DFLASH_DRAFT_CONV_PROLOGUE_MLP_ONLY = EnvBool(False)
+    # With SGLANG_OPT_DFLASH_DRAFT_MLAQ and SGLANG_OPT_DFLASH_DRAFT_SPLITKV_ATTN on the Triton draft backend: each DFlash MLA draft
+    # layer's split-KV extend attention (partial + combine) and its w_vc projection run as ONE clustered launch
+    # (speculative/dflash_draft_attnblock.py) for 1-4 requests of 8 rows; other calls keep the served kernels. Not bitwise:
+    # F16 attention operands (served: FP8 q / p on the rail), the projection before the combine, one BF16 rounding.
+    SGLANG_OPT_DFLASH_DRAFT_ATTNBLOCK = EnvBool(False)
+    # MLA DFLASH draft at TP > 1, <= 64 rows: each sublayer's all-reduce + grouped conv finish + add-RMSNorm run as one
+    # kernel (speculative/dflash_draft_ar_site.py; multicast Lamport mailbox on the draft TP group); the reduction
+    # rounds each rank's convolved partial before the sum, so outputs differ from the stock chain by rounding.
+    SGLANG_OPT_DFLASH_DRAFT_AR_SITE = EnvBool(False)
+    # With SGLANG_OPT_DFLASH_DRAFT_AR_SITE: a site whose next kernel is the split-K conv projection releases it (PDL)
+    # right after its own griddepcontrol.wait, so the projection stages its weights during the exchange; the other
+    # sites keep the release after the norm stores (DraftArSites._early_for). Outputs unchanged.
+    SGLANG_OPT_DFLASH_DRAFT_AR_SITE_EARLY_TRIGGER = EnvBool(False)
+    # With SGLANG_OPT_DFLASH_DRAFT_AR_SITE: each draft layer's o_proj / down_proj (<= 8 rows, split-K) multicasts its
+    # convolved partial into the site's slots from its epilogue and the site only polls (speculative/dflash_draft_ar_ring.py).
+    # The site's outputs are bitwise those without it.
+    SGLANG_OPT_DFLASH_DRAFT_AR_RING = EnvBool(False)
+    # With SGLANG_OPT_DFLASH_DRAFT_AR_RING: the ring o_proj / down_proj epilogue threads wait for the PDL predecessor and load
+    # the conv coefficients while the main loop runs, instead of after the tile is staged. Same arithmetic: outputs unchanged.
+    SGLANG_OPT_DFLASH_DRAFT_RING_EARLY_COEF = EnvBool(False)
+    # DFLASH MLA draft on the Triton backend (<= 64 rows): q_a / kv_a RMSNorm, q_b, W_UK, RoPE, the FP8 KV-row store and the extend
+    # K / V in one CuTe kernel (speculative/dflash_draft_mlaq.py DraftMlaQuery) instead of five launches. Numerics: the served
+    # rounding points, another accumulation order (ulp-level differences).
+    SGLANG_OPT_DFLASH_DRAFT_MLAQ = EnvBool(False)
+    # With SGLANG_OPT_DFLASH_DRAFT_MLAQ: the largest draft row count it serves (multiple of 8, 8..128; default 64 = draft B8);
+    # larger row counts keep the served chain. Draft batches of 9-16 requests are 72-128 rows.
+    SGLANG_OPT_DFLASH_DRAFT_MLAQ_MAX_ROWS = EnvInt(64)
+    # With SGLANG_OPT_DFLASH_DRAFT_MLAQ: draft row counts from this value to 128 (a multiple of 8 in [16, 128]; 0 = off) run
+    # DraftMlaQueryWide (speculative/dflash_draft_mlaq_wide.py: RMSNorms + RoPE + FP8 KV row, cuBLAS Q_B, W_UK + RoPE; the two Triton
+    # launches programmatically dependent) instead of DraftMlaQuery / the served chain. Numerics: the served rounding points, another
+    # accumulation order (ulp-level). Draft batches of 13-16 requests = 104-128 rows.
+    SGLANG_OPT_DFLASH_DRAFT_MLAQ_WIDE_MIN_ROWS = EnvInt(0)
+    # With SGLANG_OPT_DFLASH_DRAFT_AR_RING: a polled site of at most 8 rows (one draft block) first has lane s of warp 0
+    # wait for one fragment of source s before the CTA polls (the GATED_AR form), so fewer polls are in
+    # flight while the peers' stores land. Outputs unchanged.
+    SGLANG_OPT_DFLASH_DRAFT_AR_GATE = EnvBool(False)
+    # With SGLANG_OPT_DFLASH_DRAFT_AR_RING: the ring o_proj / down_proj release their PDL dependents only after their own
+    # griddepcontrol.wait (fenced), and the polled site after each (<= 8 rows) runs everything before its own wait and waits
+    # at the end (the SITE_DEFERRED form); it writes its normed rows into a static buffer per site. Outputs unchanged.
+    SGLANG_OPT_DFLASH_DRAFT_AR_DEFERRED = EnvBool(False)
+    # With SGLANG_OPT_DFLASH_DRAFT_AR_RING (Rubin): the polled site of <= 8 rows lands each CTA's columns of the TP slots in
+    # shared memory with validity-reporting bulk copies, re-issued until no copied 16 B chunk is armed, instead of every
+    # thread polling them (the VALID_AR form). Replaces SGLANG_OPT_DFLASH_DRAFT_AR_GATE there. Outputs unchanged.
+    SGLANG_OPT_DFLASH_DRAFT_AR_VALID = EnvBool(False)
+    # With SGLANG_OPT_DFLASH_DRAFT_AR_SITE: unpolled sites (> 8 rows, or no ring) of at least this many rows exchange over
+    # the plugin's two-shot Lamport box (reduce-scatter to column owners, owner multicast of the BF16 sums; the
+    # ArNormTwoShot form) instead of every rank receiving every rank's row. 0 = never. Outputs unchanged (same sums, same order).
+    SGLANG_OPT_DFLASH_DRAFT_AR_TWOSHOT_ROWS = EnvInt(0)
+    # Two-shot draft AR sites: owners poll their TP slots in the plugin reduce's batched form (every slot re-loaded each pass, all
+    # loads in flight; the TWOSHOT_BATCHED form) instead of re-loading only the pending ones. Same words, same order, same bits.
+    SGLANG_OPT_DFLASH_DRAFT_AR_TWOSHOT_BATCHED = EnvBool(False)
+    # Two-shot draft AR sites: the gather-side re-arm fence moves to one non-live thread after the norm's first CTA barrier
+    # (overlaps the sum of squares / norm). Same bits.
+    SGLANG_OPT_DFLASH_DRAFT_AR_TWOSHOT_FENCE_OFFLOAD = EnvBool(False)
+    # Two-shot draft AR sites inside one draft forward: site s leaves its gather row published and site s + 1's non-live
+    # threads re-arm (and fence) it while the live threads push; the forward's last site re-arms its own. Same bits.
+    SGLANG_OPT_DFLASH_DRAFT_AR_TWOSHOT_DRR = EnvBool(False)
+    # Draft AR sites (one-shot and two-shot): the norm's sum of squares is stored per thread in shared memory and the cluster
+    # pushers rebuild warp_sum's butterfly tree from it (same adds, same order) instead of 5 warp shuffles. Same bits.
+    SGLANG_OPT_DFLASH_DRAFT_AR_SMEMSUM = EnvBool(False)
+    # Rows of the two-shot box, a multiple of 8 in [64, 128]: above 64 (the one-shot mailbox) the draft forward keeps its
+    # AR sites up to this many rows (wide decode tier, 9-16 requests) on the two-shot path; needs TWOSHOT_ROWS <= 64.
+    SGLANG_OPT_DFLASH_DRAFT_AR_TWOSHOT_CAP = EnvInt(64)
+    # With a two-shot box cap above 64: two-shot sites of more than this many rows run ceil(rows / N) rows per CTA, so their grid
+    # stays at <= N 8-CTA clusters (clusters beyond what stays co-resident cost a second wave). Per row the same arithmetic
+    # and exchange, so the same bits. 0 = one row per cluster.
+    SGLANG_OPT_DFLASH_DRAFT_AR_TWOSHOT_MAXCL = EnvInt(0)
+    # DFLASH selector draft graph: its captured tail writes the verify tokens into a static buffer and the target verify
+    # runner's static input_ids, the prefix seq-lens snapshot moves before the draft launch, and the verify runner skips
+    # its input_ids / positions copies (speculative/dflash_post_stage.py). 0 = off, 1 = on, 2 = on + a per-round check
+    # against the eager path (host syncs; identity arms only). Outputs unchanged.
+    SGLANG_OPT_DFLASH_POST_IN_GRAPH = EnvInt(0)
+    # Sparse TARGET_VERIFY graph (kimi_k31_verify_dsa_binding): the prologue's valid mask, per-request page-table de-expand
+    # and score contexts in one Triton kernel (speculative/dflash_verify_prologue.py), and the stable-rows mask passed as a
+    # callable (no kernel unless SGLANG_ENABLE_PP_SPEC uses it). Outputs unchanged (plain copies).
+    SGLANG_OPT_DFLASH_VERIFY_PROLOGUE_FUSED = EnvBool(False)
+    # DFLASH draft head (models/dflash.py _project_candidate_logits, dense BF16 head): at these drafted-row counts
+    # (comma list, e.g. "21,28" = 3 / 4 requests at 7 drafted) project through the plugin split-K projection with one K
+    # slice (M tile 64, N tile = rows rounded up to 8, 9 stages) instead of torch.matmul. "" = off. Numerics: one FP32
+    # accumulation per output instead of cuBLAS's split-K order (draft logits only; target tokens unchanged).
+    SGLANG_OPT_DFLASH_DRAFT_HEAD_SPLITK_ROWS = EnvTuple(())
+    # One-row-per-cluster two-shot draft AR sites of more than this many rows compile with a launch bound of 6 CTAs per SM (<= 85
+    # registers), so more of their CTAs stay resident instead of falling back to a second wave. 0 = never. Same bits.
+    SGLANG_OPT_DFLASH_DRAFT_AR_TWOSHOT_BOUND_ROWS = EnvInt(0)
+    # With SGLANG_OPT_DFLASH_SELECTOR_FUSED_ACCEPT and an all-reduce DFLASH_SELECTOR sync: the select kernel writes the
+    # sync's fp32 all-reduce input and the commit kernel reads its output (three glue kernels fewer per round;
+    # kernels/ops/speculative/selector_sampled_accept.py selector_sampled_accept_synced); same outputs.
+    SGLANG_OPT_DFLASH_SELECTOR_SYNC_FOLD = EnvBool(False)
+    # With SGLANG_OPT_DFLASH_SELECTOR_FUSED_ACCEPT, on rounds that take SGLANG_OPT_DFLASH_VERIFY_SOFTMAX_WIDE: the accept
+    # evaluates p from the verify logits and per-row softmax stats where it reads it, instead of normalizing every
+    # verify row over the vocabulary first (selector_sampled_accept.py selector_logit_accept); same outputs.
+    SGLANG_OPT_DFLASH_SELECTOR_LOGIT_ACCEPT = EnvBool(False)
+    # With SGLANG_OPT_DFLASH_SELECTOR_LOGIT_ACCEPT: the per-row softmax stats come from one read of the verify logits at
+    # any row count (kernels/ops/speculative/verify_row_stats.py) instead of verify_softmax_wide's stats (<= 128 rows,
+    # bitwise to the served p). The max and inv_temp keep the served bits; the denominator is summed in another order,
+    # so p is not bit-identical to the served p: relative differences reach ~2e-6 at vocab 163840, the same order as
+    # the served fp32 sum's own error against an FP64 sum.
+    SGLANG_OPT_DFLASH_VERIFY_ROW_STATS = EnvBool(False)
     SGLANG_ENABLE_LILICORR_SAMPLING = EnvBool(False)
     SGLANG_LILICORR_REQUIRE_SAMPLING = EnvBool(False)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")
@@ -1805,11 +2068,129 @@ class Envs:
     # decision alike. If TP ranks still diverge or hang, set "all" and report a repro.
     # The K3.1 GB switch keeps its tuned site set.
     SGLANG_SPEC_TP_SYNC = EnvStr(_k31_gb_best("all,-dflash-accept-greedy", "init"))
+    # The DFlash sync sites (token ids and accept lengths, all below 2**24) reach the TP group through one fp32
+    # all-reduce of rank 0's values plus zeros (exact) instead of a ring broadcast, whose root leaves first.
+    SGLANG_OPT_SPEC_TP_SYNC_ALLREDUCE = EnvBool(False)
     # Kill-switch for the draft-extend cuda graph. Draft extend then always runs
     # eager. Escape hatch for setups where the capture's memory pool costs more
     # than the graph saves (e.g. DeepEP MoE workspace captured at full dispatch
     # capacity).
     SGLANG_DISABLE_DRAFT_EXTEND_CUDA_GRAPH = EnvBool(False)
+
+    # K3.1 megakernel flags, one section per component; add flags under the
+    # matching section, all default off.
+    # --- K3.1: expert (MoE) ---
+
+    # --- K3.1: attention ---
+
+    # --- K3.1: KDA ---
+    # KDA spec verify with --mamba-ssm-dtype bfloat16 and the ReplaySSM rings: run the fused CuTe verify
+    # (kernels/ops/attention/kda_decode_mtp.py, state staged as BF16 and widened to FP32) instead of falling back to
+    # the generic conv + Triton recurrence chain. Same math as FP32 on the same (BF16) state values.
+    SGLANG_OPT_KDA_CUTE_VERIFY_BF16_STATE = EnvBool(False)
+
+    # --- K3.1: communication ---
+
+    # --- K3.1: DFLASH draft ---
+    # DFLASH selector draft, sampled verify: accept on the sparse selector q split
+    # over the vocabulary, one rank-0 sync; the same draws as the dense-q path.
+    SGLANG_OPT_DFLASH_SELECTOR_FUSED_ACCEPT = EnvBool(False)
+    # With SGLANG_OPT_DFLASH_SELECTOR_FUSED_ACCEPT: draw the accept's uniforms on a side stream before the verify
+    # (speculative/dflash_accept_rand.py); the same bits, off the critical path.
+    SGLANG_OPT_DFLASH_ACCEPT_RAND_HOIST = EnvBool(False)
+    # DFLASH MLA draft on the Triton backend: q / k concat and the FP8 KV-row store in one
+    # kernel (kernels/ops/kvcache/mla_fused_kv_write.py), bitwise to stock.
+    SGLANG_OPT_DFLASH_MLA_FUSED_KV_WRITE = EnvBool(False)
+    # DFLASH MLA draft on the Triton backend: the draft block's extend attention as one split-KV pass + a fixed-order
+    # combine (kernels/ops/attention/dflash_draft_splitkv.py). 0 = stock serial kernel; 1 = stock operand dtypes
+    # (q / p cast to fp8 for the rail dots); 2 = bf16 rail operands (fp8 K / V upcast). Needs a bounded draft window.
+    SGLANG_OPT_DFLASH_DRAFT_SPLITKV_ATTN = EnvInt(0)
+    # With SGLANG_OPT_DFLASH_DRAFT_SPLITKV_ATTN = 1 at draft batch > 1: one CTA scores each rail tile for a group of query heads
+    # (one KV head, MQA), so each K / V tile is read once per group instead of once per head. Bitwise equal outputs.
+    SGLANG_OPT_DFLASH_DRAFT_P1_HPACK = EnvBool(False)
+    # With SGLANG_OPT_DFLASH_DRAFT_SPLITKV_ATTN and SGLANG_OPT_DFLASH_DRAFT_PDL_GLUE: the split-KV combine kernel also releases its PDL
+    # dependents right after its own wait, so a PDL-launched successor (the SPLITK_WVC projection) issues its weight tiles during the
+    # combine. The successor reads the combine's output only after its griddepcontrol.wait (whole combine grid). Bitwise equal outputs.
+    SGLANG_OPT_DFLASH_DRAFT_P1_COMBINE_TRIGGER = EnvBool(False)
+    # With SGLANG_OPT_DFLASH_DRAFT_P1_HPACK = 1: rail tiles per partial-pass slot (tps). "1" (default) = unchanged; an integer =
+    # that tps at every draft batch; "auto" = the per-batch table tuned on the target GPU (dflash_draft_splitkv.P1_TPS_AUTO).
+    # tps > 1 changes the fp32 reduction order of the draft attention (drafter numerics; not bitwise to tps = 1).
+    SGLANG_OPT_DFLASH_DRAFT_P1_TPS = EnvStr("1")
+    # With SGLANG_OPT_DFLASH_DRAFT_P1_HPACK = 1: the head-packed pass's launch at wider draft batches. "0" (default) = the served
+    # launch (16 rows = 2 heads per CTA, 8 warps, 1 stage; tps from SGLANG_OPT_DFLASH_DRAFT_P1_TPS); "auto" = the per-batch table dflash_draft_splitkv.P1_WIDE_AUTO
+    # (heads per CTA, V split, warps, stages, tps, combine chunk; tuned on the target GPU). Wider CTAs change the dot layouts and the fp32
+    # reduction order (drafter numerics, not bitwise to "0"); batches outside the table keep the served launch. Any other value, or
+    # "auto" without P1_HPACK, fails at startup.
+    SGLANG_OPT_DFLASH_DRAFT_P1_WIDE = EnvStr("0")
+    # DFlash2 selector head after the LM head in three launches (top-k + lattice operands, lattice GEMM, walk);
+    # TP16 K3.1 draft shapes only, bitwise equal to the unfused head.
+    SGLANG_OPT_DFLASH_FUSED_SELECTOR = EnvBool(False)
+    # With SGLANG_OPT_DFLASH_FUSED_SELECTOR: the candidate top-k, the lattice GEMM and the walk after the gather in one
+    # kernel (jit/csrc/speculative/dflash_selector_one_launch.cuh) instead of three launches. Bitwise to off.
+    SGLANG_OPT_DFLASH_SELECTOR_ONE_LAUNCH = EnvBool(False)
+    # With SGLANG_OPT_DFLASH_FUSED_SELECTOR, draft batches of 2+ requests: the draft head reads the drafted rows copied compact by a
+    # PDL kernel (kernels/ops/speculative/dflash_draft_gather.py) instead of the plain reshape copy of the non-contiguous slice.
+    # Pure copy: bitwise to off.
+    SGLANG_OPT_DFLASH_DRAFT_HEAD_GATHER = EnvBool(False)
+    # DFlash2 selector draft sampler: stage the per-request temperatures and greedy mask only when the batch's
+    # sampling tensors, their contents (version counters) or bs change, instead of three launches every round.
+    # Same buffer contents: bitwise to off.
+    SGLANG_OPT_DFLASH_DRAFT_STAGE_ONCE = EnvBool(False)
+    # DFLASH draft layer: the Triton glue kernels (grouped conv, the MLA fused KV write, the split-KV attention pair)
+    # launch with PDL and wait before their first read, so the split-K projections that follow them stage their
+    # weights early. Same kernels and math: bitwise to off.
+    SGLANG_OPT_DFLASH_DRAFT_PDL_GLUE = EnvBool(False)
+    # DFLASH draft block prep as one launch (speculative/dflash_fused_draft_prep.py), CHECK only: for the first N
+    # draft graph rounds the fused kernel writes shadow buffers that are compared bitwise with the eager prep's
+    # outputs (a host sync per checked round). Served outputs unchanged. 0 = off.
+    SGLANG_OPT_DFLASH_FUSED_DRAFT_PREP_CHECK = EnvInt(0)
+    # DFLASH draft block prep as one launch, SERVED (ON form): the kernel writes the worker / runner / Triton backend
+    # buffers the eager prep writes, the eager ops are skipped, and the draft graph runner skips fill_from and the
+    # backend's out-graph prep for that replay. Bitwise to off (integer index work + an exact embedding row copy).
+    # Needs the replicated draft embedding table (attention DP); exclusive with the CHECK knob above.
+    SGLANG_OPT_DFLASH_FUSED_DRAFT_PREP = EnvBool(False)
+    # ON-form re-check: for the first N fused replays, snapshot the runner's static buffers and the replay backend's tensors, run the
+    # skipped fill_from + backend prep anyway, and compare bitwise (logs MISMATCH / OK). Test only (host syncs).
+    SGLANG_TEST_DFLASH_FUSED_DRAFT_PREP_RECHECK = EnvInt(0)
+
+    # --- K3.1: verify ---
+    # DFLASH sampled verify: the target softmax as flashinfer's vocabulary-split kernels with the normalization
+    # spread over (row, 4096-column) CTAs and the per-request temperature read in-kernel
+    # (kernels/ops/speculative/verify_softmax_wide.py); bitwise equal to the flashinfer call it replaces.
+    SGLANG_OPT_DFLASH_VERIFY_SOFTMAX_WIDE = EnvBool(False)
+
+    # --- K3.1: host ---
+    # Decode-stall diagnostics in every scheduler process (0 = off): log a GC pass of at least this many ms,
+    # and the main thread's stack when it stays at one position this long (scheduler_components/stall_probe.py).
+    SGLANG_LOG_GC_STALL_MS = EnvInt(0)
+    SGLANG_LOG_STALL_STACK_MS = EnvInt(0)
+    # DFlash decode: the target verify's input-slot copies, attention metadata and mamba track ids run on a
+    # side stream that waits only for the draft replay's start (model_executor/runner/dflash_verify_prep.py).
+    SGLANG_OPT_DFLASH_VERIFY_PREP_BESIDE_DRAFT = EnvBool(False)
+    # DFlash decode seams: the round's small device-to-device copies (forced-AL token block, aux-graph input staging,
+    # draft-token block, verify replay inputs) run as one batched SM copy kernel each instead of copy-engine memcpys.
+    SGLANG_OPT_K31_SEAM_SMALL_COPY = EnvBool(False)
+    # DFlash sampled verify (selector fused accept; no top-k / top-p / penalties / grammar / logprobs): no full-logit
+    # all-gather. Each rank reduces its vocab shard to a per-row payload (argmax, softmax stats, Gumbel winner,
+    # candidate logits), the TP group all-gathers the payloads and every rank combines them: the chain walk on the
+    # served uniforms, the bonus by Gumbel-max (distribution-identical, not token-identical, to the served draw) and
+    # the target argmax the forced-acceptance simulator reads (bitwise). kernels/ops/speculative/vocab_parallel_accept.py
+    SGLANG_OPT_K31_VP_ACCEPT = EnvBool(False)
+    # Forced-acceptance simulator only (the sampled accept keeps the full logits): the target argmax comes from the
+    # vocab shard (softcap_row_argmax + an all-gather of [rows, 2]) instead of torch.argmax over the full logits; bitwise.
+    SGLANG_OPT_K31_VP_SIM_ARGMAX = EnvBool(False)
+    # SGLANG_OPT_K31_VP_ACCEPT cross-rank guard: every N vocab-parallel accepts, read the device counter of requests
+    # whose seed / input hash differed between TP ranks and log it (one host sync per N rounds). 0 = never read.
+    SGLANG_OPT_K31_VP_XRANK_LOG_EVERY = EnvInt(0)
+    # SGLANG_OPT_K31_VP_ACCEPT payload all-gather: "multimem" = the served multimem all-gather kernel
+    # (triton_symm_mem_ag, built once at worker init; NCCL if the group has no multicast), "nccl" = NCCL ring.
+    SGLANG_OPT_K31_VP_GATHER = EnvStr("multimem")
+    # SGLANG_OPT_K31_VP_ACCEPT column chunks per vocab shard in the local payload kernel: 0 = auto (~128 programs),
+    # 1 = the whole shard per row (the first form), n = fixed. Changes only the FP32 summation order of the softmax
+    # denominator; the target argmax stays bitwise.
+    SGLANG_OPT_K31_VP_SPLIT = EnvInt(0)
+    # Drop the multimem payload gather's entry barrier (the served logits gatherer's form). Default keeps it.
+    SGLANG_OPT_K31_VP_GATHER_SKIP_ENTRY = EnvBool(False)
 
     # ===================================================================
     # Multimodal processing
@@ -1879,6 +2260,26 @@ class Envs:
     # mamba pool ratio accordingly. Frees one resident slot per running request,
     # raising max_running_requests. Off = original locking + ratio (escape hatch).
     SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK = EnvBool(False)
+    # Opt-in: KDA commit-then-verify under --enable-linear-replayssm-spec. The
+    # post-verify step only records each slot's accept length; the next
+    # nv_cutedsl verify replays that window in-kernel and writes the committed
+    # state back, so the state is read once per step instead of twice.
+    # Track-crossing rows and every non-verify forward commit eagerly. BF16
+    # state also needs SGLANG_OPT_KDA_CUTE_VERIFY_BF16_STATE.
+    SGLANG_OPT_KDA_SPEC_FOLD_VERIFY = EnvBool(False)
+    # Fold mode: verify batches smaller than this flush first and verify without
+    # the replay (the fold kernel costs more latency per CTA than it saves when
+    # the whole batch is one wave). 0 = fold every chain verify.
+    SGLANG_OPT_KDA_SPEC_FOLD_MIN_BS = EnvInt(0)
+    # V-column tile of the ReplaySSM exact-fold commit kernel (and of the fold
+    # mode's sparse commit on BF16 state, which follows it). On FP32 state any
+    # value gives the same bits (it only partitions independent V columns); on
+    # BF16 state a few elements move by 1-2 BF16 ulps with the tile. None keeps 8.
+    SGLANG_OPT_KDA_REPLAYSSM_FOLD_BLOCK_V = EnvInt(None)
+    # KDA ReplaySSM spec-verify records (rawv/rawk/d/k) in this dtype
+    # (float32|bfloat16|float16). Unset: the activation dtype, as before.
+    # g/beta stay fp32; GDN is unaffected.
+    SGLANG_KDA_REPLAY_RECORD_DTYPE = EnvStr(None)
     # PD decode with --disaggregation-decode-enable-radix-cache on a hybrid-SSM
     # model: the radix tree keeps FULL KV only. Prefill always sends a
     # request's final recurrent state and decode never computes a prompt, so a
@@ -2240,6 +2641,10 @@ class Envs:
     # Requires a DeepGEMM paged-MQA scheduler supporting batches > SM count
     # (0.2.3 does); set to 0 for an older DeepGEMM.
     SGLANG_DSA_FULL_BATCH_MQA = EnvBool(True)
+    # prims_ts DSA on SM107 (VR200, Rubin): off keeps dev's SM100/SM103-only
+    # startup check; on admits SM107 and needs a FlashInfer Prims-TS tree with
+    # flashinfer-ai/flashinfer#8186 (sparse MLA planning on SM107).
+    SGLANG_ENABLE_PRIMS_TS_SM107 = EnvBool(False)
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
     SGLANG_DISABLE_DSA_INDEXER_FUSION = EnvBool(False)
@@ -2358,6 +2763,18 @@ class Envs:
     # either direction (the K3.1 GB switch forces it on unless set). See
     # srt/layers/communication/k3_ar_fusion.py.
     SGLANG_K3_AR_FUSION = EnvBool(SGLANG_ENABLE_NV_MEGA_RUNTIME_K31_GB_OPTIMIZATION.get)
+    # K3 AR fusion on VR200 (SM107): run the NVLS pull all-reduces of large
+    # (prefill-sized, > 4 MB) messages -- the attention/KDA o_proj output, the
+    # MoE latent+norm and the overlapped MoE shared AR -- with more CTAs. The
+    # stock large-message fallbacks (4 / 24 / 4 blocks) were tuned on GB300;
+    # the CTA count only partitions the rows (bit-identical results).
+    SGLANG_K3_AR_LARGE_PULL_TUNING = EnvBool(False)
+    # SM107 (VR200) joins the SM100/SM103 gates of the K3 paths here (the
+    # fusion auto-probe and the SP collective; an SM107 GPU with no tuning JSON
+    # takes GB300's for the same world size). Their JIT kernels build for the
+    # SM100 family, which SM107 runs. Off: SM107 behaves as before. See
+    # k3_ar_fusion.k3_sm_supported.
+    SGLANG_ENABLE_K3_SM107 = EnvBool(False)
     # K3 SP-MoE fused residual + reduce-scatter and matching all-gather over
     # CustomAllReduceV2's MNNVL push workspace. Auto-probed for checked-in
     # TP4/TP8 GB300 and TP16 GB200/GB300 tuning; set 0/1 to override. See
@@ -2387,6 +2804,22 @@ class Envs:
     # dense GEMMs, the side-stream [f_a | b] TGV, and attention side streams up
     # to 288 rows (kimi_k3._k31_gb300_tuning). 0 restores the generic picks.
     SGLANG_K31_DECODE_GEMM_TACTICS = EnvBool(True)
+    # Kimi-K3.1 on VR200 (SM107), default off: the per-M TGV tactics of the
+    # decode dense GEMMs measured on SM107 (through the PD-decode DFLASH verify
+    # rows), the side-stream [f_a | b] TGV, and the SM107 attention side-stream
+    # row caps below (kimi_k3._k31_sm107_tuning). Off: SM107 keeps the generic
+    # picks and the 128-row side streams.
+    SGLANG_K31_SM107_GEMM_TACTICS = EnvBool(False)
+    # Optional path of a JSON table that replaces the built-in SM107 table
+    # (benchmark/kernels/k31_sm107/sweep_sm107_decode_gemms.py writes it).
+    SGLANG_K31_SM107_GEMM_TABLE = EnvStr(None)
+    # Under SGLANG_K31_SM107_GEMM_TACTICS on SM107: the largest graphed rows
+    # whose KDA [f_a | b] GEMM runs on the side stream beside [q,k,v,g]
+    # (default 1152 = the largest verify rows, the stable table's
+    # side_cap_bfa), and whose MLA output gate runs on the side stream beside
+    # attention (default 128, today's cap: raising it measured no gain).
+    SGLANG_K31_SM107_BFA_SIDE_MAX_TOKENS = EnvInt(1152)
+    SGLANG_K31_SM107_GATE_SIDE_MAX_TOKENS = EnvInt(128)
     # Use the ROCm radix-4 router for covered K3 top-k workloads.
     SGLANG_K3_RADIX4_TOPK = EnvBool(False)
     # Kimi-K3.1 decode routed MoE on SM100/SM103: replace flashinfer's deferred-finalize
@@ -2394,6 +2827,70 @@ class Envs:
     # (kernels/ops/moe/k31_decode_moe.py) for covered TP-MoE shapes (896 local
     # experts, intermediate 384, top-16, <= 256 tokens); anything else runs flashinfer.
     SGLANG_K31_DECODE_MOE = EnvBool(False)
+
+    # Kimi-K3.1 VR200 prefill paths, default off; tuning values are the ones the
+    # prefill/decode-disaggregated c=40 / c=48 points ran, and those points turn
+    # them on through benchmark/kimi_k31_vr200/mr_tree/mid_pd_prefill.env.
+    # Barrier-free 2shot push band of SGLANG_K3_AR_FUSION past its 1shot window,
+    # up to _MAX_KB of payload, through CustomAllReduceV2's push slots. _FINALIZE
+    # keeps the deferred MoE finalize fused into the latent all-reduce in this
+    # band; _MC forces the multicast fan-out for every variant.
+    SGLANG_K3_AR_PUSH2 = EnvBool(False)
+    SGLANG_K3_AR_PUSH2_MAX_KB = EnvInt(8192)
+    SGLANG_K3_AR_PUSH2_FINALIZE = EnvBool(False)
+    # Under SGLANG_K3_AR_FUSION, decode batches up to _MAX_TOKENS run the latent
+    # MoE up_proj TP-sharded with a multicast all-gather (gemm_ag).
+    SGLANG_K3_SHARDED_LATENT_UP = EnvBool(False)
+    SGLANG_K3_SHARDED_LATENT_UP_MAX_TOKENS = EnvInt(512)
+    # NVFP4 route+quant preparation staged before the K3 MoE top-k where it covers
+    # the batch (SM107, NVFP4 MoE, under SGLANG_K3_AR_FUSION).
+    SGLANG_K31_PF_NVFP4_ROUTE_QUANT = EnvBool(False)
+    # attn_residual: the score kernel in 1024-wide H tiles and the run-time-nvb
+    # combine kernel (aggregate_stream).
+    SGLANG_K31_PF_ATTN_RES_TILED = EnvBool(False)
+    # TP-shard the fused K3 MoE front's router + latent-down rows with the shared
+    # experts' gate_up rows in one GEMM, all-gathered through CustomAllReduceV2,
+    # for batches of _MIN_TOKENS to _MAX_TOKENS rows. Not SGLANG_K3_SHARDED_MOE.
+    SGLANG_K3_SHARDED_MOE_FRONT = EnvBool(False)
+    SGLANG_K3_SHARDED_MOE_FRONT_MIN_TOKENS = EnvInt(18)
+    SGLANG_K3_SHARDED_MOE_FRONT_MAX_TOKENS = EnvInt(512)
+    # K3.1 MoE routing in one kernel for batches of 1-512 rows: top-16, mxfp8 quant
+    # of the routed input, padded-row mask and trtllm-gen routing metadata.
+    SGLANG_K31_FUSED_ROUTING = EnvBool(False)
+    # K3.1 M <= 8 prepared trtllm-gen routing metadata from route_quant_fused, the
+    # prepared FP4 MoE bodies (kernels/ops/moe/trtllm_prepared_fp4.py) and the NVFP4
+    # route+quant handoff.
+    SGLANG_K31_PF_PREPARED_ROUTING = EnvBool(False)
+    # K3.1 eager prefill on plain-TP MoE: sequence-parallel layer tail for EXTEND
+    # batches of at least _MIN_TOKENS rows without CP or PP. _COMM: k3 (NVLS pull
+    # reduce-scatter / multicast all-gather on CustomAllReduceV2) or nccl; the
+    # _BLOCKS values are CTAs of the k3 kernels.
+    SGLANG_K31_PREFILL_SP_TAIL = EnvBool(False)
+    SGLANG_K31_PREFILL_SP_TAIL_MIN_TOKENS = EnvInt(10240)
+    SGLANG_K31_PREFILL_SP_TAIL_COMM = EnvStr("k3")
+    SGLANG_K31_PREFILL_SP_TAIL_RS_BLOCKS = EnvInt(96)
+    SGLANG_K31_PREFILL_SP_TAIL_AG_BLOCKS = EnvInt(32)
+    SGLANG_K31_PREFILL_SP_TAIL_SHARED_RS_BLOCKS = EnvInt(16)
+    # Prefill forward all-gathers (DSA indexer top-k, DCP prefix gathers) on the
+    # direct multicast all-gather through one symmetric buffer of _MAX_MB per GPU;
+    # bitwise equal to NCCL. _PAD_MAX bounds padded / real rows; _BLOCKS = CTAs.
+    SGLANG_K31_PF_CUSTOM_AG = EnvBool(False)
+    SGLANG_K31_PF_CUSTOM_AG_MAX_MB = EnvFloat(768.0)
+    SGLANG_K31_PF_CUSTOM_AG_PAD_MAX = EnvFloat(1.5)
+    SGLANG_K31_PF_CUSTOM_AG_BLOCKS = EnvInt(32)
+    # K3.1 KDA prefill kernels, read at import; 0 / the default is the stock path.
+    # SEGSCAN: segments of the segmented h scan for chunks of at least _MIN_T
+    # tokens (_TORCH_GLUE uses the torch setup glue). TUNE_PIN: pin the KDA
+    # autotune configs. QKV_PREP: one-launch q/k/v prep. H_PREFETCH: prefetch the
+    # next chunk's k tiles. CONV_BLOCK_N: causal-conv channels per program (256,
+    # 512 or 1024).
+    SGLANG_K31_KDA_SEGSCAN = EnvInt(0)
+    SGLANG_K31_KDA_SEGSCAN_MIN_T = EnvInt(16384)
+    SGLANG_K31_KDA_SEGSCAN_TORCH_GLUE = EnvBool(False)
+    SGLANG_K31_KDA_TUNE_PIN = EnvInt(0)
+    SGLANG_K31_KDA_QKV_PREP = EnvInt(0)
+    SGLANG_K31_KDA_H_PREFETCH = EnvInt(0)
+    SGLANG_K31_KDA_CONV_BLOCK_N = EnvInt(256)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_CACHE_CAPACITY = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MIN_HITS = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MAX_SEQLEN = EnvInt(6144)

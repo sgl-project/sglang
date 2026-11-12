@@ -1,5 +1,10 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the SGLang project
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 from __future__ import annotations
 
+import contextlib
+import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
 
@@ -238,6 +243,9 @@ class TritonAttnBackend(AttentionBackend):
         self.target_verify_num_tokens_per_req = model_runner.decode_num_tokens_per_req()
         self.speculative_num_steps = get_spec().speculative_num_steps
         self.topk = get_spec().speculative_eagle_topk or 0
+        # Target-verify metadata at bs = 1: the indptr is the length itself, no scan;
+        # no mask indptr when no custom mask reads it.
+        self._trim_verify_metadata = envs.SGLANG_OPT_TRITON_VERIFY_METADATA_TRIM.get()
         # Split-KV verify is bit-equivalent only for a pure-causal chain (topk==1)
         # and is gfx95-only; else fall back to extend_attention_fwd.
         self.use_verify_splitkv = is_gfx95_supported() and self.topk == 1
@@ -415,6 +423,61 @@ class TritonAttnBackend(AttentionBackend):
         self._verify_mask = None
         # Tree-mask scratch is fetched from the target backend only.
         self.is_draft_runner = model_runner.is_draft_worker
+        # SGLANG_OPT_DFLASH_DRAFT_SPLITKV_ATTN: the draft block's extend attention as one split-KV pass. Its grid is
+        # sized at capture from the compact draft window's rail bound (window + page - 1); a longer rail writes NaN rows.
+        self._draft_splitkv_mode = (
+            envs.SGLANG_OPT_DFLASH_DRAFT_SPLITKV_ATTN.get() if self.is_draft_runner else 0
+        )
+        self._draft_splitkv_max_kv = None
+        self._draft_splitkv_pdl = bool(
+            self._draft_splitkv_mode
+        ) and envs.SGLANG_OPT_DFLASH_DRAFT_PDL_GLUE.get()
+        self._draft_splitkv_hpack = (
+            self._draft_splitkv_mode == 1 and envs.SGLANG_OPT_DFLASH_DRAFT_P1_HPACK.get()
+        )
+        self._draft_splitkv_ctrig = False
+        if self.is_draft_runner and envs.SGLANG_OPT_DFLASH_DRAFT_P1_COMBINE_TRIGGER.get():
+            self._draft_splitkv_ctrig = self._draft_splitkv_pdl
+            logging.getLogger(__name__).info(
+                "DFLASH draft P1 combine trigger %s",
+                "ENGAGED (split-KV combine releases its PDL dependents after its wait)"
+                if self._draft_splitkv_ctrig
+                else "NOT ENGAGED: needs SGLANG_OPT_DFLASH_DRAFT_SPLITKV_ATTN and SGLANG_OPT_DFLASH_DRAFT_PDL_GLUE",
+            )
+        # Rail tiles per slot of the head-packed pass, resolved per draft batch at the call (a Python int per captured graph).
+        self._draft_splitkv_tps = (
+            envs.SGLANG_OPT_DFLASH_DRAFT_P1_TPS.get() if self._draft_splitkv_hpack else "1"
+        )
+        if self._draft_splitkv_hpack:
+            from sglang.kernels.ops.attention.dflash_draft_splitkv import resolve_p1_tps
+
+            resolve_p1_tps(self._draft_splitkv_tps, 1)  # fail at startup on a bad value
+        # SGLANG_OPT_DFLASH_DRAFT_P1_WIDE: the head-packed pass's launch table at wider draft batches (default "0" = served launch).
+        self._draft_splitkv_wide = (
+            envs.SGLANG_OPT_DFLASH_DRAFT_P1_WIDE.get() if self.is_draft_runner else "0"
+        )
+        if str(self._draft_splitkv_wide).strip().lower() != "0":
+            from sglang.kernels.ops.attention.dflash_draft_splitkv import resolve_p1_wide
+
+            resolve_p1_wide(self._draft_splitkv_wide, 1)  # fail at startup on a bad value
+            if not self._draft_splitkv_hpack:
+                raise ValueError(
+                    "SGLANG_OPT_DFLASH_DRAFT_P1_WIDE needs SGLANG_OPT_DFLASH_DRAFT_SPLITKV_ATTN=1 and "
+                    "SGLANG_OPT_DFLASH_DRAFT_P1_HPACK=1."
+                )
+        if self._draft_splitkv_mode not in (0, 1, 2):
+            raise ValueError(
+                "SGLANG_OPT_DFLASH_DRAFT_SPLITKV_ATTN must be 0 (stock), 1 or 2, "
+                f"got {self._draft_splitkv_mode}."
+            )
+        if self._draft_splitkv_mode:
+            draft_window = get_spec().speculative_draft_window_size
+            if draft_window is None:
+                raise ValueError(
+                    "SGLANG_OPT_DFLASH_DRAFT_SPLITKV_ATTN needs a bounded draft rail "
+                    "(--speculative-draft-window-size)."
+                )
+            self._draft_splitkv_max_kv = int(draft_window) + self.page_size - 1
 
         # Auto-detect BLOCK_M that extend_attention kernel will use for this model.
         # This is used by the scheduler's tile-budget admission logic to match
@@ -433,6 +496,31 @@ class TritonAttnBackend(AttentionBackend):
 
             self.dllm_attention = DllmFlashAttention(self)
             self.supports_prefill_cuda_graph_max_context_size = True
+
+    def _p1_wide_for(self, bs: int):
+        if str(self._draft_splitkv_wide).strip().lower() == "0":
+            return None
+        from sglang.kernels.ops.attention.dflash_draft_splitkv import resolve_p1_wide
+
+        wide = resolve_p1_wide(self._draft_splitkv_wide, bs)
+        logged = self.__dict__.setdefault("_p1_wide_logged", set())
+        if bs not in logged:
+            logged.add(bs)
+            if wide is not None:
+                logging.getLogger(__name__).info("SGLANG_OPT_DFLASH_DRAFT_P1_WIDE ENGAGED: draft P1 launch %s (heads/CTA, V split, warps, stages, tps, chunk) at draft batch %d.", wide, bs)
+            else:
+                logging.getLogger(__name__).info("SGLANG_OPT_DFLASH_DRAFT_P1_WIDE: no table entry at draft batch %d (served launch).", bs)
+        return wide
+
+    def _p1_tps_for(self, bs: int) -> int:
+        from sglang.kernels.ops.attention.dflash_draft_splitkv import resolve_p1_tps
+
+        tps = resolve_p1_tps(self._draft_splitkv_tps, bs)
+        logged = self.__dict__.setdefault("_p1_tps_logged", set())
+        if bs not in logged:
+            logged.add(bs)
+            logging.getLogger(__name__).info("DFLASH draft P1 tps %d at draft batch %d (SGLANG_OPT_DFLASH_DRAFT_P1_TPS=%s).", tps, bs, self._draft_splitkv_tps)
+        return tps
 
     def get_num_kv_splits(
         self,
@@ -526,10 +614,12 @@ class TritonAttnBackend(AttentionBackend):
         req_pool_indices: torch.Tensor,
         kv_indices: torch.Tensor,
         kv_indptr: Optional[torch.Tensor] = None,
+        single_request: bool = False,
     ) -> torch.Tensor:
         if kv_indptr is None:
             kv_indptr = self.kv_indptr[: bs + 1]
-        kv_indptr[1:] = torch.cumsum(seq_lens, dim=0)
+        # A one-element cumsum is the element (a copy instead of two scan kernels).
+        kv_indptr[1:] = seq_lens if single_request else torch.cumsum(seq_lens, dim=0)
         self.runner_ids.pack_read_stream(
             plan,
             req_pool_indices=req_pool_indices,
@@ -613,8 +703,14 @@ class TritonAttnBackend(AttentionBackend):
             dtype=torch.int32,
             device=self.device,
         )
+        single = self._trim_verify_metadata and bs == 1
         kv_indptr = self._fill_kv_indptr_and_indices(
-            plan, bs, seq_lens, req_pool_indices, self.cuda_graph_kv_indices
+            plan,
+            bs,
+            seq_lens,
+            req_pool_indices,
+            self.cuda_graph_kv_indices,
+            single_request=single,
         )
         window_kv_indptr = self.window_kv_indptr
         window_kv_indices = None
@@ -635,6 +731,7 @@ class TritonAttnBackend(AttentionBackend):
                     bs,
                     token_to_kv_pool=self.token_to_kv_pool,
                     window_kv_indices=window_kv_indices,
+                    single_request=single,
                 )
             )
         custom_mask = (
@@ -644,9 +741,10 @@ class TritonAttnBackend(AttentionBackend):
             custom_mask[: spec_info.custom_mask.shape[0]] = spec_info.custom_mask
         else:
             custom_mask = None
-        seq_mask_len = num_tokens_per_req * (seq_lens + num_tokens_per_req)
         mask_indptr = self.mask_indptr[: bs + 1]
-        mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len, dim=0)
+        if custom_mask is not None or not self._trim_verify_metadata:
+            seq_mask_len = num_tokens_per_req * (seq_lens + num_tokens_per_req)
+            mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len, dim=0)
         return (
             qo_indptr,
             kv_indptr,
@@ -1961,6 +2059,50 @@ class TritonAttnBackend(AttentionBackend):
         ):
             return o
 
+        if (
+            self._draft_splitkv_mode
+            and self.dllm_attention is None
+            and score_mod is None
+            and sinks is None
+            and not logits_soft_cap
+            and causal
+            and self.forward_metadata.custom_mask is None
+            and layer.xai_temperature_len <= 0
+            and layer.qk_head_dim == 576
+            and layer.v_head_dim == 512
+            and self.forward_metadata.max_extend_len is not None
+            and self.forward_metadata.max_extend_len <= 16
+        ):
+            from sglang.kernels.ops.attention.dflash_draft_splitkv import (
+                dflash_draft_splitkv_attention_fwd,
+            )
+
+            dflash_draft_splitkv_attention_fwd(
+                q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
+                k.contiguous(),
+                v.contiguous(),
+                o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
+                self.token_to_kv_pool.get_key_buffer(layer.layer_id),
+                self.token_to_kv_pool.get_value_buffer(layer.layer_id),
+                self.forward_metadata.qo_indptr,
+                kv_indptr,
+                kv_indices,
+                self.forward_metadata.max_extend_len,
+                k_descale,
+                v_descale,
+                layer.scaling,
+                max_kv_len=self._draft_splitkv_max_kv,
+                sliding_window_size=sliding_window_size,
+                hp=self._draft_splitkv_mode == 2,
+                pdl=self._draft_splitkv_pdl,
+                pdl_wait_first=self._draft_splitkv_pdl,
+                hpack=self._draft_splitkv_hpack,
+                combine_trigger=self._draft_splitkv_ctrig,
+                tps=self._p1_tps_for(self.forward_metadata.qo_indptr.shape[0] - 1),
+                wide=self._p1_wide_for(self.forward_metadata.qo_indptr.shape[0] - 1),
+            )
+            return o
+
         self._forward_extend_kernel(
             layer,
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
@@ -2867,6 +3009,7 @@ def update_sliding_window_buffer(
     device=None,
     token_to_kv_pool=None,
     window_kv_indices=None,
+    single_request=False,
 ):
     """Fill window KV buffers for sliding-window attention.
 
@@ -2884,7 +3027,9 @@ def update_sliding_window_buffer(
         seq_lens,
         torch.tensor(sliding_window_size),
     )
-    window_kv_indptr[1 : bs + 1] = torch.cumsum(window_kv_lens, dim=0)
+    window_kv_indptr[1 : bs + 1] = (
+        window_kv_lens if single_request else torch.cumsum(window_kv_lens, dim=0)
+    )
     window_kv_indptr = window_kv_indptr[: bs + 1]
     if window_kv_indices is None:
         window_kv_indices = torch.empty(

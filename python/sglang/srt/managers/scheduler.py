@@ -1,4 +1,5 @@
 # Copyright 2023-2024 SGLang Team
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -325,6 +326,7 @@ from sglang.srt.managers.scheduler_components.request_receiver import (
 )
 from sglang.srt.managers.scheduler_components.request_retirer import RequestRetirer
 from sglang.srt.managers.scheduler_components.state_check import CheckPhase
+from sglang.srt.managers.scheduler_components.stall_probe import StallProbe
 from sglang.srt.managers.scheduler_components.weight_updater import (
     SchedulerWeightUpdaterManager,
 )
@@ -348,6 +350,7 @@ from sglang.srt.mem_cache.common import (
 )
 from sglang.srt.mem_cache.events import KvEventLoraNames
 from sglang.srt.mem_cache.kv_weight_version_tracker import KvWeightVersionTracker
+from sglang.srt.mem_cache.prefill_budget import park_chunked_prefill_enabled
 from sglang.srt.mem_cache.static_kv_storage import StaticPoolShape, kv_storage_of
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.runner_utils.pool import prewarm_graph_pool_borrow
@@ -739,6 +742,9 @@ class Scheduler(
 
         # Init watchdog, memory saver, input blocker and recv skipper
         self.init_watch_dog_memory_saver_input_blocker()
+
+        # Init decode-stall diagnostics (default off)
+        self.maybe_init_stall_probe()
 
         # Init profiler
         self.init_profiler()
@@ -1744,6 +1750,9 @@ class Scheduler(
         # Configure GC logger
         if envs.SGLANG_LOG_GC.get():
             configure_gc_logger()
+
+    def maybe_init_stall_probe(self) -> None:
+        self.stall_probe = StallProbe.maybe_create()
 
     def init_disaggregation(self):
         self.mm_receiver = None
@@ -4553,6 +4562,36 @@ class Scheduler(
 
         return NextBatchPlan(batch_to_run=ret, running_batch=running_batch)
 
+    def _k31_note_chunk_park(self, parked: bool, adder) -> None:
+        """Log each park episode of a chunked continuation once, and its end."""
+        state = getattr(self, "_k31_chunk_park_state", None)
+        req = self.chunked_req
+        if parked:
+            if state is not None and state[0] is req:
+                state[2] += 1
+                return
+            self._k31_chunk_park_state = [req, time.perf_counter(), 1]
+            logger.info(
+                "K31 park-chunked-prefill: parked rid=%s prefix_len=%d "
+                "input_len=%d remaining_total=%d available=%d",
+                req.rid,
+                req.prefix_len,
+                len(req.origin_input_ids),
+                int(adder.memory_budget.remaining_total),
+                self.token_to_kv_pool_allocator.available_size(),
+            )
+        elif state is not None:
+            # Resumed: the parked request runs a chunk (its last one included).
+            if any(r is state[0] for r in adder.can_run_list):
+                logger.info(
+                    "K31 park-chunked-prefill: resumed rid=%s after %d passes, "
+                    "%.3f s parked",
+                    state[0].rid,
+                    state[2],
+                    time.perf_counter() - state[1],
+                )
+            self._k31_chunk_park_state = None
+
     def _get_new_batch_prefill_raw(
         self,
         prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
@@ -4681,6 +4720,7 @@ class Scheduler(
                 self.waiting_queue,
                 adder.rem_chunk_tokens or 0,
                 self.page_size,
+                adder=adder,
             )
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
@@ -4713,11 +4753,20 @@ class Scheduler(
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
         buffer_pipeline = self.tree_cache.buffer_pipeline
+        # #44823 (gated): a parked chunk found no budget in this pass. Admit no
+        # one ahead of it, so no batch carries a chunked request it does not run.
+        chunk_parked = False
+        if park_chunked_prefill_enabled():
+            chunk_parked = (
+                self.chunked_req is not None
+                and self.chunked_req not in adder.can_run_list
+            )
+            self._k31_note_chunk_park(chunk_parked, adder)
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
             # A spent pass budget admits no one, even before the first
             # candidate: the resumed chunk or mixed decode rows can spend it.
-            if adder.budget_state() == AddReqResult.OTHER:
+            if chunk_parked or adder.budget_state() == AddReqResult.OTHER:
                 break
             if self.enable_lora and not self.can_schedule_lora_req(req, running_loras):
                 continue

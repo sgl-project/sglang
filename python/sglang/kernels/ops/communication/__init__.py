@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the SGLang project
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 """Collective-communication kernels and fused compute/communication kernels.
 
 Stateful operators are imported from their modules so communicator registration,
@@ -68,6 +71,18 @@ register_kernel(
         capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(9, 0))}),
     )
 )
+
+# DFLASH draft collectives over epoch-tagged mailboxes.
+for _fn in ("draft_all_reduce_pk3", "draft_topk_gather"):
+    register_kernel(
+        KernelSpec(
+            op=f"communication.{_fn}",
+            backend=KernelBackend.JIT,
+            target=f"sglang.kernels.ops.communication.draft_collectives:{_fn}",
+            capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(9, 0))}),
+        )
+    )
+del _fn
 
 # Muse Spark collectives. The MoE finalize op (with its optional fused TP
 # all-reduce) is built per layer: inventoried through its class methods.

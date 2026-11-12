@@ -1,4 +1,5 @@
 # Copyright 2023-2024 SGLang Team
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -502,8 +503,13 @@ class ModelRunner:
         self.init_torch_distributed()
 
         # Init forward stream for overlap schedule
+        # SGLANG_OPT_DFLASH_DRAFT_GRAPH_PRIO: a priority -1 forward stream, so the eager draft prep is not queued behind the
+        # join-late KDA commit fold's CTA dispatch (fold side stream at priority 0); else SGLANG_PLB_STREAM_PRIORITY.
+        from sglang.srt.speculative.dflash_draft_graph_prio import forward_stream_priority
+
+        _fwd_prio = forward_stream_priority(self.device, self.spec_algorithm)
         self.forward_stream = torch.get_device_module(self.device).Stream(
-            priority=envs.SGLANG_PLB_STREAM_PRIORITY.get()
+            priority=envs.SGLANG_PLB_STREAM_PRIORITY.get() if _fwd_prio is None else _fwd_prio
         )
 
         # Read-done mailbox: the scheduler's WAR barrier reads it from the runner

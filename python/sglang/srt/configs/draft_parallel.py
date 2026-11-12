@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the SGLang project
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 from __future__ import annotations
 
 from enum import Enum
@@ -26,6 +29,7 @@ class DraftParallelLayout(msgspec.Struct, frozen=True, kw_only=True):
     tp_group: GroupCoordinator | None
     attn_tp_size: int
     disable_cp: bool = False
+    collapse_dcp: bool = False
 
     @property
     def local_dp(self) -> bool:

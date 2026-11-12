@@ -1,5 +1,6 @@
 # Adapted from flash-linear-attention project.
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 
 import torch
 import triton
@@ -13,9 +14,11 @@ from sglang.kernels.ops.attention.fla.index import (
 )
 from sglang.kernels.ops.attention.fla.op import exp2, gather
 from sglang.kernels.ops.attention.fla.utils import (
+    KDA_TUNE_PIN,
     autotune_cache_kwargs,
     is_gather_supported,
     is_tf32_supported,
+    k31_pin_autotune,
 )
 
 if is_tf32_supported:
@@ -1029,7 +1032,12 @@ def chunk_kda_fwd_intra(
 
     # Non-fused path: inter_solve stores Akk, then separate recompute
     Akk = torch.zeros(B, T, H, BT, device=k.device, dtype=k.dtype)
-    chunk_kda_fwd_kernel_inter_solve_fused[grid](
+    _inter_solve = (
+        _INTER_SOLVE_PINNED
+        if _INTER_SOLVE_PINNED is not None
+        else chunk_kda_fwd_kernel_inter_solve_fused
+    )
+    _inter_solve[grid](
         q=q,
         k=k,
         g=gk,
@@ -1070,3 +1078,19 @@ def chunk_kda_fwd_intra(
         chunk_indices=chunk_indices,
     )
     return w, u, None, kg, Aqk, Akk
+
+
+# K3.1 KDA autotune pins (SGLANG_K31_KDA_TUNE_PIN=1, see fla/utils.py): long-chunk configs, one per kernel.
+# inter_solve is pinned only on the non-fused (large-grid) launch: the small-grid fused path keeps the
+# stock list (BK 64 / 1 warp is slower there).
+_INTER_SOLVE_PINNED = None
+if KDA_TUNE_PIN:
+    k31_pin_autotune(chunk_kda_fwd_kernel_intra_sub_chunk, 1, 3)
+    _INTER_SOLVE_PINNED = triton.heuristics(
+        {"IS_VARLEN": lambda args: args["cu_seqlens"] is not None}
+    )(
+        triton.autotune(
+            configs=[triton.Config({"BK": 64, "BV": 64}, num_warps=1, num_stages=3)],
+            key=["H", "K", "BC", "V", "FUSE_RECOMPUTE", "FUSE_DIAGONAL"],
+        )(chunk_kda_fwd_kernel_inter_solve_fused.fn.fn)
+    )

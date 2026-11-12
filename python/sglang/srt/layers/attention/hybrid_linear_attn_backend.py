@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the SGLang project
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 from __future__ import annotations
 
 import logging
@@ -1605,6 +1608,31 @@ class HybridLinearAttnBackend(AttentionBackend):
                 **kwargs,
             )
 
+    def mtp_verify_state_indices(
+        self,
+        request_number: int,
+        req_pool_indices: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """The mamba slots update_mamba_state_after_mtp_verify commits for the
+        last verify forward's first request_number requests."""
+        if pp_spec_stable_rows_enabled() and req_pool_indices is not None:
+            return self.linear_attn_backend._translate_mamba_indices(
+                self.linear_attn_backend.req_to_token_pool.get_mamba_indices(
+                    req_pool_indices[:request_number]
+                )
+            )
+        return self.linear_attn_backend.forward_metadata.mamba_cache_indices[
+            :request_number
+        ]
+
+    def mamba_commit_state_indices(self, request_number: int) -> torch.Tensor:
+        """A copy, made on the current stream, of the state indices the post-verify commit reads. On the
+        CUDA-graph path they are a static per-bs buffer that the next verify's metadata prep rewrites in
+        place (beside the draft, on a side stream), so a commit that may still run then reads this copy."""
+        return self.linear_attn_backend.forward_metadata.mamba_cache_indices[
+            :request_number
+        ].clone()
+
     def update_mamba_state_after_mtp_verify(
         self,
         last_correct_step_indices: torch.Tensor,
@@ -1612,8 +1640,10 @@ class HybridLinearAttnBackend(AttentionBackend):
         mamba_steps_to_track: Optional[torch.Tensor],
         model,
         req_pool_indices: Optional[torch.Tensor] = None,
+        state_indices: Optional[torch.Tensor] = None,
     ):
-        """Commit accepted Mamba states; PP rows identify the delayed batch."""
+        """Commit accepted Mamba states; PP rows identify the delayed batch.
+        `state_indices`: a copy from mamba_commit_state_indices (otherwise the live metadata is read)."""
         request_number = last_correct_step_indices.shape[0]
         src_indices_raw = None
         if pp_spec_stable_rows_enabled() and req_pool_indices is not None:
@@ -1631,6 +1661,8 @@ class HybridLinearAttnBackend(AttentionBackend):
                     req_pool_indices[:request_number]
                 )
             )
+        elif state_indices is not None:
+            state_indices_tensor = state_indices[:request_number]
         else:
             state_indices_tensor = (
                 self.linear_attn_backend.forward_metadata.mamba_cache_indices[
@@ -1666,6 +1698,12 @@ class HybridLinearAttnBackend(AttentionBackend):
                 src_indices_raw=src_indices_raw,
                 null_block_id=-1,
                 ring_indices=ring_indices,
+                block_v=envs.SGLANG_OPT_KDA_REPLAYSSM_FOLD_BLOCK_V.get(),
+                fold_pending=(
+                    mamba_pool.kda_fold_pending
+                    if getattr(mamba_pool, "kda_fold_active", False)
+                    else None
+                ),
             )
             return
 

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the SGLang project
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 """DCP decode reduce as one push + combine kernel over a CustomAllReduceV2 push plane.
 
 Every DCP rank holds the attention partials of all heads over its KV shard and
@@ -8,6 +11,9 @@ pack + all-to-all + combine sequence. See ``csrc/dsa/dcp_push_combine.cuh``.
 
 from __future__ import annotations
 
+import hashlib
+import os
+import sys
 from typing import TYPE_CHECKING
 
 import torch
@@ -29,9 +35,48 @@ HEAD_DIM = 128
 # Push slot bytes per (row, local head): the bf16 payload and one 16 B LSE word.
 SLOT_BYTES_PER_ROW = HEAD_DIM * 2 + 16
 
+# Knob K31HT_DCP_COMBINE
+# ("0" / unset = the served module, unchanged; "v3" = csrc/dsa/dcp_push_combine_v3.cuh, a half-warp per row, bitwise equal to
+# the served kernel by construction). Read once at import, same on every rank. Fail closed: any other value, a missing v3
+# source, or a world size above 16 raises. One 'K31HT_DCP_COMBINE ENGAGE' line per (process, world size) on stderr when v3
+# is loaded (under CUDA graphs: at capture).
+COMBINE_FORM = os.environ.get("K31HT_DCP_COMBINE", "0")
+if COMBINE_FORM not in ("0", "v3"):
+    raise ValueError(f"K31HT_DCP_COMBINE must be '0' or 'v3', got {COMBINE_FORM!r}")
+V3_SOURCE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), os.pardir, os.pardir, "jit", "csrc", "dsa", "dcp_push_combine_v3.cuh"
+)
+V3_SOURCE_MD5 = None
+if COMBINE_FORM == "v3":
+    with open(V3_SOURCE, "rb") as _f:  # missing source -> FileNotFoundError at import (fail closed)
+        V3_SOURCE_MD5 = hashlib.md5(_f.read()).hexdigest()
+ENGAGED: list[str] = []
+
+
+def _v3_module(world_size: int) -> Module:
+    if not 2 <= world_size <= 16:
+        raise ValueError(f"K31HT_DCP_COMBINE=v3 supports world sizes 2..16, got {world_size}")
+    args = make_cpp_args(world_size, is_arch_support_pdl())
+    return load_jit(
+        "dcp_push_combine_v3",
+        *args,
+        cuda_files=[os.path.abspath(V3_SOURCE)],
+        cuda_wrappers=[("run", f"DcpPushCombineV3Kernel<{args}>::run")],
+        extra_cuda_cflags=["-O3"],
+    )
+
 
 @cache_once
 def _jit_module(world_size: int) -> Module:
+    if COMBINE_FORM == "v3":
+        mod = _v3_module(world_size)
+        line = (
+            f"K31HT_DCP_COMBINE ENGAGE form=v3 world={world_size} block=512 pdl={int(is_arch_support_pdl())} "
+            f"src_md5={V3_SOURCE_MD5} pid={os.getpid()}"
+        )
+        ENGAGED.append(line)
+        print(line, file=sys.stderr, flush=True)
+        return mod
     args = make_cpp_args(world_size, is_arch_support_pdl())
     return load_jit(
         "dcp_push_combine",

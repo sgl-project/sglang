@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the SGLang project
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 """Symmetric-memory ``multimem.st`` all-gather along the hidden (last) dim.
 
 Each rank stores its ``[T, H/TP]`` shard into a multicast buffer in one NVLink
@@ -201,6 +203,7 @@ def _wait_signal_acquire(addrs):
                 atom.global.sys.acquire.cas.b32 %tmp32_0, [$1], 1, 0;
                 setp.eq.u32 %p0, %tmp32_0, 1;
                 @!%p0 bra wait_signal;
+            fence.proxy.alias;
         }
         """,
         "=r, l",
@@ -262,7 +265,7 @@ def _all_gather_kernel_inner(
     SKIP_ENTRY_SYNC: tl.constexpr,
 ) -> None:
     if SKIP_ENTRY_SYNC == 0:
-        _blockwise_barrier(signal_pad_ptr, RANK, WORLD_SIZE, sem="relaxed")
+        _blockwise_barrier(signal_pad_ptr, RANK, WORLD_SIZE, sem="acq_rel")
         _sync_threads()
 
     chunks_per_row: tl.constexpr = LOCAL_HIDDEN // NUMEL_PER_THREAD

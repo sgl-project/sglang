@@ -43,6 +43,7 @@ from sglang.kernels.arch import current_arch
 from sglang.kernels.kernel_api_logging import debug_kernel_api
 from sglang.srt.utils import is_sm100_supported
 from sglang.srt.utils.custom_op import direct_register_custom_op
+from sglang.srt.utils.device import get_device_sm
 
 # Tuple format: (cta_m, cta_n, num_ab_stage, use_2cta); cta_k is fixed at
 # 128. Sorted within each use_2cta block by (cta_m, cta_n, num_ab_stage).
@@ -81,7 +82,30 @@ _TGV_CUTE_EXT_TACTIC_CONFIGS: List[Tuple[int, int, int, bool]] = [
     (128, 32, 6, True),  # 26
     (128, 64, 5, True),  # 27
     (128, 128, 4, True),  # 28
+    # SM107 only (backport of sgl-project/sglang#48783): the tiles above with the
+    # deepest A/B pipeline that fits SM107 SMEM; appended so tactic ids 0-28 keep
+    # their meaning on every arch. No ladder picks them: only a registered m range
+    # (kimi_k3 SGLANG_K31_SM107_SMALLM_TABLE) or an explicit tactic does.
+    (64, 8, 18, False),  # 29
+    (64, 16, 16, False),  # 30
+    (64, 32, 13, False),  # 31
+    (64, 64, 10, False),  # 32
+    (64, 128, 6, False),  # 33
+    (128, 8, 9, False),  # 34
+    (128, 16, 9, False),  # 35
+    (128, 32, 8, False),  # 36
+    (128, 64, 6, False),  # 37
+    (128, 128, 5, False),  # 38
+    (64, 16, 18, True),  # 39
+    (64, 32, 16, True),  # 40
+    (64, 64, 13, True),  # 41
+    (64, 128, 10, True),  # 42
+    (128, 16, 9, True),  # 43
+    (128, 32, 9, True),  # 44
+    (128, 64, 8, True),  # 45
+    (128, 128, 6, True),  # 46
 ]
+_TGV_CUTE_EXT_FIRST_SM107_TACTIC: int = 29
 
 
 class WorkTileInfo(NamedTuple):
@@ -114,6 +138,7 @@ class TgvGemmCuteExtKernel:
         pdl_count: int = -1,
         has_bias: bool = False,
         out_dtype: Type[cutlass.Numeric] = cutlass.BFloat16,
+        arch: str = "sm_100",
     ):
         self.acc_dtype = acc_dtype
         self.out_dtype = out_dtype
@@ -130,6 +155,9 @@ class TgvGemmCuteExtKernel:
         # adds it to the accumulator before the bf16 cast. When False, all
         # bias-related code is elided via cutlass.const_expr.
         self.has_bias = has_bias
+        # Dynamic SMEM requested at launch: the capacity of ``arch``
+        # (sgl-project/sglang#48783; sm_107 only for tactics >= 29).
+        self.smem_capacity = utils.get_smem_capacity_in_bytes(arch)
 
         # 1-CTA: cta_n ∈ [8, 256] step 8 (bf16 tcgen05.mma atom limit).
         # 2-CTA: cta_n ∈ [16, 256] step 16 (bf16 K-major cluster mma).
@@ -189,7 +217,7 @@ class TgvGemmCuteExtKernel:
             grid=grid,
             block=(self.threads_per_cta, 1, 1),
             cluster=self.cluster_shape,
-            smem=cute.Int64(utils.get_smem_capacity_in_bytes("sm_100")),
+            smem=cute.Int64(self.smem_capacity),
             stream=stream,
             use_pdl=self.pdl_launch,
         )
@@ -1104,6 +1132,7 @@ def _get_compiled_cute_ext_kernel(
     a_leading: int,
     b_leading: int,
     c_leading: int,
+    arch: str = "sm_100",
 ):
     """Compile (or fetch from cache) a TgvGemmCuteExtKernel for the given
     config + layout pattern. Returns a callable with signature
@@ -1125,6 +1154,7 @@ def _get_compiled_cute_ext_kernel(
         a_leading,
         b_leading,
         c_leading,
+        arch,
     )
     cached = _TGV_CUTE_EXT_COMPILE_CACHE.get(key)
     if cached is not None:
@@ -1150,6 +1180,7 @@ def _get_compiled_cute_ext_kernel(
         use_pdl=use_pdl,
         has_bias=has_bias,
         out_dtype=_TORCH_TO_CUTLASS_OUT_DTYPE[c_dtype],
+        arch=arch,
     )
 
     a_, b_, c_, bias_ = _make_compile_repr_tensors(
@@ -1264,6 +1295,9 @@ def _run_tgv(
     """Dispatch one TGV GEMM: a (M, K) @ b (K, N) -> out (M, N), bias (N,)."""
     cta_m, cta_n, num_ab_stage, use_2cta = _resolve_tactic(tactic)
     has_bias = bias is not None
+    sm107_tactic = tactic >= _TGV_CUTE_EXT_FIRST_SM107_TACTIC
+    if sm107_tactic and get_device_sm() != 107:
+        raise ValueError(f"cute_ext tactic {tactic} needs SM107 SMEM.")
 
     a_, b_, c_, bias_, (a_leading, b_leading, c_leading) = _to_cute_swap(
         a,
@@ -1285,6 +1319,7 @@ def _run_tgv(
         a_leading=a_leading,
         b_leading=b_leading,
         c_leading=c_leading,
+        arch="sm_107" if sm107_tactic else "sm_100",
     )
 
     stream = cuda.CUstream(torch.cuda.current_stream(a.device).cuda_stream)

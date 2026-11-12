@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the SGLang project
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 """K3 SP-MoE MNNVL reduce-scatter/all-gather dispatch.
 
 The reduce-scatter folds the pending attention residual into its reduction
@@ -74,7 +77,7 @@ def _init_state() -> Optional[_State]:
         comm_disabled = None
         has_multicast = None
     if (
-        device_sm not in (100, 103)
+        not k3_ar_fusion.k3_sm_supported()
         or group.world_size not in _SUPPORTED_WORLD_SIZES
         or a2a not in ("megamoe", "deepep")
         or not is_custom_allreduce
@@ -82,7 +85,8 @@ def _init_state() -> Optional[_State]:
         or not has_multicast
     ):
         message = (
-            "K3 SP collective requires SM100/SM103, TP4/TP8/TP16, "
+            "K3 SP collective requires SM100/SM103 (SM107 with "
+            "SGLANG_ENABLE_K3_SM107=1), TP4/TP8/TP16, "
             "MegaMoE/DeepEP, and CustomAllReduceV2 with multicast; using NCCL "
             "(sm=%s, world_size=%s, a2a=%s, comm=%s, disabled=%s, "
             "has_multicast=%s)."
@@ -469,3 +473,123 @@ def attn_res_all_gather(
         write_prefix=write_prefix,
     )
     return output
+
+
+# ---------------------------------------------------------------------------
+# Eager prefill sequence-parallel tail (Kimi-K3.1 TP8/DCP8 PD prefill, plain-TP
+# MoE: moe_a2a_backend none). Unlike SP-MoE above, this needs no EP a2a: the
+# model keeps the residual stream and the attention-residual bank on each TP
+# rank's 1/tp of the rows between layers and gathers the rows that a full-row
+# consumer (the attention, the MoE front) reads. It reuses the pull RS and the
+# direct AG kernels of this module, on the TP group's CustomAllReduceV2 and on
+# inputs / outputs in k3_ar_fusion's persistent symmetric buffers, or NCCL
+# (SGLANG_K31_PREFILL_SP_TAIL_COMM=nccl). See KimiK3LinearModel._prefill_sp.
+# ---------------------------------------------------------------------------
+
+_PREFILL_SP_AG = "prefill_sp_all_gather"  # direct AG output, one per forward step
+_PREFILL_SP_COMM = None
+_PREFILL_SP_COMM_INIT = False
+
+
+def prefill_sp_comm():
+    """The TP group's CustomAllReduceV2, registered with the SP collective
+    kernels for the prefill SP tail, or None (the tail then uses NCCL)."""
+    global _PREFILL_SP_COMM, _PREFILL_SP_COMM_INIT
+    if _PREFILL_SP_COMM_INIT:
+        return _PREFILL_SP_COMM
+    _PREFILL_SP_COMM_INIT = True
+    from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
+        CustomAllReduceV2,
+    )
+
+    group = get_parallel().tp_group
+    comm = group.ca_comm
+    if (
+        not k3_ar_fusion.k3_sm_supported()
+        or group.world_size not in _SUPPORTED_WORLD_SIZES
+        or not isinstance(comm, CustomAllReduceV2)
+        or comm.disabled
+        or not comm.has_multicast
+        or not comm.pull_enabled
+        or not k3_ar_fusion.enabled()
+    ):
+        logger.info("K3.1 prefill SP tail: no multicast pull plane; using NCCL.")
+        return None
+    from sglang.kernels.ops.communication import sp_collective
+
+    # One communicator per world size per process: SP-MoE registers the
+    # attention-TP group's, which is this one whenever both can run.
+    sp_collective.register_comm(comm.obj)
+    _PREFILL_SP_COMM = comm
+    logger.info(
+        "K3.1 prefill SP tail: pull RS / direct AG on the TP%d multicast plane",
+        group.world_size,
+    )
+    return comm
+
+
+def _pull_tuning(comm, num_blocks: int, block_size: int):
+    from sglang.kernels.ops.communication import sp_collective
+
+    cap = comm.config.num_pull_blocks
+    return sp_collective.Tuning(max(1, min(num_blocks, cap)), block_size)
+
+
+def prefill_sp_reduce_scatter(
+    x: torch.Tensor,
+    out: torch.Tensor,
+    residual: Optional[torch.Tensor] = None,
+    *,
+    num_blocks: int,
+    block_size: int = 1024,
+    use_k3: bool = True,
+) -> torch.Tensor:
+    """``out = reduce_scatter(x) [+ residual]`` over the TP group, rows split
+    rank-major: ``x`` is ``[rows, ...]``, ``out`` and ``residual`` this rank's
+    ``[rows / tp, ...]`` block. The NVLS pull reads ``x`` through its
+    multicast alias when it lies in a K3 symmetric buffer; NCCL otherwise."""
+    group = get_parallel().tp_group
+    comm = prefill_sp_comm() if use_k3 else None
+    mc_ptr = k3_ar_fusion.find_mc_ptr(x) if comm is not None else None
+    if comm is not None and mc_ptr is not None:
+        from sglang.kernels.ops.communication import sp_collective
+
+        return sp_collective.reduce_scatter_pull(
+            group.world_size,
+            x,
+            out,
+            residual,
+            input_mc_ptr=mc_ptr,
+            tuning=_pull_tuning(comm, num_blocks, block_size),
+        )
+    group.reduce_scatter_tensor(out, x)
+    if residual is not None:
+        out.add_(residual)
+    return out
+
+
+def prefill_sp_all_gather(
+    x: torch.Tensor, *, num_blocks: int, block_size: int = 1024, use_k3: bool = True
+) -> torch.Tensor:
+    """``[tp * rows, H]`` gather of this rank's ``[rows, H]`` block over the TP
+    group, rank-major. The direct multicast AG writes into one persistent K3
+    symmetric buffer that the next prefill SP gather overwrites, so a caller
+    that keeps the result past the next gather must copy it (or pass
+    ``use_k3=False`` for owned NCCL output)."""
+    group = get_parallel().tp_group
+    rows = x.shape[0] * group.world_size
+    comm = prefill_sp_comm() if use_k3 else None
+    if comm is not None and x.dtype == torch.bfloat16 and x.is_contiguous():
+        from sglang.kernels.ops.communication import sp_collective
+
+        out = k3_ar_fusion.symm_buffer(_PREFILL_SP_AG, rows, x.shape[1], x.dtype)
+        return sp_collective.all_gather_direct(
+            group.world_size,
+            x,
+            out,
+            output_mc_ptr=k3_ar_fusion.get_mc_ptr(out),
+            tuning=_pull_tuning(comm, num_blocks, block_size),
+        )
+    out = x.new_empty((rows, *x.shape[1:]))
+    group.all_gather_into_tensor(out, x.contiguous())
+    return out

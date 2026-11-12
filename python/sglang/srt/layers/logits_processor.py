@@ -1,4 +1,5 @@
 # Copyright 2023-2024 SGLang Team
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -585,6 +586,11 @@ class LogitsProcessor(nn.Module):
         # full-vocabulary gather even when the runtime master switch is on.
         self.sharded_verify = False
         self._sharded_verify_temperature_keys = False
+        # Also set by that worker when a vocab-parallel consumer reads the shard
+        # (SGLANG_OPT_K31_VP_ACCEPT / _VP_SIM_ARGMAX): defer the target-verify
+        # gather for 16- / 32-bit logits with or without softcap, not only on the
+        # fused gather + softcap path (see _can_defer_verify_shard).
+        self.defer_verify_gather_any = False
         self.final_logit_softcapping = getattr(
             self.config, "final_logit_softcapping", None
         )
@@ -1233,6 +1239,18 @@ class LogitsProcessor(nn.Module):
         if self.logit_scale is not None:
             logits.mul_(self.logit_scale)
 
+        if (
+            self.defer_verify_gather
+            and self.defer_verify_gather_any
+            and logits_metadata.forward_mode.is_target_verify()
+            and self._can_defer_verify_shard(
+                logits, local_hidden_states, lm_head, logits_metadata
+            )
+        ):
+            # The raw shard; finish_deferred_gather returns the values the gather
+            # below would (an exact cast to FP32, softcap if configured).
+            return logits
+
         if self._can_gather_softcap_fused(
             logits, local_hidden_states, lm_head, logits_metadata
         ):
@@ -1342,6 +1360,29 @@ class LogitsProcessor(nn.Module):
             self.defer_plain_gather
             and not self.final_logit_softcapping
             and self.do_tensor_parallel_all_gather
+            and not self.use_attn_tp_group
+            and not self.do_tensor_parallel_all_gather_dp_attn
+            and logits.is_cuda
+            and not (_is_npu or _is_cpu)
+            and logits.dtype in (torch.float32, torch.bfloat16, torch.float16)
+            and logits.dim() == 2
+            and logits.is_contiguous()
+            and not self._can_use_tp_lm_head_all_to_all(
+                logits, local_hidden_states, lm_head, logits_metadata
+            )
+        )
+
+    def _can_defer_verify_shard(
+        self,
+        logits: torch.Tensor,
+        local_hidden_states: torch.Tensor,
+        lm_head: VocabParallelEmbedding,
+        logits_metadata: LogitsMetadata,
+    ) -> bool:
+        """_can_gather_softcap_fused without its softcap and FP32 terms: a plain
+        TP vocab shard that finish_deferred_gather can complete."""
+        return (
+            self.do_tensor_parallel_all_gather
             and not self.use_attn_tp_group
             and not self.do_tensor_parallel_all_gather_dp_attn
             and logits.is_cuda

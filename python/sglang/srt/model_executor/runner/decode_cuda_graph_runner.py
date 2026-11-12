@@ -1,4 +1,5 @@
 # Copyright 2023-2026 SGLang Team
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -92,6 +93,15 @@ from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
     freeze_gc,
     get_batch_sizes_to_capture,
 )
+from sglang.srt.model_executor.runner.dflash_verify_prep import (
+    VERIFY_PREP_SLOTS,
+    DFlashVerifyPrep,
+    dflash_verify_prep,
+    install_dflash_verify_prep,
+    settle_dflash_verify_prep,
+    stage_beside_draft,
+    unsupported_reason,
+)
 from sglang.srt.model_executor.runner.early_verify_metadata import (
     STAGED_SLOTS,
     EarlyVerifyMetadata,
@@ -133,6 +143,8 @@ from sglang.srt.model_executor.runner_utils.shared_read_event import make_extern
 from sglang.srt.models.unlimited_ocr_v2_support.decode_graph_io import UOCRDecodeGraphIO
 from sglang.srt.runtime_context import get_exec, get_flags, get_parallel, get_spec
 from sglang.srt.utils import empty_context, get_available_gpu_memory
+from sglang.srt.runtime_context import get_memory
+from sglang.srt.speculative.dflash_draft_graph_prio import draft_graph_capture_stream
 from sglang.srt.utils.device_timer import device_timer_ctx
 
 try:
@@ -299,8 +311,26 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     _metadata_prep_fork: Optional[tuple] = None
     _metadata_prep_fork_resolved = False
     _early_verify_metadata = None
+    # SGLANG_OPT_DFLASH_VERIFY_PREP_BESIDE_DRAFT: the target verify runner's prep, and whether
+    # this (DFlash draft) runner marks each replay's start for it.
+    _verify_prep: Optional[DFlashVerifyPrep] = None
+    _marks_draft_start = False
     _skips_prefilled_inputs = False
     _prefilled_inputs: Optional[tuple] = None
+    # SGLANG_OPT_DFLASH_FUSED_DRAFT_PREP: the DFlash worker set this to the replay's bs after its one-launch prep
+    # wrote the static inputs and the backend buffers (DFlashFusedDraftPrepOn.run_on).
+    dflash_fused_prep_bs: Optional[int] = None
+    dflash_fused_prep_skips = 0
+    dflash_fused_prep_fallbacks: Optional[dict] = None
+    # SGLANG_OPT_DFLASH_POST_IN_GRAPH: the DFlash worker sets this to the round's bs when the draft graph already wrote
+    # the verify tokens into this (target verify) runner's static input_ids; the plan load then skips the input_ids slot
+    # and keeps the verify's input_ids tensor, whose replay skips the input_ids / positions re-copy (positions are
+    # written by the beside-draft prep, which this path requires).
+    dflash_post_staged_bs: Optional[int] = None
+    _post_staged_input_ids: Optional[torch.Tensor] = None
+    dflash_post_skips = 0
+    dflash_post_replay_skips = 0
+    dflash_post_fallbacks: Optional[dict] = None
     num_prefilled_input_skips = 0
     # SGLANG_OPT_SKIP_GLUED_REPLAY_VIEW, read in __init__.
     _skip_glued_replay_view = False
@@ -569,11 +599,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             ),
             aux_hidden_states_width=self.model_runner.get_aux_hidden_states_width(),
         )
-        # The early verify metadata writes these slots beside the draft graph, which
-        # must not share their storage through the process-wide pool.
-        self.buffers.share_buffers(
-            exclude=STAGED_SLOTS if self._wants_early_verify_metadata() else ()
-        )
+        self._verify_prep = self._maybe_install_verify_prep()
+        self._seam_small_copy = envs.SGLANG_OPT_K31_SEAM_SMALL_COPY.get()
+        self._marks_draft_start = self._is_marking_dflash_draft()
+        # The early verify metadata and the verify prep beside the draft write these slots
+        # beside the draft graph, which must not share their storage through the process-wide pool.
+        self.buffers.share_buffers(exclude=self._slots_written_beside_draft())
         # FB-shared slot registry adopting DecodeInputBuffers storage (same
         # physical tensors, stable data_ptr for capture vs replay). Provides
         # the unified fill_from / slot access surface for capture/replay.
@@ -744,6 +775,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             # Stays None without external-event support, so the read-end
             # resolution below never hands out an unrecorded event.
             event.record()
+
+    def _replay_attn_backend(self):
+        """The attention backend a replay of this runner's graphs uses."""
+        return self.attn_backend
 
     def _resolve_shared_read_ends(self, attn_backend, forward_mode) -> SharedReadEnds:
         declared = attn_backend.shared_read_ends(forward_mode)
@@ -967,6 +1002,15 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
 
     def can_run_graph(self, forward_batch: ForwardBatch):
+        can_run = self._can_run_graph(forward_batch)
+        if not can_run and (self._verify_prep is not None or self._marks_draft_start):
+            # An eager verify reads what this round's side stream made; an eager draft leaves this
+            # round unmarked, so an earlier round's mark must not be taken for it.
+            settle_dflash_verify_prep()
+        return can_run
+
+
+    def _can_run_graph(self, forward_batch: ForwardBatch):
         if not megakernel_can_run_graph(self.model_runner.model, forward_batch):
             return False
         # Disable for token embedding overrides (dynamic per-request)
@@ -1349,7 +1393,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         with freeze_gc(get_exec().graph.enable_cudagraph_gc):
             with (
                 graph_capture(
-                    stream=get_or_create_global_graph_capture_stream()
+                    # SGLANG_OPT_DFLASH_DRAFT_GRAPH_PRIO: the DFLASH draft captures on a priority -1
+                    # stream (graph nodes keep the capture priority); else the shared capture stream.
+                    stream=draft_graph_capture_stream(
+                        self.model_runner,
+                        get_or_create_global_graph_capture_stream,
+                    )
                 ) as graph_capture_context,
                 profile_context as prof,
             ):
@@ -1698,15 +1747,44 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         early_staged = self._take_early_verify_metadata(
             forward_batch, raw_bs=raw_bs, bs=bs, is_ragged=is_ragged, key=glue_key
         )
-        self.buffer_registry.fill_from(
-            forward_batch,
+        beside_draft = self._take_verify_prep(raw_bs=raw_bs, bs=bs, is_ragged=is_ragged)
+        fused_prep = self._take_dflash_fused_prep(
             raw_bs=raw_bs,
-            padded_bs=bs,
-            raw_num_tokens=raw_num_token,
-            padded_num_tokens=padded_num_tokens,
-            pp_proxy_tensors=pp_proxy_tensors,
-            skip_slots=STAGED_SLOTS if early_staged else frozenset(),
+            bs=bs,
+            is_ragged=is_ragged,
+            early_staged=early_staged,
+            beside_draft=beside_draft,
         )
+        if beside_draft:
+            skip_slots = VERIFY_PREP_SLOTS
+        else:
+            skip_slots = STAGED_SLOTS if early_staged else frozenset()
+        self._post_staged_input_ids = None
+        if self._take_dflash_post_staged(
+            raw_bs=raw_bs,
+            bs=bs,
+            raw_num_token=raw_num_token,
+            is_ragged=is_ragged,
+            beside_draft=beside_draft,
+        ):
+            skip_slots = skip_slots | {"input_ids"}
+            self._post_staged_input_ids = forward_batch.input_ids
+        recheck_snap = None
+        if fused_prep:
+            if forward_batch.seq_lens_cpu is not None:
+                # fill_from's only write the fused kernel does not make: the host mirror (raw_bs == bs here).
+                buffers.seq_lens_cpu[:raw_bs].copy_(forward_batch.seq_lens_cpu)
+            recheck_snap = self._dflash_recheck_snapshot()
+        if not fused_prep or recheck_snap is not None:
+            self.buffer_registry.fill_from(
+                forward_batch,
+                raw_bs=raw_bs,
+                padded_bs=bs,
+                raw_num_tokens=raw_num_token,
+                padded_num_tokens=padded_num_tokens,
+                pp_proxy_tensors=pp_proxy_tensors,
+                skip_slots=skip_slots,
+            )
         if self._restage_skip and not early_staged:
             self._staged_inputs = self._staged_signature(forward_batch)
         if self._skips_prefilled_inputs:
@@ -1722,6 +1800,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 )
             )
             and forward_batch.input_embeds is not None
+            and forward_batch.input_embeds.data_ptr() != buffers.input_embeds.data_ptr()
         ):
             buffers.input_embeds[:raw_num_token].copy_(forward_batch.input_embeds)
         # Padded tokens aren't read, so skip zeroing. Ragged input_ids arrive
@@ -1741,15 +1820,25 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         ):
             forward_batch.spec_info.custom_mask = buffers.custom_mask
 
-        self._init_replay_attn_metadata(
-            forward_batch,
-            raw_bs=raw_bs,
-            bs=bs,
-            num_tokens=padded_num_tokens,
-            glue_key=glue_key,
-            early_staged=early_staged,
-            attention_variant=attention_variant,
-        )
+        if beside_draft:
+            self._stage_verify_prep(
+                forward_batch,
+                bs=bs,
+                num_tokens=padded_num_tokens,
+                attention_variant=attention_variant,
+            )
+        elif not fused_prep or recheck_snap is not None:
+            self._init_replay_attn_metadata(
+                forward_batch,
+                raw_bs=raw_bs,
+                bs=bs,
+                num_tokens=padded_num_tokens,
+                glue_key=glue_key,
+                early_staged=early_staged,
+                attention_variant=attention_variant,
+            )
+        if recheck_snap is not None:
+            self._dflash_recheck_compare(recheck_snap, bs)
         if self._draft_metadata_glue or self._target_metadata_glue:
             self._maybe_log_draft_glue()
 
@@ -1815,6 +1904,120 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             logger.info("Draft metadata glue graph off: %s.", why)
             return False
         logger.info("Draft metadata prep through the glue graph, one per replay key.")
+        return True
+
+    def _dflash_recheck_tensors(self):
+        """(name, tensor) for every tensor attribute (CUDA or CPU) of the static buffers and the replay backend (+ forward_metadata)."""
+        seen, out = set(), []
+        def walk(prefix, obj):
+            try:
+                items = list(vars(obj).items())
+            except TypeError:
+                return
+            for k, v in items:
+                vals = [(f"{prefix}.{k}", v)]
+                if isinstance(v, (list, tuple)):
+                    vals = [(f"{prefix}.{k}[{i}]", x) for i, x in enumerate(v)]
+                for n, t in vals:
+                    if isinstance(t, torch.Tensor) and t.numel() > 0 and t.numel() * t.element_size() <= (256 << 20):
+                        key = (t.data_ptr(), t.numel(), t.dtype)
+                        if key not in seen:
+                            seen.add(key)
+                            out.append((n, t))
+        walk("buffers", self.buffers)
+        be = self._replay_attn_backend()
+        walk("backend", be)
+        if getattr(be, "forward_metadata", None) is not None:
+            walk("backend.forward_metadata", be.forward_metadata)
+        return out
+
+    def _dflash_recheck_snapshot(self):
+        n = getattr(self, "_dflash_recheck_n", None)
+        if n is None:
+            n = self._dflash_recheck_n = envs.SGLANG_TEST_DFLASH_FUSED_DRAFT_PREP_RECHECK.get()
+            self._dflash_recheck_k = 0
+            if n > 0:
+                logger.warning("DFLASH fused prep recheck ON: first %d fused replays (test hook)", n)
+        if n <= 0 or self._dflash_recheck_k >= n:
+            return None
+        return [(name, t, t.clone()) for name, t in self._dflash_recheck_tensors()]
+
+    def _dflash_recheck_compare(self, snap, bs: int) -> None:
+        self._dflash_recheck_k += 1
+        k, n = self._dflash_recheck_k, self._dflash_recheck_n
+        bad = []
+        for name, t, s in snap:
+            if not torch.equal(t, s):
+                diff = (t != s).reshape(-1).nonzero()
+                i = int(diff[0]) if diff.numel() else -1
+                bad.append(f"{name} shape {tuple(t.shape)} {int(diff.numel())} elems first {i} "
+                           f"eager {t.reshape(-1)[i].item() if i >= 0 else None} skip {s.reshape(-1)[i].item() if i >= 0 else None}")
+        if bad:
+            logger.warning("DFLASH fused prep recheck %d/%d: MISMATCH (bs %d): %s", k, n, bs, " | ".join(bad[:6]))
+        elif k in (1, 10) or k % 100 == 0 or k == n:
+            logger.info("DFLASH fused prep recheck %d/%d: OK (bs %d, %d tensors)", k, n, bs, len(snap))
+
+    def _take_dflash_post_staged(
+        self, *, raw_bs: int, bs: int, raw_num_token: int, is_ragged: bool, beside_draft: bool
+    ) -> bool:
+        """Whether this verify plan skips the input_ids slot because the DFlash draft graph already wrote these rows
+        (SGLANG_OPT_DFLASH_POST_IN_GRAPH). A fallback copies the same values from the verify's input_ids tensor."""
+        want, self.dflash_post_staged_bs = self.dflash_post_staged_bs, None
+        if want is None:
+            return False
+        why = None
+        if not (want == raw_bs == bs):
+            why = "padded or mismatched bs"
+        elif is_ragged:
+            why = "ragged verify"
+        elif not beside_draft:
+            why = "verify prep not beside the draft (positions not staged)"
+        elif raw_num_token != raw_bs * self.captured_req_width:
+            why = "tokens per request differ from the captured width"
+        if why is not None:
+            fb = self.dflash_post_fallbacks
+            if fb is None:
+                fb = self.dflash_post_fallbacks = {}
+            if why not in fb:
+                logger.info("DFLASH POST in graph: verify plan keeps its input_ids copy (%s)", why)
+            fb[why] = fb.get(why, 0) + 1
+            return False
+        self.dflash_post_skips += 1
+        if self.dflash_post_skips == 1:
+            logger.info("DFLASH POST in graph: verify plan skipped its input_ids copy (first replay, bs %d)", bs)
+        return True
+
+    def _take_dflash_fused_prep(
+        self, *, raw_bs: int, bs: int, is_ragged: bool, early_staged: bool, beside_draft: bool
+    ) -> bool:
+        """Whether this replay skips fill_from + the backend's out-graph prep because the DFlash worker's
+        fused draft prep already wrote them. Any other replay feature that needs them keeps the eager path,
+        which rewrites the same values from the kernel-written worker buffers."""
+        want, self.dflash_fused_prep_bs = self.dflash_fused_prep_bs, None
+        if want is None:
+            return False
+        why = None
+        if not (want == raw_bs == bs):
+            why = "padded or mismatched bs"
+        elif is_ragged or early_staged or beside_draft:
+            why = "ragged / staged / beside-draft prep"
+        elif self.enable_two_batch_overlap:
+            why = "tbo"
+        elif self.model_runner.lora_manager is not None:
+            why = "lora"
+        elif self.dllm_input_preparation is not None or self.dllm_attention is not None:
+            why = "dllm"
+        if why is not None:
+            fb = self.dflash_fused_prep_fallbacks
+            if fb is None:
+                fb = self.dflash_fused_prep_fallbacks = {}
+            if why not in fb:
+                logger.info("DFLASH fused draft prep: runner keeps fill_from + backend prep (%s)", why)
+            fb[why] = fb.get(why, 0) + 1
+            return False
+        self.dflash_fused_prep_skips += 1
+        if self.dflash_fused_prep_skips == 1:
+            logger.info("DFLASH fused draft prep: runner skipped fill_from + backend prep (first replay, bs %d)", bs)
         return True
 
     def _init_replay_attn_metadata(
@@ -1901,6 +2104,95 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 self._metadata_glue.note_not_routed()
             with self._prep_attention_variant(attention_variant):
                 attn_backend.init_forward_metadata_out_graph(fb_view)
+
+    def _maybe_install_verify_prep(self) -> Optional[DFlashVerifyPrep]:
+        """SGLANG_OPT_DFLASH_VERIFY_PREP_BESIDE_DRAFT: every DFlash target verify runner installs
+        (or, when it does not qualify, uninstalls) the process's verify prep."""
+        if not (
+            envs.SGLANG_OPT_DFLASH_VERIFY_PREP_BESIDE_DRAFT.get()
+            and self.capture_forward_mode == ForwardMode.TARGET_VERIFY
+            and not self.model_runner.is_draft_worker
+            and self.model_runner.spec_algorithm.is_dflash()
+        ):
+            return None
+        why = unsupported_reason(
+            self.attn_backend,
+            enable_unified_memory=get_memory().enable_unified_memory,
+        )
+        if why:
+            logger.info("DFlash verify prep beside the draft off: %s.", why)
+        return install_dflash_verify_prep(
+            enabled=not why and self._wants_verify_prep_beside_draft(),
+            avoid_streams=(
+                self.model_runner.forward_stream,
+                torch.cuda.current_stream(),
+            ),
+        )
+
+    def _wants_verify_prep_beside_draft(self) -> bool:
+        """The runner-side conditions of the verify prep beside the draft, from facts fixed before
+        the buffers are shared."""
+        return (
+            not self.ragged_verify_mode
+            and torch.device(self.model_runner.device).type == "cuda"
+            and not get_parallel().attn_dp_enabled
+            and not self.require_gathered_buffer
+            and not self.enable_two_batch_overlap
+            and self.model_runner.lora_manager is None
+            and not self._wants_early_verify_metadata()
+        )
+
+    def _is_marking_dflash_draft(self) -> bool:
+        return (
+            envs.SGLANG_OPT_DFLASH_VERIFY_PREP_BESIDE_DRAFT.get()
+            and self.model_runner.is_draft_worker
+            and self.model_runner.spec_algorithm.is_dflash()
+        )
+
+    def _slots_written_beside_draft(self) -> frozenset:
+        if self._verify_prep is not None:
+            return VERIFY_PREP_SLOTS
+        return STAGED_SLOTS if self._wants_early_verify_metadata() else frozenset()
+
+    def _take_verify_prep(self, *, raw_bs: int, bs: int, is_ragged: bool) -> bool:
+        """Whether this verify's prep runs beside the draft graph; a fallback first orders the
+        current stream after any side work of this round."""
+        prep = self._verify_prep
+        if prep is None:
+            return False
+        if prep.marked and not is_ragged and raw_bs == bs:
+            return True
+        prep.settle()
+        prep.note(beside=False)
+        return False
+
+    def _stage_verify_prep(
+        self,
+        forward_batch: ForwardBatch,
+        *,
+        bs: int,
+        num_tokens: int,
+        attention_variant,
+    ) -> None:
+        sources = {}
+        for name in VERIFY_PREP_SLOTS:
+            src = getattr(forward_batch, name)
+            if src is not None and self.buffer_registry.has_slot(name):
+                sources[name] = src
+        stage_beside_draft(
+            prep=self._verify_prep,
+            registry=self.buffer_registry,
+            sources=sources,
+            run_prep=lambda: self._init_replay_attn_metadata_from_view(
+                forward_batch,
+                raw_bs=bs,
+                bs=bs,
+                num_tokens=num_tokens,
+                glue_key=None,
+                attention_variant=attention_variant,
+            ),
+            check=False,
+        )
 
     def _wants_early_verify_metadata(self) -> bool:
         """SGLANG_OPT_DSV41_TARGET_METADATA_EARLY, from facts fixed before the buffers
@@ -2002,6 +2294,14 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         staged = None
         if self._restage_skip:
             staged, self._staged_inputs = self._staged_inputs, None
+        post_ids, self._post_staged_input_ids = self._post_staged_input_ids, None
+        if post_ids is not None and forward_batch.input_ids is post_ids:
+            # SGLANG_OPT_DFLASH_POST_IN_GRAPH: input_ids rows came from the draft graph, positions from the
+            # beside-draft prep (both of this very batch, settled on this stream before the replay).
+            self.dflash_post_replay_skips += 1
+            if self.dflash_post_replay_skips == 1:
+                logger.info("DFLASH POST in graph: verify replay skipped its input_ids / positions copy (first replay)")
+            return
         if self._restage_is_redundant(staged, forward_batch):
             return
         # The plan-time load (or the early stage it took) filled these from the very
@@ -2017,6 +2317,21 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 [forward_batch.input_ids, forward_batch.positions],
             )
         ):
+            return
+        if (
+            prefilled is None
+            and self._seam_small_copy
+            and try_small_copy(
+                [
+                    self.buffers.input_ids[: self.raw_num_token],
+                    self.buffers.positions[: self.raw_num_token],
+                ],
+                [forward_batch.input_ids, forward_batch.positions],
+            )
+        ):
+            from sglang.srt.speculative.dflash_utils import note_seam_small_copy
+
+            note_seam_small_copy("verify replay inputs")
             return
         if prefilled is None or forward_batch.input_ids is not prefilled[0]:
             self.buffers.input_ids[: self.raw_num_token].copy_(forward_batch.input_ids)
@@ -2116,6 +2431,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if shared_read_ends is SharedReadEnds.PRE_REPLAY:
                 self._publish_read_done(in_graph=False)
 
+            if self._marks_draft_start and dflash_verify_prep() is not None:
+                # After the draft's own prep, so the side stream never races it.
+                dflash_verify_prep().mark_draft_start()
             output = self.backend.replay(self._replay_graph_key, forward_batch)
 
             if shared_read_ends is SharedReadEnds.IN_REPLAY:

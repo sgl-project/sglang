@@ -787,12 +787,36 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     (layer.w2_weight.data, layer.w2_weight_scale.data),
                     mma_type=mma_type,
                 )
-                layer.mega_l1_weights = l1_pair
-                layer.mega_l2_weights = l2_pair
-                layer.w13_weight.data = l1_pair[0]
-                layer.w13_weight_scale.data = l1_pair[1]
-                layer.w2_weight.data = l2_pair[0]
-                layer.w2_weight_scale.data = l2_pair[1]
+                from sglang.srt.layers.moe.mega_moe import (
+                    _is_mega_moe_localization_enabled,
+                )
+
+                if _is_mega_moe_localization_enabled():
+                    # SGLANG_OPT_DEEPGEMM_MEGA_MOE_LOCALIZE=1 on SM107: the MegaMoE
+                    # weight localization of sgl-project/sglang #47976 + #48099,
+                    # applied on the K3.1 MXFP4 path too. The kernel takes the
+                    # (domains, experts, N / domains, K) localized weights; the
+                    # params get their expert-major view of the same memory, and
+                    # the plain copies are released.
+                    import deep_gemm
+
+                    l1_pair = (deep_gemm.localize(l1_pair[0]), l1_pair[1])
+                    l2_pair = (deep_gemm.localize(l2_pair[0]), l2_pair[1])
+                    layer.mega_l1_weights = l1_pair
+                    layer.mega_l2_weights = l2_pair
+                    layer.w13_weight.data = l1_pair[0].transpose(0, 1)
+                    layer.w13_weight_scale.data = l1_pair[1]
+                    layer.w2_weight.data = l2_pair[0].transpose(0, 1)
+                    layer.w2_weight_scale.data = l2_pair[1]
+                    layer._mega_moe_weights_localized = True
+                    torch.cuda.empty_cache()
+                else:
+                    layer.mega_l1_weights = l1_pair
+                    layer.mega_l2_weights = l2_pair
+                    layer.w13_weight.data = l1_pair[0]
+                    layer.w13_weight_scale.data = l1_pair[1]
+                    layer.w2_weight.data = l2_pair[0]
+                    layer.w2_weight_scale.data = l2_pair[1]
                 layer._mega_moe_weights_built = True
             layer._mxfp4_backend = "deep_gemm"
             return

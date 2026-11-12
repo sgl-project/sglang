@@ -1,5 +1,10 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the SGLang project
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 from __future__ import annotations
 
+import logging
+import os
 from typing import TYPE_CHECKING, NamedTuple, Optional
 
 import torch
@@ -37,9 +42,35 @@ def max_num_ctas(num_tokens: int, tile_tokens: int) -> int:
     return filled + (remaining - filled) // tile_tokens
 
 
+logger = logging.getLogger(__name__)
+
+# Default off: build the trtllm metadata in a separate 1024-thread kernel chained
+# by PDL instead of the routing grid's last-CTA tail. Same outputs.
+_META_SPLIT_ENV = "SGLANG_K31_ROUTING_META_SPLIT"
+
+
+@cache_once
+def _meta_split() -> bool:
+    on = os.environ.get(_META_SPLIT_ENV, "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+    if on:
+        logger.info(
+            "K3.1 fused routing: metadata split kernel on (%s=1)",
+            _META_SPLIT_ENV,
+        )
+    return on
+
+
 @cache_once
 def _jit_module() -> Module:
-    args = make_cpp_args(is_arch_support_pdl())
+    if _meta_split():
+        args = make_cpp_args(is_arch_support_pdl(), True)
+    else:
+        args = make_cpp_args(is_arch_support_pdl())
     return load_jit(
         "kimi_k3_fused_routing",
         *args,

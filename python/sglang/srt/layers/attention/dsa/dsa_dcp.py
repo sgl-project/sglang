@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the SGLang project
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 from __future__ import annotations
 
 from typing import Optional, Tuple
@@ -23,6 +26,75 @@ def trtllm_rows_per_call(*, workspace_bytes: int, heads: int) -> int:
         heads * _SOFTMAX_BYTES_PER_ROW_HEAD
     )
     return max(1, min(TRTLLM_MAX_BATCH_ROWS, rows))
+
+
+def window_row_tiles(rows: int, wave_rows: int, tail_max: int) -> list:
+    """K31HT_DRAFT_DCP1_TILE: row tiles for one DCP-1 draft window call.
+
+    At 12 heads the trtllm-gen sparse kernel runs one CTA per row up to one
+    wave (wave_rows = SM count) and is priced per wave: a call one row past
+    a wave boundary pays a whole extra wave. When the last, partial wave
+    holds at most ``tail_max`` rows, those rows run as their own call, where
+    the kernel picks its multi-CTA form. Returns [(0, rows)] for no split.
+    """
+    if wave_rows <= 0 or rows <= wave_rows:
+        return [(0, rows)]
+    tail = rows % wave_rows
+    if tail == 0 or tail > tail_max:
+        return [(0, rows)]
+    head = rows - tail
+    return [(0, head), (head, rows)]
+
+
+def _k31ht_tiled_trtllm_sparse_attention(
+    *, query, block_tables, seq_lens, cu_seqlens_q, need_lse, lse, step, row_tiles, attention_kwargs
+):
+    """K31HT_DRAFT_DCP1_TILE: dcp_trtllm_sparse_attention's per-call loop over the row tiles of
+    window_row_tiles, each tile cut at ``step`` rows."""
+    import flashinfer.decode
+
+    rows, _, heads, _ = query.shape
+    tiles = row_tiles
+    if tiles[0][0] != 0 or tiles[-1][1] != rows or any(
+        a[1] != b[0] for a, b in zip(tiles, tiles[1:])
+    ):
+        raise ValueError(f"row_tiles {tiles} do not cover [0, {rows})")
+    bounds = [
+        (start, min(start + step, hi))
+        for lo, hi in tiles
+        for start in range(lo, hi, step)
+    ]
+    if len(bounds) > 1:
+        # Calls share the workspace and the multi-CTA counter buffer: keep
+        # them strictly ordered.
+        attention_kwargs["enable_pdl"] = False
+    top_k_lens = attention_kwargs.pop("sparse_mla_top_k_lens", None)
+    outputs = []
+    for start, end in bounds:
+        result = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
+            query=query[start:end],
+            block_tables=block_tables[start:end],
+            seq_lens=seq_lens[start:end],
+            return_lse=need_lse,
+            lse=lse[start:end] if need_lse else None,
+            sparse_mla_top_k_lens=(
+                None if top_k_lens is None else top_k_lens[start:end]
+            ),
+            **attention_kwargs,
+        )
+        output = result[0] if need_lse else result
+        output = output.view(end - start, heads, -1)
+        if need_lse:
+            fixup_zero_kv_rows(
+                output,
+                lse[start:end],
+                seq_lens[start:end],
+                cu_seqlens_q[: end - start + 1],
+                1,
+            )
+        outputs.append(output)
+    output = outputs[0] if len(outputs) == 1 else torch.cat(outputs)
+    return output.view(rows, 1, heads, -1), lse
 
 
 class DcpPageTableCache(msgspec.Struct):
@@ -70,6 +142,7 @@ def dcp_trtllm_sparse_attention(
     seq_lens: torch.Tensor,
     cu_seqlens_q: torch.Tensor,
     # False also skips the zero-KV-row fixup: every row must own a key.
+    row_tiles: Optional[list] = None,
     need_lse: bool = True,
     **attention_kwargs,
 ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
@@ -95,6 +168,18 @@ def dcp_trtllm_sparse_attention(
     step = trtllm_rows_per_call(
         workspace_bytes=workspace.numel() * workspace.element_size(), heads=heads
     )
+    if row_tiles:
+        return _k31ht_tiled_trtllm_sparse_attention(
+            query=query,
+            block_tables=block_tables,
+            seq_lens=seq_lens,
+            cu_seqlens_q=cu_seqlens_q,
+            need_lse=need_lse,
+            lse=lse,
+            step=step,
+            row_tiles=row_tiles,
+            attention_kwargs=attention_kwargs,
+        )
     if rows > step:
         attention_kwargs["enable_pdl"] = False
     top_k_lens = attention_kwargs.pop("sparse_mla_top_k_lens", None)

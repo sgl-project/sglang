@@ -1,3 +1,4 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 """
 Copyright 2026 SGLang Team
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,7 +23,7 @@ free-slot bookkeeping.
 
 from __future__ import annotations
 
-from typing import Iterator, Optional
+from typing import Callable, Iterator, List, Optional
 
 import torch
 
@@ -36,6 +37,9 @@ class MambaSlotAllocator:
         self.device = device
         # Set by alloc_group_begin(); alloc(1) drains it until alloc_group_end().
         self._alloc_iter: Optional[Iterator] = None
+        # Called with every batch of newly handed-out slot indices (per-slot
+        # metadata resets, e.g. the KDA fold-pending lengths).
+        self.alloc_hooks: List[Callable[[torch.Tensor], None]] = []
         self.clear()
 
     def translate(self, slot_ids: torch.Tensor) -> torch.Tensor:
@@ -78,6 +82,8 @@ class MambaSlotAllocator:
             return None
         select_index = self.free_slots[:need_size]
         self.free_slots = self.free_slots[need_size:]
+        for hook in self.alloc_hooks:
+            hook(select_index)
         return select_index
 
     def free(self, free_index: torch.Tensor):

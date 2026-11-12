@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the SGLang project
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 """Config fields of the ``exec`` namespace."""
 
 from __future__ import annotations
@@ -318,7 +321,8 @@ class ExecKernel(msgspec.Struct):
         Optional[str],
         Arg(
             help="DSA (DeepSeek Sparse Attention) prefill backend. If not specified, auto-detects based on hardware and kv_cache_dtype. "
-            "'prims_ts': FlashInfer Prims-TS sparse MLA (SM100/SM103, fp8_e4m3 KV).",
+            "'prims_ts': FlashInfer Prims-TS sparse MLA (SM100/SM103; SM107 with "
+            "SGLANG_ENABLE_PRIMS_TS_SM107=1; fp8_e4m3 KV).",
             choices=[
                 "flashmla_sparse",
                 "flashmla_sparse_q8",
@@ -383,7 +387,8 @@ class ExecKernel(msgspec.Struct):
         Optional[str],
         Arg(
             help="DSA (DeepSeek Sparse Attention) decode backend. If not specified, auto-detects based on hardware and kv_cache_dtype. "
-            "'prims_ts': FlashInfer Prims-TS sparse MLA (SM100/SM103, fp8_e4m3 KV).",
+            "'prims_ts': FlashInfer Prims-TS sparse MLA (SM100/SM103; SM107 with "
+            "SGLANG_ENABLE_PRIMS_TS_SM107=1; fp8_e4m3 KV).",
             choices=[
                 "flashmla_sparse",
                 "flashmla_sparse_q8",

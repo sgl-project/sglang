@@ -1,3 +1,8 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the SGLang project
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
+# Portions (transfer-queue sharding by bootstrap room) are a cherry-pick of
+# sgl-project/sglang pull request #42163 (Apache-2.0).
 from __future__ import annotations
 
 import concurrent.futures
@@ -90,6 +95,16 @@ FAILED_SESSION_RECOVERIES = Counter(
     "sglang:failed_session_recoveries_total",
     "Number of mooncake_session_ids un-blacklisted via probe.",
 )
+
+_UINT64_MASK = (1 << 64) - 1
+
+
+def _mix_room_id(room: int) -> int:
+    """Return the SplitMix64 hash of an integer room ID."""
+    mixed = (room + 0x9E3779B97F4A7C15) & _UINT64_MASK
+    mixed = ((mixed ^ (mixed >> 30)) * 0xBF58476D1CE4E5B9) & _UINT64_MASK
+    mixed = ((mixed ^ (mixed >> 27)) * 0x94D049BB133111EB) & _UINT64_MASK
+    return (mixed ^ (mixed >> 31)) & _UINT64_MASK
 
 
 @dataclasses.dataclass
@@ -289,6 +304,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         self.max_transfer_batch_indices = (
             envs.SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES.get()
         )
+        self.shard_transfers_by_room = envs.SGLANG_K31_PF_MOONCAKE_ROOM_SHARD.get()
         self.enable_trace = get_observability().enable_trace
         # Set by teardown() to make worker threads exit (P<->D role switch).
         self._stopped = False
@@ -3429,12 +3445,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             # add further chunks into the transfer queue.
             return
 
-        # NOTE(shangming): sharding according to the dst_infos to make sure
-        # requests with the same dst_sessions will be added into the same
-        # queue, which enables early abort with failed sessions.
-        dst_infos = self.transfer_infos[bootstrap_room].keys()
-        session_port_sum = sum(int(session.rsplit(":", 1)[1]) for session in dst_infos)
-        shard_idx = session_port_sum % len(self.transfer_queues)
+        shard_idx = self._transfer_shard_index(bootstrap_room)
 
         if trace_ctx is None:
             trace_ctx = TraceNullContext()
@@ -3453,6 +3464,18 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 indices_event=indices_event,
             )
         )
+
+    def _transfer_shard_index(self, bootstrap_room: int) -> int:
+        if self.shard_transfers_by_room:
+            # Every chunk of a room still lands on one FIFO queue. Room IDs can be
+            # congruent with their DP rank, so mix all bits first.
+            return _mix_room_id(bootstrap_room) % len(self.transfer_queues)
+        # NOTE(shangming): sharding according to the dst_infos to make sure
+        # requests with the same dst_sessions will be added into the same
+        # queue, which enables early abort with failed sessions.
+        dst_infos = self.transfer_infos[bootstrap_room].keys()
+        session_port_sum = sum(int(session.rsplit(":", 1)[1]) for session in dst_infos)
+        return session_port_sum % len(self.transfer_queues)
 
     def get_session_id(self):
         return self.engine.get_session_id()

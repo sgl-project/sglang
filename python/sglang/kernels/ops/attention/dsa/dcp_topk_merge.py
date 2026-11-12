@@ -1,8 +1,13 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the SGLang project
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 """Exact global top-k merge for DSA decode context parallelism; the algorithm
 is described in ``jit/csrc/dsa/dcp_topk_merge.cuh``."""
 
 from __future__ import annotations
 
+import logging
+import os
 from typing import TYPE_CHECKING
 
 import torch
@@ -13,9 +18,28 @@ if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
 
+# Default off: the merge_kernel kStaged variant (coalesced smem-staged push, own
+# top-k stored after it, register fallback for <= 2 failed ranks). Same output.
+_STAGED_ENV = "SGLANG_K31_DCP_MERGE_STAGED"
+
+
+@cache_once
+def _staged() -> bool:
+    on = os.environ.get(_STAGED_ENV, "0").strip().lower() in ("1", "true", "yes", "on")
+    if on:
+        logging.getLogger(__name__).info(
+            "DSA DCP top-k merge: staged push variant on (%s=1)",
+            _STAGED_ENV,
+        )
+    return on
+
+
 @cache_once
 def _jit_dcp_topk_merge_module(num_ranks: int, topk: int, cand_k: int) -> Module:
-    args = make_cpp_args(num_ranks, topk, cand_k)
+    if _staged():
+        args = make_cpp_args(num_ranks, topk, cand_k, 1)
+    else:
+        args = make_cpp_args(num_ranks, topk, cand_k)
     return load_jit(
         "dcp_topk_merge",
         *args,

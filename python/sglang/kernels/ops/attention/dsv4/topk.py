@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the SGLang project
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 from __future__ import annotations
 
 from typing import Optional
@@ -223,6 +226,31 @@ def topk_transform_ragged_v2(
 _CANDIDATES_CLUSTER_FLOOR = 16384
 
 
+_CAND_CLUSTER_LOGGED: set = set()
+
+
+def _cand_cluster_override(rows: int) -> Optional[int]:
+    """SGLANG_K31_DCP_CAND_CLUSTER = 0 | 2 | 4 (unset: off) forces the DCP
+    candidate top-k's cluster size for
+    launches of SGLANG_K31_DCP_CAND_CLUSTER_MIN_ROWS (default 1) to
+    SGLANG_K31_DCP_CAND_CLUSTER_ROWS (default 63) rows. The selection is exact at
+    every size, so only the CTA count per row changes. None = no override. Size 8
+    is not offered: topk_v2.cuh has no cluster-8 case."""
+    import os
+
+    raw = os.environ.get("SGLANG_K31_DCP_CAND_CLUSTER", "").strip()
+    if not raw:
+        return None
+    size = int(raw)
+    if size not in (0, 2, 4):
+        raise ValueError(f"SGLANG_K31_DCP_CAND_CLUSTER must be 0, 2 or 4, got {raw!r}")
+    max_rows = int(os.environ.get("SGLANG_K31_DCP_CAND_CLUSTER_ROWS", "63"))
+    min_rows = int(os.environ.get("SGLANG_K31_DCP_CAND_CLUSTER_MIN_ROWS", "1"))
+    if not min_rows <= rows <= max_rows:
+        return None
+    return size
+
+
 def _candidates_cluster_size(rows: int) -> int:
     # SM90 / SM100 only, as SUPPORT_CLUSTER in topk_impl.cuh builds the cluster path.
     arch = current_arch()
@@ -232,6 +260,27 @@ def _candidates_cluster_size(rows: int) -> int:
         NoSchedulableClustersError,
         get_max_active_clusters,
     )
+
+    forced = _cand_cluster_override(rows)
+    if forced is not None:
+        fits = forced == 0
+        if not fits:
+            try:
+                fits = rows <= get_max_active_clusters(forced, occupancy=1)
+            except NoSchedulableClustersError:
+                fits = False
+        if (rows, forced) not in _CAND_CLUSTER_LOGGED:
+            _CAND_CLUSTER_LOGGED.add((rows, forced))
+            import logging
+
+            logging.getLogger(__name__).info(
+                "K3.1 DCP candidate cluster override %s: rows=%d cluster=%d",
+                "engaged" if fits else "ignored (does not fit)",
+                rows,
+                forced,
+            )
+        if fits:
+            return forced
 
     for size in (4, 2):
         try:

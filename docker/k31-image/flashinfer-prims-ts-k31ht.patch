@@ -1,0 +1,422 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
+# K31HT_MLA_TAILROW (default off) for FlashInfer 26bb6dc9 flashinfer/attention/prims_ts (Apache-2.0, FlashInfer team): in the FP8
+# 2-CTA sparse MLA decode, a masked gather row is loaded from a valid row of the same tile instead of an out-of-bounds TMA
+# zero fill. Applied by overlay_flashinfer_prims_ts.py (git apply, -p1, in the prims_ts directory). Unset, every patched file
+# runs the 26bb6dc9 code: the additions are const_expr branches on the knob and a compile-cache key extension when it is on.
+# FlashInfer NOTICE: FlashInfer / Copyright 2025-2026 NVIDIA / Copyright 2023-2026 FlashInfer community (https://flashinfer.ai/)
+diff --git a/_compile_cache.py b/_compile_cache.py
+index b374a65..46c1550 100644
+--- a/_compile_cache.py
++++ b/_compile_cache.py
+@@ -1,4 +1,5 @@
+ # Copyright (c) 2026 by FlashInfer team.
++# Modified by NVIDIA CORPORATION & AFFILIATES (2026): K31HT_MLA_TAILROW (default off), see _k31ht_knobs.py.
+ #
+ # Licensed under the Apache License, Version 2.0 (the "License");
+ # you may not use this file except in compliance with the License.
+@@ -21,6 +22,7 @@ import functools
+ import hashlib
+ from pathlib import Path
+ from typing import Any
++from ._k31ht_knobs import KEY as _K31HT_KEY
+ 
+ 
+ def _stable_value(value: object) -> object:
+@@ -58,7 +60,10 @@ def _compile_cache_key(spec: object, options: str, extra: tuple = ()) -> str | N
+             if field.compare and field.name != "device_index"
+         )
+     try:
+-        encoded = repr(_stable_value((spec, options, extra)))
++        if _K31HT_KEY[1]:  # TAILROW on: the knob and form join the key (every form shares the source text)
++            encoded = repr(_stable_value((spec, options, extra, _K31HT_KEY)))
++        else:
++            encoded = repr(_stable_value((spec, options, extra)))
+     except TypeError:
+         return None
+     return hashlib.sha256(encoded.encode()).hexdigest()
+diff --git b/_k31ht_knobs.py b/_k31ht_knobs.py
+new file mode 100644
+index 0000000..ff42742
+--- /dev/null
++++ b/_k31ht_knobs.py
+@@ -0,0 +1,26 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
++"""K31HT_MLA_TAILROW: map masked sparse-MLA gather rows to a valid row of the same tile at the TMA issue (served FP8 2-CTA path).
++
++'0' / unset = served (masked rows -> out-of-bounds TMA zero fill). '1' = on: in SmemKResource / SmemVResource.tma_load_shared
++(gather4_uniform_quad_slices), a masked row coordinate becomes the tile's token-0 row when that row is valid and has the same
++source tag; the SMEM offsets, the score mask and the expect-tx bytes are unchanged (masked scores are replaced before the row max,
++P = 0 on those columns). Only tiles whose row 127 is masked take the substituted loop; other tiles run the served loop text.
++Anything else raises at import.
++"""
++import os
++
++_v = os.environ.get("K31HT_MLA_TAILROW", "0")
++if _v not in ("0", "1"):
++    raise ValueError(f"K31HT_MLA_TAILROW must be '0' or '1', got {_v!r}")
++TAILROW = _v == "1"
++# Compile-cache identity: both settings share the source text, so the key must carry the knob.
++KEY = ("K31HT_MLA_TAILROW", TAILROW)
++_engaged = set()
++
++
++def engage(site):
++    """Print one ENGAGE line per process and site when the knob's branch is traced."""
++    if site not in _engaged:
++        _engaged.add(site)
++        print(f"K31HT_MLA_TAILROW ENGAGE site={site} pid={os.getpid()}", flush=True)
+diff --git a/kernels/mla_decode/helpers/gather.py b/kernels/mla_decode/helpers/gather.py
+index 367f659..bfbb13b 100644
+--- a/kernels/mla_decode/helpers/gather.py
++++ b/kernels/mla_decode/helpers/gather.py
+@@ -1,4 +1,5 @@
+ # Copyright (c) 2026 by FlashInfer team.
++# Modified by NVIDIA CORPORATION & AFFILIATES (2026): K31HT_MLA_TAILROW (default off), see _k31ht_knobs.py.
+ # Licensed under the Apache License, Version 2.0 (the "License");
+ # you may not use this file except in compliance with the License.
+ # You may obtain a copy of the License at
+@@ -26,6 +27,7 @@ from cutlass.experimental import cuda
+ from ...tensor_map import create_tensor_map_tiled_from_view
+ 
+ from .constants import TMA_GATHER_ROWS
++from .... import _k31ht_knobs as _K31HT
+ from .sparse_indices import SparseKVIndices, SparseSourceTile
+ 
+ 
+@@ -400,6 +402,7 @@ def gather4_uniform_quad_slices(
+     num_slices: cutlass.Constexpr[int],
+     dst_stride: cutlass.Constexpr[int],
+     col_stride: cutlass.Constexpr[int],
++    fallback=None,
+ ):
+     """Issue 2CTA feature slices from a warp-uniform cached row quadruple.
+ 
+@@ -408,6 +411,15 @@ def gather4_uniform_quad_slices(
+     The caller accounts for all copied bytes in the completion barrier.
+     """
+     descriptor, rows = decode_sparse_quad(primary, extra, raw)
++    if cutlass.const_expr(fallback is not None):
++        # K31HT_MLA_TAILROW: a masked coordinate (0x7FFFFFFF, an
++        # out-of-bounds TMA zero-fill row) becomes the tile's token-0 row when that row carries the quad's
++        # source tag (sign bits of fallback and raw[0] agree). A masked fallback maps to 0x7FFFFFFF itself,
++        # so the served coordinate is kept. SMEM offsets, the score mask and expect-tx are untouched.
++        fb_row = fallback & Int32(0x7FFFFFFF)
++        masked_row = fb_row if (fallback ^ raw[0]) >= Int32(0) else Int32(0x7FFFFFFF)
++        for j in cutlass.range_constexpr(TMA_GATHER_ROWS):
++            rows[j] = masked_row if rows[j] == Int32(0x7FFFFFFF) else rows[j]
+     _gather4_slices(
+         dst,
+         descriptor,
+diff --git a/kernels/mla_decode/throughput_2cta/resources.py b/kernels/mla_decode/throughput_2cta/resources.py
+index b655e8a..782c20b 100644
+--- a/kernels/mla_decode/throughput_2cta/resources.py
++++ b/kernels/mla_decode/throughput_2cta/resources.py
+@@ -1,4 +1,5 @@
+ # Copyright (c) 2026 by FlashInfer team.
++# Modified by NVIDIA CORPORATION & AFFILIATES (2026): K31HT_MLA_TAILROW (default off), see _k31ht_knobs.py.
+ #
+ # Licensed under the Apache License, Version 2.0 (the "License");
+ # you may not use this file except in compliance with the License.
+@@ -60,6 +61,7 @@ from ..helpers.math import final_lse
+ from ...mask import kv_tile_needs_right_mask
+ from ...tensor_map import transform_ragged_coords
+ 
++from .... import _k31ht_knobs as _K31HT
+ from ..helpers.sparse_indices import SparseKVIndices, SparseSourceTile
+ from ..helpers.gather import (
+     gather4_cached,
+@@ -1988,44 +1990,140 @@ class SmemKResource(HighThroughputMlaResource):
+         base = (
+             cute.arch.make_warp_uniform(stage_info.stage_idx) * cfg.smem_k_stage_elems
+         )
+-        for owner in cutlass.range_constexpr(
+-            cfg.tokens_per_k_cta // TMA_GATHER_ROWS // cfg.load_num_warps
+-        ):
+-            # All lanes read the same quad: shared-memory broadcast replaces
+-            # four register shuffles. Retain the quad across feature slices.
+-            quad = warp + Int32(owner * cfg.load_num_warps)
+-            offset = (
++        # K31HT_MLA_TAILROW: reads of the same offset-ring slot, inside the same
++        # page_offsets wait / release window as the quads below (no new sync edge). gate form: only a tile whose row 127 is masked
++        # (every tile holding a pad: pads are a suffix) takes the substituted loop; other tiles run the served loop text.
++        tail_fb = None
++        if cutlass.const_expr(_K31HT.TAILROW):
++            _K31HT.engage("fp8_shared_k")
++            tail_fb = self.smem_sparse_offsets.data_ptr(
+                 page_offset_stage * Int32(128)
+-                + quad * Int32(4)
+-                + cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+-                * Int32(64)
+-            )
+-            raw = self.smem_sparse_offsets.data_ptr(offset).load(count=4, alignment=16)
+-            gather4_uniform_quad_slices(
+-                self.smem_k.data_ptr(base + quad * 4 * cfg.mma_qk_tiler_k),
+-                self.tma_desc_c_latent,
+-                self.tma_desc_c_rope,
+-                Int32(0),
+-                raw,
+-                stage_info.barrier,
+-                num_slices=cfg.iterations_qk_latent,
+-                dst_stride=64 * cfg.mma_qk_tiler_k,
+-                col_stride=cfg.mma_qk_tiler_k,
++            ).load(count=4, alignment=16)[0]
++        if cutlass.const_expr(_K31HT.TAILROW):
++            tail_last = cute.arch.make_warp_uniform(
++                self.smem_sparse_offsets.data_ptr(
++                    page_offset_stage * Int32(128) + Int32(124)
++                ).load(count=4, alignment=16)[3]
+             )
+-            if cutlass.const_expr(cfg.rope_dim):
++            if (tail_last & Int32(0x7FFFFFFF)) == Int32(0x7FFFFFFF):
++                for owner in cutlass.range_constexpr(
++                    cfg.tokens_per_k_cta // TMA_GATHER_ROWS // cfg.load_num_warps
++                ):
++                    # All lanes read the same quad: shared-memory broadcast replaces
++                    # four register shuffles. Retain the quad across feature slices.
++                    quad = warp + Int32(owner * cfg.load_num_warps)
++                    offset = (
++                        page_offset_stage * Int32(128)
++                        + quad * Int32(4)
++                        + cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
++                        * Int32(64)
++                    )
++                    raw = self.smem_sparse_offsets.data_ptr(offset).load(count=4, alignment=16)
++                    gather4_uniform_quad_slices(
++                        self.smem_k.data_ptr(base + quad * 4 * cfg.mma_qk_tiler_k),
++                        self.tma_desc_c_latent,
++                        self.tma_desc_c_rope,
++                        Int32(0),
++                        raw,
++                        stage_info.barrier,
++                        num_slices=cfg.iterations_qk_latent,
++                        dst_stride=64 * cfg.mma_qk_tiler_k,
++                        col_stride=cfg.mma_qk_tiler_k,
++                        fallback=tail_fb,
++                    )
++                    if cutlass.const_expr(cfg.rope_dim):
++                        gather4_uniform_quad_slices(
++                            self.smem_k.data_ptr(
++                                base + 64 * cfg.latent_dim + quad * 4 * cfg.rope_dim
++                            ),
++                            self.tma_desc_sparse_rope,
++                            self.tma_desc_sparse_extra_rope,
++                            Int32(0),
++                            raw,
++                            stage_info.barrier,
++                            num_slices=1,
++                            dst_stride=64 * cfg.rope_dim,
++                            col_stride=0,
++                            fallback=tail_fb,
++                        )
++            else:
++                for owner in cutlass.range_constexpr(
++                    cfg.tokens_per_k_cta // TMA_GATHER_ROWS // cfg.load_num_warps
++                ):
++                    # All lanes read the same quad: shared-memory broadcast replaces
++                    # four register shuffles. Retain the quad across feature slices.
++                    quad = warp + Int32(owner * cfg.load_num_warps)
++                    offset = (
++                        page_offset_stage * Int32(128)
++                        + quad * Int32(4)
++                        + cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
++                        * Int32(64)
++                    )
++                    raw = self.smem_sparse_offsets.data_ptr(offset).load(count=4, alignment=16)
++                    gather4_uniform_quad_slices(
++                        self.smem_k.data_ptr(base + quad * 4 * cfg.mma_qk_tiler_k),
++                        self.tma_desc_c_latent,
++                        self.tma_desc_c_rope,
++                        Int32(0),
++                        raw,
++                        stage_info.barrier,
++                        num_slices=cfg.iterations_qk_latent,
++                        dst_stride=64 * cfg.mma_qk_tiler_k,
++                        col_stride=cfg.mma_qk_tiler_k,
++                    )
++                    if cutlass.const_expr(cfg.rope_dim):
++                        gather4_uniform_quad_slices(
++                            self.smem_k.data_ptr(
++                                base + 64 * cfg.latent_dim + quad * 4 * cfg.rope_dim
++                            ),
++                            self.tma_desc_sparse_rope,
++                            self.tma_desc_sparse_extra_rope,
++                            Int32(0),
++                            raw,
++                            stage_info.barrier,
++                            num_slices=1,
++                            dst_stride=64 * cfg.rope_dim,
++                            col_stride=0,
++                        )
++        else:
++            for owner in cutlass.range_constexpr(
++                cfg.tokens_per_k_cta // TMA_GATHER_ROWS // cfg.load_num_warps
++            ):
++                # All lanes read the same quad: shared-memory broadcast replaces
++                # four register shuffles. Retain the quad across feature slices.
++                quad = warp + Int32(owner * cfg.load_num_warps)
++                offset = (
++                    page_offset_stage * Int32(128)
++                    + quad * Int32(4)
++                    + cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
++                    * Int32(64)
++                )
++                raw = self.smem_sparse_offsets.data_ptr(offset).load(count=4, alignment=16)
+                 gather4_uniform_quad_slices(
+-                    self.smem_k.data_ptr(
+-                        base + 64 * cfg.latent_dim + quad * 4 * cfg.rope_dim
+-                    ),
+-                    self.tma_desc_sparse_rope,
+-                    self.tma_desc_sparse_extra_rope,
++                    self.smem_k.data_ptr(base + quad * 4 * cfg.mma_qk_tiler_k),
++                    self.tma_desc_c_latent,
++                    self.tma_desc_c_rope,
+                     Int32(0),
+                     raw,
+                     stage_info.barrier,
+-                    num_slices=1,
+-                    dst_stride=64 * cfg.rope_dim,
+-                    col_stride=0,
++                    num_slices=cfg.iterations_qk_latent,
++                    dst_stride=64 * cfg.mma_qk_tiler_k,
++                    col_stride=cfg.mma_qk_tiler_k,
+                 )
++                if cutlass.const_expr(cfg.rope_dim):
++                    gather4_uniform_quad_slices(
++                        self.smem_k.data_ptr(
++                            base + 64 * cfg.latent_dim + quad * 4 * cfg.rope_dim
++                        ),
++                        self.tma_desc_sparse_rope,
++                        self.tma_desc_sparse_extra_rope,
++                        Int32(0),
++                        raw,
++                        stage_info.barrier,
++                        num_slices=1,
++                        dst_stride=64 * cfg.rope_dim,
++                        col_stride=0,
++                    )
+ 
+     @producer_work
+     @cute.jit
+@@ -2219,30 +2317,97 @@ class SmemVResource(HighThroughputMlaResource):
+         base = (
+             cute.arch.make_warp_uniform(stage_info.stage_idx) * cfg.smem_v_stage_elems
+         )
+-        for owner in cutlass.range_constexpr(
+-            cfg.tokens_per_v_tile // TMA_GATHER_ROWS // cfg.load_num_warps
+-        ):
+-            # All lanes read the same quad: shared-memory broadcast replaces
+-            # four register shuffles. Retain the quad across feature slices.
+-            quad = warp + Int32(owner * cfg.load_num_warps)
+-            offset = page_offset_stage * Int32(128) + quad * Int32(4)
+-            raw = self.smem_sparse_offsets.data_ptr(offset).load(count=4, alignment=16)
+-            call = (quad // Int32(16)) * cfg.iterations_pv_n
+-            gather4_uniform_quad_slices(
+-                self.smem_v.data_ptr(
+-                    base
+-                    + call * 128 * cfg.mma_pv_tiler[2]
+-                    + (quad % Int32(16)) * 4 * 128
+-                ),
+-                self.tma_desc_c_transpose,
+-                self.tma_desc_extra_v,
+-                cta * 128,
+-                raw,
+-                stage_info.barrier,
+-                num_slices=cfg.iterations_pv_n,
+-                dst_stride=128 * cfg.mma_pv_tiler[2],
+-                col_stride=256,
++        # K31HT_MLA_TAILROW: reads of the same offset-ring slot, inside the same
++        # page_offsets wait / release window as the quads below (no new sync edge). gate form: only a tile whose row 127 is masked
++        # (every tile holding a pad: pads are a suffix) takes the substituted loop; other tiles run the served loop text.
++        tail_fb = None
++        if cutlass.const_expr(_K31HT.TAILROW):
++            _K31HT.engage("fp8_shared_v")
++            tail_fb = self.smem_sparse_offsets.data_ptr(
++                page_offset_stage * Int32(128)
++            ).load(count=4, alignment=16)[0]
++        if cutlass.const_expr(_K31HT.TAILROW):
++            tail_last = cute.arch.make_warp_uniform(
++                self.smem_sparse_offsets.data_ptr(
++                    page_offset_stage * Int32(128) + Int32(124)
++                ).load(count=4, alignment=16)[3]
+             )
++            if (tail_last & Int32(0x7FFFFFFF)) == Int32(0x7FFFFFFF):
++                for owner in cutlass.range_constexpr(
++                    cfg.tokens_per_v_tile // TMA_GATHER_ROWS // cfg.load_num_warps
++                ):
++                    # All lanes read the same quad: shared-memory broadcast replaces
++                    # four register shuffles. Retain the quad across feature slices.
++                    quad = warp + Int32(owner * cfg.load_num_warps)
++                    offset = page_offset_stage * Int32(128) + quad * Int32(4)
++                    raw = self.smem_sparse_offsets.data_ptr(offset).load(count=4, alignment=16)
++                    call = (quad // Int32(16)) * cfg.iterations_pv_n
++                    gather4_uniform_quad_slices(
++                        self.smem_v.data_ptr(
++                            base
++                            + call * 128 * cfg.mma_pv_tiler[2]
++                            + (quad % Int32(16)) * 4 * 128
++                        ),
++                        self.tma_desc_c_transpose,
++                        self.tma_desc_extra_v,
++                        cta * 128,
++                        raw,
++                        stage_info.barrier,
++                        num_slices=cfg.iterations_pv_n,
++                        dst_stride=128 * cfg.mma_pv_tiler[2],
++                        col_stride=256,
++                        fallback=tail_fb,
++                    )
++            else:
++                for owner in cutlass.range_constexpr(
++                    cfg.tokens_per_v_tile // TMA_GATHER_ROWS // cfg.load_num_warps
++                ):
++                    # All lanes read the same quad: shared-memory broadcast replaces
++                    # four register shuffles. Retain the quad across feature slices.
++                    quad = warp + Int32(owner * cfg.load_num_warps)
++                    offset = page_offset_stage * Int32(128) + quad * Int32(4)
++                    raw = self.smem_sparse_offsets.data_ptr(offset).load(count=4, alignment=16)
++                    call = (quad // Int32(16)) * cfg.iterations_pv_n
++                    gather4_uniform_quad_slices(
++                        self.smem_v.data_ptr(
++                            base
++                            + call * 128 * cfg.mma_pv_tiler[2]
++                            + (quad % Int32(16)) * 4 * 128
++                        ),
++                        self.tma_desc_c_transpose,
++                        self.tma_desc_extra_v,
++                        cta * 128,
++                        raw,
++                        stage_info.barrier,
++                        num_slices=cfg.iterations_pv_n,
++                        dst_stride=128 * cfg.mma_pv_tiler[2],
++                        col_stride=256,
++                    )
++        else:
++            for owner in cutlass.range_constexpr(
++                cfg.tokens_per_v_tile // TMA_GATHER_ROWS // cfg.load_num_warps
++            ):
++                # All lanes read the same quad: shared-memory broadcast replaces
++                # four register shuffles. Retain the quad across feature slices.
++                quad = warp + Int32(owner * cfg.load_num_warps)
++                offset = page_offset_stage * Int32(128) + quad * Int32(4)
++                raw = self.smem_sparse_offsets.data_ptr(offset).load(count=4, alignment=16)
++                call = (quad // Int32(16)) * cfg.iterations_pv_n
++                gather4_uniform_quad_slices(
++                    self.smem_v.data_ptr(
++                        base
++                        + call * 128 * cfg.mma_pv_tiler[2]
++                        + (quad % Int32(16)) * 4 * 128
++                    ),
++                    self.tma_desc_c_transpose,
++                    self.tma_desc_extra_v,
++                    cta * 128,
++                    raw,
++                    stage_info.barrier,
++                    num_slices=cfg.iterations_pv_n,
++                    dst_stride=128 * cfg.mma_pv_tiler[2],
++                    col_stride=256,
++                )
+ 
+     @producer_work
+     @cute.jit

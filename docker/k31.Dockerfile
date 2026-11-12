@@ -1,4 +1,5 @@
 # syntax=docker/dockerfile:1.7
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 # Kimi-K3.1 serving image built from a sglang-k31 checkout (the build context), with the compiled
 # parts that the K3.1 optimizations rely on. Without them the server still starts and answers
 # correctly, only slower (silent fallback):
@@ -7,7 +8,8 @@
 #                            token packing; PyPI sglang-kernel 0.4.10 has none of them
 #   3. FlashInfer DynBlock   TRT-LLM MoE routing modules rebuilt for 1024 experts (K3.1 has 896)
 # verify_image.py fails the build if any of the three fell back. Three more parts back opt-in paths:
-#   4. FlashInfer Prims-TS   main 26bb6dc9's prims_ts/ over 0.7.2, for --dsa-*-backend prims_ts
+#   4. FlashInfer Prims-TS   main 26bb6dc9's prims_ts/ over 0.7.2, for --dsa-*-backend prims_ts, plus
+#                            flashinfer-prims-ts-k31ht.patch (K31HT_MLA_TAILROW, default off)
 #   5. DeepGEMM              sgl-deep-gemm 0.2.3.post2 + DeepGEMM#130 (MegaMoE decode block_m)
 #   6. Dynamo 1.6.0          ai-dynamo-runtime rebuilt with the session-affinity patches and the
 #                            K3.1 edits to dynamo.sglang, so Dynamo+SGLang serves K3.1 as is
@@ -58,7 +60,8 @@ RUN cd /sgl-workspace/sglang/python/sglang/kernels/aot \
 # FlashInfer DynBlock: raise DynBlockKernelMaxNumExperts to 1024 in the installed headers and
 # rebuild the prebuilt jit-cache modules that include it, in place (no runtime env var needed).
 COPY docker/k31-image/patch_flashinfer.py docker/k31-image/build_flashinfer_dynblock.py \
-     docker/k31-image/overlay_flashinfer_prims_ts.py docker/k31-image/build_deepgemm.py \
+     docker/k31-image/overlay_flashinfer_prims_ts.py docker/k31-image/flashinfer-prims-ts-k31ht.patch \
+     docker/k31-image/build_deepgemm.py \
      docker/k31-image/deepgemm-mega-moe-decode-block-m.patch docker/k31-image/build_dynamo.py \
      docker/k31-image/verify_image.py /opt/k31-image/
 COPY docker/k31-image/dynamo/ /opt/k31-image/dynamo/

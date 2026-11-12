@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright contributors to the SGLang project
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 // K3 MNNVL fused all-reduce (bf16-only), two zero-copy algorithm families:
 //
 //   - push (1shot): lamport-style push, but the data staging is a SINGLE
@@ -162,9 +165,10 @@ constexpr uint32_t kFinTopK = 16;
 //   local[t] = sum_k fin_weights[t, k] * fin_gemm2[fin_idx[t*16 + k]]
 // All 16 gathers issue before the FMA chain; threads of the same token
 // broadcast-load the same routing rows. `W` is the routing-weight dtype
-// (bf16 or fp32; see finalize_push_norm).
-template <typename W>
-SGL_DEVICE device::AlignedVector<bf16x2_t, 4> finalize_vec(const FusionParams& params, uint32_t vid) {
+// (bf16 or fp32; see finalize_push_norm). `Params` is any params struct with
+// the fin_* fields (FusionParams, Push2Params).
+template <typename W, typename Params>
+SGL_DEVICE device::AlignedVector<bf16x2_t, 4> finalize_vec(const Params& params, uint32_t vid) {
   using namespace device;
   static_assert(std::is_same_v<W, bf16_t> || std::is_same_v<W, fp32_t>, "unsupported routing-weight dtype");
   constexpr uint32_t kIdxVecSize = kMaxVecBytes / sizeof(int32_t);
@@ -382,6 +386,317 @@ __global__ __launch_bounds__(kNormRowVecs / kClusterSize) __cluster_dims__(kClus
     params.push_counter[row_idx].set(phase ^ 1);
   }
 }
+
+#ifdef SGL_K3_AR_PUSH2  // the 2shot push band; built by all_reduce_residual._jit_push2_module only
+// Push2 family: barrier-free 2shot over the push plane, for the mid-size band
+// between the 1shot window and the sizes where the NVLS pull's bandwidth wins
+// over its two barriers. The protocol is all_reduce_2shot_push_kernel's
+// (csrc/distributed/custom_all_reduce.cuh): chunk c of the tensor is owned by
+// rank c; slot (dst, src) holds two chunk-sized halves, [0, chunk) taking src's
+// partial of chunk dst and [chunk, 2 * chunk) taking src's reduced chunk src.
+// Every word a round writes is reset by its consumer, so these kernels share
+// the slots and the phase counters with the 1shot kernels and the gathers
+// (grid = the counter array, each block flips its own counter).
+//
+// Unlike the generic kernel it works in place and carries the K3 epilogues:
+//   * res:  flat chunks; the owner adds the residual (identical on every rank).
+//   * norm: row-aligned chunks, so the owner holds whole latent rows and
+//           applies the RMSNorm before fanning them out.
+//   * finalize: the norm variant whose partial rows are the deferred MoE
+//           finalize (finalize_vec) instead of a staged input.
+// The owner reduces its chunk in rank order in fp32 (reduce_vec / reduce_sqr,
+// the 1shot kernels' arithmetic) and every rank stores the owner's bits.
+// kUseMc fans the reduced chunk out with one multimem store per vector (it
+// lands in the owner's own slot too, which the owner then drains like a peer)
+// instead of world_size - 1 unicast stores.
+
+template <uint32_t kWorldSize>
+struct Push2Params {
+  uint8_t* input;           // in place; output-only for the finalize variant
+  const uint8_t* residual;  // res only, may be null (kHasResidual selects)
+  device::distributed::PushWorkSpace<kWorldSize> ws;
+  uint32_t rank;
+  uint32_t num_vecs;    // 16B vectors of the whole tensor
+  uint32_t chunk_vecs;  // vectors per owner chunk (whole rows for norm)
+  // norm / finalize: RMSNorm over the first num_norm_rows rows of the
+  // [num_vecs / kNormRowVecs, kNormDim] row view
+  const uint8_t* norm_weight;
+  float norm_eps;
+  uint32_t num_norm_rows;
+  // finalize only (see FusionParams)
+  const uint8_t* fin_gemm2;
+  const uint8_t* fin_idx;
+  const uint8_t* fin_weights;
+};
+
+/// Warp groups of a push2 grid, one per peer: warps are dealt round-robin over
+/// blocks, then over the world_size - 1 peers, so every peer's scatter and
+/// drain is spread over the whole grid.
+template <uint32_t kWorldSize>
+struct Push2Groups {
+  static constexpr uint32_t kFan = kWorldSize - 1;
+  uint32_t global_tid, num_threads, peer, group_tid, group_stride;
+
+  SGL_DEVICE explicit Push2Groups(uint32_t rank) {
+    using device::kWarpThreads;
+    num_threads = blockDim.x * gridDim.x;
+    const auto num_warps = num_threads / kWarpThreads;
+    const auto lane = threadIdx.x % kWarpThreads;
+    const auto global_warp = blockIdx.x + gridDim.x * (threadIdx.x / kWarpThreads);
+    global_tid = global_warp * kWarpThreads + lane;
+    peer = (rank + 1 + global_warp % kFan) % kWorldSize;
+    const auto group_warps = num_warps / kFan + (global_warp % kFan < num_warps % kFan ? 1 : 0);
+    group_tid = (global_warp / kFan) * kWarpThreads + lane;
+    group_stride = group_warps * kWarpThreads;
+  }
+};
+
+SGL_DEVICE uint32_t push2_chunk_len(uint32_t num_vecs, uint32_t chunk_vecs, uint32_t c) {
+  return min(chunk_vecs, num_vecs - min(num_vecs, c * chunk_vecs));
+}
+
+/// Drain pass: the peer's reduced chunk (or, after a multicast fan-out, the
+/// owner's own) from slot (rank, src) into the output, resetting the markers.
+template <uint32_t kWorldSize>
+SGL_DEVICE void push2_drain(
+    const Push2Params<kWorldSize>& params,
+    const device::distributed::PushEpoch<kWorldSize>& epoch,
+    uint32_t src,
+    uint32_t first,
+    uint32_t stride) {
+  using vec_t = device::AlignedVector<bf16x2_t, 4>;
+  const auto chunk_vecs = params.chunk_vecs;
+  const auto len = push2_chunk_len(params.num_vecs, chunk_vecs, src);
+  const auto poll_ptr = epoch.slot_ptr(/*dst=*/params.rank, src);
+  vec_t zero_vec;
+  Lamport::fill_pos_zero(zero_vec.data());
+  for (auto j = first; j < len; j += stride) {
+    vec_t vec;
+    do {
+      device::ptx::ld_relaxed_16B(vec, poll_ptr, chunk_vecs + j);
+    } while (Lamport::has_pos_zero(vec.data()));
+    device::ptx::st_global_16B(vec, params.input, src * chunk_vecs + j);
+    device::ptx::st_global_16B(zero_vec, poll_ptr, chunk_vecs + j);
+  }
+}
+
+/// Fan the owner's reduced vector out: one multicast store, or a unicast store
+/// per peer plus the local output.
+template <bool kUseMc, uint32_t kWorldSize>
+SGL_DEVICE void push2_fan_out(
+    const Push2Params<kWorldSize>& params,
+    const device::distributed::PushEpoch<kWorldSize>& epoch,
+    const device::AlignedVector<bf16x2_t, 4>& out_vec,
+    uint32_t j) {
+  const auto r = params.rank;
+  const auto chunk_vecs = params.chunk_vecs;
+  if constexpr (kUseMc) {
+    const auto mc_ptr = params.ws.mc_workspace + epoch.slot_offset(/*src=*/r) + int64_t(chunk_vecs) * 16;
+    device::ptx::st_multimem_16B(out_vec, mc_ptr, j);
+  } else {
+#pragma unroll
+    for (uint32_t i = 0; i < kWorldSize; ++i) {
+      if (i != r) device::ptx::st_relaxed_16B(out_vec, epoch.slot_ptr(/*dst=*/i, /*src=*/r), chunk_vecs + j);
+    }
+    device::ptx::st_global_16B(out_vec, params.input, r * chunk_vecs + j);
+  }
+}
+
+template <uint32_t kWorldSize, bool kHasResidual, bool kUseMc, bool kUsePDL>
+__global__
+__launch_bounds__(1024, 1) void all_reduce_push2_res_kernel(const __grid_constant__ Push2Params<kWorldSize> params) {
+  using namespace device;
+  using vec_t = AlignedVector<bf16x2_t, 4>;
+  static_assert(kWorldSize >= 2);
+  const auto r = params.rank;
+  const auto chunk_vecs = params.chunk_vecs;
+  const auto g = Push2Groups<kWorldSize>{r};
+  const auto peer_len = push2_chunk_len(params.num_vecs, chunk_vecs, g.peer);
+
+  PDLWaitPrimary<kUsePDL>();
+  const auto epoch = distributed::PushEpoch<kWorldSize>{params.ws};
+
+  // reduce-scatter: my partial of the peer's chunk to its owner
+  {
+    const auto push_ptr = epoch.slot_ptr(/*dst=*/g.peer, /*src=*/r);
+    for (auto j = g.group_tid; j < peer_len; j += g.group_stride) {
+      vec_t vec;
+      ptx::ld_global_16B(vec, params.input, g.peer * chunk_vecs + j);
+      Lamport::clear_pos_zero(vec.data());
+      ptx::st_relaxed_16B(vec, push_ptr, j);
+    }
+  }
+
+  // reduce my chunk (+ residual) in rank order and fan it out
+  vec_t zero_vec;
+  Lamport::fill_pos_zero(zero_vec.data());
+  void* poll_ptrs[kWorldSize];
+#pragma unroll
+  for (uint32_t i = 0; i < kWorldSize; ++i) {
+    poll_ptrs[i] = epoch.slot_ptr(/*dst=*/r, /*src=*/i);
+  }
+  const auto my_len = push2_chunk_len(params.num_vecs, chunk_vecs, r);
+  for (auto j = g.global_tid; j < my_len; j += g.num_threads) {
+    const auto vid = r * chunk_vecs + j;
+    vec_t vec[kWorldSize + kHasResidual];
+    vec_t local_vec;
+    ptx::ld_global_16B(local_vec, params.input, vid);
+    if constexpr (kHasResidual) vec[kWorldSize].load(params.residual, vid);
+    do {
+      bool has_zero = false;
+#pragma unroll
+      for (uint32_t i = 0; i < kWorldSize; ++i) {
+        if (i != r) ptx::ld_relaxed_16B(vec[i], poll_ptrs[i], j);
+      }
+#pragma unroll
+      for (uint32_t i = 0; i < kWorldSize; ++i) {
+        has_zero |= (i != r) & Lamport::has_pos_zero(vec[i].data());
+      }
+      if (!has_zero) break;
+    } while (true);
+#pragma unroll
+    for (uint32_t i = 0; i < kWorldSize; ++i) {
+      if (i == r) vec[i] = local_vec;
+    }
+    auto out_vec = reduce_vec(vec);  // fp32 accumulation over 8(+1) inputs
+    // remap before the local store too, so every rank holds identical bits
+    Lamport::clear_pos_zero(out_vec.data());
+    push2_fan_out<kUseMc>(params, epoch, out_vec, j);
+#pragma unroll
+    for (uint32_t i = 0; i < kWorldSize; ++i) {
+      if (i != r) ptx::st_global_16B(zero_vec, poll_ptrs[i], j);
+    }
+  }
+
+  // all-gather: drain the peer's reduced chunk (and my own after a multicast)
+  push2_drain(params, epoch, g.peer, g.group_tid, g.group_stride);
+  if constexpr (kUseMc) push2_drain(params, epoch, r, g.global_tid, g.num_threads);
+
+  PDLTriggerSecondary<kUsePDL>();
+  __syncthreads();
+  epoch.flip();
+}
+
+// One block of kNormRowVecs threads per latent row in the owner pass (the
+// pull_norm kernel's row layout: warp partials of the sum of squares, summed
+// in warp order). The owner rows go to the grid's last blocks while the
+// scatter's warp groups fill it from the first, and each owner block loads
+// (finalizes) its first row's partial before it scatters, so neither waits on
+// the other. FinWeight != void selects the finalize variant.
+template <uint32_t kWorldSize, bool kUseMc, bool kUsePDL, typename FinWeight = void>
+__global__ __launch_bounds__(kNormRowVecs, 1) void all_reduce_push2_norm_kernel(
+    const __grid_constant__ Push2Params<kWorldSize> params) {
+  using namespace device;
+  using vec_t = AlignedVector<bf16x2_t, 4>;
+  constexpr bool kFinalize = !std::is_void_v<FinWeight>;
+  static_assert(kWorldSize >= 2);
+  const auto tx = threadIdx.x;
+  const auto r = params.rank;
+  const auto chunk_vecs = params.chunk_vecs;
+  const auto g = Push2Groups<kWorldSize>{r};
+  const auto peer_len = push2_chunk_len(params.num_vecs, chunk_vecs, g.peer);
+  // this rank's partial of one vector: the deferred finalize or the input
+  const auto load_partial = [&](uint32_t vid) {
+    vec_t vec;
+    if constexpr (kFinalize) {
+      vec = finalize_vec<FinWeight>(params, vid);
+    } else {
+      ptx::ld_global_16B(vec, params.input, vid);
+    }
+    return vec;
+  };
+  const auto owner_slot = gridDim.x - 1 - blockIdx.x;
+  const auto my_rows = push2_chunk_len(params.num_vecs, chunk_vecs, r) / kNormRowVecs;
+
+  PDLWaitPrimary<kUsePDL>();
+  const auto epoch = distributed::PushEpoch<kWorldSize>{params.ws};
+
+  vec_t first_local;
+  if (owner_slot < my_rows) first_local = load_partial(r * chunk_vecs + owner_slot * kNormRowVecs + tx);
+
+  // reduce-scatter: my partial rows of the peer's chunk to its owner
+  {
+    const auto push_ptr = epoch.slot_ptr(/*dst=*/g.peer, /*src=*/r);
+    for (auto j = g.group_tid; j < peer_len; j += g.group_stride) {
+      auto vec = load_partial(g.peer * chunk_vecs + j);
+      Lamport::clear_pos_zero(vec.data());
+      ptx::st_relaxed_16B(vec, push_ptr, j);
+    }
+  }
+
+  // reduce + norm my rows, one row per block pass, and fan them out
+  vec_t w;
+  w.load(params.norm_weight, tx);
+  vec_t zero_vec;
+  Lamport::fill_pos_zero(zero_vec.data());
+  void* poll_ptrs[kWorldSize];
+#pragma unroll
+  for (uint32_t i = 0; i < kWorldSize; ++i) {
+    poll_ptrs[i] = epoch.slot_ptr(/*dst=*/r, /*src=*/i);
+  }
+  __shared__ float smem[2][kNormWarps];
+  uint32_t parity = 0;
+  const auto row_base = r * (chunk_vecs / kNormRowVecs);
+  for (auto row = owner_slot; row < my_rows; row += gridDim.x) {
+    const auto j = row * kNormRowVecs + tx;
+    const auto local_vec = row == owner_slot ? first_local : load_partial(r * chunk_vecs + j);
+    vec_t vec[kWorldSize];
+    do {
+      bool has_zero = false;
+#pragma unroll
+      for (uint32_t i = 0; i < kWorldSize; ++i) {
+        if (i != r) ptx::ld_relaxed_16B(vec[i], poll_ptrs[i], j);
+      }
+#pragma unroll
+      for (uint32_t i = 0; i < kWorldSize; ++i) {
+        has_zero |= (i != r) & Lamport::has_pos_zero(vec[i].data());
+      }
+      if (!has_zero) break;
+    } while (true);
+#pragma unroll
+    for (uint32_t i = 0; i < kWorldSize; ++i) {
+      if (i == r) vec[i] = local_vec;
+    }
+    vec_t out_vec;
+    if (row_base + row < params.num_norm_rows) {  // block-uniform
+      auto& sm = smem[parity];
+      parity ^= 1;
+      const auto warp_sqr = warp::reduce_sum(reduce_sqr(out_vec, vec));
+      if (tx % kWarpThreads == 0) sm[tx / kWarpThreads] = warp_sqr;
+      __syncthreads();
+      float total = 0.0f;
+#pragma unroll
+      for (uint32_t i = 0; i < kNormWarps; ++i) {
+        total += sm[i];
+      }
+      const auto norm_factor = math::rsqrt(total / kNormDim + params.norm_eps);
+#pragma unroll
+      for (uint32_t k = 0; k < 4; ++k) {
+        const auto [a, b] = cast<fp32x2_t>(out_vec[k]);
+        const auto [wa, wb] = cast<fp32x2_t>(w[k]);
+        out_vec[k] = cast<bf16x2_t>(fp32x2_t{a * norm_factor * wa, b * norm_factor * wb});
+      }
+    } else {
+      out_vec = reduce_vec(vec);
+    }
+    Lamport::clear_pos_zero(out_vec.data());
+    push2_fan_out<kUseMc>(params, epoch, out_vec, j);
+#pragma unroll
+    for (uint32_t i = 0; i < kWorldSize; ++i) {
+      if (i != r) ptx::st_global_16B(zero_vec, poll_ptrs[i], j);
+    }
+  }
+
+  // all-gather: drain the peer's reduced rows (and my own after a multicast)
+  push2_drain(params, epoch, g.peer, g.group_tid, g.group_stride);
+  // (same row-per-block mapping as the owner pass)
+  if constexpr (kUseMc) push2_drain(params, epoch, r, owner_slot * kNormRowVecs + tx, gridDim.x * kNormRowVecs);
+
+  PDLTriggerSecondary<kUsePDL>();
+  __syncthreads();
+  epoch.flip();
+}
+#endif  // SGL_K3_AR_PUSH2
 
 // Pull family: low-SM NVLS, reusing the CustomAllReduceV2 pull semaphores
 
@@ -709,6 +1024,38 @@ struct AllReduceFusionKernel {
     return params;
   }
 
+#ifdef SGL_K3_AR_PUSH2
+  /// Push2 params: the flat (res) or row-aligned (norm, `row_chunks`) owner
+  /// chunks, and the push-plane slice their two halves need per slot.
+  static Push2Params<kWorldSize> make_push2_params(
+      const host::distributed::CommunicatorObj& comm,
+      TensorView input,
+      std::optional<TensorView> residual,
+      bool row_chunks,
+      bool use_mc) {
+    using namespace host;
+    const auto& push = comm.get_push_obj();
+    const auto fused = make_params(comm, input, residual);  // dtype / device / size checks
+    const auto num_vecs = fused.num_vecs;
+    uint32_t chunk_vecs = div_ceil(num_vecs, kWorldSize);
+    if (row_chunks) {
+      CHECK_HOST(num_vecs % kNormRowVecs == 0)
+          << "numel must be a multiple of " << kNormDim << ", got " << int64_t(num_vecs) * 8;
+      chunk_vecs = div_ceil(num_vecs / kNormRowVecs, kWorldSize) * kNormRowVecs;
+    }
+    CHECK_HOST(!use_mc || push.mc_workspace != nullptr) << "the multicast fan-out needs a multicast push plane";
+    Push2Params<kWorldSize> params{};
+    params.input = fused.input;
+    params.residual = fused.residual;
+    // each slot holds a partial half and a gathered half of one chunk
+    params.ws = push.get_workspace<kWorldSize>(int64_t{2} * chunk_vecs * 16);
+    params.rank = push.rank;
+    params.num_vecs = num_vecs;
+    params.chunk_vecs = chunk_vecs;
+    return params;
+  }
+#endif  // SGL_K3_AR_PUSH2
+
   // Runtime unroll dispatch: every supported width is compiled into the
   // module so the tuned per-size unroll needs no extra JIT builds.
   template <bool kHasResidual>
@@ -825,6 +1172,96 @@ struct AllReduceFusionKernel {
     host::LaunchKernel((num_row_clusters + 1) * kClusterSize, kNormRowVecs / kClusterSize, out.device())
         .enable_pdl(kUsePDL)(kernel, params);
   }
+
+#ifdef SGL_K3_AR_PUSH2
+  /// In-place ``x = allreduce(x) [+ residual]`` via the barrier-free 2shot
+  /// push (any contiguous bf16 tensor; two chunk halves must fit a slot).
+  static void push2_res(CommunicatorRef ref, TensorView input, std::optional<TensorView> residual, bool use_mc) {
+    using namespace host;
+    const auto& push = ref.get()->get_push_obj();
+    const auto params = make_push2_params(*ref.get(), input, residual, /*row_chunks=*/false, use_mc);
+    const auto launch = [&](auto kernel) {
+      // the grid is bound to the counter array; at least one warp per peer
+      const auto block_size =
+          std::max(choose_block_size(params.num_vecs), 32u * host::div_ceil(kWorldSize - 1, push.num_blocks));
+      host::LaunchKernel(push.num_blocks, block_size, input.device()).enable_pdl(kUsePDL)(kernel, params);
+    };
+    if (residual.has_value()) {
+      use_mc ? launch(all_reduce_push2_res_kernel<kWorldSize, true, true, kUsePDL>)
+             : launch(all_reduce_push2_res_kernel<kWorldSize, true, false, kUsePDL>);
+    } else {
+      use_mc ? launch(all_reduce_push2_res_kernel<kWorldSize, false, true, kUsePDL>)
+             : launch(all_reduce_push2_res_kernel<kWorldSize, false, false, kUsePDL>);
+    }
+  }
+
+  /// In-place 2shot push allreduce + RMSNorm over the first num_norm_rows rows
+  /// of the [numel / 3584, 3584] row view (same contract as push_norm).
+  static void
+  push2_norm(CommunicatorRef ref, TensorView input, TensorView weight, float eps, int64_t num_norm_rows, bool use_mc) {
+    using namespace host;
+    const auto& push = ref.get()->get_push_obj();
+    const auto norm = make_params_norm(*ref.get(), input, weight, eps, num_norm_rows);
+    auto params = make_push2_params(*ref.get(), input, std::nullopt, /*row_chunks=*/true, use_mc);
+    params.norm_weight = norm.norm_weight;
+    params.norm_eps = norm.norm_eps;
+    params.num_norm_rows = norm.num_norm_rows;
+    const auto kernel = use_mc ? all_reduce_push2_norm_kernel<kWorldSize, true, kUsePDL>
+                               : all_reduce_push2_norm_kernel<kWorldSize, false, kUsePDL>;
+    host::LaunchKernel(push.num_blocks, kNormRowVecs, input.device()).enable_pdl(kUsePDL)(kernel, params);
+  }
+
+  /// Deferred MoE finalize + 2shot push all-reduce + RMSNorm over EVERY row:
+  /// finalize_push_norm's contract for the sizes past the 1shot window.
+  static void finalize_push2_norm(
+      CommunicatorRef ref,
+      TensorView out,
+      TensorView gemm2_out,
+      TensorView permuted_idx,
+      TensorView expert_weights,
+      TensorView weight,
+      float eps,
+      bool use_mc) {
+    using namespace host;
+    const auto& push = ref.get()->get_push_obj();
+    const auto norm = make_params_norm(*ref.get(), out, weight, eps, out.size(0) / kNormDim);
+    const auto num_tokens = norm.num_vecs / kNormRowVecs;
+
+    auto P = SymbolicSize{"num_permuted_rows"};
+    auto T = SymbolicSize{"num_tokens"};
+    T.set_value(num_tokens);
+    auto K = SymbolicSize{"top_k"};
+    auto TK = SymbolicSize{"num_expanded"};
+    TK.set_value(static_cast<int64_t>(num_tokens) * kFinTopK);
+    SymbolicDevice device;
+    device.set_options<kDLGPU>();
+    TensorMatcher({P, kNormDim}).with_dtype<bf16_t>().with_device<kDLGPU>(device).verify(gemm2_out);
+    TensorMatcher({T, K}).with_dtype<fp32_t, bf16_t>().with_device<kDLGPU>(device).verify(expert_weights);
+    TensorMatcher({TK}).with_dtype<int32_t>().with_device<kDLGPU>(device).verify(permuted_idx);
+    CHECK_HOST(K.unwrap() == kFinTopK) << "finalize_push2_norm is specialized for top_k = " << kFinTopK;
+
+    auto params = make_push2_params(*ref.get(), out, std::nullopt, /*row_chunks=*/true, use_mc);
+    params.norm_weight = norm.norm_weight;
+    params.norm_eps = norm.norm_eps;
+    params.num_norm_rows = norm.num_norm_rows;
+    params.fin_gemm2 = static_cast<const uint8_t*>(gemm2_out.data_ptr());
+    params.fin_idx = static_cast<const uint8_t*>(permuted_idx.data_ptr());
+    params.fin_weights = static_cast<const uint8_t*>(expert_weights.data_ptr());
+    CHECK_HOST(reinterpret_cast<uintptr_t>(params.fin_weights) % device::kMaxVecBytes == 0)
+        << "expert_weights must be " << device::kMaxVecBytes << "B aligned";
+
+    const auto launch = [&](auto kernel) {
+      host::LaunchKernel(push.num_blocks, kNormRowVecs, out.device()).enable_pdl(kUsePDL)(kernel, params);
+    };
+    if (is_type<fp32_t>(expert_weights.dtype())) {
+      use_mc ? launch(all_reduce_push2_norm_kernel<kWorldSize, true, kUsePDL, fp32_t>)
+             : launch(all_reduce_push2_norm_kernel<kWorldSize, false, kUsePDL, fp32_t>);
+    } else {
+      use_mc ? launch(all_reduce_push2_norm_kernel<kWorldSize, true, kUsePDL, bf16_t>)
+             : launch(all_reduce_push2_norm_kernel<kWorldSize, false, kUsePDL, bf16_t>);
+    }
+  }
+#endif  // SGL_K3_AR_PUSH2
 
   /// Low-SM NVLS pull (+ optional residual): in-place reduce-scatter +
   /// broadcast on the symmetric input, whose multicast VA the caller passes

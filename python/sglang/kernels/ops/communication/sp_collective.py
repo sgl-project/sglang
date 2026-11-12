@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the SGLang project
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 """K3 SP-MoE bf16 reduce-scatter and all-gather over MNNVL push memory."""
 
 from __future__ import annotations
@@ -48,11 +51,31 @@ def _device_name(device: torch.device) -> str:
     return torch.cuda.get_device_name(device).replace(" ", "_").replace("/", "_")
 
 
-def _table(world_size: int, hidden_size: int, device: torch.device) -> Optional[dict]:
-    path = os.path.join(
+# SM107 (VR200) has no measured table yet; under SGLANG_ENABLE_K3_SM107 it
+# takes GB300's (same NVL72 MNNVL topology) until a VR200 sweep is checked in.
+_SM107_SEED_DEVICE_NAME = "NVIDIA_GB300"
+
+
+def _table_path(world_size: int, hidden_size: int, device_name: str) -> str:
+    return os.path.join(
         _CONFIG_DIR,
-        (f"world={world_size},H={hidden_size},device_name={_device_name(device)}.json"),
+        f"world={world_size},H={hidden_size},device_name={device_name}.json",
     )
+
+
+def _sm107_seeded(device: torch.device) -> bool:
+    from sglang.srt.environ import envs
+
+    return (
+        tuple(torch.cuda.get_device_capability(device)) == (10, 7)
+        and envs.SGLANG_ENABLE_K3_SM107.get()
+    )
+
+
+def _table(world_size: int, hidden_size: int, device: torch.device) -> Optional[dict]:
+    path = _table_path(world_size, hidden_size, _device_name(device))
+    if not os.path.exists(path) and _sm107_seeded(device):
+        path = _table_path(world_size, hidden_size, _SM107_SEED_DEVICE_NAME)
     if path not in _TABLES:
         if os.path.exists(path):
             with open(path) as f:

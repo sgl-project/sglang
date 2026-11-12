@@ -1,3 +1,8 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the SGLang project
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
+from typing import Optional
+
 import torch
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
@@ -45,6 +50,7 @@ def mla_quantize_and_rope_for_fp8(
     is_neox: bool,
     kv_lora_rank: int,
     qk_rope_head_dim: int,
+    q_out: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     import flashinfer.rope
 
@@ -82,12 +88,24 @@ def mla_quantize_and_rope_for_fp8(
 
     # Allocate output tensors with FP8 dtype
     # Query output will contain merged nope + rope components
-    q_out = q_rope.new_empty(
-        q_len,
-        num_heads,
-        kv_lora_rank + qk_rope_head_dim,
-        dtype=attn_dtype,
-    )
+    if q_out is None:
+        q_out = q_rope.new_empty(
+            q_len,
+            num_heads,
+            kv_lora_rank + qk_rope_head_dim,
+            dtype=attn_dtype,
+        )
+    else:
+        # A caller-owned [q_len, num_heads, kv_lora_rank + qk_rope_head_dim]
+        # view (last dim contiguous, any row / head stride): the kernel takes
+        # the output strides, so each element is the same value it writes to a
+        # fresh tensor.
+        assert q_out.dtype == attn_dtype and q_out.stride(-1) == 1, q_out.dtype
+        assert tuple(q_out.shape) == (
+            q_len,
+            num_heads,
+            kv_lora_rank + qk_rope_head_dim,
+        ), tuple(q_out.shape)
 
     # Key outputs maintain original shapes but with FP8 dtype
     k_rope_out = k_rope.new_empty(k_rope.shape, dtype=attn_dtype)

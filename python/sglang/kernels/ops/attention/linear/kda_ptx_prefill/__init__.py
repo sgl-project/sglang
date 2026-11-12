@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Hand-written PTX/tcgen05 KDA chunked-prefill kernel (sm_100a / sm_103a).
+# SPDX-FileCopyrightText: Copyright contributors to the SGLang project
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
+"""Hand-written PTX/tcgen05 KDA chunked-prefill kernel (sm_100a / sm_103a / sm_107a).
 
 Vendored from the upstream ``kda_prefill`` artifact (commit 33583615): the CUDA
 source in ``kernels/jit/csrc/attention/kda_prefill.cu`` plus the FLA-signature
@@ -11,9 +13,9 @@ The extension is JIT-compiled with ``torch.utils.cpp_extension`` on first use
 (~1-2 min, cached under ``TORCH_EXTENSIONS_DIR``); concurrent TP ranks
 serialize on torch's build lock and then load the cached .so.
 
-The kernel uses only the tcgen05 subset that sm_100a and sm_103a share, so it
-is built for whichever of the two the device is (arch-specific cubins do not
-run across them).
+The kernel uses only the tcgen05 subset that sm_100a, sm_103a and sm_107a
+share, so it is built for whichever of them the device is (arch-specific
+cubins do not run across them).
 """
 
 import os
@@ -23,8 +25,8 @@ import torch
 K = 128  # head dim (qk == v), fixed by the kernel
 CHUNK = 64  # kernel chunk size, fixed
 
-# Compute capability -> build target: B200 / GB200 and B300 / GB300.
-SM_ARCHS = {(10, 0): "100a", (10, 3): "103a"}
+# Compute capability -> build target: B200 / GB200, B300 / GB300 and VR200.
+SM_ARCHS = {(10, 0): "100a", (10, 3): "103a", (10, 7): "107a"}
 
 _EXT_NAME = "kda_prefill_ptx"
 _ext = None
@@ -53,7 +55,7 @@ def load_ext():
         capability = torch.cuda.get_device_capability()
         if capability not in SM_ARCHS:
             raise RuntimeError(
-                "PTX KDA prefill needs SM100 or SM103, got "
+                "PTX KDA prefill needs SM100, SM103 or SM107, got "
                 f"SM{capability[0]}{capability[1]}"
             )
         arch = SM_ARCHS[capability]
@@ -100,6 +102,8 @@ def chunk_kda_fwd(
     use_qk_l2norm_in_kernel: bool = False,
     use_beta_sigmoid_in_kernel: bool = False,
     allow_neg_eigval: bool = False,
+    track_state: torch.Tensor | None = None,
+    track_chunk_idx: torch.Tensor | None = None,
 ):
     """Inference drop-in for fla's chunk_kda_fwd (forward only).
 
@@ -122,6 +126,12 @@ def chunk_kda_fwd(
       initial_state [N,H,128,128] fp32 or None (zeros).
       return_intermediate_states=True returns dense fp32 chunk-boundary states
         [1, NT, H, 128, 128] at tuple index 10.
+      track_state [N,H,128,128] fp32 contiguous + track_chunk_idx [N] (both or
+        neither; not with return_intermediate_states): the kernel writes
+        track_state[n] = sequence n's state entering its chunk
+        track_chunk_idx[n] (layout per state_v_first) and leaves rows whose
+        index is outside [0, ceil(len_n / 64)) untouched, like fla's
+        chunk_gated_delta_rule_fwd_h track_state output.
 
     Returns the fla-shaped 12-tuple: (o [B,T,H,128] bf16, final_state
     [N,H,128,128] fp32 or None, then Nones, ..., h, initial_state).
@@ -180,11 +190,23 @@ def chunk_kda_fwd(
         gf = gf.contiguous()
         sg, a_log_flat, dtb, lb = False, None, None, 0.0
 
+    assert (track_state is None) == (track_chunk_idx is None), (
+        "track_state and track_chunk_idx must be passed together"
+    )
     h = None
-    if return_intermediate_states:
+    hpc, trk = None, None
+    if track_state is not None:
+        assert not return_intermediate_states, (
+            "track_state and return_intermediate_states are exclusive here"
+        )
+        assert track_state.dtype == torch.float32 and track_state.is_contiguous(), (
+            f"track_state must be contiguous fp32, got {track_state.dtype}"
+        )
+        hpc, trk = track_state, track_chunk_idx.to(torch.int32).contiguous()
+    elif return_intermediate_states:
         lens = (cu_cpu[1:] - cu_cpu[:-1]).tolist() if cu_cpu is not None else [Tt]
         nt = sum((int(length) + CHUNK - 1) // CHUNK for length in lens)
-        h = torch.empty(nt, H, K, K, dtype=torch.float32, device=q.device)
+        h = hpc = torch.empty(nt, H, K, K, dtype=torch.float32, device=q.device)
 
     o, Sf = load_ext().kda_prefill_fwd(
         qf,
@@ -202,8 +224,9 @@ def chunk_kda_fwd(
         lower_bound=lb,
         use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
         use_beta_sigmoid_in_kernel=use_beta_sigmoid_in_kernel,
-        h_per_chunk=h,
+        h_per_chunk=hpc,
         h_v_first=state_v_first,
+        **({} if trk is None else dict(track_chunk_idx=trk)),
     )
 
     o = o.view(B, T, H, K)

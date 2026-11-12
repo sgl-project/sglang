@@ -1,6 +1,7 @@
 # Adapt from https://github.com/fla-org/flash-linear-attention/blob/main/fla/modules/l2norm.py
 # -*- coding: utf-8 -*-
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 
 from typing import Optional
 
@@ -10,6 +11,7 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.attention.fla.utils import input_guard
+from sglang.srt.environ import envs
 
 BT_LIST = [8, 16, 32, 64, 128]
 
@@ -259,6 +261,117 @@ def gdn_prefill_qkv_prepare_fwd(
         num_stages=2,
     )
     return l2norm_fwd(q_out, eps), l2norm_fwd(k_out, eps), v_out
+
+
+# K3.1 QKVP (SGLANG_K31_KDA_QKV_PREP, default 0 = stock; read at import): chunk_kda prepares
+# strided q / k / v views of the prefill conv output in ONE launch (q / k L2-normalized, v copied, all
+# written token-major contiguous) instead of q.contiguous() + l2norm, k.contiguous() + l2norm and
+# v.contiguous() (three torch strided copies + two l2norm launches). Bitwise: each q / k head block uses
+# l2norm_fwd_kernel's (BT, BD) block, op order and num_warps, so the row reduction is unchanged.
+KDA_QKV_PREP = envs.SGLANG_K31_KDA_QKV_PREP.get()
+
+
+@triton.jit(do_not_specialize=["T"])
+def kda_qkv_l2norm_prepare_kernel(
+    q,
+    k,
+    v,
+    q_out,
+    k_out,
+    v_out,
+    q_stride_t,
+    q_stride_h,
+    k_stride_t,
+    k_stride_h,
+    v_stride_t,
+    v_stride_h,
+    eps,
+    T,
+    H: tl.constexpr,
+    D: tl.constexpr,
+    BT: tl.constexpr,
+    BD: tl.constexpr,
+):
+    # Triton >= 3.9 removed block pointers: plain masked pointer loads / stores over
+    # l2norm_fwd_kernel's (BT, BD) tile with its mask and other=0.0 (rows >= T are
+    # neither stored nor part of any kept row's reduction), so the arithmetic is unchanged.
+    i_t = tl.program_id(0).to(tl.int64)
+    i_h = tl.program_id(1)
+    o_t = i_t * BT + tl.arange(0, BT)
+    o_d = tl.arange(0, BD)
+    m_x = (o_t[:, None] < T) & (o_d[None, :] < D)
+    if i_h < H:
+        p_x = q + i_h * q_stride_h + o_t[:, None] * q_stride_t + o_d[None, :]
+        b_x = tl.load(p_x, mask=m_x, other=0.0).to(tl.float32)
+        b_var = tl.sum(b_x * b_x, axis=1)
+        b_y = b_x / tl.sqrt(b_var + eps)[:, None]
+        p_y = q_out + i_h * D + o_t[:, None] * (H * D) + o_d[None, :]
+        tl.store(p_y, b_y.to(p_y.dtype.element_ty), mask=m_x)
+    elif i_h < 2 * H:
+        i_k = i_h - H
+        p_x = k + i_k * k_stride_h + o_t[:, None] * k_stride_t + o_d[None, :]
+        b_x = tl.load(p_x, mask=m_x, other=0.0).to(tl.float32)
+        b_var = tl.sum(b_x * b_x, axis=1)
+        b_y = b_x / tl.sqrt(b_var + eps)[:, None]
+        p_y = k_out + i_k * D + o_t[:, None] * (H * D) + o_d[None, :]
+        tl.store(p_y, b_y.to(p_y.dtype.element_ty), mask=m_x)
+    else:
+        i_v = i_h - 2 * H
+        p_x = v + i_v * v_stride_h + o_t[:, None] * v_stride_t + o_d[None, :]
+        b_v = tl.load(p_x, mask=m_x, other=0.0)
+        p_y = v_out + i_v * D + o_t[:, None] * (H * D) + o_d[None, :]
+        tl.store(p_y, b_v, mask=m_x)
+
+
+def kda_qkv_prep_eligible(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> bool:
+    """[1, T, H, D] views with unit last stride, equal shapes / dtypes, at least one non-contiguous."""
+    return (
+        q.dim() == 4
+        and q.shape[0] == 1
+        and k.shape == q.shape
+        and v.shape == q.shape
+        and q.dtype == k.dtype == v.dtype
+        and q.stride(-1) == 1
+        and k.stride(-1) == 1
+        and v.stride(-1) == 1
+        and q.shape[-1] <= 512
+        and not (q.is_contiguous() and k.is_contiguous() and v.is_contiguous())
+    )
+
+
+def kda_qkv_l2norm_prepare_fwd(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, eps: float = 1e-6
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """== (l2norm_fwd(q.contiguous()), l2norm_fwd(k.contiguous()), v.contiguous()) bitwise, one launch."""
+    _, T, H, D = q.shape
+    q_out = torch.empty(q.shape, dtype=q.dtype, device=q.device)
+    k_out = torch.empty(k.shape, dtype=k.dtype, device=k.device)
+    v_out = torch.empty(v.shape, dtype=v.dtype, device=v.device)
+    BT = 16
+    BD = triton.next_power_of_2(D)
+    kda_qkv_l2norm_prepare_kernel[(triton.cdiv(T, BT), 3 * H)](
+        q,
+        k,
+        v,
+        q_out,
+        k_out,
+        v_out,
+        q.stride(1),
+        q.stride(2),
+        k.stride(1),
+        k.stride(2),
+        v.stride(1),
+        v.stride(2),
+        eps,
+        T=T,
+        H=H,
+        D=D,
+        BT=BT,
+        BD=BD,
+        num_warps=8,
+        num_stages=3,
+    )
+    return q_out, k_out, v_out
 
 
 class L2NormFunction(torch.autograd.Function):

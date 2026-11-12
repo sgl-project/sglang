@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the SGLang project
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 """
 Life cycle of a request in the prefill server
 
@@ -88,6 +91,7 @@ from sglang.srt.mem_cache.common import (
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
+from sglang.srt.mem_cache.prefill_budget import park_chunked_prefill_enabled
 from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.observability.req_time_stats import set_schedule_time_batch
@@ -854,12 +858,20 @@ class SchedulerDisaggregationPrefillMixin:
         Shutdown stops new launches; a wait finishes through the blocking handler.
         After a failed preparation, only new input or bootstrap arrivals retry
         during the wait; other readiness is checked after a result finishes.
+        With SGLANG_DISAGG_PREFILL_EAGER_RESULT_FIRST (and polling off), an eager
+        forward's result that is already complete on every TP rank is processed
+        before the next launch.
         """
         self.enable_continuous_input_polling = (
             self._is_continuous_input_polling_enabled()
         )
         poll_transfers_while_waiting = self._is_transfer_wait_polling_enabled()
         poll_hicache_while_waiting = self._is_hicache_wait_polling_enabled()
+        # Continuous input polling keeps its own two-deep discipline.
+        eager_result_first = (
+            envs.SGLANG_DISAGG_PREFILL_EAGER_RESULT_FIRST.get()
+            and not self.enable_continuous_input_polling
+        )
         self.result_queue = deque()
         batch_result_completion_status = torch.empty(1, dtype=torch.int32, device="cpu")
         # True when intake repeats while the oldest batch result is unfinished.
@@ -897,6 +909,14 @@ class SchedulerDisaggregationPrefillMixin:
             # Resume batch creation on completion, new/ready requests, or an idle step.
             if not waiting_for_batch_result or received_inputs or bootstrapped_reqs:
                 skip_batch_creation = False
+
+            # A CPU-bound eager launch often outlasts its forward on the GPU, so the
+            # result is ready before the next launch: finish it now rather than one
+            # forward later. This never waits on the GPU.
+            processed_before_launch = (
+                eager_result_first
+                and self._process_eager_result_first(batch_result_completion_status)
+            )
 
             # Keep at most two batches in flight. On shutdown, launch nothing new
             # except the one selection whose MLP-sync gather carries this rank's
@@ -943,7 +963,10 @@ class SchedulerDisaggregationPrefillMixin:
                 else:
                     batch_result = None
 
-            if self.last_batch:
+            if processed_before_launch:
+                # This step already finished the previous batch's result.
+                pass
+            elif self.last_batch:
                 # L3 I/O (fenced on forward_stream) also makes the wait poll, so
                 # prefetch completions and write acks land during the forward.
                 pump_hicache = (
@@ -1003,6 +1026,26 @@ class SchedulerDisaggregationPrefillMixin:
             self.last_batch = batch
             waiting_for_batch_result = False
             self.invariant_checker.run(CheckPhase.BUSY, batch)
+
+    def _process_eager_result_first(
+        self: Scheduler, batch_result_completion_status: torch.Tensor
+    ) -> bool:
+        # Only when the newest forward ran eagerly: a forward still running on any
+        # TP rank (GPU-bound) and graph replays keep the two-deep overlap. Every
+        # check before the collective must read state identical on every TP rank.
+        if not (
+            self.result_queue
+            and not self.result_queue[-1][1].can_run_cuda_graph
+            and self.result_queue[0][1].copy_done is not None
+            and self.result_queue[0][1].delay_sample_func is None
+            and self.is_disagg_prefill_batch_result_ready(
+                self.result_queue[0][1], batch_result_completion_status
+            )
+        ):
+            return False
+        oldest_batch, oldest_batch_result = self.result_queue.popleft()
+        self.process_batch_result(oldest_batch, oldest_batch_result)
+        return True
 
     def is_disagg_prefill_batch_result_ready(
         self: Scheduler,
@@ -1554,7 +1597,14 @@ class SchedulerDisaggregationPrefillMixin:
         reqs_to_exclude = set()
         if (req := self.chunked_req) is not None:
             reqs_to_exclude.add(req)
-            self.checkpoint_disagg_prefill(req)
+            # #44823 (gated): a parked chunk (add_chunked_req found no budget)
+            # leaves extend_end at prefix_len: it computed no new KV to
+            # checkpoint or send.
+            computed = (
+                not park_chunked_prefill_enabled() or req.extend_end > req.prefix_len
+            )
+            if computed:
+                self.checkpoint_disagg_prefill(req)
 
             if not self.check_bootstrap(req):
                 if is_aborted(req):
@@ -1574,13 +1624,13 @@ class SchedulerDisaggregationPrefillMixin:
                             req, self.prefill_launched_reqs
                         )
                 # else: still bootstrapping, keep computing without sending
-            elif self.enable_overlap:
+            elif computed and self.enable_overlap:
                 # Delay KV transfer to process_batch_result_disagg_prefill when overlap is enabled to ensure results are resolved
                 req.tmp_end_idx = min(
                     req.extend_end,
                     len(req.origin_input_ids),
                 )
-            else:
+            elif computed:
                 self.send_kv_chunk(req)
 
             if self.chunked_req is not None:

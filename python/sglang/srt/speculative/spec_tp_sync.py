@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the SGLang project
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 from __future__ import annotations
 
 import logging
@@ -117,6 +120,18 @@ def parse_spec_tp_sync(spec: str) -> frozenset[SpecTpSyncSite]:
     return sites
 
 
+# DFlash sites whose payloads are token ids and accept lengths: integers below the vocabulary size, which an fp32
+# sum carries exactly (|v| < 2**24).
+_ALLREDUCE_SITES = frozenset(
+    {
+        SpecTpSyncSite.DFLASH_SELECTOR,
+        SpecTpSyncSite.DFLASH_ACCEPT_SAMPLE,
+        SpecTpSyncSite.DFLASH_ACCEPT_GREEDY,
+        SpecTpSyncSite.DFLASH_TARGET,
+    }
+)
+
+
 class SpecTpSync:
     """Broadcasts a speculative decision from rank 0 to its TP group."""
 
@@ -125,6 +140,16 @@ class SpecTpSync:
         # Parsed even on a single rank so a typo fails on every deployment.
         sites = parse_spec_tp_sync(envs.SGLANG_SPEC_TP_SYNC.get())
         self._sites = sites if tp_group.world_size > 1 else frozenset()
+        # SGLANG_OPT_SPEC_TP_SYNC_ALLREDUCE: a ring broadcast releases rank 0 about one hop per rank before
+        # the last rank, which then holds every rank at the next collective; an all-reduce of rank 0's values
+        # plus zeros leaves all ranks together.
+        self._allreduce_sites = (
+            _ALLREDUCE_SITES
+            if envs.SGLANG_OPT_SPEC_TP_SYNC_ALLREDUCE.get()
+            else frozenset()
+        )
+        self._is_root = tp_group.rank_in_group == 0
+        self._allreduce_noted: set = set()
         if (
             envs.SGLANG_SPEC_TP_SYNC.is_set()
             and tp_group.world_size > 1
@@ -139,9 +164,38 @@ class SpecTpSync:
         return site in self._sites
 
     def sync(self, site: SpecTpSyncSite, values: torch.Tensor) -> torch.Tensor:
-        if site in self._sites:
+        if site not in self._sites:
+            return values
+        if site in self._allreduce_sites and values.dtype in (torch.int32, torch.int64):
+            # Exact: every payload here is an integer below 2**24, and adding zeros is exact. Padded to a
+            # 16-byte multiple, which the custom all-reduce needs (an 8-byte payload would fall back to NCCL).
+            n = values.numel()
+            summed = torch.zeros(
+                (n + 3) // 4 * 4, dtype=torch.float32, device=values.device
+            )
+            if self._is_root:
+                summed[:n].copy_(values.reshape(-1))
+            values.copy_(self._tp_group.all_reduce(summed)[:n].view(values.shape))
+            if site not in self._allreduce_noted:
+                # Once per site and process: engagement line for the server log.
+                self._allreduce_noted.add(site)
+                logger.info("Speculative TP sync via all-reduce engaged: %s.", site.slug)
+        else:
             self._tp_group.broadcast(values, src=0)
         return values
+
+    def fp32_sum_sync(self, site: SpecTpSyncSite):
+        """For a caller that writes ``sync``'s fp32 all-reduce input itself (SGLANG_OPT_DFLASH_SELECTOR_SYNC_FOLD):
+        (all_reduce(buf) -> summed buffer, whether this rank writes its values), or None when the site syncs by
+        broadcast (the caller then keeps ``sync``)."""
+        if site not in self._sites:
+            return (lambda buf: buf), True
+        if site not in self._allreduce_sites:
+            return None
+        if site not in self._allreduce_noted:
+            self._allreduce_noted.add(site)
+            logger.info("Speculative TP sync via all-reduce engaged: %s (folded fp32 payload).", site.slug)
+        return self._tp_group.all_reduce, self._is_root
 
     def available_memory_gb(self, site: SpecTpSyncSite, device, gpu_id, *, group):
         """Free GPU memory, reduced to the group minimum when ``site`` is on."""

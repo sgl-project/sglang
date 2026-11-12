@@ -1,3 +1,8 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the SGLang project
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
+# Portions (the prepared trtllm-gen FP4 routing entries) are adapted from
+# sgl-project/sglang pull requests #46475 and #46484 (Apache-2.0).
 from __future__ import annotations
 
 import contextvars
@@ -6,6 +11,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Generator, Optional, cast
 
+import msgspec
 import torch
 from packaging.version import Version
 from torch.nn import Module
@@ -341,6 +347,76 @@ def _trtllm_mxfp4_moe_runner(
     return runner, runner_kwargs
 
 
+_K31_MOE_BODY_ENV = "SGLANG_K31_MOE_BODY_TACTICS"
+_k31_moe_body_logged: set = set()
+
+
+def _k31_moe_body_table() -> tuple:
+    """Per-row-count (tile_n, config) table for the K3.1 prepared-routing MoE
+    body, from SGLANG_K31_MOE_BODY_TACTICS="lo-hi:tile_n/config,...", e.g.
+    "33-47:8/1261,60:16/375". Unset (the default) returns () and changes nothing.
+
+    FlashInfer keys the tuned tactic on the bucket next_power_of_2(rows), so rows
+    33-64 share one tactic picked on synthetic routing at 64 rows; this table
+    pins a tactic ranked offline on real routing per captured row count."""
+    import os
+
+    raw = os.environ.get(_K31_MOE_BODY_ENV, "").strip()
+    cached = getattr(_k31_moe_body_table, "_cache", None)
+    if cached is not None and cached[0] == raw:
+        return cached[1]
+    table = []
+    for item in filter(None, (s.strip() for s in raw.split(","))):
+        try:
+            rows, tac = item.split(":")
+            lo, _, hi = rows.partition("-")
+            tile, cfg = tac.split("/")
+            entry = (int(lo), int(hi or lo), int(tile), int(cfg))
+        except ValueError as e:
+            raise ValueError(f"{_K31_MOE_BODY_ENV}: bad entry {item!r}") from e
+        if not (1 <= entry[0] <= entry[1] and entry[2] > 0 and entry[3] >= 0):
+            raise ValueError(f"{_K31_MOE_BODY_ENV}: bad entry {item!r}")
+        table.append(entry)
+    _k31_moe_body_table._cache = (raw, tuple(table))
+    return tuple(table)
+
+
+def _k31_moe_body_override(runner, moe_inputs, num_tokens: int):
+    """(tile_n, config) pinned for num_tokens rows, or None. A pinned tactic the
+    kernel library does not list as valid for this shape is ignored (warned)."""
+    hit = next(
+        (e[2:] for e in _k31_moe_body_table() if e[0] <= num_tokens <= e[1]), None
+    )
+    if hit is None:
+        return None
+    valid = {
+        tuple(int(v) for v in t)
+        for t in runner.get_valid_tactics(moe_inputs.to_list(), None)
+        if not isinstance(t, int)
+    }
+    ok = tuple(hit) in valid
+    if num_tokens not in _k31_moe_body_logged:
+        _k31_moe_body_logged.add(num_tokens)
+        if ok:
+            logger.info(
+                "K3.1 MoE body override engaged: rows=%d tile_n=%d config=%d (%s)",
+                num_tokens,
+                hit[0],
+                hit[1],
+                _K31_MOE_BODY_ENV,
+            )
+        else:
+            logger.warning(
+                "K3.1 MoE body override ignored: rows=%d tile_n=%d config=%d is not "
+                "a valid tactic for this shape (%d valid); using the tuned tactic",
+                num_tokens,
+                hit[0],
+                hit[1],
+                len(valid),
+            )
+    return tuple(hit) if ok else None
+
+
 def select_trtllm_routed_body(
     layer: Module, x: torch.Tensor, top_k: int, expert_weights_dtype: torch.dtype
 ):
@@ -400,6 +476,10 @@ def select_trtllm_routed_body(
         gemm1_lora_delta=None,
         per_token_scale=None,
     )
+    if _k31_moe_body_table():
+        pinned = _k31_moe_body_override(runner, moe_inputs, num_tokens)
+        if pinned is not None:
+            return DABody(tactic=pinned[1], tile_n=pinned[0])
     tuning_config = runner._make_tuning_config(
         moe_inputs,
         tune_max_num_tokens=next_power_of_2(num_tokens),
@@ -485,6 +565,268 @@ def _run_trtllm_prepared_routing_moe(
         da_routing_metadata=routing_metadata,
         da_body_workspace=workspace,
         **runner_kwargs,
+    )
+
+
+class K31FusedRoutingPlan(msgspec.Struct):
+    """The routed MoE call for rows routed by the K3.1 fused routing kernel
+    (kernels/ops/moe/moe_k31_fused_routing.py), which emits trtllm-gen's
+    routing metadata so the MoE runs its GEMMs from it (FlashInfer's
+    prepared-routing body entry) instead of running its own routing kernel.
+
+    ``tactic`` is what FlashInfer's autotuner picks for today's routed call
+    (trtllm_fp4_block_scale_routed_moe) at this M, so the GEMM kernels are the
+    same, and the metadata is padded to its tile: [tile_n, config], or -1 (the
+    op's default tile and config, when that wins the race or nothing is tuned).
+    Today's call finalizes with the bf16-packed weights at or below the fused
+    route+quant cap and with the router's fp32 weights above it;
+    ``weights_dtype`` keeps that."""
+
+    runner: object
+    tactic: object
+    runner_kwargs: dict
+    tile_tokens: int
+    local_expert_offset: int
+    local_num_experts: int
+    weights_dtype: torch.dtype
+    # K31RoutingMetadata and the routed ids, set once the routing kernel ran.
+    metadata: Optional[tuple] = None
+    topk_ids: Optional[torch.Tensor] = None
+
+
+def _k31_fused_routing_default_tile_n(
+    num_tokens: int, top_k: int, num_local_experts: int, device: torch.device
+) -> int:
+    """The tile the op resolves the default tactic (-1) to: selectDefaultTileN,
+    the smallest of computeSelectedTileN's candidates around the first tile
+    covering the average tokens per local expert."""
+    tiles = _FP4_MXFP8_TILE_NS
+    if _flashinfer_lacks_sm107_moe_fixes(device):
+        tiles = tuple(t for t in tiles if t != 192)
+    average = num_tokens * top_k / num_local_experts
+    i = next((i for i, t in enumerate(tiles) if t >= average), len(tiles) - 1)
+    return tiles[max(i - 1, 0)]
+
+
+def plan_k31_fused_routing(
+    layer: Module, x: torch.Tensor, top_k: int
+) -> Optional[K31FusedRoutingPlan]:
+    """Plan the routed MoE call of ``layer`` (a FusedMoE) for the ``x`` rows,
+    or None where the fused routing does not apply: other runners or
+    autotuning in progress (today's call does the profiling)."""
+    from sglang.kernels.ops.moe.moe_k31_fused_routing import (
+        PACKED_WEIGHTS_MAX_TOKENS,
+    )
+    from sglang.srt.layers.quantization.mxfp4 import Mxfp4MoEMethod
+
+    method = layer.quant_method
+    if not (
+        isinstance(method, Mxfp4MoEMethod)
+        and method.use_flashinfer
+        and not method.use_marlin
+        and method._fi_kernel == "trtllm_sm100"
+        and method.flashinfer_mxfp4_moe_precision == "default"
+        and method.moe_runner_config.activation == "situ"
+        and method.hidden_size == x.shape[-1]
+    ):
+        return None
+    # The Kimi-K3.1 decode MoE kernels route from the packed top-k themselves.
+    if getattr(layer, "k31_decode_moe", False) and x.shape[0] <= k31.MAX_TOKENS:
+        return None
+    try:
+        from flashinfer.autotuner import AutoTuner
+        from flashinfer.fused_moe import core as fi_moe_core
+        from flashinfer.fused_moe.backends.trtllm import MoERunner
+        from flashinfer.fused_moe.shared.inputs import MoeRunnerInputs
+        from flashinfer.tllm_enums import (
+            ActivationType,
+            Fp8QuantizationType,
+            RoutingInputMode,
+            RoutingMethodType,
+            SfLayout,
+            WeightLayout,
+            deduce_trtllm_gen_tensor_dtype,
+        )
+    except ImportError:
+        return None
+    tuner = AutoTuner.get()
+    if tuner.is_tuning_mode:
+        return None
+
+    num_tokens, hidden_size = x.shape
+    device = x.device
+
+    def shaped(*shape: int, dtype: torch.dtype) -> torch.Tensor:
+        # The tactic lookup reads shapes only.
+        return torch.empty((1,) * len(shape), dtype=dtype, device=device).expand(*shape)
+
+    # Mirror trtllm_fp4_block_scale_routed_moe -> trtllm_fp4_block_scale_moe_op
+    # as _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen calls it.
+    packed = num_tokens <= PACKED_WEIGHTS_MAX_TOKENS
+    routing_input_mode = (
+        RoutingInputMode.PackedPrecomputed
+        if packed
+        else RoutingInputMode.UnpackedPrecomputed
+    )
+    weights_dtype = torch.bfloat16 if packed else torch.float32
+    hidden_states = shaped(num_tokens, hidden_size, dtype=torch.float8_e4m3fn)
+    hidden_states_scale = shaped(
+        num_tokens, hidden_size // 32, dtype=torch.float8_e4m3fn
+    )
+    moe_op = fi_moe_core.get_trtllm_moe_sm100_module().moe_op
+    runner = MoERunner(
+        moe_op,
+        top_k=top_k,
+        num_local_experts=layer.num_local_experts,
+        dtype_act=deduce_trtllm_gen_tensor_dtype(hidden_states, hidden_states_scale),
+        dtype_weights=deduce_trtllm_gen_tensor_dtype(
+            layer.w13_weight, layer.w13_weight_scale
+        ),
+        fp8_quantization_type=Fp8QuantizationType.NoneFp8,
+        hidden_size=hidden_size,
+        hidden_size_output=hidden_size,
+        intermediate_size=method.intermediate_size_per_partition,
+        activation_type=ActivationType.Situ.value,
+        weight_layout=WeightLayout.MajorK,
+        use_shuffled_weight=True,
+        use_per_token_scaling=False,
+        num_experts=layer.num_experts,
+        num_fused_shared_experts=0,
+    )
+    moe_inputs = MoeRunnerInputs(
+        output=shaped(num_tokens, hidden_size, dtype=torch.bfloat16),
+        routing_logits=None,
+        topk_ids=shaped(num_tokens, top_k, dtype=torch.int32),
+        expert_weights=shaped(num_tokens, top_k, dtype=weights_dtype),
+        hidden_states=hidden_states,
+        hidden_states_scale=hidden_states_scale,
+        gemm1_lora_delta=None,
+        per_token_scale=None,
+    )
+    tuning_config = runner._make_tuning_config(
+        moe_inputs,
+        tune_max_num_tokens=next_power_of_2(num_tokens),
+        routing_input_mode=routing_input_mode,
+        hidden_states_scale_layout=SfLayout.layout_linear,
+        use_cold_l2_cache=True,
+        use_cuda_graph=True,
+    )
+    enable_pdl = trtllm_moe_enable_pdl(num_tokens)
+    device_support_moe_pdl = getattr(fi_moe_core, "_device_support_moe_pdl", None)
+    if device_support_moe_pdl is not None and not device_support_moe_pdl(device):
+        enable_pdl = False
+    local_expert_offset = layer.moe_ep_rank * layer.num_local_experts
+    runner_kwargs = {
+        "routing_input_mode": routing_input_mode,
+        "num_experts": layer.num_experts,
+        "routing_bias": None,
+        "gemm1_weights": layer.w13_weight,
+        "gemm1_weights_scale": layer.w13_weight_scale,
+        "gemm1_bias": None,
+        "gemm1_alpha": layer.gemm1_alpha,
+        "gemm1_beta": layer.gemm1_clamp_limit,
+        "gemm1_clamp_limit": None,
+        "gemm2_weights": layer.w2_weight,
+        "gemm2_weights_scale": layer.w2_weight_scale,
+        "gemm2_bias": None,
+        "output1_scale_scalar": None,
+        "output1_scale_gate_scalar": None,
+        "output2_scale_scalar": None,
+        "n_group": None,
+        "topk_group": None,
+        "local_expert_offset": local_expert_offset,
+        "routed_scaling_factor": None,
+        "routing_method_type": RoutingMethodType.TopK.value,
+        "enable_pdl": enable_pdl,
+        "do_finalize": True,
+        "activation_type": ActivationType.Situ.value,
+        "num_fused_shared_experts": 0,
+        "norm_topk_prob": True,
+        "routing_replay_out": None,
+        "valid_hidden_size": None,
+        "valid_intermediate_size": None,
+    }
+    _, tactic = tuner.choose_one(
+        "flashinfer::trtllm_fp4_block_scale_moe",
+        [runner],
+        tuning_config,
+        moe_inputs.to_list(),
+        **runner_kwargs,
+    )
+    # A tuned tactic is [tile_n, config] (a list, or the FFI array the C++
+    # tactic query returns); -1 is the op's default.
+    if not isinstance(tactic, int):
+        try:
+            tactic = [int(v) for v in tactic]
+        except TypeError:
+            return None
+        if len(tactic) != 2:
+            return None
+        if min(tactic) < 0:
+            tactic = -1
+    if tactic == -1:
+        # The op resolves the default tactic to its default tile and that
+        # tile's default config; the metadata needs the tile up front.
+        tile_tokens = _k31_fused_routing_default_tile_n(
+            num_tokens, top_k, layer.num_local_experts, device
+        )
+    elif isinstance(tactic, list):
+        tile_tokens = tactic[0]
+    else:
+        return None
+    return K31FusedRoutingPlan(
+        runner=runner,
+        tactic=tactic,
+        runner_kwargs=runner_kwargs,
+        tile_tokens=tile_tokens,
+        local_expert_offset=local_expert_offset,
+        local_num_experts=layer.num_local_experts,
+        weights_dtype=weights_dtype,
+    )
+
+
+def _run_k31_fused_routing_moe(
+    plan: K31FusedRoutingPlan,
+    x_quant: torch.Tensor,
+    x_scale: torch.Tensor,
+    output: torch.Tensor,
+    do_finalize: bool,
+) -> list:
+    """The routed MoE from the fused routing's metadata: the planned tactic's
+    GEMMs (and finalize unless deferred), without a routing kernel. Returns
+    FlashInfer's result ABI: [output], or [gemm2_out, expert_weights,
+    expanded_idx_to_permuted_idx] when the finalize is deferred."""
+    from flashinfer.fused_moe.shared.inputs import MoeRunnerInputs
+
+    metadata = plan.metadata
+    assert metadata is not None and plan.topk_ids is not None
+    inputs = MoeRunnerInputs(
+        output=output,
+        routing_logits=None,
+        topk_ids=plan.topk_ids,
+        expert_weights=metadata.expert_weights,
+        hidden_states=x_quant,
+        hidden_states_scale=x_scale,
+        gemm1_lora_delta=None,
+        per_token_scale=None,
+    ).to_list()
+    kwargs = dict(plan.runner_kwargs, do_finalize=do_finalize)
+    routing_metadata = list(metadata)
+    # Body buffers (FC1/FC2 outputs and GEMM workspaces) for this M and tactic,
+    # allocated per call like the op's own; no kernel launch.
+    body = plan.runner.forward(
+        inputs,
+        tactic=plan.tactic,
+        do_preparation=True,
+        da_routing_metadata=routing_metadata,
+        **kwargs,
+    )
+    return plan.runner.forward(
+        inputs,
+        tactic=plan.tactic,
+        da_routing_metadata=routing_metadata,
+        da_body_workspace=body,
+        **kwargs,
     )
 
 
@@ -1603,6 +1945,28 @@ def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
 
         from sglang.srt.layers.moe import route_quant_handoff
 
+        if is_standard and isinstance(prepared_packed_topk, K31FusedRoutingPlan):
+            # K3.1 fused routing: the metadata is built, only the GEMMs remain.
+            routed_top_k = prepared_packed_topk.topk_ids.shape[1]
+            defer_finalize = _deferred_finalize_enabled.get()
+            result = _run_k31_fused_routing_moe(
+                prepared_packed_topk,
+                x_quant,
+                x_scale,
+                symm_output,
+                do_finalize=not defer_finalize,
+            )
+            if defer_finalize:
+                gemm2_out, topk_weights, expanded_idx = result
+                result = FlashInferTrtllmDeferredFinalizeOutput(
+                    gemm2_out=gemm2_out,
+                    expert_weights=topk_weights,
+                    expanded_idx_to_permuted_idx=expanded_idx,
+                    top_k=routed_top_k,
+                )
+                return StandardCombineInput(hidden_states=result)
+            return StandardCombineInput(hidden_states=symm_output)
+
         prepared_routing = (
             route_quant_handoff.take_prepared_routing(prepared_packed_topk)
             if is_standard and prepared_packed_topk is not None
@@ -1642,7 +2006,7 @@ def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
             routed_top_k = _routing_top_k(routing)
 
             defer_finalize = _deferred_finalize_enabled.get()
-            result = trtllm_fp4_block_scale_routed_moe(
+            routed_kwargs = dict(
                 topk_ids=routing,
                 routing_bias=None,
                 hidden_states=x_quant,
@@ -1674,6 +2038,19 @@ def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
                 do_finalize=not defer_finalize,
                 enable_pdl=trtllm_moe_enable_pdl(x_quant.shape[0]),
             )
+            result = None
+            if envs.SGLANG_K31_PF_PREPARED_ROUTING.get():
+                from sglang.kernels.ops.moe.trtllm_prepared_fp4 import (
+                    try_prepared_k3_mxfp4,
+                )
+
+                result = try_prepared_k3_mxfp4(
+                    quant_info.w13_weight,
+                    prepared_metadata=route_quant_handoff.take_metadata(routing),
+                    **routed_kwargs,
+                )
+            if result is None:
+                result = trtllm_fp4_block_scale_routed_moe(**routed_kwargs)
             if defer_finalize:
                 gemm2_out, topk_weights, expanded_idx = result
                 result = FlashInferTrtllmDeferredFinalizeOutput(
@@ -1893,7 +2270,21 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
         )
         hidden_pad = quant_info.padded_hidden_size - unpadded_hidden_size
         hidden_states = torch.nn.functional.pad(hidden_states, (0, hidden_pad))
-    if hidden_states_scale is not None:
+    prepared_nvfp4 = None
+    if (
+        envs.SGLANG_K31_PF_PREPARED_ROUTING.get()
+        and hidden_pad == 0
+        and hidden_states_scale is None
+        and not quant_info.use_per_token_activation
+    ):
+        from sglang.srt.layers.moe import route_quant_handoff
+
+        prepared_nvfp4 = route_quant_handoff.take(
+            hidden_states, quant_info.w13_input_scale_quant
+        )
+    if prepared_nvfp4 is not None:
+        _, hs_fp4, hs_scale_linear = prepared_nvfp4
+    elif hidden_states_scale is not None:
         # NVFP4 dispatch (flashinfer a2a): inputs are already FP4-quantized by
         # the dispatcher, so pass them through unchanged.
         hs_fp4 = hidden_states
@@ -1973,8 +2364,11 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
     else:
         # When the dispatcher delivered pre-quantized FP4 (hidden_states is uint8),
         # the MoE output is bf16 rather than the input dtype.
+        # Pre-quantized input and fused preparation both produce BF16 output.
         output_dtype = (
-            hidden_states.dtype if hidden_states_scale is None else torch.bfloat16
+            hidden_states.dtype
+            if hidden_states_scale is None and prepared_nvfp4 is None
+            else torch.bfloat16
         )
         # A padded kernel output is a scratch buffer; the sliced copy is the
         # tensor that reaches the all-reduce.
@@ -2038,7 +2432,29 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
         )
         if symm_output is not None:
             moe_kwargs["output"] = symm_output
-        result = trtllm_fp4_block_scale_routed_moe(**moe_kwargs)
+        result = None
+        if envs.SGLANG_K31_PF_PREPARED_ROUTING.get() and (
+            defer_finalize or 1 < hs_fp4.shape[0] <= 8
+        ):
+            from sglang.kernels.ops.moe.trtllm_prepared_fp4 import (
+                try_prepared_k3_nvfp4,
+            )
+            from sglang.srt.layers.moe import route_quant_handoff
+
+            # The static scale Parameter persists across calls; weight .data
+            # views are recreated by ModelOpt and cannot own this workspace.
+            result = try_prepared_k3_nvfp4(
+                quant_info.w13_input_scale_quant,
+                prepared_metadata=(
+                    route_quant_handoff.take_metadata(routing)
+                    if prepared_nvfp4 is not None
+                    else None
+                ),
+                **moe_kwargs,
+            )
+        prepared_body_ran = result is not None
+        if result is None:
+            result = trtllm_fp4_block_scale_routed_moe(**moe_kwargs)
         if defer_finalize:
             result = _make_deferred_finalize_output(
                 result,
@@ -2048,6 +2464,11 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
             result = _finalize_in_order(
                 result, top_k=_routing_top_k(routing), out=symm_output
             )
+        elif prepared_body_ran:
+            # Both kernels wrote symm_output. The prepared body returns that
+            # tensor itself rather than a tuple, so ``result[0]`` would take
+            # row zero and broadcast it across the tokens of a verify batch.
+            result = symm_output
         else:
             result = result[0]
     else:

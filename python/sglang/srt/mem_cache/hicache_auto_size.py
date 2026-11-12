@@ -1,11 +1,17 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the SGLang project
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 from __future__ import annotations
 
 import logging
+import os
+import socket
 from contextlib import contextmanager
 from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.memory_pool import (
@@ -94,6 +100,61 @@ def _estimate_hicache_bytes(
     return total + sum(_draft_bytes(pool, draft) for draft in drafts)
 
 
+def _maybe_trim_host_heap() -> None:
+    """Return freed heap pages (weight-loading buffers) to the OS before the
+    snapshot, and log how much RSS that released."""
+    if not envs.SGLANG_K31_HICACHE_BUDGET_TRIM.get():
+        return
+    import ctypes
+
+    def rss() -> int:
+        with open("/proc/self/statm") as f:
+            return int(f.read().split()[1]) * os.sysconf("SC_PAGE_SIZE")
+
+    try:
+        libc = ctypes.CDLL("libc.so.6")
+        before = rss()
+        released = libc.malloc_trim(0)
+        after = rss()
+    except (OSError, AttributeError, ValueError) as exc:
+        logger.warning(
+            "SGLANG_K31_HICACHE_BUDGET_TRIM: malloc_trim unavailable: %s", exc
+        )
+        return
+    logger.info(
+        "SGLANG_K31_HICACHE_BUDGET_TRIM: malloc_trim(0)=%d, RSS %.2f -> %.2f GiB",
+        released,
+        before / 1024**3,
+        after / 1024**3,
+    )
+
+
+def _explicit_snapshot_budget() -> int:
+    """One per-rank host budget for explicitly sized pools, taken before any
+    rank on this host builds a HiCache pool.
+
+    Without it every pool re-samples headroom and divides it by the local rank
+    count, so a rank that reaches a late pool after its neighbours reserved
+    theirs is refused although the node has room. Sizes are unchanged; only
+    the fit check moves to this snapshot.
+    """
+    _maybe_trim_host_heap()
+    if not torch.distributed.is_initialized():
+        return host_memory_budget_bytes()
+    group = get_parallel().world_group.cpu_group
+    # Every rank has finished its pre-pool work before anyone samples, and the
+    # gather below completes only after every rank sampled, so no sample sees
+    # another rank's HiCache pool. One barrier + one gather on all ranks before
+    # any pool is built (same placement as the auto path's collective).
+    torch.distributed.barrier(group=group)
+    budget = host_memory_budget_bytes()
+    host = socket.gethostname()
+    entries = [None] * torch.distributed.get_world_size(group)
+    torch.distributed.all_gather_object(entries, (host, budget), group=group)
+    # Host-local minimum: ranks on one host share its RAM.
+    return min(value for name, value in entries if name == host)
+
+
 @contextmanager
 def auto_size_hicache(
     params: CacheInitParams, draft_plan: HiCacheDraftPlan | None, *, enabled: bool
@@ -103,8 +164,22 @@ def auto_size_hicache(
     Resolution nulls the fraction for an explicit --hicache-ratio/--hicache-size.
     """
     fraction = get_memory().hicache_host_memory_fraction
-    if not enabled or fraction is None:
+    if not enabled:
         yield
+        return
+    if fraction is None:
+        if not envs.SGLANG_K31_HICACHE_BUDGET.get():
+            yield
+            return
+        budget = _explicit_snapshot_budget()
+        logger.info(
+            "HiCache explicit-size budget (SGLANG_K31_HICACHE_BUDGET): %.2f GiB "
+            "host memory per rank from one snapshot (%d ranks on this host).",
+            budget / 1024**3,
+            ranks_per_host(),
+        )
+        with host_memory_budget_scope(budget):
+            yield
         return
     requested = get_memory().hicache_ratio
     device_bytes = _estimate_hicache_bytes(params, draft_plan)

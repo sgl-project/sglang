@@ -1,12 +1,17 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the SGLang project
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
 import torch
 
 from sglang.kernels.ops.attention.mla_qk_prep import absorbed_bmm_concat_cast_q_fp8
+from sglang.kernels.ops.kvcache.mla_fused_kv_write import mla_concat_qk_store_fp8_kv
 from sglang.kernels.ops.quantization.fp8_kernel import (
     per_tensor_quant_mla_fp8,
     per_token_group_quant_mla_deep_gemm_masked_fp8,
@@ -36,6 +41,8 @@ from sglang.srt.layers.layer_boundary import get_attn_tp_context
 from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
 from sglang.srt.layers.quantization.unquant import bf16_gemm_dispatch
 from sglang.srt.lora.utils import kv_b_lora_correction
+from sglang.srt.layers.rotary_embedding.base import RotaryEmbedding
+from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
@@ -66,6 +73,12 @@ logger = logging.getLogger(__name__)
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 _ENABLE_DSA_Q8KV8_BORN_FP8_Q = envs.SGLANG_ENABLE_DSA_Q8KV8_BORN_FP8_Q.get()
 _ENABLE_DSA_Q8KV8_QPREP_OVERLAP = envs.SGLANG_ENABLE_DSA_Q8KV8_QPREP_OVERLAP.get()
+# SGLANG_K31_DRAFT_SWA_INPLACE_Q (default off): sliding-window layers hand
+# the a2a / fi_a2a reduce strided [rows, heads, 512] partials (see
+# trtllm_mla_backend._forward_sliding_window); the pack reads them as is.
+_DRAFT_SWA_STRIDED_PARTIALS = os.environ.get(
+    "SGLANG_K31_DRAFT_SWA_INPLACE_Q", "0"
+).strip().lower() in ("1", "true", "yes", "on")
 
 from sglang.srt.model_executor.runner_utils.forward_batch import get_forward_batch
 from sglang.srt.model_executor.runner_utils.prefill_graph import (
@@ -95,6 +108,45 @@ def _select_local_dcp_heads_for_autotune(
     """Select this rank's head shard without communicating dummy outputs."""
     rank = get_parallel().attn_dcp_rank
     return attn_output.narrow(1, rank * num_local_heads, num_local_heads)
+
+
+def _mla_fused_kv_write_rows(
+    *,
+    pool,
+    layer_id: int,
+    attention_backend: Optional[str],
+    dcp_size: int,
+    k_scale: Optional[torch.Tensor],
+) -> Optional[torch.Tensor]:
+    """The layer's uint8 KV rows when the Triton backend would store them through plain
+    MLATokenToKVPool.set_kv_buffer's FP8 cast + scatter (mla_concat_qk_store_fp8_kv mirrors exactly that);
+    None otherwise."""
+    if not (
+        attention_backend == "triton"
+        and dcp_size == 1
+        and k_scale is None
+        and type(pool) is MLATokenToKVPool
+        and pool.dtype == torch.float8_e4m3fn
+        and pool.store_dtype == torch.uint8
+        and not pool.use_dsa
+        and not pool.dsa_kv_cache_store_fp8
+        and not pool.requires_physical_write_loc
+    ):
+        return None
+    return pool.kv_buffer[layer_id - pool.start_layer]
+
+
+def _mla_fused_kv_write_folds_rope(rotary_emb) -> bool:
+    """Whether the layer's rotary runs fused_rope_kernel on interleaved 64-wide pairs from an fp32 cos | sin cache,
+    the arithmetic mla_concat_qk_store_fp8_kv reproduces."""
+    return (
+        isinstance(rotary_emb, RotaryEmbedding)
+        and type(rotary_emb).forward_cuda is RotaryEmbedding.forward_cuda
+        and not rotary_emb.use_fallback_kernel
+        and not rotary_emb.is_neox_style
+        and rotary_emb.head_size == rotary_emb.rotary_dim == 64
+        and rotary_emb.cos_sin_cache.dtype == torch.float32
+    )
 
 
 def is_mla_dcp_lse_base_on_e(attention_backend: Optional[str]) -> bool:
@@ -162,6 +214,19 @@ def _apply_attention_output_gate(module, attn_output, gate):
     )
 
 
+_draft_v_preproject_logged = False
+
+
+def _log_draft_v_preproject_once(shape) -> None:
+    global _draft_v_preproject_logged
+    if not _draft_v_preproject_logged:
+        _draft_v_preproject_logged = True
+        logger.info(
+            "Draft DCP V pre-projection engaged: projected partials %s -> push-combine",
+            tuple(shape),
+        )
+
+
 def _finish_absorb_output(module, attn_bmm_output, attention_output_gate, topk_indices):
     if attention_output_gate is not None:
         attn_bmm_output = _apply_attention_output_gate(
@@ -186,6 +251,17 @@ class DeepseekMLAForwardMixin:
     # Apply W_UV to the DCP decode partials before the reduce (DSA layers only)
     dcp_v_preproject = False
     _dcp_v_weights: Optional[torch.Tensor] = None
+    # DFLASH MLA draft (SGLANG_OPT_DFLASH_MLA_FUSED_KV_WRITE): on the Triton branch one
+    # kernel builds q, k and the FP8 KV rows in place of two concats + set_kv_buffer.
+    fused_kv_write = False
+    fused_kv_write_pdl = False
+    # DFlash draft (SGLANG_OPT_DFLASH_DRAFT_MLAQ): (q, k, v) from DraftMlaQuery, which already stored the FP8 KV rows.
+    _draft_mlaq_qk = None
+    # set by forward_absorb_prepare when it left the RoPE to that kernel: the layer's KV rows
+    _fused_kv_write_rope_rows = None
+    # A non-DSA MLA layer (the DFlash draft) that takes
+    # the DCP V pre-projection; models/dflash.py sets it from its env flag.
+    draft_dcp_v_preproject = False
 
     def _prepare_dcp_v_weights(self, group):
         weights = group.all_gather(self.w_vc.contiguous(), dim=0)
@@ -466,6 +542,7 @@ class DeepseekMLAForwardMixin:
         # block; also suppresses the duplicate split/rope on that path.
         self._q8kv8_qprep_overlap_pending = False
         self._kv_cache_saved_early = False
+        self._fused_kv_write_rope_rows = None
         attention_output_gate = (
             self.prepare_attention_output_gate(hidden_states)
             if hasattr(self, "prepare_attention_output_gate")
@@ -814,10 +891,28 @@ class DeepseekMLAForwardMixin:
 
         fuse_rope_for_trtllm_mla = self._fuse_rope_for_trtllm_mla(forward_batch)
         if (
+            self.fused_kv_write
+            and not fuse_rope_for_trtllm_mla
+            and not self._q8kv8_qprep_overlap_pending
+            and not self._kv_cache_saved_early
+            and born_q_backend is None
+            and cp_overlap is None
+            and _mla_fused_kv_write_folds_rope(self.rotary_emb)
+        ):
+            # Nothing between here and forward_absorb_core reads q_pe / k_pe on this path.
+            self._fused_kv_write_rope_rows = _mla_fused_kv_write_rows(
+                pool=get_token_to_kv_pool(),
+                layer_id=self.attn_mqa.layer_id,
+                attention_backend=self.current_attention_backend,
+                dcp_size=self.dcp_size,
+                k_scale=self.attn_mqa.k_scale,
+            )
+        if (
             self.rotary_emb is not None
             and not fuse_rope_for_trtllm_mla
             # Already applied at the q-prep/indexer overlap fork.
             and not self._q8kv8_qprep_overlap_pending
+            and self._fused_kv_write_rope_rows is None
         ):
             q_nope_out, q_pe, k_nope, k_pe = self.prepare_mla_qkv(
                 positions, q_nope_out, q_pe, k_nope, k_pe, forward_batch
@@ -933,6 +1028,11 @@ class DeepseekMLAForwardMixin:
         attention_output_gate: Optional[torch.Tensor] = None,
     ):
         save_kv_cache = not self._kv_cache_saved_early
+        rope_rows = self._fused_kv_write_rope_rows
+        self._fused_kv_write_rope_rows = None
+        assert rope_rows is None or (
+            self.current_attention_backend not in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS
+        ), "the RoPE was left to the fused KV write, which only the Triton branch runs"
 
         if self.current_attention_backend in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
             extra_args = {}
@@ -1005,8 +1105,40 @@ class DeepseekMLAForwardMixin:
                     ),
                 )
         else:
-            q = torch.cat([q_nope_out, q_pe], dim=-1)
-            k = torch.cat([k_nope, k_pe], dim=-1)
+            kv_rows = rope_rows
+            draft_qkv = self._draft_mlaq_qk
+            if draft_qkv is not None:
+                self._draft_mlaq_qk = None
+                q, k, k_nope = draft_qkv
+                save_kv_cache = False
+            elif kv_rows is None and self.fused_kv_write and save_kv_cache:
+                kv_rows = _mla_fused_kv_write_rows(
+                    pool=get_token_to_kv_pool(),
+                    layer_id=self.attn_mqa.layer_id,
+                    attention_backend=self.current_attention_backend,
+                    dcp_size=self.dcp_size,
+                    k_scale=self.attn_mqa.k_scale,
+                )
+            if draft_qkv is not None:
+                pass
+            elif kv_rows is not None:
+                q, k = mla_concat_qk_store_fp8_kv(
+                    q_nope=q_nope_out,
+                    q_pe=q_pe,
+                    k_nope=k_nope,
+                    k_pe=k_pe,
+                    kv_rows=kv_rows,
+                    loc=forward_batch.out_cache_loc,
+                    positions=positions,
+                    cos_sin_cache=(
+                        self.rotary_emb.cos_sin_cache if rope_rows is not None else None
+                    ),
+                    pdl=self.fused_kv_write_pdl,
+                )
+                save_kv_cache = False
+            else:
+                q = torch.cat([q_nope_out, q_pe], dim=-1)
+                k = torch.cat([k_nope, k_pe], dim=-1)
 
             # Apply llama 4 scaling if provided
             if llama_4_scaling is not None:
@@ -1046,7 +1178,7 @@ class DeepseekMLAForwardMixin:
                     # reduction. Exchange the narrower projected partials.
                     if (
                         self.dcp_v_preproject
-                        and self.use_dsa
+                        and (self.use_dsa or self.draft_dcp_v_preproject)
                         and (
                             attn_output.shape[0] >= 512
                             # the push-combine reduce wins at any batch size
@@ -1074,6 +1206,8 @@ class DeepseekMLAForwardMixin:
                                 attn_output.transpose(0, 1), weights
                             ).transpose(0, 1)
                             dcp_v_projected = True
+                            if self.draft_dcp_v_preproject:
+                                _log_draft_v_preproject_once(attn_output.shape)
                     reduced = None
                     if dcp_v_projected:
                         # One kernel pushes the peers' heads over NVLink and
@@ -1090,8 +1224,12 @@ class DeepseekMLAForwardMixin:
                         )
                     else:
                         # A2A exchange of head partials + LSE, then local Triton combine.
-                        if not (self.use_dsa and dsa_shards_index_k()):
+                        if not (self.use_dsa and dsa_shards_index_k()) and not (
+                            _DRAFT_SWA_STRIDED_PARTIALS
+                            and self.attn_mqa_for_dcp_decode.sliding_window_size >= 0
+                        ):
                             # K3.1's DSA partials are strided views the pack reads as is
+                            # (so are a sliding-window draft's under SGLANG_K31_DRAFT_SWA_INPLACE_Q)
                             attn_output = attn_output.contiguous()
                             lse = lse.contiguous()
                         attn_output = dcp_a2a_lse_reduce(

@@ -1,3 +1,4 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 """
 Copyright 2023-2024 SGLang Team
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -63,7 +64,10 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
     is_fp8_fnuz,
     saturate_to_fp8_range,
 )
-from sglang.srt.configs.mamba_utils import BaseLinearStateParams
+from sglang.srt.configs.mamba_utils import (
+    BaseLinearStateParams,
+    kda_replay_record_dtype,
+)
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import aiter_can_use_preshuffle_paged_mqa
@@ -693,6 +697,23 @@ class MambaPool:
         )
         _replayssm_on = enable_linear_replayssm or enable_linear_replayssm_spec
         self.replayssm_request_ring = False
+        # KDA commit-then-verify (SGLANG_OPT_KDA_SPEC_FOLD_VERIFY): per slot, the
+        # accept length (| ring half << 8) of the last verify window not yet
+        # folded into `temporal` (0 = `temporal` is current). Zeroed when a slot
+        # receives a copied checkpoint, and for newly allocated slots at the start
+        # of the next forward on the forward stream (kda_fold_drain_resets): the
+        # allocator runs on the schedule stream while the previous owner's last
+        # (overlap) post-verify may still be in flight and rewrite the entry.
+        # The KDA backend decides whether its contract holds and sets
+        # kda_fold_active; inactive, it stays all zeros.
+        self.kda_fold_active = False
+        self.kda_fold_reset_queue: List[torch.Tensor] = []
+        self.kda_fold_pending = (
+            torch.zeros(size + 1, dtype=torch.int32, device=device)
+            if self.replayssm_spec_fold
+            and envs.SGLANG_OPT_KDA_SPEC_FOLD_VERIFY.get()
+            else None
+        )
 
         # for disagg with nvlink
         self.enable_custom_mem_pool, self.custom_mem_pool, _ = (
@@ -795,8 +816,15 @@ class MambaPool:
                     else size + 1
                 )
                 # Decode records follow the SSM dtype. Spec-verify compact d/k
-                # records follow the activation dtype; g stays fp32.
-                ring_dtype = conv_dtype if enable_linear_replayssm_spec else ssm_dtype
+                # records follow the activation dtype unless, for KDA,
+                # SGLANG_KDA_REPLAY_RECORD_DTYPE overrides it (byte accounting in
+                # replayssm_ring_bytes_per_req); g stays fp32.
+                if enable_linear_replayssm_spec and cache_params.is_kda:
+                    ring_dtype = kda_replay_record_dtype(conv_dtype)
+                elif enable_linear_replayssm_spec:
+                    ring_dtype = conv_dtype
+                else:
+                    ring_dtype = ssm_dtype
                 # Fold-every-commit: one verify window, no chunked (d, k)
                 # records. KDA is the exception on both counts: its window
                 # stays L-sized (the fused verify ring-write drops
@@ -858,12 +886,12 @@ class MambaPool:
                             )
                     replayssm_rawv = torch.zeros(
                         size=(num_mamba_layers, num_slots, hv, record_len, v_dim),
-                        dtype=conv_dtype,
+                        dtype=ring_dtype,
                         device=device,
                     )
                     replayssm_rawk = torch.zeros(
                         size=(num_mamba_layers, num_slots, h_k, record_len, k_dim),
-                        dtype=conv_dtype,
+                        dtype=ring_dtype,
                         device=device,
                     )
                     replayssm_beta = torch.zeros(
@@ -1033,6 +1061,14 @@ class MambaPool:
                     f"conv_state size: {get_tensor_size_bytes(conv_state) / GB:.2f}GB, "
                     f"ssm_state size: {get_tensor_size_bytes(temporal_state) / GB:.2f}GB "
                 )
+            if envs.SGLANG_K31_PF_HICACHE_MAMBA_STATE_BYTES.get():
+                # From sgl-project/sglang pull request #47040.
+                # The HiCache host mirror holds only the conv/temporal checkpoint;
+                # device-only spec verify scratch and ReplaySSM rings must not size
+                # host pools.
+                self.host_capacity_bytes = self.State(
+                    conv=conv_state, temporal=temporal_state
+                ).mem_usage_bytes()
             if _replayssm_on:
                 logger.info(
                     f"GDN ReplaySSM ring buffers allocated "
@@ -1211,6 +1247,19 @@ class MambaPool:
             chunk = slice(start, start + step)
             temporal[:, dst_indices[chunk]] = temporal[:, src_indices[chunk]]
 
+    def kda_fold_drain_resets(self) -> None:
+        """Zero the fold-pending entries of slots allocated since the last call.
+
+        Must run on the forward stream, before the forward reads the entries:
+        it is stream-ordered after every earlier forward's post-verify, so a
+        late write by a slot's previous owner cannot survive it.
+        """
+        if self.kda_fold_pending is None or not self.kda_fold_reset_queue:
+            return
+        idx = torch.cat(self.kda_fold_reset_queue)
+        self.kda_fold_reset_queue.clear()
+        self.kda_fold_pending.index_fill_(0, idx.to(self.kda_fold_pending.device), 0)
+
     def copy_from(self, src_indices: torch.Tensor, dst_indices: torch.Tensor):
         """Clone mamba state (conv + temporal) from src slots into dst slots.
 
@@ -1249,6 +1298,14 @@ class MambaPool:
             self._copy_temporal_slots(src_indices=src_indices, dst_indices=dst_indices)
         if self.replayssm_write_pos is not None:
             self.replayssm_write_pos[dst_indices] = 0
+        if self.kda_fold_pending is not None:
+            if self.debug_memory_pool:
+                # Debug-only (syncs): a fold-pending source would drop its window.
+                pending_records = self.kda_fold_pending[src_indices] & 0xFF
+                assert int(pending_records.sum()) == 0, (
+                    "copy_from requires a committed KDA fold source"
+                )
+            self.kda_fold_pending[dst_indices] = 0
         for sibling in self._slot_siblings:
             sibling.copy_slots(src_indices, dst_indices)
 
@@ -1515,6 +1572,13 @@ class HybridReqToTokenPool(ReqToTokenPool):
             size=mamba_size,
             device=device,
         )
+        if getattr(self.mamba_pool, "kda_fold_pending", None) is not None:
+            # A newly allocated slot gets a fresh `temporal` from its writer
+            # (extend, copy, PD transfer, HiCache load-back): nothing is pending.
+            # Queued here, zeroed on the forward stream (kda_fold_drain_resets).
+            self.mamba_allocator.alloc_hooks.append(
+                self.mamba_pool.kda_fold_reset_queue.append
+            )
         self.mamba_map = {layer_id: i for i, layer_id in enumerate(mamba_layer_ids)}
 
         # Qwen4-Exp PLE side states; built disabled rather than None without a config,

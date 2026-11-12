@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the SGLang project
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 from __future__ import annotations
 
 import logging
@@ -26,12 +29,30 @@ from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.model_executor.runner_utils.pool import borrow_graph_pool
 from sglang.srt.runtime_context import get_spec
 from sglang.srt.speculative.spec_utils import sample_simulated_acc_len
-from sglang.srt.utils import is_npu
+from sglang.srt.utils import get_bool_env_var, is_cuda, is_npu
+
+_is_cuda = is_cuda()
+if _is_cuda:
+    from sglang.kernels.ops.speculative.dflash_simulated_accept import (
+        dflash_simulated_accept,
+    )
+# Port of sgl-project/sglang#47765 (one fused simulated-acceptance kernel), default off here.
+_K31_SIM_FUSED = _is_cuda and get_bool_env_var("SGLANG_OPT_K31_SIM_FUSED")
 
 DEFAULT_DFLASH_MASK_TOKEN = "<|MASK|>"
 _DFLASH_ATTENTION_MODES = frozenset({"gqa", "mha", "mla"})
 
 logger = logging.getLogger(__name__)
+
+_SEAM_SMALL_COPY_SITES: set = set()
+
+
+def note_seam_small_copy(site: str) -> None:
+    """Logs once per process when a DFlash seam site first takes the batched SM copy
+    (SGLANG_OPT_K31_SEAM_SMALL_COPY)."""
+    if site not in _SEAM_SMALL_COPY_SITES:
+        _SEAM_SMALL_COPY_SITES.add(site)
+        logger.info("DFlash seam small copy engaged: %s.", site)
 
 _DFLASH_CHAIN_VERIFY_BUFFERS: dict[tuple[Optional[int], int], dict[str, Any]] = {}
 _DFLASH_VERIFY_SKIP_CUSTOM_MASK_BACKENDS = frozenset(
@@ -1101,10 +1122,45 @@ def apply_dflash_simulated_acceptance(
     next_token_logits: Optional[torch.Tensor] = None,
     fixed_token_id: int = 100,
     generator: Optional[torch.Generator] = None,
-) -> None:
+    prefix_lens: Optional[torch.Tensor] = None,
+    new_seq_lens: Optional[torch.Tensor] = None,
+) -> Optional[torch.Tensor]:
     """Forces the DFlash acceptance length (SGLANG_SIMULATE_ACC_LEN benchmark knob).
-    ``next_token_logits`` gives the target argmax when ``target_predict`` is None."""
+    ``next_token_logits`` gives the target argmax when ``target_predict`` is None.
+    Returns ``new_seq_lens`` if it was rewritten from the forced lengths, else None."""
     bs, block_size = candidates.shape
+    if _K31_SIM_FUSED and candidates.is_cuda:
+        real_draft_tokens = simulate_acc_token_mode == "real-draft-token"
+        # sample_simulated_acc_len clamps to [1, block_size].
+        forced_commit_len = sample_simulated_acc_len(
+            simulate_acc_len, simulate_acc_method, block_size, generator=generator
+        )
+        forced_accept_len = forced_commit_len - 1
+        target_bonus_tokens = None
+        if real_draft_tokens and target_predict is None:
+            # The sampling and selector branches do not materialize the target
+            # argmax; only the forced row of each request is read.
+            vocab_size = next_token_logits.shape[-1]
+            target_bonus_tokens = torch.argmax(
+                next_token_logits.view(bs, block_size, vocab_size)[:, forced_accept_len],
+                dim=-1,
+            )
+        elif real_draft_tokens:
+            target_bonus_tokens = target_predict[:, forced_accept_len]
+        dflash_simulated_accept(
+            candidates=candidates,
+            target_bonus_tokens=target_bonus_tokens,
+            forced_num_accept_tokens=forced_commit_len,
+            num_correct_drafts_out=accept_len,
+            num_accept_tokens_out=commit_lens,
+            bonus_tokens_out=bonus,
+            out_tokens=out_tokens,
+            fixed_token=fixed_token_id,
+            prefix_lens=prefix_lens,
+            new_seq_lens_out=new_seq_lens,
+        )
+        return new_seq_lens
+
     if simulate_acc_token_mode == "real-draft-token" and target_predict is None:
         # The sampling-verify branch does not materialize the target argmax.
         target_predict = sampling_argmax(next_token_logits).view(bs, block_size)
@@ -1123,7 +1179,11 @@ def apply_dflash_simulated_acceptance(
         out_tokens.fill_(fixed_token_id)
         return
 
-    if out_tokens.shape[0] == 1 and envs.SGLANG_OPT_DFLASH_BATCHED_SMALL_COPY.get():
+    # One batched launch needs disjoint destination extents: true for one row (bs 1, the one-request shape).
+    # SGLANG_OPT_K31_SEAM_SMALL_COPY (this change) and SGLANG_OPT_DFLASH_BATCHED_SMALL_COPY (#48414) name the same fast path.
+    if out_tokens.shape[0] == 1 and (
+        envs.SGLANG_OPT_K31_SEAM_SMALL_COPY.get() or envs.SGLANG_OPT_DFLASH_BATCHED_SMALL_COPY.get()
+    ):
         out_tokens.fill_(0)
         pick = target_predict[:, forced_accept_len]
         pairs = [(bonus, pick), (out_tokens[:, forced_accept_len], pick)]
@@ -1132,12 +1192,52 @@ def apply_dflash_simulated_acceptance(
                 (out_tokens[:, :forced_accept_len], candidates[:, 1:forced_commit_len])
             )
         if try_small_copy([d for d, _ in pairs], [s for _, s in pairs]):
+            note_seam_small_copy("forced-acceptance tokens")
             return
     out_tokens.zero_()
     if forced_accept_len > 0:
         out_tokens[:, :forced_accept_len].copy_(candidates[:, 1:forced_commit_len])
     bonus.copy_(target_predict[:, forced_accept_len].to(dtype=bonus.dtype))
     out_tokens[:, forced_accept_len].copy_(bonus.to(dtype=out_tokens.dtype))
+
+
+def apply_dflash_simulated_acceptance_device(
+    *,
+    candidates: torch.Tensor,
+    target_predict: Optional[torch.Tensor],
+    accept_len: torch.Tensor,
+    commit_lens: torch.Tensor,
+    bonus: torch.Tensor,
+    out_tokens: torch.Tensor,
+    forced_commit_len: torch.Tensor,
+    simulate_acc_token_mode: str,
+    next_token_logits: Optional[torch.Tensor] = None,
+    fixed_token_id: int = 100,
+) -> None:
+    """apply_dflash_simulated_acceptance with the forced commit length (drawn by
+    the caller with sample_simulated_acc_len) read from a one-element device
+    tensor, so CUDA graphs can replay it; the same outputs, without host syncs."""
+    bs, block_size = candidates.shape
+    forced_commit_len = forced_commit_len.view(1).to(torch.int64)
+    forced_accept_len = forced_commit_len - 1
+    accept_len.copy_(forced_accept_len.expand(bs))
+    commit_lens.copy_(forced_commit_len.expand(bs))
+
+    if simulate_acc_token_mode != "real-draft-token":
+        bonus.fill_(fixed_token_id)
+        out_tokens.fill_(fixed_token_id)
+        return
+
+    if target_predict is None:
+        target_predict = torch.argmax(next_token_logits, dim=-1).view(bs, block_size)
+    accept_col = forced_accept_len.view(1, 1).expand(bs, 1)
+    bonus.copy_(target_predict.gather(1, accept_col).view(bs).to(dtype=bonus.dtype))
+    # Drafts shifted left before the accept boundary, zeros after, bonus at it.
+    shifted = torch.zeros_like(out_tokens)
+    shifted[:, :-1].copy_(candidates[:, 1:])
+    cols = torch.arange(block_size, device=candidates.device)
+    out_tokens.copy_(torch.where(cols[None, :] < forced_accept_len, shifted, 0))
+    out_tokens.scatter_(1, accept_col, bonus.to(dtype=out_tokens.dtype).view(bs, 1))
 
 
 def compute_dflash_sampling_correct_drafts_and_bonus(

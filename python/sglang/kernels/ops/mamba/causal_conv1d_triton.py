@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 # Copyright (c) 2024, Tri Dao.
 # Adapted from https://github.com/Dao-AILab/causal-conv1d/blob/main/causal_conv1d/causal_conv1d_interface.py
 # and https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/mamba/ops/causal_conv1d.py
@@ -11,6 +12,7 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
+from sglang.srt.environ import envs
 
 PAD_SLOT_ID = -1
 
@@ -18,6 +20,18 @@ PAD_SLOT_ID = -1
 # Tokens per program of _causal_conv1d_fwd_kernel; a block_table enumerates
 # (sequence, chunk) pairs in these units.
 CAUSAL_CONV1D_FWD_BLOCK_M = 8
+
+
+def _conv1d_fwd_block_n() -> int:
+    # Channels per program of the prefill launch (causal_conv1d_fn). 256 is the
+    # stock value; 512 / 1024 give bit-identical outputs and conv states (every
+    # element is the same ordered sum) with fewer, wider programs. Any other
+    # value falls back to 256. Read once at import (SGLANG_K31_KDA_CONV_BLOCK_N).
+    n = envs.SGLANG_K31_KDA_CONV_BLOCK_N.get()
+    return n if n in (256, 512, 1024) else 256
+
+
+CAUSAL_CONV1D_FWD_BLOCK_N = _conv1d_fwd_block_n()
 
 
 @triton.jit()
@@ -428,6 +442,7 @@ def causal_conv1d_fn(
     validate_data=False,
     block_table: Optional[torch.Tensor] = None,
     output_split_size: int = 0,
+    out: Optional[torch.Tensor] = None,
     **kwargs,
 ):
     """support varlen + continuous batching when x is 2D tensor
@@ -476,6 +491,9 @@ def causal_conv1d_fn(
         plane, or zero for the original layout. Must divide dim.
     out: same shape as `x`, or (dim // output_split_size, cu_seq_len,
         output_split_size) when output_split_size is nonzero.
+    out (argument): optional (dim, cu_seq_len) output written in place and returned when
+        output_split_size is 0. Any strides (a transposed dense [cu_seq_len, dim] buffer keeps the
+        writes channel-last). Default: torch.empty_like(x).
     """
     if isinstance(activation, bool) and activation:
         activation = "silu"
@@ -490,8 +508,10 @@ def causal_conv1d_fn(
             dtype=x.dtype,
             device=x.device,
         )
-    else:
+    elif out is None:
         out = torch.empty_like(x)
+    else:
+        assert out.shape == x.shape and out.dtype == x.dtype, (out.shape, x.shape)
     _, width = weight.shape
     state_len = width - 1
     np2_statelen = triton.next_power_of_2(state_len)
@@ -608,7 +628,7 @@ def causal_conv1d_fn(
         NP2_STATELEN=np2_statelen,
         # launch_cooperative_grid=True
         BLOCK_M=CAUSAL_CONV1D_FWD_BLOCK_M,
-        BLOCK_N=256,
+        BLOCK_N=CAUSAL_CONV1D_FWD_BLOCK_N,
         USE_BLOCK_TABLE=block_table is not None,
         OUTPUT_SPLIT_SIZE=output_split_size,
         num_stages=2,

@@ -1,19 +1,32 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the SGLang project
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 """K3 MNNVL fused all-reduce (bf16): zero-copy AR and AR+RMSNorm.
 
-Four entry points over ``csrc/kimi_k3/comm/ar_fusion.cuh``, spanning two
+Entry points over ``csrc/kimi_k3/comm/ar_fusion.cuh``, spanning three
 algorithm families x two epilogues:
 
-============  =========================  ==================================
-              res (+ optional residual)  norm (fused RMSNorm on the latent)
-============  =========================  ==================================
-push (1shot)  :func:`all_reduce_push_res`   :func:`all_reduce_push_norm`
-pull (2shot)  :func:`all_reduce_pull_res`   :func:`all_reduce_pull_norm`
-============  =========================  ==================================
+=============  ===========================  ===================================
+               res (+ optional residual)    norm (fused RMSNorm on the latent)
+=============  ===========================  ===================================
+push (1shot)   :func:`all_reduce_push_res`    :func:`all_reduce_push_norm`
+push2 (2shot)  :func:`all_reduce_push2_res`   :func:`all_reduce_push2_norm`
+pull (2shot)   :func:`all_reduce_pull_res`    :func:`all_reduce_pull_norm`
+=============  ===========================  ===================================
+
+plus the deferred-MoE-finalize variants of the norm epilogue,
+:func:`finalize_all_reduce_push_norm` and :func:`finalize_all_reduce_push2_norm`.
 
 * **push** — 1shot multicast-push. Works on ANY contiguous bf16 tensor
   (input is read and written in place); reuses the CustomAllReduceV2 push
   plane, whose multicast base the plane itself carries.
   Best for small messages. Needs :func:`register_comm`.
+* **push2** — barrier-free 2shot over the same push plane (the generic
+  ``2shot_push`` protocol, in place): each rank sends its partial of every
+  chunk to the chunk's owner, the owner reduces it (and applies the epilogue)
+  and fans the result out. No remote loads and no barriers, so it beats the
+  pull on the mid-size band where the pull's two barriers dominate. Any
+  contiguous bf16 tensor whose two chunk halves fit a push slot.
 * **pull** — low-SM NVLS 2shot ON the input, which must be allocated from
   multicast-bound symmetric memory (the caller passes its multicast VA):
   reduce-scatter + broadcast in place.
@@ -66,6 +79,26 @@ def _jit_module(world_size: int) -> Module:
             ("finalize_push_norm", f"{cls}::finalize_push_norm"),
         ],
         extra_cuda_cflags=["-O3"],
+    )
+
+
+@cache_once
+def _jit_push2_module(world_size: int) -> Module:
+    """The 2shot push entry points (SGLANG_K3_AR_PUSH2), built as their own
+    module: ar_fusion.cuh compiles them only under SGL_K3_AR_PUSH2, so the
+    module above stays the default-off build."""
+    args = make_cpp_args(world_size, is_arch_support_pdl())
+    cls = f"AllReduceFusionKernel<{args}>"
+    return load_jit(
+        "kimi_k3_all_reduce_push2",
+        *args,
+        cuda_files=["kimi_k3/comm/ar_fusion.cuh"],
+        cuda_wrappers=[
+            ("push2_res", f"{cls}::push2_res"),
+            ("push2_norm", f"{cls}::push2_norm"),
+            ("finalize_push2_norm", f"{cls}::finalize_push2_norm"),
+        ],
+        extra_cuda_cflags=["-O3", "-DSGL_K3_AR_PUSH2"],
     )
 
 
@@ -196,6 +229,55 @@ def _finalize_push_norm_op(
 
 
 @register_custom_op(mutates_args=["x"])
+def _push2_res_op(
+    world_size: int,
+    x: torch.Tensor,
+    residual: Optional[torch.Tensor],
+    use_mc: bool,
+) -> None:
+    _jit_push2_module(world_size).push2_res(
+        _COMM_MAP[world_size], x.view(-1), residual, use_mc
+    )
+
+
+@register_custom_op(mutates_args=["x"])
+def _push2_norm_op(
+    world_size: int,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    num_norm_rows: int,
+    use_mc: bool,
+) -> None:
+    _jit_push2_module(world_size).push2_norm(
+        _COMM_MAP[world_size], x.view(-1), weight, eps, num_norm_rows, use_mc
+    )
+
+
+@register_custom_op(mutates_args=["out"])
+def _finalize_push2_norm_op(
+    world_size: int,
+    out: torch.Tensor,
+    gemm2_out: torch.Tensor,
+    expanded_idx_to_permuted_idx: torch.Tensor,
+    expert_weights: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    use_mc: bool,
+) -> None:
+    _jit_push2_module(world_size).finalize_push2_norm(
+        _COMM_MAP[world_size],
+        out.view(-1),
+        gemm2_out,
+        expanded_idx_to_permuted_idx,
+        expert_weights,
+        weight,
+        eps,
+        use_mc,
+    )
+
+
+@register_custom_op(mutates_args=["x"])
 def _pull_res_op(
     world_size: int,
     x: torch.Tensor,
@@ -291,6 +373,75 @@ def finalize_all_reduce_push_norm(
         expert_weights,
         weight,
         eps,
+    )
+    return out
+
+
+def push2_slot_bytes(nbytes: int, world_size: int, *, row_bytes: int = 0) -> int:
+    """Push-slot bytes a 2shot push of an ``nbytes`` tensor needs: a partial
+    half and a gathered half of one owner chunk (``ceil(nbytes / world)`` in
+    16B vectors, or whole ``row_bytes`` rows for the norm variants)."""
+    if row_bytes:
+        rows = -(-(nbytes // row_bytes) // world_size)
+        return 2 * rows * row_bytes
+    return 2 * 16 * -(-nbytes // (16 * world_size))
+
+
+def all_reduce_push2_res(
+    world_size: int,
+    x: torch.Tensor,
+    residual: Optional[torch.Tensor] = None,
+    *,
+    use_mc: bool = False,
+) -> torch.Tensor:
+    """In-place ``x = allreduce(x) [+ residual]`` via the barrier-free 2shot
+    push. ``x`` may be any contiguous bf16 CUDA tensor with
+    :func:`push2_slot_bytes` within the registered push slot; ``use_mc`` fans
+    the reduced chunks out with one multicast store instead of unicasts."""
+    residual_ = residual.view(-1) if residual is not None else None
+    _push2_res_op(world_size, x, residual_, use_mc)
+    return x
+
+
+def all_reduce_push2_norm(
+    world_size: int,
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    *,
+    num_norm_rows: int,
+    use_mc: bool = False,
+) -> torch.Tensor:
+    """In-place 2shot push allreduce + RMSNorm over the first
+    ``num_norm_rows`` rows of ``x`` viewed as [numel / 3584, 3584]; each rank
+    owns whole rows, so the norm runs once per row on its owner."""
+    _push2_norm_op(world_size, x, weight, eps, num_norm_rows, use_mc)
+    return x
+
+
+def finalize_all_reduce_push2_norm(
+    world_size: int,
+    out: torch.Tensor,
+    gemm2_out: torch.Tensor,
+    expanded_idx_to_permuted_idx: torch.Tensor,
+    expert_weights: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+    *,
+    use_mc: bool = False,
+) -> torch.Tensor:
+    """:func:`finalize_all_reduce_push_norm` over the 2shot push: each rank's
+    partial latent rows are computed from the deferred-finalize triple while
+    they are sent to their owner, so they never materialize either."""
+    _finalize_push2_norm_op(
+        world_size,
+        out,
+        gemm2_out,
+        expanded_idx_to_permuted_idx,
+        expert_weights,
+        weight,
+        eps,
+        use_mc,
     )
     return out
 

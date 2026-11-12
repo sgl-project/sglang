@@ -1,20 +1,26 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the SGLang project
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 """PTX/tcgen05 KDA chunked-prefill backend (``--linear-attn-prefill-backend ptx_kda``).
 
-Wraps the vendored hand-CUDA ``kda_ptx_prefill`` kernel (sm_100a / sm_103a) through
-its FLA-compatible ``chunk_kda_fwd`` interface. The kernel selects a fused
-long-sequence route or a two-launch high-head/many-sequence route at the KDA
-serving shape: K = V = 128, chunk 64.
+Wraps the vendored hand-CUDA ``kda_ptx_prefill`` kernel (sm_100a / sm_103a / sm_107a)
+through its FLA-compatible ``chunk_kda_fwd`` interface. The kernel selects a
+fused long-sequence route or a two-launch high-head/many-sequence route at the
+KDA serving shape: K = V = 128, chunk 64.
 
 Scope: ordinary extend batches satisfying the kernel's fixed tensor contract.
-Correctness-sensitive cases stay on Triton:
 
 - track batches carrying the fp32 snapshot buffer (``track_state``, the mamba
-  extra_buffer track path) stay on Triton — the kernel cannot write it.
-  Interior snapshots consumed as dense ``h`` still come from the kernel when
-  the cache checkpoint stride is also 64 tokens; boundary-only tracking uses
-  the final state either way;
-- spec-decode extends, which must stay rollback-able.
+  extra_buffer track path) run natively: the kernel writes each sequence's
+  tracked chunk-boundary state straight into the buffer (no dense per-chunk
+  states); when dense intermediates are also requested, the tracked rows are
+  copied out of them instead.
+  Interior snapshots consumed as dense ``h`` come from the kernel when the
+  cache checkpoint stride is also 64 tokens; boundary-only tracking uses the
+  final state either way;
+- a BF16 state pool is widened to fp32 for the kernel's initial state, and
+  the final state is rounded back to the pool dtype;
+- spec-decode extends, which must stay rollback-able, stay on Triton.
 
 Single-sequence token counts that are not a multiple of the kernel's 64-token
 chunk are padded up to a bucket (1k/2k/4k/8k/16k/32k) in a persistent staging
@@ -51,16 +57,15 @@ _PAD_GATE = -1000.0
 
 
 class PtxKDAKernel(LinearAttnKernelBase):
-    # Batches carrying the fp32 track snapshot buffer (track_state) route to
-    # the embedded Triton fallback, which forwards the snapshot arguments
-    # (the track_state check in extend -> _triton_extend); boundary-only
-    # tracking stays native.
+    # Batches carrying the fp32 track snapshot buffer (track_state) run
+    # natively: the kernel stores the tracked rows into the buffer itself
+    # (or _fill_track_state copies them out of dense intermediates).
     supports_track_state_snapshot: bool = True
 
     def __init__(self):
         from sglang.kernels.ops.attention.linear.kda_ptx_prefill import SM_ARCHS
 
-        # tcgen05 + TMEM: B200 / GB200 (SM100) and B300 / GB300 (SM103).
+        # tcgen05 + TMEM: B200 / GB200 (SM100), B300 / GB300 (SM103), VR200 (SM107).
         self.supports_prefill = (
             torch.cuda.is_available() and torch.cuda.get_device_capability() in SM_ARCHS
         )
@@ -73,6 +78,10 @@ class PtxKDAKernel(LinearAttnKernelBase):
         self._no_lower_bound_logged = False
         # (bucket, H, K, V, device) -> staging dict for ragged token counts.
         self._staging = {}
+        # (seq_lens, device) -> int64 first-chunk row of each sequence in the
+        # kernel's per-chunk states; every KDA layer of a forward reuses it.
+        self._chunk_offsets_key = None
+        self._chunk_offsets = None
 
     def _ensure_loaded(self):
         if self._fwd is None:
@@ -101,6 +110,33 @@ class PtxKDAKernel(LinearAttnKernelBase):
             flat = t.detach().reshape(-1).float().contiguous()
             self._param_flat[key] = flat
         return flat
+
+    def _fill_track_state(self, track_state, track_chunk_idx, h, seq_lens):
+        """Write the mamba track snapshot the Triton kernel writes in-kernel.
+
+        track_state[i] (fp32, [H, V, K]) must hold the state entering chunk
+        track_chunk_idx[i] of sequence i (-1 = sequence not tracked; its row is
+        never read). h [1, NT, H, V, K] holds the fp32 state entering each
+        64-token chunk, sequences back to back (ceil(len / 64) chunks each).
+        """
+        assert track_chunk_idx is not None and h is not None
+        assert track_state.dtype == torch.float32, track_state.dtype
+        key = (tuple(seq_lens), h.device)
+        if self._chunk_offsets_key != key:
+            starts = [0]
+            for length in seq_lens[:-1]:
+                starts.append(starts[-1] + (length + _CHUNK - 1) // _CHUNK)
+            self._chunk_offsets = torch.tensor(starts, dtype=torch.int64).to(
+                h.device, non_blocking=True
+            )
+            self._chunk_offsets_key = key
+        hs = h.squeeze(0)
+        # Untracked rows (-1) and out-of-range indices read some valid row;
+        # those rows of track_state are never consumed. No host sync.
+        rows = (self._chunk_offsets + track_chunk_idx.to(torch.int64).clamp(min=0)).clamp(
+            max=hs.shape[0] - 1
+        )
+        track_state.copy_(hs.index_select(0, rows))
 
     def _get_staging(self, bucket, num_heads, head_k_dim, head_v_dim, dev):
         key = (bucket, num_heads, head_k_dim, head_v_dim, dev.index)
@@ -181,6 +217,7 @@ class PtxKDAKernel(LinearAttnKernelBase):
         num_tokens = q.shape[1]
         seq_lens_cpu = kwargs.get("extend_seq_lens_cpu")
         track_h_src = kwargs.get("track_ssm_h_src")
+        track_state = kwargs.get("track_state")
         supported_shape = (
             q.ndim == 4
             and k.ndim == 4
@@ -231,11 +268,8 @@ class PtxKDAKernel(LinearAttnKernelBase):
             # Only the safe gate is supported: without a lower bound the
             # per-chunk decay overflows fp32 exp and the kernel returns NaN.
             and lower_bound is not None
-            # The native kernel cannot write the fp32 track snapshot buffer;
-            # a batch carrying one must take the Triton fallback, which
-            # forwards the snapshot arguments (see _triton_extend). Leaving
-            # the buffer unwritten would corrupt prefix-cache track slots.
-            and kwargs.get("track_state") is None
+            # A batch carrying the fp32 track snapshot buffer (track_state) is
+            # served natively (the kernel writes the tracked rows into it).
             and intermediate_stride_supported
             and shape_known
             and supported_shape
@@ -319,6 +353,20 @@ class PtxKDAKernel(LinearAttnKernelBase):
                 cu_cpu[1:] = torch.tensor(seq_lens, dtype=torch.int32).cumsum(0)
                 cu_kwargs = dict(cu_seqlens=query_start_loc, cu_seqlens_cpu=cu_cpu)
 
+            # Track snapshots: the kernel stores only each sequence's tracked
+            # chunk-boundary state, straight into track_state (one row per
+            # sequence), instead of every chunk's state. The caller reads the
+            # snapshot from track_state when it passes one, so no dense h is
+            # produced then (the tuple's h is None).
+            track_kwargs = {}
+            track_chunk_idx = kwargs.get("track_chunk_idx")
+            if track_state is not None and track_chunk_idx is not None:
+                ts = track_state[: len(seq_lens)]
+                if ts.dtype == torch.float32 and ts.is_contiguous():
+                    track_kwargs = dict(
+                        track_state=ts, track_chunk_idx=track_chunk_idx[: len(seq_lens)]
+                    )
+
             result = self._fwd(
                 qn,
                 kn,
@@ -326,7 +374,9 @@ class PtxKDAKernel(LinearAttnKernelBase):
                 g4,
                 b3,
                 scale=head_k_dim**-0.5,
-                initial_state=ssm_states.index_select(0, slot),
+                # The kernel reads an fp32 initial state; a BF16 state pool is
+                # widened here (a no-op view for an fp32 pool).
+                initial_state=ssm_states.index_select(0, slot).float(),
                 output_final_state=True,
                 **cu_kwargs,
                 # SGLang keeps the recurrent state V-major ([slots, H, V, K]);
@@ -337,11 +387,15 @@ class PtxKDAKernel(LinearAttnKernelBase):
                 use_gate_in_kernel=True,
                 A_log=self._flat_param(A_log),
                 dt_bias=self._flat_param(dt_bias),
-                return_intermediate_states=return_intermediate_states,
+                return_intermediate_states=not track_kwargs
+                and (return_intermediate_states or track_state is not None),
                 use_qk_l2norm_in_kernel=True,
                 use_beta_sigmoid_in_kernel=kwargs.get("beta_is_raw", False),
+                **track_kwargs,
             )
             out, final_state, h = result[0], result[1], result[10]
+            if track_state is not None and not track_kwargs:
+                self._fill_track_state(track_state, track_chunk_idx, h, seq_lens)
             ssm_states.index_copy_(0, slot, final_state.to(ssm_states.dtype))
         except Exception:
             ssm_states.index_copy_(0, slot, state_backup)

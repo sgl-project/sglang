@@ -1,6 +1,9 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright contributors to the SGLang project
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 // kda_prefill.cu — self-contained KDA prefill forward (inference drop-in for
 // the FLA Triton chunk_kda_fwd path). Single-file artifact carrying ONLY the
-// shipping default paths — two routes, picked per shape from the launch
+// shipping default paths — three routes, picked per shape from the launch
 // geometry (pick_route):
 //   FUSED (long single sequences) —
 //     eqlen  (T % 64 == 0, no cu_seqlens):
@@ -15,6 +18,11 @@
 //     then ONE chain per (sequence, head) walking from h0 — k2_chain_tc /
 //     k2_chain_tc_vl. Its P/u0 differ from the fused route's by design (P4-lo
 //     and the block apply, envelope-gated) — see the seq0 section.
+//   TFC (opt-in, K31PF_KDA_TFC=1: replaces the multi-piece FUSED pick): the
+//     tail-free builder, then kda_compose (the fused tail's piece-map
+//     composition as its own launch), then piece chains self-starting from
+//     those maps — k2_chain_tc over (H, NP) / k2_chain_tc_vlp. Three launches,
+//     no cross-CTA waits; P/u0 are the tail-free builder's (as seq0).
 // Gate modes (GM): 0 = pre-transformed bf16 glog; 1 = raw softplus,
 // 2 = raw safe_gate — both transformed in place off the serial path
 // (eqlen AND varlen). RAW and BSIG (orthogonal to GM and to each other, same
@@ -27,9 +35,11 @@
 //   kda_prefill_fwd(q, k, v, g, beta, scale, initial_state, cu_seqlens,
 //                   use_gate_in_kernel, A_log, dt_bias, safe_gate,
 //                   lower_bound, use_qk_l2norm_in_kernel,
-//                   use_beta_sigmoid_in_kernel, h_per_chunk, h_v_first)
+//                   use_beta_sigmoid_in_kernel, h_per_chunk, h_v_first,
+//                   track_chunk_idx)
 //                -> (o [T,H,128] bf16, Sf [N,H,128,128] f32)
-//   h_per_chunk is an optional preallocated per-chunk state output.
+//   h_per_chunk is an optional preallocated per-chunk state output; with
+//   track_chunk_idx it holds one snapshot row per sequence instead.
 //
 // Build (torch cpp_extension JIT):
 //   -O3 -std=c++20 -gencode arch=compute_{100a,103a},code=sm_{100a,103a}
@@ -44,9 +54,11 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstdlib>
 #include <cuda.h>
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
+#include <limits>
 #include <map>
 #include <type_traits>
 #include <vector>
@@ -140,17 +152,21 @@ mma_m16n8k16_bf16f32(float4& d, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t 
 
 // ---- gpu-scoped release/acquire flags (fused-grid piece gating) ----
 static __device__ __forceinline__ void red_add_rel_b32(uint32_t* ptr, uint32_t value) {
-  asm volatile("red.release.gpu.global.add.u32 [%0], %1;" ::"l"(ptr), "r"(value));
+  asm volatile("red.release.gpu.global.add.u32 [%0], %1;" ::"l"(ptr), "r"(value) : "memory");
 }
 static __device__ __forceinline__ uint32_t ld_acq_b32(const uint32_t* ptr) {
   uint32_t ret;
-  asm volatile("ld.acquire.gpu.global.b32 %0, [%1];" : "=r"(ret) : "l"(ptr));
+  asm volatile("ld.acquire.gpu.global.b32 %0, [%1];" : "=r"(ret) : "l"(ptr) : "memory");
   return ret;
 }
 // make generic-proxy global writes visible to the async proxy (consumers
 // read the published factor tensors via TMA)
 static __device__ __forceinline__ void fence_async_global() {
-  asm volatile("fence.proxy.async.global;");
+  asm volatile("fence.proxy.async.global;" ::: "memory");
+}
+// both state spaces (global + shared::cta) in one fence
+static __device__ __forceinline__ void fence_async_all() {
+  asm volatile("fence.proxy.async;" ::: "memory");
 }
 static __device__ __forceinline__ void fence_async_shared() {
   asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
@@ -536,11 +552,15 @@ struct ChainSmem {
   __align__(1024) bf16 sQd[2][2][64][64];
   __align__(1024) bf16 sAh[2][64][64];
   __align__(1024) bf16 sAl[2][64][64];
-  // u0 chunk tile via TMA riding mb_tma (measured: this stage was memory-
+  // u0 chunk tile via TMA riding mb_tma2 (measured: this stage was memory-
   // latency-bound on u0's 16 fp32 LDGs — a 100MB L2-spilling stream)
   __align__(1024) float sU0[2][BT][K];
+  // mb_tma2[b]: chunk TMA into buffer b. One barrier per buffer: buffer b's
+  // next phase is armed only after the next chunk's __syncthreads, which
+  // every thread reaches after its wait, so no waiter sees its barrier
+  // two phases on (a lapped parity wait would name the next, unarmed phase).
   // mb_pre/mb_preC: prefix L/c TMA; mb_cmL/mb_cmC: prefix mma-batch commits
-  uint64_t mb_tma, mb_p1, mb_p2, mb_o, mb_pre, mb_preC, mb_cmL, mb_cmC;
+  uint64_t mb_tma2[2], mb_p1, mb_p2, mb_o, mb_pre, mb_preC, mb_cmL, mb_cmC;
   uint32_t s_taddr;
 };
 
@@ -1124,6 +1144,10 @@ __device__ static void k1_body(
     // ONE commit+wait per chunk (the products'); the compose commit is
     // waited a chunk LATE (pend_wait, before its B-tile smem is rewritten);
     // piece-end chunks wait in-chunk and drain the final maps to global.
+    // Every thread fences its own generic accesses into the async proxy before the barrier
+    // (writer-side form): its P global stores, which the pTt TMA below reads back, and its
+    // sp.f / sp.a smem accesses, whose bytes that TMA overwrites (pTt aliases upT_h).
+    ptx::fence_async_all();
     __syncthreads();  // everyone past the P/u0 reads of sU
     // tail pTt: TMA the L2-hot negated-P copy this CTA stored above — the
     // [tok][kc] global IS the W mma's MN-major B image (probe-verified: SWZ128
@@ -1157,6 +1181,15 @@ __device__ static void k1_body(
         sp.b.u0Tl[kc][tokS] = __float2bfloat16(uv - __bfloat162float(uh));
       }
     }
+    // pTt TMA landed. ALL threads consume the phase (skipping an open phase
+    // would alias the next parity wait against the previous completed one),
+    // and before the barrier: tid 0 commits the products to mb_f right after
+    // it, so a thread that waited after the barrier could find mb_f two
+    // phases on, where its parity names a phase not yet issued (PTX
+    // try_wait.parity: current or immediately preceding phase only).
+    ptx::mbar_wait_parity(&mb_f, mbph & 1);
+    ++mbph;
+    ptx::fence_async_shared();  // kdT / u0T generic stores -> the tcgen05.mma reads below
     ptx::tcgen05_fence_before_thread_sync();
     __syncthreads();
     const uint32_t taddr = s_taddr;
@@ -1166,10 +1199,6 @@ __device__ static void k1_body(
     const uint32_t idwm = ptx::mma_inst_desc_dense<ptx::MmaDenseKind::F16>(
         128, 128, ptx::F16Type::BF16, ptx::F16Type::BF16, ptx::DType::F32, ptx::Major::K, ptx::Major::MN);
     const uint32_t tp = (sub & 1) ? 256u : 0u;  // this chunk's pair
-    // pTt TMA landed. ALL threads consume the phase: skipping an open
-    // phase would alias the next parity wait against the previous completed
-    ptx::mbar_wait_parity(&mb_f, mbph & 1);
-    ++mbph;
     if (tid == 0) {
       ptx::tcgen05_fence_after_thread_sync();
       // W-D at tp+[0,128): -W[kc_out][kc_in] = kdecT @ P via MN-major B
@@ -1231,6 +1260,7 @@ __device__ static void k1_body(
       dst[0] = sw ? hi : lo;
       dst[1] = sw ? lo : hi;
     }
+    ptx::fence_async_shared();  // sLt generic stores -> the compose tcgen05.mma reads
     ptx::tcgen05_fence_before_thread_sync();
     __syncthreads();  // sLt complete for the compose's B descs
     {
@@ -1322,7 +1352,14 @@ __device__ static void k1_body(
     if (sub + 1 < njobs) __syncthreads();  // slot reuse across jobs
   }  // job loop
   if (pieceL) {
-    if (warp == 0) ptx::tcgen05_dealloc(s_taddr, 512);
+    // the piece-end drain's tcgen05.ld in EVERY warp precede warp 0 freeing
+    // the columns (no barrier follows the last job otherwise)
+    ptx::tcgen05_fence_before_thread_sync();
+    __syncthreads();
+    if (warp == 0) {
+      ptx::tcgen05_fence_after_thread_sync();
+      ptx::tcgen05_dealloc(s_taddr, 512);
+    }
     ptx::tcgen05_relinquish();
   }
 }
@@ -1432,24 +1469,42 @@ __device__ static void chain_body(
     int cbase = 0,
     int pbase = 0,
     int tokoff = 0,
-    int tend = 0) {
+    int tend = 0,
+    // sparse snapshot (trk != nullptr): store ONLY the state entering chunk
+    // trk[seq] of this sequence (0 <= trk[seq] < n_chunks), at row seq of hpc
+    // ([N][H][..]); a sequence whose trk[seq] is outside that range stores
+    // nothing (the FLA track_state contract). trk == nullptr: dense, row = c.
+    const int* __restrict__ trk = nullptr,
+    int seq = 0) {
   const int tid = threadIdx.x;
   const int warp = tid >> 5, lane = tid & 31;
   const int band = (warp & 3) * 32, ch = warp >> 2;  // 16 warps: ch = quarter
   const int vc = band + lane;
+  int hpc_only_c = -1;  // -1: dense (every chunk, row c)
+  if (hpc && trk) {
+    const int t = trk[seq];
+    if (t >= 0 && t < n_chunks) {
+      const size_t so = (size_t)seq * H * K * K;
+      hpc = hpc_bf16 ? static_cast<void*>(static_cast<bf16*>(hpc) + so) : static_cast<void*>(static_cast<float*>(hpc) + so);
+      hpc_only_c = cbase + t;
+    } else {
+      hpc = nullptr;
+    }
+  }
   auto& sPneg = S.sPneg;
   auto& sKdT = S.sKdT;
   auto& sQd = S.sQd;
   auto& sAh = S.sAh;
   auto& sAl = S.sAl;
   auto& sU0 = S.sU0;
-  auto& mb_tma = S.mb_tma;
+  auto& mb_tma2 = S.mb_tma2;
   auto& mb_p1 = S.mb_p1;
   auto& mb_p2 = S.mb_p2;
   auto& mb_o = S.mb_o;
   auto& s_taddr = S.s_taddr;
   if (tid == 0) {
-    ptx::mbar_init(&mb_tma, 1);
+    ptx::mbar_init(&mb_tma2[0], 1);
+    ptx::mbar_init(&mb_tma2[1], 1);
     ptx::mbar_init(&mb_p1, 1);  // spine: P1 only
     ptx::mbar_init(&mb_p2, 1);  // spine: P2 only
     ptx::mbar_init(&mb_o, 2);   // o-pipe: P3 + P4
@@ -1513,6 +1568,7 @@ __device__ static void chain_body(
         if (pflags)  // fused grid: trail piece q2's producer
           while (ptx::ld_acq_b32(&pflags[(pbase + q2) * H + h]) < 1u)
             __nanosleep(128);
+        if (pflags) ptx::fence_async_global();  // acquired generic data -> this thread's TMA reads
         if (q2) ptx::mbar_wait_parity(&S.mb_cmL, (q2 - 1) & 1);
         ptx::mbar_arrive_expect_tx(&S.mb_pre, K * K * 2);
         ptx::cp_async_bulk_tensor_2d_load(ptx::to_shared(pL), sl_map, 0, ((pbase + q2) * H + h) * K, &S.mb_pre);
@@ -1582,19 +1638,20 @@ __device__ static void chain_body(
     if (tid == 0)
       while (ptx::ld_acq_b32(&pflags[(pbase + sg) * H + h]) < 1u)
         __nanosleep(128);
+    if (tid == 0) ptx::fence_async_global();  // acquired generic data -> this thread's TMA reads
     __syncthreads();
   }
   auto tma_issue = [&](int cc) {
     const int bu2 = (cc - c0) & 1;
-    ptx::mbar_arrive_expect_tx(&mb_tma, 6 * 64 * 64 * 2 + 128 * 64 * 2 + BT * K * 4);
-    ptx::cp_async_bulk_tensor_2d_load(ptx::to_shared(&sPneg[bu2][0][0][0]), &pneg_map, 0, (cc * H + h) * BT, &mb_tma);
-    ptx::cp_async_bulk_tensor_2d_load(ptx::to_shared(&sPneg[bu2][1][0][0]), &pneg_map, 64, (cc * H + h) * BT, &mb_tma);
-    ptx::cp_async_bulk_tensor_2d_load(ptx::to_shared(&sKdT[bu2][0][0]), &kdt_map, 0, (cc * H + h) * K, &mb_tma);
-    ptx::cp_async_bulk_tensor_2d_load(ptx::to_shared(&sQd[bu2][0][0][0]), &qd_map, 0, (cc * H + h) * BT, &mb_tma);
-    ptx::cp_async_bulk_tensor_2d_load(ptx::to_shared(&sQd[bu2][1][0][0]), &qd_map, 64, (cc * H + h) * BT, &mb_tma);
-    ptx::cp_async_bulk_tensor_2d_load(ptx::to_shared(&sAh[bu2][0][0]), &aqh_map, 0, (cc * H + h) * BT, &mb_tma);
-    ptx::cp_async_bulk_tensor_2d_load(ptx::to_shared(&sAl[bu2][0][0]), &aql_map, 0, (cc * H + h) * BT, &mb_tma);
-    ptx::cp_async_bulk_tensor_2d_load(ptx::to_shared(&sU0[bu2][0][0]), &u0f_map, 0, (cc * H + h) * BT, &mb_tma);
+    ptx::mbar_arrive_expect_tx(&mb_tma2[bu2], 6 * 64 * 64 * 2 + 128 * 64 * 2 + BT * K * 4);
+    ptx::cp_async_bulk_tensor_2d_load(ptx::to_shared(&sPneg[bu2][0][0][0]), &pneg_map, 0, (cc * H + h) * BT, &mb_tma2[bu2]);
+    ptx::cp_async_bulk_tensor_2d_load(ptx::to_shared(&sPneg[bu2][1][0][0]), &pneg_map, 64, (cc * H + h) * BT, &mb_tma2[bu2]);
+    ptx::cp_async_bulk_tensor_2d_load(ptx::to_shared(&sKdT[bu2][0][0]), &kdt_map, 0, (cc * H + h) * K, &mb_tma2[bu2]);
+    ptx::cp_async_bulk_tensor_2d_load(ptx::to_shared(&sQd[bu2][0][0][0]), &qd_map, 0, (cc * H + h) * BT, &mb_tma2[bu2]);
+    ptx::cp_async_bulk_tensor_2d_load(ptx::to_shared(&sQd[bu2][1][0][0]), &qd_map, 64, (cc * H + h) * BT, &mb_tma2[bu2]);
+    ptx::cp_async_bulk_tensor_2d_load(ptx::to_shared(&sAh[bu2][0][0]), &aqh_map, 0, (cc * H + h) * BT, &mb_tma2[bu2]);
+    ptx::cp_async_bulk_tensor_2d_load(ptx::to_shared(&sAl[bu2][0][0]), &aql_map, 0, (cc * H + h) * BT, &mb_tma2[bu2]);
+    ptx::cp_async_bulk_tensor_2d_load(ptx::to_shared(&sU0[bu2][0][0]), &u0f_map, 0, (cc * H + h) * BT, &mb_tma2[bu2]);
   };
   if (tid == 0 && (!VL || per_seg > 0)) tma_issue(c0);
   // running gC chunk pointer (chunks are H*K apart — same addresses,
@@ -1624,10 +1681,10 @@ __device__ static void chain_body(
       ptx::tcgen05_st_32x32b_x16(a1st, hw);
     }
     // h[c]: the register state BEFORE this chunk (store-only; the last
-    // boundary is final_state's). Dense — every row written; a per-sequence
-    // snapshot-index filter would gate this store (sparse follow-up).
-    if (hpc) {
-      const size_t hb = ((size_t)c * H + h) * K * K;
+    // boundary is final_state's). Dense: every chunk, row c. Sparse (trk):
+    // only chunk hpc_only_c, into the sequence's row (hpc already offset).
+    if (hpc && (hpc_only_c < 0 || c == hpc_only_c)) {
+      const size_t hb = ((size_t)(hpc_only_c < 0 ? c : 0) * H + h) * K * K;
       if (hpc_v_first) {  // [V,K]: kc contiguous, one run per thread
         const size_t off = hb + (size_t)vc * K + ch * 32;
         if (hpc_bf16) {
@@ -1663,9 +1720,9 @@ __device__ static void chain_body(
     // below need the cross-proxy visibility this mbarrier's completion
     // gives its waiters (non-issuer threads previously just idled into
     // the mb_p1 wait from here, so no overlap is lost)
-    ptx::mbar_wait_parity(&mb_tma, (c - c0) & 1);
+    ptx::mbar_wait_parity(&mb_tma2[buf_idx], ((c - c0) >> 1) & 1);
     if (tid == 0 || tid == 32) {  // dual issuers, disjoint D regions
-      // phase closed: arm the next chunk into the other buffer
+      // phase closed: arm the next chunk into the other buffer (own barrier)
       if (tid == 0 && c + 1 < c0 + per_seg) tma_issue(c + 1);
       ptx::tcgen05_fence_after_thread_sync();
       const uint32_t idesc1 = ptx::mma_inst_desc_dense<ptx::MmaDenseKind::F16>(
@@ -1728,6 +1785,9 @@ __device__ static void chain_body(
       ptx::tcgen05_st_32x32b_x8(
           taddr + lane_hi + (224u + ch * 8), lw[0], lw[1], lw[2], lw[3], lw[4], lw[5], lw[6], lw[7]);
     }
+    // this chunk's generic sU0[buf_idx] reads (U drain above) -> the TMA that refills this
+    // buffer (tma_issue of chunk c + 2, after later barriers) writes it through the async proxy
+    ptx::fence_async_shared();
     ptx::tcgen05_wait_st();
     ptx::tcgen05_fence_before_thread_sync();
     __syncthreads();
@@ -1813,12 +1873,19 @@ __device__ static void chain_body(
 #pragma unroll
     for (int j = 0; j < 32; ++j)
       Sf[((size_t)h * K + ch * 32 + j) * K + vc] = Sreg[j];
+  // every warp's tcgen05.ld precede warp 0 freeing the columns
+  ptx::tcgen05_fence_before_thread_sync();
   __syncthreads();
-  if (warp == 0) ptx::tcgen05_dealloc(taddr, 512);
+  if (warp == 0) {
+    ptx::tcgen05_fence_after_thread_sync();
+    ptx::tcgen05_dealloc(taddr, 512);
+  }
   ptx::tcgen05_relinquish();
 }
-// eqlen NP == 1 fallback: whole chain from h0, no piece maps/flags (the
-// sl/sc maps are valid encodes over the workspace but never dereferenced)
+// eqlen chains with no flags. gridDim.y == 1: the NP == 1 fallback and seq0's
+// whole-sequence chain (the sl/sc maps are valid encodes over the workspace but
+// never dereferenced). gridDim.y == NP > 1: the TFC route's piece chains, each
+// self-starting from the piece maps kda_compose wrote in the previous launch.
 __global__ void __launch_bounds__(512) k2_chain_tc(
     const __grid_constant__ CUtensorMap pneg_map,
     const __grid_constant__ CUtensorMap kdt_map,
@@ -1836,7 +1903,8 @@ __global__ void __launch_bounds__(512) k2_chain_tc(
     float* __restrict__ Sf,
     void* __restrict__ hpc,
     bool hpc_bf16,
-    bool hpc_v_first) {
+    bool hpc_v_first,
+    const int* __restrict__ trk) {
   __shared__ ChainSmem S;
   chain_body(
       S,
@@ -1859,15 +1927,310 @@ __global__ void __launch_bounds__(512) k2_chain_tc(
       hpc_v_first,
       &sl_map,
       &sc_map,
-      h0);
+      h0,
+      nullptr,
+      0,
+      0,
+      0,
+      0,
+      trk,
+      0);
+}
+
+// ---------------- TFC route: tail-free build + standalone compose ---------
+// The fused builder composes each piece's chunk maps in its tail, and that tail
+// (its TMEM columns plus its shared-memory union) is what limits its builders to
+// one CTA per SM. The TFC route builds the factors on the tail-free builder (two
+// CTAs per SM), composes the piece maps here, then runs k2_chain_tc over a (H, NP) grid
+// whose chains self-start from those maps. Three launches and no cross-CTA
+// waits: each launch reads the previous one's outputs after the stream's
+// kernel boundary.
+// One CTA per (piece, head) walks the piece's chunks with the tail's per-chunk
+// ops on operands it reads back from the factor tensors: the negated-P image
+// and the kdec rows by TMA (the kdec rows land in the same SWZ128 image the
+// tail builds with generic stores), u0 by TMA and then the tail's hi/lo
+// transpose-split, gC directly. Same mma shapes, descriptors, drains and
+// roundings, so from the same factor tensors the maps equal the fused
+// builder's bit for bit. Operand tiles are double-buffered: chunk c+1's TMA
+// lands while chunk c composes.
+struct ComposeSmem {
+  __align__(1024) bf16 pTt[2][K][64];     // [buf] negated-P image (MN-major B)
+  __align__(1024) bf16 kdT[2][K][64];     // [buf] kdec [kc][tok] rows, SWZ128
+  __align__(1024) bf16 u0Th[K][64];       // u0^T hi (SWZ128 placement)
+  __align__(1024) bf16 u0Tl[K][64];       // u0^T lo
+  __align__(1024) float sLt[16][128][8];  // L = diag(e^gC) - W, fp32 SWZ32 K=8 tiles
+  __align__(128) float sU0[BT][K];        // u0 chunk tile (TMA, linear)
+  uint64_t mb_pk[2], mb_u0, mb_m;
+  uint32_t s_taddr;
+};
+// Varlen piece table entry (host-built; see the varlen fused grid below).
+struct VlPiece {
+  int seq;     // sequence index (h0 / Sf row)
+  int cbase;   // sequence's first global chunk
+  int nc;      // sequence chunk count ceil(len/BT)
+  int np;      // pieces in the sequence
+  int sg;      // piece index within the sequence
+  int tokoff;  // tok0 - cbase*BT: global token row = c*BT + tokoff + i
+  int tend;    // sequence end token (pad mask)
+  int tail;    // piece holds the partial last chunk (len%BT != 0)
+};
+
+// Grid: one CTA per (piece, head), eqlen (pieces == nullptr: NP balanced
+// pieces of nc1 chunks) or varlen (pieces = the chain piece table). A
+// sequence's LAST piece has no map to make: chains compose only the maps of
+// the pieces before their own, so its CTAs exit at once. That also keeps the
+// varlen tail chunk (always in a last piece) out of this kernel.
+__global__ void __launch_bounds__(512) kda_compose(
+    const __grid_constant__ CUtensorMap pneg_map,
+    const __grid_constant__ CUtensorMap kdt_map,
+    const __grid_constant__ CUtensorMap u0f_map,
+    const float* __restrict__ gC,
+    bf16* __restrict__ pieceL,
+    float* __restrict__ piecec,
+    int nc1,
+    int H,
+    int NP,
+    const VlPiece* __restrict__ pieces) {
+  __shared__ ComposeSmem S;
+  const int tid = threadIdx.x;
+  const int warp = tid >> 5, lane = tid & 31;
+  const int h = blockIdx.x % H, p = blockIdx.x / H;
+  const int pidx = p * H + h;  // the fused builders' map index (eqlen and varlen)
+  int c0, njobs;
+  if (pieces) {
+    const VlPiece pv = pieces[p];
+    if (pv.sg == pv.np - 1) return;
+    c0 = pv.cbase + piece_c0(pv.sg, pv.nc, pv.np);
+    njobs = pv.cbase + piece_c0(pv.sg + 1, pv.nc, pv.np) - c0;
+  } else {
+    if (p == NP - 1) return;
+    c0 = piece_c0(p, nc1, NP);
+    njobs = piece_c0(p + 1, nc1, NP) - c0;
+  }
+  if (tid == 0) {
+    ptx::mbar_init(&S.mb_pk[0], 1);
+    ptx::mbar_init(&S.mb_pk[1], 1);
+    ptx::mbar_init(&S.mb_u0, 1);
+    ptx::mbar_init(&S.mb_m, 1);
+    asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+    ptx::prefetch_tensormap(&pneg_map);
+    ptx::prefetch_tensormap(&kdt_map);
+    ptx::prefetch_tensormap(&u0f_map);
+  }
+  if (warp == 0) ptx::tcgen05_alloc(ptx::to_shared(&S.s_taddr), 512);
+  ptx::tcgen05_fence_before_thread_sync();
+  __syncthreads();
+  ptx::tcgen05_fence_after_thread_sync();
+  const uint32_t taddr = S.s_taddr;
+  // tid 0 only. pTt / kdT of chunk sub into buffer sub & 1; u0 into its one slot
+  auto issue_pk = [&](int sub) {
+    const int b = sub & 1, c = c0 + sub;
+    ptx::mbar_arrive_expect_tx(&S.mb_pk[b], uint32_t(sizeof(S.pTt[0]) + sizeof(S.kdT[0])));
+    ptx::cp_async_bulk_tensor_2d_load(ptx::to_shared(&S.pTt[b][0][0]), &pneg_map, 0, (c * H + h) * BT, &S.mb_pk[b]);
+    ptx::cp_async_bulk_tensor_2d_load(ptx::to_shared(&S.pTt[b][64][0]), &pneg_map, 64, (c * H + h) * BT, &S.mb_pk[b]);
+    ptx::cp_async_bulk_tensor_2d_load(ptx::to_shared(&S.kdT[b][0][0]), &kdt_map, 0, (c * H + h) * K, &S.mb_pk[b]);
+  };
+  auto issue_u0 = [&](int sub) {
+    const int c = c0 + sub;
+    ptx::mbar_arrive_expect_tx(&S.mb_u0, uint32_t(sizeof(S.sU0)));
+    ptx::cp_async_bulk_tensor_2d_load(ptx::to_shared(&S.sU0[0][0]), &u0f_map, 0, (c * H + h) * BT, &S.mb_u0);
+  };
+  if (tid == 0) {
+    issue_u0(0);
+    issue_pk(0);
+    if (njobs > 1) issue_pk(1);
+  }
+  const int band = (warp & 3) * 32, ch = warp >> 2;  // 16 warps: 32-col ch
+  const int vc = band + lane;
+  const uint32_t lane_hi = uint32_t(band) << 16;
+  const uint32_t idw = ptx::mma_inst_desc_dense<ptx::MmaDenseKind::F16>(
+      128, 128, ptx::F16Type::BF16, ptx::F16Type::BF16, ptx::DType::F32, ptx::Major::K, ptx::Major::K);
+  const uint32_t idwm = ptx::mma_inst_desc_dense<ptx::MmaDenseKind::F16>(
+      128, 128, ptx::F16Type::BF16, ptx::F16Type::BF16, ptx::DType::F32, ptx::Major::K, ptx::Major::MN);
+  int mbph = 0;       // mb_m phase counter (one wait per committed batch)
+  bool pend = false;  // compose committed, wait deferred to the next chunk
+  auto drain_reg = [&](uint32_t dc, float* r2) {  // fp32 D region -> regs
+#pragma unroll
+    for (int b2 = 0; b2 < 4; ++b2) {
+      uint32_t r[8];
+      ptx::tcgen05_ld_32x32b_x8(
+          taddr + lane_hi + dc + uint32_t(ch * 32 + b2 * 8), r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7]);
+      ptx::tcgen05_wait_ld();
+#pragma unroll
+      for (int j = 0; j < 8; ++j)
+        r2[b2 * 8 + j] = __int_as_float(r[j]);
+    }
+  };
+  auto store_maps = [&](const float* lr2, const float* cr2) {  // the tail's store
+    const size_t sb2 = (size_t)pidx * K * K;
+#pragma unroll
+    for (int j = 0; j < 32; ++j) {
+      pieceL[sb2 + (size_t)(ch * 32 + j) * K + vc] = __float2bfloat16(lr2[j]);
+      piecec[sb2 + (size_t)(ch * 32 + j) * K + vc] = cr2[j];
+    }
+  };
+  for (int sub = 0; sub < njobs; ++sub) {
+    const int c = c0 + sub, b = sub & 1;
+    const uint32_t tp = b ? 256u : 0u;  // this chunk's TMEM pair
+    // u0 landed: the tail's hi/lo split into the w0 mma's A tiles. A thread
+    // owns one kc column (lanes step kc: conflict-free sU0 reads) and 16 rows.
+    ptx::mbar_wait_parity(&S.mb_u0, sub & 1);
+#pragma unroll
+    for (int j = 0; j < 16; ++j) {
+      const int kc = tid & (K - 1), tok = (tid >> 7) + 4 * j;
+      const int tokS = (((tok >> 3) ^ (kc & 7)) << 3) | (tok & 7);
+      const float uv = S.sU0[tok][kc];
+      const bf16 uh = __float2bfloat16(uv);
+      S.u0Th[kc][tokS] = uh;
+      S.u0Tl[kc][tokS] = __float2bfloat16(uv - __bfloat162float(uh));
+    }
+    // the previous chunk's compose retired: its A pair is this chunk's
+    // product target and its B tiles (sLt) are rewritten below. Waited
+    // before the barrier: tid 0 commits this chunk's products to mb_m right
+    // after it, so a thread that waited after the barrier could find mb_m
+    // two phases on (PTX try_wait.parity: current or immediately preceding
+    // phase only).
+    if (pend) {
+      ptx::mbar_wait_parity(&S.mb_m, mbph & 1);
+      ++mbph;
+      pend = false;
+    }
+    // writer-side, before the barrier: the u0T generic stores -> the w0 mma
+    // (async proxy), and the sU0 generic reads -> the u0 TMA that refills it
+    ptx::fence_async_shared();
+    ptx::tcgen05_fence_before_thread_sync();
+    __syncthreads();
+    if (tid == 0 && sub + 1 < njobs) issue_u0(sub + 1);
+    if (tid == 0) {
+      // buffer b landed. Only tid 0's mmas read pTt / kdT, so only tid 0
+      // waits: it refills b (chunk sub + 2) right after its own products
+      // wait, and another waiter could find mb_pk[b] two phases on.
+      ptx::mbar_wait_parity(&S.mb_pk[b], (sub >> 1) & 1);
+      ptx::tcgen05_fence_after_thread_sync();
+      // W-D at tp+[0,128): -W[kc_out][kc_in] = kdecT @ P via MN-major B
+#pragma unroll
+      for (int k16 = 0; k16 < BT / 16; ++k16) {
+        const uint64_t da = ptx::mma_smem_desc_k_major<uint16_t, 64, 128>(ptx::to_shared(&S.kdT[b][0][0]) + k16 * 32);
+        const uint64_t db =
+            ptx::mma_smem_desc_mn_major<uint16_t, 64, 128, 128>(ptx::to_shared(&S.pTt[b][0][0]) + k16 * 2048);
+        ptx::tcgen05_mma_f16(taddr + tp, da, db, idwm, k16 ? 1u : 0u);
+      }
+      // w0^T-D at tp+[128,256): w0^T[vc][kc_out] = u0T @ kdT^T (hi + lo A)
+      for (int half = 0; half < 2; ++half)
+#pragma unroll
+        for (int k16 = 0; k16 < BT / 16; ++k16) {
+          const uint64_t da = ptx::mma_smem_desc_k_major<uint16_t, 64, 128>(
+              ptx::to_shared(half ? &S.u0Tl[0][0] : &S.u0Th[0][0]) + k16 * 32);
+          const uint64_t db = ptx::mma_smem_desc_k_major<uint16_t, 64, 128>(ptx::to_shared(&S.kdT[b][0][0]) + k16 * 32);
+          ptx::tcgen05_mma_f16(taddr + tp + 128u, da, db, idw, (half | k16) ? 1u : 0u);
+        }
+      ptx::tcgen05_commit_arrive(&S.mb_m);
+    }
+    ptx::mbar_wait_parity(&S.mb_m, mbph & 1);
+    ++mbph;
+    ptx::tcgen05_fence_after_thread_sync();
+    // buffer b's only reader (the products mma) completed: refill it
+    if (tid == 0 && sub + 2 < njobs) issue_pk(sub + 2);
+    // W drain -> L = diag(e^gC) - W as fp32 SWZ32 K=8 tiles (the tail's)
+    for (int b4 = 0; b4 < 4; ++b4) {
+      uint32_t r[8];
+      ptx::tcgen05_ld_32x32b_x8(
+          taddr + lane_hi + (tp + uint32_t(ch * 32 + b4 * 8)), r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7]);
+      ptx::tcgen05_wait_ld();
+      float lt[8];
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        const int kin = ch * 32 + b4 * 8 + j;
+        lt[j] = (band + lane == kin ? gC[((size_t)c * H + h) * K + kin] : 0.f) + __int_as_float(r[j]);
+      }
+      const bool sw = ((band + lane) >> 2) & 1;
+      const float4 lo = float4{lt[0], lt[1], lt[2], lt[3]};
+      const float4 hi = float4{lt[4], lt[5], lt[6], lt[7]};
+      float4* dst = reinterpret_cast<float4*>(&S.sLt[ch * 4 + b4][band + lane][0]);
+      dst[0] = sw ? hi : lo;
+      dst[1] = sw ? lo : hi;
+    }
+    ptx::fence_async_shared();  // sLt generic stores -> the compose tcgen05.mma reads
+    ptx::tcgen05_fence_before_thread_sync();
+    __syncthreads();
+    const bool piece_end = sub + 1 == njobs;
+    if (sub == 0) {
+      // seed: crun = the w0^T product (in tp+128); Lrun = L^T via the
+      // transposed tile re-read
+      alignas(16) float lr[32];
+#pragma unroll
+      for (int j = 0; j < 32; ++j) {
+        const int out = ch * 32 + j;
+        lr[j] = S.sLt[vc >> 3][out][(vc & 7) ^ (((out >> 2) & 1) << 2)];
+      }
+      if (piece_end) {
+        alignas(16) float cr[32];
+        drain_reg(tp + 128u, cr);
+        store_maps(lr, cr);
+      } else {
+#pragma unroll
+        for (int c4 = 0; c4 < 32; c4 += 4)
+          ptx::tcgen05_st_32x32b_x4(
+              taddr + lane_hi + (tp + uint32_t(ch * 32 + c4)),
+              __float_as_int(lr[c4]),
+              __float_as_int(lr[c4 + 1]),
+              __float_as_int(lr[c4 + 2]),
+              __float_as_int(lr[c4 + 3]));
+        ptx::tcgen05_wait_st();
+      }
+    } else {
+      // D(tp) = Lrun @ L-tiles (scale 0 overwrites the drained W), D(tp+128)
+      // = crun @ L-tiles + w0 (scale 1 onto the completed product); A = the
+      // other pair's fp32 D read as tf32
+      if (tid == 0) {
+        ptx::tcgen05_fence_after_thread_sync();
+        const uint32_t idt = ptx::mma_inst_desc_tf32(128, K);
+        const uint32_t sp2 = tp ^ 256u;
+        for (int st2 = 0; st2 < 2; ++st2)
+#pragma unroll
+          for (int s = 0; s < 16; ++s)
+            mma_tf32_atmem(
+                taddr + tp + uint32_t(st2 * 128),
+                taddr + (sp2 + uint32_t(st2 * 128 + 8 * s)),
+                ptx::mma_smem_desc_k_major<uint32_t, 8, 32>(ptx::to_shared(&S.sLt[s][0][0])),
+                idt,
+                (st2 | s) ? 1u : 0u);
+        ptx::tcgen05_commit_arrive(&S.mb_m);
+      }
+      if (piece_end) {
+        ptx::mbar_wait_parity(&S.mb_m, mbph & 1);
+        ++mbph;
+        ptx::tcgen05_fence_after_thread_sync();
+        alignas(16) float lr[32], cr[32];
+        drain_reg(tp, lr);
+        drain_reg(tp + 128u, cr);
+        store_maps(lr, cr);
+      } else {
+        pend = true;
+      }
+    }
+  }
+  // every warp's tcgen05.ld / st precede warp 0 freeing the columns
+  ptx::tcgen05_fence_before_thread_sync();
+  __syncthreads();
+  if (warp == 0) {
+    ptx::tcgen05_fence_after_thread_sync();
+    ptx::tcgen05_dealloc(taddr, 512);
+  }
+  ptx::tcgen05_relinquish();
 }
 
 // ---------------- fused grid: chain blocks trail k1's pieces --------------
-// bids [0,NP*H) = k1 piece-builders (publish pflags after their stores);
-// bids [NP*H, 2*NP*H) = self-start chain blocks gated on the piece flags.
-// Chains become resident as builder waves retire and their spins trail the
-// (mostly complete) flags — the launch boundary and part of the chain wall
-// hide under k1's tail.
+// Roles come from a DYNAMIC block index (ticket = atomicAdd on the counter word
+// pflags[NP*H], zeroed with the flags before each launch), not from blockIdx:
+// tickets [0,NP*H) = k1 piece-builders (publish pflags after their stores);
+// tickets [NP*H, 2*NP*H) = self-start chain blocks gated on the piece flags.
+// A chain ticket exists only after every builder ticket was taken by a block
+// that is already running, and builders never wait on other blocks, so every
+// flag a chain spins on has a running producer (CUDA C++ execution model:
+// a device thread that has executed a step makes progress) for any block
+// dispatch order. Chains trail the (mostly complete) flags, so the launch
+// boundary and part of the chain wall hide under k1's tail.
 template <int GM = 0, bool RAW = false, bool BSIG = false>
 __global__ void __launch_bounds__(512) kda_fused(
     const bf16* __restrict__ q,
@@ -1905,13 +2268,18 @@ __global__ void __launch_bounds__(512) kda_fused(
     void* __restrict__ hpc,
     bool hpc_bf16,
     bool hpc_v_first,
-    uint32_t* __restrict__ pflags) {
+    uint32_t* __restrict__ pflags,
+    const int* __restrict__ trk) {
   union FusedSmem {
     K1Smem k1;
     ChainSmem chain;
   };
   __shared__ FusedSmem S;
-  const int tid = threadIdx.x, bid = blockIdx.x;
+  __shared__ int s_ticket;
+  const int tid = threadIdx.x;
+  if (tid == 0) s_ticket = int(atomicAdd(&pflags[NP * H], 1u));
+  __syncthreads();
+  const int bid = s_ticket;
   const int nc1 = T / BT;
   if (bid < NP * H) {
     const int h = bid / NP, pc = bid % NP;
@@ -1946,6 +2314,9 @@ __global__ void __launch_bounds__(512) kda_fused(
         dtb,
         lb,
         &pneg_map);
+    // writer-side: every thread's factor-tensor stores -> async proxy (chains TMA them),
+    // before the barrier that orders them ahead of tid 0's release
+    ptx::fence_async_global();
     __syncthreads();
     if (tid == 0) {
       ptx::fence_async_global();  // consumers read via TMA
@@ -1975,7 +2346,13 @@ __global__ void __launch_bounds__(512) kda_fused(
         &sl_map,
         &sc_map,
         h0,
-        pflags);
+        pflags,
+        0,
+        0,
+        0,
+        0,
+        trk,
+        0);
   }
 }
 
@@ -1992,17 +2369,7 @@ __global__ void __launch_bounds__(512) kda_fused(
 // partial last chunk) need those guards: full pieces dispatch to the exact
 // eqlen bodies — t0 = c*BT + tokoff and the global-chunk factor indexing
 // are shared, so with T = nc_tot*BT (nc1 == nc_tot) every address matches
-// the VL body's.
-struct VlPiece {
-  int seq;     // sequence index (h0 / Sf row)
-  int cbase;   // sequence's first global chunk
-  int nc;      // sequence chunk count ceil(len/BT)
-  int np;      // pieces in the sequence
-  int sg;      // piece index within the sequence
-  int tokoff;  // tok0 - cbase*BT: global token row = c*BT + tokoff + i
-  int tend;    // sequence end token (pad mask)
-  int tail;    // piece holds the partial last chunk (len%BT != 0)
-};
+// the VL body's. (VlPiece is defined with the TFC route above.)
 template <int GM = 0, bool RAW = false, bool BSIG = false>
 __global__ void __launch_bounds__(512) kda_fused_vl(
     const bf16* __restrict__ q,
@@ -2042,13 +2409,19 @@ __global__ void __launch_bounds__(512) kda_fused_vl(
     void* __restrict__ hpc,
     bool hpc_bf16,
     bool hpc_v_first,
-    uint32_t* __restrict__ pflags) {
+    uint32_t* __restrict__ pflags,
+    const int* __restrict__ trk) {
   union FusedSmem {
     K1Smem k1;
     ChainSmem chain;
   };
   __shared__ FusedSmem S;
-  const int tid = threadIdx.x, bid = blockIdx.x;
+  __shared__ int s_ticket;
+  const int tid = threadIdx.x;
+  // dynamic block index: see kda_fused (counter word pflags[npt*H])
+  if (tid == 0) s_ticket = int(atomicAdd(&pflags[npt * H], 1u));
+  __syncthreads();
+  const int bid = s_ticket;
   if (bid < npt * H) {
     const int h = bid / npt, p = bid % npt;
     const VlPiece* pc = pieces + p;
@@ -2114,6 +2487,9 @@ __global__ void __launch_bounds__(512) kda_fused_vl(
           dtb,
           lb,
           &pneg_map);
+    // writer-side: every thread's factor-tensor stores -> async proxy (chains TMA them),
+    // before the barrier that orders them ahead of tid 0's release
+    ptx::fence_async_global();
     __syncthreads();
     if (tid == 0) {
       ptx::fence_async_global();  // consumers read via TMA
@@ -2150,7 +2526,9 @@ __global__ void __launch_bounds__(512) kda_fused_vl(
           pc->cbase,
           p - pc->sg,
           pc->tokoff,
-          pc->tend);
+          pc->tend,
+          trk,
+          pc->seq);
     else
       chain_body<false>(
           S.chain,
@@ -2178,7 +2556,9 @@ __global__ void __launch_bounds__(512) kda_fused_vl(
           pc->cbase,
           p - pc->sg,
           pc->tokoff,
-          pc->tend);
+          pc->tend,
+          trk,
+          pc->seq);
   }
 }
 
@@ -2355,7 +2735,11 @@ __device__ static void k1_tf_body(
     const int c = job % nc1, h = job / nc1, t0 = c * BT + tokoff;
     const int C_act = VL ? min(BT, tse - t0) : BT;  // real rows (tail < BT)
     bf16(&sgb)[BT][K] = S.sp.sgb;
-    if (sub) __syncthreads();  // pool reuse: prior job's P4/P5 reads done
+    if (sub) {  // pool reuse: prior job's P4/P5 reads done
+      // the prior job's generic pool accesses -> the gate TMA below writes the pool (async proxy)
+      ptx::fence_async_shared();
+      __syncthreads();
+    }
     if (tid == 0) {            // ONE box: [BT][K] bf16, row-major (SWIZZLE_NONE)
       ptx::mbar_arrive_expect_tx(&S.mb_in, BT * K * 2);
       ptx::cp_async_bulk_tensor_2d_load(ptx::to_shared(&sgb[0][0]), &glog_map, h * K, t0, &S.mb_in);
@@ -3008,7 +3392,8 @@ __global__ void __launch_bounds__(512) k2_chain_tc_vl(
     void* __restrict__ hpc,
     bool hpc_bf16,
     bool hpc_v_first,
-    const VlPiece* __restrict__ seqs) {
+    const VlPiece* __restrict__ seqs,
+    const int* __restrict__ trk) {
   __shared__ ChainSmem S;
   const int s = blockIdx.x / H, h = blockIdx.x % H;
   const VlPiece* sq = seqs + s;
@@ -3040,7 +3425,9 @@ __global__ void __launch_bounds__(512) k2_chain_tc_vl(
         sq->cbase,
         0,
         sq->tokoff,
-        sq->tend);
+        sq->tend,
+        trk,
+        s);
   else
     chain_body<false>(
         S,
@@ -3068,7 +3455,96 @@ __global__ void __launch_bounds__(512) k2_chain_tc_vl(
         sq->cbase,
         0,
         sq->tokoff,
-        sq->tend);
+        sq->tend,
+        trk,
+        s);
+}
+// varlen TFC piece chains: kda_fused_vl's chain half without flags. One CTA per
+// (chain piece, head); each self-starts from the maps kda_compose wrote in the
+// previous launch for the pieces before it in its sequence.
+__global__ void __launch_bounds__(512) k2_chain_tc_vlp(
+    const __grid_constant__ CUtensorMap pneg_map,
+    const __grid_constant__ CUtensorMap kdt_map,
+    const __grid_constant__ CUtensorMap qd_map,
+    const __grid_constant__ CUtensorMap aqh_map,
+    const __grid_constant__ CUtensorMap aql_map,
+    const __grid_constant__ CUtensorMap u0f_map,
+    const __grid_constant__ CUtensorMap sl_map,
+    const __grid_constant__ CUtensorMap sc_map,
+    const float* __restrict__ gC,
+    const float* __restrict__ h0,
+    int H,
+    bf16* __restrict__ o,
+    float* __restrict__ Sf,
+    void* __restrict__ hpc,
+    bool hpc_bf16,
+    bool hpc_v_first,
+    const VlPiece* __restrict__ pieces,
+    const int* __restrict__ trk) {
+  __shared__ ChainSmem S;
+  const int h = blockIdx.x % H, p = blockIdx.x / H;
+  const VlPiece* pc = pieces + p;
+  const size_t so = (size_t)pc->seq * H * K * K;  // h0/Sf per sequence
+  if (pc->tail)
+    chain_body<true>(
+        S,
+        h,
+        pc->sg,
+        pc->np,
+        pneg_map,
+        kdt_map,
+        qd_map,
+        aqh_map,
+        aql_map,
+        u0f_map,
+        gC,
+        pc->nc,
+        H,
+        o,
+        Sf + so,
+        hpc,
+        hpc_bf16,
+        hpc_v_first,
+        &sl_map,
+        &sc_map,
+        h0 + so,
+        nullptr,
+        pc->cbase,
+        p - pc->sg,
+        pc->tokoff,
+        pc->tend,
+        trk,
+        pc->seq);
+  else
+    chain_body<false>(
+        S,
+        h,
+        pc->sg,
+        pc->np,
+        pneg_map,
+        kdt_map,
+        qd_map,
+        aqh_map,
+        aql_map,
+        u0f_map,
+        gC,
+        pc->nc,
+        H,
+        o,
+        Sf + so,
+        hpc,
+        hpc_bf16,
+        hpc_v_first,
+        &sl_map,
+        &sc_map,
+        h0 + so,
+        nullptr,
+        pc->cbase,
+        p - pc->sg,
+        pc->tokoff,
+        pc->tend,
+        trk,
+        pc->seq);
 }
 
 // Host side: tensor-map encoders, cached workspace, torch entry point.
@@ -3289,7 +3765,26 @@ constexpr double C_JOB_TF = 10.2, C_JOB_FUSED = 16.2, C_STEP = 2.1;
 struct Route {
   bool seq0;
   int npb;
+  // TFC: tail-free build over the npb builder budget, kda_compose + piece
+  // chains over the npc chain budget (see tfc_opt_in)
+  bool tfc = false;
+  int npc = 0;
 };
+// Route override for A/B probes and tests (route -1 = pick_route, 0 fused,
+// 1 seq0, 2 tfc; npb / npc 0 = default). Set only through _set_route_override;
+// the serving path never calls it. g_last records the route each call ran.
+static int g_route_ovr = -1, g_npb_ovr = 0, g_npc_ovr = 0;
+// K31PF_KDA_TFC=1 opts the default pick into TFC wherever it chose the
+// multi-piece FUSED grid on a call of >= 64 chunks: in kernel A/B against the
+// fused grid (4K-16K tokens, H 12 and 24, single sequences and packs) TFC was
+// faster at the same o / final-state error vs an fp64 reference; where the
+// pick is SEQ0, TFC was slower, so those calls keep SEQ0.
+// Read on every call so a process can flip it.
+static bool tfc_opt_in() {
+  const char* e = std::getenv("K31PF_KDA_TFC");
+  return e != nullptr && e[0] == '1' && e[1] == '\0';
+}
+static std::vector<int64_t> g_last;  // {route, npieces, builder pieces, nc, T, N, H}
 static Route pick_route(const std::vector<int64_t>& cu, int64_t T, int64_t H, bool varlen) {
   const double sms = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
   int64_t nc_tot = 0, depth = 0;
@@ -3323,12 +3818,13 @@ static Route pick_route(const std::vector<int64_t>& cu, int64_t T, int64_t H, bo
   return {false, fused.npb};
 }
 
-static Workspace&
-get_workspace(const torch::Device& dev, int64_t T, int64_t nc, int64_t H, int64_t npieces, int64_t N) {
+static Workspace& get_workspace(
+    const torch::Device& dev, int64_t T, int64_t nc, int64_t H, int64_t npieces, int64_t N, bool* created = nullptr) {
   // guarded by the GIL (single writer)
   static std::map<std::array<int64_t, 6>, Workspace> cache;
   const std::array<int64_t, 6> key{dev.index(), T, nc, H, npieces, N};
   auto it = cache.find(key);
+  if (created) *created = it == cache.end();
   if (it != cache.end()) return it->second;
   if (cache.size() >= kMaxWorkspaces) cache.clear();
   Workspace ws;
@@ -3347,7 +3843,7 @@ get_workspace(const torch::Device& dev, int64_t T, int64_t nc, int64_t H, int64_
   // failed the 16K o gate)
   ws.pieceL = torch::empty({npieces * H * K * K}, ob);
   ws.piecec = torch::empty({npieces * H * K * K}, of);
-  ws.pflags = torch::empty({npieces * H}, oi);
+  ws.pflags = torch::empty({npieces * H + 1}, oi);  // + the fused grids' ticket counter
   ws.pneg_map = enc2d(ws.P.data_ptr(), (uint64_t)(nc * H * BT), K, BT, 64);
   ws.kdt_map = enc2d(ws.kdec.data_ptr(), (uint64_t)(nc * H * K), BT, K, 64);
   ws.qd_map = enc2d(ws.qdec.data_ptr(), (uint64_t)(nc * H * BT), K, BT, 64);
@@ -3404,7 +3900,8 @@ static std::tuple<torch::Tensor, torch::Tensor> kda_prefill_fwd(
     bool use_qk_l2norm_in_kernel,
     bool use_beta_sigmoid_in_kernel,
     const std::optional<torch::Tensor>& h_per_chunk,
-    bool h_v_first) {
+    bool h_v_first,
+    const std::optional<torch::Tensor>& track_chunk_idx) {
   TORCH_CHECK(q.is_cuda() && q.dim() == 3 && q.size(2) == K, "q must be a CUDA [T, H, 128] tensor, got ", q.sizes());
   const int64_t T = q.size(0), H = q.size(1);
   TORCH_CHECK(T >= 1 && H >= 1, "empty input: T=", T, " H=", H);
@@ -3484,34 +3981,77 @@ static std::tuple<torch::Tensor, torch::Tensor> kda_prefill_fwd(
   // that piece budget is GLOBAL (sequences already parallelize the grid;
   // a per-seq NP over-fills it) — pro-rated by nc_s, round-half-up,
   // clamped to the per-seq cap; N=1 reduces exactly to the eqlen NP
-  const Route route = pick_route(cu, T, H, varlen);
+  Route route = pick_route(cu, T, H, varlen);
+  if (g_route_ovr < 0 && !route.seq0 && tfc_opt_in()) {
+    int64_t nct = 0;
+    if (varlen)
+      for (size_t s = 0; s + 1 < cu.size(); ++s)
+        nct += (cu[s + 1] - cu[s] + BT - 1) / BT;
+    else
+      nct = T / BT;
+    if (nct >= 64 && piece_plan(cu, T, route.npb, varlen).first > 1) {
+      const int64_t sms = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
+      route.tfc = true;
+      route.npb = piece_budget(cu, T, H, varlen, builder_slots(true, varlen));
+      route.npc = int(std::max<int64_t>(2, sms / H));
+    }
+  }
+  if (g_route_ovr >= 0) {  // probe / test override (see g_route_ovr)
+    route.seq0 = g_route_ovr == 1;
+    route.tfc = g_route_ovr == 2 && (varlen || T / BT >= 4);
+    if (route.tfc) {
+      const int64_t sms = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
+      route.npb = g_npb_ovr > 0 ? g_npb_ovr : piece_budget(cu, T, H, varlen, builder_slots(true, varlen));
+      route.npc = g_npc_ovr > 0 ? g_npc_ovr : int(std::max<int64_t>(2, sms / H));
+    } else if (g_npb_ovr > 0) {
+      route.npb = g_npb_ovr;
+    }
+  }
   const int npb = route.npb;
   std::vector<VlPiece> pieces;
-  int64_t nc = 0, npieces = 0;
+  int64_t nc = 0, npieces = 0, nbp = 0;  // nbp: TFC builder pieces
   if (varlen) {
     int nc_tot = 0;
     for (size_t s = 0; s + 1 < cu.size(); ++s)
       nc_tot += int((cu[s + 1] - cu[s] + BT - 1) / BT);
-    std::vector<VlPiece> seqs;  // seq0's chains: one whole-sequence piece
-    int nc_run = 0;
-    for (size_t s = 0; s + 1 < cu.size(); ++s) {
-      const int len = int(cu[s + 1] - cu[s]);
-      const int ncs = (len + BT - 1) / BT;
-      const int np =
-          std::min(std::min(npb, std::max(1, ncs / 2)), std::max(1, (2 * npb * ncs + nc_tot) / (2 * nc_tot)));
-      const int tokoff = int(cu[s]) - nc_run * BT;
-      for (int sg = 0; sg < np; ++sg)
-        pieces.push_back(VlPiece{int(s), nc_run, ncs, np, sg, tokoff, int(cu[s + 1]), sg == np - 1 && len % BT != 0});
-      seqs.push_back(VlPiece{int(s), nc_run, ncs, 1, 0, tokoff, int(cu[s + 1]), len % BT != 0});
-      nc_run += ncs;
+    // pieces per sequence for a GLOBAL budget (see above); seqs: one whole-
+    // sequence entry per sequence (seq0's chains)
+    auto plan = [&](int budget, std::vector<VlPiece>& out, std::vector<VlPiece>* seqs) {
+      int nc_run = 0;
+      for (size_t s = 0; s + 1 < cu.size(); ++s) {
+        const int len = int(cu[s + 1] - cu[s]);
+        const int ncs = (len + BT - 1) / BT;
+        const int np =
+            std::min(std::min(budget, std::max(1, ncs / 2)), std::max(1, (2 * budget * ncs + nc_tot) / (2 * nc_tot)));
+        const int tokoff = int(cu[s]) - nc_run * BT;
+        for (int sg = 0; sg < np; ++sg)
+          out.push_back(VlPiece{int(s), nc_run, ncs, np, sg, tokoff, int(cu[s + 1]), sg == np - 1 && len % BT != 0});
+        if (seqs) seqs->push_back(VlPiece{int(s), nc_run, ncs, 1, 0, tokoff, int(cu[s + 1]), len % BT != 0});
+        nc_run += ncs;
+      }
+    };
+    std::vector<VlPiece> seqs;
+    plan(npb, pieces, &seqs);
+    nc = nc_tot;
+    if (route.tfc) {  // table = [builder pieces (npb budget)][chain pieces (npc budget)]
+      std::vector<VlPiece> cps;
+      plan(route.npc, cps, nullptr);
+      nbp = int64_t(pieces.size());
+      npieces = int64_t(cps.size());
+      pieces.insert(pieces.end(), cps.begin(), cps.end());
+    } else {  // table = [builder pieces][whole-sequence entries]
+      npieces = int64_t(pieces.size());
+      pieces.insert(pieces.end(), seqs.begin(), seqs.end());
     }
-    nc = nc_run;
-    npieces = int64_t(pieces.size());
-    pieces.insert(pieces.end(), seqs.begin(), seqs.end());
   } else {
     nc = T / BT;
     npieces = std::min<int64_t>(npb, std::max<int64_t>(1, nc / 2));
+    if (route.tfc) {  // maps + chains over npc pieces; the build splits on its own
+      npieces = std::min<int64_t>(route.npc, nc / 2);
+      nbp = std::min<int64_t>(npb, nc / 2);
+    }
   }
+  g_last = {route.tfc ? 2 : (route.seq0 ? 1 : (!varlen && npieces <= 1 ? 3 : 0)), npieces, nbp, nc, T, N, H};
 
   const c10::cuda::CUDAGuard guard(q.device());
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
@@ -3548,15 +4088,38 @@ static std::tuple<torch::Tensor, torch::Tensor> kda_prefill_fwd(
   // sequence n's state after exactly j*BT tokens (j = 0 == initial_state), so
   // a consumer can only snapshot at multiples of BT == 64. The last boundary
   // is NOT here — it is final_state.
+  // With track_chunk_idx (int32 [N]) the output is SPARSE: h_per_chunk is
+  // [N, H, 128, 128] and row n receives only sequence n's state entering its
+  // chunk track_chunk_idx[n]; rows whose index lies outside [0, ceil(len_n/64))
+  // are left untouched (no dense per-chunk tensor is written).
+  const int* trk_p = nullptr;
+  if (track_chunk_idx) {
+    const auto& ti = *track_chunk_idx;
+    TORCH_CHECK(h_per_chunk, "track_chunk_idx needs h_per_chunk ([N, H, 128, 128])");
+    TORCH_CHECK(
+        ti.is_cuda() && ti.device() == q.device() && ti.scalar_type() == torch::kInt && ti.is_contiguous() &&
+            ti.dim() == 1 && ti.size(0) == N,
+        "track_chunk_idx must be a contiguous int32 [N=",
+        N,
+        "] tensor on ",
+        q.device(),
+        ", got ",
+        ti.sizes(),
+        " ",
+        ti.dtype());
+    trk_p = ti.data_ptr<int>();
+  }
+  const int64_t hrows = trk_p ? N : nc;
   void* hpc_p = nullptr;
   bool hpc_bf16 = false;
   if (h_per_chunk) {
     const auto& hp = *h_per_chunk;
     TORCH_CHECK(
         hp.is_cuda() && hp.device() == q.device() && hp.is_contiguous() &&
-            hp.sizes() == torch::IntArrayRef({nc, H, int64_t(K), int64_t(K)}),
-        "h_per_chunk must be a contiguous [nc=",
-        nc,
+            hp.sizes() == torch::IntArrayRef({hrows, H, int64_t(K), int64_t(K)}),
+        "h_per_chunk must be a contiguous [",
+        trk_p ? "N=" : "nc=",
+        hrows,
         ", H=",
         H,
         ", 128, 128] tensor on ",
@@ -3620,27 +4183,123 @@ static std::tuple<torch::Tensor, torch::Tensor> kda_prefill_fwd(
 
   const VlPiece* pt_p = nullptr;
   if (varlen) {
-    // per-cu piece table upload (only when cu changes for this key): the
-    // npieces builder pieces, then seq0's N whole-sequence chain entries
-    if (ws.cu != cu) {
+    // piece table upload, only when its provenance changes for this key: cu
+    // plus the route's table shape. Non-TFC: the npieces builder pieces, then
+    // seq0's N whole-sequence chain entries. TFC: nbp builder pieces, then the
+    // npieces chain pieces.
+    std::vector<int64_t> sig = cu;
+    sig.push_back(route.tfc ? 1 : 0);
+    sig.push_back(nbp);
+    sig.push_back(npieces);
+    if (ws.cu != sig) {
       static_assert(std::is_standard_layout_v<VlPiece>);
-      const auto hp =
-          torch::from_blob(pieces.data(), {(npieces + N) * 8}, torch::TensorOptions().dtype(torch::kInt)).clone();
-      if (!ws.pieces_dev.defined())
-        ws.pieces_dev = torch::empty({(npieces + N) * 8}, torch::TensorOptions().dtype(torch::kInt).device(q.device()));
+      const int64_t n32 = int64_t(pieces.size()) * 8;
+      const auto hp = torch::from_blob(pieces.data(), {n32}, torch::TensorOptions().dtype(torch::kInt)).clone();
+      if (!ws.pieces_dev.defined() || ws.pieces_dev.numel() != n32)
+        ws.pieces_dev = torch::empty({n32}, torch::TensorOptions().dtype(torch::kInt).device(q.device()));
       ws.pieces_dev.copy_(hp);
-      ws.cu = cu;
+      ws.cu = sig;
     }
     pt_p = reinterpret_cast<const VlPiece*>(ws.pieces_dev.const_data_ptr());
   }
-  if (route.seq0 && g_p != ws.gin_ptr) {  // only the tail-free builder reads
+  if ((route.seq0 || route.tfc) && g_p != ws.gin_ptr) {  // only the tail-free builder reads
     ws.gin_map = enc2dgb(const_cast<bf16*>(g_p), (uint64_t)T, (uint64_t)(H * K));
     ws.gin_ptr = g_p;
   }
 
   // raw modes pass g (RAW graw) as glog: k1 stages it through the same bf16
   // slot and fuses the transform (GM 1/2), on every route
-  if (route.seq0 && varlen) {
+  if (route.tfc && varlen) {  // varlen TFC: tail-free build, compose, piece chains
+    gm_dispatch([&](auto gmv, auto rawv, auto bsv) {
+      k1_tf_builder_vl<gmv(), rawv(), bsv()><<<int(nbp * H), 512, 0, stream>>>(
+          q_p,
+          k_p,
+          v_p,
+          g_p,
+          ws.gin_map,
+          alog_p,
+          dtb_p,
+          lb,
+          beta_p,
+          int(H),
+          scl,
+          P_p,
+          u0_p,
+          kdec_p,
+          qdec_p,
+          aqh_p,
+          aql_p,
+          gC_p,
+          pt_p,
+          int(nc));
+    });
+    kda_compose<<<int(npieces * H), 512, 0, stream>>>(
+        ws.pneg_map, ws.kdt_map, ws.u0f_map, gC_p, pL_p, pc_p, int(nc), int(H), 0, pt_p + nbp);
+    k2_chain_tc_vlp<<<int(npieces * H), 512, 0, stream>>>(
+        ws.pneg_map,
+        ws.kdt_map,
+        ws.qd_map,
+        ws.aqh_map,
+        ws.aql_map,
+        ws.u0f_map,
+        ws.sl_map,
+        ws.sc_map,
+        gC_p,
+        h0_p,
+        int(H),
+        o_p,
+        Sf_p,
+        hpc_p,
+        hpc_bf16,
+        h_v_first,
+        pt_p + nbp,
+        trk_p);
+  } else if (route.tfc) {  // eqlen TFC: tail-free build, compose, (H, NP) piece chains
+    gm_dispatch([&](auto gmv, auto rawv, auto bsv) {
+      k1_tf_builder<gmv(), rawv(), bsv()><<<int(nbp * H), 512, 0, stream>>>(
+          q_p,
+          k_p,
+          v_p,
+          g_p,
+          ws.gin_map,
+          alog_p,
+          dtb_p,
+          lb,
+          beta_p,
+          int(T),
+          int(H),
+          scl,
+          P_p,
+          u0_p,
+          kdec_p,
+          qdec_p,
+          aqh_p,
+          aql_p,
+          gC_p,
+          int(nbp));
+    });
+    kda_compose<<<int(npieces * H), 512, 0, stream>>>(
+        ws.pneg_map, ws.kdt_map, ws.u0f_map, gC_p, pL_p, pc_p, int(nc), int(H), int(npieces), nullptr);
+    k2_chain_tc<<<dim3(unsigned(H), unsigned(npieces)), 512, 0, stream>>>(
+        ws.pneg_map,
+        ws.kdt_map,
+        ws.qd_map,
+        ws.aqh_map,
+        ws.aql_map,
+        ws.sl_map,
+        ws.sc_map,
+        ws.u0f_map,
+        gC_p,
+        h0_p,
+        int(nc),
+        int(H),
+        o_p,
+        Sf_p,
+        hpc_p,
+        hpc_bf16,
+        h_v_first,
+        trk_p);
+  } else if (route.seq0 && varlen) {
     gm_dispatch([&](auto gmv, auto rawv, auto bsv) {
       k1_tf_builder_vl<gmv(), rawv(), bsv()><<<int(npieces * H), 512, 0, stream>>>(
           q_p,
@@ -3679,7 +4338,8 @@ static std::tuple<torch::Tensor, torch::Tensor> kda_prefill_fwd(
         hpc_p,
         hpc_bf16,
         h_v_first,
-        pt_p + npieces);
+        pt_p + npieces,
+        trk_p);
   } else if (route.seq0) {
     gm_dispatch([&](auto gmv, auto rawv, auto bsv) {
       k1_tf_builder<gmv(), rawv(), bsv()><<<int(npieces * H), 512, 0, stream>>>(
@@ -3721,9 +4381,10 @@ static std::tuple<torch::Tensor, torch::Tensor> kda_prefill_fwd(
         Sf_p,
         hpc_p,
         hpc_bf16,
-        h_v_first);
+        h_v_first,
+        trk_p);
   } else if (varlen) {
-    AT_CUDA_CHECK(cudaMemsetAsync(pf_p, 0, size_t(npieces * H) * 4, stream));
+    AT_CUDA_CHECK(cudaMemsetAsync(pf_p, 0, size_t(npieces * H + 1) * 4, stream));  // flags + ticket
     gm_dispatch([&](auto gmv, auto rawv, auto bsv) {
       kda_fused_vl<gmv(), rawv(), bsv()><<<2 * int(npieces * H), 512, 0, stream>>>(
           q_p,
@@ -3763,10 +4424,11 @@ static std::tuple<torch::Tensor, torch::Tensor> kda_prefill_fwd(
           hpc_p,
           hpc_bf16,
           h_v_first,
-          pf_p);
+          pf_p,
+          trk_p);
     });
   } else if (npieces > 1) {  // eqlen default: one fused trailing grid
-    AT_CUDA_CHECK(cudaMemsetAsync(pf_p, 0, size_t(npieces * H) * 4, stream));
+    AT_CUDA_CHECK(cudaMemsetAsync(pf_p, 0, size_t(npieces * H + 1) * 4, stream));  // flags + ticket
     gm_dispatch([&](auto gmv, auto rawv, auto bsv) {
       kda_fused<gmv(), rawv(), bsv()><<<2 * int(npieces * H), 512, 0, stream>>>(
           q_p,
@@ -3804,7 +4466,8 @@ static std::tuple<torch::Tensor, torch::Tensor> kda_prefill_fwd(
           hpc_p,
           hpc_bf16,
           h_v_first,
-          pf_p);
+          pf_p,
+          trk_p);
     });
   } else {  // eqlen nc < 4: NP == 1 two-kernel path (no piece maps)
     gm_dispatch([&](auto gmv, auto rawv, auto bsv) {
@@ -3848,15 +4511,58 @@ static std::tuple<torch::Tensor, torch::Tensor> kda_prefill_fwd(
         Sf_p,
         hpc_p,
         hpc_bf16,
-        h_v_first);
+        h_v_first,
+        trk_p);
   }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return {o, Sf};
 }
 
+// Test hook: kda_compose over the CACHED workspace of an earlier call's key
+// (that call's factor tensors) into fresh NaN-filled map tensors. Returns
+// (workspace pieceL, workspace piecec, new pieceL, new piecec); after a fused-
+// route call the workspace maps are the fused builder's in-tail maps of the
+// same factors. A sequence's last piece is not composed and stays NaN.
+// varlen: the workspace's piece table (the fused call's builder pieces first).
+static std::vector<torch::Tensor>
+debug_compose(int64_t dev, int64_t T, int64_t nc, int64_t H, int64_t npieces, int64_t N, bool varlen) {
+  const torch::Device d(torch::kCUDA, int(dev));
+  const c10::cuda::CUDAGuard guard(d);
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+  bool created = false;
+  Workspace& ws = get_workspace(d, T, nc, H, npieces, N, &created);
+  TORCH_CHECK(!created, "debug_compose: no cached workspace for this key (run a forward with it first)");
+  TORCH_CHECK(!varlen || ws.pieces_dev.defined(), "debug_compose: varlen workspace has no piece table");
+  auto L = torch::full_like(ws.pieceL, std::numeric_limits<float>::quiet_NaN());
+  auto Cm = torch::full_like(ws.piecec, std::numeric_limits<float>::quiet_NaN());
+  kda_compose<<<int(npieces * H), 512, 0, stream>>>(
+      ws.pneg_map,
+      ws.kdt_map,
+      ws.u0f_map,
+      ws.gC.data_ptr<float>(),
+      reinterpret_cast<bf16*>(L.data_ptr()),
+      Cm.data_ptr<float>(),
+      int(nc),
+      int(H),
+      int(npieces),
+      varlen ? reinterpret_cast<const VlPiece*>(ws.pieces_dev.const_data_ptr()) : nullptr);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return {ws.pieceL.clone(), ws.piecec.clone(), L, Cm};
+}
+
 }  // namespace kda
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def(
+      "_set_route_override",
+      [](int route, int npb, int npc) {
+        kda::g_route_ovr = route;
+        kda::g_npb_ovr = npb;
+        kda::g_npc_ovr = npc;
+      },
+      "probe / test only: force the route (-1 auto, 0 fused, 1 seq0, 2 tfc) and piece counts (0 = default)");
+  m.def("_last_route", []() { return kda::g_last; }, "{route, npieces, builder pieces, nc, T, N, H} of the last call");
+  m.def("_debug_compose", &kda::debug_compose, "test only: kda_compose over a cached workspace");
   m.def(
       "kda_prefill_fwd",
       &kda::kda_prefill_fwd,
@@ -3877,5 +4583,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
       py::arg("use_qk_l2norm_in_kernel") = false,
       py::arg("use_beta_sigmoid_in_kernel") = false,
       py::arg("h_per_chunk") = std::nullopt,
-      py::arg("h_v_first") = false);
+      py::arg("h_v_first") = false,
+      py::arg("track_chunk_idx") = std::nullopt);
 }

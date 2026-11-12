@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the SGLang project
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 from __future__ import annotations
 
 import hashlib
@@ -1654,6 +1657,17 @@ def _append_draft_kv_ring_state(kv_args: KVArgs) -> None:
 
 def get_dsv41_spec_layout(kv_args: KVArgs) -> Optional[dict]:
     """Describe the positional transfer layout without pool capacities or pointers."""
+    from sglang.srt.speculative.draft_parallel import draft_dcp1_requested
+
+    if (
+        str(get_spec().speculative_algorithm).upper() == "DFLASH"
+        and draft_dcp1_requested()
+    ):
+        # K31HT_DRAFT_DCP1 changes which positions each rank's draft ring row
+        # holds (all of them, not p % dcp): prefill and decode must both run
+        # it, or decode receives sink rows for 7/8 of its window. A side
+        # without the knob publishes None, so the handshake compare refuses.
+        return {"k31ht_draft_dcp1": 1}
     ratios = getattr(kv_args, "mla_compression_ratios", None) or []
     if 2 not in ratios or str(get_spec().speculative_algorithm).upper() != "DSPARK":
         return None

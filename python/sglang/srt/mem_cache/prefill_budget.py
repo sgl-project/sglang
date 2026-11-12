@@ -1,4 +1,5 @@
 # Copyright 2026 SGLang Team
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -19,6 +20,8 @@ Selection checks do not mutate cache state. Shared-pool load preparation
 realizes the selected reservation before a host transfer pins device rows.
 """
 
+import logging
+import os
 from contextlib import nullcontext
 from typing import Optional
 
@@ -31,6 +34,31 @@ from sglang.srt.layers.cp.utils import (
 )
 from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
 from sglang.srt.mem_cache.kv.alloc.interim import ChainAdmissionRules
+
+logger = logging.getLogger(__name__)
+
+# Backport of the open upstream fix
+# sgl-project/sglang#44823 (head b6acdfbe), default off. With the gate set, a
+# single-pool chunked continuation whose KV budget is spent parks for the pass
+# instead of taking a full chunk with nothing free or evictable (#45989).
+PARK_CHUNKED_PREFILL_ENV = "SGLANG_K31_PARK_CHUNKED_PREFILL"
+_park_chunked_prefill: Optional[bool] = None
+
+
+def park_chunked_prefill_enabled() -> bool:
+    """Read the gate once per process; log once when it is on."""
+    global _park_chunked_prefill
+    if _park_chunked_prefill is None:
+        _park_chunked_prefill = os.environ.get(
+            PARK_CHUNKED_PREFILL_ENV, ""
+        ).strip().lower() in ("1", "true", "yes", "on")
+        if _park_chunked_prefill:
+            logger.info(
+                "K31 park-chunked-prefill: on (%s=1; sgl-project/sglang#44823 "
+                "backport: a spent KV budget parks the chunked continuation)",
+                PARK_CHUNKED_PREFILL_ENV,
+            )
+    return _park_chunked_prefill
 
 
 def estimate_swa_kv_tokens(
@@ -190,8 +218,15 @@ class PrefillBudget:
             chunk_limit,
             available_tokens,
         )
+        if available > 0:
+            return available
+        if park_chunked_prefill_enabled():
+            # Park the continuation for this pass (#44823): nothing is free or
+            # evictable, so a chunk would only fail in the allocator. Its KV is
+            # released by inflight transfers and finishing requests, not by it.
+            return None
         # Single-pool continuation must make progress to release its KV.
-        return available if available > 0 else chunk_limit
+        return chunk_limit
 
     def fit_chunk(
         self,

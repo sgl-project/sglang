@@ -1,4 +1,7 @@
-from typing import Tuple
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the SGLang project
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
+from typing import Optional, Tuple
 
 import torch
 import triton
@@ -465,10 +468,29 @@ def _dflash_grouped_conv_kernel(
     base_tap_stride,
     out_row_stride,
     block_size,
+    early_ptr,
     TAPS: tl.constexpr,
     GROUP_SIZE: tl.constexpr,
     BLOCK: tl.constexpr,
+    USE_GDC: tl.constexpr,
+    HAS_EARLY: tl.constexpr,
 ):
+    if USE_GDC:
+        # Launched with PDL: every input is read after the wait; the trigger lets a PDL
+        # successor stage its static operands (split-K weights) while this kernel runs.
+        if HAS_EARLY:
+            # SGLANG_OPT_DFLASH_DRAFT_EARLY_TRIGGER: a nonzero flag (written before the
+            # graph launch) triggers before this kernel's own wait. Successors read only static
+            # operands (split-K weights / tensor maps; the CuTe norms read nothing) before their wait.
+            if tl.load(early_ptr) != 0:
+                tl.extra.cuda.gdc_launch_dependents()
+                tl.extra.cuda.gdc_wait()
+            else:
+                tl.extra.cuda.gdc_wait()
+                tl.extra.cuda.gdc_launch_dependents()
+        else:
+            tl.extra.cuda.gdc_wait()
+            tl.extra.cuda.gdc_launch_dependents()
     row = tl.program_id(0).to(tl.int64)
     cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
     mask = cols < hidden_size
@@ -502,10 +524,14 @@ def dflash_grouped_conv(
     block_size: int,
     group_size: int,
     taps: int,
+    *,
+    pdl: bool = False,
+    early_flag: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Grouped dynamic depthwise conv of DFlashGroupedConv: hidden_states
     [tokens, hidden], delta [tokens, taps, hidden // group_size], base [taps,
-    hidden]. Bit-exact with the torch.compile reference in models/dflash.py."""
+    hidden]. Bit-exact with the torch.compile reference in models/dflash.py.
+    pdl: launch with programmatic dependent launch (same output)."""
     num_tokens, hidden_size = hidden_states.shape
     assert hidden_states.stride(1) == 1 and delta.stride(2) == 1
     assert base.stride(1) == 1 and delta.shape[1] == taps
@@ -526,11 +552,15 @@ def dflash_grouped_conv(
         base.stride(0),
         out.stride(0),
         block_size,
+        early_flag if early_flag is not None else hidden_states,
         TAPS=taps,
         GROUP_SIZE=group_size,
         BLOCK=BLOCK,
+        USE_GDC=pdl,
+        HAS_EARLY=early_flag is not None,
         # GB300 sweep over 6..2304 tokens: 4 warps below a few hundred
         # tokens, 2 warps above (5-10% faster from 384 tokens).
         num_warps=4 if num_tokens < 256 else 2,
+        **({"launch_pdl": True} if pdl else {}),
     )
     return out

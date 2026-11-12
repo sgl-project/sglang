@@ -1,7 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the SGLang project
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 """Kimi K3.1 verify megakernel host binding; only tensors cross into the plugin."""
 
 from __future__ import annotations
+
+import os
 
 import torch
 
@@ -17,6 +21,11 @@ _EXPERT_SHARDS = {
     8: ((896, 768, 1792), (896, 3584, 192)),
     16: ((896, 512, 1792), (896, 3584, 128)),
 }
+
+# K31MK_DSA_QF=1 (default off; the plugin's dsa/verify.py reads the same switch): the packed MLA projection also carries
+# the indexer's wk and weights_proj rows, [q_a | kv_a | gate | wk | weights_proj], so the plugin's input projection
+# computes the index-K rows and the head-gate logits. Their Parameters become views of the packed rows.
+_DSA_QF = os.environ.get("K31MK_DSA_QF", "0") == "1"
 
 
 def covers_short_verify(forward_batch, query_width):
@@ -41,6 +50,7 @@ class K31VerifyHostBinding:
             VerifyLayerWeights,
             VerifyWeights,
         )
+        from sgl_nvidia_mega.kimi_k31.verify_contract import served_request_batches
 
         lm = self.model.language_model
         backbone = lm.model
@@ -68,11 +78,15 @@ class K31VerifyHostBinding:
                         "K31 verify requires NoPE index-K on every MLA layer"
                     )
                 parts = (m.fused_qkv_a_proj_with_mqa.weight, m.g_proj.weight)
+                if _DSA_QF:
+                    parts += (m.indexer.wk.weight, m.indexer.weights_proj.weight)
+                    if any(p.dtype != torch.bfloat16 or p.shape[1] != 7168 for p in parts):
+                        raise ValueError("K31MK_DSA_QF packs BF16 [rows, 7168] projections only")
                 padding = 0
             else:
                 parts = (m.fused_qkvg_proj.weight, m.f_a_proj.weight, m.b_proj.weight)
-                # Pad rows to a multiple of 8, matching the stock layout.
-                padding = -sum(p.shape[0] for p in parts) % 8
+                # Whole 16-row tiles (the megakernel's kda_pitch): TP8 6284 + 4 = 6288, TP16 3206 + 10 = 3216.
+                padding = -sum(p.shape[0] for p in parts) % 16
             # Stock Parameters become views of packed, which the module keeps alive.
             packed = torch.cat(
                 tuple(p.detach() for p in parts)
@@ -85,6 +99,10 @@ class K31VerifyHostBinding:
                 param.data = packed[offset : offset + rows]
                 offset += rows
             m.__dict__["_k31_verify_projection_storage"] = packed
+            if is_mla and _DSA_QF and getattr(m.indexer, "_wk_gate_weight", None) is not None:
+                # Stock's merged [wk | weights_proj] decode alias: the same rows, now inside the packed storage.
+                k0 = parts[0].shape[0] + parts[1].shape[0]
+                m.indexer._wk_gate_weight = packed[k0 : k0 + parts[2].shape[0] + parts[3].shape[0]]
             if is_mla:
                 full_ids.append(idx)
                 indexer = m.indexer
@@ -222,7 +240,7 @@ class K31VerifyHostBinding:
             int(cfg.moe_renormalize),
             int(context_length),
             query_width=int(query_width),
-            request_batches=(1, 2, 4) if int(query_width) == 8 else (1,),
+            request_batches=served_request_batches() if int(query_width) == 8 else (1,),
         )
 
     def can_run_graph(self, built, forward_batch):

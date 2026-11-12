@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the SGLang project
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 from __future__ import annotations
 
 import contextlib
@@ -34,6 +37,9 @@ from sglang.srt.layers.cp.base import disable_cp_strategy
 from sglang.srt.managers.schedule_batch import set_mamba_track_indices_from_reqs
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.router import STATE_PART
+from sglang.srt.model_executor.runner.dflash_verify_prep import (
+    marked_dflash_verify_prep,
+)
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
@@ -934,12 +940,40 @@ def draft_pp_context():
 
 def draft_tp_context(layout: DraftParallelLayout):
     """Enter an already-resolved draft placement from outside any draft scope."""
+    if getattr(layout, "collapse_dcp", False):
+        return _draft_dcp1(layout)
     if layout.tp_group is None:
         return contextlib.nullcontext()
     tp_context = patch_tensor_parallel_group(layout.tp_group, owns_attention=True)
     if layout.disable_cp:
         return _draft_without_cp(tp_context)
     return tp_context
+
+
+@contextmanager
+def _draft_dcp1(layout: DraftParallelLayout):
+    """K31HT_DRAFT_DCP1: the stock draft scope plus DCP 1 for the draft. Every
+    draft entry (build, pool, backends, graphs, forwards) runs here, so the
+    draft model, its backend, KV pool and ring all see one DCP rank: TP-local
+    heads, no replicated q projection, no DCP exchange."""
+    if layout.tp_group is None:
+        base = contextlib.nullcontext()
+    else:
+        base = patch_tensor_parallel_group(layout.tp_group, owns_attention=True)
+        if layout.disable_cp:
+            base = _draft_without_cp(base)
+    with (
+        base,
+        get_parallel().override(
+            dcp_size=1,
+            dcp_enabled=False,
+            attn_dcp_size=1,
+            dcp_rank=0,
+            attn_dcp_rank=0,
+            dcp_replicate_q_proj=False,
+        ),
+    ):
+        yield
 
 
 @contextmanager
@@ -1082,6 +1116,18 @@ def prepare_mamba_track_for_verify(batch: ScheduleBatch) -> None:
     """
     if not get_exec().mamba.enable_mamba_extra_buffer:
         return
+    prep = marked_dflash_verify_prep()
+    if prep is None:
+        _rebuild_verify_mamba_track(batch)
+        return
+    # The DFlash target verify stages these beside the draft graph (dflash_verify_prep.py).
+    with prep.side() as main:
+        _rebuild_verify_mamba_track(batch)
+    if batch.mamba_track_indices is not None:
+        batch.mamba_track_indices.record_stream(main)
+
+
+def _rebuild_verify_mamba_track(batch: ScheduleBatch) -> None:
     track_positions = None
     if get_exec().mamba.enable_mamba_extra_buffer_lazy:
         track_positions = batch.mamba_lazy_spec_track_positions_cpu
@@ -1397,6 +1443,12 @@ def commit_mamba_states_after_verify(
             src_indices_raw=src_indices_raw,
             null_block_id=-1,  # SGLang: valid slots >= 0, padding == -1
             ring_indices=ring_indices,
+            block_v=envs.SGLANG_OPT_KDA_REPLAYSSM_FOLD_BLOCK_V.get(),
+            fold_pending=(
+                mamba_pool.kda_fold_pending
+                if getattr(mamba_pool, "kda_fold_active", False)
+                else None
+            ),
         )
         return
 

@@ -1,5 +1,6 @@
 # Adapt from https://github.com/fla-org/flash-linear-attention/blob/main/fla/utils.py
 # -*- coding: utf-8 -*-
+# Modifications Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 
 import contextlib
 import functools
@@ -15,6 +16,7 @@ import torch
 import triton
 from packaging import version
 
+from sglang.srt.environ import envs
 from sglang.srt.utils.common import torch_release
 
 logger = logging.getLogger(__name__)
@@ -31,6 +33,34 @@ SUPPORTS_AUTOTUNE_CACHE = (
 autotune_cache_kwargs = (
     {"cache_results": FLA_CACHE_RESULTS} if SUPPORTS_AUTOTUNE_CACHE else {}
 )
+
+# K3.1 KDA autotune pins (SGLANG_K31_KDA_TUNE_PIN, default 0 = stock; read at import): the KDA prefill
+# chain's autotune keys (gate cumsum, intra, inter_solve, recompute_w_u, gla_o) do not contain T, so the
+# first call's shape picks the config every later long chunk uses, and a short warmup / first request can
+# leave 16K chunks on slower configs. 1 = pin each of these kernels to one config from its own autotune
+# list, chosen for long chunks. Measured bitwise equal to the stock picks (same o and final state).
+KDA_TUNE_PIN = envs.SGLANG_K31_KDA_TUNE_PIN.get()
+
+
+def k31_pin_autotune(kernel, num_warps: int, num_stages: int, **kwargs):
+    """Reduce an autotuned kernel's config list to the one served config matching the arguments."""
+    from triton.runtime.autotuner import Autotuner
+
+    at = kernel
+    while not isinstance(at, Autotuner):
+        at = at.fn
+    for c in at.configs:
+        if (
+            dict(c.kwargs) == kwargs
+            and c.num_warps == num_warps
+            and c.num_stages == num_stages
+        ):
+            at.configs = [c]
+            at.cache.clear()
+            return c
+    raise ValueError(
+        f"k31_pin_autotune: no config {kwargs} num_warps={num_warps} num_stages={num_stages}"
+    )
 
 
 @lru_cache(maxsize=1)

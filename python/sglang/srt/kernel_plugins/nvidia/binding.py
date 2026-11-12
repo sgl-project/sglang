@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the SGLang project
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 """SGLang's binding to the NVIDIA megakernel plugins behind --enable-nvidia-megakernel.
 
 It checks a plugin's spec against the resolved configuration at startup, builds it
@@ -1291,7 +1293,11 @@ def megakernel_can_run_graph(model, forward_batch):
         return True
     preparation = model.__dict__.get("_megakernel_prepare")
     entry = getattr(preparation[1], "tensor_entry", None) if preparation else None
-    return entry is not None and entry.can_run_graph(built, forward_batch)
+    if entry is None:
+        return False
+    # An entry whose captured graphs also hold stock forwards (above its capacity) says which batches may replay.
+    replay = getattr(entry, "can_replay_graph", None) or entry.can_run_graph
+    return replay(built, forward_batch)
 
 
 def configure_megakernel_aux(model, layer_ids):

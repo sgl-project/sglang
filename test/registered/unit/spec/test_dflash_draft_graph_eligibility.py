@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the SGLang project
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 """The scheduler's graph admission must reach the DFLASH draft runner."""
 
 import unittest
@@ -56,6 +59,7 @@ class TestDFlashDraftGraphEligibility(unittest.TestCase):
         worker.use_compact_draft_cache = False
         worker.selector = None
         worker.lilicorr = None
+        worker._aux_pending = False
 
         draft_input = DFlashDraftInputV2.create_idle_input(device="cpu")
         draft_input.bonus_tokens = torch.tensor([1])

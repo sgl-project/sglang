@@ -1,4 +1,5 @@
 # Copyright 2023-2026 SGLang Team
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -38,6 +39,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.distributed.parallel_state import GroupCoordinator
+from sglang.srt.layers.communication import k31_pf_custom_ag
 from sglang.srt.runtime_context import get_parallel, get_platform
 from sglang.srt.utils import is_hip
 from sglang.srt.utils.device import is_fi_a2a_supported
@@ -166,18 +168,26 @@ def cp_lse_ag_out_rs_mla_npu(
 def _all_gather_dcp_kv_cache(kv_a: torch.Tensor):
     parallel = get_parallel()
     dcp_world_size = parallel.dcp_size
-    # not use symmetric_memory unless torch mem_pool updated, see https://github.com/pytorch/pytorch/issues/178138
-    gathered_kv_a = kv_a.new_empty(
-        (kv_a.shape[0] * dcp_world_size, *kv_a.shape[1:]),
+    # SGLANG_K31_PF_CUSTOM_AG=1: the served direct multicast all-gather into a
+    # persistent symmetric buffer (byte copy, bitwise); copied out below.
+    custom = k31_pf_custom_ag.try_all_gather_rows(
+        parallel.dcp_group, kv_a, site="dcp_kv"
     )
-    # pynccl has no fp8 dtype; all-gather is a byte copy, so transport an fp8 KV
-    # cache as raw bytes via a uint8 view (works with --kv-cache-dtype fp8_*).
-    if kv_a.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
-        parallel.dcp_group.all_gather_into_tensor(
-            gathered_kv_a.view(torch.uint8), kv_a.contiguous().view(torch.uint8)
-        )
+    if custom is not None:
+        gathered_kv_a = custom
     else:
-        parallel.dcp_group.all_gather_into_tensor(gathered_kv_a, kv_a)
+        # not use symmetric_memory unless torch mem_pool updated, see https://github.com/pytorch/pytorch/issues/178138
+        gathered_kv_a = kv_a.new_empty(
+            (kv_a.shape[0] * dcp_world_size, *kv_a.shape[1:]),
+        )
+        # pynccl has no fp8 dtype; all-gather is a byte copy, so transport an fp8 KV
+        # cache as raw bytes via a uint8 view (works with --kv-cache-dtype fp8_*).
+        if kv_a.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+            parallel.dcp_group.all_gather_into_tensor(
+                gathered_kv_a.view(torch.uint8), kv_a.contiguous().view(torch.uint8)
+            )
+        else:
+            parallel.dcp_group.all_gather_into_tensor(gathered_kv_a, kv_a)
     # Reorder large byte-packed rows with word loads after the collective,
     # keeping every rank's wire dtype/count unchanged.
     reorder_dtype = None
@@ -201,6 +211,9 @@ def _all_gather_dcp_kv_cache(kv_a: torch.Tensor):
         .transpose(0, 1)
         .reshape(-1, *row_shape[1:])
     )
+    if custom is not None and k31_pf_custom_ag.aliases_buffer(gathered_kv_a):
+        # The reorder was a view (one row per rank): copy out of the shared buffer.
+        gathered_kv_a = gathered_kv_a.clone()
     return (
         gathered_kv_a.view(kv_a.dtype) if reorder_dtype is not None else gathered_kv_a
     )

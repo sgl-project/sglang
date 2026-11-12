@@ -1,5 +1,10 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the SGLang project
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 from __future__ import annotations
 
+import functools
+import logging
 from functools import partial
 from typing import Optional
 
@@ -13,6 +18,20 @@ from sglang.kernels.ops.speculative.dflash import (
     compute_dflash_correct_drafts_and_bonus,
 )
 from sglang.kernels.ops.speculative.dspark.dispatch import inputs_on_cuda
+from sglang.kernels.ops.speculative.verify_row_stats import (
+    verify_row_stats,
+    verify_row_stats_supported,
+)
+from sglang.kernels.ops.speculative.verify_softmax_wide import (
+    verify_softmax_wide,
+    verify_softmax_wide_stats,
+    verify_softmax_wide_supported,
+)
+from sglang.srt.environ import envs
+from sglang.kernels.ops.speculative.dspark.k31ht_softmax_split import (
+    k31ht_softmax_split,
+    k31ht_softmax_split_requested,
+)
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import (
     _get_or_create_chain_verify_buffers,
@@ -92,6 +111,67 @@ class AcceptSampling:
         )
 
 
+def verify_target_probs(
+    *,
+    target_logits: torch.Tensor,
+    sampling_info,
+    draft_input: DFlashDraftInputV2,
+    bs: int,
+    verify_num_draft_tokens: int,
+) -> torch.Tensor:
+    if not sampling_info.need_top_k_sampling and not sampling_info.need_top_p_sampling:
+        return SoftmaxTemp.execute(
+            logits=target_logits,
+            temperatures=sampling_info.temperatures,
+            rows_per_request=verify_num_draft_tokens,
+        ).view(bs, verify_num_draft_tokens, -1)
+    return build_speculative_verify_target_probs(
+        next_token_logits=target_logits,
+        sampling_info=sampling_info,
+        draft_token_num=verify_num_draft_tokens,
+        bs=bs,
+        max_top_k=draft_input.max_top_k,
+        uniform_top_k_value=draft_input.uniform_top_k_value,
+    )
+
+
+def verify_target_logit_stats(
+    *,
+    target_logits: torch.Tensor,
+    sampling_info,
+    verify_num_draft_tokens: int,
+) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
+    """(fp32 logits, per-row stats) from verify_row_stats (SGLANG_OPT_DFLASH_VERIFY_ROW_STATS, any row
+    count) or from verify_softmax_wide_stats when verify_target_probs would take verify_softmax_wide, else
+    None (the caller computes the probabilities)."""
+    if sampling_info.need_top_k_sampling or sampling_info.need_top_p_sampling:
+        return None
+    if not target_logits.is_cuda:
+        return None
+    if _verify_row_stats_enabled() and verify_row_stats_supported(
+        target_logits, verify_num_draft_tokens
+    ):
+        _log_verify_row_stats_engaged(*target_logits.shape)
+        return verify_row_stats(
+            logits=target_logits,
+            temperatures=sampling_info.temperatures,
+            rows_per_request=verify_num_draft_tokens,
+        )
+    if _flashinfer_softmax is None:
+        return None
+    if not (
+        _verify_softmax_wide_enabled()
+        and verify_softmax_wide_supported(target_logits, verify_num_draft_tokens)
+    ):
+        return None
+    _log_selector_logit_accept_engaged(*target_logits.shape)
+    return verify_softmax_wide_stats(
+        logits=target_logits,
+        temperatures=sampling_info.temperatures,
+        rows_per_request=verify_num_draft_tokens,
+    )
+
+
 def _accept_sampling_core(
     *,
     candidates: torch.Tensor,
@@ -106,21 +186,13 @@ def _accept_sampling_core(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     bs = candidates.shape[0]
     device = candidates.device
-    if not sampling_info.need_top_k_sampling and not sampling_info.need_top_p_sampling:
-        target_probs = SoftmaxTemp.execute(
-            logits=target_logits,
-            temperatures=sampling_info.temperatures,
-            rows_per_request=verify_num_draft_tokens,
-        ).view(bs, verify_num_draft_tokens, -1)
-    else:
-        target_probs = build_speculative_verify_target_probs(
-            next_token_logits=target_logits,
-            sampling_info=sampling_info,
-            draft_token_num=verify_num_draft_tokens,
-            bs=bs,
-            max_top_k=draft_input.max_top_k,
-            uniform_top_k_value=draft_input.uniform_top_k_value,
-        )
+    target_probs = verify_target_probs(
+        target_logits=target_logits,
+        sampling_info=sampling_info,
+        draft_input=draft_input,
+        bs=bs,
+        verify_num_draft_tokens=verify_num_draft_tokens,
+    )
     (
         retrieve_index,
         retrieve_next_token,
@@ -275,12 +347,50 @@ except ImportError:
     _flashinfer_softmax = None
 
 
+@functools.cache
+def _verify_softmax_wide_enabled() -> bool:
+    return envs.SGLANG_OPT_DFLASH_VERIFY_SOFTMAX_WIDE.get()
+
+
+@functools.cache
+def _verify_row_stats_enabled() -> bool:
+    return envs.SGLANG_OPT_DFLASH_VERIFY_ROW_STATS.get()
+
+
+@functools.cache
+def _log_verify_row_stats_engaged(num_rows: int, vocab: int) -> None:
+    # Engagement evidence, once per process and shape; no behaviour change.
+    logging.getLogger(__name__).info(
+        "DFLASH verify row stats engaged: rows=%d vocab=%d", num_rows, vocab
+    )
+
+
+@functools.cache
+def _log_selector_logit_accept_engaged(num_rows: int, vocab: int) -> None:
+    # Engagement evidence, once per process and shape; no behaviour change.
+    logging.getLogger(__name__).info(
+        "DFLASH selector logit accept engaged: rows=%d vocab=%d", num_rows, vocab
+    )
+
+
+@functools.cache
+def _log_verify_softmax_wide_engaged(num_rows: int, vocab: int) -> None:
+    # Engagement evidence, once per process and shape; no behaviour change.
+    logging.getLogger(__name__).info(
+        "DFLASH verify softmax wide engaged: rows=%d vocab=%d", num_rows, vocab
+    )
+
+
 # Not sampling.softmax: the FlashInfer and Triton paths are not bitwise torch.softmax(x / t).
 class SoftmaxTemp:
     @classmethod
     def execute(cls, *args, **kwargs) -> torch.Tensor:
         if not inputs_on_cuda(*args, **kwargs):
             return cls.torch(*args, **kwargs)
+        if k31ht_softmax_split_requested():
+            out = k31ht_softmax_split(*args, **kwargs)
+            if out is not None:
+                return out
         if _flashinfer_softmax is not None:
             return cls.flashinfer(*args, **kwargs)
         return cls.triton(*args, **kwargs)
@@ -430,6 +540,14 @@ def softmax_temp_flashinfer(
     assert bs * rows_per_request == num_rows, (
         f"num_rows {num_rows} not divisible by rows_per_request {rows_per_request}"
     )
+    if _verify_softmax_wide_enabled() and verify_softmax_wide_supported(
+        logits, rows_per_request
+    ):
+        # Bitwise equal to the flashinfer call below on the rows it supports.
+        _log_verify_softmax_wide_engaged(num_rows, vocab)
+        return verify_softmax_wide(
+            logits=logits, temperatures=temperatures, rows_per_request=rows_per_request
+        )
     temp_per_row = torch.repeat_interleave(
         temperatures.reshape(bs).to(torch.float32), rows_per_request, dim=0
     ).contiguous()

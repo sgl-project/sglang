@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the SGLang project
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 import itertools
 import random
 import unittest
@@ -1304,6 +1307,117 @@ class TestTritonAttention(CustomTestCase):
             with unittest.mock.patch.object(ea, "_is_gfx95", False):
                 o_default = run()
             self.assertTrue(torch.equal(o_tuned, o_default), f"head_dim {D}")
+
+    def test_extend_attention_absorbed_split_bitwise(self):
+        """The absorbed-MLA value-column split and parallel prefix tiles must reproduce the
+        stock launch bit for bit; the fp32-output pass also exposes summation-order changes.
+        Per-rank heads 12 (TP8) and 6 (TP16); the env path (the server's) must take the split too."""
+        from sglang.kernels.ops.attention import extend_attention as ea
+        from sglang.srt.environ import envs
+
+        if not (ea._is_cuda and ea.CUDA_CAPABILITY[0] == 10):
+            self.skipTest("sm_10x absorbed-MLA launch")
+        device = get_device()
+        lq, lv, slots = 576, 512, 8192
+        # (prefix lens, extend lens, page size, KV dtype, k/v scale, window, value width)
+        cases = [
+            ([1031, 0, 300], [8, 1, 16], 64, torch.float8_e4m3fn, 0.73, 1024, lv),
+            ([63], [8], 1, torch.float8_e4m3fn, 0.73, 1024, lv),
+            ([2048, 130], [8, 8], 1, torch.bfloat16, 1.0, -1, lv),
+            # A value buffer holding the whole 576-wide rows; the kernel reads 512.
+            ([300], [8], 1, torch.bfloat16, 1.0, -1, lq),
+        ]
+        for heads in (12, 6):
+            for prefix_lens, extend_lens, page, kv_dtype, scale, window, v_width in cases:
+                g = torch.Generator(device=device).manual_seed(sum(prefix_lens) + page)
+                n_ext = sum(extend_lens)
+                q = torch.randn(n_ext, heads, lq, device=device, generator=g) * 0.5
+                k_ext = torch.randn(n_ext, 1, lq, device=device, generator=g) * 0.5
+                q, k_ext = q.to(torch.bfloat16), k_ext.to(torch.bfloat16)
+                v_ext = k_ext[..., :lv].contiguous()
+                kv = torch.randn(slots, 1, lq, device=device, generator=g) * 0.5
+                kv = kv.to(kv_dtype)
+                # Each sequence owns distinct whole pages in a random order.
+                pages = torch.randperm(slots // page, device=device, generator=g)
+                indices, start = [], 0
+                for n in prefix_lens:
+                    n_pages = -(-n // page)
+                    rows = pages[start : start + n_pages, None] * page
+                    indices.append((rows + torch.arange(page, device=device)).flatten()[:n])
+                    start += n_pages
+                kv_indices = torch.cat(indices).to(torch.int64)
+                qo_indptr = torch.tensor(
+                    [0, *itertools.accumulate(extend_lens)],
+                    dtype=torch.int32,
+                    device=device,
+                )
+                kv_indptr = torch.tensor(
+                    [0, *itertools.accumulate(prefix_lens)],
+                    dtype=torch.int32,
+                    device=device,
+                )
+
+                def run(out_dtype, dv_split, prefix_tiles, expect_tiles=None):
+                    o = torch.full(
+                        (n_ext, heads, lv), float("nan"), dtype=out_dtype, device=device
+                    )
+                    with unittest.mock.patch.object(
+                        ea, "launch_prefix_tiles", wraps=ea.launch_prefix_tiles
+                    ) as tiles:
+                        extend_attention_fwd(
+                            q,
+                            k_ext,
+                            v_ext,
+                            o,
+                            kv,
+                            kv[..., :v_width],
+                            qo_indptr,
+                            kv_indptr,
+                            kv_indices,
+                            None,
+                            True,
+                            None,
+                            max(extend_lens),
+                            scale,
+                            scale,
+                            sm_scale=lq**-0.5,
+                            sliding_window_size=window,
+                            page_size=page,
+                            dv_split=dv_split,
+                            prefix_tiles=prefix_tiles,
+                        )
+                    # The arm must take the path it names.
+                    if expect_tiles is None:
+                        expect_tiles = prefix_tiles > 0
+                    self.assertEqual(tiles.called, expect_tiles, f"heads {heads}")
+                    return o
+
+                for out_dtype, bits in (
+                    (torch.bfloat16, torch.int16),
+                    (torch.float32, torch.int32),
+                ):
+                    ref = run(out_dtype, dv_split=1, prefix_tiles=0)
+                    self.assertFalse(torch.isnan(ref).any())
+                    for dv_split, prefix_tiles in ((8, 16), (1, 16), (8, 0), (1, 1)):
+                        with self.subTest(
+                            heads=heads,
+                            prefix_lens=prefix_lens,
+                            page=page,
+                            kv_dtype=kv_dtype,
+                            window=window,
+                            v_width=v_width,
+                            out_dtype=out_dtype,
+                            dv_split=dv_split,
+                            prefix_tiles=prefix_tiles,
+                        ):
+                            out = run(out_dtype, dv_split, prefix_tiles)
+                            self.assertTrue(torch.equal(out.view(bits), ref.view(bits)))
+                    # No launch args: the env flags decide, as in the server.
+                    with envs.SGLANG_TRITON_ABSORBED_MLA_PREFIX_TILES.override(
+                        16
+                    ), envs.SGLANG_TRITON_ABSORBED_MLA_DV_SPLIT.override(8):
+                        out = run(out_dtype, None, None, expect_tiles=True)
+                    self.assertTrue(torch.equal(out.view(bits), ref.view(bits)))
 
     def test_build_unified_kv_indices(self):
         """Test build_unified_kv_indices correctness."""

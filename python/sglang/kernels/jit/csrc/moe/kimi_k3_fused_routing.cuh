@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright contributors to the SGLang project
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 // NOTE(nvpohanh): The metadata must follow trtllm-gen's routingPermutation
 // contract (RoutingKernel.cuh): local experts in id order, each padded to whole
 // tiles, padding rows of the token map set to -1.
@@ -40,19 +43,27 @@ struct KimiK3FusedRoutingParams {
   KimiK3RoutingMetaParams meta;
 };
 
-struct KimiK3RoutingSmem {
-  uint32_t warp_sum[LargeRouterRadixTrait::kNumWarps];
+template <uint32_t kThreads = LargeRouterRadixTrait::kBlockSize>
+struct KimiK3RoutingSmemT {
+  uint32_t warp_sum[kThreads / device::kWarpThreads];
   int32_t num_ctas;
   int32_t expert_count[kNumExperts_];
   int32_t expert_offset[kNumExperts_];
   int32_t entry[kKimiK3RoutingMaxExpanded];
 };
+using KimiK3RoutingSmem = KimiK3RoutingSmemT<>;
 
+// kThreads: the routing CTA's 224 (last-CTA tail) or the split metadata
+// kernel's 1024 (SGLANG_K31_ROUTING_META_SPLIT); same outputs either way.
+template <uint32_t kThreads = LargeRouterRadixTrait::kBlockSize>
 SGL_DEVICE void kimi_k3_build_routing_metadata(
-    const RouteRadixParams& route, const KimiK3RoutingMetaParams& meta, KimiK3RoutingSmem& smem) {
+    const RouteRadixParams& route, const KimiK3RoutingMetaParams& meta, KimiK3RoutingSmemT<kThreads>& smem) {
   using T = LargeRouterRadixTrait;
-  constexpr uint32_t kThreads = T::kBlockSize;
-  constexpr uint32_t kEPT = kKimiK3RoutingExpertsPerThread;
+  static_assert(kThreads % device::kWarpThreads == 0 && kThreads <= 1024, "block_exclusive_sum spans <= 32 warps");
+  constexpr uint32_t kEPT = (kNumExperts_ + kThreads - 1) / kThreads;
+  static_assert(
+      kThreads != T::kBlockSize || kEPT == kKimiK3RoutingExpertsPerThread,
+      "the 224-thread tail keeps 4 experts per thread");
   const uint32_t tx = threadIdx.x;
   const uint32_t lane_id = tx % device::kWarpThreads;
   const uint32_t warp_id = tx / device::kWarpThreads;
@@ -141,48 +152,80 @@ SGL_DEVICE void kimi_k3_build_routing_metadata(
   }
 }
 
-template <bool kUsePDL, typename TScore, typename TX>
+// Routing rows of the split variant (kSplitMeta): the radix top-16 and the
+// weights only; kimi_k3_routing_metadata_kernel builds the metadata after it.
+template <bool kUsePDL, typename TScore>
+SGL_DEVICE void kimi_k3_route_row_split(const KimiK3FusedRoutingParams& params) {
+  using T = LargeRouterRadixTrait;
+  const uint32_t tx = threadIdx.x;
+  __shared__ typename T::Smem smem_route;
+  const auto& meta = params.meta;
+  device::PDLWaitPrimary<kUsePDL>();
+  const int32_t num_valid = meta.num_valid_ptr != nullptr ? meta.num_valid_ptr[0] : meta.num_valid_value;
+  route_radix_block</*kUsePDL=*/false, TScore>(params.route, smem_route);
+  // the metadata kernel's griddepcontrol.wait still waits for this whole grid
+  device::PDLTriggerSecondary<kUsePDL>();
+
+  const uint32_t row = blockIdx.x;
+  if (tx < T::kTopK) {
+    const float w = params.route.out_w[row * params.route.out_w_stride + tx];
+    if (static_cast<int32_t>(row) >= num_valid) {
+      params.route.out_i[row * params.route.out_i_stride + tx] = -1;
+    }
+    if (meta.weights_fp32) {
+      static_cast<fp32_t*>(meta.expert_weights)[row * T::kTopK + tx] = w;
+    } else {
+      static_cast<bf16_t*>(meta.expert_weights)[row * T::kTopK + tx] = __float2bfloat16_rn(w);
+    }
+  }
+}
+
+template <bool kUsePDL, typename TScore, typename TX, bool kSplitMeta = false>
 __global__ __launch_bounds__(LargeRouterRadixTrait::kBlockSize)  //
     void kimi_k3_fused_routing_kernel(const __grid_constant__ KimiK3FusedRoutingParams params) {
   using T = LargeRouterRadixTrait;
   const auto M = static_cast<uint32_t>(params.route.M);
   const uint32_t tx = threadIdx.x;
   if (blockIdx.x < M) {
-    __shared__ union {
-      typename T::Smem route;
-      KimiK3RoutingSmem meta;
-    } smem;
-    __shared__ bool is_last;
-    const auto& meta = params.meta;
-    device::PDLWaitPrimary<kUsePDL>();
-    const int32_t num_valid = meta.num_valid_ptr != nullptr ? meta.num_valid_ptr[0] : meta.num_valid_value;
-    route_radix_block</*kUsePDL=*/false, TScore>(params.route, smem.route);
-    // NOTE(nvpohanh): Early trigger is safe: the dependent's
-    // griddepcontrol.wait still waits for this whole grid, metadata included.
-    device::PDLTriggerSecondary<kUsePDL>();
+    if constexpr (kSplitMeta) {
+      kimi_k3_route_row_split<kUsePDL, TScore>(params);
+    } else {
+      __shared__ union {
+        typename T::Smem route;
+        KimiK3RoutingSmem meta;
+      } smem;
+      __shared__ bool is_last;
+      const auto& meta = params.meta;
+      device::PDLWaitPrimary<kUsePDL>();
+      const int32_t num_valid = meta.num_valid_ptr != nullptr ? meta.num_valid_ptr[0] : meta.num_valid_value;
+      route_radix_block</*kUsePDL=*/false, TScore>(params.route, smem.route);
+      // NOTE(nvpohanh): Early trigger is safe: the dependent's
+      // griddepcontrol.wait still waits for this whole grid, metadata included.
+      device::PDLTriggerSecondary<kUsePDL>();
 
-    const uint32_t row = blockIdx.x;
-    if (tx < T::kTopK) {
-      const float w = params.route.out_w[row * params.route.out_w_stride + tx];
-      if (static_cast<int32_t>(row) >= num_valid) {
-        params.route.out_i[row * params.route.out_i_stride + tx] = -1;
+      const uint32_t row = blockIdx.x;
+      if (tx < T::kTopK) {
+        const float w = params.route.out_w[row * params.route.out_w_stride + tx];
+        if (static_cast<int32_t>(row) >= num_valid) {
+          params.route.out_i[row * params.route.out_i_stride + tx] = -1;
+        }
+        if (meta.weights_fp32) {
+          static_cast<fp32_t*>(meta.expert_weights)[row * T::kTopK + tx] = w;
+        } else {
+          static_cast<bf16_t*>(meta.expert_weights)[row * T::kTopK + tx] = __float2bfloat16_rn(w);
+        }
       }
-      if (meta.weights_fp32) {
-        static_cast<fp32_t*>(meta.expert_weights)[row * T::kTopK + tx] = w;
-      } else {
-        static_cast<bf16_t*>(meta.expert_weights)[row * T::kTopK + tx] = __float2bfloat16_rn(w);
+      __syncthreads();
+      if (tx == 0) {
+        __threadfence();
+        is_last = atomicAdd(meta.counter, 1u) == M - 1;
+        if (is_last) __threadfence();
       }
+      __syncthreads();
+      if (!is_last) return;
+      kimi_k3_build_routing_metadata(params.route, meta, smem.meta);
+      if (tx == 0) *meta.counter = 0u;
     }
-    __syncthreads();
-    if (tx == 0) {
-      __threadfence();
-      is_last = atomicAdd(meta.counter, 1u) == M - 1;
-      if (is_last) __threadfence();
-    }
-    __syncthreads();
-    if (!is_last) return;
-    kimi_k3_build_routing_metadata(params.route, meta, smem.meta);
-    if (tx == 0) *meta.counter = 0u;
   } else {
     device::PDLWaitPrimary<kUsePDL>();
     using Q = RouteQuantTraitT<TX>;
@@ -191,7 +234,23 @@ __global__ __launch_bounds__(LargeRouterRadixTrait::kBlockSize)  //
   }
 }
 
+inline constexpr uint32_t kKimiK3MetaThreads = 1024;
+
+// Metadata of the split variant: one 1024-thread CTA chained after the routing
+// grid by PDL, in place of the routing grid's last-CTA 224-thread tail.
 template <bool kUsePDL>
+__global__ __launch_bounds__(kKimiK3MetaThreads) void kimi_k3_routing_metadata_kernel(
+    const __grid_constant__ KimiK3FusedRoutingParams params) {
+  __shared__ KimiK3RoutingSmemT<kKimiK3MetaThreads> smem;
+  device::PDLWaitPrimary<kUsePDL>();
+  // the next kernel's griddepcontrol.wait waits for this whole grid
+  device::PDLTriggerSecondary<kUsePDL>();
+  kimi_k3_build_routing_metadata<kKimiK3MetaThreads>(params.route, params.meta, smem);
+}
+
+// kSplitMeta (SGLANG_K31_ROUTING_META_SPLIT=1, default off): the counter
+// argument is kept and left unused.
+template <bool kUsePDL, bool kSplitMeta = false>
 struct KimiK3FusedRoutingKernel {
   static void
   run(const tvm::ffi::TensorView scores,
@@ -319,7 +378,7 @@ struct KimiK3FusedRoutingKernel {
 
 #define SGL_KIMI_K3_ROUTING_LAUNCH(TS, TX)                                \
   LaunchKernel(2 * M, LargeRouterRadixTrait::kBlockSize, device.unwrap()) \
-      .enable_pdl(kUsePDL)(kimi_k3_fused_routing_kernel<kUsePDL, TS, TX>, params)
+      .enable_pdl(kUsePDL)(kimi_k3_fused_routing_kernel<kUsePDL, TS, TX, kSplitMeta>, params)
 
     if (score_dtype.is_type<fp32_t>()) {
       if (x_dtype.is_type<fp32_t>()) {
@@ -335,6 +394,10 @@ struct KimiK3FusedRoutingKernel {
       }
     }
 #undef SGL_KIMI_K3_ROUTING_LAUNCH
+    if constexpr (kSplitMeta) {
+      LaunchKernel(1, kKimiK3MetaThreads, device.unwrap())
+          .enable_pdl(kUsePDL)(kimi_k3_routing_metadata_kernel<kUsePDL>, params);
+    }
   }
 };
 

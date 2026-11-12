@@ -1,9 +1,17 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the SGLang project
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 from __future__ import annotations
 
 import contextlib
+import functools
+import inspect
 import logging
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
+import os
+import weakref
+from typing import TYPE_CHECKING, Any, Dict, List, NamedTuple, Optional, Tuple, Union
 
+import numpy as np
 import torch
 from einops import rearrange
 
@@ -59,6 +67,7 @@ from sglang.srt.layers.attention.graph_variants import DSA_DENSE
 from sglang.srt.layers.attention.mqa_logits_utils import (
     MQA_LOGITS_BYTES_PER_ELEM,
     MQA_LOGITS_MAX_BYTES_ROCM,
+    MQA_LOGITS_ROW_ALIGN_ELEMS,
     MQA_LOGITS_STATIC_SKIP_ELEMS,
     MQA_LOGITS_TOTAL_MEM_FRACTION,
     mqa_logits_budget_bytes,
@@ -66,6 +75,7 @@ from sglang.srt.layers.attention.mqa_logits_utils import (
     mqa_logits_should_chunk,
     mqa_logits_static_budget_bytes,
 )
+from sglang.srt.layers.communication import k31_pf_custom_ag
 from sglang.srt.layers.layernorm import LayerNorm, RMSNorm
 from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
@@ -191,6 +201,76 @@ _MERGED_K_GATE_MAX_M = 16
 # (logits and top-k) across the attention-TP ranks and all-gather the top-k
 _INDEXER_TP_SPLIT_MIN_ROWS = 1024
 
+# Opt-in (default off): size the chunked prefill MQA logits by each chunk's own
+# longest KV window instead of the batch's whole flattened KV. DeepGEMM's
+# compressed layout (max_seqlen_k > 0) stores logits[i, j] = score of
+# kv[ks'[i] + j]; with ks' = ks & ~3 the top-k reads the same window at
+# row_starts = ks & 3, so its problem (window, head mask, offsets) is unchanged.
+_PER_WINDOW_LOGITS_ENV = "SGLANG_K31_DSA_PER_WINDOW_LOGITS"
+# Report the per-window chunking every this many planned extends (per process).
+_PER_WINDOW_LOG_EVERY = 512
+# Check the host widths against the device ks/ke on this many first plans.
+_PER_WINDOW_VERIFY_PLANS = 4
+
+
+@functools.lru_cache(maxsize=1)
+def _per_window_logits_requested() -> bool:
+    on = os.environ.get(_PER_WINDOW_LOGITS_ENV, "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+    if on:
+        logger.info(
+            "%s=1: chunked prefill MQA logits are sized by each chunk's longest "
+            "KV window (DeepGEMM compressed logits)",
+            _PER_WINDOW_LOGITS_ENV,
+        )
+    return on
+
+
+@functools.lru_cache(maxsize=1)
+def _compressed_mqa_logits_fn():
+    """deep_gemm.fp8_mqa_logits if it takes max_seqlen_k (the compressed layout),
+    else None: the torch fallback and older DeepGEMM keep the full-width path."""
+    fn = resolve_fp8_mqa_logits_fn()
+    try:
+        import deep_gemm
+    except ImportError:
+        return None
+    if fn is not getattr(deep_gemm, "fp8_mqa_logits", None):
+        return None
+    try:
+        has_arg = "max_seqlen_k" in inspect.signature(fn).parameters
+    except (TypeError, ValueError):  # pybind builtins: the arg names are in the doc
+        has_arg = "max_seqlen_k" in (getattr(fn, "__doc__", None) or "")
+    if not has_arg:
+        logger.warning(
+            "%s=1 ignored: deep_gemm.fp8_mqa_logits has no max_seqlen_k",
+            _PER_WINDOW_LOGITS_ENV,
+        )
+        return None
+    return fn
+
+
+@functools.lru_cache(maxsize=None)
+def _per_window_fallback_once(reason: str) -> None:
+    logger.info(
+        "%s=1: full-width MQA logits kept (%s); logged once per reason",
+        _PER_WINDOW_LOGITS_ENV,
+        reason,
+    )
+
+
+class _PerWindowPlan(NamedTuple):
+    # (start, end, width) per chunk, in absolute rows; width = max over the rows
+    # of (ke - (ks & ~3)), the compressed logits' max_seqlen_k
+    chunks: Tuple[Tuple[int, int, int], ...]
+    ks_aligned: torch.Tensor  # rows [row_lo, row_hi): ks & ~3, int32, device
+    row_rem: torch.Tensor  # rows [row_lo, row_hi): ks & 3, int32, device
+    old_chunks: int  # full-width chunks the default path would run
+
 
 if _is_cuda or _is_hip:
     # Plain-torch graph helpers: usable wherever the split-op surface is.
@@ -270,6 +350,14 @@ def _index_k_write_targets(pool, layer_id: int, loc: torch.Tensor):
     return shard_pool.index_key_cache.write_targets(layer_id, loc)
 
 
+def _idx_fp8_1pass_on(next_n: int) -> bool:
+    # K31HT_IDX_FP8_1PASS (default off): one-pass served FP8
+    # verify logits at native 5..8 rows (bitwise == DeepGEMM's FP8 kernel).
+    return next_n in (5, 6, 7, 8) and os.environ.get(
+        "K31HT_IDX_FP8_1PASS", "0"
+    ) not in ("", "0")
+
+
 # TODO(kpham-sgl): shard index-K under DCP by default (dsa_shards_index_k() always on) and remove this switch.
 def _index_k_dcp() -> Tuple[int, int]:
     if not dsa_shards_index_k():
@@ -302,6 +390,10 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
     _HEAD_DIM_WITH_SF = 132
     # One measured budget per device for the process lifetime.
     _mqa_logits_budget_bytes: Dict[int, int] = {}
+    # Per-window logits: one plan per device, reused by every layer of a forward
+    # (keyed by the forward's attention metadata, held weakly).
+    _per_window_plan_cache: Dict[int, Tuple[Any, Tuple[int, ...], _PerWindowPlan]] = {}
+    _per_window_stats: Dict[str, int] = {"plans": 0, "old": 0, "new": 0, "disabled": 0}
 
     @staticmethod
     def _mqa_logits_free_mem_fraction() -> float:
@@ -1632,19 +1724,35 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 get_paged_mqa_logits_metadata_fn=resolve_paged_mqa_logits_metadata_fn(),
             )
         elif use_dg_native:
-            logits = deepgemm_paged_mqa_logits_native(
-                _chunked_fp8_paged_mqa_logits,
-                q_fp8,
-                kv_cache_fp8,
-                weights,
-                seqlens_32_2d,
-                block_tables,
-                schedule_metadata,
-                max_seq_len,
-                q_offset=q_offset,
-                B=B,
-                next_n=next_n,
-            )
+            if _idx_fp8_1pass_on(next_n):
+                from sglang.srt.layers.attention.dsa import prec_idx_fp4
+
+                logits = prec_idx_fp4.fp8_native_logits_1p(
+                    q_fp8,
+                    kv_cache_fp8,
+                    weights,
+                    seqlens_32_2d,
+                    block_tables,
+                    schedule_metadata,
+                    max_seq_len,
+                    q_offset=q_offset,
+                    B=B,
+                    next_n=next_n,
+                )
+            else:
+                logits = deepgemm_paged_mqa_logits_native(
+                    _chunked_fp8_paged_mqa_logits,
+                    q_fp8,
+                    kv_cache_fp8,
+                    weights,
+                    seqlens_32_2d,
+                    block_tables,
+                    schedule_metadata,
+                    max_seq_len,
+                    q_offset=q_offset,
+                    B=B,
+                    next_n=next_n,
+                )
         else:
             logits = deepgemm_paged_mqa_logits_split(
                 _chunked_fp8_paged_mqa_logits,
@@ -1893,6 +2001,39 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             dst_base = row_lo
 
         start = row_lo
+        per_window = (
+            self._per_window_plan(
+                forward_batch=forward_batch,
+                metadata=metadata,
+                ks=ks,
+                ke=ke,
+                q_offset=q_offset,
+                k_offset=k_offset,
+                row_lo=row_lo,
+                row_hi=row_hi,
+                budget_bytes=logits_budget_bytes,
+                old_rows_per_chunk=max_rows,
+            )
+            if need_chunk
+            and global_topk_offset is not None
+            and _per_window_logits_requested()
+            else None
+        )
+        if per_window is not None:
+            self._topk_ragged_per_window(
+                per_window,
+                q_fp8=q_fp8,
+                weights=weights,
+                kv_fp8=kv_fp8,
+                ke=ke,
+                seq_lens_expanded=seq_lens_expanded,
+                global_topk_offset=global_topk_offset,
+                metadata=metadata,
+                row_lo=row_lo,
+                dst=dst,
+                dst_base=dst_base,
+            )
+            start = row_hi  # every row is done; skip the full-width loop
         while start < row_hi:
             end = min(start + max_rows, row_hi)
 
@@ -1965,8 +2106,224 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if tp_split is not None:
             # Rank order == row order, so the gather rebuilds rows [0, q_offset).
             group, _, _, sizes = tp_split
-            group.all_gatherv(dst, sizes=sizes, output=topk_result[:q_offset])
+            # SGLANG_K31_PF_CUSTOM_AG=1: the served direct multicast all-gather (bitwise, byte copy).
+            if not k31_pf_custom_ag.try_all_gatherv_rows(
+                group, dst, sizes, topk_result[:q_offset], site="dsa_topk"
+            ):
+                group.all_gatherv(dst, sizes=sizes, output=topk_result[:q_offset])
         return topk_result
+
+    @staticmethod
+    def _per_window_widths(
+        seq_lens_cpu: torch.Tensor, extend_lens: List[int], row_lo: int, row_hi: int
+    ) -> np.ndarray:
+        """Host-only compressed-logits width of rows [row_lo, row_hi).
+
+        Row r of request b scores kv[ks_b & ~3, ke_r), so its width is
+        (ks_b & 3) + prefix_b + pos_r + 1, where ks_b is the request's offset in
+        the flattened KV (the exclusive cumsum of seq_lens) and ke_r - ks_b =
+        prefix_b + pos_r + 1, as _cal_indexer_k_start_end builds them.
+        """
+        seq = seq_lens_cpu.to(torch.int64).numpy()
+        ext = np.asarray(extend_lens, dtype=np.int64)
+        k_start = np.cumsum(seq) - seq
+        q_start = np.cumsum(ext) - ext
+        row_base = np.repeat(seq - ext + (k_start & 3), ext)
+        row_pos = np.arange(int(ext.sum()), dtype=np.int64) - np.repeat(q_start, ext)
+        return (row_base + row_pos + 1)[row_lo:row_hi]
+
+    @staticmethod
+    def _per_window_chunks(
+        width: np.ndarray, row_lo: int, budget_bytes: int
+    ) -> List[Tuple[int, int, int]]:
+        """(start, end, max width) row chunks for compressed logits: a chunk of n
+        rows allocates ceil4(n) x align256(max width) fp32 (DeepGEMM's compressed
+        layout) and takes as many rows as fit the budget, at least one."""
+        align = MQA_LOGITS_ROW_ALIGN_ELEMS
+        elem = MQA_LOGITS_BYTES_PER_ELEM
+        chunks = []
+        n, s = int(width.shape[0]), 0
+        while s < n:
+            # n rows cost at least n * row_bytes(width[s]): bounds the scan
+            first = -(-int(width[s]) // align) * align * elem
+            cap = min(n - s, budget_bytes // max(first, 1) + 1)
+            cm = np.maximum.accumulate(width[s : s + cap])
+            rows = np.arange(1, cap + 1, dtype=np.int64)
+            need = ((rows + 3) // 4 * 4) * ((cm + align - 1) // align * align) * elem
+            # need is nondecreasing in rows, so the fitting rows are a prefix
+            fit = max(int(np.count_nonzero(need <= budget_bytes)), 1)
+            chunks.append((row_lo + s, row_lo + s + fit, int(cm[fit - 1])))
+            s += fit
+        return chunks
+
+    def _per_window_plan(
+        self,
+        *,
+        forward_batch: ForwardBatch,
+        metadata: BaseIndexerMetadata,
+        ks: torch.Tensor,
+        ke: torch.Tensor,
+        q_offset: int,
+        k_offset: int,
+        row_lo: int,
+        row_hi: int,
+        budget_bytes: int,
+        old_rows_per_chunk: int,
+    ) -> Optional[_PerWindowPlan]:
+        """The per-window chunk plan, or None to keep the full-width path."""
+        if not _is_cuda or self._per_window_stats.get("disabled"):
+            return None
+        if _compressed_mqa_logits_fn() is None:
+            _per_window_fallback_once("deep_gemm.fp8_mqa_logits has no max_seqlen_k")
+            return None
+        # Tie equivalence is shown for the v2 ragged top-k kernel only.
+        topk_backend = getattr(metadata, "topk_backend", None)
+        if (
+            topk_backend is None
+            or not topk_backend.should_use_topk_v2()
+            or not envs.SGLANG_DSA_FUSE_TOPK.get()
+            or getattr(metadata, "force_unfused_topk", True)
+        ):
+            _per_window_fallback_once("top-k is not the fused v2 ragged kernel")
+            return None
+        if self.num_init_tokens or self.num_local_tokens:
+            _per_window_fallback_once("index_init_tokens / index_local_tokens set")
+            return None
+        if self.dsa_enable_prefill_cp or is_cp_active(forward_batch):
+            _per_window_fallback_once("prefill context parallelism")
+            return None
+        # The plan comes from host lengths: never bake it into a graph.
+        if get_is_capture_mode() or torch.cuda.is_current_stream_capturing():
+            _per_window_fallback_once("CUDA graph capture")
+            return None
+        seq_lens_cpu = forward_batch.seq_lens_cpu
+        extend_lens = forward_batch.extend_seq_lens_cpu
+        # The host widths must describe exactly the ks/ke the metadata built.
+        if (
+            seq_lens_cpu is None
+            or extend_lens is None
+            or len(extend_lens) != seq_lens_cpu.numel()
+            or sum(extend_lens) != q_offset
+            or min(extend_lens, default=0) < 0
+            or int(seq_lens_cpu.sum()) != k_offset
+            or ks.shape[0] != q_offset
+        ):
+            _per_window_fallback_once("host lengths do not match the indexer rows/cols")
+            return None
+
+        device_index = ks.device.index
+        key = (row_lo, row_hi, int(budget_bytes), q_offset, k_offset)
+        attn_metadata = getattr(metadata, "attn_metadata", None)
+        cached = self._per_window_plan_cache.get(device_index)
+        if (
+            cached is not None
+            and attn_metadata is not None
+            and cached[0]() is attn_metadata
+            and cached[1] == key
+        ):
+            return cached[2]
+
+        width = self._per_window_widths(seq_lens_cpu, extend_lens, row_lo, row_hi)
+        chunks = self._per_window_chunks(width, row_lo, int(budget_bytes))
+        ks_rows = ks[row_lo:row_hi]
+        plan = _PerWindowPlan(
+            chunks=tuple(chunks),
+            ks_aligned=torch.bitwise_and(ks_rows, -4),
+            row_rem=torch.bitwise_and(ks_rows, 3),
+            old_chunks=-(-(row_hi - row_lo) // max(old_rows_per_chunk, 1)),
+        )
+        stats = self._per_window_stats
+        if stats["plans"] < _PER_WINDOW_VERIFY_PLANS:
+            # A width below a row's span would let DeepGEMM write past the row:
+            # check the host widths against the device ks/ke on the first plans
+            # of each process (one sync each), and fall back for good on a miss.
+            dev = (ke[row_lo:row_hi] - plan.ks_aligned).cpu().numpy()
+            if not np.array_equal(dev.astype(np.int64), width):
+                stats["disabled"] = 1
+                logger.error(
+                    "%s: host widths disagree with the indexer ks/ke; "
+                    "per-window logits disabled for this process",
+                    _PER_WINDOW_LOGITS_ENV,
+                )
+                return None
+        if attn_metadata is not None:
+            try:
+                ref = weakref.ref(attn_metadata)
+            except TypeError:
+                ref = None
+            if ref is not None:
+                self._per_window_plan_cache[device_index] = (ref, key, plan)
+
+        stats["plans"] += 1
+        stats["old"] += plan.old_chunks
+        stats["new"] += len(plan.chunks)
+        if stats["plans"] == 1 or stats["plans"] % _PER_WINDOW_LOG_EVERY == 0:
+            logger.info(
+                "DSA indexer per-window logits (%s=1): %d planned extends; "
+                "logits calls per layer, summed: full-width %d -> per-window %d "
+                "(last: rows %d, cols %d, max width %d, budget %.2f GB)",
+                _PER_WINDOW_LOGITS_ENV,
+                stats["plans"],
+                stats["old"],
+                stats["new"],
+                row_hi - row_lo,
+                k_offset,
+                max(c[2] for c in chunks),
+                budget_bytes / 1e9,
+            )
+        return plan
+
+    def _topk_ragged_per_window(
+        self,
+        plan: _PerWindowPlan,
+        *,
+        q_fp8: torch.Tensor,
+        weights: torch.Tensor,
+        kv_fp8: Tuple[torch.Tensor, torch.Tensor],
+        ke: torch.Tensor,
+        seq_lens_expanded: torch.Tensor,
+        global_topk_offset: torch.Tensor,
+        metadata: BaseIndexerMetadata,
+        row_lo: int,
+        dst: torch.Tensor,
+        dst_base: int,
+    ) -> None:
+        """The RAGGED chunk loop of _get_topk_ragged on compressed logits.
+
+        Same rows, scores, windows and output offsets as the full-width loop;
+        only the logits' column origin moves from 0 to ks & ~3 per row.
+        """
+        fp8_mqa_logits = _compressed_mqa_logits_fn()
+        for start, end, width in plan.chunks:
+            lo, hi = start - row_lo, end - row_lo
+            with self._with_real_sm_count():
+                q_padded, w_padded, _ = self._pad_heads_for_deep_gemm(
+                    q_fp8[start:end], weights[start:end]
+                )
+                logits_chunk = fp8_mqa_logits(
+                    q_padded,
+                    kv_fp8,
+                    w_padded,
+                    plan.ks_aligned[lo:hi],
+                    ke[start:end],
+                    clean_logits=False,
+                    max_seqlen_k=width,
+                )
+            lengths_chunk = seq_lens_expanded[start:end]
+            rem_chunk = plan.row_rem[lo:hi]
+            self._mask_init_and_local_tokens(logits_chunk, lengths_chunk, rem_chunk)
+            raw_topk_chunk = metadata.topk_transform(
+                logits_chunk,
+                self.index_topk,
+                ks=rem_chunk,
+                cu_seqlens_q=None,
+                ke_offset=lengths_chunk,
+                batch_idx_list=None,
+                topk_indices_offset_override=global_topk_offset[start:end],
+            )
+            dst[start - dst_base : end - dst_base] = raw_topk_chunk
+            # Release scratch before allocating the next chunk or gathering top-k.
+            del logits_chunk
 
     @staticmethod
     def _dcp_gather_index_k(

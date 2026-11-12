@@ -1,6 +1,7 @@
 # Adapted from https://github.com/fla-org/flash-linear-attention/blob/main/fla/ops/common/chunk_delta_h.py
 # -*- coding: utf-8 -*-
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 
 import os
 from typing import Optional, Tuple
@@ -18,12 +19,19 @@ from sglang.kernels.ops.attention.fla.utils import (
     autotune_cache_kwargs,
     is_nvidia_hopper,
 )
+from sglang.srt.environ import envs
 
 NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8, 16]
 CHUNK_SIZE = 64
 GDN_CHUNK_H_BV = int(os.getenv("SGLANG_GDN_CHUNK_H_BV", "32"))
 GDN_CHUNK_H_NUM_WARPS = int(os.getenv("SGLANG_GDN_CHUNK_H_NUM_WARPS", "4"))
 GDN_CHUNK_H_NUM_STAGES = int(os.getenv("SGLANG_GDN_CHUNK_H_NUM_STAGES", "2"))
+# K3.1 KDA h prefetch (SGLANG_K31_KDA_H_PREFETCH, read at import, default 0): with gk
+# and 64 < K <= 128, step i_t loads chunk i_t + 1's k tiles and gk-last row at its
+# top, so their latency overlaps the step's dots. Same values, same dot order
+# (bitwise equal to 0); 0 = stock. This is the process default; a caller may pass
+# prefetch_k=True / False per call (D-SEG passes False: HPF slows its segment calls).
+KDA_H_PREFETCH = envs.SGLANG_K31_KDA_H_PREFETCH.get()
 
 
 @triton.autotune(
@@ -82,6 +90,7 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
     NT_BUCKET: tl.constexpr,
     USE_EXP2: tl.constexpr,
     TRACK_STATE: tl.constexpr,
+    PREFETCH_K: tl.constexpr,
 ):
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
     i_n, i_h = i_nh // H, i_nh % H
@@ -173,6 +182,30 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
             b_h4 += tl.load(p_h0_4, mask=m_h4, other=0.0).to(tl.float32)
 
     # main recurrence
+    if PREFETCH_K:
+        # chunk 0's k tiles and gk-last row; an empty varlen row (T == 0) reads nothing
+        # Triton >= 3.9 removed block pointers: the [64, BT] k tiles are masked pointer
+        # loads in the stock (non-prefetch) b_k form below, other=0.0.
+        o_kn = tl.arange(0, 64)
+        o_tn = tl.arange(0, BT).to(tl.int64)
+        m_tn = o_tn < T
+        p_kn = k + o_kn[:, None] + o_tn[None, :] * stride_k
+        b_kn1 = tl.load(p_kn, mask=(o_kn < K)[:, None] & m_tn[None, :], other=0.0)
+        p_kn = k + (64 + o_kn)[:, None] + o_tn[None, :] * stride_k
+        b_kn2 = tl.load(
+            p_kn, mask=((64 + o_kn) < K)[:, None] & m_tn[None, :], other=0.0
+        )
+        l_n = min(BT, T) - 1
+        b_gkn1 = tl.load(
+            gk + (bos + l_n) * H * K + i_h * K + o_kn,
+            mask=(o_kn < K) & (l_n >= 0),
+            other=0.0,
+        )
+        b_gkn2 = tl.load(
+            gk + (bos + l_n) * H * K + i_h * K + 64 + o_kn,
+            mask=((64 + o_kn) < K) & (l_n >= 0),
+            other=0.0,
+        )
     for i_t in range(NT):
         o_t = (i_t * BT + tl.arange(0, BT)).to(tl.int64)
         m_t = o_t < T
@@ -200,6 +233,30 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
             if K > 192:
                 p_t4 = p_track_base + o_v[:, None] * K + o_k4[None, :]
                 tl.store(p_t4, b_h4, mask=m_h4)
+
+        if PREFETCH_K:
+            # this chunk's tiles came from the previous step; issue chunk i_t + 1's
+            b_k1 = b_kn1
+            b_k2 = b_kn2
+            b_gk_last1 = b_gkn1
+            b_gk_last2 = b_gkn2
+            o_tn = ((i_t + 1) * BT + tl.arange(0, BT)).to(tl.int64)
+            m_tn = o_tn < T
+            p_kn = k + o_kn[:, None] + o_tn[None, :] * stride_k
+            b_kn1 = tl.load(p_kn, mask=(o_kn < K)[:, None] & m_tn[None, :], other=0.0)
+            p_kn = k + (64 + o_kn)[:, None] + o_tn[None, :] * stride_k
+            b_kn2 = tl.load(
+                p_kn, mask=((64 + o_kn) < K)[:, None] & m_tn[None, :], other=0.0
+            )
+            l_n = min((i_t + 2) * BT, T) - 1
+            b_gkn1 = tl.load(
+                gk + (bos + l_n) * H * K + i_h * K + o_kn, mask=(o_kn < K), other=0.0
+            )
+            b_gkn2 = tl.load(
+                gk + (bos + l_n) * H * K + i_h * K + 64 + o_kn,
+                mask=((64 + o_kn) < K),
+                other=0.0,
+            )
 
         p_w = w + o_t[:, None] * stride_w + o_k1[None, :]
         b_w = tl.load(p_w, mask=m_t[:, None] & m_k1[None, :], other=0.0)
@@ -239,7 +296,14 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
             if K > 192:
                 b_h4 = b_h4 * b_g_last
 
-        if USE_GK:
+        if PREFETCH_K:
+            if USE_EXP2:
+                b_h1 *= exp2(b_gk_last1)[None, :]
+                b_h2 *= exp2(b_gk_last2)[None, :]
+            else:
+                b_h1 *= exp(b_gk_last1)[None, :]
+                b_h2 *= exp(b_gk_last2)[None, :]
+        elif USE_GK:
             o_k1 = tl.arange(0, 64)
             b_gk_last1 = tl.load(
                 gk + (bos + last_idx) * H * K + i_h * K + o_k1,
@@ -285,21 +349,25 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
                     b_h4 *= exp(b_gk_last4)[None, :]
         b_v = b_v.to(k.dtype.element_ty)
 
-        p_k = k + o_k1[:, None] + o_t[None, :] * stride_k
-        b_k = tl.load(p_k, mask=m_k1[:, None] & m_t[None, :], other=0.0)
-        b_h1 += tl.trans(tl.dot(b_k, b_v))
-        if K > 64:
-            p_k = k + o_k2[:, None] + o_t[None, :] * stride_k
-            b_k = tl.load(p_k, mask=m_k2[:, None] & m_t[None, :], other=0.0)
-            b_h2 += tl.trans(tl.dot(b_k, b_v))
-        if K > 128:
-            p_k = k + o_k3[:, None] + o_t[None, :] * stride_k
-            b_k = tl.load(p_k, mask=m_k3[:, None] & m_t[None, :], other=0.0)
-            b_h3 += tl.trans(tl.dot(b_k, b_v))
-        if K > 192:
-            p_k = k + o_k4[:, None] + o_t[None, :] * stride_k
-            b_k = tl.load(p_k, mask=m_k4[:, None] & m_t[None, :], other=0.0)
-            b_h4 += tl.trans(tl.dot(b_k, b_v))
+        if PREFETCH_K:
+            b_h1 += tl.trans(tl.dot(b_k1, b_v))
+            b_h2 += tl.trans(tl.dot(b_k2, b_v))
+        else:
+            p_k = k + o_k1[:, None] + o_t[None, :] * stride_k
+            b_k = tl.load(p_k, mask=m_k1[:, None] & m_t[None, :], other=0.0)
+            b_h1 += tl.trans(tl.dot(b_k, b_v))
+            if K > 64:
+                p_k = k + o_k2[:, None] + o_t[None, :] * stride_k
+                b_k = tl.load(p_k, mask=m_k2[:, None] & m_t[None, :], other=0.0)
+                b_h2 += tl.trans(tl.dot(b_k, b_v))
+            if K > 128:
+                p_k = k + o_k3[:, None] + o_t[None, :] * stride_k
+                b_k = tl.load(p_k, mask=m_k3[:, None] & m_t[None, :], other=0.0)
+                b_h3 += tl.trans(tl.dot(b_k, b_v))
+            if K > 192:
+                p_k = k + o_k4[:, None] + o_t[None, :] * stride_k
+                b_k = tl.load(p_k, mask=m_k4[:, None] & m_t[None, :], other=0.0)
+                b_h4 += tl.trans(tl.dot(b_k, b_v))
 
     # epilogue
     if INPLACE_UPDATE and valid_state:
@@ -332,6 +400,7 @@ def chunk_gated_delta_rule_fwd_h(
     track_state: Optional[torch.Tensor] = None,
     track_chunk_idx: Optional[torch.Tensor] = None,
     chunk_offsets: Optional[torch.Tensor] = None,
+    prefetch_k: Optional[bool] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     assert not (use_exp2 and g is not None), (
         "use_exp2 covers only the per-channel gk path; scalar g stays natural-exp"
@@ -402,5 +471,8 @@ def chunk_gated_delta_rule_fwd_h(
         NT_BUCKET=(0 if NT <= 32 else (1 if NT <= 128 else 2)),
         USE_EXP2=use_exp2,
         TRACK_STATE=track_state is not None,
+        PREFETCH_K=bool(KDA_H_PREFETCH if prefetch_k is None else prefetch_k)
+        and gk is not None
+        and 64 < K <= 128,
     )
     return h, v_new

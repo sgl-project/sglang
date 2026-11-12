@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the SGLang project
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Optional
@@ -237,6 +240,13 @@ class HybridAttnBackend(AttentionBackend):
         else:
             backend = self.prefill_backend
         return backend.update_mamba_state_after_mtp_verify(*args, **kwargs)
+
+    def mtp_verify_state_indices(self, *args, **kwargs):
+        if self.spec_attn_is_decode:
+            backend = self.decode_backend
+        else:
+            backend = self.prefill_backend
+        return backend.mtp_verify_state_indices(*args, **kwargs)
 
     def forward(
         self,

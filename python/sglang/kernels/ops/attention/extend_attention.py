@@ -1,4 +1,5 @@
 # Copyright 2023-2024 SGLang Team
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -25,10 +26,14 @@ import triton.language as tl
 
 from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.attention.decode_attention import _extract_kv_strides
+from sglang.kernels.ops.attention.extend_attention_prefix_tiles import (
+    launch_prefix_tiles,
+)
 from sglang.kernels.ops.attention.score_mod import unpack_aux_tensors
 from sglang.srt.environ import envs
-from sglang.srt.utils import is_gfx95_supported, is_gfx1250_supported, is_hip
+from sglang.srt.utils import is_cuda, is_gfx95_supported, is_gfx1250_supported, is_hip
 
+_is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_gfx95 = _is_hip and is_gfx95_supported()
 _is_gfx1250 = _is_hip and is_gfx1250_supported()
@@ -441,6 +446,13 @@ def _fwd_kernel(
     aux0_stride_t=0,
     aux0_stride_h=0,
     aux0_len=0,
+    DV_SPLIT: tl.constexpr = 1,
+    PRE_TILES: tl.constexpr = 0,
+    TileSkip=None,
+    TileMax=None,
+    TileSum=None,
+    TilePV=None,
+    tile_heads=0,
 ):
     if USE_COMPACT_TILE_GRID:
         output_tile = tl.program_id(0)
@@ -467,7 +479,12 @@ def _fwd_kernel(
         cur_block_m = output_tile - cum_tiles
     else:
         cur_seq = tl.program_id(0)
-        cur_head = tl.program_id(1)
+        if DV_SPLIT > 1:
+            # Axis 1 is head * DV_SPLIT + slice; each slice owns BLOCK_DV value columns,
+            # recomputing the head's scores with the same operations.
+            cur_head = tl.program_id(1) // DV_SPLIT
+        else:
+            cur_head = tl.program_id(1)
         cur_block_m = tl.program_id(2)
     cur_kv_head = cur_head // kv_group_num
     LOG2E: tl.constexpr = 1.4426950408889634
@@ -492,7 +509,10 @@ def _fwd_kernel(
         window_kv_offset = tl.load(window_kv_offset_ptr + cur_seq)
 
     offs_d = tl.arange(0, BLOCK_DMODEL)
-    offs_dv = tl.arange(0, BLOCK_DV)
+    if DV_SPLIT > 1:
+        offs_dv = (tl.program_id(1) % DV_SPLIT) * BLOCK_DV + tl.arange(0, BLOCK_DV)
+    else:
+        offs_dv = tl.arange(0, BLOCK_DV)
     offs_m = tl.arange(0, BLOCK_M)
     mask_m = (cur_block_m * BLOCK_M + offs_m) < cur_seq_len_extend
 
@@ -538,7 +558,26 @@ def _fwd_kernel(
     e_max = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
 
     prefix_end = 0 if SKIP_PREFIX else cur_seq_len_prefix
-    for start_n in range(0, prefix_end, BLOCK_N_PREFIX):
+    if PRE_TILES > 0:
+        # Tiles below PRE_TILES were scored by extend_attention_prefix_tiles.py;
+        # replay their running-max, sum and acc updates in tile order.
+        tile_row = (cur_seq * tile_heads + cur_head) * PRE_TILES
+        for j in tl.static_range(PRE_TILES):
+            if j * BLOCK_N_PREFIX < prefix_end:
+                if tl.load(TileSkip + tile_row + j) == 0:
+                    n_e_max = tl.load(TileMax + (tile_row + j) * BLOCK_M + offs_m)
+                    re_scale = tl.exp(e_max - n_e_max)
+                    deno = deno * re_scale + tl.load(
+                        TileSum + (tile_row + j) * BLOCK_M + offs_m
+                    )
+                    dot = tl.load(
+                        TilePV
+                        + ((tile_row + j) * BLOCK_M + offs_m[:, None]) * Lv
+                        + offs_dv[None, :]
+                    )
+                    acc = acc * re_scale[:, None] + dot * v_scale
+                    e_max = n_e_max
+    for start_n in range(PRE_TILES * BLOCK_N_PREFIX, prefix_end, BLOCK_N_PREFIX):
         start_n = tl.multiple_of(start_n, BLOCK_N_PREFIX)
         mask_n = (start_n + offs_n_prefix) < cur_seq_len_prefix
 
@@ -914,6 +953,33 @@ def _fwd_kernel(
         )
 
 
+def _resolve_absorbed_split(
+    *, dv_split, prefix_tiles, from_env, block_dv, lv, split_ok, tiles_ok
+):
+    """The arguments, else the env when from_env; 1 / 0 where a call can't take them."""
+    if from_env and (dv_split is None or prefix_tiles is None):
+        env_dv_split = envs.SGLANG_TRITON_ABSORBED_MLA_DV_SPLIT.get()
+        env_prefix_tiles = envs.SGLANG_TRITON_ABSORBED_MLA_PREFIX_TILES.get()
+        if not (1 <= env_dv_split <= 64 and env_dv_split & (env_dv_split - 1) == 0):
+            raise ValueError(
+                "SGLANG_TRITON_ABSORBED_MLA_DV_SPLIT must be a power of two in "
+                f"[1, 64], got {env_dv_split}."
+            )
+        if env_prefix_tiles < 0:
+            raise ValueError(
+                "SGLANG_TRITON_ABSORBED_MLA_PREFIX_TILES must be >= 0, "
+                f"got {env_prefix_tiles}."
+            )
+        dv_split = env_dv_split if dv_split is None else dv_split
+        prefix_tiles = env_prefix_tiles if prefix_tiles is None else prefix_tiles
+    # The replay and the split both read whole value rows (block_dv == lv).
+    if dv_split is None or not split_ok or block_dv != lv or block_dv % dv_split:
+        dv_split = 1
+    if prefix_tiles is None or not tiles_ok or block_dv != lv:
+        prefix_tiles = 0
+    return dv_split, prefix_tiles
+
+
 def extend_attention_fwd(
     q_extend,
     k_extend,
@@ -945,6 +1011,8 @@ def extend_attention_fwd(
     aux_tensors=None,
     extend_seq_lens_cpu=None,
     identity_kv_indices: bool = False,
+    dv_split: Optional[int] = None,
+    prefix_tiles: Optional[int] = None,
 ):
     """
     q_extend, k_extend, v_extend, o_extend: contiguous tensors
@@ -959,6 +1027,10 @@ def extend_attention_fwd(
     see triton_ops/score_mod.py for the contract.
     ``identity_kv_indices`` promises that the prefix buffer is densely packed,
     allowing direct addressing instead of loading an index for every token.
+    ``dv_split`` splits each head's value columns over that many programs, and
+    ``prefix_tiles`` scores that many leading prefix tiles in parallel first
+    (extend_attention_prefix_tiles.py); None reads the env on the CUDA absorbed-MLA
+    shape. Both keep every output element's operations.
     """
     Lq, Lk, Lv = (
         q_extend.shape[-1],
@@ -984,6 +1056,10 @@ def extend_attention_fwd(
         and Lv == 512
     )
     kimi_k3_shape = zero_prefix_shape or absorbed_shape
+    # The env-driven split launches: absorbed MLA at any head count (TP8 12, TP16 6).
+    absorbed_any_heads = (
+        k_extend.shape[1] == 1 and Lq == 576 and Lk == 576 and Lv == 512
+    )
 
     # Match Aiter's opt-in behavior: cast Q, K, and V separately before the
     # native-FP8 zero-prefix kernel at every sequence length.
@@ -1070,10 +1146,51 @@ def extend_attention_fwd(
         )
 
     use_compact_tile_grid = compact_q_tiles is not None
+    dv_split, prefix_tiles = _resolve_absorbed_split(
+        dv_split=dv_split,
+        prefix_tiles=prefix_tiles,
+        from_env=_is_cuda and absorbed_any_heads,
+        block_dv=BLOCK_DV,
+        lv=Lv,
+        split_ok=not (STORE_LSE or use_compact_tile_grid or _is_hip),
+        tiles_ok=(
+            not (skip_prefix or USE_CUSTOM_MASK or STORE_LSE or HAS_SINK)
+            and logit_cap <= 0
+            and xai_temperature_len <= 0
+            and score_mod is None
+            and not (use_compact_tile_grid or USE_FP8_PREFIX or USE_EXP2 or _is_hip)
+            and BLOCK_DPE > 0
+            and max_len_extend <= BLOCK_M
+        ),
+    )
+    BLOCK_DV //= dv_split
     if use_compact_tile_grid:
         grid = (compact_q_tiles, head_num)
     else:
-        grid = (batch_size, head_num, triton.cdiv(max_len_extend, BLOCK_M))
+        grid = (batch_size, head_num * dv_split, triton.cdiv(max_len_extend, BLOCK_M))
+    tile_kwargs = {}
+    if prefix_tiles > 0:
+        tile_kwargs = launch_prefix_tiles(
+            prefix_tiles=prefix_tiles,
+            q_extend=q_extend,
+            k_buffer=k_buffer,
+            v_buffer=v_buffer,
+            qo_indptr=qo_indptr,
+            kv_indptr=kv_indptr,
+            kv_indices=kv_indices,
+            sm_scale=sm_scale,
+            k_scale=k_scale,
+            kv_group_num=kv_group_num,
+            lv=Lv,
+            page_size=page_size,
+            identity_kv_indices=identity_kv_indices,
+            sliding_window_size=sliding_window_size,
+            block_dmodel=BLOCK_DMODEL,
+            block_dpe=BLOCK_DPE,
+            block_m=BLOCK_M,
+            block_n_prefix=BLOCK_N_PREFIX,
+            num_warps=num_warps,
+        )
     num_stages = (
         _get_num_stages_for_extend_attention(Lq, Lv, BLOCK_N) if kimi_k3_shape else 1
     )
@@ -1163,6 +1280,8 @@ def extend_attention_fwd(
         aux0_stride_t=aux0_stride_t,
         aux0_stride_h=aux0_stride_h,
         aux0_len=aux0_len,
+        DV_SPLIT=dv_split,
+        **tile_kwargs,
         num_warps=num_warps,
         num_stages=num_stages,
         **extra_kargs,

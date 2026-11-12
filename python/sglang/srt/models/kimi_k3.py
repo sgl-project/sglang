@@ -1,3 +1,8 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the SGLang project
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
+# Portions (the MoE route staging and the NVFP4 route-preparation check) are
+# adapted from sgl-project/sglang pull request #46484 (Apache-2.0).
 # Kimi-K3 multimodal model: KimiLinear text backbone + MoonViT3d vision tower.
 # Based on kimi_linear.py with K3-specific features:
 #   - Attention Residual (attn_res_block_size)
@@ -6,11 +11,13 @@
 #   - MLA output gate (mla_use_output_gate)
 #   - Full-rank KDA gate (use_full_rank_gate)
 
+import json
 import logging
+import os
 import re
 from array import array
 from collections.abc import Iterable
-from functools import cached_property
+from functools import cached_property, lru_cache
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
@@ -18,6 +25,7 @@ import torch
 from torch import nn
 
 from sglang.kernels.ops.attention.fla.fused_norm_gate import FusedRMSNormGated
+from sglang.kernels.ops.moe import moe_route_quant_fused
 from sglang.srt.configs.kimi_k3 import KimiK3Config
 from sglang.srt.configs.kimi_linear import KimiLinearConfig
 from sglang.srt.configs.model_config import is_kimi_k31
@@ -44,6 +52,7 @@ from sglang.srt.layers.cp.interleave import (
     cp_sequence_to_interleave_order,
     is_interleave_extend,
 )
+from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.layers.dcp.layout import set_dsa_shards_index_k
 from sglang.srt.layers.dcp.planner import prepare_decode_context_parallel_metadata
 from sglang.srt.layers.dp_attention import (
@@ -218,15 +227,352 @@ def _k31_gb300_tuning(config) -> bool:
     )
 
 
-def _k3_side_stream_max_tokens(config) -> int:
+# Kimi-K3.1 on VR200 (SM107): the decode dense GEMM rows where a
+# fixed TGV tactic beats cuBLAS, through the PD-decode DFLASH verify rows
+# (M = 6 x graph bs, to 1152). This is the "table" / "side" content of
+# sm107_table-stable.json (benchmark/kimi_k31_vr200/sm107_tables): only the
+# rows with the same tactic at every swept M in two independent sweeps (CUDA
+# graph, weights rotated past L2, a minimum-win threshold); every changed pick
+# was bitwise equal to cuBLAS on SM107.
+# The unit test checks it against that file. SGLANG_K31_SM107_GEMM_TABLE
+# replaces it with another sweep's JSON.
+_K31_SM107_TGV_M_RANGES = {
+    (6144, 7168): ((132, 192, 24), (624, 624, 24)),
+    (1536, 7168): ((168, 192, 21), (336, 480, 23)),
+    (7168, 1536): ((72, 96, 24),),
+    (2112, 7168): ((528, 528, 24), (912, 960, 28)),
+    (7168, 3584): ((52, 64, 23), (132, 144, 27)),
+}
+# Side-stream [f_a | b] beside qkvg on SM107 (the same file's "side"; per-M
+# intersection of both sweeps), used up to SGLANG_K31_SM107_BFA_SIDE_MAX_TOKENS.
+_K31_SM107_BFA_SIDE_TGV_M_RANGES = {
+    (144, 7168): (
+        (108, 120, 21),
+        (132, 132, 23),
+        (156, 192, 23),
+        (336, 336, 24),
+        (672, 768, 28),
+    ),
+}
+# Identifies the built-in table in the init log line.
+_K31_SM107_TABLE_ID = "built-in (sm107_table-stable sha256 358899b1)"
+# The shapes an SM107 table may route: the TP8 attention-side projections and
+# the latent projections; (144, 7168) only on the attention side stream.
+_K31_SM107_TABLE_SHAPES = frozenset(
+    {
+        (6144, 7168),  # KDA fused qkvg
+        (2112, 7168),  # MLA fused q_a + kv_a
+        (1536, 7168),  # MLA g_proj / output gate
+        (7168, 1536),  # KDA / MLA o_proj
+        (2304, 1536),  # MLA q_b
+        (896, 3584),  # TP-sharded latent-up slice
+        (7168, 3584),  # latent up_proj (replicated)
+    }
+)
+_K31_SM107_SIDE_SHAPES = frozenset({(144, 7168)})
+
+
+def _k31_sm107_tuning(config) -> bool:
+    """Kimi-K3.1 on VR200 under SGLANG_K31_SM107_GEMM_TACTICS (default off):
+    the SM107 tactics and the SGLANG_K31_SM107_*_SIDE_MAX_TOKENS side streams."""
+    return (
+        is_kimi_k31(config)
+        and get_platform().device_sm == 107
+        and envs.SGLANG_K31_SM107_GEMM_TACTICS.get()
+    )
+
+
+def _k31_sm107_parse_ranges(section: dict, allowed: frozenset) -> dict:
+    """``{"n,k": [[m_lo, m_hi, tactic], ...]}`` -> the TGV m-range dict; any
+    shape outside ``allowed`` or a range under _K31_TGV_M_RANGES raises."""
+    out = {}
+    for key, ranges in section.items():
+        n, k = (int(v) for v in key.split(","))
+        if (n, k) not in allowed:
+            raise ValueError(f"SM107 GEMM table: shape {(n, k)} is not allowed")
+        # The generic K3.1 ranges stay registered; an SM107 range must sit above.
+        floor = max((hi for _, hi, _ in _K31_TGV_M_RANGES.get((n, k), ())), default=0)
+        rows = []
+        for m_lo, m_hi, tactic in ranges:
+            if not (
+                type(m_lo) is int
+                and type(m_hi) is int
+                and floor < m_lo <= m_hi <= 4096
+                and (tactic is None or (type(tactic) is int and tactic >= 0))
+            ):
+                raise ValueError(
+                    f"SM107 GEMM table: bad range {(m_lo, m_hi, tactic)} for {(n, k)}"
+                )
+            rows.append((m_lo, m_hi, tactic))
+        out[(n, k)] = tuple(rows)
+    return out
+
+
+@lru_cache(maxsize=1)
+def _k31_sm107_tables() -> tuple:
+    """(dense-GEMM m ranges, side-stream [f_a | b] m ranges) for SM107: the JSON
+    at SGLANG_K31_SM107_GEMM_TABLE, else the built-in table."""
+    path = envs.SGLANG_K31_SM107_GEMM_TABLE.get()
+    if path:
+        with open(path) as f:
+            doc = json.load(f)
+        dense = _k31_sm107_parse_ranges(doc["table"], _K31_SM107_TABLE_SHAPES)
+        side = _k31_sm107_parse_ranges(doc.get("side", {}), _K31_SM107_SIDE_SHAPES)
+    else:
+        dense, side = _K31_SM107_TGV_M_RANGES, _K31_SM107_BFA_SIDE_TGV_M_RANGES
+    logger.info(
+        "K3.1 SM107 decode GEMM tactics on (SGLANG_K31_SM107_GEMM_TACTICS=1): "
+        "table=%s dense=%s side=%s side-stream rows bfa<=%d gate<=%d",
+        path or _K31_SM107_TABLE_ID,
+        {f"{n}x{k}": [r[:2] for r in v] for (n, k), v in dense.items()},
+        {f"{n}x{k}": [r[:2] for r in v] for (n, k), v in side.items()},
+        envs.SGLANG_K31_SM107_BFA_SIDE_MAX_TOKENS.get(),
+        envs.SGLANG_K31_SM107_GATE_SIDE_MAX_TOKENS.get(),
+    )
+    return dense, side
+
+
+# VR200 small-M decode rows (M <= 128: TP8 DFLASH verify at graph bs <= 16 and
+# the draft). The generic _K31_TGV_M_RANGES (1-64, ladder pick) and the dense
+# table above were tuned on B300 or at larger M; at M 30 the ladder's
+# cta64x16 qkvg fills under half the SMs' bandwidth. SGLANG_K31_SM107_SMALLM_TABLE
+# (default unset; read only under _k31_sm107_tuning) names a JSON (the served one
+# is in benchmark/kimi_k31_vr200/sm107_tables):
+#   "dense": {"n,k": [[m_lo, m_hi, tactic], ...]}  tactic: a TGV id, null (the
+#            ladder pick) or "cublas" (no TGV: the dispatch falls to cuBLAS).
+#            These rows replace every overlapping generic / SM107 range.
+#   "side":  {"144,7168": [[m_lo, m_hi, tactic], ...]}  the KDA [f_a | b] GEMM
+#            on the attention side stream: a TGV id or "tiny" (the tiny GEMM /
+#            cuBLAS); these rows replace the overlapping SM107 side ranges.
+#   "slice": {"n,k": [[m_lo, m_hi, spec], ...]}  k3_ar_fusion.slice_gemm under
+#            capture (read there).
+_K31_SM107_SMALLM_MAX_M = 128
+# Shapes whose dispatch falls to cuBLAS above M 8 once no TGV range holds the
+# M (use_cutedsl_bf16_gemm: k > 6144 or k < 2048; M <= 8 is TGV for them anyway).
+_K31_SM107_CUBLAS_SHAPES = frozenset(
+    {(6144, 7168), (2112, 7168), (1536, 7168), (7168, 1536), (2304, 1536)}
+)
+
+
+def _k31_sm107_parse_smallm(
+    section: dict, side: bool = False, fold: bool = False
+) -> dict:
+    """``{"n,k": [[m_lo, m_hi, tactic], ...]}`` -> {(n, k): ((m_lo, m_hi,
+    tactic), ...)} sorted by m; tactic an int >= 0, None or "cublas" (dense),
+    an int >= 0 or "tiny" (side), an int >= 0, None or "off" (fold)."""
+    out = {}
+    if fold:
+        allowed = _K31_SM107_FOLD_SHAPES
+    else:
+        allowed = _K31_SM107_SIDE_SHAPES if side else _K31_SM107_TABLE_SHAPES
+    for key, ranges in section.items():
+        n, k = (int(v) for v in key.split(","))
+        if (n, k) not in allowed:
+            raise ValueError(f"SM107 small-M table: shape {(n, k)} is not allowed")
+        rows = []
+        for m_lo, m_hi, tactic in ranges:
+            ok = (
+                type(m_lo) is int
+                and type(m_hi) is int
+                and 1 <= m_lo <= m_hi <= _K31_SM107_SMALLM_MAX_M
+            )
+            if side:
+                ok = ok and (tactic == "tiny" or (type(tactic) is int and tactic >= 0))
+            elif fold and tactic == "off":
+                pass
+            elif tactic == "cublas":
+                ok = ok and (n, k) in _K31_SM107_CUBLAS_SHAPES and m_lo > 8
+            else:
+                ok = ok and (tactic is None or (type(tactic) is int and tactic >= 0))
+            if not ok:
+                raise ValueError(
+                    f"SM107 small-M table: bad range {(m_lo, m_hi, tactic)} for {(n, k)}"
+                )
+            rows.append((m_lo, m_hi, tactic))
+        rows.sort(key=lambda r: r[0])
+        for a, b in zip(rows, rows[1:]):
+            if b[0] <= a[1]:
+                raise ValueError(f"SM107 small-M table: {a} overlaps {b} for {(n, k)}")
+        out[(n, k)] = tuple(rows)
+    return out
+
+
+def _k31_m_ranges_minus(ranges: tuple, cuts: tuple) -> tuple:
+    """``ranges`` ((m_lo, m_hi, tactic), ...) with the m spans in ``cuts`` removed."""
+    out = []
+    for lo, hi, tactic in ranges:
+        segs = [(lo, hi)]
+        for c_lo, c_hi, _ in cuts:
+            nxt = []
+            for a, b in segs:
+                if c_hi < a or c_lo > b:
+                    nxt.append((a, b))
+                    continue
+                if a < c_lo:
+                    nxt.append((a, c_lo - 1))
+                if c_hi < b:
+                    nxt.append((c_hi + 1, b))
+            segs = nxt
+        out.extend((a, b, tactic) for a, b in segs)
+    return tuple(out)
+
+
+def _k31_sm107_merge_smallm(tables: tuple, smallm: dict) -> dict:
+    """The union of ``tables`` (disjoint per shape), with every small-M row
+    replacing the m it covers; "cublas" / "tiny" / "off" rows only remove."""
+    merged: dict = {}
+    for table in tables:
+        for shape, ranges in table.items():
+            merged[shape] = merged.get(shape, ()) + tuple(ranges)
+    for shape, rows in smallm.items():
+        kept = _k31_m_ranges_minus(merged.get(shape, ()), rows)
+        merged[shape] = kept + tuple(
+            r for r in rows if r[2] not in ("cublas", "tiny", "off")
+        )
+    return {
+        shape: tuple(sorted(ranges, key=lambda r: r[0]))
+        for shape, ranges in merged.items()
+        if ranges
+    }
+
+
+@lru_cache(maxsize=1)
+def _k31_sm107_smallm_ranges() -> Optional[tuple]:
+    """(dense TGV m ranges to register, side [f_a | b] m ranges) on SM107 when
+    SGLANG_K31_SM107_SMALLM_TABLE is set: the generic + SM107 tables with the
+    small-M rows on top. None when unset."""
+    path = os.environ.get("SGLANG_K31_SM107_SMALLM_TABLE", "")
+    if not path:
+        return None
+    with open(path) as f:
+        doc = json.load(f)
+    dense_rows = _k31_sm107_parse_smallm(doc.get("dense", {}))
+    side_rows = _k31_sm107_parse_smallm(doc.get("side", {}), side=True)
+    dense_base, side_base = _k31_sm107_tables()
+    dense = _k31_sm107_merge_smallm((_K31_TGV_M_RANGES, dense_base), dense_rows)
+    side = _k31_sm107_merge_smallm((side_base,), side_rows)
+    logger.info(
+        "K3.1 SM107 small-M GEMM table on (SGLANG_K31_SM107_SMALLM_TABLE=%s): "
+        "dense=%s side=%s registered=%s side_ranges=%s slice=%s",
+        path,
+        {f"{n}x{k}": [list(r) for r in v] for (n, k), v in dense_rows.items()},
+        {f"{n}x{k}": [list(r) for r in v] for (n, k), v in side_rows.items()},
+        {f"{n}x{k}": [list(r) for r in v] for (n, k), v in dense.items()},
+        {f"{n}x{k}": [list(r) for r in v] for (n, k), v in side.items()},
+        sorted(doc.get("slice", {})),
+    )
+    return dense, side
+
+
+# VR200 KDA in-proj fold (default off): at decode/verify M the side-stream
+# [f_a | b] chain (cuBLAS split-K + reduce, 144 x 7168) ends after the wide
+# [q,k,v,g] TGV and is the KDA region's critical path. With
+# SGLANG_K31_SM107_FUSE_KDA_INPROJ_MAX_TOKENS=<max M> (1-128; read only under
+# _k31_sm107_tuning) the [f_a | b] rows are appended to the [q,k,v,g] weight
+# (one [6144 + 144, 7168] buffer at TP8, views for the unfused paths) and one
+# TGV GEMM serves min M <= M <= max M; f_b follows on the main stream. Below
+# min M (SGLANG_K31_SM107_FUSE_KDA_INPROJ_MIN_TOKENS, default 1) the tiny-GEMM
+# side pair stays (it beats the fold at M 6 and 12 on VR200). The CUDA
+# counterpart of the ROCm SGLANG_ROCM_K3_FUSE_KDA_INPROJ
+# (sgl-project/sglang#35176). Tactic: the TGV ladder pick, or the small-M
+# table's "fold" rows {"6288,7168": [[m_lo, m_hi, tactic | null | "off"]]}
+# ("off": no fold at those M, e.g. where the side-pair row is faster).
+_K31_SM107_FOLD_ENV = "SGLANG_K31_SM107_FUSE_KDA_INPROJ_MAX_TOKENS"
+_K31_SM107_FOLD_MIN_ENV = "SGLANG_K31_SM107_FUSE_KDA_INPROJ_MIN_TOKENS"
+_K31_SM107_FOLD_SHAPES = frozenset({(6288, 7168)})  # TP8 [q,k,v,g | f_a | b | pad]
+
+
+def _k31_sm107_fold_max_tokens(config) -> int:
+    """The KDA in-proj fold's largest M, or 0 (off)."""
+    raw = os.environ.get(_K31_SM107_FOLD_ENV, "")
+    if not raw or not _k31_sm107_tuning(config):
+        return 0
+    max_m = int(raw)
+    if not 0 <= max_m <= _K31_SM107_SMALLM_MAX_M:
+        raise ValueError(
+            f"{_K31_SM107_FOLD_ENV}={raw} must be in [0, {_K31_SM107_SMALLM_MAX_M}]"
+        )
+    return max_m
+
+
+def _k31_sm107_fold_min_tokens(max_m: int) -> int:
+    """The KDA in-proj fold's smallest M (1 when unset); read only when the
+    fold is on (max_m > 0)."""
+    raw = os.environ.get(_K31_SM107_FOLD_MIN_ENV, "")
+    if not max_m or not raw:
+        return 1
+    min_m = int(raw)
+    if not 1 <= min_m <= max_m:
+        raise ValueError(
+            f"{_K31_SM107_FOLD_MIN_ENV}={raw} must be in [1, {_K31_SM107_FOLD_ENV}={max_m}]"
+        )
+    return min_m
+
+
+@lru_cache(maxsize=1)
+def _k31_sm107_fold_rows() -> dict:
+    """The small-M table's "fold" rows ({} without a table)."""
+    path = os.environ.get("SGLANG_K31_SM107_SMALLM_TABLE", "")
+    if not path:
+        return {}
+    with open(path) as f:
+        doc = json.load(f)
+    return _k31_sm107_parse_smallm(doc.get("fold", {}), fold=True)
+
+
+def _k31_sm107_fold_ranges(shape: tuple, max_m: int, min_m: int = 1) -> tuple:
+    """((m_lo, m_hi, tactic), ...) of the folded in-proj GEMM: the ladder over
+    min_m..max_m with the table's fold rows on top ("off" rows cut holes),
+    clipped to [min_m, max_m]."""
+    merged = _k31_sm107_merge_smallm(
+        ({shape: ((min_m, max_m, None),)},), _k31_sm107_fold_rows()
+    ).get(shape, ())
+    return tuple(
+        (max(lo, min_m), min(hi, max_m), t)
+        for lo, hi, t in merged
+        if lo <= max_m and hi >= min_m
+    )
+
+
+_k31_sm107_fold_logged = False
+
+
+def _k31_sm107_log_fold(
+    shape: tuple, max_m: int, ranges: tuple, min_m: int = 1
+) -> None:
+    global _k31_sm107_fold_logged
+    if _k31_sm107_fold_logged:
+        return
+    _k31_sm107_fold_logged = True
+    logger.info(
+        "K3.1 SM107 KDA in-proj fold on (%s=%d, %s=%d): one TGV GEMM %dx%d for "
+        "[q,k,v,g | f_a | b] at %d <= M <= %d, ranges=%s",
+        _K31_SM107_FOLD_ENV,
+        max_m,
+        _K31_SM107_FOLD_MIN_ENV,
+        min_m,
+        shape[0],
+        shape[1],
+        min_m,
+        max_m,
+        [list(r) for r in ranges],
+    )
+
+
+def _k3_side_stream_max_tokens(config, sm107_max_tokens=None) -> int:
     """Largest graphed decode / verify batch whose attention side-stream GEMMs
     (MLA g_proj, KDA [f_a | b] -> f_b) overlap the main stream. Above it the
     attention core fills the SMs and the overlap only adds sync overhead; on
     K3.1 GB300 the TGV picks above keep the gate and [f_a | b] cheap enough to
-    hide up to 288 verify rows."""
+    hide up to 288 verify rows. ``sm107_max_tokens`` is the SM107 cap's env
+    field, read only under _k31_sm107_tuning."""
     if not get_platform().is_blackwell:
         return 64
-    return 288 if _k31_gb300_tuning(config) else 128
+    if _k31_gb300_tuning(config):
+        return 288
+    if sm107_max_tokens is not None and _k31_sm107_tuning(config):
+        return sm107_max_tokens.get()
+    return 128
 
 
 def _k3_bfa_side_gemm(
@@ -322,6 +668,13 @@ def _k3_bf16_gemm(
 # than the replicated read saves (measured on GB300 TP8).
 _SHARDED_FRONT_MIN_TOKENS = 18
 _SHARDED_FRONT_MAX_TOKENS = 256
+
+# Blocks of the sharded front's side-stream shared-expert AR ([M, 7168] bf16
+# pull) under SGLANG_K3_SHARDED_MOE_FRONT: RES_TUNING's 16-block band ends at
+# 4 MB (292 rows) and falls back to the 4-block prefill setting, which leaves
+# the AR behind gemm1 / gemm2 and the latent AR (same pull semaphores) waiting
+# on it, so that front keeps 16 over its whole range (18-512 rows).
+_K31_SHARDED_SHARED_AR_BLOCKS = 16
 
 
 # Fully fused KDA decode step (kernels/ops/attention/kda_fused_decode). The
@@ -482,7 +835,7 @@ def _k3_all_reduce_add(hidden_states, residual, forward_batch):
     all-reduce, for an output o_proj wrote into its multicast buffer."""
     if k3_ar_fusion.find_mc_ptr(hidden_states) is None:
         return None
-    return k3_ar_fusion.all_reduce(hidden_states, residual)
+    return k3_ar_fusion.all_reduce(hidden_states, residual, o_proj=True)
 
 
 def _k3_reduce_scatter_add(hidden_states, residual, forward_batch):
@@ -550,6 +903,235 @@ def _uses_ep_a2a() -> bool:
     )
 
 
+class _K31MoEStart:
+    """Kimi-K3.1 MegaMoE decode block: start order of the routed and shared branches.
+
+    Default off.
+    ``SGLANG_K31_MOE_START`` (read here, at the call site) selects how
+    ``KimiK3MoE._forward_unfused`` issues its two branches inside a captured CUDA
+    graph when the routed experts run through DeepGEMM MegaMoE and the replicated
+    shared experts overlap them on the side stream (SBO):
+
+    - ``prio``: the routed chain (``mega_moe_pre_dispatch`` -> MegaMoE -> latent norm ->
+      latent up projection) runs on a stream of the greatest CUDA priority, forked
+      from and joined back to the current stream. Stream capture copies a stream's
+      priority into its kernel nodes, and torch instantiates graphs with
+      ``cudaGraphInstantiateFlagUseNodePriority`` (pytorch#167346), so the block
+      scheduler dispatches routed CTAs ahead of pending shared-expert CTAs.
+    - ``order``: the shared experts fork after ``mega_moe_pre_dispatch`` instead of
+      after the MoE front, so the MegaMoE launch (PDL-chained to the pre-dispatch)
+      is queued before the shared gate_up GEMM.
+    - ``early``: the shared experts fork before the MoE front, and the front and the
+      routed chain run on the priority stream (implies ``prio``): the shared GEMMs
+      fill the SMs the front's split-K reduce, epilogue and pre-dispatch leave idle.
+
+    Values: unset, ``0`` or ``off`` = off; ``1`` = ``prio,order``; otherwise a ``,``/``+``
+    separated subset of {prio, order, early} (``early`` excludes ``order``). Same
+    kernels, inputs and launch configurations; only graph edges and node priorities
+    change. Every other model, config and path behaves exactly as before.
+    """
+
+    ENV = "SGLANG_K31_MOE_START"
+    TAG = "default off"
+    TOKENS = frozenset({"prio", "order", "early"})
+    OFF = frozenset()
+
+    _streams = {}
+    _logged_on = False
+    _logged_off = False
+
+    @staticmethod
+    @lru_cache(maxsize=8)
+    def parse_mode(value: Optional[str]) -> frozenset:
+        """The set of start-order tokens for one ``SGLANG_K31_MOE_START`` value."""
+        cls = _K31MoEStart
+        if value is None:
+            return cls.OFF
+        text = value.strip().lower()
+        if text in ("", "0", "off", "false", "no", "none"):
+            return cls.OFF
+        if text in ("1", "on", "true", "yes"):
+            text = "prio,order"
+        tokens = frozenset(t for t in re.split(r"[,+\s]+", text) if t)
+        bad = tokens - cls.TOKENS
+        if bad:
+            raise ValueError(
+                f"{cls.ENV}={value!r}: unknown token(s) {sorted(bad)}; "
+                f"use 0/off, 1, or a subset of {sorted(cls.TOKENS)}"
+            )
+        if "early" in tokens and "order" in tokens:
+            raise ValueError(f"{cls.ENV}={value!r}: 'early' and 'order' are exclusive")
+        if "early" in tokens:
+            tokens = tokens | {"prio"}
+        return tokens
+
+    @staticmethod
+    def mode() -> frozenset:
+        return _K31MoEStart.parse_mode(os.environ.get(_K31MoEStart.ENV))
+
+    @staticmethod
+    def on_stream(stream):
+        """``torch.cuda.stream(stream)``, or a no-op that touches no device API."""
+        if stream is None:
+            from contextlib import nullcontext
+
+            return nullcontext()
+        return torch.cuda.stream(stream)
+
+    @staticmethod
+    def _greatest_priority() -> int:
+        try:
+            _least, greatest = torch.cuda.Stream.priority_range()
+            return int(greatest)
+        except Exception:  # older torch: any negative value maps to the top pool
+            return -1
+
+    @staticmethod
+    def routed_stream(create: bool = False):
+        """The process's high-priority routed-chain stream for the current device.
+
+        Created at model init (``create=True``), outside graph capture; a forward
+        that finds none falls back to the default order."""
+        if not torch.cuda.is_available():
+            return None
+        streams = _K31MoEStart._streams
+        device = torch.cuda.current_device()
+        stream = streams.get(device)
+        if stream is None and create:
+            stream = torch.cuda.Stream(priority=_K31MoEStart._greatest_priority())
+            streams[device] = stream
+        return stream
+
+    @staticmethod
+    def prepare_at_init() -> None:
+        """Validate the flag (raises on a bad value) and create the priority stream."""
+        if "prio" in _K31MoEStart.mode():
+            _K31MoEStart.routed_stream(create=True)
+
+    @staticmethod
+    def log_on_once(
+        layer_idx: int, num_tokens: int, tokens: frozenset, shared_stream
+    ) -> None:
+        cls = _K31MoEStart
+        if cls._logged_on:
+            return
+        cls._logged_on = True
+        stream = cls.routed_stream() if "prio" in tokens else None
+        logger.info(
+            "K31 MoE start order on (%s=%s, %s): layer %d, %d rows; routed chain stream "
+            "priority %s (shared-expert stream priority %s); shared experts fork %s",
+            cls.ENV,
+            ",".join(sorted(tokens)),
+            cls.TAG,
+            layer_idx,
+            num_tokens,
+            "unchanged" if stream is None else stream.priority,
+            "?" if shared_stream is None else shared_stream.priority,
+            "before the MoE front"
+            if "early" in tokens
+            else "after mega_moe_pre_dispatch"
+            if "order" in tokens
+            else "after the MoE front",
+        )
+
+    @staticmethod
+    def log_off_once(layer_idx: int, reason: str) -> None:
+        cls = _K31MoEStart
+        if cls._logged_off:
+            return
+        cls._logged_off = True
+        logger.warning(
+            "K31 MoE start order off (%s set, %s): layer %d: %s; the default order runs",
+            cls.ENV,
+            cls.TAG,
+            layer_idx,
+            reason,
+        )
+
+
+class _PrefillSP:
+    """One eager prefill forward's sequence-parallel tail (see
+    KimiK3LinearModel._prefill_sp_begin). From ``first_layer`` on, the residual
+    stream and the attention-residual bank stay on this TP rank's contiguous
+    ``rows`` of the batch padded to ``padded`` rows (a multiple of 2 * tp, so a
+    [padded, 3584] latent splits on whole rows too); the attention and the MoE
+    front read the gathered rows ``[:num_tokens]``. Pad rows are zero going
+    in, never reach a full-row consumer, and are dropped by every gather that
+    leaves the tail. Every choice here depends only on the batch size and the
+    env, so all TP ranks take the same path and issue the same collectives."""
+
+    __slots__ = (
+        "num_tokens",
+        "padded",
+        "local",
+        "rows",
+        "first_layer",
+        "use_k3",
+        "rs_blocks",
+        "ag_blocks",
+        "shared_rs_blocks",
+        "bank_storage",
+        "entered",
+    )
+
+    def __init__(self, num_tokens: int, padded: int, first_layer: int):
+        group = get_parallel().tp_group
+        self.num_tokens = num_tokens
+        self.padded = padded
+        self.local = padded // group.world_size
+        start = group.rank_in_group * self.local
+        self.rows = slice(start, start + self.local)
+        self.first_layer = first_layer
+        self.use_k3 = envs.SGLANG_K31_PREFILL_SP_TAIL_COMM.get() != "nccl"
+        self.rs_blocks = envs.SGLANG_K31_PREFILL_SP_TAIL_RS_BLOCKS.get()
+        self.ag_blocks = envs.SGLANG_K31_PREFILL_SP_TAIL_AG_BLOCKS.get()
+        self.shared_rs_blocks = envs.SGLANG_K31_PREFILL_SP_TAIL_SHARED_RS_BLOCKS.get()
+        # The bank's padded storage while the replicated layers before
+        # first_layer use its first num_tokens rows (None: no padding).
+        self.bank_storage: Optional[torch.Tensor] = None
+        self.entered = False
+
+    def gather(self, x: torch.Tensor, *, owned: bool = False) -> torch.Tensor:
+        """The full rows of this rank's ``[local, H]`` block, ``[:num_tokens]``.
+        Without ``owned`` the result lives in a persistent buffer that the
+        next gather overwrites (every consumer here reads it before then)."""
+        full = k3_sp_collective.prefill_sp_all_gather(
+            x, num_blocks=self.ag_blocks, use_k3=self.use_k3
+        )
+        if owned and self.use_k3:
+            return full[: self.num_tokens].clone()
+        return full[: self.num_tokens]
+
+    def reduce_scatter(
+        self,
+        x: torch.Tensor,
+        out: torch.Tensor,
+        residual: Optional[torch.Tensor] = None,
+        *,
+        num_blocks: Optional[int] = None,
+    ) -> torch.Tensor:
+        """``out`` = this rank's rows of the TP sum of ``[padded, ...]`` ``x``
+        (+ ``residual``, this rank's rows)."""
+        return k3_sp_collective.prefill_sp_reduce_scatter(
+            x,
+            out,
+            residual,
+            num_blocks=self.rs_blocks if num_blocks is None else num_blocks,
+            use_k3=self.use_k3,
+        )
+
+    def padded_rows(self, x: torch.Tensor, name: str) -> torch.Tensor:
+        """``[padded, H]`` view of the K3 symmetric buffer ``name`` whose first
+        num_tokens rows ``x`` already is (o_proj writes there); a copy if a
+        wrapper handed back other storage. Pad rows zeroed."""
+        full = k3_ar_fusion.symm_buffer(name, self.padded, x.shape[1], x.dtype)
+        if x.data_ptr() != full.data_ptr():
+            full[: self.num_tokens].copy_(x)
+        if self.padded != self.num_tokens:
+            full[self.num_tokens :].zero_()
+        return full
+
+
 class KimiK3MoE(nn.Module):
     """K3 MoE with Latent MoE (experts run in moe_hidden_size space)."""
 
@@ -577,6 +1159,9 @@ class KimiK3MoE(nn.Module):
         self.num_shared_experts = config.num_shared_experts
         self.layer_idx = layer_idx
         self.alt_stream = alt_stream
+        # Default off: SGLANG_K31_MOE_START.
+        if alt_stream is not None:
+            _K31MoEStart.prepare_at_init()
 
         self.use_latent_moe = _uses_latent_moe(config)
         # Merged front weight ([H, gate_up + E + latent]), built after weight
@@ -696,7 +1281,8 @@ class KimiK3MoE(nn.Module):
         # Defer the trtllm-gen finalize (top-k weighted unpermute) into the
         # push all-reduce's staging pass (k3_ar_fusion.finalize_all_reduce_push_norm)
         # so the rank-local latent never materializes. Sizes beyond the push
-        # window fall back to the in-op finalize at runtime.
+        # window and the 2shot push band (SGLANG_K3_AR_PUSH2) fall back to the
+        # in-op finalize at runtime.
         self._defer_moe_finalize = (
             get_moe_runner_backend().is_flashinfer_mxfp4()
             and config.hidden_act == "situ"
@@ -884,7 +1470,7 @@ class KimiK3MoE(nn.Module):
                 "Kimi-K3 MoE front is active: each MoE layer keeps a copy of its "
                 "router and routed_expert_down_proj rows that in-place weight "
                 "writes do not refresh. Restart with SGLANG_K3_SHARDED_MOE=0 "
-                "to allow online updates."
+                "(and SGLANG_K3_SHARDED_MOE_FRONT=0) to allow online updates."
             )
 
     @cached_property
@@ -928,7 +1514,7 @@ class KimiK3MoE(nn.Module):
         fp32 all-gather of the blocks is exactly the replicated front's
         [router | latent] columns."""
         if not (
-            envs.SGLANG_K3_SHARDED_MOE.get()
+            (envs.SGLANG_K3_SHARDED_MOE.get() or envs.SGLANG_K3_SHARDED_MOE_FRONT.get())
             and self._front_fp32
             and self.tp_size > 1
             and k3_ar_fusion.enabled()
@@ -942,13 +1528,26 @@ class KimiK3MoE(nn.Module):
             return None
         return gate_up_rows + group.rank_in_group * rows, rows
 
+    @cached_property
+    def _sharded_front_window(self) -> Tuple[int, int]:
+        """(min, max) rows of the TP-sharded front: SGLANG_K3_SHARDED_MOE_FRONT's
+        _MIN_TOKENS / _MAX_TOKENS when it is on, else the constants above."""
+        if envs.SGLANG_K3_SHARDED_MOE_FRONT.get():
+            return (
+                envs.SGLANG_K3_SHARDED_MOE_FRONT_MIN_TOKENS.get(),
+                envs.SGLANG_K3_SHARDED_MOE_FRONT_MAX_TOKENS.get(),
+            )
+        return _SHARDED_FRONT_MIN_TOKENS, _SHARDED_FRONT_MAX_TOKENS
+
     def _sharded_front_covers(self, num_tokens: int) -> bool:
         # static per M, so each captured CUDA graph bakes in one front
         shard = self._front_shard
         return (
             shard is not None
             and self._front_block_w is not None
-            and _SHARDED_FRONT_MIN_TOKENS <= num_tokens <= _SHARDED_FRONT_MAX_TOKENS
+            and self._sharded_front_window[0]
+            <= num_tokens
+            <= self._sharded_front_window[1]
             and k3_ar_fusion.moe_front_all_gather_fits(num_tokens, shard[1])
         )
 
@@ -976,12 +1575,18 @@ class KimiK3MoE(nn.Module):
         topk_output,
         *,
         valid_token_count: Optional[torch.Tensor] = None,
+        after_pre_dispatch=None,
+        decode_tiles: bool = False,
     ) -> torch.Tensor:
         """Routed experts via deep_gemm MegaMoE: fused a2a dispatch + grouped
         GEMMs + SiTU + combine over the EP-group symmetric buffer. Semantically
         equivalent to `self.experts(routed_input, topk_output)` on an a2a
         backend (combine returns fully-summed rows; `_reduce_latent` then only
-        applies the norm)."""
+        applies the norm).
+
+        decode_tiles: this call is captured into a decode / target-verify CUDA
+        graph, so an FP8xFP4 launch takes the raised decode BLOCK_M
+        (_mega_moe_tiles_env, SGLANG_OPT_DEEPGEMM_MEGA_MOE_RAISE_DECODE_BLOCK_M)."""
         import deep_gemm
 
         from sglang.kernels.ops.moe.dsv4 import mega_moe_pre_dispatch
@@ -989,6 +1594,7 @@ class KimiK3MoE(nn.Module):
         from sglang.srt.layers.moe.mega_moe import (
             _configure_mega_moe_deep_gemm_num_sms,
             _mega_moe_mma_type,
+            _mega_moe_tiles_env,
         )
 
         # Under SP-MoE these rows are this rank's shard of the batch; an unpadded
@@ -1051,13 +1657,24 @@ class KimiK3MoE(nn.Module):
                 quant_group_size=32,
                 num_token_non_padded=valid_token_count,
             )
+        if after_pre_dispatch is not None:
+            # SGLANG_K31_MOE_START=order: fork the shared experts here, so the
+            # MegaMoE launch queues ahead of their gate_up GEMM.
+            after_pre_dispatch()
         # At least one row so the tvm-ffi binding sees a non-null data_ptr.
         y = torch.empty(
             (max(num_tokens, 1), self.moe_hidden_size),
             dtype=torch.bfloat16,
             device=routed_input.device,
         )
-        with _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
+        # K3 fuses no shared experts into MegaMoE, so no shared-expert scale
+        # layout has to follow the remapped BLOCK_M; the scoped
+        # DG_MEGA_MOE_TILES only reaches this launch (and the graph it is
+        # captured into).
+        with (
+            _configure_mega_moe_deep_gemm_num_sms(deep_gemm),
+            _mega_moe_tiles_env(buf, num_tokens, decode_tiles and num_tokens > 0),
+        ):
             deep_gemm.fp8_fp4_mega_moe(
                 y,
                 self.experts.mega_l1_weights,
@@ -1300,12 +1917,44 @@ class KimiK3MoE(nn.Module):
             and not is_in_tc_piecewise_cuda_graph()
         )
 
+    def _k31_moe_start_mode(
+        self, hidden_states: torch.Tensor, fine_grained_overlap: bool
+    ) -> frozenset:
+        """SGLANG_K31_MOE_START tokens for this captured MegaMoE + SBO call, or empty.
+
+        Default off; eager calls keep the default order."""
+        tokens = _K31MoEStart.mode()
+        if not tokens or not torch.cuda.is_current_stream_capturing():
+            return _K31MoEStart.OFF
+        reason = None
+        if not (
+            self._use_mega_moe and self.use_latent_moe and self._sbo_shared_overlap
+        ):
+            reason = "needs MegaMoE, latent MoE and the side-stream shared experts"
+        elif _is_npu or _is_hip or fine_grained_overlap:
+            reason = "CUDA only"
+        elif self._shared_experts_tp_comm or self._routed_needs_reduce:
+            # Their collectives must stay on the current stream.
+            reason = "needs replicated shared experts and no latent all-reduce"
+        elif hidden_states.shape[0] == 0:
+            reason = "no rows"
+        elif "prio" in tokens and _K31MoEStart.routed_stream() is None:
+            reason = "no priority stream (created at model init)"
+        if reason is not None:
+            _K31MoEStart.log_off_once(self.layer_idx, reason)
+            return _K31MoEStart.OFF
+        _K31MoEStart.log_on_once(
+            self.layer_idx, hidden_states.shape[0], tokens, self.alt_stream
+        )
+        return tokens
+
     def _forward_unfused(
         self,
         hidden_states: torch.Tensor,
         *,
         prefix_sum: Optional[torch.Tensor],
         valid_token_count: Optional[torch.Tensor] = None,
+        mega_decode_tiles: bool = False,
     ) -> torch.Tensor:
         """Front section with three separate GEMMs, each reading
         hidden_states: shared-expert MLP, router gate, latent down-proj."""
@@ -1317,6 +1966,7 @@ class KimiK3MoE(nn.Module):
         #   current: front ---------- dispatch ---------- routed GEMMs -- tail
         #   alt:     all-gather ----- shared MLP -------- reduce-scatter
         fine_grained_overlap = self._can_overlap_shared_experts_npu(hidden_states)
+        k31_start = self._k31_moe_start_mode(hidden_states, fine_grained_overlap)
         shared_input = None
         shared_output = None
         shared_event = None
@@ -1350,11 +2000,15 @@ class KimiK3MoE(nn.Module):
             else:
                 shared_output = self._forward_shared_experts(hidden_states)
 
-        def run_experts(expert_input, topk_output):
+        def run_experts(expert_input, topk_output, after_pre_dispatch=None):
             if not fine_grained_overlap:
                 return (
                     self._forward_mega_experts(
-                        expert_input, topk_output, valid_token_count=valid_token_count
+                        expert_input,
+                        topk_output,
+                        valid_token_count=valid_token_count,
+                        after_pre_dispatch=after_pre_dispatch,
+                        decode_tiles=mega_decode_tiles,
                     )
                     if self._use_mega_moe
                     else self.experts(expert_input, topk_output)
@@ -1412,28 +2066,49 @@ class KimiK3MoE(nn.Module):
 
         # Give the NPU shared-expert branch a head start. At this point
         # hidden_states is the decoder layer's post-attention RMSNorm output.
-        if _is_npu and self._sbo_shared_overlap:
+        if (_is_npu and self._sbo_shared_overlap) or "early" in k31_start:
             issue_shared()
+
+        # SGLANG_K31_MOE_START: the routed chain (and under "early" the front)
+        # on the priority stream, forked where its first input is ready;
+        # off, both contexts are nullcontext.
+        k31_routed = None
+        if "prio" in k31_start:
+            k31_main = torch.cuda.current_stream()
+            k31_routed = _K31MoEStart.routed_stream()
+        k31_front_stream = None
+        if "early" in k31_start:
+            k31_front_stream = k31_routed
+            k31_routed.wait_stream(k31_main)
 
         # Front: gate + TopK (+ latent down-proj when merged). Strategy table:
         # kernels/ops/moe/moe_front.py.
-        routed_input = self._ep_front(hidden_states)
-        if routed_input is None and not fine_grained_overlap:
-            routed_input = self._ep_front_overlap(hidden_states)
-        topk_output = None
-        if routed_input is not None:
-            topk_output, routed_input = routed_input
-        elif hidden_states.shape[0] == 0:
-            # An idle DP-attention rank routes nothing but still enters the EP
-            # dispatch; like DeepseekV2MoE, skip the gate and TopK kernels.
-            topk_output = self.topk.empty_topk_output(hidden_states.device)
-        else:
-            # MoEGate produces fp32 router logits on CUDA (via linear_bf16_fp32
-            # or tiny_gemm_bf16); non-CUDA falls back to F.linear (bf16). The
-            # fp32 logits reach the radix router from moe_fused_gate.
-            router_logits = self.gate(hidden_states)
-            topk_output = self.topk(hidden_states, router_logits)
-        if not (_is_npu and self._sbo_shared_overlap):
+        with _K31MoEStart.on_stream(k31_front_stream):
+            routed_input = self._ep_front(hidden_states)
+            # _ep_front_overlap would queue the gate behind the shared experts
+            # on alt_stream; the plain gate below runs the same kernels.
+            if (
+                routed_input is None
+                and not fine_grained_overlap
+                and "early" not in k31_start
+            ):
+                routed_input = self._ep_front_overlap(hidden_states)
+            topk_output = None
+            if routed_input is not None:
+                topk_output, routed_input = routed_input
+            elif hidden_states.shape[0] == 0:
+                # An idle DP-attention rank routes nothing but still enters the EP
+                # dispatch; like DeepseekV2MoE, skip the gate and TopK kernels.
+                topk_output = self.topk.empty_topk_output(hidden_states.device)
+            else:
+                # MoEGate produces fp32 router logits on CUDA (via linear_bf16_fp32
+                # or tiny_gemm_bf16); non-CUDA falls back to F.linear (bf16). The
+                # fp32 logits reach the radix router from moe_fused_gate.
+                router_logits = self.gate(hidden_states)
+                topk_output = self.topk(hidden_states, router_logits)
+        if not (_is_npu and self._sbo_shared_overlap) and not (
+            k31_start & {"early", "order"}
+        ):
             issue_shared()
 
         if not self.use_latent_moe:
@@ -1450,25 +2125,35 @@ class KimiK3MoE(nn.Module):
                 and self.routed_expert_up_proj is not None
             )
 
-        if routed_input is None:
-            if hidden_states.shape[0] == 0:
-                # Idle DP ranks must still enter the EP dispatch below so the
-                # active replicas can exchange routed tokens.  Ascend's
-                # quantized matmul does not accept an empty activation, so
-                # materialize its shape-only result without launching GEMM.
-                routed_input = hidden_states.new_empty((0, self.moe_hidden_size))
+        if k31_routed is not None and "early" not in k31_start:
+            k31_routed.wait_stream(k31_main)
+        with _K31MoEStart.on_stream(k31_routed):
+            if routed_input is None:
+                if hidden_states.shape[0] == 0:
+                    # Idle DP ranks must still enter the EP dispatch below so the
+                    # active replicas can exchange routed tokens.  Ascend's
+                    # quantized matmul does not accept an empty activation, so
+                    # materialize its shape-only result without launching GEMM.
+                    routed_input = hidden_states.new_empty((0, self.moe_hidden_size))
+                else:
+                    routed_input, _ = self.routed_expert_down_proj(hidden_states)
+            expert_output = run_experts(
+                routed_input,
+                topk_output,
+                after_pre_dispatch=issue_shared if "order" in k31_start else None,
+            )
+            if expert_output.shape[0] == 0:
+                # The EP combine returns one row per source token.  Keep the
+                # source-side empty result while avoiding empty RMSNorm/up-proj
+                # launches; the collective itself has already completed above.
+                out = hidden_states.new_empty((0, hidden_states.shape[1]))
             else:
-                routed_input, _ = self.routed_expert_down_proj(hidden_states)
-        expert_output = run_experts(routed_input, topk_output)
-        if expert_output.shape[0] == 0:
-            # The EP combine returns one row per source token.  Keep the
-            # source-side empty result while avoiding empty RMSNorm/up-proj
-            # launches; the collective itself has already completed above.
-            out = hidden_states.new_empty((0, hidden_states.shape[1]))
-        else:
-            latent = self._reduce_latent(expert_output)
-            # up_proj is replicated, so the routed output is now fully reduced.
-            out, _ = self.routed_expert_up_proj(latent)
+                latent = self._reduce_latent(expert_output)
+                # up_proj is replicated, so the routed output is now fully reduced.
+                out, _ = self.routed_expert_up_proj(latent)
+        if k31_routed is not None:
+            k31_main.wait_stream(k31_routed)
+            out.record_stream(k31_main)
         wait_and_finalize_shared_experts()
         if shared_output is not None:
             # tp1 shared experts (SP-MoE) are complete per-rank; TP-sharded
@@ -1540,11 +2225,26 @@ class KimiK3MoE(nn.Module):
             and self.experts.moe_runner_config.activation == "situ"
         )
 
-    def _forward_routed(self, hidden_states, router_logits, routed_input, latent):
+    def _route_staged(self, hidden_states, router_logits, routed_input):
+        """Stage the fused route preparation and route; returns the topk output
+        and the routed input to feed the experts. Caller clears the handoff."""
         if self._route_quant_fuse_eligible:
             route_quant_handoff.stage(routed_input, layer=self.experts)
+        fuse_nvfp4 = self._nvfp4_preparation_covered(router_logits, routed_input)
+        if fuse_nvfp4:
+            route_quant_handoff.stage(routed_input, self.experts.w13_input_scale_quant)
+        topk_output = self.topk(hidden_states, router_logits)
+        if fuse_nvfp4 and not route_quant_handoff.ready(
+            routed_input, self.experts.w13_input_scale_quant
+        ):
+            routed_input = routed_input.to(hidden_states.dtype).contiguous()
+        return topk_output, routed_input
+
+    def _forward_routed(self, hidden_states, router_logits, routed_input, latent):
         try:
-            topk_output = self.topk(hidden_states, router_logits)
+            topk_output, routed_input = self._route_staged(
+                hidden_states, router_logits, routed_input
+            )
             with zero_copy_context.set_moe_output(latent):
                 expert_output = self.experts(routed_input, topk_output)
         finally:
@@ -1552,15 +2252,39 @@ class KimiK3MoE(nn.Module):
         if expert_output.data_ptr() != latent.data_ptr():
             latent.copy_(expert_output)
 
+    def _nvfp4_preparation_covered(self, router_logits, routed_input):
+        if not envs.SGLANG_K31_PF_NVFP4_ROUTE_QUANT.get():
+            return False
+        from sglang.srt.layers.quantization.modelopt_quant import (
+            ModelOptNvFp4FusedMoEMethod,
+        )
+
+        if not (
+            self._defer_moe_finalize
+            and isinstance(self.experts.quant_method, ModelOptNvFp4FusedMoEMethod)
+            and self.alt_stream is not None
+            and self.fuse_ar_norm
+            and k3_ar_fusion.enabled()
+            and self.gate.e_score_correction_bias is not None
+        ):
+            return False
+        return moe_route_quant_fused.nvfp4_covered(
+            router_logits,
+            self.gate.e_score_correction_bias,
+            self.experts.top_k,
+            routed_input,
+            self.experts.w13_input_scale_quant,
+        )
+
     def _forward_routed_deferred(self, hidden_states, router_logits, routed_input):
         """Routed experts with the in-op finalize skipped: returns the
         FlashInferTrtllmDeferredFinalizeOutput triple (permuted gemm2 output,
         expanded_idx_to_permuted_idx, expert_weights) for the finalize-fused
         all-reduce."""
-        if self._route_quant_fuse_eligible:
-            route_quant_handoff.stage(routed_input, layer=self.experts)
         try:
-            topk_output = self.topk(hidden_states, router_logits)
+            topk_output, routed_input = self._route_staged(
+                hidden_states, router_logits, routed_input
+            )
             return self.experts.forward_deferred_finalize(routed_input, topk_output)
         finally:
             route_quant_handoff.clear()
@@ -1599,7 +2323,9 @@ class KimiK3MoE(nn.Module):
         )
         if hidden_states.shape[0] > 1 and _is_hip and not _aiter_k3_opt:
             router_logits = router_logits.contiguous()
-        if self._moe_front_needs_dense_bf16:
+        if self._moe_front_needs_dense_bf16 and not self._nvfp4_preparation_covered(
+            router_logits, routed_input
+        ):
             # off an fp32 front the cast allocates the dense buffer, so the
             # contiguous() behind it is free; off a bf16 front it is the copy
             routed_input = routed_input.to(hidden_states.dtype).contiguous()
@@ -1636,7 +2362,10 @@ class KimiK3MoE(nn.Module):
         return router_logits, routed_input
 
     def _forward_fused(
-        self, hidden_states: torch.Tensor, *, prefix_sum: Optional[torch.Tensor]
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        prefix_sum: Optional[torch.Tensor],
     ) -> torch.Tensor:
         """Fused-front pipeline: read hidden_states once through the merged
         [H, gate_up + E + latent] weight (or its TP-sharded form, see
@@ -1699,7 +2428,14 @@ class KimiK3MoE(nn.Module):
                 )
                 self.alt_stream.wait_stream(current_stream)
                 with torch.cuda.stream(self.alt_stream):
-                    k3_ar_fusion.all_reduce_low_sm(shared_output)
+                    k3_ar_fusion.all_reduce_low_sm(
+                        shared_output,
+                        num_blocks=(
+                            _K31_SHARDED_SHARED_AR_BLOCKS
+                            if envs.SGLANG_K3_SHARDED_MOE_FRONT.get()
+                            else None
+                        ),
+                    )
             if defer_finalize:
                 deferred = self._forward_routed_deferred(
                     hidden_states, router_logits, routed_input
@@ -1716,7 +2452,8 @@ class KimiK3MoE(nn.Module):
                     )
             current_stream.wait_stream(self.alt_stream)
             # The latent AR must stay serialized after the shared AR (both
-            # reuse the v2 pull semaphores); the join above does it.
+            # reuse the v2 pull semaphores past the push bands); the join above
+            # does it.
             if defer_finalize:
                 # finalize folded into the push AR's staging pass; the norm
                 # covers every latent row
@@ -1738,7 +2475,8 @@ class KimiK3MoE(nn.Module):
             else:
                 k3_ar_fusion.all_reduce(latent)
             # the gemm_ag tail wants the normed latent straight out of the
-            # fused-norm AR (its GEMV chains on it via PDL)
+            # fused-norm AR (its GEMV chains on it via PDL); the sharded tail
+            # covers decode batches, prefill-sized M keeps the replicated GEMM
             if (
                 fused_norm
                 and self._gemm_ag_up_eligible
@@ -1774,6 +2512,76 @@ class KimiK3MoE(nn.Module):
         # prefetch_bc: b and c complete before the norm / up_proj chain
         # starts; only `a`'s producer can still be in flight at PDL entry.
         return _add3(out, shared_output, prefix_sum, prefetch_bc=True)
+
+    @property
+    def prefill_sp_capable(self) -> bool:
+        """Static half of the prefill SP tail's eligibility: the fused front
+        with the side-stream shared experts and the fused-norm latent tail
+        (whose all-reduce becomes this tail's reduce-scatter)."""
+        return (
+            self._eligible_for_fused_front
+            and self.fuse_ar_norm
+            and self.alt_stream is not None
+            and self.routed_expert_up_proj is not None
+            and not self._use_mega_moe
+            and k3_ar_fusion.enabled()
+        )
+
+    def forward_prefill_sp(
+        self,
+        normed: torch.Tensor,
+        prefix_sum: torch.Tensor,
+        sp: _PrefillSP,
+    ) -> torch.Tensor:
+        """The MoE of a prefill SP layer: ``normed`` is this rank's rows of the
+        FFN input, ``prefix_sum`` this rank's rows of the stream it adds to;
+        returns this rank's rows of the next stream.
+
+        The rows are gathered for the front (the same replicated GEMM as
+        _forward_fused) and the experts; the routed experts' latent sum and the
+        shared experts' sum (side stream, beside the routed experts) are
+        reduce-scattered instead of all-reduced, and the latent RMSNorm, the
+        up_proj and the tail add run on this rank's rows only."""
+        if TYPE_CHECKING:
+            assert (
+                self.routed_expert_up_proj is not None and self.alt_stream is not None
+            )
+        hidden_size = normed.shape[1]
+        latent_size = self.moe_hidden_size
+        num_tokens, padded = sp.num_tokens, sp.padded
+        hidden_states = sp.gather(normed)
+        gate_up, router_logits, routed_input = self._fused_front(hidden_states)
+        # [latent | shared] TP partials, padded rows each, in the symmetric
+        # buffer the pull reduce-scatter reads through its multicast alias
+        buf = k3_ar_fusion.symm_buffer(
+            k3_ar_fusion.MOE_LATENT_SHARED,
+            padded,
+            latent_size + hidden_size,
+            hidden_states.dtype,
+        ).view(-1)
+        latent_full = buf[: padded * latent_size].view(padded, latent_size)
+        shared_full = buf[padded * latent_size :].view(padded, hidden_size)
+        if padded != num_tokens:
+            latent_full[num_tokens:].zero_()
+            shared_full[num_tokens:].zero_()
+        latent = latent_full[:num_tokens]
+        shared_output = shared_full[:num_tokens]
+        shared_local = normed.new_empty((sp.local, hidden_size))
+
+        current_stream = torch.cuda.current_stream()
+        self.alt_stream.wait_stream(current_stream)
+        self._forward_routed(hidden_states, router_logits, routed_input, latent)
+        with torch.cuda.stream(self.alt_stream):
+            self._forward_shared(gate_up, shared_output)
+            sp.reduce_scatter(shared_full, shared_local, num_blocks=sp.shared_rs_blocks)
+        # the latent reduce-scatter shares the pull semaphores with the shared
+        # one: keep it after the join, like the replicated tail's latent AR
+        current_stream.wait_stream(self.alt_stream)
+        latent_local = sp.reduce_scatter(
+            latent_full, normed.new_empty((sp.local, latent_size))
+        )
+        out, _ = self.routed_expert_up_proj(self._latent_norm(latent_local))
+        return _add3(out, shared_local, prefix_sum, prefetch_bc=True)
 
     def _forward_cp_shard_rows(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """This rank's CP rows of the complete output, for rows gathered
@@ -1812,6 +2620,7 @@ class KimiK3MoE(nn.Module):
         prefix_sum: Optional[torch.Tensor] = None,
         cp_shard_rows: bool = False,
         valid_token_count: Optional[torch.Tensor] = None,
+        mega_decode_tiles: bool = False,
     ) -> torch.Tensor:
         """A latent MoE, which writes the next stream itself, takes the pending
         prefix_sum: folded into the 3-way JIT tail add when covered, plain adds
@@ -1825,12 +2634,16 @@ class KimiK3MoE(nn.Module):
         if cp_shard_rows:
             return self._forward_cp_shard_rows(hidden_states)
         if hidden_states.shape[0] > 0 and self._eligible_for_fused_front:
-            out = self._forward_fused(hidden_states, prefix_sum=prefix_sum)
+            out = self._forward_fused(
+                hidden_states,
+                prefix_sum=prefix_sum,
+            )
         else:
             out = self._forward_unfused(
                 hidden_states,
                 prefix_sum=prefix_sum,
                 valid_token_count=valid_token_count,
+                mega_decode_tiles=mega_decode_tiles,
             )
         return out.view(num_tokens, hidden_size)
 
@@ -1858,10 +2671,22 @@ class KimiK3DeltaAttention(nn.Module):
         # stream (graphed decode/verify only; SM bound as the MLA gate stream).
         self._bfa_alt_stream = bfa_alt_stream
         self._bfa_bs_limit = (
-            _k3_side_stream_max_tokens(config) if bfa_alt_stream is not None else 0
+            _k3_side_stream_max_tokens(
+                config, envs.SGLANG_K31_SM107_BFA_SIDE_MAX_TOKENS
+            )
+            if bfa_alt_stream is not None
+            else 0
         )
         # TGV m ranges of the side-stream [f_a | b] GEMM, set with _bfa_w.
         self._bfa_side_tgv_m_ranges: Optional[TGVMRanges] = None
+        # SM107 KDA in-proj fold (_k31_sm107_fold_max_tokens; default off):
+        # the merged [q,k,v,g | f_a | b | pad] weight, its output split and TGV
+        # m ranges, set by _merge_bfa_weights() when the fold applies.
+        self._k31_fold_max_m = _k31_sm107_fold_max_tokens(config)
+        self._k31_fold_min_m = _k31_sm107_fold_min_tokens(self._k31_fold_max_m)
+        self._k31_fold_w: Optional[torch.Tensor] = None
+        self._k31_fold_sizes: Optional[list[int]] = None
+        self._k31_fold_m_ranges: Optional[TGVMRanges] = None
         self.tp_size = get_parallel().tp_size
         # KDA is an attention layer: head-sharded params follow the
         # attention-TP group, matching the mamba state cache sizing. Under
@@ -1904,7 +2729,9 @@ class KimiK3DeltaAttention(nn.Module):
             # and f_a (128, replicated) in skews the output dim and degrades
             # GEMM kernel selection; they stay as separate tiny GEMVs. ROCm
             # reverses this below the token threshold
-            # (_merge_kda_inproj_weights_hip).
+            # (_merge_kda_inproj_weights_hip), and SM107 with an explicit TGV
+            # GEMM under SGLANG_K31_SM107_FUSE_KDA_INPROJ_MAX_TOKENS
+            # (_fold_kda_inproj_sm107).
             self.fused_qkvg_proj = MergedColumnParallelLinear(
                 self.hidden_size,
                 [
@@ -2189,20 +3016,77 @@ class KimiK3DeltaAttention(nn.Module):
             # their scales.
             if _is_hip and not _is_unquantized_mergeable([mod.weight for mod in mods]):
                 return
-            self._bfa_w, sizes = _merge_weights_as_views(mods, pad_rows_to=8)
+            if self._may_fold_kda_inproj_sm107():
+                sizes = self._fold_kda_inproj_sm107()
+            else:
+                self._bfa_w, sizes = _merge_weights_as_views(mods, pad_rows_to=8)
             self._bfa_f_b_w = self.f_b_proj.weight
         self._bfa_fa_size, self._bfa_b_size = sizes
         from sglang.srt.layers.quantization.unquant import get_bf16_gemm_backend
 
-        if _k31_gb300_tuning(self.config) and get_bf16_gemm_backend().is_cutedsl():
+        side_tables = None
+        if _k31_gb300_tuning(self.config):
+            side_tables = _K31_GB300_BFA_SIDE_TGV_M_RANGES
+        elif _k31_sm107_tuning(self.config):
+            smallm = _k31_sm107_smallm_ranges()
+            side_tables = _k31_sm107_tables()[1] if smallm is None else smallm[1]
+        if side_tables is not None and get_bf16_gemm_backend().is_cutedsl():
             from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import TGVMRanges
 
             m_ranges = TGVMRanges()
-            for m_lo, m_hi, tactic in _K31_GB300_BFA_SIDE_TGV_M_RANGES.get(
-                tuple(self._bfa_w.shape), ()
-            ):
+            for m_lo, m_hi, tactic in side_tables.get(tuple(self._bfa_w.shape), ()):
                 m_ranges.append(m_lo=m_lo, m_hi=m_hi, tactic=tactic)
             self._bfa_side_tgv_m_ranges = m_ranges
+
+    def _may_fold_kda_inproj_sm107(self) -> bool:
+        """Whether the SM107 KDA in-proj fold applies: the env is set (under
+        _k31_sm107_tuning), the bf16 GEMM backend is cutedsl, and the three
+        weights are plain 2-D bf16 tensors of one width (no scales to drop)."""
+        if not self._k31_fold_max_m or _is_hip or self._bfa_uses_block_fp8:
+            return False
+        from sglang.srt.layers.quantization.unquant import get_bf16_gemm_backend
+
+        if not get_bf16_gemm_backend().is_cutedsl():
+            return False
+        ws = [m.weight for m in (self.fused_qkvg_proj, self.f_a_proj, self.b_proj)]
+        if not all(
+            type(w.data) is torch.Tensor
+            and w.dim() == 2
+            and w.dtype == torch.bfloat16
+            and w.is_contiguous()
+            for w in ws
+        ):
+            return False
+        return len({w.shape[1] for w in ws}) == 1
+
+    def _fold_kda_inproj_sm107(self) -> list:
+        """[q,k,v,g | f_a | b | pad] as one buffer (module weights and _bfa_w
+        become views of it: the unfused paths above the fold's M read the same
+        bytes); returns [f_a rows, b rows] like _merge_weights_as_views."""
+        mods = [self.fused_qkvg_proj, self.f_a_proj, self.b_proj]
+        merged, sizes = _merge_weights_as_views(mods, pad_rows_to=8)
+        # [f_a | b | pad] tail: byte-identical to the [f_a | b] merge (the
+        # qkvg rows are a multiple of 8, so the pad is the same).
+        self._bfa_w = merged[sizes[0] :]
+        self._k31_fold_w = merged
+        self._k31_fold_sizes = [
+            *self.split_sizes,  # q,k,v then g
+            sizes[1],
+            sizes[2],
+            merged.shape[0] - sum(sizes),  # alignment pad
+        ]
+        from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import TGVMRanges
+
+        shape = tuple(merged.shape)
+        ranges = _k31_sm107_fold_ranges(
+            shape, self._k31_fold_max_m, self._k31_fold_min_m
+        )
+        m_ranges = TGVMRanges()
+        for m_lo, m_hi, tactic in ranges:
+            m_ranges.append(m_lo=m_lo, m_hi=m_hi, tactic=tactic)
+        self._k31_fold_m_ranges = m_ranges
+        _k31_sm107_log_fold(shape, self._k31_fold_max_m, ranges, self._k31_fold_min_m)
+        return sizes[1:]
 
     def _merge_kda_inproj_weights_hip(self) -> bool:
         """ROCm only: append the [f_a | b] tail to the wide [q,k,v,g] buffer so
@@ -2384,6 +3268,45 @@ class KimiK3DeltaAttention(nn.Module):
                 w = self._bfa_w
                 n_fa, n_b = self._bfa_fa_size, self._bfa_b_size
                 from sglang.kernels.ops.gemm import kimi_k3_tiny_gemm as gemm
+
+                m = hidden_states.shape[0]
+                if (
+                    self._k31_fold_w is not None
+                    and self.fused_qkvg_proj.weight.data_ptr()
+                    != self._k31_fold_w.data_ptr()
+                ):
+                    # Something repacked the in-proj after the fold (e.g. the
+                    # K31 verify plugin's own [q,k,v,g | f_a | b] buffer): drop
+                    # the stale buffer and keep the unfused path.
+                    logger.warning(
+                        "K3.1 SM107 KDA in-proj fold off for layer %d: the "
+                        "in-proj weights were repacked after the fold",
+                        self.layer_idx,
+                    )
+                    self._k31_fold_w = None
+                if (
+                    self._k31_fold_w is not None
+                    and get_is_capture_mode()
+                    and hidden_states.dim() == 2
+                    and hidden_states.stride(-1) == 1
+                    and m in self._k31_fold_m_ranges
+                ):
+                    # SM107 KDA in-proj fold: one TGV GEMM for [q,k,v,g | f_a | b]
+                    # (the side-stream [f_a | b] chain no longer trails qkvg).
+                    from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import (
+                        cutedsl_bf16_gemm,
+                    )
+
+                    fused_states = cutedsl_bf16_gemm(
+                        hidden_states,
+                        self._k31_fold_w,
+                        tactic=self._k31_fold_m_ranges(m),
+                    )
+                    qkv, g_proj_states, f_a, beta, _pad = torch.split(
+                        fused_states, self._k31_fold_sizes, dim=-1
+                    )
+                    forget_gate = f_a if defer_f_b else gemm(f_a, self._bfa_f_b_w)
+                    return qkv, beta, forget_gate, g_proj_states
 
                 if (
                     _is_hip
@@ -2679,7 +3602,9 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
             self._gate_pending_stream = None
             self._gate_alt_stream = gate_alt_stream
             self._gate_bs_limit = (
-                _k3_side_stream_max_tokens(config)
+                _k3_side_stream_max_tokens(
+                    config, envs.SGLANG_K31_SM107_GATE_SIDE_MAX_TOKENS
+                )
                 if self._gate_alt_stream is not None
                 else 0
             )
@@ -3052,6 +3977,8 @@ class KimiK3DecoderLayer(nn.Module):
             )
 
         self._ffn_writes_stream = _latent_moe_writes_stream(config, layer_idx)
+        # The stack's bank holder, which the prefill SP tail reads directly.
+        self._attn_bank = attn_bank
         self._declare_stages(config, layer_idx, attn_bank)
 
     def _declare_stages(self, config, layer_idx, attn_bank):
@@ -3134,6 +4061,71 @@ class KimiK3DecoderLayer(nn.Module):
 
         return result
 
+    @property
+    def prefill_sp_capable(self) -> bool:
+        """Whether this layer can run the prefill SP tail
+        (KimiK3LinearModel._prefill_sp_begin): a latent MoE layer on the
+        attention-residual bank whose FFN writes the next stream, with o_proj
+        writing its TP-partial output into K3's symmetric buffer."""
+        return (
+            self._is_moe_layer
+            and not self._sp_moe
+            and self.use_attn_residuals
+            and self._attn_bank is not None
+            and self._ffn_writes_stream
+            and self.all_reduce_fusion
+            and isinstance(self.mlp, KimiK3MoE)
+            and self.mlp.prefill_sp_capable
+        )
+
+    def forward_prefill_sp(
+        self,
+        stream: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        zero_allocator: BumpAllocator,
+        sp: _PrefillSP,
+    ) -> torch.Tensor:
+        """This layer on this rank's rows of the stream (the prefill SP tail):
+        the same reads, sums and adds as the stage boundaries' ordinary path
+        (bank read -> attention -> o_proj TP sum + residual add -> bank read ->
+        MoE writing the next stream), with each row-wise step on this rank's
+        rows only and the rows gathered for the attention and the MoE front.
+        ``stream`` and the result are this rank's ``[sp.local, H]`` rows."""
+        bank = self._attn_bank.require()
+        # Attention input: the bank aggregation of this rank's rows (a write
+        # layer snapshots them into the bank's next row, after which the
+        # running residual restarts empty), gathered.
+        normed, prefix = bank.forward(
+            stream,
+            None,
+            self.self_attention_res_proj,
+            self.self_attention_res_norm,
+            self.input_layernorm,
+            rows=sp.rows,
+            write=self.is_block_write_layer,
+        )
+        residual = None if self.is_block_write_layer else prefix
+        partial = self._run_self_attn(
+            sp.gather(normed), positions, forward_batch, zero_allocator
+        )
+        # o_proj's TP sum onto this rank's rows with the residual add, then the
+        # FFN input's bank aggregation of those rows.
+        prefix = sp.reduce_scatter(
+            sp.padded_rows(partial, k3_ar_fusion.ATTN_O_PROJ),
+            stream.new_empty((sp.local, stream.shape[1])),
+            residual,
+        )
+        normed, prefix = bank.forward(
+            prefix,
+            None,
+            self.mlp_res_proj,
+            self.mlp_res_norm,
+            self.post_attention_layernorm,
+            rows=sp.rows,
+        )
+        return self.mlp.forward_prefill_sp(normed, prefix, sp)
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -3162,6 +4154,8 @@ class KimiK3DecoderLayer(nn.Module):
                 # attention-TP size) would otherwise be routed: their stale
                 # contents pile onto a few experts that every rank then waits on.
                 valid_token_count = forward_batch.moe_num_token_non_padded()
+            from sglang.srt.layers.moe.mega_moe import _use_mega_moe_decode_tiles
+
             hidden_states = self.mlp(
                 hidden_states,
                 prefix_sum=(
@@ -3170,6 +4164,7 @@ class KimiK3DecoderLayer(nn.Module):
                     else None
                 ),
                 valid_token_count=valid_token_count,
+                mega_decode_tiles=_use_mega_moe_decode_tiles(forward_batch),
             )
         elif self._ffn_writes_stream:
             hidden_states = self.mlp(
@@ -3318,6 +4313,7 @@ class KimiK3LinearModel(nn.Module):
             device=device,
         )
 
+        sp = self._prefill_sp_begin(forward_batch, hidden_states)
         if self.attn_bank is not None:
             attn_res_block_num = _cdiv(self.end_layer, self.config.attn_res_block_size)
             # A later pipeline rank inherits the rows the earlier ones banked.
@@ -3326,7 +4322,17 @@ class KimiK3LinearModel(nn.Module):
                 if self.pp_group.is_first_rank
                 else pp_proxy_tensors["attn_res_bank"]
             )
-            self.attn_bank.open(hidden_states, attn_res_block_num, inherited)
+            if sp is not None and sp.padded != sp.num_tokens:
+                # The prefill SP tail banks padded rows; the replicated layers
+                # before it bank the leading num_tokens of the same storage.
+                bank = self.attn_bank.open(
+                    hidden_states[:1].expand(sp.padded, -1), attn_res_block_num
+                )
+                sp.bank_storage = bank.block_residual
+                sp.bank_storage[sp.num_tokens :].zero_()
+                bank.block_residual = sp.bank_storage[: sp.num_tokens]
+            else:
+                self.attn_bank.open(hidden_states, attn_res_block_num, inherited)
 
         packs_aux = self.packs_aux_hidden_states
         aux_hidden_states: AuxHiddenStateAccumulator = (
@@ -3356,24 +4362,35 @@ class KimiK3LinearModel(nn.Module):
                 )
         for i in range(self.start_layer, self.end_layer):
             with get_global_expert_distribution_recorder().with_current_layer(i):
-                hidden_states = self.layers[i](
-                    positions=positions,
-                    hidden_states=hidden_states,
-                    forward_batch=forward_batch,
-                    zero_allocator=zero_allocator,
-                    capture_gathered=(
-                        aux_hidden_states
-                        if captures_at_input and i - 1 in captures
-                        else None
-                    ),
-                )
+                if sp is not None and i >= sp.first_layer:
+                    if not sp.entered:
+                        hidden_states = self._prefill_sp_enter(
+                            hidden_states, forward_batch, sp
+                        )
+                    hidden_states = self.layers[i].forward_prefill_sp(
+                        hidden_states, positions, forward_batch, zero_allocator, sp
+                    )
+                else:
+                    hidden_states = self.layers[i](
+                        positions=positions,
+                        hidden_states=hidden_states,
+                        forward_batch=forward_batch,
+                        zero_allocator=zero_allocator,
+                        capture_gathered=(
+                            aux_hidden_states
+                            if captures_at_input and i - 1 in captures
+                            else None
+                        ),
+                    )
             if (
                 not captures_at_input
                 and i in captures
                 and (i + 1 < self.end_layer or self.pp_group.is_last_rank)
             ):
                 aux_hidden_states.append(
-                    self._dspark_capture_stream(i, hidden_states, forward_batch)
+                    self._prefill_sp_capture_stream(i, hidden_states, sp)
+                    if sp is not None and sp.entered
+                    else self._dspark_capture_stream(i, hidden_states, forward_batch)
                 )
 
         if not self.pp_group.is_last_rank:
@@ -3392,17 +4409,20 @@ class KimiK3LinearModel(nn.Module):
                 )
             return proxy_tensors
 
-        hidden_states = residual_batch.final_norm(
-            hidden_states,
-            forward_batch,
-            self._final_read,
-            capture=(
-                aux_hidden_states.capture
-                if captures_at_input and self.end_layer - 1 in captures
-                else None
-            ),
-            skip_empty=True,
-        )
+        if sp is not None and sp.entered:
+            hidden_states = self._prefill_sp_final_read(hidden_states, sp)
+        else:
+            hidden_states = residual_batch.final_norm(
+                hidden_states,
+                forward_batch,
+                self._final_read,
+                capture=(
+                    aux_hidden_states.capture
+                    if captures_at_input and self.end_layer - 1 in captures
+                    else None
+                ),
+                skip_empty=True,
+            )
         if self.attn_bank is not None:
             self.attn_bank.close()
 
@@ -3411,6 +4431,120 @@ class KimiK3LinearModel(nn.Module):
         if self.dspark_layers_to_capture is not None:
             return hidden_states, aux_hidden_states
         return hidden_states
+
+    @cached_property
+    def _prefill_sp_first_layer(self) -> Optional[int]:
+        """The first layer of the prefill SP tail, or None when this stack
+        cannot run it: one pipeline rank, plain TP (no attention DP / CP),
+        K3's fused all-reduce, the bank, and every layer from the first MoE
+        layer on able to (see KimiK3DecoderLayer.prefill_sp_capable). Read
+        after weight loading (the fused front is built there)."""
+        parallel = get_parallel()
+        if (
+            self.attn_bank is None
+            or self.alt_streams is None
+            or not (self.pp_group.is_first_rank and self.pp_group.is_last_rank)
+            or parallel.tp_size <= 1
+            or parallel.attn_tp_size != parallel.tp_size
+            or parallel.attn_cp_size != 1
+            or self._dp_attention
+            or not k3_ar_fusion.enabled()
+        ):
+            return None
+        layers = range(self.start_layer, self.end_layer)
+        first = next((i for i in layers if _is_moe_layer(self.config, i)), None)
+        if first is None or first == self.start_layer:
+            return None
+        if not all(
+            self.layers[i].prefill_sp_capable for i in range(first, self.end_layer)
+        ):
+            return None
+        return first
+
+    def _prefill_sp_begin(
+        self, forward_batch: ForwardBatch, hidden_states: torch.Tensor
+    ) -> Optional[_PrefillSP]:
+        """The prefill SP tail for this forward, or None for the replicated
+        layout: SGLANG_K31_PREFILL_SP_TAIL, an eager EXTEND batch (no CUDA
+        graph capture or breakable-graph replay, no CP) of at least
+        SGLANG_K31_PREFILL_SP_TAIL_MIN_TOKENS rows that fits K3's symmetric
+        buffers once padded to a multiple of 2 * tp. Decode, target verify and
+        draft passes never take it."""
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+
+        if (
+            not envs.SGLANG_K31_PREFILL_SP_TAIL.get()
+            or forward_batch.forward_mode != ForwardMode.EXTEND
+            or hidden_states.shape[0] < envs.SGLANG_K31_PREFILL_SP_TAIL_MIN_TOKENS.get()
+            or get_is_capture_mode()
+            or is_in_breakable_cuda_graph()
+            or is_cp_active(forward_batch)
+        ):
+            return None
+        first = self._prefill_sp_first_layer
+        if first is None:
+            return None
+        num_tokens = hidden_states.shape[0]
+        align = 2 * get_parallel().tp_size
+        padded = -(-num_tokens // align) * align
+        if padded > k3_ar_fusion.symm_buffer_max_rows():
+            return None
+        return _PrefillSP(num_tokens, padded, first)
+
+    def _prefill_sp_enter(
+        self, hidden_states, forward_batch: ForwardBatch, sp: _PrefillSP
+    ) -> torch.Tensor:
+        """Hand the replicated layers' output to the prefill SP tail: fold the
+        last FFN's output into the stream (as a pipeline handoff does), close
+        the residual stream, move the bank onto its padded storage and keep
+        this rank's rows of the stream."""
+        stream = residual_batch.fold(hidden_states, forward_batch)
+        residual_batch.clear(forward_batch)
+        sp.entered = True
+        if sp.bank_storage is not None:
+            self.attn_bank.require().block_residual = sp.bank_storage
+        start, stop = sp.rows.start, min(sp.rows.stop, sp.num_tokens)
+        if stop - start == sp.local:
+            return stream[sp.rows]
+        local = stream.new_zeros((sp.local, stream.shape[1]))
+        if stop > start:
+            local[: stop - start].copy_(stream[start:stop])
+        return local
+
+    def _prefill_sp_capture_stream(
+        self, layer_idx: int, stream: torch.Tensor, sp: _PrefillSP
+    ) -> torch.Tensor:
+        """_dspark_capture_stream for the prefill SP tail: the pre-norm
+        mixture on this rank's rows, gathered into owned storage."""
+        if layer_idx + 1 < self.end_layer:
+            next_layer = self.layers[layer_idx + 1]
+            score_proj = next_layer.self_attention_res_proj
+            score_norm = next_layer.self_attention_res_norm
+            nvb = next_layer.prev_valid_blocks
+        else:
+            score_proj = self.output_attn_res_proj
+            score_norm = self.output_attn_res_norm
+            nvb = _cdiv(self.end_layer, self.config.attn_res_block_size)
+        bank = self.attn_bank.require()
+        mixed = aggregate_stream(
+            stream, bank.block_residual[sp.rows], nvb, score_proj, score_norm
+        )
+        return sp.gather(mixed, owned=True)
+
+    def _prefill_sp_final_read(
+        self, stream: torch.Tensor, sp: _PrefillSP
+    ) -> torch.Tensor:
+        """The terminal bank read (AttnBankOutputRead) on this rank's rows,
+        gathered into owned storage."""
+        normed, _ = self.attn_bank.require().forward(
+            stream,
+            None,
+            self.output_attn_res_proj,
+            self.output_attn_res_norm,
+            self.norm,
+            rows=sp.rows,
+        )
+        return sp.gather(normed, owned=True)
 
     @property
     def packs_aux_hidden_states(self) -> bool:
@@ -3490,9 +4624,16 @@ class KimiK3LinearForCausalLM(nn.Module):
                 register_tgv_m_ranges,
             )
 
-            register_tgv_m_ranges(_K31_TGV_M_RANGES)
-            if _k31_gb300_tuning(config):
-                register_tgv_m_ranges(_K31_GB300_TGV_M_RANGES)
+            smallm = _k31_sm107_smallm_ranges() if _k31_sm107_tuning(config) else None
+            if smallm is not None:
+                # generic + SM107 ranges with the small-M rows carved in
+                register_tgv_m_ranges(smallm[0])
+            else:
+                register_tgv_m_ranges(_K31_TGV_M_RANGES)
+                if _k31_gb300_tuning(config):
+                    register_tgv_m_ranges(_K31_GB300_TGV_M_RANGES)
+                elif _k31_sm107_tuning(config):
+                    register_tgv_m_ranges(_k31_sm107_tables()[0])
         if quant_config is not None:
             if isinstance(quant_config, ModelSlimConfig):
                 model_mapping = {

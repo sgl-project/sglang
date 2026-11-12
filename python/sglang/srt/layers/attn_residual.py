@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
+# _combine_kernel_rt is the run-time-depth combine kernel of sgl-project/sglang
+# pull request #32541 (Apache-2.0).
 # Kimi-K3 Attention Residual: snapshot bank + aggregation.
 #
 # The public API is the AttnResidual class (constructed once per forward pass).
@@ -22,6 +24,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.utils import is_cuda, is_hip, is_npu
@@ -210,6 +213,53 @@ def _combine_kernel(
     )
 
 
+@triton.jit
+def _combine_kernel_rt(
+    prefix_ptr,
+    bank_ptr,
+    scores_ptr,  # [T, MAX_ROWS] fp32
+    out_ptr,  # [T, H]
+    NVB,
+    stride_pm,
+    stride_bm,
+    stride_bb,
+    stride_sm,
+    stride_om,
+    BLOCK_H: tl.constexpr,
+    MAX_ROWS: tl.constexpr,
+):
+    """_combine_kernel with NVB a run-time value (one compile serves every
+    bank depth); taken under SGLANG_K31_PF_ATTN_RES_TILED."""
+    pid_t = tl.program_id(0).to(tl.int64)  # pid_t * stride_bm overflows int32
+    pid_h = tl.program_id(1)
+    h0 = pid_h * BLOCK_H
+
+    offs_b = tl.arange(0, MAX_ROWS)
+    mask_b = offs_b <= NVB
+    raw = tl.load(
+        scores_ptr + pid_t * stride_sm + offs_b, mask=mask_b, other=float("-inf")
+    )
+    m = tl.max(raw, axis=0)
+    e = tl.where(mask_b, tl.exp(raw - m), 0.0)
+    p = e / tl.sum(e, axis=0)
+
+    offs_h = h0 + tl.arange(0, BLOCK_H)
+    acc = tl.zeros([BLOCK_H], tl.float32)
+    for j in range(0, NVB + 1):
+        if j < NVB:
+            v = tl.load(bank_ptr + pid_t * stride_bm + j * stride_bb + offs_h).to(
+                tl.float32
+            )
+        else:
+            v = tl.load(prefix_ptr + pid_t * stride_pm + offs_h).to(tl.float32)
+        p_j = tl.sum(tl.where(offs_b == j, p, 0.0), axis=0)
+        acc += p_j * v
+    tl.store(
+        out_ptr + pid_t * stride_om + offs_h,
+        acc.to(out_ptr.dtype.element_ty),
+    )
+
+
 def _mix_fused(
     prefix_sum: torch.Tensor,
     bank: torch.Tensor,
@@ -233,6 +283,9 @@ def _mix_fused(
             score_norm.variance_epsilon,
         )
     n_h_blocks = H // _BLOCK_H
+    # SGLANG_K31_PF_ATTN_RES_TILED: score rows in _BLOCK_H tiles (H % _BLOCK_H
+    # == 0 here, so the tile masks are all true) and combine with run-time nvb.
+    tiled = envs.SGLANG_K31_PF_ATTN_RES_TILED.get()
 
     # Step 1: score each row (2D grid, full row-parallelism)
     scores = torch.empty((T, _MAX_ROWS), dtype=torch.float32, device=prefix_sum.device)
@@ -248,13 +301,14 @@ def _mix_fused(
         bank.stride(1),
         scores.stride(0),
         H=H,
-        BLOCK_H=min(triton.next_power_of_2(H), 8192),
+        BLOCK_H=_BLOCK_H if tiled else min(triton.next_power_of_2(H), 8192),
         num_warps=8,
     )
 
     # Step 2: softmax + weighted sum (2D grid, full H-parallelism)
     out = torch.empty_like(prefix_sum)
-    _combine_kernel[(T, n_h_blocks)](
+    combine = _combine_kernel_rt if tiled else _combine_kernel
+    combine[(T, n_h_blocks)](
         prefix_sum,
         bank,
         scores,

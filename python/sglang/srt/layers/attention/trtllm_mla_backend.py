@@ -1,11 +1,16 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the SGLang project
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 """
 Support attention backend for TRTLLM MLA kernels from flashinfer.
 """
 
 from __future__ import annotations
 
+import importlib
 import logging
 import math
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional, Union
 
@@ -104,6 +109,112 @@ DEFAULT_WORKSPACE_SIZE_MB = envs.SGLANG_TRTLLM_MLA_WORKSPACE_MB.get()
 TRTLLM_BLOCK_CONSTRAINT = 128
 
 TRTLLM_MLA_MAX_BATCH_SIZE = 8192
+
+# K31HT_DRAFT_DCP1_TILE default tail bound (rows): the measured multi-CTA
+# region of the 12-head window kernel (<= 96 rows).
+_DRAFT_TILE_TAIL_MAX = 96
+
+
+def draft_window_tile_config(device) -> Optional[tuple[int, int]]:
+    """K31HT_DRAFT_DCP1_TILE (default off = stock; needs K31HT_DRAFT_DCP1=1):
+    '1' = (SM count, 96); 'W,T' = explicit (wave rows, tail max). Applies to
+    the draft's window calls at DCP 1 only (see window_row_tiles)."""
+    raw = os.environ.get("K31HT_DRAFT_DCP1_TILE", "0").strip()
+    if raw in ("", "0"):
+        return None
+    if os.environ.get("K31HT_DRAFT_DCP1", "0").strip() != "1":
+        raise ValueError("K31HT_DRAFT_DCP1_TILE needs K31HT_DRAFT_DCP1=1")
+    if raw == "1":
+        props = torch.cuda.get_device_properties(torch.device(device))
+        return props.multi_processor_count, _DRAFT_TILE_TAIL_MAX
+    try:
+        wave, tail = (int(x) for x in raw.split(","))
+    except ValueError:
+        raise ValueError(
+            f"K31HT_DRAFT_DCP1_TILE={raw!r}: expected 0, 1 or 'WAVE,TAIL'"
+        ) from None
+    if wave <= 0 or tail < 0:
+        raise ValueError(f"K31HT_DRAFT_DCP1_TILE={raw!r}: need WAVE > 0, TAIL >= 0")
+    return wave, tail
+
+
+# K31HT_DRAFT_DENSE_IMPL -> (kernel module, K31HT_DRAFT_DENSE_CFG keys). 'cute' is
+# the hand-written CuTe DSL form; it needs q_len x heads <= 128.
+_DRAFT_DENSE_IMPLS = {
+    "cute": (
+        "sglang.kernels.ops.attention.mla_window_dense_cute",
+        ("SPLIT", "RED", "MASKALL", "SKIP_CORR", "PERSISTENT"),
+    ),
+}
+
+
+def draft_window_dense_impl() -> str:
+    """K31HT_DRAFT_DENSE_IMPL: 'cute' (default and only form)."""
+    raw = os.environ.get("K31HT_DRAFT_DENSE_IMPL", "cute").strip() or "cute"
+    if raw not in _DRAFT_DENSE_IMPLS:
+        raise ValueError(f"K31HT_DRAFT_DENSE_IMPL={raw!r}: expected cute")
+    return raw
+
+
+def draft_window_dense_config() -> Optional[dict]:
+    """K31HT_DRAFT_DENSE (default off = stock; needs K31HT_DRAFT_DCP1=1): the
+    draft's DCP-1 sliding-window call runs the exact dense per-request kernel
+    (K31HT_DRAFT_DENSE_IMPL: one CTA group per request, its rows x heads packed
+    into one MMA tile, the window read once) instead of the per-row trtllm-gen
+    sparse call. Same window semantics; not bitwise (FP64 error class).
+    K31HT_DRAFT_DENSE_CFG='KEY=INT,...' overrides the kernel form (keys: SPLIT RED
+    MASKALL SKIP_CORR PERSISTENT)."""
+    raw = os.environ.get("K31HT_DRAFT_DENSE", "0").strip()
+    if raw in ("", "0"):
+        return None
+    if raw != "1":
+        raise ValueError(f"K31HT_DRAFT_DENSE={raw!r}: expected 0 or 1")
+    if os.environ.get("K31HT_DRAFT_DCP1", "0").strip() != "1":
+        raise ValueError("K31HT_DRAFT_DENSE needs K31HT_DRAFT_DCP1=1")
+    impl = draft_window_dense_impl()
+    cfg = {}
+    spec = os.environ.get("K31HT_DRAFT_DENSE_CFG", "").strip()
+    for item in filter(None, (s.strip() for s in spec.split(","))):
+        key, _, val = item.partition("=")
+        if key not in _DRAFT_DENSE_IMPLS[impl][1]:
+            raise ValueError(f"K31HT_DRAFT_DENSE_CFG: unknown key {key!r} for {impl}")
+        try:
+            cfg[key] = int(val)
+        except ValueError:
+            raise ValueError(f"K31HT_DRAFT_DENSE_CFG: {item!r} needs an int") from None
+    return cfg
+
+
+# SGLANG_K31_DRAFT_SWA_INPLACE_Q (default off): a sliding-window MLA layer
+# whose query head count has no trtllm-gen kernel (64 < heads < 128, the 96-head
+# DFlash draft under DCP8) gets its FP8 query from RopeQuantize written straight
+# into a persistent 128-head buffer whose pad heads were zeroed once, instead of
+# new_zeros + a strided copy per layer; under the a2a / fi_a2a DCP reduce its
+# 96-head partials go to the pack as a strided view instead of a .contiguous()
+# copy.
+_DRAFT_SWA_INPLACE_Q_ENV = "SGLANG_K31_DRAFT_SWA_INPLACE_Q"
+_TRTLLM_GEN_MLA_PAD_HEADS = 128
+_draft_swa_engaged_logged = False
+
+
+def draft_swa_inplace_q_requested() -> bool:
+    return os.environ.get(_DRAFT_SWA_INPLACE_Q_ENV, "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def make_draft_swa_q_pad_buffer(
+    rows: int, head_dim: int, device, heads: int = _TRTLLM_GEN_MLA_PAD_HEADS
+) -> torch.Tensor:
+    """[rows, heads, head_dim] FP8, all bytes zero (FP8 +0.0, what new_zeros
+    writes). Only the live heads' slice is ever written, so the pad heads stay
+    zero for the process's lifetime."""
+    return torch.zeros((rows, heads, head_dim), dtype=torch.uint8, device=device).view(
+        torch.float8_e4m3fn
+    )
 
 
 def _multi_ctas_kv_counter_bytes(
@@ -323,6 +434,19 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         self._window_index_cache = None
         self._window_counter_buffer = None
         self._window_row_indptr = None
+        self._window_row_tile = draft_window_tile_config(self.device)
+        self._window_last_tiles = None
+        self._window_tile_logged = set()
+        self._window_dense = draft_window_dense_config()
+        self._window_dense_logged = set()
+        self._window_dense_impl = (
+            draft_window_dense_impl() if self._window_dense is not None else "cute"
+        )
+        self._window_dense_decided = {}
+        # SGLANG_K31_DRAFT_SWA_INPLACE_Q: persistent zero-padded FP8 query buffer
+        # and whether the DCP window path returns strided partials.
+        self._swa_q_pad = None
+        self._swa_strided_partials = False
 
         self._megakernel = megakernel_enabled()
         # A compact draft req_to_token holds the committed suffix at [0, seq_len)
@@ -355,6 +479,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             self._window_row_indptr = torch.arange(
                 max_rows + 1, dtype=torch.int32, device=self.device
             )
+            self._init_draft_swa_inplace_q(max_rows)
         self.dense_q_indptr_verify = (
             self.q_indptr_decode * self.num_draft_tokens
             if self.num_draft_tokens
@@ -1478,6 +1603,100 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         )
         return output.flatten(1), lse
 
+    def _init_draft_swa_inplace_q(self, max_rows: int) -> None:
+        """SGLANG_K31_DRAFT_SWA_INPLACE_Q=1:
+        Allocates, outside any graph capture, the FP8 [max_rows, 128, 576]
+        query buffer shared by every sliding-window layer of this process
+        (layers run one after another on one stream)."""
+        if not draft_swa_inplace_q_requested():
+            return
+        heads = self.num_decode_q_heads
+        parallel = get_parallel()
+        reason = None
+        if self.data_type != torch.float8_e4m3fn:
+            reason = f"KV cache dtype {self.data_type} is not FP8"
+        elif not (64 < heads < _TRTLLM_GEN_MLA_PAD_HEADS):
+            reason = f"{heads} query heads need no head padding"
+        if reason is not None:
+            logger.info(
+                "Draft SWA in-place q off (%s=1): %s",
+                _DRAFT_SWA_INPLACE_Q_ENV,
+                reason,
+            )
+            return
+        head_dim = self.kv_cache_dim
+        self._swa_q_pad = get_buffer(
+            f"draft_swa_q_pad_{max_rows}x{_TRTLLM_GEN_MLA_PAD_HEADS}x{head_dim}",
+            lambda: make_draft_swa_q_pad_buffer(
+                max_rows, head_dim, torch.device(self.device)
+            ),
+        )
+        self._swa_strided_partials = parallel.dcp_enabled and (
+            parallel.dcp_comm_backend in ("a2a", "fi_a2a")
+        )
+        logger.info(
+            "Draft SWA in-place q on (%s=1): FP8 q "
+            "buffer %d rows x %d heads x %d (%.1f MiB, pad heads zeroed once) for "
+            "%d live heads; strided DCP partials %s (dcp_comm_backend=%s)",
+            _DRAFT_SWA_INPLACE_Q_ENV,
+            max_rows,
+            _TRTLLM_GEN_MLA_PAD_HEADS,
+            head_dim,
+            self._swa_q_pad.numel() / 2**20,
+            heads,
+            "on" if self._swa_strided_partials else "off",
+            parallel.dcp_comm_backend if parallel.dcp_enabled else "none",
+        )
+
+    def _draft_swa_q_out(
+        self, layer: RadixAttention, q_rope: torch.Tensor
+    ) -> Optional[torch.Tensor]:
+        """The live-head slice [rows, heads, 576] of the persistent padded
+        buffer for RopeQuantize to write into, or None (today's path)."""
+        buf = self._swa_q_pad
+        if buf is None or layer.sliding_window_size < 0 or q_rope.dim() != 3:
+            return None
+        rows, heads = q_rope.shape[0], q_rope.shape[1]
+        if (
+            heads != layer.tp_q_head_num
+            or not (64 < heads < buf.shape[1])
+            or layer.head_dim != buf.shape[2]
+            or not (0 < rows <= buf.shape[0])
+        ):
+            return None
+        return buf[:rows, :heads]
+
+    def _draft_swa_padded_query(
+        self, query: torch.Tensor, rows: int, kernel_heads: int
+    ) -> Optional[torch.Tensor]:
+        """The padded [rows, 1, 128, 576] kernel query when ``query`` is the
+        buffer view _draft_swa_q_out handed out (so RopeQuantize already wrote
+        it in place), else None."""
+        global _draft_swa_engaged_logged
+        buf = self._swa_q_pad
+        if (
+            buf is None
+            or kernel_heads != buf.shape[1]
+            or rows > buf.shape[0]
+            or query.dtype != buf.dtype
+            or query.data_ptr() != buf.data_ptr()
+            or query.shape[3] != buf.shape[2]
+            or query.stride(0) != buf.stride(0)
+            or query.stride(2) != buf.stride(1)
+            or query.stride(3) != 1
+        ):
+            return None
+        if not _draft_swa_engaged_logged:
+            _draft_swa_engaged_logged = True
+            logger.info(
+                "Draft SWA in-place q engaged: "
+                "rows=%d heads=%d->%d, no pad memset/copy",
+                rows,
+                query.shape[2],
+                kernel_heads,
+            )
+        return buf[:rows].unsqueeze(1)
+
     def _window_sparse_indices(
         self, layer: RadixAttention, forward_batch: ForwardBatch
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -1523,6 +1742,84 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         window_left = min(layer.sliding_window_size, self._compact_draft_window)
         return local.reshape(-1), window_left
 
+    def _window_dense_module(self):
+        """The K31HT_DRAFT_DENSE_IMPL kernel module, imported once."""
+        mod = getattr(self, "_window_dense_mod", None)
+        if mod is None:
+            impl = getattr(self, "_window_dense_impl", "cute")
+            mod = importlib.import_module(_DRAFT_DENSE_IMPLS[impl][0])
+            self._window_dense_mod = mod
+        return mod
+
+    def _window_dense_engage(
+        self, bs: int, q_len: int, heads: int, window_left: int, device
+    ) -> bool:
+        """Whether the dense kernel takes this window call: every shape the cute
+        form supports (q_len x heads <= 128). Decided once per (bs, q_len), so a
+        CUDA graph captures one fixed choice and every rank of a group with the
+        same bs decides alike."""
+        decided = getattr(self, "_window_dense_decided", None)
+        if decided is None:
+            decided = self._window_dense_decided = {}
+        key = (bs, q_len)
+        if key in decided:
+            return decided[key]
+        impl = getattr(self, "_window_dense_impl", "cute")
+        if impl == "cute" and q_len * heads > 128:
+            decided[key] = False
+            logger.info(
+                "K31HT_DRAFT_DENSE declined: %d rows (%d req x %d): impl cute "
+                "needs q_len x heads <= 128 (%d heads)",
+                bs * q_len,
+                bs,
+                q_len,
+                heads,
+            )
+            return False
+        decided[key] = True
+        return True
+
+    def _forward_sliding_window_dense(
+        self,
+        q: torch.Tensor,
+        kv_cache: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        cfg: dict,
+    ) -> torch.Tensor:
+        """K31HT_DRAFT_DENSE: the DCP-1 window layer through the exact dense
+        per-request kernel. Same keys per row as _window_sparse_indices at
+        dcp_size 1 with the draft ring: [max(p - window, 0, min_pos), p]."""
+        bs, q_len, heads, head_dim = q.shape
+        rows = bs * q_len
+        ring = self._draft_runner.draft_kv_ring if self._draft_runner else None
+        if ring is None:
+            raise RuntimeError("K31HT_DRAFT_DENSE needs the DFLASH draft KV ring")
+        out = self._window_dense_module().dense_window_mla(
+            q.reshape(rows, heads, head_dim),
+            kv_cache,
+            forward_batch.positions,
+            forward_batch.req_pool_indices,
+            window_left=layer.sliding_window_size,
+            ring_rows_per_req=ring.rows_per_req,
+            sm_scale=self._compute_decode_bmm1_scale(layer),
+            min_pos=ring.min_pos,
+            cfg=cfg,
+        )
+        if rows not in self._window_dense_logged:
+            self._window_dense_logged.add(rows)
+            logger.info(
+                "K31HT_DRAFT_DENSE engaged: %d rows (%d req x %d), %d heads, cfg %s, "
+                "impl %s",
+                rows,
+                bs,
+                q_len,
+                heads,
+                cfg or "default",
+                getattr(self, "_window_dense_impl", "cute"),
+            )
+        return out.reshape(rows, -1)
+
     def _forward_sliding_window(
         self,
         q: torch.Tensor,
@@ -1538,6 +1835,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         merge, like the dense DCP path."""
         from sglang.srt.layers.attention.dsa.dsa_dcp import (
             dcp_trtllm_sparse_attention,
+            window_row_tiles,
         )
 
         bs, q_len, heads, head_dim = q.shape
@@ -1550,19 +1848,42 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                 q.reshape(rows, heads, head_dim), layer
             )
             return (out, lse) if get_parallel().dcp_enabled else out
+        if (
+            getattr(self, "_window_dense", None) is not None
+            and rows > 0
+            and not get_parallel().dcp_enabled
+            and self._window_dense_engage(
+                bs, q_len, heads, layer.sliding_window_size, q.device
+            )
+        ):
+            return self._forward_sliding_window_dense(
+                q, kv_cache, layer, forward_batch, self._window_dense
+            )
         indices, counts = self._window_sparse_indices(layer, forward_batch)
         # trtllm-gen MLA has no 64 < heads < 128 variant (96-head draft under DCP8).
         kernel_heads = 128 if 64 < heads < 128 else heads
         query = q.reshape(rows, 1, heads, head_dim)
         if kernel_heads != heads:
-            padded = query.new_zeros((rows, 1, kernel_heads, head_dim))
-            padded[:, :, :heads].copy_(query)
+            padded = self._draft_swa_padded_query(query, rows, kernel_heads)
+            if padded is None:
+                padded = query.new_zeros((rows, 1, kernel_heads, head_dim))
+                padded[:, :, :heads].copy_(query)
             query = padded
+        _k31ht_row_tiles = None
+        if getattr(self, "_window_row_tile", None) is not None and not get_parallel().dcp_enabled:
+            _k31ht_row_tiles = window_row_tiles(rows, *self._window_row_tile)
+            if len(_k31ht_row_tiles) > 1 and rows not in self._window_tile_logged:
+                self._window_tile_logged.add(rows)
+                logger.info(
+                    "K31HT_DRAFT_DCP1_TILE engaged: %d rows -> %s", rows, _k31ht_row_tiles
+                )
+            self._window_last_tiles = _k31ht_row_tiles
         out, lse = dcp_trtllm_sparse_attention(
             query=query,
             block_tables=indices.unsqueeze(1),
             seq_lens=counts,
             cu_seqlens_q=self._window_row_indptr[: rows + 1],
+            row_tiles=_k31ht_row_tiles,
             kv_cache=kv_cache,
             workspace_buffer=self.workspace_buffer,
             qk_nope_head_dim=self.qk_nope_head_dim,
@@ -1582,6 +1903,13 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         lse = lse[:, :heads]
         if self.dcp_lse_base_on_e:
             lse = lse * math.log(2.0)  # -inf rows (no owned key) stay -inf
+        if self._swa_strided_partials and kernel_heads != heads:
+            # The a2a / fi_a2a pack reads [rows, heads, 512] partials and the
+            # LSE through their strides (dcp_pack_a2a_send), and forward_mla
+            # skips its .contiguous() for sliding-window layers under the same
+            # flag: hand over views, not copies. flatten(1) is a view here (the
+            # head stride equals the head size).
+            return out.flatten(1), lse
         return out.contiguous().flatten(1), lse.contiguous()
 
     def forward_extend(
@@ -1681,6 +2009,11 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                     is_neox,
                     self.kv_lora_rank,
                     self.qk_rope_head_dim,
+                    q_out=(
+                        self._draft_swa_q_out(layer, q_rope)
+                        if self._swa_q_pad is not None
+                        else None
+                    ),
                 )
             merge_query = False
 

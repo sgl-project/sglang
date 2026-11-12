@@ -1,4 +1,5 @@
 # Copyright 2025 SGLang Team
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
@@ -107,6 +108,31 @@ def mamba2_state_dtype(config=None) -> Mamba2StateDType:
     return Mamba2StateDType(conv=conv_dtype, temporal=ssm_dtype)
 
 
+_KDA_REPLAY_RECORD_DTYPES = {
+    "float32": torch.float32,
+    "bfloat16": torch.bfloat16,
+    "float16": torch.float16,
+}
+
+
+def kda_replay_record_dtype(default_dtype: torch.dtype) -> torch.dtype:
+    """Dtype of the KDA ReplaySSM spec-verify records (rawv, rawk, d, k).
+
+    Unset SGLANG_KDA_REPLAY_RECORD_DTYPE returns `default_dtype` (the activation
+    dtype the callers pass). Set, the records take that dtype while the SSM state
+    keeps its own; g/beta are fp32 regardless.
+    """
+    name = envs.SGLANG_KDA_REPLAY_RECORD_DTYPE.get()
+    if name is None or name == "":
+        return default_dtype
+    if name not in _KDA_REPLAY_RECORD_DTYPES:
+        raise ValueError(
+            f"SGLANG_KDA_REPLAY_RECORD_DTYPE={name!r}: must be one of "
+            f"{list(_KDA_REPLAY_RECORD_DTYPES)} or unset"
+        )
+    return _KDA_REPLAY_RECORD_DTYPES[name]
+
+
 @dataclass(kw_only=True, frozen=True)
 class BaseLinearStateParams(ABC):
     dtype: Mamba2StateDType = field(default_factory=lambda: mamba2_state_dtype(None))
@@ -135,13 +161,15 @@ class BaseLinearStateParams(ABC):
         conv_b = self.dtype.conv.itemsize
         fp32_b = 4
         if self.is_kda:
+            # Must match MambaPool's KDA ring allocation.
+            rec_b = kda_replay_record_dtype(self.dtype.conv).itemsize
             per_layer = (
-                hv * record_len * v_dim * conv_b  # rawv
-                + h_k * record_len * k_dim * conv_b  # rawk
+                hv * record_len * v_dim * rec_b  # rawv
+                + h_k * record_len * k_dim * rec_b  # rawk
                 + hv * record_len * fp32_b  # beta
                 + hv * record_len * k_dim * fp32_b  # vector g
-                + hv * record_len * v_dim * conv_b  # d
-                + h_k * record_len * k_dim * conv_b  # k
+                + hv * record_len * v_dim * rec_b  # d
+                + h_k * record_len * k_dim * rec_b  # k
             )
         else:
             per_layer = (

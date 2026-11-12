@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright contributors to the SGLang project
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 // Exact global top-k merge for DSA decode context parallelism (DCP), one CTA per
 // row. Ranks exchange their best kCandK local candidates over NVLink multicast
 // and select the k-th key t* among them. A rank whose candidates all reach t*
@@ -246,6 +249,58 @@ SGL_DEVICE uint64_t fallback_kth(
   return select_kth(visit, min(n, kTopK), s);
 }
 
+// fallback_kth for at most two failed ranks without the union scratch: the
+// failed ranks' full local top-k (polled into registers) and the candidates of
+// every other rank, selected in registers.
+template <int kNumRanks, int kTopK, int kCandK>
+SGL_DEVICE uint64_t fallback_kth_regs(
+    const Params& p, unsigned fail, int64_t full_off, uint64_t tag, const uint64_t (&cand)[kCandK / 32], Smem& s) {
+  constexpr int kThreads = 32 * kNumRanks;
+  constexpr int kPerThread = kTopK / kThreads;
+  constexpr int kPerLane = kCandK / 32;
+  const int tid = threadIdx.x, warp = tid / 32;
+  const int q0 = __ffs(fail) - 1;
+  const unsigned rest = fail & (fail - 1);
+  const int q1 = rest ? __ffs(rest) - 1 : q0;
+  const auto* src0 = reinterpret_cast<const uint64_t*>(p.peer_ptrs[q0]) + full_off + tid;
+  const auto* src1 = reinterpret_cast<const uint64_t*>(p.peer_ptrs[q1]) + full_off + tid;
+  uint64_t f0[kPerThread], f1[kPerThread];
+  unsigned pending = rest ? 0xFFFFFFFFu >> (32 - 2 * kPerThread) : 0xFFFFFFFFu >> (32 - kPerThread);
+  while (pending) {
+#pragma unroll
+    for (int j = 0; j < kPerThread; ++j) {
+      if (pending >> j & 1) f0[j] = device::ptx::load_relaxed_sys(src0 + j * kThreads);
+      if (pending >> (kPerThread + j) & 1) f1[j] = device::ptx::load_relaxed_sys(src1 + j * kThreads);
+    }
+#pragma unroll
+    for (int j = 0; j < kPerThread; ++j) {
+      if ((f0[j] & 255) == tag) pending &= ~(1u << j);
+      if ((f1[j] & 255) == tag) pending &= ~(1u << (kPerThread + j));
+    }
+  }
+#pragma unroll
+  for (int j = 0; j < kPerThread; ++j) {
+    f0[j] = entry_key(f0[j]);
+    f1[j] = rest ? entry_key(f1[j]) : 0;
+  }
+  const bool drop = fail >> warp & 1;
+  auto visit = [&](auto f) {
+#pragma unroll
+    for (int i = 0; i < kPerLane; ++i)
+      f(drop ? uint64_t{0} : cand[i]);
+#pragma unroll
+    for (int j = 0; j < kPerThread; ++j)
+      f(f0[j]);
+#pragma unroll
+    for (int j = 0; j < kPerThread; ++j)
+      f(f1[j]);
+  };
+  int mine = 0, n;
+  visit([&](uint64_t k) { mine += k != 0; });
+  block_exclusive_sum<kNumRanks>(mine, n, s);
+  return select_kth(visit, min(n, kTopK), s);
+}
+
 // Keys of rank q among the first L positions under the token interleave.
 template <int kNumRanks>
 SGL_DEVICE int local_len(int L, int q) {
@@ -254,7 +309,11 @@ SGL_DEVICE int local_len(int L, int q) {
 
 // Buffer layout (uint64_t entries): [2 parities][max_rows][kNumRanks * kCandK + kTopK],
 // the candidate block of every rank, then this rank's full local top-k.
-template <int kNumRanks, int kTopK, int kCandK>
+// kStaged (SGLANG_K31_DCP_MERGE_STAGED=1, default off):
+// stage the candidate push in smem and store it coalesced, store the own full
+// top-k after the push, and take the register fallback for <= 2 failed ranks.
+// Same keys, same threshold, same output.
+template <int kNumRanks, int kTopK, int kCandK, bool kStaged = false>
 __global__ void __launch_bounds__(32 * kNumRanks) merge_kernel(const __grid_constant__ Params p) {
   static_assert(kNumRanks == 8 || kNumRanks == 16, "one warp per rank: 8 or 16 ranks");
   constexpr int kThreads = 32 * kNumRanks;
@@ -279,7 +338,9 @@ __global__ void __launch_bounds__(32 * kNumRanks) merge_kernel(const __grid_cons
     v[i] = p.candidates[static_cast<int64_t>(row) * kTopK + tid + i * kThreads];
     own[i] = make_topk_key(v[i].x, v[i].y);
     n_valid += own[i] != 0;
-    device::ptx::store_relaxed_sys(p.buffer + full_off + tid + i * kThreads, pack_entry(v[i].x, v[i].y, tag));
+    if constexpr (!kStaged) {
+      device::ptx::store_relaxed_sys(p.buffer + full_off + tid + i * kThreads, pack_entry(v[i].x, v[i].y, tag));
+    }
   }
   block_exclusive_sum<kNumRanks>(n_valid, n_own, s);
 
@@ -287,11 +348,26 @@ __global__ void __launch_bounds__(32 * kNumRanks) merge_kernel(const __grid_cons
   bool sel[kPerThread];
   select_at_least(own, select_kth(visit_keys(own), min(n_own, kCandK), s), sel);
   uint64_t* const dst = p.multicast_ptr + base + static_cast<int64_t>(p.dcp_rank) * kCandK;
-  compact<kCandK, kThreads>(
-      sel,
-      [&](int e, int i) { device::ptx::multimem_store_relaxed(dst + e, pack_entry(v[i].x, v[i].y, tag)); },
-      [&](int e) { device::ptx::multimem_store_relaxed(dst + e, pack_entry(0, -1, tag)); },
-      s);
+  if constexpr (kStaged) {
+    __shared__ uint64_t stage[kCandK];
+    compact<kCandK, kThreads>(
+        sel,
+        [&](int e, int i) { stage[e] = pack_entry(v[i].x, v[i].y, tag); },
+        [&](int e) { stage[e] = pack_entry(0, -1, tag); },
+        s);
+    __syncthreads();
+    for (int e = tid; e < kCandK; e += kThreads)
+      device::ptx::multimem_store_relaxed(dst + e, stage[e]);
+#pragma unroll
+    for (int i = 0; i < kPerThread; ++i)
+      device::ptx::store_relaxed_sys(p.buffer + full_off + tid + i * kThreads, pack_entry(v[i].x, v[i].y, tag));
+  } else {
+    compact<kCandK, kThreads>(
+        sel,
+        [&](int e, int i) { device::ptx::multimem_store_relaxed(dst + e, pack_entry(v[i].x, v[i].y, tag)); },
+        [&](int e) { device::ptx::multimem_store_relaxed(dst + e, pack_entry(0, -1, tag)); },
+        s);
+  }
 
   // widened slots of the own keys, while the pushes travel
   int slot[kPerThread];
@@ -334,7 +410,14 @@ __global__ void __launch_bounds__(32 * kNumRanks) merge_kernel(const __grid_cons
     if (want > 0 && s.kept[q] == s.sent[q] && local_len<kNumRanks>(L, q) > s.sent[q]) fail |= 1u << q;
   }
   if (tid == 0) p.fallback[row] = fail != 0;
-  if (fail) t = fallback_kth<kNumRanks, kTopK, kCandK>(p, row, fail, full_off, tag, cand, s);
+  if (fail) {
+    if constexpr (kStaged) {
+      t = __popc(fail) <= 2 ? fallback_kth_regs<kNumRanks, kTopK, kCandK>(p, fail, full_off, tag, cand, s)
+                            : fallback_kth<kNumRanks, kTopK, kCandK>(p, row, fail, full_off, tag, cand, s);
+    } else {
+      t = fallback_kth<kNumRanks, kTopK, kCandK>(p, row, fail, full_off, tag, cand, s);
+    }
+  }
 
   int32_t* const out = p.out_slots + static_cast<int64_t>(row) * kTopK;
   const auto pad = [&](int e) { out[e] = -1; };
@@ -347,9 +430,9 @@ __global__ void __launch_bounds__(32 * kNumRanks) merge_kernel(const __grid_cons
 
 }  // namespace dcp_topk_merge
 
-template <int64_t kNumRanks, int64_t kTopK, int64_t kCandK>
+template <int64_t kNumRanks, int64_t kTopK, int64_t kCandK, int64_t kStaged = 0>
 struct DcpTopKMergeKernel {
-  static constexpr auto kernel = dcp_topk_merge::merge_kernel<kNumRanks, kTopK, kCandK>;
+  static constexpr auto kernel = dcp_topk_merge::merge_kernel<kNumRanks, kTopK, kCandK, kStaged != 0>;
 
   /// \brief Merges one batch of decode rows; dcp_topk_merge.py holds the contract.
   static void

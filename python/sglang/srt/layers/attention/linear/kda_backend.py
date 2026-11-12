@@ -1,4 +1,8 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the SGLang project
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 import importlib.util
+import os
 from typing import Optional, Tuple, Union
 
 import torch
@@ -23,6 +27,7 @@ from sglang.srt.layers.attention.linear.kernels.kda_triton import TritonKDAKerne
 from sglang.srt.layers.attention.linear.utils import (
     LinearAttnKernelBackend,
     build_verify_intermediate_state_indices,
+    pp_spec_stable_rows_enabled,
     select_verify_intermediate_state_indices,
 )
 from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
@@ -55,6 +60,43 @@ from sglang.srt.runtime_context import (
 )
 
 
+def conv_prefill_split_qkv(
+    mixed_qkv: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    conv_states: torch.Tensor,
+    dims: Tuple[int, int, int],
+    **conv_kwargs,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Prefill short conv run once per q / k / v channel slice.
+
+    mixed_qkv is [tokens, q_dim + k_dim + v_dim]; conv_states is the
+    [slots, dim, width - 1] view of the pool. Each slice's conv writes its own
+    dense [tokens, dim] buffer, so q, k and v reach the extend kernel
+    contiguous and its gather copies of a split packed output are skipped.
+    The conv is depthwise, so every output element and every conv-state row is
+    computed exactly as in one packed call.
+    """
+    num_tokens = mixed_qkv.shape[0]
+    outs = []
+    off = 0
+    for d in dims:
+        sl = slice(off, off + d)
+        o = mixed_qkv.new_empty((num_tokens, d))
+        causal_conv1d_fn(
+            mixed_qkv[:, sl].transpose(0, 1),
+            weight[sl],
+            None if bias is None else bias[sl],
+            activation="silu",
+            conv_states=conv_states[:, sl],
+            out=o.transpose(0, 1),
+            **conv_kwargs,
+        )
+        outs.append(o)
+        off += d
+    return outs[0], outs[1], outs[2]
+
+
 def _validate_flashinfer_kda_prefill(
     *,
     chunk_size: int,
@@ -74,9 +116,13 @@ def _validate_flashinfer_kda_prefill(
 
 
 def flashinfer_kda_prefill_default(model_runner: ModelRunner) -> Optional[str]:
-    """Default safe-gate KDA prefill to FlashInfer on SM100/SM103."""
+    """Default safe-gate KDA prefill to FlashInfer on SM100/SM103 (and SM107 when
+    SGLANG_K31_KDA_PREFILL_FI_SM107=1)."""
     from sglang.srt.configs.bailing_hybrid import BailingHybridConfig
     from sglang.srt.configs.hybrid_arch import hybrid_kda_config
+    from sglang.srt.layers.attention.linear.kernels.kda_flashinfer_prefill import (
+        prefill_capabilities,
+    )
 
     config = hybrid_kda_config(model_runner.model_config)
     lower_bound = (
@@ -92,7 +138,7 @@ def flashinfer_kda_prefill_default(model_runner: ModelRunner) -> Optional[str]:
         and not execution.overlap.enable_two_batch_overlap
         and execution.graph.cuda_graph_config.prefill.backend != CudaGraphBackend.FULL
         and is_cuda()
-        and torch.cuda.get_device_capability() in ((10, 0), (10, 3))
+        and torch.cuda.get_device_capability() in prefill_capabilities()
     ):
         return "flashinfer"
     return None
@@ -266,7 +312,7 @@ class KDAKernelDispatcher:
                 f"Unsupported KDA prefill backend: {prefill_backend}. "
                 "KDA supports 'triton', 'helion', 'flashinfer', 'flashkda', 'cutedsl', "
                 "'nvidia_kda', or 'ptx_kda' (cutedsl/nvidia_kda prefill need "
-                "SM100, ptx_kda SM100 or SM103)."
+                "SM100, ptx_kda SM100, SM103 or SM107)."
             )
 
         self.supports_packed_decode = getattr(
@@ -559,6 +605,121 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 dtype=torch.int32,
                 device=model_runner.device,
             )
+        # Commit-then-verify (SGLANG_OPT_KDA_SPEC_FOLD_VERIFY): the pool's
+        # per-slot pending accept lengths, or None when fold mode is off.
+        self.fold_pending = self._init_kda_fold(verify_backend)
+        self._fold_min_bs = envs.SGLANG_OPT_KDA_SPEC_FOLD_MIN_BS.get()
+        # Set when this forward's pending windows were flushed before it ran. A
+        # captured fold kernel replayed after a flush finds 0 pending records in
+        # half 1 and writes its window to half 0, as the stock verify does.
+        self._fold_flushed = False
+
+    def _init_kda_fold(self, verify_backend) -> Optional[torch.Tensor]:
+        """Turn on fold mode if its contract holds (see memory_pool / kda_decode_mtp FOLD).
+
+        Fold mode leaves `temporal` one accepted window behind between forwards.
+        Only the nv_cutedsl verify kernel can consume that window, so every other
+        reader of `temporal` must be ruled out or must flush first: the radix
+        cache must not copy live slots (extra_buffer donates committed track
+        slots; no_buffer copies the live one), tree verify has no fold kernel,
+        PP's delayed rows are not handled, and the slot allocator must zero the
+        pending length of every slot it hands out.
+        """
+        mamba_pool = self.req_to_token_pool.mamba_pool
+        pending = getattr(mamba_pool, "kda_fold_pending", None)
+        if pending is None:
+            return None
+        reason = None
+        if not verify_backend.is_nv_cutedsl():
+            reason = "the verify backend is not nv_cutedsl (only its kernel folds)"
+        elif (get_spec().speculative_eagle_topk or 1) > 1:
+            reason = "tree verify (topk > 1) has no fold kernel"
+        elif not (
+            get_memory().disable_radix_cache
+            or getattr(self.req_to_token_pool, "enable_mamba_extra_buffer", False)
+        ):
+            reason = "the no_buffer mamba radix cache copies live slots"
+        elif pp_spec_stable_rows_enabled():
+            reason = "PP spec rows are not supported"
+        elif not getattr(self.req_to_token_pool.mamba_allocator, "alloc_hooks", None):
+            reason = "the mamba slot allocator does not reset fold state"
+        elif (
+            envs.SGLANG_ENABLE_OVERLAP_PLAN_STREAM.get()
+            or envs.SGLANG_ENABLE_METADATA_GLUE_GRAPH.get()
+        ):
+            # The pre-forward flush must run on the forward's own stream.
+            reason = "the plan stream / metadata glue graph moves the pre-forward flush"
+        elif not (
+            mamba_pool.mamba_cache.temporal.dtype == torch.float32
+            or (
+                mamba_pool.mamba_cache.temporal.dtype == torch.bfloat16
+                and envs.SGLANG_OPT_KDA_CUTE_VERIFY_BF16_STATE.get()
+            )
+        ):
+            # Otherwise every verify falls back from nv_cutedsl and must flush.
+            reason = (
+                f"the nv_cutedsl verify does not take "
+                f"{mamba_pool.mamba_cache.temporal.dtype} state (BF16 needs "
+                f"SGLANG_OPT_KDA_CUTE_VERIFY_BF16_STATE)"
+            )
+        if reason is not None:
+            rank0_log(f"KDA fold verify requested but disabled: {reason}.")
+            return None
+        mamba_pool.kda_fold_active = True
+        rank0_log("KDA fold verify enabled: the next verify commits the accepted window.")
+        return pending
+
+    def _kda_fold_before_forward(
+        self,
+        forward_batch: ForwardBatch,
+        in_capture: bool,
+        cache_indices: Optional[torch.Tensor] = None,
+    ):
+        """Forward-stream fold bookkeeping before every forward.
+
+        First zero the pending entries of newly allocated slots (queued by the
+        allocator on the schedule stream; see MambaPool.kda_fold_reset_queue).
+        Then flush pending windows before a forward that will not fold them:
+        only a chain target-verify on the nv_cutedsl path folds; extend (also
+        mixed and prefill-graph), plain decode and ragged-verify forwards read
+        `temporal` directly.
+        """
+        self._fold_flushed = False
+        if self.fold_pending is None or in_capture:
+            return
+        self.req_to_token_pool.mamba_pool.kda_fold_drain_resets()
+        mode = forward_batch.forward_mode
+        if mode.is_idle():
+            return
+        spec = forward_batch.spec_info
+        if (
+            mode.is_target_verify()
+            and getattr(spec, "ragged_verify_layout", None) is None
+            and forward_batch.batch_size >= self._fold_min_bs
+        ):
+            return
+        from sglang.kernels.ops.attention.linear.kda_replayssm_spec_decode import (
+            kda_fold_flush,
+        )
+
+        if cache_indices is None:
+            cache_indices = self.forward_metadata.mamba_cache_indices[
+                : forward_batch.batch_size
+            ]
+        kda_fold_flush(
+            spec_state=self.req_to_token_pool.get_speculative_mamba2_params_all_layers(),
+            pending=self.fold_pending,
+            state_batch_indices=cache_indices,
+            null_block_id=-1,
+            block_v=envs.SGLANG_OPT_KDA_REPLAYSSM_FOLD_BLOCK_V.get(),
+        )
+        self._fold_flushed = True
+
+    def init_forward_metadata_out_graph(
+        self, forward_batch: ForwardBatch, in_capture: bool = False
+    ):
+        super().init_forward_metadata_out_graph(forward_batch, in_capture=in_capture)
+        self._kda_fold_before_forward(forward_batch, in_capture)
 
     @staticmethod
     def _can_fuse_accept_state(verify_backend) -> bool:
@@ -666,10 +827,15 @@ class KDAAttnBackend(MambaAttnBackendBase):
     def refresh_prefill_graph_metadata(
         self, meta: KDAPrefillGraphMetadata, forward_batch: ForwardBatch
     ) -> None:
+        cache_indices = self._prefill_graph_cache_indices(forward_batch)
+        # Prefill-graph replays (incl. mixed batches) skip init_forward_metadata.
+        self._kda_fold_before_forward(
+            forward_batch, in_capture=False, cache_indices=cache_indices
+        )
         self._fill_prefill_graph_metadata(
             meta=meta,
             forward_batch=forward_batch,
-            cache_indices=self._prefill_graph_cache_indices(forward_batch),
+            cache_indices=cache_indices,
         )
 
     def _prefill_graph_cache_indices(self, forward_batch: ForwardBatch):
@@ -756,6 +922,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             self.forward_metadata.query_start_loc_i64 = (
                 self.forward_metadata.query_start_loc.to(torch.int64)
             )
+        self._kda_fold_before_forward(forward_batch, in_capture=False)
         if self.forward_metadata.has_mamba_track_mask:
             if self.forward_metadata.mamba_track_mask_indices is None:
                 self.forward_metadata.mamba_track_mask_indices = (
@@ -1045,7 +1212,28 @@ class KDAAttnBackend(MambaAttnBackendBase):
         conv_states: torch.Tensor,
         cache_indices: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Return Q/K/V, using contiguous planes for equal-width FlashInfer prefill."""
+        """Return Q/K/V, each [tokens, dim]: contiguous planes for equal-width FlashInfer prefill,
+        dense q / k / v from three conv launches with K31PF_KDA_SPLIT_CONV=1."""
+        conv_kwargs = dict(
+            has_initial_state=forward_batch.extend_prefix_lens > 0,
+            cache_indices=cache_indices,
+            query_start_loc=self.forward_metadata.query_start_loc,
+            seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+        )
+        dims = (layer.q_dim, layer.k_dim, layer.v_dim)
+        if os.environ.get("K31PF_KDA_SPLIT_CONV") == "1" and isinstance(
+            layer.conv_weights, torch.Tensor
+        ):
+            # Three conv launches, but q / k / v come out dense and the extend
+            # kernel does not gather them out of one packed output.
+            return conv_prefill_split_qkv(
+                mixed_qkv,
+                layer.conv_weights,
+                layer.bias,
+                conv_states,
+                dims,
+                **conv_kwargs,
+            )
         # Depthwise conv is channel-independent, so one packed call over the
         # full qkv width matches the decode path and saves two kernel launches.
         split_size = (
@@ -1060,10 +1248,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             layer.bias,
             activation="silu",
             conv_states=conv_states,
-            has_initial_state=forward_batch.extend_prefix_lens > 0,
-            cache_indices=cache_indices,
-            query_start_loc=self.forward_metadata.query_start_loc,
-            seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+            **conv_kwargs,
             output_split_size=split_size,
         )
         if split_size:
@@ -1376,6 +1561,12 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 replayssm_rawk=mamba_cache_params.replayssm_rawk,
                 replayssm_g=mamba_cache_params.replayssm_g,
                 replayssm_beta=mamba_cache_params.replayssm_beta,
+                fold_pending=None if self._fold_flushed else self.fold_pending,
+            )
+        if self.fold_pending is not None and not self._fold_flushed:
+            raise RuntimeError(
+                "KDA fold verify: this verify cannot take the nv_cutedsl path, so "
+                "it would read a stale state; unset SGLANG_OPT_KDA_SPEC_FOLD_VERIFY."
             )
         if ragged_layout is None:
             batch_size = seq_len // draft_token_num
@@ -1837,8 +2028,17 @@ class KDAAttnBackend(MambaAttnBackendBase):
             return False
         if layer.conv_weights.dtype != torch.float32:
             return False
+        # BF16 state: only on the ReplaySSM ring path (the kernel reads it and
+        # widens to FP32; snapshots stay FP32) and only behind the opt-in knob.
+        bf16_state = (
+            ssm_states.dtype == torch.bfloat16
+            and intermediate_state_cache is None
+            and replayssm_rawv is not None
+            and envs.SGLANG_OPT_KDA_CUTE_VERIFY_BF16_STATE.get()
+        )
+        align = 16 // ssm_states.element_size()
         if (
-            ssm_states.dtype != torch.float32
+            (ssm_states.dtype != torch.float32 and not bf16_state)
             or tuple(ssm_states.shape[-3:])
             != (layer.num_v_heads, layer.head_v_dim, layer.head_k_dim)
             or tuple(ssm_states.stride()[-3:])
@@ -1847,8 +2047,8 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 layer.head_k_dim,
                 1,
             )
-            or ssm_states.stride(0) % 4 != 0
-            or ssm_states.storage_offset() % 4 != 0
+            or ssm_states.stride(0) % align != 0
+            or ssm_states.storage_offset() % align != 0
         ):
             return False
         if conv_states.shape[-2] != 3 or intermediate_conv_window_cache.shape[-2] != 3:
@@ -1886,6 +2086,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         replayssm_rawk: Optional[torch.Tensor] = None,
         replayssm_g: Optional[torch.Tensor] = None,
         replayssm_beta: Optional[torch.Tensor] = None,
+        fold_pending: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         from sglang.kernels.ops.attention.kda_decode_mtp import (
             fused_kda_decode_mtp_dspark,
@@ -1958,6 +2159,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             onorm_gate=onorm_gate,
             onorm_weight=onorm_weight,
             onorm_eps=onorm_eps,
+            fold_pending=fold_pending,
         )
         if apply_onorm:
             layer._k3_onorm_consumed = True

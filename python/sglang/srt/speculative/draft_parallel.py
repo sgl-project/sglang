@@ -1,5 +1,9 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the SGLang project
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING
 
 from sglang.srt.configs.draft_parallel import (
@@ -48,6 +52,24 @@ def model_draft_parallel_spec(
         if declaration is not None:
             return declaration
     return legacy_draft_parallel_spec(spec_algorithm, dspark_is_moe=dspark_is_moe)
+
+
+def draft_dcp1_requested() -> bool:
+    """K31HT_DRAFT_DCP1=1 (default off = stock): run the DFLASH draft's
+    attention at DCP 1 inside its attention-TP group. Read once per call; the
+    worker resolves it into ``DraftParallelLayout.collapse_dcp`` at init."""
+    return os.environ.get("K31HT_DRAFT_DCP1", "0").strip() == "1"
+
+
+def k31ht_draft_dcp1_layout(layout: DraftParallelLayout) -> DraftParallelLayout:
+    """K31HT_DRAFT_DCP1: the resolved layout with ``collapse_dcp`` set, which only takes effect under
+    DCP > 1 (``bool(collapse_dcp) and parallel.attn_dcp_size > 1``, on both DraftParallelLayout forms). Call it in
+    target scope, right after resolve_draft_parallel_layout, only when draft_dcp1_requested()."""
+    import msgspec
+
+    if get_parallel().attn_dcp_size > 1:
+        return msgspec.structs.replace(layout, collapse_dcp=True)
+    return layout
 
 
 def resolve_draft_parallel_layout(

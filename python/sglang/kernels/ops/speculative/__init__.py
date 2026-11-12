@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the SGLang project
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 """Speculative-decoding kernels (Triton).
 
 The Triton kernels migrated here live in this package
@@ -50,6 +53,14 @@ register_kernel(
         op="speculative.simulated_accept",
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.speculative.simulated_accept:simulated_accept",
+        capabilities=CUDA_ONLY,
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="speculative.dflash_simulated_accept",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.speculative.dflash_simulated_accept:dflash_simulated_accept",
         capabilities=CUDA_ONLY,
     )
 )

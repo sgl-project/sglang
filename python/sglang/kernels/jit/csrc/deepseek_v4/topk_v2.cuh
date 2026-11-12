@@ -1,3 +1,6 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: Copyright contributors to the SGLang project
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 /**
  * \file topk_v2.cuh
  * \brief TopK kernel for DeepSeek v4.
@@ -697,12 +700,14 @@ CLUSTER_TOPK_KERNEL void topk_persistent_cluster_kernel(const __grid_constant__ 
 
 template <bool kPDL, TopKMode kMode, uint32_t kClusterSize, uint32_t kOccupancy>
 CLUSTER_TOPK_KERNEL void topk_small_batch_cluster_kernel(const __grid_constant__ TopKPagedParams params) {
-  device::enable_smem_spilling();
   constexpr bool kNeedStaging = kMode != TopKMode::INDICES;
   const auto bx = blockIdx.x;
   const auto by = blockIdx.y;
   auto problem = params.problem(bx);
-  __shared__ int32_t s_topk_indices[kMaxTopK];
+  // The kMaxTopK staging buffer lives in dynamic shared memory, so the static footprint stays under the
+  // 48 KiB static limit ptxas enforces (sm_100f, CUDA 13.4); no enable_smem_spilling() with dynamic smem.
+  extern __shared__ __align__(16) int32_t s_topk_dyn[];
+  int32_t* const s_topk_indices = s_topk_dyn;
   using Cluster = impl::TopKCluster<kClusterSize>;
   __shared__ impl::MaxSmem<Register4::Smem, Streaming::Smem, typename Cluster::Smem> smem;
 
@@ -763,10 +768,12 @@ CLUSTER_TOPK_KERNEL void topk_small_batch_cluster_kernel(const __grid_constant__
 template <bool kPDL, uint32_t kClusterSize>
 CLUSTER_TOPK_KERNEL void
 topk_candidates_cluster_kernel(const __grid_constant__ TopKCandidatesParams params, const uint32_t cluster_floor) {
-  device::enable_smem_spilling();
+  // The kMaxTopK staging buffer lives in dynamic shared memory, so the static footprint stays under the
+  // 48 KiB static limit ptxas enforces (sm_100f, CUDA 13.4); no enable_smem_spilling() with dynamic smem.
+  extern __shared__ __align__(16) int32_t s_topk_dyn[];
+  int32_t* const s_topk_indices = s_topk_dyn;
   using Cluster = impl::TopKCluster<kClusterSize>;
   __shared__ impl::MaxSmem<RaggedSmem, typename Cluster::Smem> smem;
-  __shared__ int32_t s_topk_indices[kMaxTopK];
 
   const auto bx = blockIdx.x;
   const auto seq_len = static_cast<uint32_t>(params.seq_lens[bx]);
@@ -1378,8 +1385,10 @@ struct TopKKernel {
           const auto kernel_ptr = reinterpret_cast<const void*>(kernel);
           runtime::init_per_device(device, [kernel_ptr] {
             CHECK_CUDA(::cudaFuncSetAttribute(kernel_ptr, ::cudaFuncAttributeNonPortableClusterSizeAllowed, 1));
+            CHECK_CUDA(::cudaFuncSetAttribute(
+                kernel_ptr, ::cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kMaxTopK * sizeof(int32_t))));
           });
-          return LaunchKernel({batch_size, kClusterSize}, kBlockSize, device)
+          return LaunchKernel({batch_size, kClusterSize}, kBlockSize, device, kMaxTopK * sizeof(int32_t))
               .config({.use_pdl = kUsePDL, .cluster_dim = dim3{1, kClusterSize}})
               .launch(kernel, params);
         }
@@ -1388,9 +1397,15 @@ struct TopKKernel {
       if constexpr (kNumPersistentClusters > 0) {
         if (batch_size <= kNumPersistentClusters) {
           constexpr uint32_t kClusterSize = 8;
-          return LaunchKernel({batch_size, kClusterSize}, kBlockSize, device)
+          const auto kernel8 = topk_small_batch_cluster_kernel<kUsePDL, kMode, kClusterSize, 2>;
+          const auto kernel8_ptr = reinterpret_cast<const void*>(kernel8);
+          runtime::init_per_device(device, [kernel8_ptr] {
+            CHECK_CUDA(::cudaFuncSetAttribute(
+                kernel8_ptr, ::cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kMaxTopK * sizeof(int32_t))));
+          });
+          return LaunchKernel({batch_size, kClusterSize}, kBlockSize, device, kMaxTopK * sizeof(int32_t))
               .config({.use_pdl = kUsePDL, .cluster_dim = dim3{1, kClusterSize}})
-              .launch(topk_small_batch_cluster_kernel<kUsePDL, kMode, kClusterSize, 2>, params);
+              .launch(kernel8, params);
         } else {
           // TODO(perf): one C8 launch could also run two TopKCluster<4> halves per cluster when the
           // pool has many items (a per-call width bit from the plan). Measured (B300): C4 is
@@ -2019,9 +2034,15 @@ struct TopKKernel {
       RuntimeCheck(cluster_floor >= 0 && cluster_floor <= UINT32_MAX, "invalid cluster_floor");
       const auto floor = static_cast<uint32_t>(cluster_floor);
       const auto launch = [&]<uint32_t kClusterSize>() {
-        LaunchKernel({rows, kClusterSize}, kBlockSize, device_.unwrap())
+        const auto kernel = topk_candidates_cluster_kernel<kUsePDL, kClusterSize>;
+        const auto kernel_ptr = reinterpret_cast<const void*>(kernel);
+        runtime::init_per_device(device_.unwrap(), [kernel_ptr] {
+          CHECK_CUDA(::cudaFuncSetAttribute(
+              kernel_ptr, ::cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kMaxTopK * sizeof(int32_t))));
+        });
+        LaunchKernel({rows, kClusterSize}, kBlockSize, device_.unwrap(), kMaxTopK * sizeof(int32_t))
             .config({.use_pdl = kUsePDL, .cluster_dim = dim3{1, kClusterSize}})
-            .launch(topk_candidates_cluster_kernel<kUsePDL, kClusterSize>, params, floor);
+            .launch(kernel, params, floor);
       };
       switch (cluster_size) {
         case 2:

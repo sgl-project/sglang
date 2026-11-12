@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 # Adapted from https://github.com/vllm-project/vllm/blob/0384aa7150c4c9778efca041ffd1beb3ad2bd694/vllm/model_executor/layers/fla/ops/kda.py
 # This file contains code copied from the flash-linear-attention project.
 # The original source code was licensed under the MIT license and included
@@ -23,13 +24,24 @@ from sglang.kernels.ops.attention.fla.fused_recurrent import (
 from sglang.kernels.ops.attention.fla.index import (
     prepare_chunk_indices,
 )
-from sglang.kernels.ops.attention.fla.l2norm import l2norm_fwd
+from sglang.kernels.ops.attention.fla.kda_segscan import (
+    KDA_SEGSCAN_P,
+    chunk_gated_delta_rule_fwd_h_dseg,
+)
+from sglang.kernels.ops.attention.fla.l2norm import (
+    KDA_QKV_PREP,
+    kda_qkv_l2norm_prepare_fwd,
+    kda_qkv_prep_eligible,
+    l2norm_fwd,
+)
 from sglang.kernels.ops.attention.fla.op import exp, exp2, log
 from sglang.kernels.ops.attention.fla.utils import (
+    KDA_TUNE_PIN,
     autotune_cache_kwargs,
     check_shared_mem,
     is_intel,
     is_nvidia,
+    k31_pin_autotune,
 )
 
 if is_intel:
@@ -1129,7 +1141,14 @@ def chunk_kda_fwd(
         fuse_recompute=_small_grid,
     )
 
-    h, v_new = chunk_gated_delta_rule_fwd_h(
+    # K3.1 D-SEG (SGLANG_K31_KDA_SEGSCAN >= 2, default off): segment-parallel
+    # h recurrence for long single-sequence chunks; out of scope -> served call.
+    _fwd_h = (
+        chunk_gated_delta_rule_fwd_h_dseg
+        if KDA_SEGSCAN_P >= 2
+        else chunk_gated_delta_rule_fwd_h
+    )
+    h, v_new = _fwd_h(
         k=kg,
         w=w,
         u=u,
@@ -1194,8 +1213,13 @@ def chunk_kda(
         scale = k.shape[-1] ** -0.5
 
     if use_qk_l2norm_in_kernel:
-        q = l2norm_fwd(q.contiguous())
-        k = l2norm_fwd(k.contiguous())
+        if KDA_QKV_PREP and kda_qkv_prep_eligible(q, k, v):
+            # K3.1 QKVP (SGLANG_K31_KDA_QKV_PREP): one strided launch, bitwise vs the
+            # three .contiguous() copies + two l2norm launches below (fla/l2norm.py).
+            q, k, v = kda_qkv_l2norm_prepare_fwd(q, k, v)
+        else:
+            q = l2norm_fwd(q.contiguous())
+            k = l2norm_fwd(k.contiguous())
 
     # Returns o [B, T, H, V] when output_intermediate_states=False, or (o, h [B, NT, H, V, K]) when output_intermediate_states=True.
     return chunk_kda_fwd(
@@ -1218,3 +1242,10 @@ def chunk_kda(
         chunk_indices=chunk_indices,
         chunk_offsets=chunk_offsets,
     )
+
+
+# K3.1 KDA autotune pins (SGLANG_K31_KDA_TUNE_PIN=1, see fla/utils.py): long-chunk configs, one per kernel.
+if KDA_TUNE_PIN:
+    k31_pin_autotune(kda_gate_chunk_cumsum_vector_kernel, 2, 3, BS=32)
+    k31_pin_autotune(recompute_w_u_fwd_kernel, 4, 3, BK=64, BV=128)
+    k31_pin_autotune(chunk_gla_fwd_kernel_o, 2, 3, BK=32, BV=128)

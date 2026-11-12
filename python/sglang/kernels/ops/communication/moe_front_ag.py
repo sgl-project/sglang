@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the SGLang project
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 """K3 TP-sharded MoE front: fp32 multicast all-gather of the router + latent.
 
 Each rank multicast-stores its ``[M, N / world]`` block into every peer's
@@ -28,9 +31,12 @@ if TYPE_CHECKING:
 
 # Threads per block for a gathered output up to this many bytes; wider blocks
 # beyond. The grid is capped at one block per push counter, so wider blocks are
-# what keeps enough 16B spin loads in flight at large batches.
+# what keeps enough 16B spin loads in flight at large batches. With
+# ``widest_block`` (SGLANG_K3_SHARDED_MOE_FRONT), past 1 MB the 1024-thread
+# block is faster (measured on GB300 TP8 over MNNVL, [M, 4480] fp32).
 _NARROW_BLOCK_MAX_BYTES = 256 * 1024
-_NARROW_BLOCK, _WIDE_BLOCK = 128, 512
+_MID_BLOCK_MAX_BYTES = 1024 * 1024
+_NARROW_BLOCK, _WIDE_BLOCK, _WIDEST_BLOCK = 128, 512, 1024
 
 
 @cache_once
@@ -59,15 +65,23 @@ def moe_front_all_gather(
     local: torch.Tensor,
     out: torch.Tensor,
     block: Optional[int] = None,
+    *,
+    widest_block: bool = False,
 ) -> torch.Tensor:
     """``out[:, r * n : (r + 1) * n] = local`` of rank ``r``, for every rank.
 
     ``local`` is this rank's fp32 ``[M, n]`` block, ``n % 4 == 0``, 16B-aligned
     rows that may be strided (a column slice of a wider GEMM output);
     ``out`` is ``[M, world_size * n]`` fp32 (output-only). ``M * n * 4`` bytes
-    must fit one push slot. ``block`` (threads per block) defaults by size."""
+    must fit one push slot. ``block`` (threads per block) defaults by size;
+    ``widest_block`` adds the 1024-thread tier past 1 MB."""
     if block is None:
-        narrow = out.numel() * out.element_size() <= _NARROW_BLOCK_MAX_BYTES
-        block = _NARROW_BLOCK if narrow else _WIDE_BLOCK
+        nbytes = out.numel() * out.element_size()
+        if nbytes <= _NARROW_BLOCK_MAX_BYTES:
+            block = _NARROW_BLOCK
+        elif nbytes <= _MID_BLOCK_MAX_BYTES or not widest_block:
+            block = _WIDE_BLOCK
+        else:
+            block = _WIDEST_BLOCK
     _moe_front_all_gather_op(world_size, local, out, block)
     return out
