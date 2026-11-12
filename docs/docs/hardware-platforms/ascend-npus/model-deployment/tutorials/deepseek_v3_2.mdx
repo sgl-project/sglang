@@ -129,6 +129,25 @@ quay.io/ascend/sglang:v0.5.18-cann9.0.0-a3
 
 ## Online service deployment
 
+### Single-node deployment (minimal)
+
+The W8A8 checkpoint fits one A3 Series node (16 dies, `--tp-size 16`). Verify a minimal launch first:
+
+```bash Command
+python3 -m sglang.launch_server \
+    --model-path /path/to/DeepSeek-V3.2-W8A8 \
+    --tp-size 16 \
+    --quantization modelslim \
+    --trust-remote-code \
+    --attention-backend ascend \
+    --device npu
+```
+
+This minimal launch is for functional verification, not performance. To tune it, batch-enable the switches that apply
+to your model, then tune the knobs one at a time — see
+[Parameter Tuning](/docs/hardware-platforms/ascend-npus/optimization/parameter_tuning). For benchmark-validated
+configurations, see [Best practices](#best-practices).
+
 ### Multi-node PD disaggregation deployment
 
 PD disaggregation splits the prefill and decode stages onto separate nodes, reducing interference and improving

@@ -98,6 +98,9 @@ export HF_TOKEN=<secret>
 sglang serve --model-path Qwen/Qwen2.5-7B-Instruct --attention-backend ascend &
 ```
 
+<Tip>`sglang serve` is a CLI shortcut for the same server that `python3 -m sglang.launch_server` starts — the command
+the model tutorials and best practices use. Both entry points accept the same flags.</Tip>
+
 Server startup may take several minutes. Once you see output like the following, the server is running.
 
 ```log Output

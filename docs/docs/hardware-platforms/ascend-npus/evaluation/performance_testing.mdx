@@ -45,6 +45,8 @@ sglang serve --model-path Qwen/Qwen3-Embedding-8B --is-embedding
 
 <Note>The server binds to `http://127.0.0.1:30000` by default. All online benchmarks below assume the server is running at that address. The `--is-embedding` flag is required for embedding models.</Note>
 
+<Note>If your deployment is PD-disaggregated, the per-role prefill and decode ports do not serve requests directly — point every benchmark at the router port instead. The best-practice pages launch `sglang_router` on its own port (e.g., `6688`) and run their benchmarks against that port; see your model's best-practice page for the matching benchmark command.</Note>
+
 ### 1.2 Install benchmarking tools
 
 `bench_serving` and `bench_offline_throughput` are built into SGLang and require no extra installation. For Evalscope and AISBench, set up each in its own virtual environment:
