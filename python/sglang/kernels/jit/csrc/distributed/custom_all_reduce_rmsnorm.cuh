@@ -3,8 +3,8 @@
 //   residual_out = all_reduce(input) + residual
 //   output       = rmsnorm(residual_out) * weight
 //
-// A 2shot_push variant: it shares the push plane, the per-block epoch counters
-// and the slot layout conventions of `custom_all_reduce.cuh`, so it interleaves
+// A 2shot_push variant: it shares the push plane, the epoch counter and the
+// slot layout conventions of `custom_all_reduce.cuh`, so it interleaves
 // freely with the plain push all-reduce. Ownership is by whole rows (rank c
 // owns rows [c * R, (c + 1) * R)). The exchange and the owner's reduction are
 // spread over the whole grid as in the plain kernel; the owner fans the bf16 sum
@@ -252,7 +252,7 @@ all_reduce_rmsnorm_2shot_push_kernel(const __grid_constant__ AllReduceRMSNormPar
 
   PDLTriggerSecondary<kUsePDL>();
   __syncthreads();
-  epoch.flip();
+  epoch.commit();
 }
 
 template <typename T, uint32_t kWorldSize, bool kUsePDL>
@@ -310,8 +310,7 @@ struct AllReduceRMSNormKernel {
     const auto stream = LaunchKernel::resolve_device(in.device());
     const auto launch = [&]<uint32_t kThreads, uint32_t kVecs>() {
       const auto kernel = all_reduce_rmsnorm_2shot_push_kernel<T, kWorldSize, kThreads, kVecs, kUsePDL>;
-      // the grid is bound to the counter array and must stay constant
-      LaunchKernel(push.num_blocks, kThreads, stream)  //
+      LaunchKernel(push.default_blocks, kThreads, stream)  //
           .enable_pdl(kUsePDL)(kernel, params);
     };
     // gfx1250 TP8: wider blocks are slower (512 x 2 loses ~3 us to 256 x 4 at
