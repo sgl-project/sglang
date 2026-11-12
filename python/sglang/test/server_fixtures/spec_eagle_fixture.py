@@ -17,7 +17,7 @@ import time
 import requests
 
 from sglang.srt.environ import envs
-from sglang.srt.utils.hf_transformers_utils import get_tokenizer
+from sglang.srt.hf_transformers import get_tokenizer
 from sglang.test.test_utils import (
     DEFAULT_DRAFT_MODEL_EAGLE,
     DEFAULT_DRAFT_MODEL_EAGLE3,

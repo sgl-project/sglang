@@ -11,7 +11,7 @@ use crate::policies::{has_caller_input_ids, request_tokens_for, RequestTokens};
 use crate::proxy::grpc::{sampling_value, RoutingView};
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
-use crate::server::metrics::{InputIdsForwarding, MetricsRegistry};
+use crate::server::metrics::{InputIdsForwarding, MediaCounts, MetricsRegistry};
 use crate::state::kv_events::CacheNamespace;
 use crate::tokenizer::ForwardingScope;
 use axum::http::HeaderMap;
@@ -20,7 +20,7 @@ use serde::de::IgnoredAny;
 use serde::Deserialize;
 use serde_json::{json, Number, Value};
 use sglang_processor::openai::{
-    lower_chat, lower_completion, OpenAiHeaders, OpenAiSettings, Responder,
+    lower_chat, lower_completion, GenerateRequest, OpenAiHeaders, OpenAiSettings, Responder,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -104,6 +104,9 @@ pub(super) struct PreparedRequest {
     pub(super) expected_peak_sequence_tokens: Option<u64>,
     pub(super) caller_set_rid: bool,
     pub(super) fans_out: bool,
+    /// Media items of chat `messages`, `/generate` or typed `Generate` media
+    /// fields, or multimodal embeddings and rerank inputs, for the access log.
+    pub(super) media: MediaCounts,
     /// Whether chat forwards `tokens` as `input_ids`; `None` for `/generate`,
     /// embeddings, classify and rerank, which prepare their own body.
     input_ids_forwarding: Option<InputIdsForwarding>,
@@ -167,10 +170,19 @@ impl PreparedRequest {
         model: ModelId,
         fields: RoutingFields,
         headers: &HeaderMap,
-        body: Bytes,
+        mut body: Bytes,
         policy_needs_request_tokens: bool,
         lower: bool,
     ) -> Result<Self, ApiError> {
+        // MiniMax-M3.1's thinking contract, before anything renders or forwards the
+        // body, so the engine and the router's render see the same request.
+        if path == CHAT_PATH && ctx.tokenizers.is_minimax_m31(&model.0) {
+            if let Ok(mut value) = serde_json::from_slice::<Value>(&body) {
+                if enforce_minimax_m31_thinking(&mut value)? {
+                    body = Bytes::from(serde_json::to_vec(&value).map_err(|_| invalid_request())?);
+                }
+            }
+        }
         // The fleet's sampling contract applies to the client's body on both routes.
         let sampling_defaults =
             resolve_sampling_defaults(&ctx.config.model.sampling_overrides, &fields, &ctx.metrics)?;
@@ -180,7 +192,13 @@ impl PreparedRequest {
             .collect();
         let with_defaults = append_fields(&body, &defaults).unwrap_or_else(|| body.clone());
         let lowered = if lower {
-            lower_openai(ctx, path, &model, headers, &with_defaults)
+            lower_openai(ctx, path, &model, headers, &with_defaults).and_then(
+                |(generate, responder)| {
+                    let generate =
+                        serde_json::to_value(generate).map_err(|_| "generate_serialization")?;
+                    Ok((generate, responder))
+                },
+            )
         } else {
             Err("native_grpc")
         };
@@ -198,6 +216,7 @@ impl PreparedRequest {
             }
             return Ok(Self {
                 responder: Some(responder),
+                media: fields.media,
                 ..Self::generate_value(ctx, model, generate, None)?
             });
         }
@@ -241,6 +260,7 @@ impl PreparedRequest {
             caller_set_rid: fields.caller_set_rid,
             fans_out: requests_multiple_samples(&fields, &sampling_defaults)
                 || (path == COMPLETIONS_PATH && fields.prompt_batch),
+            media: fields.media,
             input_ids_forwarding: forwarding,
             forwarding_booked: false,
             parsed_body,
@@ -301,6 +321,7 @@ impl PreparedRequest {
                 .map(|output| (sequence_tokens as u64).saturating_add(output)),
             caller_set_rid: fields.caller_set_rid,
             fans_out: batch.is_some() || requests_multiple_samples(&fields, &sampling_defaults),
+            media: MediaCounts::default(),
             input_ids_forwarding: None,
             forwarding_booked: false,
             responder: None,
@@ -395,6 +416,7 @@ impl PreparedRequest {
             cache_namespace: cache_namespace(GENERATE_PATH, &value),
             caller_set_rid: !value["rid"].is_null(),
             fans_out,
+            media: generate_media(&value),
             input_ids_forwarding: None,
             forwarding_booked: false,
             parsed_body: Some(value),
@@ -413,6 +435,7 @@ impl PreparedRequest {
         mut value: Value,
     ) -> Result<Self, ApiError> {
         let batch = is_embedding_batch(&value["input"]);
+        let media = embedding_media(&value["input"]);
         let text_ids = tokenize_input_text(ctx, &model, &value["input"]);
         let forward = !ctx.config.model.disable_input_ids_forwarding;
         // `ClassifyRequest` takes the token IDs of one prompt, not of a batch.
@@ -443,6 +466,7 @@ impl PreparedRequest {
             cache_namespace: cache_namespace(path, &value),
             caller_set_rid: !value["rid"].is_null(),
             fans_out: batch,
+            media,
             ..Self::no_output(path, model, body, &lengths)
         })
     }
@@ -462,6 +486,7 @@ impl PreparedRequest {
         Ok(Self {
             // Each document is its own engine request, and the engine reads no `rid`.
             fans_out: true,
+            media: rerank_media(&value),
             ..Self::no_output(RERANK_PATH, model, body, &lengths)
         })
     }
@@ -515,6 +540,7 @@ impl PreparedRequest {
                 .map(|output| (input as u64).saturating_add(output)),
             caller_set_rid,
             fans_out,
+            media: view.media,
             input_ids_forwarding: None,
             forwarding_booked: false,
             responder: None,
@@ -549,6 +575,7 @@ impl PreparedRequest {
             cache_namespace: CacheNamespace::default(),
             caller_set_rid: false,
             fans_out: false,
+            media: MediaCounts::default(),
             input_ids_forwarding: None,
             forwarding_booked: false,
             parsed_body: None,
@@ -626,7 +653,7 @@ fn lower_openai(
     model: &ModelId,
     headers: &HeaderMap,
     body: &[u8],
-) -> Result<(Value, Responder), &'static str> {
+) -> Result<(GenerateRequest, Responder), &'static str> {
     let settings = model_openai_settings(ctx, model).ok_or("engine_settings_unknown")?;
     let headers = OpenAiHeaders {
         // The router owns DP ranks; a client's header is never forwarded.
@@ -701,17 +728,20 @@ pub(super) fn forwarded_prompt_ids(
 
 /// `text` as the engine's `input_ids`, of the same shape; `None` when the caller sent ids.
 fn tokenize_text(ctx: &AppContext, model: &ModelId, value: &Value) -> Option<Value> {
-    if has_caller_input_ids(value) {
+    if has_caller_input_ids(value) || !ctx.tokenizers.can_encode_prompt(&model.0) {
         return None;
     }
     let encode = |text: &Value| ctx.tokenizers.encode_prompt(&model.0, text.as_str()?);
     match &value["text"] {
         // An empty batch stays text; as `input_ids: []` it would read as one empty prompt.
-        Value::Array(texts) if !texts.is_empty() => texts
-            .iter()
-            .map(encode)
-            .collect::<Option<Vec<_>>>()
-            .map(Value::from),
+        // One handoff for the whole batch: each `encode_prompt` inside runs inline.
+        Value::Array(texts) if !texts.is_empty() => crate::off_worker::run(|| {
+            texts
+                .iter()
+                .map(encode)
+                .collect::<Option<Vec<_>>>()
+                .map(Value::from)
+        }),
         text => encode(text).map(Value::from),
     }
 }
@@ -824,13 +854,16 @@ fn tokenize_input_text(ctx: &AppContext, model: &ModelId, input: &Value) -> Opti
         text.trim_matches(|c: char| c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c))
             .is_empty()
     };
-    if texts.iter().any(blank) {
+    if texts.iter().any(blank) || !ctx.tokenizers.can_encode_prompt(&model.0) {
         return None;
     }
-    texts
-        .into_iter()
-        .map(|text| ctx.tokenizers.encode_prompt(&model.0, text))
-        .collect()
+    // One handoff for the whole batch: each `encode_prompt` inside runs inline.
+    crate::off_worker::run(|| {
+        texts
+            .into_iter()
+            .map(|text| ctx.tokenizers.encode_prompt(&model.0, text))
+            .collect()
+    })
 }
 
 /// Prompt text bytes of a string, a multimodal item or a list of content parts;
@@ -867,6 +900,8 @@ pub(super) struct RoutingFields {
     caller_set_rid: bool,
     /// A completions `prompt` listing several prompts, as strings or id lists.
     prompt_batch: bool,
+    /// Media content parts of chat `messages`, counted without retaining them.
+    media: MediaCounts,
 }
 
 impl RoutingFields {
@@ -1019,6 +1054,7 @@ enum RequestKey {
     Sampling(SamplingField),
     Rid,
     Prompt,
+    Messages,
     Other,
 }
 
@@ -1040,6 +1076,7 @@ impl<'de> Deserialize<'de> for RequestKey {
                     "max_completion_tokens" => RequestKey::Routing(RoutingKey::MaxCompletionTokens),
                     "rid" => RequestKey::Rid,
                     "prompt" => RequestKey::Prompt,
+                    "messages" => RequestKey::Messages,
                     other => match SamplingField::from_wire_name(other) {
                         Some(field) => RequestKey::Sampling(field),
                         None => RequestKey::Other,
@@ -1104,6 +1141,9 @@ impl<'de> serde::de::Visitor<'de> for RoutingFieldsVisitor {
                     let prompt = map.next_value::<Value>()?;
                     fields.prompt_batch =
                         prompt.get(0).is_some_and(|p| p.is_string() || p.is_array());
+                }
+                RequestKey::Messages => {
+                    fields.media = map.next_value::<MessagesMedia>()?.0;
                 }
                 RequestKey::Other => {
                     // Validate unrelated JSON without retaining its contents.
@@ -1487,6 +1527,250 @@ fn request_has_multimodal_content(value: &Value) -> bool {
         })
 }
 
+/// Media items of `/generate`'s `image_data`, `video_data` and `audio_data`:
+/// one item, a list of items, or a batch's list of per-request lists.
+fn generate_media(value: &Value) -> MediaCounts {
+    fn items(field: &Value) -> u32 {
+        let count = match field {
+            Value::Null => 0,
+            Value::Array(items) => items
+                .iter()
+                .map(|item| match item {
+                    Value::Null => 0,
+                    Value::Array(nested) => nested.iter().filter(|i| !i.is_null()).count(),
+                    _ => 1,
+                })
+                .sum(),
+            _ => 1,
+        };
+        u32::try_from(count).unwrap_or(u32::MAX)
+    }
+    MediaCounts {
+        images: items(&value["image_data"]),
+        videos: items(&value["video_data"]),
+        audios: items(&value["audio_data"]),
+    }
+}
+
+/// `MultimodalEmbeddingInput` items' `image` and `video`; text inputs have none.
+fn embedding_media(input: &Value) -> MediaCounts {
+    let mut counts = MediaCounts::default();
+    for item in input.as_array().into_iter().flatten() {
+        if !item["image"].is_null() {
+            counts.images = counts.images.saturating_add(1);
+        }
+        if !item["video"].is_null() {
+            counts.videos = counts.videos.saturating_add(1);
+        }
+    }
+    counts
+}
+
+/// Media content parts of a rerank `query` and its `documents`, counted once
+/// each as the client sent them; string contents have none.
+fn rerank_media(value: &Value) -> MediaCounts {
+    let documents = value["documents"].as_array().into_iter().flatten();
+    let mut counts = MediaCounts::default();
+    for content in std::iter::once(&value["query"]).chain(documents) {
+        for part in content.as_array().into_iter().flatten() {
+            if let Some(part_type) = part["type"].as_str() {
+                counts.add_part(part_type);
+            }
+        }
+    }
+    counts
+}
+
+/// Media content parts of chat `messages`, counted as they deserialize so the
+/// router never holds them. Shapes the engine rejects count nothing rather than
+/// failing the parse, so the engine's own error still reaches the client.
+#[derive(Default)]
+struct MessagesMedia(MediaCounts);
+
+/// A chat message's media parts.
+#[derive(Default)]
+struct MessageMedia(MediaCounts);
+
+/// A message `content` value's media parts; string content has none.
+#[derive(Default)]
+struct ContentMedia(MediaCounts);
+
+/// One content part, counted by its `type`.
+#[derive(Default)]
+struct PartMedia(MediaCounts);
+
+/// JSON of another type than the visitor expects counts nothing.
+macro_rules! lenient_json_scalars {
+    () => {
+        fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<Self::Value, E> {
+            Ok(Self::Value::default())
+        }
+        fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<Self::Value, E> {
+            Ok(Self::Value::default())
+        }
+        fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<Self::Value, E> {
+            Ok(Self::Value::default())
+        }
+        fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<Self::Value, E> {
+            Ok(Self::Value::default())
+        }
+        fn visit_str<E: serde::de::Error>(self, _: &str) -> Result<Self::Value, E> {
+            Ok(Self::Value::default())
+        }
+        fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(Self::Value::default())
+        }
+    };
+}
+
+impl<'de> Deserialize<'de> for MessagesMedia {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = MessagesMedia;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("chat messages")
+            }
+
+            lenient_json_scalars!();
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut counts = MediaCounts::default();
+                while let Some(MessageMedia(message)) = seq.next_element()? {
+                    counts.add(message);
+                }
+                Ok(MessagesMedia(counts))
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> Result<Self::Value, A::Error> {
+                serde::de::Visitor::visit_map(IgnoredAny, map).map(|_| Self::Value::default())
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+
+impl<'de> Deserialize<'de> for MessageMedia {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = MessageMedia;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a chat message")
+            }
+
+            lenient_json_scalars!();
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                serde::de::Visitor::visit_seq(IgnoredAny, seq).map(|_| Self::Value::default())
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut counts = MediaCounts::default();
+                while let Some(key) = map.next_key::<String>()? {
+                    if key == "content" {
+                        counts = map.next_value::<ContentMedia>()?.0;
+                    } else {
+                        map.next_value::<IgnoredAny>()?;
+                    }
+                }
+                Ok(MessageMedia(counts))
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+
+impl<'de> Deserialize<'de> for ContentMedia {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = ContentMedia;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("message content")
+            }
+
+            lenient_json_scalars!();
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut counts = MediaCounts::default();
+                while let Some(PartMedia(part)) = seq.next_element()? {
+                    counts.add(part);
+                }
+                Ok(ContentMedia(counts))
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> Result<Self::Value, A::Error> {
+                serde::de::Visitor::visit_map(IgnoredAny, map).map(|_| Self::Value::default())
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+
+impl<'de> Deserialize<'de> for PartMedia {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = PartMedia;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a content part")
+            }
+
+            lenient_json_scalars!();
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                serde::de::Visitor::visit_seq(IgnoredAny, seq).map(|_| Self::Value::default())
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut counts = MediaCounts::default();
+                while let Some(key) = map.next_key::<String>()? {
+                    if key == "type" {
+                        // Last `type` wins, as it does for the engine's parser.
+                        counts = MediaCounts::default();
+                        if let Some(part_type) = map.next_value::<Value>()?.as_str() {
+                            counts.add_part(part_type);
+                        }
+                    } else {
+                        map.next_value::<IgnoredAny>()?;
+                    }
+                }
+                Ok(PartMedia(counts))
+            }
+        }
+        d.deserialize_any(V)
+    }
+}
+
 /// Validate supplied values and return exact defaults for missing or null parameters.
 fn resolve_sampling_defaults(
     overrides: &SamplingOverrides,
@@ -1561,9 +1845,112 @@ fn invalid_request() -> ApiError {
     ApiError::BadRequest("invalid request: body must be a JSON object".into())
 }
 
+/// MiniMax-M3.1's thinking contract (its inspection manual and MiniMax's Provider
+/// Verifier, `m3_a_reasoning_effort`), which the engine does not enforce:
+///
+/// - thinking is always adaptive, so `thinking: {"type": "disabled"}` and
+///   `chat_template_kwargs.thinking_mode: "disabled"` are a 400;
+/// - `reasoning_effort: "none"` is not accepted — a 400;
+/// - `reasoning_effort: "minimal"` is accepted and mapped to `low`.
+///
+/// The effort is read wherever the engine reads it: `reasoning_effort`,
+/// `reasoning.effort` / `reasoning.reasoning_effort` and
+/// `chat_template_kwargs.reasoning_effort`. Returns whether the request was
+/// rewritten, so the caller re-serializes the forwarded body.
+pub(crate) fn enforce_minimax_m31_thinking(value: &mut Value) -> Result<bool, ApiError> {
+    let Some(obj) = value.as_object_mut() else {
+        return Ok(false);
+    };
+    let is = |v: Option<&Value>, want: &str| {
+        v.and_then(Value::as_str)
+            .is_some_and(|s| s.eq_ignore_ascii_case(want))
+    };
+    if is(obj.get("thinking").and_then(|t| t.get("type")), "disabled")
+        || is(
+            obj.get("chat_template_kwargs")
+                .and_then(|c| c.get("thinking_mode")),
+            "disabled",
+        )
+    {
+        return Err(ApiError::BadRequest(
+            "thinking cannot be disabled for MiniMax-M3.1: thinking is always adaptive \
+             (set its depth with reasoning_effort: low, medium, high, xhigh or max)"
+                .into(),
+        ));
+    }
+    fn effort(slot: Option<&mut Value>) -> Result<bool, ApiError> {
+        let Some(effort) = slot else {
+            return Ok(false);
+        };
+        match effort.as_str() {
+            Some(s) if s.eq_ignore_ascii_case("none") => Err(ApiError::BadRequest(
+                "reasoning_effort \"none\" is not supported for MiniMax-M3.1: thinking is always \
+                 adaptive; use one of low, medium, high, xhigh, max"
+                    .into(),
+            )),
+            Some(s) if s.eq_ignore_ascii_case("minimal") => {
+                *effort = Value::from("low");
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+    let mut changed = effort(obj.get_mut("reasoning_effort"))?;
+    if let Some(reasoning) = obj.get_mut("reasoning").and_then(Value::as_object_mut) {
+        changed |= effort(reasoning.get_mut("effort"))?;
+        changed |= effort(reasoning.get_mut("reasoning_effort"))?;
+    }
+    if let Some(kwargs) = obj
+        .get_mut("chat_template_kwargs")
+        .and_then(Value::as_object_mut)
+    {
+        changed |= effort(kwargs.get_mut("reasoning_effort"))?;
+    }
+    Ok(changed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn minimax_m31_thinking_contract() {
+        let run = |mut v: Value| enforce_minimax_m31_thinking(&mut v).map(|changed| (changed, v));
+        for bad in [
+            json!({"thinking": {"type": "disabled"}}),
+            json!({"thinking": {"type": "Disabled"}, "reasoning_effort": "high"}),
+            json!({"chat_template_kwargs": {"thinking_mode": "disabled"}}),
+            json!({"reasoning_effort": "none"}),
+            json!({"reasoning": {"effort": "none"}}),
+            json!({"chat_template_kwargs": {"reasoning_effort": "NONE"}}),
+        ] {
+            assert!(
+                matches!(run(bad.clone()), Err(ApiError::BadRequest(_))),
+                "{bad} must be a 400"
+            );
+        }
+        // minimal -> low, wherever the effort is given.
+        let (changed, v) = run(json!({"reasoning_effort": "minimal", "messages": []})).unwrap();
+        assert!(changed);
+        assert_eq!(v["reasoning_effort"], "low");
+        let (changed, v) = run(json!({
+            "reasoning": {"effort": "minimal"},
+            "chat_template_kwargs": {"reasoning_effort": "minimal"},
+        }))
+        .unwrap();
+        assert!(changed);
+        assert_eq!(v["reasoning"]["effort"], "low");
+        assert_eq!(v["chat_template_kwargs"]["reasoning_effort"], "low");
+        // Accepted as-is.
+        for ok in [
+            json!({}),
+            json!({"reasoning_effort": "high", "thinking": {"type": "adaptive"}}),
+            json!({"chat_template_kwargs": {"thinking_mode": "adaptive"}}),
+            json!({"reasoning_effort": "max"}),
+        ] {
+            assert_eq!(run(ok.clone()).unwrap(), (false, ok));
+        }
+    }
     use crate::tokenizer::TokenizerRegistry;
     use std::sync::Arc;
 
@@ -1655,17 +2042,44 @@ mod tests {
         let view = RoutingView {
             input_ids: &[1, 2, 3],
             text: None,
-            sampling_params: Some(&sglang_api_types::runtime::v1::SamplingParams {
+            sampling_params: Some(&sglang_runtime_v1_types::SamplingParams {
                 max_new_tokens: Some(10),
                 ..Default::default()
             }),
             stream: false,
             rid: None,
+            media: MediaCounts::default(),
         };
         let model = ModelId("stub-model".into());
         let r = PreparedRequest::typed(&ctx, GENERATE_PATH, model, &view).unwrap();
         assert_eq!((r.input_token_count, r.output_tokens), (12, Some(40)));
         assert!(r.fans_out);
+    }
+
+    #[test]
+    fn embeddings_and_rerank_count_media_inputs() {
+        let ctx = AppContext::stub();
+        let input = json!([{"text":"a","image":"x"},{"image":"y","video":"v"},{"text":"b"}]);
+        let (r, _) = prepare_embeddings(&ctx, input);
+        let want = MediaCounts {
+            images: 2,
+            videos: 1,
+            audios: 0,
+        };
+        assert_eq!(r.media, want);
+        assert_eq!(
+            prepare_embeddings(&ctx, json!("hi")).0.media,
+            MediaCounts::default()
+        );
+
+        let image = json!({"type":"image_url","image_url":{"url":"x"}});
+        let video = json!({"type":"video_url","video_url":{"url":"v"}});
+        let body = json!({
+            "query":[{"type":"text","text":"q"},image],
+            "documents":["text only",[image, video]]
+        });
+        let r = PreparedRequest::rerank(ModelId("stub-model".into()), body.to_string().into());
+        assert_eq!(r.unwrap().media, want);
     }
 
     #[test]
@@ -2101,6 +2515,71 @@ mod tests {
         let fields = fields_of(r#"{"model":"tiny","messages":[]}"#);
         assert_eq!(fields.stream, None);
         assert_eq!(fields.model.as_deref(), Some("tiny"));
+    }
+
+    #[test]
+    fn routing_fields_count_media_parts_without_rejecting_odd_shapes() {
+        let fields = fields_of(
+            r#"{"model":"tiny","messages":[
+                {"role":"system","content":"text only"},
+                {"role":"user","content":[
+                    {"type":"text","text":"what is this?"},
+                    {"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}},
+                    {"type":"image_url","image_url":"https://x/y.png"},
+                    {"type":"input_audio","input_audio":{"data":"BBBB","format":"wav"}},
+                    {"type":"video_url","video_url":{"url":"https://x/v.mp4"}},
+                    {"type":"audio_url","audio_url":{"url":"https://x/a.wav"}}
+                ]}
+            ]}"#,
+        );
+        assert_eq!(
+            fields.media,
+            MediaCounts {
+                images: 2,
+                videos: 1,
+                audios: 2
+            }
+        );
+        assert_eq!(
+            fields_of(r#"{"model":"tiny","messages":[]}"#).media,
+            MediaCounts::default()
+        );
+        // The engine rejects these; the router still forwards them, counting nothing.
+        for body in [
+            r#"{"model":"tiny","messages":"hi"}"#,
+            r#"{"model":"tiny","messages":[1,"x",null,[{"type":"image_url"}]]}"#,
+            r#"{"model":"tiny","messages":[{"role":"user","content":[1,"x",[],{"type":7}]}]}"#,
+            r#"{"model":"tiny","messages":{"type":"image_url"}}"#,
+        ] {
+            assert_eq!(fields_of(body).media, MediaCounts::default(), "{body}");
+        }
+    }
+
+    #[test]
+    fn generate_media_counts_single_list_and_batch_fields() {
+        let single = json!({"text":"a","image_data":"x","audio_data":"data:audio/wav;base64,BB"});
+        assert_eq!(
+            generate_media(&single),
+            MediaCounts {
+                images: 1,
+                videos: 0,
+                audios: 1
+            }
+        );
+        let batch = json!({
+            "text":["a","b","c"],
+            "image_data":[["x","y"],null,"z"],
+            "video_data":["v1","v2","v3"]
+        });
+        assert_eq!(
+            generate_media(&batch),
+            MediaCounts {
+                images: 3,
+                videos: 3,
+                audios: 0
+            }
+        );
+        assert_eq!(generate_media(&json!({"text":"a"})), MediaCounts::default());
     }
 
     #[test]

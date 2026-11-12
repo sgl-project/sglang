@@ -12,7 +12,7 @@ from sglang.srt.lora.utils import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import LoRABatchLayout
-from sglang.srt.utils.common import empty_device_cache
+from sglang.srt.utils.device import empty_device_cache
 
 
 class BaseLoRABackend(LoRABackendLmHeadMixing):

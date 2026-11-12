@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from sglang.srt.arg_groups.overrides import (
+from sglang.srt.arg_groups.model_override_base import (
     attention_backends_of,
     resolved_view,
     resolving_view,
@@ -44,11 +44,8 @@ def supports_prefill_cp_bcg(server_args: ServerArgs) -> bool:
 
     cfg = resolving_view(server_args)
     resolved = resolved_view(server_args)
-    if not (
-        cfg.enable_prefill_cp
-        and cfg.pp_size == 1
-        and resolved.attn_cp_size == cfg.tp_size
-    ):
+    # Pipeline parallelism is decided per strategy in its ``supports``.
+    if not (cfg.enable_prefill_cp and resolved.attn_cp_size == cfg.tp_size):
         return False
     prefill_attention_backend, _ = attention_backends_of(resolved)
     try:
