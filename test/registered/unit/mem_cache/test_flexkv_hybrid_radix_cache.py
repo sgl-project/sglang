@@ -4,8 +4,9 @@ import sys
 import threading
 from array import array
 from contextlib import nullcontext
+from dataclasses import replace
 from pathlib import Path
-from types import ModuleType, SimpleNamespace
+from types import ModuleType
 from unittest.mock import MagicMock, call, patch
 
 import pytest
@@ -21,6 +22,8 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
 from sglang.srt.mem_cache.storage.flexkv.flexkv_cache_lifecycle import _namespace_kwargs
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.flexkv_test_utils import RequestState as SimpleNamespace
+from sglang.test.flexkv_test_utils import discard_row
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
@@ -61,7 +64,7 @@ FlexKVHybridRadixCache = _load_hybrid_cache_class()
 def test_namespaced_lookup_requires_connector_support(extra_key, cache_salt, supported):
     cache, req, _, _ = _make_layerwise_restore()
     result = MatchResult(
-        device_indices=torch.empty(0, dtype=torch.int64),
+        device_prefix_len=int((torch.empty(0, dtype=torch.int64)).numel()),
         last_device_node=req.last_node,
         last_host_node=req.last_node,
         best_match_node=req.last_node,
@@ -196,17 +199,27 @@ def test_restored_swa_tail_marks_older_prefix_as_evicted_before_cache_insert():
         _flexkv_swa_evicted_seqlen=10240,
     )
 
-    cache.cache_unfinished_req(req, chunked=True)
+    cache._load_markers = {}
+    cache.flexkv_connector = MagicMock()
+    cache.token_to_kv_pool_allocator = MagicMock()
+    cache.token_to_kv_pool_allocator.page_size = 4
+    cache.token_to_kv_pool_allocator.target_window_pool.return_value = "swa"
+    cache._store_prefix = MagicMock()
+    cache.checkpoint(req, up_to=len(req.full_untruncated_fill_ids))
 
-    assert req.kv.swa_evicted_seqlen == 10240
+    assert req.kv.get_evicted_seqlen("swa") == 10240
     assert not hasattr(req, "_flexkv_swa_evicted_seqlen")
-    inner.cache_unfinished_req.assert_called_once_with(req, chunked=True)
+    inner.checkpoint.assert_called_once_with(
+        req, up_to=len(req.full_untruncated_fill_ids)
+    )
 
 
 def test_restore_lease_blocks_duplicate_lookup_until_cache_commit():
     node = object()
     inner_match = MatchResult(
-        device_indices=torch.tensor([10, 11, 12, 13], dtype=torch.int64),
+        device_prefix_len=int(
+            (torch.tensor([10, 11, 12, 13], dtype=torch.int64)).numel()
+        ),
         last_device_node=node,
         last_host_node=node,
         best_match_node=node,
@@ -214,9 +227,13 @@ def test_restore_lease_blocks_duplicate_lookup_until_cache_commit():
     inner = MagicMock()
     inner.is_root.return_value = False
     inner.match_prefix.return_value = inner_match
+    inner.path_device_indices.return_value = torch.tensor(
+        [10, 11, 12, 13], dtype=torch.int64
+    )
 
     restored = torch.tensor([20, 21, 22, 23], dtype=torch.int64)
     allocator = MagicMock()
+    allocator.page_size = 4
     connector = MagicMock()
     connector.enable_layerwise = False
     connector.lookup_kv.return_value = (7, 4)
@@ -239,7 +256,7 @@ def test_restore_lease_blocks_duplicate_lookup_until_cache_commit():
     req = SimpleNamespace(
         rid="request",
         cache_request_handle=CacheRequestHandle("request", 0),
-        prefix_indices=inner_match.device_indices,
+        expected_prefix=torch.arange(10, 14),
         last_node=node,
         kv=SimpleNamespace(cache_protected_len=4, swa_evicted_seqlen=0),
         pending_restore_generation=None,
@@ -257,7 +274,7 @@ def test_restore_lease_blocks_duplicate_lookup_until_cache_commit():
         )
     )
 
-    assert loaded_indices is restored
+    assert loaded_indices == restored.numel()
     assert cache.has_uncommitted_restore(req)
     assert req.pending_restore_generation == 0
     assert req.pending_restore_slots is restored
@@ -287,7 +304,7 @@ def test_restore_lease_blocks_duplicate_lookup_until_cache_commit():
     assert cache._restore_leases[_tracking_key(req.rid)] is lease
     assert req.pending_restore_slots is restored
 
-    cache.cache_unfinished_req(req, chunked=True)
+    cache.checkpoint(req, up_to=len(req.full_untruncated_fill_ids))
 
     assert not cache.has_uncommitted_restore(req)
     assert req._flexkv_uncached_restore is False
@@ -298,6 +315,7 @@ def test_restore_lease_blocks_duplicate_lookup_until_cache_commit():
 def test_partial_synchronous_restore_is_freed_in_full():
     restored = torch.tensor([20, 21, 22, 23], dtype=torch.int64)
     allocator = MagicMock()
+    allocator.page_size = 4
     connector = MagicMock()
     connector.enable_layerwise = False
     connector.retrieve_kv.return_value = 2
@@ -323,7 +341,7 @@ def test_partial_synchronous_restore_is_freed_in_full():
         InitLoadBackParams(best_match_node=req.last_node, host_hit_length=4, req=req)
     )
 
-    assert loaded_indices.numel() == 0
+    assert loaded_indices == 0
     allocator.free.assert_called_once_with(restored)
     assert not cache.has_uncommitted_restore(req)
     assert req.pending_restore_generation is None
@@ -333,6 +351,7 @@ def test_partial_synchronous_restore_is_freed_in_full():
 def test_restore_launch_exception_is_retained_until_safe_reset():
     restored = torch.tensor([20, 21, 22, 23], dtype=torch.int64)
     allocator = MagicMock()
+    allocator.page_size = 4
     connector = MagicMock()
     connector.enable_layerwise = True
     connector.start_load_kv_layerwise.side_effect = RuntimeError("launch failed")
@@ -394,11 +413,12 @@ def test_finished_release_commits_restore_lease_after_inner_cache():
         )
     }
 
-    cache.cache_finished_req(req, is_insert=False, owned_kv_len=4)
+    cache.flexkv_connector = MagicMock()
+    cache._load_markers = {}
+    cache._store_prefix = MagicMock()
+    cache.checkpoint(req, up_to=4)
 
-    inner.cache_finished_req.assert_called_once_with(
-        req, is_insert=False, owned_kv_len=4
-    )
+    inner.checkpoint.assert_called_once_with(req, up_to=4)
     assert not cache.has_uncommitted_restore(req)
     assert req.pending_restore_generation is None
     assert req.pending_restore_slots is None
@@ -415,8 +435,9 @@ def test_prefill_boundary_is_stored_with_an_independent_tracking_key(salt):
     indices = torch.tensor([8, 9, 10, 11], dtype=torch.int64)
     inner.match_prefix.return_value = SimpleNamespace(
         last_device_node=node,
-        device_indices=indices,
+        device_prefix_len=int((indices).numel()),
     )
+    inner.path_device_indices.return_value = indices
     dec_params = object()
     inner.inc_lock_ref.return_value = SimpleNamespace(to_dec_params=lambda: dec_params)
 
@@ -445,10 +466,12 @@ def test_prefill_boundary_is_stored_with_an_independent_tracking_key(salt):
         patch("torch.cuda.current_stream", return_value=MagicMock()),
         patch("torch.cuda.stream", return_value=nullcontext()),
     ):
-        cache.cache_unfinished_req(req)
+        cache.checkpoint(req, up_to=len(req.full_untruncated_fill_ids))
         cache._store_prefix(req, [1, 2, 3, 4])
 
-    inner.cache_unfinished_req.assert_called_once_with(req)
+    inner.checkpoint.assert_called_once_with(
+        req, up_to=len(req.full_untruncated_fill_ids)
+    )
     first_store, second_store = connector.store_kv.call_args_list
     assert first_store.args[:2] == (
         _tracking_key("request") + ":flexkv-store:0",
@@ -511,16 +534,21 @@ def test_forwarding_connector_scopes_hybrid_lookup_and_store(extra_key, cache_sa
     inner.is_eagle = False
     inner.match_prefix.side_effect = [
         MatchResult(
-            device_indices=torch.empty(0, dtype=torch.int64),
+            device_prefix_len=int((torch.empty(0, dtype=torch.int64)).numel()),
             last_device_node=req.last_node,
             last_host_node=req.last_node,
             best_match_node=req.last_node,
         ),
         SimpleNamespace(
             last_device_node=object(),
-            device_indices=torch.tensor([8, 9, 10, 11], dtype=torch.int64),
+            device_prefix_len=int(
+                (torch.tensor([8, 9, 10, 11], dtype=torch.int64)).numel()
+            ),
         ),
     ]
+    inner.path_device_indices.return_value = torch.tensor(
+        [8, 9, 10, 11], dtype=torch.int64
+    )
     inner.inc_lock_ref.return_value = SimpleNamespace(to_dec_params=lambda: None)
     key = RadixKey(array("q", range(4)), extra_key, cache_salt=cache_salt)
 
@@ -567,6 +595,7 @@ def test_reset_frees_uncommitted_restore_after_connector_drain():
     calls = MagicMock()
     connector = MagicMock()
     allocator = MagicMock()
+    allocator.page_size = 4
     inner = MagicMock()
     inner.is_root.return_value = False
     calls.attach_mock(connector, "connector")
@@ -612,29 +641,29 @@ def test_reset_frees_uncommitted_restore_after_connector_drain():
 
 
 def test_page_size_one_restore_requests_swa_for_the_full_hit():
-    allocator = MagicMock()
-    restored_slots = torch.arange(8, dtype=torch.int64)
-    allocator.alloc.side_effect = [None, restored_slots]
+    from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 
+    allocator = MagicMock()
+    allocator.page_size = 4
+    slots = torch.arange(8)
+    allocator.alloc.side_effect = [None, slots]
     cache = FlexKVHybridRadixCache.__new__(FlexKVHybridRadixCache)
+    cache._inner_cache = MagicMock()
+    cache._inner_cache.window_sub_pools.return_value = (("swa", 128),)
     cache.page_size = 1
     cache.token_to_kv_pool_allocator = allocator
-    cache.supports_swa = MagicMock(return_value=True)
-    req = SimpleNamespace()
-
-    with patch(
-        "sglang.srt.mem_cache.common.evict_from_tree_cache"
-    ) as evict_from_tree_cache:
-        result = cache._alloc_restore_slots(req, host_hit_length=8)
-
-    assert result is restored_slots
-    evict_from_tree_cache.assert_called_once_with(cache, 8, swa_num_tokens=8)
+    cache.supports_swa = lambda: True
+    assert cache._alloc_restore_slots(SimpleNamespace(), 8) is slots
+    cache._inner_cache.evict_for_alloc.assert_called_once_with(
+        KVDemand(full_tokens=8, window_tokens={"swa": 8})
+    )
 
 
 def _make_layerwise_restore(loaded=4):
     cache = FlexKVHybridRadixCache.__new__(FlexKVHybridRadixCache)
     cache._inner_cache = MagicMock()
     cache.token_to_kv_pool_allocator = MagicMock()
+    cache.token_to_kv_pool_allocator.page_size = 4
     cache.flexkv_connector = MagicMock()
     del cache.flexkv_connector.sync_load_ready
     cache.flexkv_connector.enable_layerwise = True
@@ -655,7 +684,7 @@ def _make_layerwise_restore(loaded=4):
         rid="request",
         cache_request_handle=CacheRequestHandle("request", 0),
         last_node=object(),
-        prefix_indices=torch.empty(0, dtype=torch.int64),
+        expected_prefix=torch.empty(0, dtype=torch.int64),
         kv=SimpleNamespace(
             cache_protected_len=0, kv_committed_len=4, swa_evicted_seqlen=0
         ),
@@ -697,7 +726,7 @@ def test_stale_hybrid_abort_does_not_cancel_a_new_request_attempt():
     cache.init_load_back(params)
     cache.release_aborted_request(previous.cache_request_handle)
     current = SimpleNamespace(**vars(previous))
-    current.kv = SimpleNamespace(**vars(previous.kv))
+    current.kv = replace(previous.kv)
     current.cache_request_handle = CacheRequestHandle(previous.rid, 1)
     cache._load_markers[_tracking_key(previous.rid, 1)] = SimpleNamespace(
         device_length=0
@@ -741,17 +770,18 @@ def test_unexpected_layerwise_length_retains_every_slot_until_drained_reset(load
 def test_zero_layerwise_return_releases_prelaunch_allocation():
     cache, req, params, restored = _make_layerwise_restore(0)
     loaded, _ = cache.init_load_back(params)
-    assert loaded.numel() == 0
+    assert loaded == 0
     cache.token_to_kv_pool_allocator.free.assert_called_once_with(restored)
     assert not cache.has_uncommitted_restore(req)
 
 
-@pytest.mark.parametrize("method", ["cache_finished_req", "cache_unfinished_req"])
+@pytest.mark.parametrize("method", ["finished", "chunk"])
 @pytest.mark.parametrize("mismatch", ["identity", "generation", "slots"])
 def test_hybrid_lease_mismatch_fails_before_inner_cache_mutation(method, mismatch):
     cache, req, params, restored = _make_layerwise_restore()
     cache.init_load_back(params)
     lease = cache._restore_leases[_tracking_key(req.rid)]
+    req.finished = lambda: method == "finished"
     if mismatch == "identity":
         req = SimpleNamespace(**vars(req))
     elif mismatch == "generation":
@@ -761,12 +791,12 @@ def test_hybrid_lease_mismatch_fails_before_inner_cache_mutation(method, mismatc
     req._flexkv_swa_evicted_seqlen = 8
 
     with pytest.raises(RuntimeError, match="restore lease mismatch"):
-        if method == "cache_finished_req":
-            cache.cache_finished_req(req, is_insert=False)
+        if method == "checkpoint":
+            cache.checkpoint(req, up_to=len(req.full_untruncated_fill_ids))
         else:
-            cache.cache_unfinished_req(req, chunked=True)
-    getattr(cache._inner_cache, method).assert_not_called()
-    assert req.kv.swa_evicted_seqlen == 0
+            cache.checkpoint(req, up_to=len(req.full_untruncated_fill_ids))
+    cache._inner_cache.checkpoint.assert_not_called()
+    assert req.kv.get_evicted_seqlen("swa") == 0
     cache.token_to_kv_pool_allocator.free.assert_not_called()
     assert cache.has_uncommitted_restore(req)
     assert cache._restore_leases[_tracking_key(req.rid)] is lease
@@ -779,27 +809,16 @@ def test_hybrid_abort_unblocks_rid_but_keeps_slots_until_cleanup():
     cache, req, params, restored = _make_layerwise_restore()
     cache.init_load_back(params)
     cache.release_aborted_request(req.cache_request_handle)
-
-    assert not cache.has_uncommitted_restore(req)
-    assert req._flexkv_uncached_restore is True
-    assert cache._aborted_restore_leases[req.pending_restore_generation].req is req
     assert req.pending_restore_slots is restored
-    # Abort notification is not completion of the asynchronous H2D writer.
     cache.token_to_kv_pool_allocator.free.assert_not_called()
-
-    # The real completion path still runs cleanly afterwards.
-    cache.cache_finished_req(req, is_insert=False, owned_kv_len=4)
-    cache._inner_cache.cache_finished_req.assert_called_once_with(
-        req, is_insert=False, owned_kv_len=4
-    )
-    assert not cache.has_uncommitted_restore(req)
-    assert cache._aborted_restore_leases == {}
-    cache.token_to_kv_pool_allocator.free.assert_not_called()
-
-    # And the aborted rid stays schedulable: a requeued restore is accepted.
+    # Model core release ordering through the two production hooks.
+    cache.free_kv_row(req.kv, [(0, 4)])
+    cache.on_release(req, checkpointed=False)
+    cache._inner_cache.free_kv_row.assert_called_once_with(req.kv, [(0, 4)])
+    cache._inner_cache.checkpoint.assert_not_called()
+    assert cache._aborted_restore_leases == {} and req.pending_restore_slots is None
     cache._load_markers[_tracking_key(req.rid)] = SimpleNamespace(device_length=0)
     cache.init_load_back(params)
-    assert cache.has_uncommitted_restore(req)
     assert req.pending_restore_slots is restored
 
 
@@ -815,7 +834,7 @@ def test_hybrid_old_abort_cleanup_preserves_reused_rid_with_real_inner_cache():
     cache.init_load_back(params)
     cache.release_aborted_request(old.cache_request_handle)
     new = SimpleNamespace(**vars(old))
-    new.kv = SimpleNamespace(**vars(old.kv))
+    new.kv = replace(old.kv)
     new_slots = torch.arange(40, 44, dtype=torch.int64)
     cache._alloc_restore_slots.return_value = new_slots
     cache._load_markers[_tracking_key(new.rid)] = SimpleNamespace(device_length=0)
@@ -836,12 +855,12 @@ def test_hybrid_old_abort_cleanup_preserves_reused_rid_with_real_inner_cache():
     ]
     allocator.free_full_segments.side_effect = allocator.free_segments.side_effect
     inner.req_to_token_pool = SimpleNamespace(req_to_token=old_slots.unsqueeze(0))
-    cache.cache_finished_req(old, is_insert=False, owned_kv_len=4)
+    discard_row(cache, old, 4)
     assert live == set(new_slots.tolist())
     assert cache._restore_leases[_tracking_key(new.rid)].req is new
     assert cache._aborted_restore_leases == {}
     inner.req_to_token_pool.req_to_token = new_slots.unsqueeze(0)
-    cache.cache_finished_req(new, is_insert=False, owned_kv_len=4)
+    discard_row(cache, new, 4)
     cache.reset()
     assert not live
 
@@ -885,3 +904,27 @@ def test_hybrid_reset_fences_connector_before_reclaiming_slots(failure):
         assert cache.has_uncommitted_restore(req)
         cache.token_to_kv_pool_allocator.free.assert_not_called()
         cache._inner_cache.reset.assert_not_called()
+
+
+def test_discard_applies_restored_swa_boundary_before_freeing_row():
+    cache, req, params, _ = _make_layerwise_restore(loaded=8)
+    cache.supports_swa = lambda: True
+    cache._inner_cache.path_device_indices.return_value = torch.empty(
+        0, dtype=torch.int64
+    )
+    cache.token_to_kv_pool_allocator.target_window_pool.return_value = "swa"
+    restored = torch.arange(20, 28, dtype=torch.int64)
+    cache._alloc_restore_slots.return_value = restored
+    params.host_hit_length = 8
+    assert cache.init_load_back(params)[0] == 8
+    assert req._flexkv_swa_evicted_seqlen == 4
+
+    def free(kv, ranges):
+        assert kv.get_evicted_seqlen("swa") == 4
+        assert ranges == [(0, 8)]
+
+    cache._inner_cache.free_kv_row.side_effect = free
+    cache.free_kv_row(req.kv, [(0, 8)])
+    assert not hasattr(req, "_flexkv_swa_evicted_seqlen")
+    cache.on_release(req, checkpointed=False)
+    assert req.pending_restore_slots is None

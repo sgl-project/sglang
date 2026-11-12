@@ -97,6 +97,7 @@ def _two_rank_restore_trace(rank, rendezvous, adapter, layerwise):
                 cache_request_handle=handle,
                 last_node=prefix_node,
                 prefix_indices=prefix.clone(),
+                prefix_len=len(prefix),
                 kv=SimpleNamespace(cache_protected_len=4),
             )
             if adapter == "ordinary":
@@ -125,12 +126,12 @@ def _two_rank_restore_trace(rank, rendezvous, adapter, layerwise):
             assert tracking_key not in cache._load_markers
             torch.testing.assert_close(req.prefix_indices, prefix)
             if all_ready:
-                torch.testing.assert_close(restored, slots)
+                assert restored == len(slots)
                 assert allocator.free.call_count == frees_before
                 request_owned = adapter == "hybrid" or layerwise
                 assert (tracking_key in cache._restore_leases) is request_owned
             else:
-                assert restored.numel() == 0
+                assert restored == 0
                 assert node is prefix_node
                 assert tracking_key not in cache._restore_leases
                 assert not hasattr(req, "pending_restore_slots")
@@ -143,7 +144,9 @@ def _two_rank_restore_trace(rank, rendezvous, adapter, layerwise):
                 existing = RadixCache.match_prefix(
                     cache, MatchPrefixParams(key=prefix_key)
                 )
-                torch.testing.assert_close(existing.device_indices, prefix)
+                torch.testing.assert_close(
+                    cache.path_device_indices(existing.last_device_node), prefix
+                )
                 assert existing.last_device_node is prefix_node
             # The same group must remain usable after rollback.
             dist.barrier()

@@ -1,66 +1,75 @@
-from types import SimpleNamespace
+"""Admission behavior of opt-in completion of a restored short tail."""
+
 from unittest.mock import MagicMock
 
-import torch
+import pytest
+import test_prefill_adder as fixtures
 
-from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
-from sglang.srt.mem_cache.prefill_budget import PrefillBudget
+from sglang.srt.managers.schedule_policy import AddReqResult
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 
-def test_zero_chunk_budget_rejects_before_storage_restore():
-    tree_cache = MagicMock()
-    tree_cache.disable = False
-    tree_cache.supports_mamba.return_value = False
-    tree_cache.evictable_size.return_value = 0
-    tree_cache.is_tree_cache.return_value = False
+@pytest.fixture
+def factory():
+    case = fixtures.TestPrefillAdder()
+    case.setUp()
+    try:
+        yield case
+    finally:
+        case.doCleanups()
 
-    allocator = MagicMock()
-    allocator.available_size.return_value = 4096
 
-    adder = PrefillAdder.__new__(PrefillAdder)
-    adder.page_size = 4
-    adder.exact_chunk_fill = False
-    allocator.page_size = 4
-    adder.memory_budget = PrefillBudget(allocator, tree_cache)
-    adder.tree_cache = tree_cache
-    adder.token_to_kv_pool_allocator = allocator
-    adder.running_batch = None
-    adder.prefill_delayer_single_pass = None
-    adder.dsa_prefill_cp_in_seq_split = False
-    adder.prefill_max_requests = None
-    adder.can_run_list = []
-    adder.dllm_config = None
-    adder.rem_chunk_tokens = 0
-    adder.rem_input_tokens = 4096
-    adder.rem_total_token_offset = 0
-    adder.cur_rem_token_offset = 0
-    adder.is_hybrid_swa = False
-    adder.is_all_swa = False
-    adder.is_hybrid_ssm_cache = False
-    adder._mamba_slot_cost = 0
-    adder.rem_mamba_slots = None
-
-    req = SimpleNamespace(
-        sampling_params=SimpleNamespace(max_new_tokens=16, ignore_eos=False),
-        output_ids=[],
-        full_untruncated_fill_ids=list(range(12)),
-        prefix_indices=torch.arange(4, dtype=torch.int64),
-        host_hit_length=4,
-        swa_host_hit_length=0,
-        last_node=object(),
-        retracted_stain=False,
-        needs_host_load_back=lambda: True,
+def setup_admission(
+    factory, *, initial=8, remaining=4, tail=8, host=4, existing=True, enabled=True
+):
+    cache = factory.mock_tree_cache
+    cache.supports_mamba.return_value = False
+    cache.supports_swa.return_value = False
+    cache.window_sub_pools.return_value = ()
+    cache.window_reprefill_tail_tokens.return_value = 0
+    cache.prefer_complete_restored_requests = enabled
+    allocator = factory.mock_token_allocator
+    allocator.available_size.return_value = 10000
+    allocator.full_available_size.return_value = 10000
+    req = factory.create_mock_req("restore", 0, 1)
+    req.full_untruncated_fill_ids = list(range(host + tail))
+    req.best_match_node = req.last_node
+    req.host_hit_length = host
+    req.needs_host_load_back.return_value = host > 0
+    cache.init_load_back.return_value = (host, req.last_node)
+    cache.load_back_is_cache_owned.return_value = False
+    adder = factory.create_adder(
+        factory.create_running_batch(), rem_chunk_tokens=initial, page_size=1
     )
+    adder.rem_chunk_tokens = remaining
+    if existing:
+        adder.can_run_list = [object()]
+    return adder, req, cache
 
-    result = adder.add_one_req(
-        req,
-        has_chunked_req=False,
-        truncation_align_size=None,
-    )
 
-    assert result is AddReqResult.OTHER
-    tree_cache.init_load_back.assert_not_called()
-    assert adder.can_run_list == []
+def test_restored_short_tail_waits_before_restore_and_vote(factory):
+    adder, req, cache = setup_admission(factory)
+    adder.prefill_delayer_single_pass = MagicMock()
+    assert adder.add_one_req(req, False, None) is AddReqResult.OTHER
+    assert req not in adder.can_run_list
+    cache.init_load_back.assert_not_called()
+    adder.prefill_delayer_single_pass.negotiate_should_allow_prefill.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "options", [dict(existing=False), dict(enabled=False), dict(tail=12), dict(host=0)]
+)
+def test_empty_batch_and_nonmatching_cases_continue_to_progress(factory, options):
+    adder, req, cache = setup_admission(factory, **options)
+    adder.add_one_req(req, False, None)
+    assert req in adder.can_run_list
+    assert req.extend_len > 0
+
+
+def test_zero_chunk_budget_rejects_before_storage_restore(factory):
+    adder, req, cache = setup_admission(factory, remaining=0)
+    adder.add_one_req(req, False, None)
+    assert req not in adder.can_run_list
+    cache.init_load_back.assert_not_called()

@@ -6,11 +6,11 @@ from unittest.mock import MagicMock
 
 import torch
 
-from sglang.srt.mem_cache.unified_cache.components.base import (
+from sglang.srt.mem_cache.unified_cache.component_type import (
     BASE_COMPONENT_TYPE,
     ComponentType,
-    EvictLayer,
 )
+from sglang.srt.mem_cache.unified_cache.components.base import EvictLayer
 from sglang.srt.mem_cache.unified_cache.components.swa import SWAComponent
 from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -24,7 +24,13 @@ def _component_with_mapping(mapping: torch.Tensor):
     allocator.translate_loc_from_full_to_swa.return_value = mapping
 
     component = object.__new__(SWAComponent)
-    component.cache = SimpleNamespace(token_to_kv_pool_allocator=allocator)
+    component.cache = SimpleNamespace(
+        token_to_kv_pool_allocator=allocator,
+        kv_storage=lambda: SimpleNamespace(
+            tree_sub_pool=lambda *a, **kw: "swa",
+            window_ids=lambda name, ids: allocator.translate_loc_from_full_to_swa(ids),
+        ),
+    )
     component.tree_core = SimpleNamespace(
         component_evictable_size_={ComponentType.SWA: mapping.numel()},
         host_lru_lists={ComponentType.SWA: MagicMock()},
@@ -54,6 +60,7 @@ def test_swa_evict_reports_only_live_physical_slots():
         node,
         device_frees=device_frees,
         host_frees=defaultdict(list),
+        cache_actions=[],
         target=EvictLayer.DEVICE,
     )
 
@@ -75,7 +82,7 @@ def test_internal_ghost_tombstone_reports_structural_progress():
     core.component_evictable_size_ = {ComponentType.SWA: 2}
     component = MagicMock()
 
-    def tombstone_internal(_tracker, _device_frees, _host_frees):
+    def tombstone_internal(_tracker, _device_frees, _host_frees, **kwargs):
         core.component_evictable_size_[ComponentType.SWA] = 0
         return None
 
@@ -114,6 +121,7 @@ def test_swa_evict_does_not_claim_tombstoned_slots():
         node,
         device_frees=defaultdict(list),
         host_frees=defaultdict(list),
+        cache_actions=[],
         target=EvictLayer.DEVICE,
     )
 

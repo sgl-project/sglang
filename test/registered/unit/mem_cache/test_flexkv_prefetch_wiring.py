@@ -5,7 +5,7 @@ import json
 import sys
 from array import array
 from pathlib import Path
-from types import ModuleType, SimpleNamespace
+from types import ModuleType
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -19,8 +19,8 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
 from sglang.srt.mem_cache.storage.flexkv import _flexkv_factory
-from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.flexkv_test_utils import RequestState as SimpleNamespace
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
@@ -137,8 +137,11 @@ def test_completion_releases_only_its_unused_lookup(lookup_cache):
 
     inner = getattr(cache, "_inner_cache", None)
     target = inner if inner is not None else RadixCache
-    with patch.object(target, "cache_finished_req"):
-        cache.cache_finished_req(req, is_insert=False, owned_kv_len=8)
+    req.finished = lambda: False
+    if hybrid:
+        cache._swa_grid_tokens = 0
+    with patch.object(target, "checkpoint"):
+        cache.checkpoint(req, up_to=8)
 
     cache.flexkv_connector.release_pending.assert_called_once_with(rid)
     # Another request's lookup and in-flight Store ownership are untouched.
@@ -157,6 +160,8 @@ def test_scheduler_flexkv_prefetch_is_one_liner_to_tree_cache():
     sched.tree_cache = MagicMock()
 
     req = SimpleNamespace(rid="x", cache_request_handle=CacheRequestHandle("x", 0))
+    sched.enable_unified_cache_external_linker = False
+    sched.enable_lmcache = False
     sched._prefetch_kvcache(req)
     sched.tree_cache.prefetch_request.assert_called_once_with(req)
 
@@ -230,6 +235,8 @@ def test_shutdown_releases_flexkv_and_inner_host_resources(
         cache.shutdown()
     else:
         scheduler = Scheduler.__new__(Scheduler)
+        scheduler.request_receiver = MagicMock()
+        scheduler.uocr_runtime = None
         scheduler.tree_cache = cache
         scheduler.hisparse_coordinator = None
         scheduler.decode_offload_manager = None
@@ -266,6 +273,8 @@ def test_factory_uses_published_parallel_context(
         # Stale worker state must not leak into the connector topology.
         tp_worker=SimpleNamespace(ps=SimpleNamespace(dp_rank=99, attn_dp_rank=99)),
         enable_hierarchical_cache=False,
+        disable_radix_cache=False,
+        full_tokens_per_layer=1,
         is_hybrid_ssm=False,
         is_hybrid_swa=hybrid,
     )
@@ -290,6 +299,10 @@ def test_factory_uses_published_parallel_context(
             "sglang.srt.mem_cache.storage.flexkv.get_memory",
             return_value=SimpleNamespace(flexkv_config_file=None),
         ),
+        patch(
+            "sglang.srt.mem_cache.registry.create_unified_radix_cache",
+            return_value=unified_module,
+        ) as build_inner,
         patch("sglang.srt.runtime_context.get_parallel", return_value=parallel),
     ):
         result = _flexkv_factory(context)
@@ -304,5 +317,25 @@ def test_factory_uses_published_parallel_context(
     assert constructor.call_args.kwargs["pp_rank"] == 1
     assert constructor.call_args.kwargs["attn_cp_rank"] == 0
     if hybrid:
-        assert context.params.tree_components == (ComponentType.FULL, ComponentType.SWA)
-        unified_module.UnifiedRadixCache.assert_called_once_with(context.params)
+        build_inner.assert_called_once_with(context)
+        assert constructor.call_args.kwargs["inner_cache"] is unified_module
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_pending_observer_runs_only_at_opted_in_symmetric_hook(monkeypatch, enabled):
+    monkeypatch.setenv("SGLANG_FLEXKV_PENDING_PREFIX_PROBE", "1" if enabled else "0")
+    sched = Scheduler.__new__(Scheduler)
+    sched.enable_hierarchical_cache = False
+    sched.enable_unified_cache_external_linker = False
+    sched.enable_hicache_storage = False
+    sched.enable_lmcache = False
+    sched.enable_flexkv = True
+    sched.waiting_queue = [object()]
+    sched.tree_cache = MagicMock()
+    sched._process_hicache_events()
+    sched.tree_cache.check_hicache_events.assert_called_once_with()
+    assert sched.tree_cache.refresh_pending_prefix_metrics.call_count == int(enabled)
+    if enabled:
+        sched.tree_cache.refresh_pending_prefix_metrics.assert_called_once_with(
+            sched.waiting_queue
+        )

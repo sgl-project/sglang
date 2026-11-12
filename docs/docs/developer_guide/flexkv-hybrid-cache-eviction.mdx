@@ -1,112 +1,97 @@
 ---
 title: "FlexKV hybrid cache eviction"
-description: "Understand how FlexKV restores and evicts full-attention and sliding-window KV cache without exhausting either device pool."
+description: "Restore ownership, named window demand, and cross-rank rollback in the FlexKV hybrid adapter."
 ---
 
-FlexKV can restore a cached prompt from host memory to device memory. On hybrid-attention models, that restore uses two device-memory pools:
+FlexKV restores a hybrid-attention prefix into a FULL token pool and its live
+sliding-window (SWA) tail. The adapter wraps the unified cache created from the
+storage's tree slots. The unified cache retains responsibility for insertion,
+window state, tree locks, and pool accounting.
 
-- The **full-attention pool** stores KV data used by full-attention layers.
-- The **sliding-window attention (SWA) pool** stores KV data used by layers that attend to a recent window.
+## Price the allocation with KVDemand
 
-An allocation succeeds only when both pools have enough free capacity for their parts of the restore. This page explains how to calculate that capacity and how to diagnose failures that appear only under memory pressure.
-
-## Follow the restore path
-
-`FlexKVHybridRadixCache._alloc_restore_slots()` first asks the allocator for device slots. If the allocation fails, it follows this path:
-
-```text
-_alloc_restore_slots()
-  -> evict_from_tree_cache()
-  -> allocator.evict_to_free_tokens(...)
-  -> tree_cache.evict_for_alloc(EvictParams(...))
-  -> retry the allocation
-```
-
-Small tests may never enter `evict_from_tree_cache()` because the device pools still have free slots. Always include a memory-pressure test when you change this path.
-
-## Keep demand separate from eviction
-
-The eviction helper accepts two allocation demands:
+`FlexKVHybridRadixCache._alloc_restore_slots()` first attempts allocation. On
+failure it calls `evict_for_alloc(KVDemand(...))`, then retries once. A demand
+states the capacity the allocation needs, including each window pool by name:
 
 ```python
-evict_from_tree_cache(
-    tree_cache,
-    num_tokens=full_need,
-    swa_num_tokens=swa_need,
+KVDemand(
+    full_tokens=host_hit_length,
+    window_tokens={name: swa_need for name, _ in cache.window_sub_pools()},
 )
 ```
 
-`num_tokens` and `swa_num_tokens` describe how much capacity the pending allocation needs. They do not describe how many cached tokens to evict.
+For a paged restore, the current connector supplies one live SWA page:
+`min(page_size, host_hit_length)`. With `page_size == 1`, the SWA demand covers
+the full restored hit. Normal extend/decode allocations can have different
+window demands; do not replace all of them with the restore's tail demand.
 
-For independent fixed-capacity pools, evict only each pool's deficit:
+Allocation demand is different from the number of tokens to evict. For separate
+fixed pools, a FULL demand of 128 with 80 available requires 48 more FULL slots.
+A window demand of 64 with 32 available requires 32 more window slots. Shared
+allocators use their own reclaim discipline and byte/slot accounting. Passing
+those demands directly to `EvictParams` would over-evict; `evict_for_alloc`
+calculates the required reclaim through the allocator's discipline.
 
-```python
-full_to_evict = max(0, full_need - full_available)
-swa_to_evict = max(0, swa_need - swa_available)
+## Agree before launching a restore
+
+When the connector implements `sync_load_ready`, every participating rank votes
+after its local allocation/retry, including ranks whose allocation failed.
+A rejected vote frees only successful peers' fresh allocations and releases
+held lookups. Existing tree prefixes retain their owners. Both ordinary and
+hybrid adapters follow this contract in MP and IP modes.
+
+```mermaid
+sequenceDiagram
+    participant S as Scheduler ranks
+    participant A as Local adapters
+    participant C as FlexKV connector
+    S->>A: Admit and allocate destination slots
+    A->>A: Evict for named KVDemand and retry if needed
+    A->>C: sync_load_ready(local_ready), on every rank
+    alt Any allocation failed
+        C-->>A: False on every rank
+        A->>A: Free fresh peer slots and release lookup
+        A-->>S: No restored prefix; retry or recompute
+    else All allocations succeeded
+        C-->>A: True on every rank
+        A->>C: Retrieve or prepare layerwise H2D
+        A-->>S: Restored length and node handle
+    end
 ```
 
-For example, suppose a restore needs 128 full-attention slots and 64 SWA slots. If 80 full-attention slots and 32 SWA slots are free, the cache should evict 48 full-attention slots and 32 SWA slots.
+Local-pressure eviction never polls Store-completion collectives. Those run at
+the scheduler's rank-symmetric cache-event hook.
 
-| Pool | Needed | Available | Evict |
-| --- | ---: | ---: | ---: |
-| Full attention | 128 | 80 | 48 |
-| SWA | 64 | 32 | 32 |
+## Keep the restored row owned until checkpoint or release
 
-Passing `swa_need` directly to `EvictParams.swa_num_tokens` would evict 64 SWA slots in this example, twice the required amount.
+Matches expose `device_prefix_len`; `prefix_device_indices(req)` materializes
+the resident tree path plus any private restore lease. Hybrid MP and IP
+restores remain request-owned until `checkpoint(req, up_to=...)` publishes
+computed KV through the inner cache. Stores use a snapshot of tree-owned slots
+and retain the source node lock until synchronized completion.
 
-## Calculate SWA demand for each allocation mode
+A discarded request follows the core's row-release path instead. The adapter
+validates its lease and applies the restored SWA eviction cursor **before** the
+inner cache frees the row. This prevents an older, unmapped part of the FULL
+restore from being freed again as live SWA. `on_release` then retires the lease
+without cancelling a successor that reused the tracking key.
 
-FlexKV uses different SWA allocation behavior depending on the page size:
+Queued aborts use `RequestRetirer` and `finish(handle, ABORT)`. An allocation
+that has not yet acquired a request row remains in the orphan ledger until
+reset fences the connector's writers. A positive partial layerwise return is
+fatal: its length does not establish that a DMA destination is idle.
 
-| Allocation mode | Full-attention demand | SWA demand |
-| --- | ---: | ---: |
-| `page_size == 1` | `host_hit_length` | `host_hit_length` |
-| `page_size > 1`, hybrid SWA tail restore | `host_hit_length` | `min(page_size, host_hit_length)` |
-| Non-SWA allocator | `host_hit_length` | Not supplied |
+## Test memory pressure and ownership
 
-With `page_size == 1`, `SWATokenToKVPoolAllocator.alloc()` allocates one full-attention slot and one SWA slot per restored token. The two demands are therefore equal.
+Run the FlexKV tests under `test/registered/unit/mem_cache/` and
+`test/registered/unit/managers/`, together with `test_registry.py`,
+`test_prefill_adder.py`, and `test_swa_eviction_accounting.py`.
+`test_evict_from_tree_cache.py` now exercises named KVDemand at the adapter's
+owning allocation interface, including tail-only windows and retry behavior.
 
-With paged allocation, `alloc_extend_swa_tail()` restores full-attention KV for the whole host hit but SWA KV only for the last page. Its SWA demand is at most one page.
-
-If a caller omits `swa_num_tokens`, `evict_from_tree_cache()` defaults it to `num_tokens`. This keeps existing callers compatible because normal hybrid allocations reserve the same token demand from both pools.
-
-## Let the allocator plan reclamation
-
-`evict_from_tree_cache()` forwards the allocation demand to the allocator. The fixed SWA allocator computes separate Full and SWA deficits. Shared-memory allocators can instead calculate a reclaim plan and compact the shared pool before retrying allocation; their physical-capacity accounting cannot be replaced by a generic token-count loop.
-
-The FlexKV adapter retries allocation once after reclamation. If capacity is still unavailable, it returns without launching H2D, and scheduler admission can retry later. It does not spin on protected cache entries.
-
-## Recognize the failure pattern
-
-An interface mismatch can stay hidden until the cache is full:
-
-1. A small run restores data without eviction and passes.
-2. A larger or more concurrent run exhausts a device pool.
-3. `_alloc_restore_slots()` enters the eviction path.
-4. If the caller and helper signatures disagree, Python raises `TypeError` before eviction.
-5. Later requests may report connection failures if the server process exits.
-
-Start with the first server-side exception. A final `Connection refused` error is often a consequence, not the root cause.
-
-## Test changes to this path
-
-Run the focused CPU tests:
-
-```bash
-python -m pytest -q \
-  test/registered/unit/mem_cache/test_evict_from_tree_cache.py \
-  test/registered/unit/mem_cache/test_flexkv_hybrid_radix_cache.py
-```
-
-The tests should cover these cases:
-
-- only the full-attention pool has a deficit;
-- only the SWA pool has a deficit;
-- both pools already have enough capacity;
-- a caller omits `swa_num_tokens`;
-- eviction cannot make progress; and
-- `page_size == 1` requests SWA capacity for the full host hit.
-
-After the CPU tests pass, run a workload that is large enough to trigger real eviction. Confirm that the log contains no `TypeError`, the server stays healthy, and the restore round returns responses for every request.
-
-For the broader cache hierarchy, see [HiCache system design and optimization](/docs/advanced_features/hicache_design).
+The allocation regression uses real two-rank Gloo with controlled CPU slots
+and transfer endpoints. It covers ordinary/hybrid × MP/IP, either rank failing,
+both ranks failing, rollback, and later progress. These checks establish CPU
+protocol behavior. GPU allocation failures, DMA, model output, physical remote
+I/O, and performance require separate validation on the intended deployment.

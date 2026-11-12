@@ -10,7 +10,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     block_quant_dequant,
     inverse_transform_scale_ue8m0,
 )
-from sglang.srt.utils import set_weight_attrs
+from sglang.srt.layers.utils.common import set_weight_attrs
 
 NVFP4_BLOCK_SIZE = 16
 _FP4_E2M1_LUT = torch.tensor(

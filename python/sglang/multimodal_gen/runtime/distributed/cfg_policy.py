@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 import torch
 
@@ -125,7 +125,10 @@ def _apply_cfg_postprocess(
 ) -> torch.Tensor:
     if batch.cfg_normalization and float(batch.cfg_normalization) > 0:
         noise_pred = _apply_cfg_normalization(
-            noise_pred, noise_pred_cond, float(batch.cfg_normalization)
+            noise_pred,
+            noise_pred_cond,
+            float(batch.cfg_normalization),
+            gather=_sp_latent_gather(batch, pipeline_config),
         )
     if batch.guidance_rescale > 0.0:
         noise_pred = _rescale_noise_cfg(
@@ -134,19 +137,35 @@ def _apply_cfg_postprocess(
     return pipeline_config.postprocess_cfg_noise(batch, noise_pred, noise_pred_cond)
 
 
+def _sp_latent_gather(
+    batch: Req, pipeline_config: Any
+) -> Callable[[torch.Tensor], torch.Tensor] | None:
+    from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+        get_sp_world_size,
+    )
+
+    if not getattr(batch, "did_sp_shard_latents", False) or get_sp_world_size() <= 1:
+        return None
+    return lambda tensor: pipeline_config.gather_latents_for_sp(tensor, batch=batch)
+
+
 def _apply_cfg_normalization(
     noise_pred: torch.Tensor,
     noise_pred_cond: torch.Tensor,
     cfg_normalization: float,
+    gather: Callable[[torch.Tensor], torch.Tensor] | None = None,
 ) -> torch.Tensor:
-    cond_f = noise_pred_cond.float()
-    pred_f = noise_pred.float()
-    ori_norm = torch.linalg.vector_norm(cond_f)
-    new_norm = torch.linalg.vector_norm(pred_f)
+    # The norms are over the whole latent; under SP each rank holds only a shard
+    cond_f = (noise_pred_cond if gather is None else gather(noise_pred_cond)).float()
+    pred_f = (noise_pred if gather is None else gather(noise_pred)).float()
+    dims = list(range(1, noise_pred.ndim))
+    ori_norm = torch.linalg.vector_norm(cond_f, dim=dims, keepdim=True)
+    new_norm = torch.linalg.vector_norm(pred_f, dim=dims, keepdim=True)
     max_norm = ori_norm * cfg_normalization
-    if new_norm > max_norm:
-        noise_pred = noise_pred * (max_norm / new_norm)
-    return noise_pred
+    scale = torch.where(
+        new_norm > max_norm, max_norm / new_norm, torch.ones_like(new_norm)
+    )
+    return (noise_pred * scale).to(noise_pred.dtype)
 
 
 def _rescale_noise_cfg(

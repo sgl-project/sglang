@@ -422,6 +422,8 @@ Use this option when you have sufficient GPU memory and want to minimize latency
 
 This can reduce GPU memory usage, improve inference speed, and help to avoid OOM, but may impact model performance, thus set a proper value based on your specific use case. The config entries are passed as `images_kwargs`, `videos_kwargs`, and `audio_kwargs` to the HuggingFace processor, so each modality's settings are kept separate and do not collide. Refer to the HuggingFace documentation for your model's processor to understand the available parameters.
 
+For GLM-V models, the per-request `video_url` fields `fps`, `max_frames`, `max_tokens_per_frame`, and `max_image_tokens` can only tighten the deployment's video budget. Larger `fps`, `max_frames`, and `max_image_tokens` values are clamped to the deployment setting, and a `max_tokens_per_frame` that would exceed the video token budget is ignored. Raise the limits with `--mm-process-config` instead.
+
 ### Bidirectional Attention in Multimodal Model Serving
 **Note for serving the Gemma-3 multimodal model**:
 

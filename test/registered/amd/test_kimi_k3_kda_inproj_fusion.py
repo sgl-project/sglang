@@ -16,7 +16,7 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.kernels.ops.kimi_k3 import kimi_k3_tiny_gemm
+from sglang.kernels.ops.gemm import kimi_k3_tiny_gemm
 from sglang.srt.models.kimi_k3 import (
     KimiK3DeltaAttention,
     _merge_weights_as_views,

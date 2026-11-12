@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
+from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle, MatchPrefixParams
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -57,6 +57,94 @@ class _RestoreLease:
 
 
 class FlexKVCacheLifecycleMixin:
+    def refresh_pending_prefix_metrics(self, waiting_queue) -> None:
+        """Observe FCFS compute demand at the rank-symmetric scheduler hook."""
+        if not waiting_queue:
+            return
+        connector = self.flexkv_connector
+        peek = getattr(self, "peek_prefix_length", None)
+        capabilities = (
+            "pending_probe_plan",
+            "peek_cpu_prefix_tokens",
+            "sync_prefix_length",
+        )
+        if not callable(peek) or not all(
+            callable(getattr(connector, name, None)) for name in capabilities
+        ):
+            for req in waiting_queue:
+                req._pending_prefix_probe_valid = False
+            return
+        plan = connector.pending_probe_plan(
+            [getattr(req, "_pending_prefix_observed_at", 0.0) for req in waiting_queue]
+        )
+        from sglang.srt.environ import envs
+        from sglang.srt.mem_cache.radix_cache import RadixKey
+
+        for index in plan["indices"]:
+            req = waiting_queue[index]
+            namespace = _namespace_kwargs(connector, req.extra_key, req.cache_salt)
+            tokens = req.full_untruncated_fill_ids
+            end = req._compute_max_prefix_len(len(tokens))
+            count = None
+            if namespace is not None:
+                if (
+                    self.disable
+                    or req.positional_embed_overrides is not None
+                    or envs.SGLANG_RADIX_FORCE_MISS.get()
+                ):
+                    count = 0
+                elif end <= 0:
+                    count = 0
+                else:
+                    key = RadixKey(
+                        tokens,
+                        req.extra_key,
+                        limit=end,
+                        cache_salt=req.cache_salt,
+                    )
+                    gpu = connector.sync_prefix_length(peek(MatchPrefixParams(key=key)))
+                    aligned = end // self.page_size * self.page_size
+                    if gpu >= aligned:
+                        count = min(gpu, end)
+                    else:
+                        mask = torch.ones(aligned, dtype=torch.bool)
+                        mask[:gpu] = False
+                        host = connector.peek_cpu_prefix_tokens(
+                            tokens[:aligned], mask, **namespace
+                        )
+                        if host is not None:
+                            count = min(end, gpu + host)
+            req._pending_prefix_observed_tokens = count
+            req._pending_prefix_probe_valid = count is not None
+            req._pending_prefix_observed_at = plan["observed_at"]
+
+    def _validate_row_restore_owner(self, kv) -> Optional[Req]:
+        owner = None
+        for lease in list(self._restore_leases.values()) + list(
+            self._aborted_restore_leases.values()
+        ):
+            if lease.req.kv is kv:
+                self._validate_restore_lease(lease.req)
+                owner = lease.req
+        return owner
+
+    def prefix_device_indices(self, req: Req) -> torch.Tensor:
+        indices = self.path_device_indices(req.last_node)[: req.prefix_len]
+        missing = req.prefix_len - len(indices)
+        if missing:
+            lease = self._validate_restore_lease(req)
+            if lease is None:
+                raise RuntimeError(
+                    f"FlexKV private prefix has no restore owner: {req.rid}"
+                )
+            tree_length = getattr(
+                req, "_flexkv_restore_tree_owned_len", req.kv.cache_protected_len
+            )
+            skip = max(len(indices) - tree_length, 0)
+            indices = torch.cat([indices, lease.device_indices[skip : skip + missing]])
+        assert len(indices) == req.prefix_len
+        return indices
+
     def _init_restore_state(self) -> None:
         self._restore_leases: dict[str, _RestoreLease] = {}
         self._aborted_restore_leases: dict[int, _RestoreLease] = {}

@@ -17,7 +17,7 @@ import requests
 import torch
 
 from sglang.kernels.ops.attention.dsv4.fp4_indexer_schedule_hip import MAX_FUSED_ROWS
-from sglang.kernels.ops.attention.dsv4.unified_kv_kernels import runtime
+from sglang.kernels.ops.kvcache import dsv4_unified_kv_store
 from sglang.kernels.ops.speculative.dspark import dspark_verify_window
 from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
     DeepseekV4HipRadixBackend,
@@ -121,7 +121,7 @@ class TestDSparkUnifiedKVKernelsAMD(CustomTestCase):
                     self.assertIs(result, eager_metadata)
                     backend.init_forward_metadata_target_verify_old.assert_called_once()
 
-    def test_build_unified_commit_inject_layout(self):
+    def test_build_ring_commit_inject_layout(self):
         stride, ring_stride = 7, 128
         req_pool_indices = torch.tensor([3, 0, 5, 1], device=DEVICE, dtype=torch.int32)
         prefix_lens = torch.tensor(
@@ -130,7 +130,7 @@ class TestDSparkUnifiedKVKernelsAMD(CustomTestCase):
         block_pos_offsets = torch.arange(stride, device=DEVICE, dtype=torch.int64)
         commit_lens = torch.tensor([0, 3, stride, 5], device=DEVICE, dtype=torch.int32)
 
-        got = dspark_verify_window.build_unified_commit_inject_layout(
+        got = dspark_verify_window.build_ring_commit_inject_layout(
             req_pool_indices=req_pool_indices,
             prefix_lens=prefix_lens,
             block_pos_offsets=block_pos_offsets,
@@ -163,11 +163,15 @@ class TestDSparkUnifiedKVKernelsAMD(CustomTestCase):
         keep = loc >= 0
         expected[loc[keep].long()] = kv[keep]
 
-        runtime.scatter_bf16_into_unified(kv=kv, loc=loc, unified_kv=unified)
+        dsv4_unified_kv_store.scatter_bf16_into_unified(
+            kv=kv, loc=loc, unified_kv=unified
+        )
         self.assertTrue(torch.equal(unified, expected))
 
         with self.assertRaises(AssertionError):
-            runtime.scatter_bf16_into_unified(kv=kv, loc=loc, unified_kv=unified.t())
+            dsv4_unified_kv_store.scatter_bf16_into_unified(
+                kv=kv, loc=loc, unified_kv=unified.t()
+            )
 
 
 class TestDeepseekV4DSparkUnifiedKVGSM8K(CustomTestCase):
@@ -183,9 +187,8 @@ class TestDeepseekV4DSparkUnifiedKVGSM8K(CustomTestCase):
             "--trust-remote-code",
             "--tp",
             "8",
-            "--dp",
+            "--attn-dp-size",
             "8",
-            "--enable-dp-attention",
             "--enable-dp-lm-head",
             "--enable-prefill-delayer",
             "--disable-radix-cache",

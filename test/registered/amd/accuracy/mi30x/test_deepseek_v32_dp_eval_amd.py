@@ -28,6 +28,7 @@ register_amd_ci(
     est_time=5400,
     suite="nightly-amd-accuracy-8-gpu-deepseek-v32-dp",
     nightly=True,
+    disabled="Older model generation; AMD nightly keeps the latest two per family",
 )
 
 DEEPSEEK_V32_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2"
@@ -50,9 +51,8 @@ class TestDeepseekV32DP(CustomTestCase):
             "--trust-remote-code",
             "--tp",
             "8",
-            "--dp",
+            "--attn-dp-size",
             "8",
-            "--enable-dp-attention",
             "--attention-backend",
             "aiter",
             "--chunked-prefill-size",

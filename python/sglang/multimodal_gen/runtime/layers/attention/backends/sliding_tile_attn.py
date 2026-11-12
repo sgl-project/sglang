@@ -80,12 +80,6 @@ class SlidingTileAttentionMetadata(AttentionMetadata):
 
 
 class SlidingTileAttentionMetadataBuilder(AttentionMetadataBuilder):
-    def __init__(self):
-        pass
-
-    def prepare(self):
-        pass
-
     def build(  # type: ignore
         self,
         STA_param: list[list[Any]],
@@ -121,7 +115,10 @@ class SlidingTileAttentionImpl(AttentionImpl):
             get_global_server_args().attention_backend_config.mask_strategy_file_path
         )
         if mask_strategy_file_path is None:
-            raise ValueError("SGLANG_DIFFUSION_ATTENTION_CONFIG is not set")
+            raise ValueError(
+                "sliding_tile_attn needs --attention-backend-config "
+                "mask_strategy_file_path=<path to the mask strategy JSON>"
+            )
 
         # TODO(kevin): get mask strategy for different STA modes
         with open(mask_strategy_file_path) as f:

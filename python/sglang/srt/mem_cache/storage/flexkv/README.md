@@ -3,7 +3,7 @@
 SGLang delegates host, SSD, and remote KV transfers to the external
 [FlexKV package](https://github.com/taco-project/FlexKV). Ordinary models use
 `FlexKVRadixCache(RadixCache)`. DeepSeek V4's split C4/C128/SWA layout uses
-`FlexKVHybridRadixCache`, which wraps `UnifiedRadixCache(FULL, SWA)` and leaves
+`FlexKVHybridRadixCache`, which wraps the current unified cache built from the storage tree slots and leaves
 radix insertion, SWA state, and eviction accounting with the inner cache.
 
 ## Setup
@@ -39,7 +39,7 @@ and retrieval until scheduler admission has passed:
   cached but is reported as an admission miss so recomputation is budgeted.
 - **IP, `FLEXKV_ENABLE_LAYERWISE_TRANSFER=1`:** the adapter registers ownership
   before starting H2D. Per-layer transfer counters fence consumption during
-  forward. Fresh slots remain request-owned until normal cache completion.
+  forward. Fresh slots remain request-owned until `checkpoint(req, up_to=...)` takes them over or the core releases their request row.
 - **Hybrid:** both MP and IP restore into request-owned slots. Normal completion
   inserts them through the inner unified cache, preserving SWA semantics.
 
@@ -61,6 +61,42 @@ applies to synchronous and layerwise transfers, independently of optional
 batching. A failed vote releases newly allocated peer slots and held lookups;
 existing GPU prefixes remain tree-owned. Connectors without this API retain the
 local allocation check. Use a connector with the API for cross-rank rollback.
+
+## Current SGLang lifecycle
+
+Matches report `device_prefix_len`; slot tensors are materialized lazily by
+`prefix_device_indices(req)`. A private restore lease contributes only its fresh
+slots, while an already resident prefix remains tree-owned. Checkpoints publish
+at most `up_to` tokens. The core owns row freeing, and `on_release` retires the
+lease after that free; metadata mismatches are rejected before row mutation.
+Queued aborts go through `RequestRetirer` and `finish(handle, ABORT)`; pre-row
+allocations remain recorded until reset fences their writers.
+
+`FLEXKV_WHOLE_RESTORE_TAIL=1` prefers completing an ordinary IP restored tail in
+a fresh batch if it fits that batch's initial chunk budget. It defers before
+restore allocation and before the delayer vote, and an empty batch still makes
+progress. It is disabled by default and excludes hybrid/PP paths.
+
+`FLEXKV_BATCH_LAYERWISE_RESTORE=1` prepares ordinary IP restores at admission
+and flushes only admitted attempt keys before forward setup. It requires the
+connector's `flush_layerwise_loads` capability and is disabled by default.
+Allocation agreement and rollback apply with either setting.
+
+## Read-only pending-prefix observation
+
+Set `SGLANG_FLEXKV_PENDING_PREFIX_PROBE=1` to enable local GPU/CPU prefix
+observation at the rank-symmetric scheduler hook. It feeds FCFS waiting compute
+demand in `/v1/loads`; exact cache-aware matches retain precedence. The public
+connector must expose `pending_probe_plan`, `sync_prefix_length` and
+`peek_cpu_prefix_tokens`. The leader selects refreshes (default interval 0.5 s),
+all ranks use their minimum GPU-prefix length, and the host lookup is CPU-only.
+A pure tree walk never splits nodes, touches LRU or takes locks. Probe values
+live in separate observation fields; they never admit work, allocate KV slots,
+change request prefix ownership or populate request lookup/prefetch maps.
+Unavailable observation, unsupported namespace/connector and hybrid caches
+without a pure peek retain the historical load estimate. This is an estimate
+of waiting compute, not a prediction of future remote hits or latency. The
+feature is disabled by default pending workload overhead validation.
 
 ## Store ownership
 
@@ -118,6 +154,8 @@ option; when changing layouts, use an empty or separately namespaced cache pool.
   must use a fresh host/remote cache pool to discard those old entries.
 - DeepSeek V4 unified-KV, independent `--enable-hisparse` device-page mapping,
   and Mamba/SSM pools are unsupported.
+- `--disable-radix-cache` and pure-SWA models are rejected because this backend
+  needs a FULL prefix owner.
 - `--enable-streaming-session` is rejected: its wrapper can retain KV without
   calling the inner completion hooks needed to commit restore leases.
 - `--enable-hierarchical-cache` cannot be combined with FlexKV; they implement

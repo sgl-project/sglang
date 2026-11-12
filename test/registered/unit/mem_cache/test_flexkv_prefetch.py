@@ -98,7 +98,13 @@ def test_full_chain_and_candidate_offset(matched):
 
 def test_scheduler_starts_flexkv_without_hicache_storage_backend():
     cache = Mock()
-    scheduler = NS(enable_flexkv=True, enable_hicache_storage=False, tree_cache=cache)
+    scheduler = NS(
+        enable_flexkv=True,
+        enable_hicache_storage=False,
+        enable_unified_cache_external_linker=False,
+        enable_lmcache=False,
+        tree_cache=cache,
+    )
     req = NS(rid="r", cache_request_handle=CacheRequestHandle("r", 0))
     method(SCHEDULER, "Scheduler", "_prefetch_kvcache")(scheduler, req)
     cache.prefetch_request.assert_called_once_with(req)
@@ -130,17 +136,32 @@ def test_queue_entry_does_not_lookup_remote_or_allocate_restore(path, cls):
 
 
 def test_abort_releases_flexkv_without_hicache_enabled():
+    from unittest.mock import patch
+
+    from sglang.srt.managers.req_types import FINISH_ABORT
+    from sglang.srt.managers.schedule_batch import ReqKvInfo
+    from sglang.srt.managers.scheduler_components.request_retirer import RequestRetirer
+
     cache = Mock()
-    scheduler = NS(
-        enable_flexkv=True,
-        enable_hicache_storage=False,
-        enable_hierarchical_cache=False,
-        enable_unified_cache_external_linker=False,
+    req = NS(
+        cache_request_handle=CacheRequestHandle("r", 0),
+        finished_reason=FINISH_ABORT(),
+        owner_list=None,
+        session=None,
+        get_mm_token_counts=Mock(),
+        release_mm_inputs_on_abort=Mock(),
+        kv=ReqKvInfo(),
+    )
+    retirer = RequestRetirer(
         tree_cache=cache,
+        beam_coordinator=Mock(),
+        hisparse_coordinator=None,
+        uocr_runtime=None,
+        send_abort_output=Mock(),
+        stream_output=Mock(),
     )
-    method(SCHEDULER, "Scheduler", "_release_aborted_request")(
-        scheduler, NS(cache_request_handle=CacheRequestHandle("r", 0))
-    )
+    with patch("sglang.srt.managers.scheduler_components.request_retirer.record_exit"):
+        retirer.release(req, checkpoint=False)
     cache.finish.assert_called_once_with(
         CacheRequestHandle("r", 0), CacheRequestOutcome.ABORT
     )
@@ -210,6 +231,7 @@ def hybrid_restore():
         _alloc_restore_slots=Mock(return_value=slots),
         supports_swa=lambda: True,
         _empty_indices=lambda: torch.empty(0, dtype=torch.int64),
+        prefix_device_indices=lambda req: req.prefix_indices,
     )
     cache._restore_lease_matches_req = method(
         HYBRID, "FlexKVHybridRadixCache", "_restore_lease_matches_req"
@@ -242,7 +264,7 @@ def test_hybrid_restore_owns_slots_before_h2d_and_preserves_tree_boundary(
 ):
     cache, req, slots = hybrid_restore
     restored, node = cache.init_load_back(NS(req=req, host_hit_length=512))
-    assert restored is slots and node is req.last_node
+    assert restored == slots.numel() and node is req.last_node
     assert req.kv.cache_protected_len == 256
     assert req._flexkv_swa_evicted_seqlen == 512
     assert req.pending_restore_slots is slots
@@ -256,7 +278,7 @@ def test_hybrid_failed_restore_frees_once(hybrid_restore):
     cache.flexkv_connector.retrieve_kv.side_effect = None
     cache.flexkv_connector.retrieve_kv.return_value = 0
     restored, _ = cache.init_load_back(NS(req=req, host_hit_length=512))
-    assert restored.numel() == 0 and not cache._restore_leases
+    assert restored == 0 and not cache._restore_leases
     cache.token_to_kv_pool_allocator.free.assert_called_once_with(slots)
     assert req.pending_restore_slots is None
 
@@ -287,7 +309,7 @@ def test_hybrid_stale_generation_cannot_free_current_slots(hybrid_restore):
         (True, False, False, False),
         (True, True, False, True),
         (True, False, True, True),
-        (False, False, False, True),
+        (False, False, False, False),
     ],
 )
 def test_capacity_rejection_keeps_idle_flexkv_schedulable(
@@ -330,12 +352,21 @@ def test_capacity_rejection_keeps_idle_flexkv_schedulable(
             enable_unified_cache_external_linker=False,
             enable_flexkv=flexkv,
             tree_cache=NS(has_uncommitted_restore=lambda r: False),
+            _drop_unadmitted_match=lambda req: (
+                setattr(req.kv, "mamba_cow_src_index", None),
+                setattr(req.kv, "mamba_needs_clear", False),
+            ),
         ),
         get_memory=lambda: NS(enable_flexkv=flexkv),
-        AddReqResult=NS(CONTINUE="continue", NO_TOKEN="no_token"),
+        AddReqResult=NS(
+            CONTINUE="continue", NO_TOKEN="no_token", UNSCHEDULABLE="unschedulable"
+        ),
         res="no_token",
         running_batch=batch,
-        adder=NS(can_run_list=[req] if admitted else []),
+        adder=NS(
+            can_run_list=[req] if admitted else [],
+            batch_is_full_after_rejection=lambda req: admitted or running,
+        ),
         req=req,
         has_uncommitted_restore=None,
     )

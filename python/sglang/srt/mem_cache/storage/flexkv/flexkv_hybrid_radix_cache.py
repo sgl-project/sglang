@@ -65,7 +65,7 @@ class FlexKVHybridRadixCache(FlexKVCacheLifecycleMixin, BasePrefixCache):
     """Compose FlexKV I/O with an existing hybrid radix implementation.
 
     The inner cache remains the sole owner of radix/SWA bookkeeping. FlexKV
-    only restores request-owned slots; the normal cache_finished_req path then
+    only restores request-owned slots; the normal checkpoint path then
     inserts those slots with the same component semantics as fresh prefill.
     """
 
@@ -180,7 +180,7 @@ class FlexKVHybridRadixCache(FlexKVCacheLifecycleMixin, BasePrefixCache):
         if namespace_kwargs is None:
             return result
         token_ids = key.raw_token_ids()
-        device_length = int(result.device_indices.numel())
+        device_length = result.device_prefix_len
         if not token_ids or device_length >= len(token_ids):
             return result
 
@@ -206,7 +206,7 @@ class FlexKVHybridRadixCache(FlexKVCacheLifecycleMixin, BasePrefixCache):
             cache_protected_len=device_length,
         )
 
-    def init_load_back(self, params: InitLoadBackParams) -> tuple[torch.Tensor, Any]:
+    def init_load_back(self, params: InitLoadBackParams) -> tuple[int, Any]:
         req = params.req
         if _request_key(req.cache_request_handle) in self._restore_leases:
             raise RuntimeError(
@@ -218,7 +218,7 @@ class FlexKVHybridRadixCache(FlexKVCacheLifecycleMixin, BasePrefixCache):
             self.flexkv_connector.release_pending(
                 _request_key(req.cache_request_handle)
             )
-            return self._empty_indices(), req.last_node
+            return 0, req.last_node
 
         device_indices = self._alloc_restore_slots(req, params.host_hit_length)
         ready = device_indices is not None
@@ -233,7 +233,7 @@ class FlexKVHybridRadixCache(FlexKVCacheLifecycleMixin, BasePrefixCache):
             self.flexkv_connector.release_pending(
                 _request_key(req.cache_request_handle)
             )
-            return self._empty_indices(), req.last_node
+            return 0, req.last_node
 
         # Register ownership before launching the connector. If launch raises,
         # its write status may be unknown; reset must drain the connector before
@@ -266,7 +266,7 @@ class FlexKVHybridRadixCache(FlexKVCacheLifecycleMixin, BasePrefixCache):
                 )
             self.token_to_kv_pool_allocator.free(lease.device_indices)
             self._commit_restore(req)
-            return self._empty_indices(), req.last_node
+            return 0, req.last_node
 
         if (
             self.supports_swa()
@@ -274,7 +274,9 @@ class FlexKVHybridRadixCache(FlexKVCacheLifecycleMixin, BasePrefixCache):
             and hasattr(self.token_to_kv_pool_allocator, "alloc_extend_swa_tail")
             and device_indices.numel() > 0
         ):
-            restored_end = int(req.prefix_indices.numel() + device_indices.numel())
+            restored_end = int(
+                self.prefix_device_indices(req).numel() + device_indices.numel()
+            )
             swa_tail_length = min(self.page_size, int(device_indices.numel()))
             req._flexkv_swa_evicted_seqlen = restored_end - swa_tail_length
 
@@ -283,7 +285,8 @@ class FlexKVHybridRadixCache(FlexKVCacheLifecycleMixin, BasePrefixCache):
         # inner cache can deduplicate or free every restored slot correctly.
         req.kv.cache_protected_len = marker.device_length
         req._flexkv_uncached_restore = True
-        return device_indices, req.last_node
+        req._flexkv_restore_tree_owned_len = marker.device_length
+        return int(device_indices.numel()), req.last_node
 
     def _alloc_restore_slots(
         self, req: Req, host_hit_length: int
@@ -292,7 +295,7 @@ class FlexKVHybridRadixCache(FlexKVCacheLifecycleMixin, BasePrefixCache):
         if self.page_size == 1:
             slots = allocator.alloc(host_hit_length)
         else:
-            prefix_length = int(req.prefix_indices.numel())
+            prefix_length = int(self.prefix_device_indices(req).numel())
             sequence_length = prefix_length + host_hit_length
             prefix_lengths = torch.tensor(
                 [prefix_length], dtype=torch.int64, device=self.device
@@ -303,7 +306,9 @@ class FlexKVHybridRadixCache(FlexKVCacheLifecycleMixin, BasePrefixCache):
             )
             sequence_lengths_cpu = torch.tensor([sequence_length], dtype=torch.int64)
             last_location = (
-                req.prefix_indices[-1:].to(device=self.device, dtype=torch.int64)
+                self.prefix_device_indices(req)[-1:].to(
+                    device=self.device, dtype=torch.int64
+                )
                 if prefix_length > 0
                 else torch.tensor([-1], dtype=torch.int64, device=self.device)
             )
@@ -332,8 +337,6 @@ class FlexKVHybridRadixCache(FlexKVCacheLifecycleMixin, BasePrefixCache):
         if slots is not None:
             return slots
 
-        from sglang.srt.mem_cache.common import evict_from_tree_cache
-
         swa_need = None
         if self.supports_swa():
             swa_need = (
@@ -341,7 +344,16 @@ class FlexKVHybridRadixCache(FlexKVCacheLifecycleMixin, BasePrefixCache):
                 if self.page_size == 1
                 else min(self.page_size, host_hit_length)
             )
-        evict_from_tree_cache(self, host_hit_length, swa_num_tokens=swa_need)
+        from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
+
+        self.evict_for_alloc(
+            KVDemand(
+                full_tokens=host_hit_length,
+                window_tokens={
+                    name: swa_need or 0 for name, _ in self.window_sub_pools()
+                },
+            )
+        )
         if self.page_size == 1:
             return allocator.alloc(host_hit_length)
         return self._alloc_restore_slots_once(req, host_hit_length)
@@ -351,7 +363,7 @@ class FlexKVHybridRadixCache(FlexKVCacheLifecycleMixin, BasePrefixCache):
     ) -> Optional[torch.Tensor]:
         """Retry the paged allocation once after eviction."""
         allocator = self.token_to_kv_pool_allocator
-        prefix_length = int(req.prefix_indices.numel())
+        prefix_length = int(self.prefix_device_indices(req).numel())
         sequence_length = prefix_length + host_hit_length
         prefix_lengths = torch.tensor(
             [prefix_length], dtype=torch.int64, device=self.device
@@ -362,7 +374,9 @@ class FlexKVHybridRadixCache(FlexKVCacheLifecycleMixin, BasePrefixCache):
         )
         sequence_lengths_cpu = torch.tensor([sequence_length], dtype=torch.int64)
         last_location = (
-            req.prefix_indices[-1:].to(device=self.device, dtype=torch.int64)
+            self.prefix_device_indices(req)[-1:].to(
+                device=self.device, dtype=torch.int64
+            )
             if prefix_length > 0
             else torch.tensor([-1], dtype=torch.int64, device=self.device)
         )
@@ -385,40 +399,38 @@ class FlexKVHybridRadixCache(FlexKVCacheLifecycleMixin, BasePrefixCache):
             host_hit_length,
         )
 
-    def cache_finished_req(self, req: Req, is_insert: bool = True, **kwargs) -> None:
+    def checkpoint(self, req: Req, *, up_to: int, **kwargs) -> None:
         self._validate_restore_lease(req)
         self._apply_restore_swa_boundary(req)
-        kv_length = int(kwargs.get("owned_kv_len", req.kv.kv_committed_len))
-        token_ids = (req.origin_input_ids + req.output_ids)[:kv_length]
-        self._inner_cache.cache_finished_req(req, is_insert=is_insert, **kwargs)
+        previous = req.kv.cache_protected_len
+        self._inner_cache.checkpoint(req, up_to=up_to, **kwargs)
         self._commit_restore(req)
         self._release_load_marker(req.cache_request_handle)
-        if not is_insert:
-            return
+        if req.finished():
+            self._store_prefix(req, req.full_untruncated_fill_ids[:up_to])
+        elif self._swa_grid_tokens > 0:
+            self._store_grid_point(req, previous, self._swa_grid_tokens, up_to=up_to)
 
-        self._store_prefix(req, token_ids)
+    def free_kv_row(self, kv, ranges) -> None:
+        owner = self._validate_row_restore_owner(kv)
+        if owner is not None:
+            self._apply_restore_swa_boundary(owner)
+        self._inner_cache.free_kv_row(kv, ranges)
 
-    def cache_unfinished_req(self, req: Req, **kwargs) -> None:
-        self._validate_restore_lease(req)
-        self._apply_restore_swa_boundary(req)
-        chunked = kwargs.get("chunked", False)
-        grid_tokens = self._swa_grid_tokens
-        # Prefix length as of the previous chunk boundary; the inner insert
-        # below advances it to this chunk's end.
-        prev_protected_len = (
-            req.kv.cache_protected_len if chunked and grid_tokens > 0 else 0
-        )
-        self._inner_cache.cache_unfinished_req(req, **kwargs)
+    def on_release(self, req: Req, *, checkpointed: bool) -> None:
         self._commit_restore(req)
+        if not checkpointed and not self.has_uncommitted_restore(req):
+            self.release_aborted_request(req.cache_request_handle)
+        self._inner_cache.on_release(req, checkpointed=checkpointed)
 
-        if chunked:
-            if grid_tokens > 0:
-                self._store_grid_point(req, prev_protected_len, grid_tokens)
-            return
-        self._store_prefix(req, list(req.get_fill_ids()))
+    def _abandon_attempt(self, handle: CacheRequestHandle) -> None:
+        self.release_aborted_request(handle)
+
+    def load_back_is_cache_owned(self) -> bool:
+        return False
 
     def _store_grid_point(
-        self, req: Req, prev_protected_len: int, grid_tokens: int
+        self, req: Req, prev_protected_len: int, grid_tokens: int, *, up_to: int
     ) -> None:
         """Store at a chunk boundary when the prefix crosses a grid multiple.
 
@@ -427,7 +439,7 @@ class FlexKVHybridRadixCache(FlexKVCacheLifecycleMixin, BasePrefixCache):
         floor for window eviction, so the page the D2H reads cannot be freed
         beneath it.
         """
-        fill_ids = list(req.get_fill_ids())
+        fill_ids = list(req.full_untruncated_fill_ids[:up_to])
         aligned_length = len(fill_ids) // self.page_size * self.page_size
         if aligned_length // grid_tokens == prev_protected_len // grid_tokens:
             return
@@ -452,7 +464,7 @@ class FlexKVHybridRadixCache(FlexKVCacheLifecycleMixin, BasePrefixCache):
         )
         match = self._inner_cache.match_prefix(MatchPrefixParams(key=key))
         node = match.last_device_node
-        indices = match.device_indices
+        indices = self._inner_cache.path_device_indices(match.last_device_node)
         if self._inner_cache.is_root(node) or indices.numel() == 0:
             return
         if indices.numel() < len(token_ids):
@@ -525,12 +537,14 @@ class FlexKVHybridRadixCache(FlexKVCacheLifecycleMixin, BasePrefixCache):
             return nullcontext()
         return torch.profiler.record_function(name)
 
-    @staticmethod
-    def _apply_restore_swa_boundary(req: Req) -> None:
+    def _apply_restore_swa_boundary(self, req: Req) -> None:
         boundary = getattr(req, "_flexkv_swa_evicted_seqlen", None)
         if boundary is None or req.kv is None:
             return
-        req.kv.swa_evicted_seqlen = max(req.kv.swa_evicted_seqlen, boundary)
+        from sglang.srt.mem_cache.base_prefix_cache import window_sub_pool_of
+
+        name = window_sub_pool_of(self.token_to_kv_pool_allocator)
+        req.kv.set_evicted_seqlen(name, max(req.kv.get_evicted_seqlen(name), boundary))
         del req._flexkv_swa_evicted_seqlen
 
     def evict(self, params: EvictParams) -> EvictResult:
@@ -560,14 +574,14 @@ class FlexKVHybridRadixCache(FlexKVCacheLifecycleMixin, BasePrefixCache):
         self._load_markers.pop(rid, None)
         self.flexkv_connector.release_pending(rid)
         self.flexkv_connector.cancel_prefetch(rid)
-        # Queue-limit/timeout aborts can finish without cache_finished_req.
+        # Queue-limit/timeout aborts can finish without checkpoint.
         # Remove the scheduling guard, but keep a separate allocation ledger:
         # dropping the only slot record would leak such pre-admission restores.
         lease = self._restore_leases.pop(rid, None)
         if lease is not None:
             self._aborted_restore_leases[lease.generation] = lease
         # Preserve request cleanup flags/boundaries. Scheduled requests still
-        # release through cache_finished_req; orphaned allocations await an idle
+        # release through checkpoint; orphaned allocations await an idle
         # flush, whose connector reset fences H2D before freeing them.
 
     def inc_lock_ref(self, node: Any) -> IncLockRefResult:
@@ -591,8 +605,8 @@ class FlexKVHybridRadixCache(FlexKVCacheLifecycleMixin, BasePrefixCache):
     def rotation_base_of(self, node):
         return self._inner_cache.rotation_base_of(node)
 
-    def evict_for_alloc(self, params: EvictParams):
-        return self._inner_cache.evict_for_alloc(params)
+    def evict_for_alloc(self, demand):
+        return self._inner_cache.evict_for_alloc(demand)
 
     def swa_retain_floor(self, req):
         return self._inner_cache.swa_retain_floor(req)
@@ -684,6 +698,97 @@ class FlexKVHybridRadixCache(FlexKVCacheLifecycleMixin, BasePrefixCache):
 
     def _empty_indices(self) -> torch.Tensor:
         return torch.empty((0,), dtype=torch.int64, device=self.device)
+
+    def path_device_indices(self, *args, **kwargs):
+        return self._inner_cache.path_device_indices(*args, **kwargs)
+
+    def lock(self, *args, **kwargs):
+        return self._inner_cache.lock(*args, **kwargs)
+
+    def unlock(self, *args, **kwargs):
+        return self._inner_cache.unlock(*args, **kwargs)
+
+    def reclaim_jointly(self, *args, **kwargs):
+        return self._inner_cache.reclaim_jointly(*args, **kwargs)
+
+    def evict_pool_shortfalls(self, *args, **kwargs):
+        return self._inner_cache.evict_pool_shortfalls(*args, **kwargs)
+
+    def window_available_size(self, *args, **kwargs):
+        return self._inner_cache.window_available_size(*args, **kwargs)
+
+    def window_slot_of(self, *args, **kwargs):
+        return self._inner_cache.window_slot_of(*args, **kwargs)
+
+    def window_sub_pool_of_slot(self, *args, **kwargs):
+        return self._inner_cache.window_sub_pool_of_slot(*args, **kwargs)
+
+    def window_sub_pools(self, *args, **kwargs):
+        return self._inner_cache.window_sub_pools(*args, **kwargs)
+
+    def reclaim(self, *args, **kwargs):
+        return self._inner_cache.reclaim(*args, **kwargs)
+
+    def evict_until(self, *args, **kwargs):
+        return self._inner_cache.evict_until(*args, **kwargs)
+
+    def window_evictable_size(self, *args, **kwargs):
+        return self._inner_cache.window_evictable_size(*args, **kwargs)
+
+    def window_protected_size(self, *args, **kwargs):
+        return self._inner_cache.window_protected_size(*args, **kwargs)
+
+    def window_slots(self, *args, **kwargs):
+        return self._inner_cache.window_slots(*args, **kwargs)
+
+    def window_lengths(self, *args, **kwargs):
+        return self._inner_cache.window_lengths(*args, **kwargs)
+
+    def window_retention(self, *args, **kwargs):
+        return self._inner_cache.window_retention(*args, **kwargs)
+
+    def window_checkpoint_interval(self, *args, **kwargs):
+        return self._inner_cache.window_checkpoint_interval(*args, **kwargs)
+
+    def insert_window_cursors(self, *args, **kwargs):
+        return self._inner_cache.insert_window_cursors(*args, **kwargs)
+
+    def window_reprefill_tail_tokens(self, *args, **kwargs):
+        return self._inner_cache.window_reprefill_tail_tokens(*args, **kwargs)
+
+    def retained_window_tokens(self, *args, **kwargs):
+        return self._inner_cache.retained_window_tokens(*args, **kwargs)
+
+    def retained_window_req_count(self, *args, **kwargs):
+        return self._inner_cache.retained_window_req_count(*args, **kwargs)
+
+    def session_records(self, *args, **kwargs):
+        return self._inner_cache.session_records(*args, **kwargs)
+
+    def supports_prefix_sharing(self, *args, **kwargs):
+        return self._inner_cache.supports_prefix_sharing(*args, **kwargs)
+
+    def swa_retain_window(self):
+        return self._inner_cache.swa_retain_window()
+
+    def maybe_hand_to_session(self, req):
+        return self._inner_cache.maybe_hand_to_session(req)
+
+    def claim_kv_row(self, req):
+        return self._inner_cache.claim_kv_row(req)
+
+    def touch_prefix(self, key):
+        return self._inner_cache.touch_prefix(key)
+
+    def transfers_in_flight(self):
+        return (
+            bool(
+                self._restore_leases
+                or self._aborted_restore_leases
+                or self._inflight_store_nodes
+            )
+            or self._inner_cache.transfers_in_flight()
+        )
 
     def __getattr__(self, name: str) -> Any:
         if name.startswith("__"):

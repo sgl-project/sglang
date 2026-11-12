@@ -45,6 +45,15 @@ def _flexkv_factory(ctx):
             "Disable FlexKV or use a speculative mode without bigram cache keys."
         )
 
+    if ctx.disable_radix_cache:
+        raise ValueError(
+            "FlexKV requires radix caching to own restored and stored prefixes"
+        )
+    if ctx.is_hybrid_swa and ctx.full_tokens_per_layer == 0:
+        raise NotImplementedError(
+            "FlexKV requires a FULL token pool; pure SWA is unsupported"
+        )
+
     try:
         from flexkv.integration.sglang.connector import FlexKVConnector  # noqa: F401
     except ImportError as exc:
@@ -111,14 +120,12 @@ def _flexkv_factory(ctx):
     )
 
     if ctx.is_hybrid_swa:
+        from sglang.srt.mem_cache.registry import create_unified_radix_cache
         from sglang.srt.mem_cache.storage.flexkv.flexkv_hybrid_radix_cache import (
             FlexKVHybridRadixCache,
         )
-        from sglang.srt.mem_cache.unified_cache.components import ComponentType
-        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
-        ctx.params.tree_components = (ComponentType.FULL, ComponentType.SWA)
-        inner_cache = UnifiedRadixCache(ctx.params)
+        inner_cache = create_unified_radix_cache(ctx)
         return FlexKVHybridRadixCache(
             inner_cache=inner_cache,
             **common_kwargs,
