@@ -394,7 +394,6 @@ from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.session.session_controller import SessionController
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
-from sglang.srt.speculative.dflash_draft_ring import draft_kv_ring_enabled
 from sglang.srt.speculative.dflash_utils import validate_dflash_request
 from sglang.srt.speculative.eagle_utils import (
     get_draft_recurrent_hidden_state_spec_from_config,
@@ -1633,7 +1632,7 @@ class Scheduler(
         draft_token_to_kv_pool = (
             self.draft_worker.primary_draft_kv_pool
             if self.draft_worker is not None
-            and not (self.spec_algorithm.is_dflash() and draft_kv_ring_enabled())
+            and not get_spec().speculative_dflash_draft_kv_ring
             else None
         )
 
