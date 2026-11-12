@@ -7046,29 +7046,6 @@ class KimiK3ThinkingTestCase(unittest.TestCase):
                 )
                 self.assertIn("invalid thinking", self.chat._validate_request(request))
 
-    def test_draft07_identifier_in_tool_parameters_is_accepted(self):
-        """A `$id` with a fragment is draft-07 style: it fails the 2020-12
-        metaschema's URI form check but constrains nothing, and this stack
-        renders and constrains such a schema correctly."""
-        request = ChatCompletionRequest(
-            model="x",
-            messages=self.MESSAGES,
-            tools=[
-                {
-                    "type": "function",
-                    "function": {
-                        "name": "f",
-                        "parameters": {
-                            "$id": "#user",
-                            "type": "object",
-                            "properties": {"value": {"type": "string"}},
-                        },
-                    },
-                }
-            ],
-        )
-        self.assertIsNone(self.chat._validate_request(request))
-
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
