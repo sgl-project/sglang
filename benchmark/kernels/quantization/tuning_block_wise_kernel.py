@@ -154,14 +154,26 @@ def get_rocm_configs_compute_bound():
     return configs
 
 
-def get_configs_compute_bound():
+def get_cuda_block_k_tiles(block_k=None):
+    """BLOCK_SIZE_K candidates for the CUDA search space.
+
+    A tile must divide the quantization group along K. Groups smaller than the
+    default tiles (e.g. a [32, 32] recipe) fall back to a 32-wide tile.
+    """
+    tiles = [64, 128]
+    if block_k is not None and not any(block_k % tile == 0 for tile in tiles):
+        tiles = [tile for tile in [32] if block_k % tile == 0]
+    return tiles
+
+
+def get_configs_compute_bound(block_k=None):
     configs = []
     if _is_hip:
         configs = get_rocm_configs_compute_bound()
     else:
         for num_stages in [2, 3, 4, 5]:
             for block_m in [16, 32, 64, 128, 256]:
-                for block_k in [64, 128]:
+                for block_k_tile in get_cuda_block_k_tiles(block_k):
                     for block_n in [32, 64, 128, 256]:
                         for num_warps in [4, 8]:
                             for group_size in [1, 16, 32, 64]:
@@ -169,7 +181,7 @@ def get_configs_compute_bound():
                                     {
                                         "BLOCK_SIZE_M": block_m,
                                         "BLOCK_SIZE_N": block_n,
-                                        "BLOCK_SIZE_K": block_k,
+                                        "BLOCK_SIZE_K": block_k_tile,
                                         "GROUP_SIZE_M": group_size,
                                         "num_warps": num_warps,
                                         "num_stages": num_stages,
@@ -274,8 +286,12 @@ def tune(M, N, K, block_size, out_dtype, search_space, input_type):
             best_time = kernel_time
             best_config = config
     now = datetime.now()
+    if best_config is None:
+        raise RuntimeError(
+            f"No config in the search space ran for batch_size={M}, N={N}, K={K}, "
+            f"block_size={block_size}: every candidate failed with OutOfResources."
+        )
     print(f"{now.ctime()}] Completed tuning for batch_size={M}")
-    assert best_config is not None
     return best_config
 
 
@@ -333,10 +349,14 @@ def tune_on_gpu(args_dict):
     save_path = args.save_path
     input_type = args.input_type
 
-    search_space = get_configs_compute_bound()
+    search_space = get_configs_compute_bound(block_k)
     search_space = [
         config for config in search_space if block_k % config["BLOCK_SIZE_K"] == 0
     ]
+    if not search_space:
+        raise ValueError(
+            f"No candidate config has a BLOCK_SIZE_K that divides --block-k {block_k}."
+        )
 
     start = time.perf_counter()
     for shape in tqdm(weight_shapes, desc=f"GPU {gpu_id} - Shapes"):
