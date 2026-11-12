@@ -10,12 +10,8 @@ if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
 
 
-def validate_attention(
-    layer: "RadixAttention", sinks: torch.Tensor | None, return_lse: bool
-) -> None:
+def validate_attention(layer: "RadixAttention", sinks: torch.Tensor | None) -> None:
     """Reject unsupported attention options before writing the KV cache."""
-    if return_lse:
-        raise NotImplementedError("Explicit return_lse=True is not supported.")
     if sinks is not None:
         raise NotImplementedError("MLU attention does not support attention sinks.")
     if layer.logit_cap != 0:

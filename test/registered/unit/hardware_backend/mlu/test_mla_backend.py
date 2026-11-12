@@ -117,8 +117,9 @@ class TestMLAMLU(CustomTestCase):
         )
 
     @staticmethod
-    def _reference(q, k, v, qlens, lens, scale):
+    def _reference(q, k, v, qlens, lens, scale, return_lse=False):
         outputs = []
+        lses = []
         for qi, ki, vi in zip(
             q.cpu().float().split(qlens),
             k.cpu().float().split(lens),
@@ -131,11 +132,14 @@ class TestMLAMLU(CustomTestCase):
                 torch.arange(qi.shape[0])[:, None] + ki.shape[0] - qi.shape[0]
             )
             logits.masked_fill_(mask.unsqueeze(0), -torch.inf)
+            lses.append(logits.logsumexp(-1).T)
             outputs.append(
                 torch.einsum(
                     "hqk,khd->qhd", logits.softmax(-1), vi.expand(-1, qi.shape[1], -1)
                 )
             )
+        if return_lse:
+            return torch.cat(outputs), torch.cat(lses)
         return torch.cat(outputs)
 
     def test_latent_prefill_decode_mixed(self):
@@ -169,6 +173,31 @@ class TestMLAMLU(CustomTestCase):
                     expected,
                     atol=0.004,
                     rtol=0.025,
+                )
+                with_lse, lse = f.backend.forward(
+                    f.q,
+                    f.current,
+                    None,
+                    f.layer,
+                    f.fb,
+                    save_kv_cache=False,
+                    return_lse=True,
+                )
+                self.assertEqual(with_lse.shape, actual.shape)
+                self.assertEqual(lse.shape, (sum(qlens), 8))
+                self.assertEqual(lse.dtype, torch.float32)
+                torch.testing.assert_close(with_lse, actual, atol=0.004, rtol=0.025)
+                _, expected_lse = self._reference(
+                    f.q,
+                    f.cache,
+                    f.cache[..., :512],
+                    qlens,
+                    lens,
+                    f.layer.scaling,
+                    return_lse=True,
+                )
+                torch.testing.assert_close(
+                    lse.cpu(), expected_lse, atol=0.003, rtol=0.003
                 )
                 gathered = f.pool.get_key_buffer(0)[f.fb.out_cache_loc.long()]
                 torch.testing.assert_close(gathered, f.current, rtol=0, atol=0)
@@ -241,12 +270,21 @@ class TestMLAMLU(CustomTestCase):
         q = f.q[..., :192].contiguous()
         k = torch.randn(56, 8, 192, device="mlu", dtype=torch.bfloat16) * 0.2
         v = torch.randn(56, 8, 128, device="mlu", dtype=torch.bfloat16) * 0.2
-        expected = self._reference(q, k, v, f.qlens, f.lens, layer.scaling)
+        expected, expected_lse = self._reference(
+            q, k, v, f.qlens, f.lens, layer.scaling, return_lse=True
+        )
         f.fb.mha_one_shot = True
         one = f.backend.forward(q, k, v, layer, f.fb, save_kv_cache=False)
         torch.testing.assert_close(
             one.cpu().view_as(expected).float(), expected, atol=0.004, rtol=0.025
         )
+        one_with_lse, one_lse = f.backend.forward(
+            q, k, v, layer, f.fb, save_kv_cache=False, return_lse=True
+        )
+        self.assertEqual(one_with_lse.shape, expected.shape)
+        self.assertEqual(one_lse.dtype, torch.float32)
+        torch.testing.assert_close(one_with_lse.flatten(1), one, atol=0.004, rtol=0.025)
+        torch.testing.assert_close(one_lse.cpu(), expected_lse, atol=0.003, rtol=0.003)
         f.fb.mha_one_shot = False
         f.fb.mha_return_lse = True
         f.fb.attn_attend_prefix_cache = False
@@ -274,6 +312,7 @@ class TestMLAMLU(CustomTestCase):
             part, plse = f.backend.forward(q, ck, cv, layer, f.fb, save_kv_cache=False)
             out, lse = merge_state(part, plse, out, lse)
         torch.testing.assert_close(out.cpu().float(), expected, atol=0.004, rtol=0.025)
+        torch.testing.assert_close(lse.cpu(), expected_lse, atol=0.003, rtol=0.003)
 
     def test_merge_output_buffers(self):
         torch.manual_seed(17)

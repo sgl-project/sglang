@@ -18,12 +18,13 @@ from sglang.srt.utils.log_utils import print_warning_once
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
+    from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 
 
 class MLUMHATokenToKVPool(MHATokenToKVPool):
     """MLU paged HND storage with shared allocation and slot movement."""
 
-    def _create_buffers(self):
+    def _create_buffers(self) -> None:
         if not self.use_hnd:
             raise NotImplementedError(
                 "MLU MHA cache requires shared HND initialization, "
@@ -49,14 +50,14 @@ class MLUMHATokenToKVPool(MHATokenToKVPool):
     def set_kv_buffer(
         self,
         layer: "RadixAttention",
-        loc_info,
+        loc_info: "torch.Tensor | KVWriteLoc",
         cache_k: torch.Tensor,
         cache_v: torch.Tensor,
         k_scale: float | None = None,
         v_scale: float | None = None,
         layer_id_override: int | None = None,
         dcp_kv_mask: torch.Tensor | None = None,
-    ):
+    ) -> None:
         """Write MHA key/value tokens into the MLU paged cache."""
         if dcp_kv_mask is not None:
             raise NotImplementedError("dcp_kv_mask is not supported for MLU MHA cache.")
@@ -96,7 +97,7 @@ class MLUMHATokenToKVPool(MHATokenToKVPool):
 class MLUMLATokenToKVPool(MLATokenToKVPool):
     """Token-linear latent storage; TMO consumes a zero-copy paged view."""
 
-    def _create_buffers(self):
+    def _create_buffers(self) -> None:
         if self.dtype != torch.bfloat16 or self.use_dsa:
             raise NotImplementedError("MLU MLA requires BF16 dense latent KV cache.")
         super()._create_buffers()
@@ -104,11 +105,11 @@ class MLUMLATokenToKVPool(MLATokenToKVPool):
     def set_kv_buffer(
         self,
         layer: "RadixAttention",
-        loc_info,
+        loc_info: "torch.Tensor | KVWriteLoc",
         cache_k: torch.Tensor,
-        cache_v: torch.Tensor,
+        cache_v: torch.Tensor | None,
         layer_id_override: int | None = None,
-    ):
+    ) -> None:
         loc, _, _ = unwrap_write_loc(loc_info)
         self._check_physical_write_loc(loc_info, "set_kv_buffer (MLA)")
         maybe_detect_oob(loc, 0, self.size + self.page_size, "set_kv_buffer (MLA)")
@@ -151,7 +152,7 @@ class MLUMLATokenToKVPool(MLATokenToKVPool):
         loc: torch.Tensor,
         dst_dtype: torch.dtype | None = None,
         layer_id_override: int | None = None,
-    ):
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         # get k nope and k rope from the kv buffer, and optionally cast them to dst_dtype.
         layer_id = (
             layer_id_override if layer_id_override is not None else layer.layer_id

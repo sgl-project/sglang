@@ -143,6 +143,13 @@ class TestAttentionMLU(CustomTestCase):
         # A later consumer may reuse populated KV without receiving current K/V.
         cached = f.fn(f.q, None, None, f.layer, f.fb, save_kv_cache=False)
         torch.testing.assert_close(cached, actual, rtol=0.03, atol=0.03)
+        with_lse, lse = f.fn(
+            f.q, None, None, f.layer, f.fb, save_kv_cache=False, return_lse=True
+        )
+        self.assertEqual(with_lse.shape, actual.shape)
+        self.assertEqual(lse.shape, (sum(qlens), 8))
+        self.assertEqual(lse.dtype, torch.float32)
+        torch.testing.assert_close(with_lse, actual, rtol=0.03, atol=0.03)
         actual = actual.view(-1, 8, 128).cpu().float()
         offset = ko = 0
         for n, m in zip((21, 35), qlens):
@@ -160,6 +167,10 @@ class TestAttentionMLU(CustomTestCase):
             ).transpose(0, 1)
             torch.testing.assert_close(
                 actual[offset : offset + m], expected, rtol=0.03, atol=0.03
+            )
+            expected_lse = scores.masked_fill(mask, float("-inf")).logsumexp(-1).T
+            torch.testing.assert_close(
+                lse[offset : offset + m].cpu(), expected_lse, rtol=0.003, atol=0.003
             )
             offset += m
             ko += n
@@ -209,10 +220,9 @@ class TestAttentionMLU(CustomTestCase):
                     torch.zeros(8, device="mlu", dtype=f.q.dtype),
                     "attention sinks",
                 ),
-                ("return_lse", True, "return_lse"),
             )
             if mode.is_decode():
-                cases = cases[-2:]
+                cases = cases[-1:]
             for field, value, message in cases:
                 with self.subTest(mode=mode, feature=field):
                     # Zero sinks still request unsupported semantics.
