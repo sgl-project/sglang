@@ -1329,33 +1329,14 @@ class Glm5NextForConditionalGeneration(nn.Module):
     def register_modelslim_projection_aliases(
         cls, quant_config: Optional[QuantizationConfig]
     ) -> None:
-        """Map KDA gate projections that keep a ``forget_gate`` submodule.
-
-        Some ModelSlim (W8A8) exports store the gate projections as
-        ``self_attn.forget_gate.f_a_proj`` / ``f_b_proj`` while the runtime
-        builds them directly on ``self_attn``.  ``get_quant_method`` resolves a
-        runtime projection through the ``model`` subgroup of
-        ``packed_modules_mapping`` before reading
-        ``quant_model_description.json``, so registering the checkpoint
-        spelling here keeps the scheme/FLOAT metadata resolvable without
-        model-specific rules inside the quantization backend.
-        """
-        from sglang.srt.layers.quantization.modelslim.modelslim import (
-            ModelSlimConfig,
-        )
-
-        if not isinstance(quant_config, ModelSlimConfig):
+        if quant_config is None or quant_config.get_name() != "modelslim":
             return
-        # ModelSlimConfig.update_packed_modules_mapping merges by top-level key,
-        # so the loader-injected ``model`` subgroup has to be passed back whole.
-        model_mapping = dict(quant_config.packed_modules_mapping.get("model", {}))
-        model_mapping.update(
+        quant_config.update_packed_modules_mapping(
             {
                 "f_a_proj": ["forget_gate.f_a_proj"],
                 "f_b_proj": ["forget_gate.f_b_proj"],
             }
         )
-        quant_config.update_packed_modules_mapping({"model": model_mapping})
 
     def __init__(
         self,
@@ -1789,9 +1770,6 @@ class Glm5NextForConditionalGeneration(nn.Module):
             return hidden_states
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
-        # Checkpoint naming variants live in ``hf_to_sglang_mapper`` so the
-        # weight stream and the ModelSlim quant-description aliases share one
-        # rule set.
         weights = Glm5NextForConditionalGeneration.hf_to_sglang_mapper.apply(weights)
         if is_nextn:
             if hasattr(self.config, "num_nextn_predict_layers"):

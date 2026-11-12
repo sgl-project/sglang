@@ -943,11 +943,7 @@ class AscendAttnBackend(AttentionBackend):
         self.graph_mode = False
 
     def _create_forward_metadata(self) -> ForwardMetadata:
-        """Create the metadata object owned by one forward pass.
-
-        Model-specific Ascend backends override this factory when they need to
-        extend the common metadata without maintaining a second source of truth.
-        """
+        """Create the metadata object for one forward pass."""
         return ForwardMetadata()
 
     def _prepare_quant_flash_attn_metadata(
@@ -1997,8 +1993,7 @@ class AscendAttnBackend(AttentionBackend):
         k_nope, k_pe = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
 
         # SFA's MLA interface requires a fixed 64-dimensional query_rope even
-        # for models without RoPE. Keep the model/cache contract at dimension 0
-        # and materialize an operator-only zero tensor here.
+        # for models without RoPE.
         if self.qk_rope_head_dim == 0 and is_npu_arch35():
             k_pe = self._a5_zero_rope(k_nope, (*k_nope.shape[:-1], 64))
             q_pe = self._a5_zero_rope(q_nope, (q.shape[0], layer.tp_q_head_num, 64))
@@ -4541,8 +4536,6 @@ class AscendAttnMultiStepDraftBackend:
     draft decoding steps
     """
 
-    # Allow DSA subclasses to replace the backend for each step without
-    # duplicating the entire multi-step scheduling logic.
     backend_cls = AscendAttnBackend
 
     def __init__(
@@ -4556,8 +4549,6 @@ class AscendAttnMultiStepDraftBackend:
 
         self.attn_backends = []
         for step_id in range(self.speculative_num_steps):
-            # Construct through an overridable type so DSA draft decode can
-            # generate indexer metadata.
             self.attn_backends.append(
                 self.backend_cls(model_runner, speculative_step_id=step_id)
             )
