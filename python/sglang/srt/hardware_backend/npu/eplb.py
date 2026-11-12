@@ -390,12 +390,10 @@ class _ExpertWeightAdapter:
 
 
 def prewarm_eplb_communication() -> None:
-    """Materialize the existing NPU TP transports before KV-cache sizing."""
-    from sglang.srt.runtime_context import get_exec, get_parallel
+    """Warm TP transports for enabled, non-elastic NPU EPLB before KV sizing."""
+    from sglang.srt.runtime_context import get_parallel
 
     parallel = get_parallel()
-    if not get_exec().moe.enable_eplb or get_exec().moe.elastic_ep_backend is not None:
-        return
     tp = parallel.tp_group
     group = tp.device_group
     _validate_migration_topology(dist.get_world_size(group))
