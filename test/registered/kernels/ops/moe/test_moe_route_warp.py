@@ -337,6 +337,22 @@ def test_strided_bias_falls_back(config: str) -> None:
     _assert_matches(w, i, _reference(scores, bias, **kwargs), kwargs["topk"])
 
 
+@pytest.mark.parametrize("config", ["kimi_k2", "qwen3_moe"])
+def test_cpu_offloaded_bias_falls_back(config: str) -> None:
+    scores, _ = _inputs(config, 64, seed=12)
+    generator = torch.Generator(device=DEVICE).manual_seed(12)
+    bias = torch.randn(scores.shape[1], device=DEVICE, generator=generator) * 0.1
+    host_bias = bias.contiguous().cpu().pin_memory()
+    assert host_bias.is_pinned() and host_bias.is_contiguous()
+    assert host_bias.data_ptr() % 16 == 0
+    assert not route_warp_module.bias_layout_ok(host_bias)
+    kwargs = _kwargs(config)
+    weights, indices = moe_fused_gate(scores, host_bias, **kwargs)
+    _assert_matches(
+        weights, indices, _reference(scores, bias, **kwargs), kwargs["topk"]
+    )
+
+
 def test_softmax_bias_grouped_falls_back() -> None:
     # Grouped softmax stays on the Triton router, bias included.
     scores, _ = _inputs("qwen3_moe", 64, seed=6)
