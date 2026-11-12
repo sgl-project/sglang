@@ -120,7 +120,7 @@ class Glm4MoeModelNextN(nn.Module):
 
 class Glm4MoeForCausalLMNextN(Glm4MoeForCausalLM):
     @staticmethod
-    def own_quant_config(quant_config):
+    def own_quant_config(hf_config, quant_config):
         """The quant config this class keeps, read before it is built to size
         the draft's KV cache: an NPU draft runs unquantized unless a draft
         quantization is named."""
@@ -136,7 +136,7 @@ class Glm4MoeForCausalLMNextN(Glm4MoeForCausalLM):
     ) -> None:
         nn.Module.__init__(self)
         self.config = config
-        quant_config = self.own_quant_config(quant_config)
+        quant_config = self.own_quant_config(config, quant_config)
         self.quant_config = quant_config
 
         # Drives the inherited loader's shared-expert remap after the build.

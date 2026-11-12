@@ -101,9 +101,12 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
     # q/k/v_proj) before matching them against an exclude list. Without it an
     # excluded attention projection is not recognised as excluded.
     packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
-    # The quant config this class keeps, read before it is built to size the
-    # draft's KV cache.
-    own_quant_config = staticmethod(_mtp_quant_config)
+
+    @staticmethod
+    def own_quant_config(hf_config, quant_config):
+        """The quant config this class keeps, read before it is built to size
+        the draft's KV cache."""
+        return _mtp_quant_config(quant_config)
 
     @staticmethod
     def shared_experts_fusion_disable_reason(hf_config, quant_config):
@@ -119,6 +122,7 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         prefix: str = "",
     ) -> None:
         nn.Module.__init__(self)
+        quant_config = self.own_quant_config(config, quant_config)
 
         self.is_multimodal = hasattr(config, "text_config")
         if self.is_multimodal:
@@ -126,8 +130,6 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
 
         # Deep-copy so MTP mutations below don't leak into the target's config.
         config = copy.deepcopy(config)
-
-        quant_config = self.own_quant_config(quant_config)
 
         self.config = config
         self.quant_config = quant_config

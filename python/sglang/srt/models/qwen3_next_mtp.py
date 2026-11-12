@@ -40,7 +40,7 @@ logger = logging.getLogger(__name__)
 
 class Qwen3NextForCausalLMMTP(Qwen3NextForCausalLM):
     @staticmethod
-    def own_quant_config(quant_config):
+    def own_quant_config(hf_config, quant_config):
         """The quant config this class keeps, read before it is built to size
         the draft's KV cache: an NPU draft runs unquantized unless a draft
         quantization is named."""
@@ -58,7 +58,7 @@ class Qwen3NextForCausalLMMTP(Qwen3NextForCausalLM):
         # Deep-copy so MTP mutations below don't leak into the target's config.
         config = copy.deepcopy(config)
         self.config = config
-        quant_config = self.own_quant_config(quant_config)
+        quant_config = self.own_quant_config(config, quant_config)
         self.quant_config = quant_config
         # if not set, model load will be broken in Qwen3NextForCausalLM load_weights()
         self.pp_group = get_parallel().pp_group

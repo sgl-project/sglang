@@ -33,6 +33,7 @@ class Qwen4ExpForCausalLMMTP(Qwen3_5ForCausalLMMTP):
         prefix: str = "",
     ) -> None:
         nn.Module.__init__(self)
+        quant_config = self.own_quant_config(config, quant_config)
 
         self.is_multimodal = hasattr(config, "text_config")
         if self.is_multimodal:
@@ -44,8 +45,6 @@ class Qwen4ExpForCausalLMMTP(Qwen3_5ForCausalLMMTP):
         config.layer_types = ["full_attention"]
         config.full_attention_interval = 1
         config.ple_layer_ids = []
-
-        quant_config = self.own_quant_config(quant_config)
 
         self.config = config
         self.quant_config = quant_config
