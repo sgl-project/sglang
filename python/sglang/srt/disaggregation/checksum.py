@@ -152,10 +152,8 @@ class KvChecksumComputer:
 
     @classmethod
     def for_kv_args(cls, kv_args, device: torch.device) -> KvChecksumComputer:
-        """Digest the KV and the state entries `state_indices_for_request`
-        addresses. A DFLASH draft KV ring's two entries (its rows and floor) are
-        left out: its rows are addressed per position, not by the request's
-        state slots."""
+        """Leaves out a DFLASH draft KV ring's two entries (rows and floor): they
+        are addressed per position, not by the request's state slots."""
         from sglang.srt.disaggregation.base.conn import StateType
 
         keep = list(range(len(kv_args.state_types)))

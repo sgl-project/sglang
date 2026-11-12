@@ -523,9 +523,6 @@ class TestDeferredDestinationPublish(CustomTestCase):
         self.assertFalse(queue.has_published_destinations)
 
     def test_draft_ring_floor_resets_only_for_a_fake_transfer(self):
-        """A prefill sends a real transfer's draft KV ring floor, so admitting
-        it leaves the floor alone; nothing sends a fake transfer's."""
-
         def acquire(reqs):
             reqs[0].kv.req_pool_idx = 1
             return [1]

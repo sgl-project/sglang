@@ -145,8 +145,6 @@ class TestKvChecksumComputerConfig(unittest.TestCase):
         self.assertEqual(computer._state_item_lens, [88, 99, 111])
 
     def test_leaves_out_the_dflash_draft_kv_ring(self):
-        """The ring's entries (registered last) are not addressed by the
-        request's state slots, so the digest skips them."""
         kv_args = SimpleNamespace(
             kv_data_ptrs=[11],
             kv_item_lens=[33],

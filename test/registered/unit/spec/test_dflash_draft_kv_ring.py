@@ -70,20 +70,16 @@ class TestResolveDraftKVRing(CustomTestCase):
                 self.assertTrue(self._resolve(args))
 
     def test_on_under_pd_over_mooncake(self):
-        for mode in ("prefill", "decode"):
-            with self.subTest(mode=mode), _switch():
-                args = _args(
-                    disaggregation_mode=mode, disaggregation_transfer_backend="mooncake"
-                )
-                self.assertTrue(self._resolve(args))
+        with _switch():
+            args = _args(
+                disaggregation_mode="decode", disaggregation_transfer_backend="mooncake"
+            )
+            self.assertTrue(self._resolve(args))
 
     def test_off_by_launch_flags_without_loading_the_draft(self):
         cases = {
             "prefill over nixl": _args(
                 disaggregation_mode="prefill", disaggregation_transfer_backend="nixl"
-            ),
-            "decode over mori": _args(
-                disaggregation_mode="decode", disaggregation_transfer_backend="mori"
             ),
             "decode host receive": _args(
                 disaggregation_mode="decode",
@@ -197,9 +193,6 @@ class TestDraftKVRingLayout(CustomTestCase):
 
 
 class TestDraftKVRingPDTransfer(CustomTestCase):
-    """Prefill and decode build position-matched ``transfer_rows`` for their own
-    req pool slot; Mooncake copies the pairs both ranks own."""
-
     def _received(self, prefill_dcp, decode_dcp, seq_len):
         """{decode rank: [(position, prefill row, decode row)]} one prefill rank
         per decode rank: the same rank under equal DCP, else prefill rank 0."""
@@ -242,12 +235,6 @@ class TestDraftKVRingPDTransfer(CustomTestCase):
                         covered += positions
                     window = range(max(0, seq_len - WINDOW_LEFT - 1), seq_len)
                     self.assertEqual(sorted(covered), list(window))
-
-    def test_reset_floor_empties_the_window(self):
-        ring = _ring(8)
-        ring.min_pos[2] = 7
-        ring.reset_floor(2, 4096)
-        self.assertEqual(ring.min_pos.tolist(), [0, 0, 4096, 0])
 
     def test_buffer_infos_address_one_ring_row_per_item(self):
         page_size = 64

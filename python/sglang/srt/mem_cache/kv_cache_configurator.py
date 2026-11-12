@@ -1493,7 +1493,7 @@ class KVCacheConfigurator:
             return 2 * max_running_requests
         return max_running_requests
 
-    def _req_pool_pre_alloc_size(self) -> Optional[int]:
+    def _req_pool_pre_alloc_size(self) -> int:
         """Pre-alloc rows of a PD decode req pool (0 for any other pool)."""
         disagg = get_disagg()
         # A flip-capable prefill needs the decode pool shape, and the extra-slot
@@ -2745,9 +2745,7 @@ class KVCacheConfigurator:
             self.spec_aux_config.draft_model_config.hf_config,
             # Request rows, PD pre-alloc rows and the padding row.
             req_to_token_rows=(
-                self._req_pool_rows(max_num_reqs)
-                + (self._req_pool_pre_alloc_size() or 0)
-                + 1
+                self._req_pool_rows(max_num_reqs) + self._req_pool_pre_alloc_size() + 1
             ),
             page_size=page_size,
         )

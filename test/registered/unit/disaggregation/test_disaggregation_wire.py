@@ -547,10 +547,15 @@ class TestDisaggregationWire(unittest.TestCase):
                     self.assertIn("same physical TP size", reason)
 
     def test_mooncake_dflash_tp_mismatch_allows_a_draft_kv_ring(self):
-        """A DFLASH draft KV ring registers no draft KV entries to reslice."""
         manager = object.__new__(MooncakeKVManager)
         manager.kv_args = SimpleNamespace(
-            state_types=[], num_draft_entries=0, kv_layer_ids=[], kv_item_lens=[]
+            state_types=[StateType.DRAFT_RING, StateType.REQUEST_ROW],
+            state_data_ptrs=[[1000], [1100]],
+            state_item_lens=[[576], [4]],
+            state_layer_ids=[[], []],
+            num_draft_entries=0,
+            kv_layer_ids=[],
+            kv_item_lens=[],
         )
         manager.is_mla_backend = True
         manager.is_hybrid_mla_backend = False
@@ -563,13 +568,15 @@ class TestDisaggregationWire(unittest.TestCase):
             dst_draft_rows_dcp_collapsed=False,
             dst_kv_layer_ids=[],
             dst_kv_item_lens=[],
+            dst_state_data_ptrs=[[2000], [3000]],
+            dst_state_item_lens=[[576], [4]],
+            dst_state_layer_ids=[[], []],
             dst_dcp_size=1,
             requires_dcp_relayout=False,
         )
         with get_context().override_server_args(
             enable_unified_memory=False,
             speculative_algorithm="DFLASH",
-            speculative_dflash_draft_kv_ring=True,
         ):
             fully_checked, reason = manager._validate_peer_state_layout(
                 registration_info
@@ -1279,9 +1286,6 @@ class TestDsaIndexKTokenBytes(unittest.TestCase):
 
 
 class TestDFlashDraftKVRingRegistration(unittest.TestCase):
-    """A DFLASH draft KV ring registers its rows and its floor after the
-    storage's entries, so prefill and decode pair them by position."""
-
     def _register(self, ring):
         from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 
@@ -1651,8 +1655,6 @@ class TestQwen4StateWire(unittest.TestCase):
         self.assertEqual(manager.sent[0]["item_lens"], [16])
 
     def test_draft_ring_sent_once_under_mixed_tp_on_non_mla(self):
-        """A DFLASH draft KV ring is identical across the prefill's attention
-        TP: one rank sends it flat to a narrower decode, the others nothing."""
         req = SimpleNamespace(
             room=42, mooncake_session_id="session", dst_state_indices=[[5, 6], [3]]
         )
