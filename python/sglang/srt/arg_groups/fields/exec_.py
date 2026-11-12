@@ -546,9 +546,9 @@ class ExecMamba(msgspec.Struct):
         int,
         Arg(
             help="Where a hybrid model's prefix cache checkpoints recurrent "
-            "state. 2: fork points and request ends only (a PD prefill worker's "
-            "end is its complete prompt), keeping one state per path, so host "
-            "and storage tiers receive only those states; models that also have "
+            "state. 2: branching points and request ends only (a PD prefill worker's "
+            "end is its complete prompt), with a soft cap of one state per path. "
+            "Host and storage tiers receive published states; models that also have "
             "sliding-window layers still checkpoint every chunk. 3: every "
             "prefill chunk and decode tracking boundary.",
             choices=[2, 3],

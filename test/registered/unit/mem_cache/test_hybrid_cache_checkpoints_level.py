@@ -25,12 +25,16 @@ PROMPT = list(range(1, 17))
 
 
 def _build(
-    level, components=(ComponentType.FULL, ComponentType.MAMBA), page_size=4, **kwargs
+    level,
+    components=(ComponentType.FULL, ComponentType.MAMBA),
+    page_size=4,
+    enable_mamba_extra_buffer=True,
+    **kwargs,
 ):
     cfg = CacheConfig(
         page_size=page_size,
         components=components,
-        enable_mamba_extra_buffer=True,
+        enable_mamba_extra_buffer=enable_mamba_extra_buffer,
         kv_size=64,
         max_context_len=64,
         mamba_cache_size=8,
@@ -57,7 +61,8 @@ def _running_req(cache, allocator, pool, up_to):
     req.kv.kv_committed_len = len(PROMPT)
     req.kv.kv_allocated_len = len(PROMPT)
     req.kv.cache_protected_len = 0
-    req.kv.mamba_last_track_seqlen = up_to
+    if cache.enable_mamba_extra_buffer:
+        req.kv.mamba_last_track_seqlen = up_to
     pool.write(
         (req.kv.req_pool_idx, slice(0, len(PROMPT))),
         allocator.alloc(len(PROMPT)),
@@ -132,14 +137,27 @@ class TestRequestEndCheckpoints(CustomTestCase):
         cache.unlock(req.lock)
         cache.sanity_check()
 
-    def test_level2_publishes_fork_point(self):
-        cache, allocator, pool = _build(2)
-        req = _running_req(cache, allocator, pool, up_to=8)
-        req.mamba_branching_seqlen = 8
-        cache.checkpoint(req, up_to=8)
-        self.assertEqual(_cached_len(cache, PROMPT), 8)
-        cache.unlock(req.lock)
-        cache.sanity_check()
+    def test_level2_publishes_branching_point(self):
+        """Both strategies publish at the state boundary, not a later token depth."""
+        for extra_buffer in (False, True):
+            for branching_seqlen in (8, 12):
+                with self.subTest(
+                    extra_buffer=extra_buffer, branching_seqlen=branching_seqlen
+                ):
+                    cache, allocator, pool = _build(
+                        2, page_size=1, enable_mamba_extra_buffer=extra_buffer
+                    )
+                    req = _running_req(cache, allocator, pool, up_to=8)
+                    req.mamba_branching_seqlen = branching_seqlen
+                    if not extra_buffer:
+                        self.assertIsNone(req.kv.mamba_last_track_seqlen)
+                    cache.checkpoint(req, up_to=16 if extra_buffer else 8)
+                    self.assertEqual(
+                        _cached_len(cache, PROMPT),
+                        8 if branching_seqlen == 8 else 0,
+                    )
+                    cache.unlock(req.lock)
+                    cache.sanity_check()
 
     def test_level2_publishes_complete_prompt_on_prefill_worker(self):
         cache, allocator, pool = _build(2)

@@ -783,18 +783,20 @@ class MambaComponent(TreeComponent):
             return None
         return previous_cache_len, pool.get_mamba_ping_pong_other_idx(keep_idx)
 
-    def _defers_checkpoint(self, req: Req, token_ids_len: int) -> bool:
+    def _defers_checkpoint(
+        self, req: Req, token_ids_len: int, checkpoint_len: int
+    ) -> bool:
         """Below checkpoint level 3 a running request publishes a state only at
-        its fork point or, on a PD prefill worker, once its prompt is complete.
+        its branching point or, on a PD prefill worker, once its prompt is complete.
         A sliding-window tree keeps every chunk: prefill frees window rows only
         behind a checkpoint the tree takes."""
         if self.checkpoints_level >= 3 or self.cache.is_swa_enabled:
             return False
+        # TODO: Publish streaming sessions' first-prompt FULL KV when KV-only
+        # checkpoints are supported. Session handoff bypasses final insertion,
+        # so deferred prompts currently remain private to their session.
         branching_seqlen = req.mamba_branching_seqlen
-        if (
-            branching_seqlen is not None
-            and req.kv.mamba_last_track_seqlen == branching_seqlen
-        ):
+        if branching_seqlen is not None and checkpoint_len == branching_seqlen:
             return False
         return not (
             get_disagg().disaggregation_mode == "prefill"
@@ -847,7 +849,7 @@ class MambaComponent(TreeComponent):
         else:
             if cache_len is None:
                 return 0
-            if self._defers_checkpoint(req, token_ids_len):
+            if self._defers_checkpoint(req, token_ids_len, cache_len):
                 insert_params.mamba_checkpoint_deferred = True
                 return 0
             if self._mamba_host_only_checkpoint():
