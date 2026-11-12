@@ -958,20 +958,6 @@ class KVCacheConfigurator:
         )
         return has_window, has_state
 
-    def _validate_replay_spec_algorithm(self) -> None:
-        # DSPARK/DFLASH commit routes through the backend fold (KDA-only); a
-        # non-KDA model there would scatter a None intermediate_ssm and crash.
-        _algo = (get_spec().speculative_algorithm or "").upper()
-        if (
-            get_exec().mamba.enable_linear_replayssm_spec
-            and _algo in ("DSPARK", "DFLASH")
-            and self.hybrid_kda_config is None
-        ):
-            raise ValueError(
-                "--enable-linear-replayssm-spec with DSPARK/DFLASH requires a KDA "
-                "model; got a non-KDA model."
-            )
-
     def _kv_layer_decls(self) -> tuple:
         """This runner's per-layer KV and state declarations for the unified pool."""
         from sglang.srt.mem_cache.kv.decl import (
@@ -1046,7 +1032,6 @@ class KVCacheConfigurator:
             )
         state = {}
         if has_state:
-            self._validate_replay_spec_algorithm()
             from sglang.srt.mem_cache.kv.decl import (
                 StateReplay,
                 with_state_ple,
@@ -1297,7 +1282,9 @@ class KVCacheConfigurator:
                 resolve_draft_worker_attention_backend,
             )
 
-            draft_backend = resolve_draft_worker_attention_backend()
+            draft_backend = resolve_draft_worker_attention_backend(
+                algo_label="DFLASH" if self.spec_algorithm.is_dflash() else None
+            )
         else:
             draft_backend = get_spec().speculative_draft_attention_backend
         draft_backends = (
@@ -1632,7 +1619,6 @@ class KVCacheConfigurator:
         max_num_reqs: int,
         extra_max_context_len: int,
     ) -> ReqToTokenPool:
-        self._validate_replay_spec_algorithm()
         req_to_token_pool = HybridReqToTokenPool(
             size=max_num_reqs,
             mamba_size=get_schedule().max_mamba_cache_size,
