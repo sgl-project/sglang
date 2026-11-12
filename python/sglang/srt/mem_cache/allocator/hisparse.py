@@ -152,6 +152,35 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.hisparse_attn_allocator.available_size() + reclaimable,
         )
 
+    def check_decode_capacity(
+        self, *, num_tokens, tree_cache, requests=None, spec_algorithm=None
+    ) -> bool:
+        ok = super().check_decode_capacity(
+            num_tokens=num_tokens,
+            tree_cache=tree_cache,
+            requests=requests,
+            spec_algorithm=spec_algorithm,
+        )
+        r = self._reclaimer
+        if (
+            ok
+            and requests is not None
+            and r is not None
+            and getattr(r, "hs_excl", False) is True
+        ):
+            # HS_EXCL: the buffered requests' next host slots, and the round's device slots from free slots plus the
+            # demotions the host can take after them
+            ok = r.hs_excl_decode_fits(requests, num_tokens, self.hs_excl_device_term())
+        return ok
+
+    def hs_excl_device_term(self) -> int:
+        """HS_EXCL: available_size()'s device term without the reclaimable slots (the static view under HS_ELASTIC)."""
+        if self._hs_el is not None:
+            el = self._hs_el
+            band = el["kv"].mapped // el["row"] - (el["k_min"] + self.page_size)
+            return self.hisparse_attn_allocator.available_size() - max(0, band)
+        return self.hisparse_attn_allocator.available_size()
+
     # ---- HS_ELASTIC ------------------------------------------------------------------------------------------------
     @staticmethod
     def _hs_el_filter(alloc, max_page: int) -> None:

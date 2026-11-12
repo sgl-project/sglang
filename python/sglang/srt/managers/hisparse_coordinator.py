@@ -629,6 +629,9 @@ class HiSparseCoordinator:
     _resident = types.MappingProxyType({})
     resident_demotions = 0
     _resident_steps = 0
+    hs_excl = False  # HS_EXCL (class default)
+    _hs_excl_skip = types.MappingProxyType({})
+    _hs_excl_base = types.MappingProxyType({})
 
     def __init__(
         self,
@@ -712,6 +715,24 @@ class HiSparseCoordinator:
                 )
                 self.item_size_bytes = self.mem_pool_device.bytes_per_token_k
             else:
+                # HS_EXCL: resident requests keep no host copy, so the host pool may hold fewer tokens than the logical
+                # pool (size = device tokens x ratio + one page, the stock rule, with the ratio derived from the tokens)
+                hs_host_ratio = host_to_device_ratio
+                hs_host_tokens = envs.SGLANG_HISPARSE_HOST_TOKENS.get()
+                if hs_host_tokens > 0:
+                    if not self._hs_excl_wanted(num_draft_tokens):
+                        raise ValueError(
+                            "SGLANG_HISPARSE_HOST_TOKENS needs SGLANG_HISPARSE_EXCLUSIVE=1 with residency (and its "
+                            "speculative variant under speculative decoding) and the lazy host backup"
+                        )
+                    dev_cap = (
+                        self.mem_pool_device.size
+                        if self.mem_pool_device.host_capacity_tokens is None
+                        else self.mem_pool_device.host_capacity_tokens
+                    )
+                    hs_host_ratio = min(
+                        float(host_to_device_ratio), hs_host_tokens / dev_cap
+                    )
                 self.mem_pool_host = MLATokenToKVPoolHost(
                     buffer_info=self.mem_pool_device.get_device_pool_infos()[
                         0
@@ -722,7 +743,7 @@ class HiSparseCoordinator:
                     start_layer=self.mem_pool_device.start_layer,
                     end_layer=self.mem_pool_device.end_layer,
                     target_layer_num=self.mem_pool_device.layer_num,
-                    host_to_device_ratio=host_to_device_ratio,
+                    host_to_device_ratio=hs_host_ratio,
                     host_size=0,
                     page_size=self.mem_pool_device.page_size,
                     layout="layer_first",
@@ -920,6 +941,39 @@ class HiSparseCoordinator:
             )
         self.hs_lazy_backups = 0
         self.hs_lazy_tokens = 0
+        # HS_EXCL: a request that will stay resident gets no host copy at staging (no host slots, no copy); a demotion
+        # copies its whole KV. Short prompts are staged as before (waiting while the host pool has no room). Demotions,
+        # the admission count and the decode check count only free host slots.
+        self.hs_excl = bool(self.hs_lazy and envs.SGLANG_HISPARSE_EXCLUSIVE.get())
+        self._hs_excl_skip = {}  # req_pool_idx -> prefill length of a request staged without a host copy
+        self._hs_excl_base = {}  # req_pool_idx -> device-only prefix of a resident request (validation hooks)
+        self._hs_excl_margin = max(0, envs.SGLANG_HISPARSE_EXCL_HOST_MARGIN.get())
+        # stagings without a copy; tokens copied by whole-request demotions; demotion picks the host limited (or found
+        # none); decode checks failed on host slots; short prompts that waited for host slots
+        self.hs_excl_stats = [0, 0, 0, 0, 0]
+        self._hs_host_len_np = (
+            self.req_to_host_pool_allocated_len.numpy()
+        )  # a view: the CPU tensor's own memory
+        if self.hs_excl != (
+            self._hs_excl_wanted(num_draft_tokens)
+            and not self.is_dsv4_hisparse
+            and not self.is_m3_hisparse
+        ):
+            raise RuntimeError(
+                "HiSparse exclusive residency: switch and pool sizing disagree"
+            )
+        if self.hs_excl:
+            logger.info(
+                "HiSparse exclusive residency: resident requests keep no host copy; host pool %d tokens for %d "
+                "logical tokens; admission margin %d host slots",
+                self.mem_pool_host.size,
+                self.token_to_kv_pool_allocator.size_full,
+                self._hs_excl_margin,
+            )
+        elif envs.SGLANG_HISPARSE_EXCLUSIVE.get():
+            logger.warning(
+                "HiSparse: SGLANG_HISPARSE_EXCLUSIVE ignored (needs residency and the lazy backup)"
+            )
         self._hs_lean = [
             0,
             0,
@@ -1113,7 +1167,15 @@ class HiSparseCoordinator:
     def admit_request_into_staging(self, req: Req) -> None:
         """Start the host copy of a prefilled request and move it into staging."""
         req.hisparse_staging = True
+        if self.hs_excl and self._hs_excl_stage(
+            req
+        ):  # HS_EXCL: no host copy, or waiting for host slots
+            return
+        move([self._hs_stage_copy(req)], self.ack_staging_queue)
 
+    def _hs_stage_copy(self, req: Req) -> HiSparseAct:
+        """Start the prompt's staging copy to host (the stock admit_request_into_staging); return its entry for the
+        staging list."""
         full_kv_indices = self.req_to_token_pool.req_to_token[
             req.kv.req_pool_idx, : req.extend_end
         ].to(dtype=torch.int64, copy=True)
@@ -1153,7 +1215,169 @@ class HiSparseCoordinator:
             if device_indices.is_cuda:
                 device_indices.record_stream(self.write_staging_stream)
 
-        move([HiSparseAct(start_event, finish_event, req)], self.ack_staging_queue)
+        return HiSparseAct(start_event, finish_event, req)
+
+    # ---- HS_EXCL -----------------------------------------------------------------------------------------------------
+    @staticmethod
+    def _hs_excl_wanted(num_draft_tokens: int) -> bool:
+        """HS_EXCL's switch and what it needs (DSA MLA pools): residency, its speculative variant under speculative
+        decoding, the lazy host backup, no host map."""
+        return bool(
+            envs.SGLANG_HISPARSE_EXCLUSIVE.get()
+            and envs.SGLANG_HISPARSE_RESIDENT.get()
+            and envs.SGLANG_HISPARSE_LAZY_BACKUP.get()
+            and not envs.SGLANG_HISPARSE_HOST_MAP.get()
+            and (num_draft_tokens == 0 or envs.SGLANG_HISPARSE_SPEC_RESIDENT.get())
+        )
+
+    def _hs_excl_stage(self, req: Req) -> bool:
+        """A prompt longer than the hot buffer will stay resident: no host slots and no staging copy (an event that is
+        already complete keeps the staging queue's order and the TP count of ready requests). A short prompt is staged
+        as before when the host pool has room for it, else it waits, in order: it joins the staging list without events
+        (no copy yet) and _hs_excl_drain_wait starts its copy later. True: handled here."""
+        rid = req.kv.req_pool_idx
+        n = self.host_token_len(int(req.extend_end))
+        if n > self.device_buffer_size:
+            self._hs_excl_skip[rid] = n
+            self._hs_staged_len[rid] = 0
+            ev = device_module.Event()
+            ev.record()
+            move([HiSparseAct(ev, ev, req)], self.ack_staging_queue)
+            self.hs_excl_stats[0] += 1
+            self._hs_excl_skip_hook(req, n)
+            return True
+        if self._hs_excl_waiting() or not self._hs_excl_host_fits(n):
+            move([HiSparseAct(None, None, req)], self.ack_staging_queue)
+            self.hs_excl_stats[4] += 1
+            return True
+        return False
+
+    def _hs_excl_waiting(self) -> bool:
+        """Whether a short prompt waits for host slots (a staging-list entry without events)."""
+        return self.hs_excl and any(
+            act.finish_event is None for act in self.ack_staging_queue.items()
+        )
+
+    def _hs_excl_skip_hook(self, req: Req, n: int) -> None:
+        """HS_EXCL: validation anchor (the in-situ hooks hash the prompt rows the stock staging would have copied)."""
+        return
+
+    def _hs_excl_drain_wait(self) -> None:
+        """Stage the waiting short prompts, in order, while the host pool has room. A started copy's entry moves behind
+        the entries already copying, as a fresh admission would join the list; the waiting ones stay last."""
+        items = list(self.ack_staging_queue.items())
+        copying = [act for act in items if act.finish_event is not None]
+        waiting = [act for act in items if act.finish_event is None]
+        started = []
+        while waiting and self._hs_excl_host_fits(
+            self.host_token_len(int(waiting[0].req.extend_end))
+        ):
+            started.append(self._hs_stage_copy(waiting.pop(0).req))
+        if started:
+            self.ack_staging_queue.reorder(copying + started + waiting)
+
+    def _hs_excl_reserve(self) -> int:
+        """Host slots a demotion leaves free: two pages for the next round of every buffered request and of the
+        demoted one, and one page."""
+        n_buf = int((self.req_device_buffer_size > 0).sum())
+        return (2 * n_buf + 3) * self.page_size
+
+    def _hs_excl_host_fits(self, n: int) -> bool:
+        P = self.page_size
+        return (
+            self.mem_pool_host.available_size()
+            >= -(-n // P) * P + self._hs_excl_reserve()
+        )
+
+    def _hs_excl_host_need(self, rid: int) -> int:
+        """Host slots a demotion of resident request `rid` allocates at most: its device-owned positions
+        (page-rounded) beyond the host slots it holds."""
+        return max(
+            0,
+            self._owned_device_slots(self._resident[rid])
+            - int(self._hs_host_len_np[rid]),
+        )
+
+    def _hs_excl_pick(self) -> Optional[int]:
+        """The largest resident request (allocated length; reclaim_device's order and ties) whose demotion the host
+        pool can take with the reserve left free; None if there is none."""
+        room = self.mem_pool_host.available_size() - self._hs_excl_reserve()
+        best, best_len, top = None, -1, -1
+        for rid, req in self._resident.items():
+            n = int(req.kv.kv_allocated_len)
+            top = max(top, n)
+            if n > best_len and self._hs_excl_host_need(rid) <= room:
+                best, best_len = rid, n
+        if best is None or best_len < top:
+            self.hs_excl_stats[2] += 1
+        return best
+
+    def _hs_excl_reclaimable(self, room: int) -> int:
+        """Device slots freed by the demotions a host room of `room` slots can take, largest first."""
+        total = 0
+        for rid, req in sorted(
+            self._resident.items(), key=lambda kv: -int(kv[1].kv.kv_allocated_len)
+        ):
+            need = self._hs_excl_host_need(rid)
+            if need <= room:
+                room -= need
+                total += max(self._owned_device_slots(req) - self.padded_buffer_size, 0)
+        return total
+
+    def hs_excl_decode_fits(
+        self, requests, num_tokens: int = 0, device_term: Optional[int] = None
+    ) -> bool:
+        """The scheduler's decode check (allocator.check_decode_capacity): the next round's host slots of the buffered
+        requests (up to one page past each one's allocated length) must be free, and the round's device slots
+        (num_tokens) must come from the device term plus the demotions the host can take AFTER those host slots (both
+        draw on the host pool in the same round); else the scheduler retracts."""
+        P = self.page_size
+        hl = self._hs_host_len_np
+        res = self._resident
+        need = 0
+        for req in requests:
+            rid = req.kv.req_pool_idx
+            if rid is None or rid in res:
+                continue
+            want = -(-int(req.kv.kv_allocated_len) // P) * P + P
+            have = int(hl[rid])
+            if want > have:
+                need += want - have
+        free = self.mem_pool_host.available_size()
+        ok = need <= free
+        if ok and device_term is not None:
+            # plain decode: a short request whose buffer reaches the hot-buffer size also takes the padded page in the
+            # same step (_grow_device_buffers: 960 -> 1088 at a 1024 buffer), one page more than the scheduler counts
+            B, caps, extra = self.device_buffer_size, self.req_device_buffer_size, 0
+            for req in requests:
+                rid = req.kv.req_pool_idx
+                if rid is None or rid in res:
+                    continue
+                cap, n = int(caps[rid]), int(req.kv.kv_committed_len) + 1
+                if 0 < cap < n <= B:
+                    new_cap = min(-(-n // P) * P, B)
+                    if new_cap == B:
+                        new_cap = self.padded_buffer_size
+                    extra += max(0, new_cap - cap - P)
+            dev_need = num_tokens + extra
+            if dev_need > device_term:
+                ok = dev_need <= device_term + self._hs_excl_reclaimable(
+                    free - need - self._hs_excl_reserve()
+                )
+        if ok:
+            return True
+        self.hs_excl_stats[3] += 1
+        if self.hs_excl_stats[3] % 100 == 1:
+            logger.info(
+                "HiSparse exclusive: decode check short (host %d needed, %d free; device %d tokens + padded "
+                "pages, term %s); stats %s",
+                need,
+                free,
+                num_tokens,
+                device_term,
+                self.hs_excl_stats,
+            )
+        return False
 
     def admit_request_direct(self, req: Req) -> None:
         """Direct-to-host path: KV data already resides in host pool via RDMA.
@@ -1373,10 +1597,13 @@ class HiSparseCoordinator:
         self.req_device_buffer_size[rid] = 0
         if self.hs_lazy:  # HS_LEAN: decode tokens stay on the device only, until a demotion backs them up
             self.hs_lazy_from[rid] = self._hs_staged_len[rid]
-        if (
-            self.hs_spec_res
-        ):  # HS_SPECRES: positions [0, staged) have their prefill device slots
-            self._hs_dev_len[rid] = self._hs_staged_len[rid]
+        n_dev = (
+            self._hs_excl_skip.pop(rid, None) if self.hs_excl else None
+        )  # HS_EXCL: the prefill, device only
+        if n_dev is not None:
+            self._hs_excl_base[rid] = n_dev
+        if self.hs_spec_res:  # HS_SPECRES: positions [0, staged) have their prefill device slots (HS_EXCL: [0, prefill))
+            self._hs_dev_len[rid] = self._hs_staged_len[rid] if n_dev is None else n_dev
 
     def _owned_device_slots(self, req: Req) -> int:
         page = self.mem_pool_device.page_size
@@ -1387,6 +1614,12 @@ class HiSparseCoordinator:
 
     def reclaimable_slots(self) -> int:
         """Device slots that demoting every resident request would free (the allocator's admission budget)."""
+        if self.hs_excl:  # HS_EXCL: only demotions the host pool can take, keeping the reserve and the margin free
+            return self._hs_excl_reclaimable(
+                self.mem_pool_host.available_size()
+                - self._hs_excl_reserve()
+                - self._hs_excl_margin
+            )
         return sum(
             max(self._owned_device_slots(r) - self.padded_buffer_size, 0)
             for r in self._resident.values()
@@ -1401,6 +1634,12 @@ class HiSparseCoordinator:
             rid = max(
                 self._resident, key=lambda r: self._resident[r].kv.kv_allocated_len
             )
+            if (
+                self.hs_excl
+            ):  # HS_EXCL: the largest resident request the host pool can take
+                rid = self._hs_excl_pick()
+                if rid is None:
+                    return False
             self._demote(rid)
         return True
 
@@ -1422,6 +1661,10 @@ class HiSparseCoordinator:
         if not self._resident:
             return False
         rid = max(self._resident, key=lambda r: self._resident[r].kv.kv_allocated_len)
+        if self.hs_excl:  # HS_EXCL: the largest resident request the host pool can take
+            rid = self._hs_excl_pick()
+            if rid is None:
+                return False
         self._demote(rid)
         self.hs_el_stats[4] += 1
         return True
@@ -1670,6 +1913,9 @@ class HiSparseCoordinator:
         self.hs_lazy_from[rid] = _HS_I64_MAX
         self.hs_lazy_backups += 1
         self.hs_lazy_tokens += n
+        if self.hs_excl and staged == 0:  # HS_EXCL: a whole-request copy
+            self.hs_excl_stats[1] += n
+        self._hs_excl_base.pop(rid, None)
 
     def _hs_spec_res_prepare(self, batch) -> List[int]:
         """HS_SPECRES: give every resident request of this verify batch the device pages of the logical pages it holds
@@ -1739,7 +1985,8 @@ class HiSparseCoordinator:
         if st[0] % 1000 == 0:
             logger.info(
                 "HiSparse spec resident: %d verify steps, %.1f resident / %.1f buffered rows per step; %d resident now, "
-                "%d demotions so far; lazy backups %d (%d tokens); reclaims before scratch %d, before buffer %d",
+                "%d demotions so far; lazy backups %d (%d tokens); reclaims before scratch %d, before buffer %d; "
+                "exclusive %s, host free %d",
                 st[0],
                 st[1] / st[0],
                 st[2] / st[0],
@@ -1749,6 +1996,8 @@ class HiSparseCoordinator:
                 self.hs_lazy_tokens,
                 self.hs_spec_reclaims[0],
                 self.hs_spec_reclaims[1],
+                self.hs_excl_stats if self.hs_excl else "off",
+                self.mem_pool_host.available_size(),
             )
         return rows
 
@@ -1788,7 +2037,7 @@ class HiSparseCoordinator:
         if self._resident_steps % 1000 == 0:
             logger.info(
                 "HiSparse resident: %d of %d running requests resident, %d demotions so far; lean prep %d steps, "
-                "general %d; lazy backups %d (%d tokens)",
+                "general %d; lazy backups %d (%d tokens); exclusive %s, host free %d",
                 len(rpi),
                 len(rpi),
                 self.resident_demotions,
@@ -1796,6 +2045,8 @@ class HiSparseCoordinator:
                 self._hs_lean[1],
                 self.hs_lazy_backups,
                 self.hs_lazy_tokens,
+                self.hs_excl_stats if self.hs_excl else "off",
+                self.mem_pool_host.available_size(),
             )
         mapping = self.token_to_kv_pool_allocator.full_to_hisparse_device_index_mapping
         prev_logical = self.req_to_token_pool.req_to_token[
@@ -1872,10 +2123,17 @@ class HiSparseCoordinator:
         """Move the staged requests whose host copy has landed into `dst`, and
         return them."""
         ready_reqs: List[Req] = []
+        if self._hs_excl_waiting():  # HS_EXCL: short prompts that waited for host slots
+            self._hs_excl_drain_wait()
         if len(self.ack_staging_queue) == 0:
             return ready_reqs
 
-        staged = list(self.ack_staging_queue.items())
+        # HS_EXCL: entries still waiting for host slots have no copy (no events) and are not ready
+        staged = [
+            act
+            for act in self.ack_staging_queue.items()
+            if act.finish_event is not None
+        ]
         finish_count = 0
         for _, finish_event, _ in staged:
             if not finish_event.query():
@@ -1893,7 +2151,9 @@ class HiSparseCoordinator:
         move([req for _, _, req in staged[:finish_count]], dst)
         for _, _, req in staged[:finish_count]:
             # prepare device buffer and update req (HS_RESIDENT: or keep the whole prefill resident)
-            if self._can_stay_resident(req):
+            if req.kv.req_pool_idx in self._hs_excl_skip or self._can_stay_resident(
+                req
+            ):  # HS_EXCL: no host copy
                 self._make_resident(req)
             else:
                 if (
@@ -2230,6 +2490,8 @@ class HiSparseCoordinator:
 
     def _release_staging(self, req: Req) -> None:
         """Free a staged request's host + device resources."""
+        if self.hs_excl:  # HS_EXCL: a long prompt staged without a host copy
+            self._hs_excl_skip.pop(req.kv.req_pool_idx, None)
         # Wait for any in-flight staging DMA to complete before freeing
         self.write_staging_stream.synchronize()
 
@@ -2265,6 +2527,9 @@ class HiSparseCoordinator:
         if self.decode_producer_stream is not None:
             device_module.current_stream().wait_stream(self.decode_producer_stream)
         self.wait_for_pending_backup()
+        if self.hs_excl:  # HS_EXCL
+            self._hs_excl_skip.pop(req.kv.req_pool_idx, None)
+            self._hs_excl_base.pop(req.kv.req_pool_idx, None)
         if self._resident and self._resident.pop(req.kv.req_pool_idx, None) is not None:
             # HS_RESIDENT: its device slots stay mapped; release_kv_cache frees them as it does a prefill's.
             self.req_resident[req.kv.req_pool_idx] = 0

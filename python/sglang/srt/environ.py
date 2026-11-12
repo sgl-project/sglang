@@ -803,6 +803,11 @@ class Envs:
     # HiSparse: lend the unused index-K reservation to the device KV pool; logical pages kept mapped above use.
     SGLANG_HISPARSE_ELASTIC = EnvBool(False)
     SGLANG_HISPARSE_ELASTIC_HEADROOM = EnvInt(4096)
+    # HiSparse: resident requests keep no host copy (a demotion copies the whole request); host pool tokens per
+    # rank (0: as many as logical tokens); host slots the admission count leaves for growth.
+    SGLANG_HISPARSE_EXCLUSIVE = EnvBool(False)
+    SGLANG_HISPARSE_HOST_TOKENS = EnvInt(0)
+    SGLANG_HISPARSE_EXCL_HOST_MARGIN = EnvInt(65536)
     SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS = EnvBool(True)
     # Decode batches between SWA out-of-window evictions.
     SGLANG_SWA_EVICTION_INTERVAL = EnvInt(128)
