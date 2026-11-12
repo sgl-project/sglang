@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-from typing import List, Optional, Sequence, Union
+from typing import List, Sequence, Union
 
 import torch
 
 from sglang.kernels.ops.memory.adler32 import adler32_strided_checksum
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
+from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, MiniMaxSparseKVPool
@@ -40,11 +41,23 @@ def page_indices_for_request(
 ) -> torch.Tensor:
     # start_idx is the page-aligned prefix decode already held, which prefill
     # never sent; both sides digest [start_idx, end_idx) of their own row.
-    page_size = scheduler.token_to_kv_pool_allocator.page_size
+    allocator = scheduler.token_to_kv_pool_allocator
     kv_indices = scheduler.req_to_token_pool.req_to_token[
         req.kv.req_pool_idx, start_idx:end_idx
     ]
-    return _to_page_indices_gpu(kv_indices, page_size)
+    # Pages as the transfer names them: a unified pool registers its arena by
+    # physical page, while req_to_token holds virtual ids.
+    kv_indices = allocator.translate_kv_indices_for_transfer(kv_indices)
+    return _to_page_indices_gpu(kv_indices, allocator.page_size)
+
+
+def _state_slots(scheduler, req: Req) -> torch.Tensor:
+    # The slot as the Mamba transfer payload names it: through the allocator's
+    # state ids, which a unified pool keeps virtual in the request table.
+    table = scheduler.req_to_token_pool
+    slots = table.req_index_to_mamba_index_mapping[req.kv.req_pool_idx]
+    state_ids = scheduler.token_to_kv_pool_allocator.state_ids(table.state_sub_pool)
+    return state_ids.ids(slots).to(torch.int64).contiguous().reshape(-1)
 
 
 def _window_rows(scheduler, req: Req, ids, window, seq_len, start_idx):
@@ -61,7 +74,8 @@ def state_indices_for_request(
     scheduler, req: Req, seq_len: int, start_idx: int = 0
 ) -> Union[None, torch.Tensor, List[torch.Tensor]]:
     """The state rows the transfer of ``req`` digests: one tensor for every
-    entry, or one per entry for a unified pool of several windows."""
+    entry, or one per entry when the entries read different rows (a unified
+    pool's windows, a window pool beside a recurrent state pool)."""
     from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
 
     storage = kv_storage_of(
@@ -89,35 +103,35 @@ def state_indices_for_request(
 
 def _state_indices(
     scheduler, req: Req, seq_len: int, start_idx: int = 0
-) -> Optional[torch.Tensor]:
+) -> Union[None, torch.Tensor, List[torch.Tensor]]:
     pool = scheduler.token_to_kv_pool_allocator.get_kvcache()
     router = pool.layer_router
     # A pool wrapping one token KV view keeps its other layers' state per request.
     if router.wrapped_view() is not None:
-        return (
-            scheduler.req_to_token_pool.req_index_to_mamba_index_mapping[
-                req.kv.req_pool_idx
-            ]
-            .to(torch.int64)
-            .contiguous()
-            .reshape(-1)
-        )
+        return _state_slots(scheduler, req)
     if router.sub_pool(IdSpaceKind.SLIDING_WINDOW) is not None:
         from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
 
-        tails = kv_storage_of(
+        storage = kv_storage_of(
             scheduler.req_to_token_pool, scheduler.token_to_kv_pool_allocator
-        ).retained_window_lengths()
-        return _window_rows(
+        )
+        window = _window_rows(
             scheduler,
             req,
             scheduler.token_to_kv_pool_allocator.id_spaces()[
                 router.sub_pool(IdSpaceKind.SLIDING_WINDOW).name
             ],
-            max(tails.values()),
+            max(storage.retained_window_lengths().values()),
             seq_len,
             start_idx,
         )
+        # A window pool beside a recurrent state pool registers both entries;
+        # the state's is read at the request's slots, not at the window's pages.
+        types = [entry.state_type for entry in storage.wire_entries()]
+        if StateType.MAMBA not in types:
+            return window
+        slots = _state_slots(scheduler, req)
+        return [slots if t == StateType.MAMBA else window for t in types]
     if isinstance(pool, (DSATokenToKVPool, MiniMaxSparseKVPool)):
         device_page_size = pool.page_size
         kv_full = scheduler.req_to_token_pool.req_to_token[
