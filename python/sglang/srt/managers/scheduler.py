@@ -2517,7 +2517,7 @@ class Scheduler(
             enable_memory_saver=get_exec().features.enable_memory_saver,
             pp_size=get_parallel().pp_size,
             offload_tags=self.weight_updater.offload_tags,
-            is_engine_paused=lambda: self._engine_paused,
+            is_engine_paused=lambda: self.pause_state.paused,
             is_fully_idle=self.is_fully_idle,
             release_memory_occupation=self.weight_updater.release_memory_occupation,
             resume_memory_occupation=self.weight_updater.resume_memory_occupation,

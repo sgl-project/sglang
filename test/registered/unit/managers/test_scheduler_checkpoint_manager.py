@@ -3,7 +3,10 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-from sglang.srt.managers.io_struct import CheckpointState
+from sglang.srt.managers.io_struct import (
+    CheckpointState,
+    ReleaseMemoryOccupationReqOutput,
+)
 from sglang.srt.managers.scheduler_components.checkpoint_manager import (
     SchedulerCheckpointManager,
 )
@@ -35,6 +38,7 @@ def _server(*drained, tp_size=1, release_error=None):
             if fails and release_error is not None:
                 raise release_error
             calls.append("release")
+            return ReleaseMemoryOccupationReqOutput(success=True, message="Success")
 
         return release_memory_occupation
 

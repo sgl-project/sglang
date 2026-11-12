@@ -21,6 +21,7 @@ from sglang.srt.managers.io_struct import (
     CheckpointReqType,
     CheckpointState,
     ReleaseMemoryOccupationReqInput,
+    ReleaseMemoryOccupationReqOutput,
     ResumeMemoryOccupationReqInput,
 )
 
@@ -36,7 +37,9 @@ class SchedulerCheckpointManager:
         offload_tags: Set[str],
         is_engine_paused: Callable[[], bool],
         is_fully_idle: Callable[..., bool],
-        release_memory_occupation: Callable[[ReleaseMemoryOccupationReqInput], None],
+        release_memory_occupation: Callable[
+            [ReleaseMemoryOccupationReqInput], ReleaseMemoryOccupationReqOutput
+        ],
         resume_memory_occupation: Callable[[ResumeMemoryOccupationReqInput], None],
         all_gather_object: Callable[[Any], List[Any]],
     ) -> None:
@@ -109,9 +112,11 @@ class SchedulerCheckpointManager:
         if self.state != CheckpointState.PREPARING or not self._is_drained():
             return
         try:
-            self._release_memory_occupation(
+            out = self._release_memory_occupation(
                 ReleaseMemoryOccupationReqInput(tags=[GPU_MEMORY_TYPE_KV_CACHE])
             )
+            if not out.success:
+                raise RuntimeError(out.message)
         except Exception as e:
             self.state = CheckpointState.FAILED
             self._error = f"Failed to prepare for the checkpoint: {e}"
@@ -121,5 +126,5 @@ class SchedulerCheckpointManager:
             logger.info("Prepared for a process checkpoint")
 
     def _is_drained(self) -> bool:
-        # Same idle condition as release_memory_occupation asserts.
+        # Same idle condition as release_memory_occupation checks.
         return self._is_fully_idle(ignore_waiting=self._is_engine_paused())
