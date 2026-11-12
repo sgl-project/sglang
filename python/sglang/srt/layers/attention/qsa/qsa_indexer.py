@@ -34,7 +34,6 @@ from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
 from sglang.srt.layers.utils.multi_platform import MultiPlatformOp
-from sglang.srt.model_executor.runner import get_is_capture_mode
 
 # Cap on the fp32 [query_rows, compressed_keys] prefill logits workspace;
 # top-k is per row, so tiling rows does not change the selection.
@@ -170,7 +169,6 @@ class QSAIndexer(MultiPlatformOp):
         pool=None,
         cache_loc: torch.Tensor | None = None,
         q_heads_padded: int | None = None,
-        ensure_cos_sin_cache: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor, bool]:
         qk, _ = self.index_qk_proj(hidden_states)
         token_k = qk[:, self.index_n_heads * self.index_head_dim :].reshape(
@@ -186,14 +184,6 @@ class QSAIndexer(MultiPlatformOp):
                 qsa_index_q_norm_rope_store,
             )
 
-            if (
-                ensure_cos_sin_cache
-                and not get_is_capture_mode()
-                and hasattr(self.rotary_emb, "_ensure_cos_sin_cache_length")
-            ):
-                self.rotary_emb._ensure_cos_sin_cache_length(
-                    int(positions.max().item())
-                )
             key_state_buffer = pool.get_qsa_key_state_buffer(self.layer_id)
             q = qsa_index_q_norm_rope_store(
                 qk,
@@ -216,7 +206,7 @@ class QSAIndexer(MultiPlatformOp):
         q = self.q_layernorm(q_raw.reshape(-1, self.index_head_dim)).reshape(
             -1, self.index_n_heads, self.index_head_dim
         )
-        q = self.apply_rope(positions, q, ensure_cos_sin_cache=ensure_cos_sin_cache)
+        q = self.apply_rope(positions, q)
         if pool is not None:
             q = q.to(pool.qsa_compressed_dtype)
         return q, token_k, False
@@ -412,7 +402,6 @@ class QSAIndexer(MultiPlatformOp):
         self,
         positions: torch.Tensor,
         tensor: torch.Tensor,
-        ensure_cos_sin_cache: bool = True,
     ) -> torch.Tensor:
         if tensor.numel() == 0:
             return tensor
@@ -422,13 +411,6 @@ class QSAIndexer(MultiPlatformOp):
         )
         if num_positions != tensor.shape[0]:
             raise ValueError("QSA RoPE positions must match the token dimension")
-        if (
-            ensure_cos_sin_cache
-            and not get_is_capture_mode()
-            and hasattr(self.rotary_emb, "_ensure_cos_sin_cache_length")
-        ):
-            self.rotary_emb._ensure_cos_sin_cache_length(int(positions.max().item()))
-
         # position_cos/position_sin repeat cos/sin to the full rotary width;
         # apply_rotary_emb consumes one half.
         self.rotary_emb.get_cos_sin_with_position(positions)
@@ -631,13 +613,10 @@ class QSAIndexer(MultiPlatformOp):
         )
         # Use the compressed-cache dtype for Q. Leaving cache_loc unset defers
         # the ring store until raw local K has been gathered into global order.
-        # The load-time RoPE reservation covers these positions, as this layer's
-        # attention already assumed; re-checking costs a device sync per layer.
         q, token_k, _ = self.project_qk(
             hidden_states,
             positions,
             pool=indexer_metadata.token_to_kv_pool,
-            ensure_cos_sin_cache=False,
         )
         # Raw keys of all new tokens in global packed order: the ring store
         # and compression use the global write plan unchanged. Cached prefix

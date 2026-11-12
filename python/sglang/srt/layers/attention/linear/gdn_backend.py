@@ -274,6 +274,15 @@ elif is_cpu():
     causal_conv1d_fn = causal_conv1d_fn_cpu
     causal_conv1d_update = causal_conv1d_update_cpu
     fused_gdn_gating = torch.ops.sgl_kernel.fused_gdn_gating_cpu
+elif is_xpu():
+    from sgl_kernel.mamba import causal_conv1d_fn_xpu
+
+    from sglang.srt.layers.attention.linear.kernels.gdn_xpu import (
+        causal_conv1d_update_xpu_dispatch,
+    )
+
+    causal_conv1d_fn = causal_conv1d_fn_xpu
+    causal_conv1d_update = causal_conv1d_update_xpu_dispatch
 
 
 def flashinfer_gdn_prefill_default(model_runner: ModelRunner) -> Optional[str]:
@@ -365,17 +374,22 @@ class GDNKernelDispatcher:
     ):
         triton_kernel = TritonGDNKernel()
         self.tree_verify_kernel = triton_kernel
+        xpu_kernel = None
+        if any(
+            backend is not None and backend.is_intel_xpu()
+            for backend in (decode_backend, prefill_backend, verify_backend)
+        ):
+            if not is_xpu():
+                raise ValueError("--linear-attn-backend intel_xpu requires Intel XPU")
+            from sglang.srt.layers.attention.linear.kernels.gdn_xpu import XpuGDNKernel
+
+            xpu_kernel = XpuGDNKernel()
 
         cutedsl_kernel = None
         if decode_backend.is_triton():
             self.decode_kernel = triton_kernel
         elif decode_backend.is_intel_xpu():
-            if not is_xpu():
-                raise ValueError("--linear-attn-backend intel_xpu requires Intel XPU")
-            # The fused SYCL kernel is dispatched via XpuGDNAttnBackend.forward_fused_gdn,
-            # outside this dispatcher; Triton is the dispatcher-level kernel for requests
-            # that hook doesn't handle (e.g. verify).
-            self.decode_kernel = triton_kernel
+            self.decode_kernel = xpu_kernel
         elif decode_backend.is_cutedsl():
             if not is_cuda():
                 raise ValueError("GDN CuTe DSL backend requires CUDA")
@@ -404,11 +418,7 @@ class GDNKernelDispatcher:
         if prefill_backend.is_triton():
             self.extend_kernel = triton_kernel
         elif prefill_backend.is_intel_xpu():
-            if not is_xpu():
-                raise ValueError("--linear-attn-backend intel_xpu requires Intel XPU")
-            # See the decode branch above: intel_xpu uses Triton as its
-            # dispatcher-level fallback kernel.
-            self.extend_kernel = triton_kernel
+            self.extend_kernel = xpu_kernel
         elif prefill_backend.is_cutedsl():
             if not is_cuda():
                 raise ValueError("GDN CuTe DSL backend requires CUDA")
@@ -457,6 +467,10 @@ class GDNKernelDispatcher:
         # --mamba-ssm-dtype bfloat16 setups must be able to force Triton here.
         if verify_backend is not None and verify_backend.is_triton():
             self.verify_kernel = triton_kernel
+            self.verify_kernel_is_flashinfer = False
+        elif verify_backend is not None and verify_backend.is_intel_xpu():
+            self.verify_kernel = xpu_kernel
+            self.tree_verify_kernel = xpu_kernel
             self.verify_kernel_is_flashinfer = False
         elif (
             decode_backend.is_flashinfer() or prefill_backend.is_flashinfer()
@@ -1509,7 +1523,10 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     stable_rows=pp_spec_stable_rows_enabled(),
                 )
         else:
-            g, beta = self._prefill_gates(layer, a, b)
+            if self.kernel_dispatcher.extend_kernel.defers_prefill_gates:
+                g = beta = None
+            else:
+                g, beta = self._prefill_gates(layer, a, b)
             h_track_buf = None
             if (
                 forward_metadata.has_mamba_track_mask
@@ -1540,10 +1557,18 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 state_checkpoint_every_n_tokens=(
                     forward_metadata.state_checkpoint_every_n_tokens
                 ),
+                a=a,
+                b=b,
+                A_log=layer.A_log,
+                dt_bias=layer.dt_bias,
                 output=kwargs.get("linear_attn_output"),
                 layer_id=layer.layer_id,
                 extend_prefix_lens=forward_batch.extend_prefix_lens,
                 track_state=h_track_buf,
+                needs_track_state=(
+                    forward_metadata.has_mamba_track_mask
+                    and forward_metadata.track_ssm_h_src.numel() > 0
+                ),
                 track_chunk_idx=(
                     forward_metadata.track_chunk_idx
                     if h_track_buf is not None
