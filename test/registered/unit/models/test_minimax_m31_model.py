@@ -134,6 +134,7 @@ def cutile_server_args(**kwargs):
         enable_lora=False,
         enable_paged_experts=False,
         paged_experts_enable_disk=False,
+        paged_experts_host_memory_gb=None,
         cpu_offload_gb=0,
         offload_group_size=-1,
         enable_memory_saver=False,
