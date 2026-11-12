@@ -135,6 +135,7 @@ from sglang.srt.hf_transformers import (
 from sglang.srt.layers.cp.base import get_cp_strategy, is_cp_sharded_padded
 from sglang.srt.layers.cp.utils import from_cp_sharded
 from sglang.srt.layers.dp_attention import get_dp_tp_group, require_mlp_sync
+from sglang.srt.layers.layernorm_sp import is_muse_spark_architecture
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
 from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
@@ -1746,6 +1747,20 @@ class Scheduler(
                 scheduler=self,
             )
 
+    def _gpu_work_on_forward_stream(self) -> bool:
+        # Muse Spark's monokernel launches need every one of their workgroups resident
+        # at once (they wait on each other); a kernel on another stream that takes a CU
+        # while one is dispatched can leave it waiting forever. Keep the scheduler's GPU
+        # work and the result readback on the forward stream (the host side still
+        # overlaps; its kernels queue behind the forward's).
+        architectures = self.model_config.hf_config.architectures
+        return bool(
+            _is_hip
+            and get_exec().kernel.enable_amd_monokernel
+            and architectures
+            and is_muse_spark_architecture(architectures[0])
+        )
+
     def init_overlap(self):
         self.device_module = torch.get_device_module(self.device)
 
@@ -1797,8 +1812,12 @@ class Scheduler(
         self.forward_stream_ctx: CudaStreamContext = self.device_module.stream(
             self.forward_stream
         )
-        self.copy_stream: CudaStream = self.device_module.Stream(
-            priority=envs.SGLANG_PLB_STREAM_PRIORITY.get()
+        self.copy_stream: CudaStream = (
+            self.forward_stream
+            if self._gpu_work_on_forward_stream()
+            else self.device_module.Stream(
+                priority=envs.SGLANG_PLB_STREAM_PRIORITY.get()
+            )
         )
         self.copy_stream_ctx: CudaStreamContext = self.device_module.stream(
             self.copy_stream
@@ -2101,7 +2120,9 @@ class Scheduler(
             # stream aliases forward_stream, which would eliminate scheduler
             # overlap. Only CUDA/HIP streams expose a ``cuda_stream`` handle;
             # other accelerators (e.g. NPU/XPU) skip the alias check.
-            if self.schedule_stream.cuda_stream == self.forward_stream.cuda_stream:
+            if self._gpu_work_on_forward_stream():
+                self.schedule_stream = self.forward_stream
+            elif self.schedule_stream.cuda_stream == self.forward_stream.cuda_stream:
                 self.schedule_stream = allocate_distinct_stream(
                     self.device_module, (self.forward_stream,)
                 )
@@ -6177,6 +6198,8 @@ class Scheduler(
     def _hicache_l3_layout(self) -> dict:
         from sglang.srt.mem_cache.hicache_storage import disabled_l3_layout
 
+        if self.enable_unified_cache_external_linker:
+            return self._linker_l3_layout()
         if not self.enable_hierarchical_cache:
             return disabled_l3_layout(
                 "Hierarchical cache is disabled", page_size=self.page_size
@@ -6212,6 +6235,68 @@ class Scheduler(
                 )
             }
         return storage_backend.describe_l3_object_layout(
+            sidecar_pool_specs=sidecar_pool_specs,
+            window_trailing_pages=window_trailing_pages,
+            page_size=self.page_size,
+        )
+
+    def _linker_l3_layout(self) -> dict:
+        """The direct external linker's Mooncake objects, described like HiCache's:
+        the linker writes through its own MooncakeStore with the same key builders."""
+        from sglang.srt.mem_cache.hicache_storage import (
+            PoolHitPolicy,
+            PoolName,
+            SidecarPoolSpec,
+            disabled_l3_layout,
+        )
+        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
+            MooncakeDirectLinker,
+        )
+
+        tree_cache = self.tree_cache
+        wrapper = tree_cache.linker
+        cache_linker = wrapper.cache_linker if wrapper is not None else None
+        if not isinstance(cache_linker, MooncakeDirectLinker):
+            return disabled_l3_layout(
+                (
+                    "External linker storage is not Mooncake"
+                    if wrapper is not None
+                    else "Mooncake external linker is not attached"
+                ),
+                backend=get_memory().unified_cache_external_linker_backend,
+                page_size=self.page_size,
+            )
+        # Linker keys embed the attention-CP rank, so each CP shard is its own object.
+        if get_parallel().attn_cp_size > 1:
+            return disabled_l3_layout(
+                "External L3 layout does not support attention context parallelism",
+                backend="mooncake",
+                page_size=self.page_size,
+            )
+        storage = cache_linker.storage
+        window_trailing_pages = {
+            str(window.pool_name): window.full_window_pages
+            for window in (
+                tree_cache.components[ct] for ct in tree_cache.window_slots()
+            )
+        }
+        # The linker never fills tree_cache.sidecar_pool_specs; resolve_transfers
+        # gives each entry its index source's hit policy, so mirror that here.
+        trailing_sources = {str(PoolName.MAMBA), *window_trailing_pages}
+        sidecar_pool_specs = [
+            SidecarPoolSpec(
+                pool_name=entry.name,
+                indices_from_pool=entry.indices_from_pool,
+                hit_policy=(
+                    PoolHitPolicy.TRAILING_PAGES
+                    if str(entry.indices_from_pool) in trailing_sources
+                    else PoolHitPolicy.ALL_PAGES
+                ),
+            )
+            for entry in storage.mem_pool_host.entries
+            if entry.indices_from_pool != entry.name
+        ]
+        return storage.describe_l3_object_layout(
             sidecar_pool_specs=sidecar_pool_specs,
             window_trailing_pages=window_trailing_pages,
             page_size=self.page_size,

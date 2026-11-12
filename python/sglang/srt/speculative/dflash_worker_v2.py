@@ -20,6 +20,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_accept import (
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_dp_tp_group
+from sglang.srt.layers.layernorm_sp import is_muse_spark_architecture
 from sglang.srt.layers.logits_processor import (
     LogitsProcessor,
     LogitsProcessorOutput,
@@ -57,8 +58,12 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
+from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, HiCacheDraftPlan
 from sglang.srt.speculative.dflash_dp import gather_draft_embedding
+from sglang.srt.speculative.dflash_draft_ring import (
+    DFlashDraftKVRing,
+    draft_kv_ring_rows_per_req_from_config,
+)
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import (
@@ -413,6 +418,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         self.draft_window_size: Optional[int] = get_spec().speculative_draft_window_size
         self.use_compact_draft_cache = self.draft_window_size is not None
         self.device = target_worker.device
+        self.draft_kv_ring: Optional[DFlashDraftKVRing] = None
 
         self._warned_sampling_fallback = False
         self._warned_lilicorr_eager = False
@@ -452,6 +458,11 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
         self._draft_worker = bundle.draft_worker
         self.draft_model_runner = bundle.draft_model_runner
+        self._draft_compact_page_size = self._compact_draft_alignment_for_backend(
+            self.page_size,
+            bundle.resolved_attention_backend,
+            target_worker.model_runner.model_config.hf_config.architectures,
+        )
         self._draft_sampler = None
         self.draft_model = bundle.draft_model
         self.selector = self.draft_model.candidate_selector
@@ -705,6 +716,36 @@ class DFlashWorkerV2(BaseSpecWorker):
                 ),
                 token_to_kv_pool_allocator=token_to_kv_pool_allocator,
             )
+        if get_spec().speculative_dflash_draft_kv_ring:
+            self._init_draft_kv_ring()
+
+    def _init_draft_kv_ring(self) -> None:
+        dcp_size = get_parallel().attn_dcp_size
+        pool = self.draft_model_runner.token_to_kv_pool
+        req_to_token_rows = self.model_runner.req_to_token_pool.req_to_token.shape[0]
+        self.draft_kv_ring = DFlashDraftKVRing(
+            rows_per_req=draft_kv_ring_rows_per_req_from_config(
+                self.draft_model_runner.model_config.hf_config
+            ),
+            dcp_size=dcp_size,
+            req_to_token_rows=req_to_token_rows,
+            device=self.device,
+        )
+        if get_parallel().tp_rank == 0:
+            logger.info(
+                "DFLASH draft KV ring: %d rows per request per rank (%d positions), "
+                "%d req_to_token rows, draft pool %d rows.",
+                self.draft_kv_ring.rows_per_req,
+                self.draft_kv_ring.span,
+                req_to_token_rows,
+                pool.size,
+            )
+
+    def _build_hicache_draft_plan(self) -> HiCacheDraftPlan:
+        # A ring holds no prefix: a cached prefix brings no draft KV back.
+        if self.draft_kv_ring is not None:
+            return HiCacheDraftPlan()
+        return super()._build_hicache_draft_plan()
 
     def init_attention_backends(self):
         with (
@@ -712,6 +753,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_tp_context(self.draft_parallel_layout),
         ):
             self._draft_worker.init_attention_backends()
+        if self.draft_kv_ring is not None:
+            self.draft_model_runner.attn_backend.set_draft_kv_ring(self.draft_kv_ring)
         self._need_mamba_verify_commit = mambaish_config(
             self.model_runner.model_config
         ) is not None and hasattr(
@@ -1230,13 +1273,31 @@ class DFlashWorkerV2(BaseSpecWorker):
             context="DFLASH req_to_token segment gather",
         )
 
+    @staticmethod
+    def _compact_draft_alignment_for_backend(
+        page_size: int, backend: str, architectures: Optional[List[str]] = None
+    ) -> int:
+        # Muse Spark on ROCm: Triton reads individual token slots, so the compact
+        # suffix need not start at a physical page boundary. Keep the 16-token
+        # logical origin that defines the existing draft softmax and reduction
+        # partitions. Other models and backends keep the page alignment.
+        if (
+            torch.version.hip is not None
+            and architectures
+            and is_muse_spark_architecture(architectures[0])
+            and backend == "triton"
+            and page_size in (32, 64, 128)
+        ):
+            return 16
+        return page_size
+
     def _compute_compact_draft_seq_lens(self, seq_lens: torch.Tensor) -> torch.Tensor:
         assert self.draft_window_size is not None
         visible_lens = torch.clamp(
             seq_lens.to(dtype=torch.int32, device=self.device),
             max=int(self.draft_window_size),
         )
-        if self.page_size <= 1:
+        if self._draft_compact_page_size <= 1:
             return visible_lens
 
         # Paged FA backends derive the page table from local token positions, so the
@@ -1245,7 +1306,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         seq_lens_i64 = seq_lens.to(torch.int64)
         visible_lens_i64 = visible_lens.to(torch.int64)
         visible_start = seq_lens_i64 - visible_lens_i64
-        aligned_start = visible_start - torch.remainder(visible_start, self.page_size)
+        aligned_start = visible_start - torch.remainder(
+            visible_start, self._draft_compact_page_size
+        )
         return (seq_lens_i64 - aligned_start).to(torch.int32)
 
     def _compute_compact_draft_seq_lens_host(
@@ -1261,7 +1324,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         """
         assert self.draft_window_size is not None
         bound = int(self.draft_window_size) + (
-            self.page_size if self.page_size > 1 else 0
+            self._draft_compact_page_size if self._draft_compact_page_size > 1 else 0
         )
         lens = host_seq_lens.to(dtype=torch.int64, device="cpu")
         out.copy_(torch.clamp(lens, max=bound).to(torch.int32))
@@ -1284,7 +1347,11 @@ class DFlashWorkerV2(BaseSpecWorker):
             # Compact device lengths never exceed the window plus one page.
             out.fill_(
                 int(self.draft_window_size)
-                + (self.page_size if self.page_size > 1 else 0)
+                + (
+                    self._draft_compact_page_size
+                    if self._draft_compact_page_size > 1
+                    else 0
+                )
             )
 
     def _rebuild_compact_draft_cache(
@@ -2524,12 +2591,30 @@ class DFlashWorkerV2(BaseSpecWorker):
                 ctx_lens,
                 int(sum(batch.extend_lens)),
             )
-            # The draft KV goes to the slots the target prefill just wrote.
+            if self.draft_kv_ring is not None:
+                self.draft_kv_ring.record_floors(
+                    batch.reqs,
+                    batch.prefix_lens,
+                    self.model_runner.req_to_token_pool.req_generation,
+                )
+                draft_cache_loc = self.draft_kv_ring.extend_locs(
+                    req_pool_indices=batch.req_pool_indices,
+                    positions=positions,
+                    extend_lens=ctx_lens,
+                    seq_ends=draft_seq_lens + ctx_lens,
+                )
+            else:
+                # The draft KV goes to the slots the target prefill just wrote.
+                draft_cache_loc = self._draft_write_ids(iteration_ids)
             self._append_target_hidden_to_draft_kv_by_loc(
                 target_hidden=logits_output.hidden_states,
-                cache_loc=self._draft_write_ids(iteration_ids),
-                swa_cache_loc=self._draft_write_ids(
-                    iteration_ids, IdSpaceKind.SLIDING_WINDOW
+                cache_loc=draft_cache_loc,
+                swa_cache_loc=(
+                    None
+                    if self.draft_kv_ring is not None
+                    else self._draft_write_ids(
+                        iteration_ids, IdSpaceKind.SLIDING_WINDOW
+                    )
                 ),
                 positions=positions,
                 extend_lens=ctx_lens,
@@ -2795,6 +2880,13 @@ class DFlashWorkerV2(BaseSpecWorker):
             else iteration_ids
         )
         draft_plan.bind(forward_batch, draft_translator)
+        ring_block_locs = None
+        if self.draft_kv_ring is not None:
+            ring_block_locs = self.draft_kv_ring.block_locs(
+                batch.req_pool_indices, positions, block_size
+            )
+            forward_batch.out_cache_loc = ring_block_locs
+            forward_batch.out_cache_loc_virtual = None
 
         if self.selector is not None or self.lilicorr is not None:
             self._selector_sample = None
@@ -3105,13 +3197,19 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         # Consume in this step: every decode graph size shares one aux output,
         # which the next target forward overwrites (resolve_aux_hidden_states_width).
-        cache_loc = self._draft_write_ids(iteration_ids)
+        cache_loc = (
+            ring_block_locs
+            if ring_block_locs is not None
+            else self._draft_write_ids(iteration_ids)
+        )
         self._append_target_hidden_to_draft_kv_by_loc(
             target_hidden=hidden.reshape(-1, hidden.shape[-1]),
             cache_loc=cache_loc,
             cache_loc_2d=cache_loc.view(verify_out_cache_loc_2d.shape),
-            swa_cache_loc=self._draft_write_ids(
-                iteration_ids, IdSpaceKind.SLIDING_WINDOW
+            swa_cache_loc=(
+                None
+                if ring_block_locs is not None
+                else self._draft_write_ids(iteration_ids, IdSpaceKind.SLIDING_WINDOW)
             ),
             positions=positions,
             commit_lens=commit_lens,
