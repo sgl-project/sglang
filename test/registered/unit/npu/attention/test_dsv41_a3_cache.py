@@ -98,10 +98,10 @@ def _single_pool(classes, ratio=1, compressed=True, size=256):
     pool.qk_nope_head_dim = 448
     pool.qk_rope_head_dim = 64
     pool.layout = (
-        NPUDSV4KVLayout.V41_CMP_FP4
-        if compressed
-        else NPUDSV4KVLayout.V41_SWA_FP8
-    ) if classes["is_npu_arch35"]() else NPUDSV4KVLayout.V41_BF16
+        (NPUDSV4KVLayout.V41_CMP_FP4 if compressed else NPUDSV4KVLayout.V41_SWA_FP8)
+        if classes["is_npu_arch35"]()
+        else NPUDSV4KVLayout.V41_BF16
+    )
     pool.kernel_page_size = 128 // ratio
     pool.size = size
     pool.device = "cpu"
@@ -285,6 +285,56 @@ class TestA3Cache(unittest.TestCase):
             2, torch.tensor([64, -1]), torch.ones(2, 128), None, True
         )
         self.assertEqual(wrapper.get_index_k(5)[1, 0].sum(), 128)
+
+    def test_pd_entries_match_physical_a3_and_a5_buffers(self):
+        # PD addresses each entry with the FULL logical page id. C2 KV pages
+        # hold half as many rows; index pages are grouped to cover that page.
+        for arch35 in (False, True):
+            with self.subTest(arch35=arch35):
+                classes = _pool_classes(arch35=arch35)
+                owner = object.__new__(classes["DSV4NPUTokenToKVPool"])
+                owner.page_size = 128
+                owner.c4_kv_pool = None
+                owner.kv_pools = {
+                    ratio: _single_pool(classes, ratio, size=256 // ratio)
+                    for ratio in (1, 2)
+                }
+                indexers = {
+                    ratio: _index_pool(classes, size=(256 + 128) // ratio)
+                    for ratio in (1, 2)
+                }
+                for pool in indexers.values():
+                    pool.page_size = 64
+                owner._indexer_pool = indexers.__getitem__
+
+                buffers = []
+                for ratio in (1, 2):
+                    buffers.extend(owner.kv_pools[ratio].kv_buffer)
+                    buffers.extend(indexers[ratio].index_k_buffer)
+                    if arch35:
+                        buffers.extend(indexers[ratio].index_scale_buffer)
+                ptrs, lengths, strides = owner.get_contiguous_buf_infos()
+                self.assertEqual(ptrs, [buf.data_ptr() for buf in buffers])
+                self.assertEqual(lengths, [buf.nbytes for buf in buffers])
+                self.assertEqual(
+                    strides,
+                    [40960, 8192, 512, 20480, 4096, 256]
+                    if arch35
+                    else [131072, 32768, 65536, 16384],
+                )
+                self.assertEqual(
+                    owner.get_contiguous_buf_infos(), (ptrs, lengths, strides)
+                )
+
+    def test_a3_layout_does_not_advertise_a5_quantization(self):
+        self.assertEqual(NPUDSV4KVLayout.V41_BF16.quant, (None, None))
+        self.assertEqual(
+            NPUDSV4KVLayout.V41_BF16.indexer_kv_info(128),
+            (128, 0, torch.bfloat16, torch.float32),
+        )
+        self.assertNotEqual(
+            NPUDSV4KVLayout.V41_BF16.value, NPUDSV4KVLayout.V41_CMP_FP4.value
+        )
 
 
 class TestA3Budget(unittest.TestCase):

@@ -345,9 +345,7 @@ class TestPoolFactory(unittest.TestCase):
             self._make(page_size=128, global_page_size=128, kv_layout=KVLayout.V4)
 
     def test_window_layout_resolves_the_row_format(self):
-        fake = SimpleNamespace(
-            compression_ratios=(0, 1, 2), _is_v41_model=lambda: True
-        )
+        fake = SimpleNamespace(compression_ratios=(0, 1, 2), _is_v41_model=lambda: True)
         with patch.object(dsv4_memory_pool, "is_npu_arch35", return_value=True):
             self.assertIs(
                 DSV4NPUTokenToKVPool._window_kv_layout(fake),
@@ -1236,7 +1234,6 @@ class TestCompressedRowIdentity(unittest.TestCase):
         for ratio in (1, 2):
             slots_per_page = page_size // ratio
             self.assertEqual(slots_per_page % DSV41_INDEX_PAGE_SIZE, 0)
-            blocks_per_page = slots_per_page // DSV41_INDEX_PAGE_SIZE
             index_table = expand_index_page_table(
                 table,
                 full_page_size=page_size,
@@ -1633,6 +1630,7 @@ class TestVerifyGraphGuards(unittest.TestCase):
         ctx = SimpleNamespace(
             fm=metadata,
             bs=1,
+            raw_bs=1,
             forward_batch=forward_batch,
             graph_mode=graph_mode,
             is_idle_replay=is_idle,
@@ -1691,8 +1689,9 @@ class TestVerifyGraphGuards(unittest.TestCase):
         self._ensure_static_mode(RaggedVerifyMode.STATIC)
         self._ensure_static_mode(RaggedVerifyMode.CAP_ACCEPT)
 
-    def test_compact_off_arch35_degrades_silently(self):
-        self._ensure_static_mode(RaggedVerifyMode.COMPACT, arch35=False)
+    def test_compact_on_a3_uses_the_same_fixed_width_guard(self):
+        with self.assertRaisesRegex(RuntimeError, "SGLANG_RAGGED_VERIFY_MODE"):
+            self._ensure_static_mode(RaggedVerifyMode.COMPACT, arch35=False)
 
 
 class _FakeTorchOps:

@@ -59,9 +59,27 @@ class TestA3DsparkMetadata(unittest.TestCase):
             _dsv41_a3_ops=lambda: SimpleNamespace(metadata=self.metadata_op),
         )
         cls = load_class(BACKEND, "LowRatioCompressAscendBackendMixin", self.namespace)
+        backend_class = next(
+            node
+            for node in ast.parse(BACKEND.read_text()).body
+            if isinstance(node, ast.ClassDef)
+            and node.name == "DeepseekV4AscendAttnBackend"
+        )
+        refresh = next(
+            node
+            for node in backend_class.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_refresh_graph_verify_rows"
+        )
+        exec(
+            compile(ast.Module(body=[refresh], type_ignores=[]), str(BACKEND), "exec"),
+            self.namespace,
+        )
+        cls._refresh_graph_verify_rows = self.namespace[refresh.name]
         self.backend = cls()
         self.backend.page_size = 128
         self.backend._dsv4_unique_compress_ratios = (0, 1, 2)
+        self.backend._dsv4_has_low_ratio = True
         self.backend._dsv4_q_head_num = 32
         self.backend._dsv4_head_dim = 512
         self.backend._dsv4_index_topk = 512
@@ -139,6 +157,7 @@ class TestA3DsparkMetadata(unittest.TestCase):
             verify_lens=lengths if ragged else None,
             device="cpu",
             is_idle_replay=False,
+            has_compress=False,
         )
         return fb, fm, ctx
 
@@ -241,13 +260,13 @@ class TestA3DsparkMetadata(unittest.TestCase):
             "positions_cmp_padding_c2",
         )
         pointers = {field: getattr(fm, field).data_ptr() for field in fields}
-        self.backend._refresh_graph_dsv41_verify_metadata(ctx)
+        self.backend._refresh_graph_verify_rows(ctx)
         self.assertEqual(fm.c1_loc.tolist(), list(range(256, 262)))
         self.assertEqual(fm.c2_loc.tolist(), [128, 129, 130, -1])
         # An idle replay may have no runtime spec_info. Capture geometry remains.
         fb.spec_info = None
         ctx.is_idle_replay = True
-        self.backend._refresh_graph_dsv41_verify_metadata(ctx)
+        self.backend._refresh_graph_verify_rows(ctx)
         self.assertTrue(torch.all(fm.c1_loc == -1))
         self.assertTrue(torch.all(fm.c2_loc == -1))
         self.assertEqual(
@@ -313,7 +332,7 @@ class TestA3DsparkMetadata(unittest.TestCase):
         self.assertEqual((ctx.bs, ctx.raw_bs, ctx.tokens_per_bs), (2, 0, 6))
         self.backend._init_dsv41_graph_metadata(fm, 2, 6, "cpu", forward_batch=fb)
         pointers = (fm.c1_loc.data_ptr(), fm.c2_loc.data_ptr())
-        self.backend._refresh_graph_dsv41_verify_metadata(ctx)
+        self.backend._refresh_graph_verify_rows(ctx)
         self.assertEqual(fm.c1_loc.shape, (12,))
         self.assertEqual(fm.c2_loc.shape, (8,))
         self.assertTrue(torch.all(fm.c1_loc == -1))
@@ -337,13 +356,13 @@ class TestA3DsparkMetadata(unittest.TestCase):
             "c2_index_page_table",
         )
         pointers = {field: getattr(fm, field).data_ptr() for field in fields}
-        self.backend._refresh_graph_dsv41_verify_metadata(ctx)
+        self.backend._refresh_graph_verify_rows(ctx)
         self.assertEqual(fm.seqused.tolist(), [5, 5, 0])
         self.assertEqual(fm.start_pos.tolist(), [128, 129, 0])
         self.assertEqual(fm.c1_loc.tolist()[-5:], [-1] * 5)
         self.assertEqual(fm.c2_loc.tolist(), [128, 129, 192, 193, 194] + [-1] * 5)
         ctx.is_idle_replay = True
-        self.backend._refresh_graph_dsv41_verify_metadata(ctx)
+        self.backend._refresh_graph_verify_rows(ctx)
         self.assertEqual(fm.seqused.tolist(), [0, 0, 0])
         for ratio in (1, 2):
             self.assertTrue(torch.all(getattr(fm, f"c{ratio}_loc") == -1))
@@ -354,41 +373,27 @@ class TestA3DsparkMetadata(unittest.TestCase):
             pointers, {field: getattr(fm, field).data_ptr() for field in fields}
         )
 
-    def test_a3_compact_guard_does_not_change_a5_or_static(self):
-        node = next(
+    def test_compact_guard_is_shared_and_static_modes_remain_supported(self):
+        guard = next(
             node
             for node in ast.parse(BACKEND.read_text()).body
-            if isinstance(node, ast.ClassDef)
-            and node.name == "DeepseekV4AscendAttnBackend"
-        )
-        init = next(
-            method
-            for method in node.body
-            if isinstance(method, ast.FunctionDef) and method.name == "__init__"
-        )
-        guard = next(
-            statement
-            for statement in init.body
-            if isinstance(statement, ast.If)
-            and "SGLANG_RAGGED_VERIFY_MODE" in ast.unparse(statement.test)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "_ensure_dsv41_static_verify_mode"
         )
         module = ast.Module(body=[guard], type_ignores=[])
         code = compile(ast.fix_missing_locations(module), str(BACKEND), "exec")
-        self.namespace["self"] = SimpleNamespace(
-            _dsv4_has_low_ratio=True, _is_dspark_algorithm=True
-        )
         value = Mock(return_value="compact")
-        self.namespace["envs"] = SimpleNamespace(
-            SGLANG_RAGGED_VERIFY_MODE=SimpleNamespace(get=value)
-        )
-        with self.assertRaisesRegex(ValueError, "SGLANG_RAGGED_VERIFY_MODE=static"):
-            exec(code, self.namespace)
-        for accepted in ("static", "cap-accept"):
-            value.return_value = accepted
-            exec(code, self.namespace)
-        value.return_value = "compact"
-        self.namespace["is_npu_arch35"] = lambda: True
+        self.namespace["read_ragged_verify_mode"] = value
+        self.namespace["RaggedVerifyMode"] = SimpleNamespace(COMPACT="compact")
         exec(code, self.namespace)
+        for arch35 in (False, True):
+            self.namespace["is_npu_arch35"] = lambda: arch35
+            value.return_value = "compact"
+            with self.assertRaisesRegex(RuntimeError, "STATIC request-major"):
+                self.namespace[guard.name]()
+            for accepted in ("static", "cap-accept"):
+                value.return_value = accepted
+                self.namespace[guard.name]()
 
 
 if __name__ == "__main__":
