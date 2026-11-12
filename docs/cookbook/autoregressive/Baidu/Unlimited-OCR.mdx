@@ -79,7 +79,7 @@ The SGLang integration loads the standalone Unlimited-OCR architecture with SAM 
 - **Long OCR generations**: keep the default prefill-aware SWA path enabled. It retains prompt and image KV while still applying a sliding window to generated text.
 - **Ascend NPU**: keep overlap scheduling enabled. The validated configuration is TP1 on one A3 die, context length 32768, mem fraction 0.8, and the default graph capture and chunked-prefill settings; TP, DP, and image modes other than the ones listed below were not validated.
 - **Custom logit processor**: keep `--enable-custom-logit-processor` in the launch command.
-- **Image modes**: pass `images_config.image_mode` per request. Supported modes are `tiny`, `small`, `base`, `large`, and `gundam`. Multiple images are supported only for `tiny`, `small`, and `base`. 
+- **Image modes**: pass `images_config.image_mode` per request. Supported modes are `tiny`, `small`, `base`, `large`, and `gundam`. Multiple images are supported only for `tiny`, `small`, and `base`.
 - **Default image mode**: when `images_config.image_mode` is omitted, SGLang uses `gundam`.
 
 ## 3. Advanced Usage
