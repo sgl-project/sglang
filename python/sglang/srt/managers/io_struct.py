@@ -34,6 +34,7 @@ from typing import (
     TYPE_CHECKING,
     Annotated,
     Any,
+    ClassVar,
     Dict,
     Iterable,
     List,
@@ -218,6 +219,11 @@ def _check_mm_routing_labels(labels, field_name: str, input_count: int) -> None:
 
 @dataclass
 class GenerateReqInput:
+    # Server-owned reporting policy. ClassVar keeps it out of the public
+    # dataclass constructor and Pydantic input schema; adapters set an instance
+    # value only after request validation. It never changes physical input IDs.
+    _cache_write_reporting_suffix_tokens: ClassVar[int] = 0
+
     # Request ID(s). If omitted, generated during normalization. For batch
     # requests, a string is expanded to per-item IDs using it as a prefix.
     rid: Optional[Union[str, List[str]]] = field(default=None, kw_only=True)
@@ -1188,6 +1194,9 @@ class GenerateReqInput:
                 else None
             ),
         )
+        sub._cache_write_reporting_suffix_tokens = (
+            self._cache_write_reporting_suffix_tokens
+        )
         cache[i] = sub
         return sub
 
@@ -1312,6 +1321,9 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # scheduler (encoder disaggregation). A defaulted tail field, so older
     # IPC senders decode as None.
     mm_routing_labels: Optional[Dict[str, List[str]]] = None
+
+    # Server-owned input reporting policy. Append-only for older Rust IPC senders.
+    cache_write_reporting_suffix_tokens: int = 0
 
     def wrap_pickle_fields(self):
         self.mm_inputs = wrap_object_fields_as_pickle(self.mm_inputs)
@@ -1914,6 +1926,9 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     input_top_logprobs_idx_flat: Optional[List[Optional[np.ndarray]]] = None
     input_top_logprobs_flat_null_prefix: Optional[List[Optional[int]]] = None
 
+    # Actual newly admitted prompt cache tokens; None means unsupported/unknown.
+    cache_write_tokens: Optional[List[Optional[int]]] = None
+
 
 class DetokenizeReleaseReq(BaseReq, kw_only=True):
     """Drops the detokenizer's state of a request that ended outside the output
@@ -1998,6 +2013,9 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
     input_top_logprobs_val_flat: Optional[List[Optional[np.ndarray]]] = None
     input_top_logprobs_idx_flat: Optional[List[Optional[np.ndarray]]] = None
     input_top_logprobs_flat_null_prefix: Optional[List[Optional[int]]] = None
+
+    # Actual newly admitted prompt cache tokens; None means unsupported/unknown.
+    cache_write_tokens: Optional[List[Optional[int]]] = None
 
 
 def row_output_ids(output: Union[BatchTokenIDOutput, BatchStrOutput], i: int) -> array:

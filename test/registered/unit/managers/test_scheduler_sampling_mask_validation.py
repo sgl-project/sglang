@@ -16,6 +16,7 @@ from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.session.session_controller import SessionController
+from sglang.srt.runtime_context import get_context
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -57,11 +58,13 @@ class TestSchedulerSamplingMaskValidation(CustomTestCase):
                     input_embeds=None,
                     bootstrap_port=1,
                     bootstrap_room=9,
+                    cache_write_reporting_suffix_tokens=0,
                 )
                 req = MagicMock(return_sampling_mask=True, return_logprob=False)
                 req.exit_via = req.send_via = req.kv.retraction_backup = None
                 req.kv.holds_kv = req.kv.holds_mamba = False
                 with (
+                    get_context().override_server_args(enable_cache_report=False),
                     patch(
                         "sglang.srt.managers.scheduler.BeamCoordinator.request_beam_width",
                         return_value=1,
