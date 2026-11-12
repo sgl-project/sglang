@@ -15,10 +15,14 @@ from sglang.srt.disaggregation.mooncake.conn import (
     MooncakeKVReceiver,
     MooncakeKVSender,
 )
-from sglang.srt.disaggregation.utils import resolve_dcp_dst_entry_indices, state_wire
+from sglang.srt.disaggregation.utils import (
+    _is_fake_transfer,
+    resolve_dcp_dst_entry_indices,
+    state_wire,
+)
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.runtime_context import get_parallel, get_spec
-from sglang.srt.utils.network import get_local_ip_auto
+from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
 
 logger = logging.getLogger(__name__)
 
@@ -111,7 +115,7 @@ class AscendKVManager(MooncakeKVManager):
         )
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
 
-    def _draftless_dspark_prefill(self, info) -> bool:
+    def _is_draftless_dspark_prefill(self, info) -> bool:
         # A3 Flash has four target state entries followed by draft SWA. Only
         # that trailing draft entry may be absent, never a target component.
         target_wire = [
@@ -130,7 +134,7 @@ class AscendKVManager(MooncakeKVManager):
         )
 
     def _check_prefill_state_entries(self, info) -> None:
-        if self._draftless_dspark_prefill(info):
+        if self._is_draftless_dspark_prefill(info):
             logger.info(
                 "DSpark prefill has no draft SWA: start draft context at the "
                 "prompt boundary and populate it from verified target tokens"
@@ -138,18 +142,23 @@ class AscendKVManager(MooncakeKVManager):
             return
         super()._check_prefill_state_entries(info)
 
-    def initialize_dspark_context(
-        self, bootstrap_addr, draft_pool, req_slot, seq_len, *, fake_transfer=False
-    ):
+    def initialize_dspark_context(self, req, draft_pool, seq_len: int) -> None:
         if not self._supports_draftless_dspark:
             return
         # Synthetic startup warmup has no registered prefill peer.
-        cold_start = fake_transfer or self._draftless_dspark_prefill(
-            self.prefill_info_table[bootstrap_addr]
-        )
+        cold_start = _is_fake_transfer(req)
+        if not cold_start:
+            bootstrap_addr = NetworkAddress(
+                req.bootstrap_host, req.bootstrap_port
+            ).to_host_port_str()
+            cold_start = self._is_draftless_dspark_prefill(
+                self.prefill_info_table[bootstrap_addr]
+            )
         # Reset on every placement, including a slot previously used by a
         # draftless peer. The next forward must never read stale prompt rows.
-        draft_pool._npu_dspark_context_start[req_slot] = seq_len if cold_start else 0
+        draft_pool._npu_dspark_context_start[req.kv.req_pool_idx] = (
+            seq_len if cold_start else 0
+        )
 
     def _uses_page_interleaved_dcp(self) -> bool:
         return (
