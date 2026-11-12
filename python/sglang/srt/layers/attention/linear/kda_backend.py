@@ -547,6 +547,11 @@ class KDAAttnBackend(MambaAttnBackendBase):
             )
 
             self._hip_chain_verify_fn = kda_chain_verify_gfx950
+        if is_gfx95_supported():
+            from sglang.kernels.ops.attention.linear import kda_gfx950_prefill
+
+            # Breakable prefill graphs capture the HIP extend; load it before capture.
+            kda_gfx950_prefill.preload()
         # Per-request row index into the speculative `intermediate_ssm` scratch,
         # used by the MTP / target_verify path (mirrors GDNAttnBackend). Sized
         # past the pool for attn_tp-padded warmup/MLP-sync batches (see helper).
