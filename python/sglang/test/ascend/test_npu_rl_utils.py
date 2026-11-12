@@ -348,6 +348,7 @@ def generate(
     max_new_tokens: int = 8,
     temperature: float = 0.0,
     ignore_eos: bool = True,
+    return_logprob: bool = False,
     timeout: float = 180,
 ) -> Dict[str, Any]:
     response = post(
@@ -360,6 +361,7 @@ def generate(
                 "temperature": temperature,
                 "ignore_eos": ignore_eos,
             },
+            "return_logprob": return_logprob,
         },
         timeout=timeout,
     )
@@ -472,15 +474,69 @@ def generation_signature(
     return tuple(signature)
 
 
-def assert_signature_equal(
-    actual: Sequence[Sequence[int]],
-    expected: Sequence[Sequence[int]],
+def logprob_signature(
+    base_url: str,
+    prompts: Sequence[str],
+    *,
+    max_new_tokens: int = 8,
+) -> Tuple[Tuple[Tuple[int, ...], Tuple[float, ...]], ...]:
+    """Return ``(output_ids, output_token_logprobs)`` for each prompt.
+
+    Logprobs catch a partially or silently loaded payload that still produces
+    the same greedy tokens, which plain output ids would miss.
+    """
+    signature = []
+    for prompt in prompts:
+        result = generate(
+            base_url, prompt, max_new_tokens=max_new_tokens, return_logprob=True
+        )
+        meta = result.get("meta_info", {})
+        token_logprobs = tuple(
+            round(float(item[0]), 3)
+            for item in (meta.get("output_token_logprobs") or ())
+        )
+        if not token_logprobs:
+            raise AssertionError(
+                f"/generate returned no output_token_logprobs for {prompt!r}"
+            )
+        signature.append((tuple(result["output_ids"]), token_logprobs))
+    return tuple(signature)
+
+
+def assert_logprob_signature_equal(
+    actual: Sequence[Tuple[Sequence[int], Sequence[float]]],
+    expected: Sequence[Tuple[Sequence[int], Sequence[float]]],
     message: str,
+    *,
+    logprob_tolerance: float = 5e-2,
 ) -> None:
-    actual = tuple(tuple(ids) for ids in actual)
-    expected = tuple(tuple(ids) for ids in expected)
-    if actual != expected:
-        raise AssertionError(f"{message}\n  actual:   {actual}\n  expected: {expected}")
+    if len(actual) != len(expected):
+        raise AssertionError(
+            f"{message}: signature lengths differ ({len(actual)} != {len(expected)})"
+        )
+    for index, (actual_item, expected_item) in enumerate(zip(actual, expected)):
+        actual_ids = tuple(actual_item[0])
+        expected_ids = tuple(expected_item[0])
+        if actual_ids != expected_ids:
+            raise AssertionError(
+                f"{message}: token ids differ for prompt {index}\n"
+                f"  actual:   {actual_ids}\n  expected: {expected_ids}"
+            )
+        actual_logprobs = tuple(actual_item[1])
+        expected_logprobs = tuple(expected_item[1])
+        if len(actual_logprobs) != len(expected_logprobs):
+            raise AssertionError(
+                f"{message}: logprob count differs for prompt {index} "
+                f"({len(actual_logprobs)} != {len(expected_logprobs)})"
+            )
+        for position, (actual_lp, expected_lp) in enumerate(
+            zip(actual_logprobs, expected_logprobs)
+        ):
+            if abs(actual_lp - expected_lp) > logprob_tolerance:
+                raise AssertionError(
+                    f"{message}: logprob differs for prompt {index}, token {position} "
+                    f"({actual_lp} vs {expected_lp}, tolerance {logprob_tolerance})"
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -539,6 +595,56 @@ def checkpoint_tensor_index(model_path: str) -> Dict[str, str]:
             for name in handle.keys():
                 index[name] = path
     return index
+
+
+# Dtypes are ordered so that wider tensors start 4-byte aligned, which is what
+# FlattenedTensorBucket.empty() validates on the receiving side.
+_FLATTEN_ORDER = {"float32": 0, "float16": 1, "bfloat16": 2}
+
+
+def flattened_checkpoint_manifest(
+    model_path: str,
+) -> List[Tuple[str, str, List[int]]]:
+    """Manifest ordered for a single flattened_bucket transfer buffer."""
+    manifest = checkpoint_manifest(model_path)
+    return sorted(manifest, key=lambda item: (_FLATTEN_ORDER.get(item[1], 3), item[0]))
+
+
+def flattened_tensor_bucket(model_path: str, device: str = "npu"):
+    """Materialize the whole checkpoint as one FlattenedTensorBucket on ``device``.
+
+    Tensors are copied one at a time into the bucket buffer, so peak memory is
+    the flattened payload plus one source tensor rather than both full sets.
+    """
+    from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
+
+    manifest = flattened_checkpoint_manifest(model_path)
+    bucket = FlattenedTensorBucket.empty(
+        [name for name, _, _ in manifest],
+        [dtype for _, dtype, _ in manifest],
+        [shape for _, _, shape in manifest],
+        device,
+    )
+    index = checkpoint_tensor_index(model_path)
+    flat = bucket.get_flattened_tensor()
+    for meta in bucket.metadata:
+        source = load_checkpoint_tensor(index, meta.name)
+        flat[meta.start_idx : meta.end_idx].view(meta.dtype).reshape(meta.shape).copy_(
+            source
+        )
+    return bucket
+
+
+def serialize_flattened_bucket(bucket) -> str:
+    from sglang.srt.utils import MultiprocessingSerializer
+
+    return MultiprocessingSerializer.serialize(
+        {
+            "flattened_tensor": bucket.get_flattened_tensor(),
+            "metadata": bucket.get_metadata(),
+        },
+        output_str=True,
+    )
 
 
 def load_checkpoint_tensor(index: Dict[str, str], name: str) -> torch.Tensor:
@@ -601,12 +707,47 @@ def update_full_checkpoint(
     base_url: str,
     model_path: str,
     *,
-    chunk_bytes: int = 256 * 1024 * 1024,
+    flattened_bucket: bool = False,
+    chunk_bytes: Optional[int] = None,
     weight_version: Optional[str] = None,
 ) -> None:
-    """Stream the whole checkpoint into a running engine from tensor updates."""
+    """Stream the whole checkpoint into a running engine from tensor updates.
+
+    By default the payload is sent as one transaction, matching the RL
+    weight-transfer flow and vLLM-Ascend's single update transaction. Chunking
+    (``chunk_bytes``) is supported for memory-constrained callers, but some
+    loaders keep cross-tensor post-load state (fused qkv / indexer / expert
+    packing) that is only complete within one ``load_weights`` call, so a
+    chunked update can leave derived weights inconsistent.
+    """
     begin_weight_update(base_url)
     try:
+        if flattened_bucket:
+            # The bucket owns the NPU buffer behind the serialized IPC handle, so
+            # it must stay alive until the server has read the payload.
+            bucket = flattened_tensor_bucket(model_path, "npu")
+            body = {
+                "serialized_named_tensors": [serialize_flattened_bucket(bucket)],
+                "load_format": "flattened_bucket",
+                "flush_cache": True,
+            }
+            if weight_version is not None:
+                body["weight_version"] = weight_version
+            post(base_url, "/update_weights_from_tensor", body, timeout=900)
+            del bucket
+            return
+        if chunk_bytes is None:
+            tensors = [
+                (name, cpu_tensor.to("npu").contiguous())
+                for name, cpu_tensor in iter_checkpoint_tensors(model_path)
+            ]
+            update_weights_from_tensor(
+                base_url,
+                tensors,
+                flush_cache_after=True,
+                weight_version=weight_version,
+            )
+            return
         buffer: List[Tuple[str, torch.Tensor]] = []
         buffer_bytes = 0
         for name, cpu_tensor in iter_checkpoint_tensors(model_path):
@@ -628,6 +769,110 @@ def update_full_checkpoint(
             flush_cache(base_url)
     finally:
         end_weight_update(base_url)
+
+
+def update_weights_from_tensor_per_rank(
+    base_url: str,
+    named_tensors: Sequence[Tuple[str, torch.Tensor]],
+    tp_size: int,
+    *,
+    flattened_bucket: bool = False,
+    weight_version: Optional[str] = None,
+) -> None:
+    """Push the same named tensors as one payload per TP rank.
+
+    Each rank's payload is built on that rank's device; the engine shards the
+    full tensors inside ``load_weights``. ``flattened_bucket=True`` sends each
+    rank's payload as one flattened buffer (``load_format="flattened_bucket"``).
+    """
+    load_format = "flattened_bucket" if flattened_bucket else None
+    from sglang.srt.utils import MultiprocessingSerializer
+
+    keepalive = []
+    payloads = []
+    try:
+        for rank in range(tp_size):
+            device = f"npu:{rank}"
+            tensors = [
+                (name, tensor.to(device).contiguous()) for name, tensor in named_tensors
+            ]
+            keepalive.append(tensors)
+            if load_format == "flattened_bucket":
+                from sglang.srt.weight_sync.tensor_bucket import (
+                    FlattenedTensorBucket,
+                )
+
+                bucket = FlattenedTensorBucket(named_tensors=tensors)
+                keepalive.append(bucket)
+                payloads.append(serialize_flattened_bucket(bucket))
+            else:
+                payloads.append(
+                    MultiprocessingSerializer.serialize(tensors, output_str=True)
+                )
+        body = {
+            "serialized_named_tensors": payloads,
+            "load_format": load_format,
+            "flush_cache": True,
+        }
+        if weight_version is not None:
+            body["weight_version"] = weight_version
+        begin_weight_update(base_url)
+        try:
+            post(base_url, "/update_weights_from_tensor", body, timeout=1800)
+        finally:
+            end_weight_update(base_url)
+    finally:
+        del keepalive, payloads
+
+
+def update_full_checkpoint_per_rank(
+    base_url: str,
+    model_path: str,
+    tp_size: int,
+    *,
+    flattened_bucket: bool = False,
+    weight_version: Optional[str] = None,
+) -> None:
+    """Push one payload per TP rank, like an SPMD RL trainer.
+
+    Each rank's payload holds full (unsharded) tensors created on that rank's
+    device; the engine shards them inside ``load_weights``. The payloads are
+    serialized as NPU IPC handles, so the HTTP body stays small.
+    """
+    from sglang.srt.utils import MultiprocessingSerializer
+
+    keepalive = []
+    payloads = []
+    try:
+        for rank in range(tp_size):
+            device = f"npu:{rank}"
+            if flattened_bucket:
+                bucket = flattened_tensor_bucket(model_path, device)
+                keepalive.append(bucket)
+                payloads.append(serialize_flattened_bucket(bucket))
+            else:
+                tensors = [
+                    (name, cpu_tensor.to(device).contiguous())
+                    for name, cpu_tensor in iter_checkpoint_tensors(model_path)
+                ]
+                keepalive.append(tensors)
+                payloads.append(
+                    MultiprocessingSerializer.serialize(tensors, output_str=True)
+                )
+        body = {
+            "serialized_named_tensors": payloads,
+            "load_format": "flattened_bucket" if flattened_bucket else None,
+            "flush_cache": True,
+        }
+        if weight_version is not None:
+            body["weight_version"] = weight_version
+        begin_weight_update(base_url)
+        try:
+            post(base_url, "/update_weights_from_tensor", body, timeout=1800)
+        finally:
+            end_weight_update(base_url)
+    finally:
+        del keepalive, payloads
 
 
 def update_weights_from_flattened_bucket(
