@@ -155,7 +155,11 @@ class SglFunction:
         assert all(key in self.arg_names for key in kwargs)
 
         new_bind_dict = {**self.bind_arguments, **kwargs}
-        return SglFunction(self.func, bind_arguments=new_bind_dict)
+        return SglFunction(
+            self.func,
+            num_api_spec_tokens=self.num_api_spec_tokens,
+            bind_arguments=new_bind_dict,
+        )
 
     def run(
         self,
@@ -433,6 +437,7 @@ class SglArgument(SglExpr):
 
 class SglImage(SglExpr):
     def __init__(self, path: str):
+        super().__init__()
         self.path = path
 
     def __repr__(self) -> str:
@@ -441,6 +446,7 @@ class SglImage(SglExpr):
 
 class SglVideo(SglExpr):
     def __init__(self, path: str, num_frames: int):
+        super().__init__()
         self.path = path
         self.num_frames = num_frames
 
