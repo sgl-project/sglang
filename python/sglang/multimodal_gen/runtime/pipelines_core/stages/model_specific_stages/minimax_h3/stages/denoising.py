@@ -32,7 +32,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
     DenoisingStage,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.constants import (
-    MINIMAX_H3_HIGH_QUALITY_CACHE_DIT_CONFIG,
+    MINIMAX_H3_HIGH_QUALITY_CACHE_DIT_PHASES,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.resolved_plan import (
     minimax_h3_plan_from_batch,
@@ -486,6 +486,16 @@ def _precompute_rope_cache(
     return True
 
 
+def _high_quality_steps_computation_mask(num_inference_steps: int) -> list[int]:
+    # 1 runs the DiT stack, 0 reuses the cached residual; the final step always runs
+    mask = [1] * num_inference_steps
+    for start, end, period in MINIMAX_H3_HIGH_QUALITY_CACHE_DIT_PHASES:
+        for step in range(start, min(end, num_inference_steps)):
+            mask[step] = int((step - start) % period == period - 1)
+    mask[-1] = 1
+    return mask
+
+
 class MiniMaxH3DenoisingStage(DenoisingStage):
     def __init__(
         self, transformer, pipeline=None, stochastic_sampling: bool = False
@@ -644,7 +654,12 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
         self, primary_num_steps: int, secondary_num_steps: int | None = None
     ) -> tuple[str, str, list[int] | None, list[int] | None]:
         if getattr(self, "_minimax_h3_quality", "exact") == "high":
-            return "none", "dynamic", None, None
+            return (
+                "none",
+                "static",
+                _high_quality_steps_computation_mask(primary_num_steps),
+                None,
+            )
         return super()._cache_dit_scm_masks(primary_num_steps, secondary_num_steps)
 
     def _build_cache_dit_config(
@@ -662,14 +677,15 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                 scm_policy,
                 secondary=secondary,
             )
-        warmup, threshold, max_cached = MINIMAX_H3_HIGH_QUALITY_CACHE_DIT_CONFIG
+        # the static mask decides every step, so the residual threshold and the
+        # consecutive-reuse cap are never consulted
         return CacheDitConfig(
             enabled=True,
             Fn_compute_blocks=1,
             Bn_compute_blocks=0,
-            max_warmup_steps=warmup,
-            residual_diff_threshold=threshold,
-            max_continuous_cached_steps=max_cached,
+            max_warmup_steps=MINIMAX_H3_HIGH_QUALITY_CACHE_DIT_PHASES[0][0],
+            residual_diff_threshold=0.0,
+            max_continuous_cached_steps=-1,
             enable_taylorseer=False,
             taylorseer_order=1,
             num_inference_steps=num_inference_steps,
@@ -786,6 +802,7 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
             sampling=sampling,
             imgvid_noise_aug=imgvid_noise_aug,
             audio_noise_aug=audio_noise_aug,
+            stochastic_sampling=self.stochastic_sampling,
         )
         attn_metadata = _build_cube_attn_metadata(
             server_args,
@@ -1425,8 +1442,16 @@ def _apply_condition_noise_aug(
     sampling: Any,
     imgvid_noise_aug: float,
     audio_noise_aug: float,
+    stochastic_sampling: bool = False,
 ) -> None:
     """Apply condition noise augmentation to cond rows."""
+
+    if stochastic_sampling and ctx.cond_rows is not None:
+        # Cached anchors are on CPU; the release draws and mixes on the DiT device.
+        ctx.cond_rows = ctx.cond_rows.to(current_platform.get_local_torch_device())
+        if not ctx.is_ref2va:
+            # The released FL2VA adapter rounds clean conditioning to BF16 first.
+            ctx.cond_rows = ctx.cond_rows.to(torch.bfloat16).float()
 
     noise_visual_conditions = (
         ctx.cond_rows is not None and float(imgvid_noise_aug) < 1.0
@@ -1466,6 +1491,13 @@ def _apply_condition_noise_aug(
             imgvid_cond_num_frames=imgvid_cond_num_frames,
             seed=int(noise_seed),
             noise_aug=float(imgvid_noise_aug),
+            generator=(
+                torch.Generator(device=ctx.cond_rows.device).manual_seed(
+                    int(noise_seed) + 7919
+                )
+                if stochastic_sampling
+                else None
+            ),
         )
 
     if noise_audio_conditions:
