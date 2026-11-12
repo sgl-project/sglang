@@ -1,4 +1,4 @@
-"""Public adapter for the normal-wheel Ascend combined-cache Copy-SFA operator."""
+"""Public adapter for the Ascend combined/split-host Copy-SFA operator."""
 
 from __future__ import annotations
 
@@ -85,16 +85,9 @@ def fused_scatter_copy_sparse_flash_attention(
         attention_out,
         scale_value,
     )
-    if resident_inputs is not None:
-        operator(
-            *inputs,
-            full_visible=full_visible,
-            resident_refresh_tail=resident_refresh_tail,
-            **resident_inputs,
-        )
-    elif resident_refresh_tail:
-        operator(*inputs, full_visible=True, resident_refresh_tail=True)
-    elif full_visible:
-        operator(*inputs, full_visible=True)
-    else:
-        operator(*inputs)
+    operator(
+        *inputs,
+        full_visible=full_visible,
+        resident_refresh_tail=resident_refresh_tail,
+        **(resident_inputs or {}),
+    )

@@ -62,13 +62,6 @@ class TestSparsityDrivenKVOffloadConfig(CustomTestCase):
             patch(prefix + "get_disagg", return_value=disagg),
             patch(prefix + "get_parallel", return_value=parallel),
             patch(prefix + "get_schedule", return_value=SimpleNamespace(page_size=128)),
-            patch(
-                prefix + "get_memory",
-                return_value=SimpleNamespace(
-                    enable_hisparse=False,
-                    enable_hierarchical_cache=False,
-                ),
-            ),
         ):
             for backend in ("ascend", "mooncake"):
                 disagg.disaggregation_transfer_backend = backend
@@ -89,9 +82,20 @@ class TestSparsityDrivenKVOffloadConfig(CustomTestCase):
             with self.assertRaisesRegex(ValueError, "host receive threshold"):
                 use_pd_split_kv()
             disagg.disaggregation_decode_host_receive_threshold = 1
+            with patch.object(parallel, "nnodes", 2):
+                self.assertTrue(use_pd_split_kv())
+            with patch(
+                prefix + "get_schedule", return_value=SimpleNamespace(page_size=64)
+            ):
+                for mode in ("prefill", "decode"):
+                    disagg.disaggregation_mode = mode
+                    with (
+                        self.subTest(mode=mode),
+                        self.assertRaisesRegex(ValueError, "page-size 128"),
+                    ):
+                        use_pd_split_kv()
             for obj, attribute, value, message in (
                 (disagg, "disaggregation_transfer_backend", "fake", "transfer backend"),
-                (parallel, "nnodes", 2, "single-node"),
                 (parallel, "pp_size", 2, "PP=1"),
                 (parallel, "attn_cp_size", 2, "context parallelism"),
                 (parallel, "dcp_enabled", True, "context parallelism"),
@@ -135,18 +139,24 @@ class TestSparsityDrivenKVOffloadConfig(CustomTestCase):
             patch(prefix + "get_eager_max_batch_size", return_value=4),
             patch(prefix + "get_sparse_kv_max_query_width", return_value=1),
         ):
-            plan = get_sparse_kv_budget(
-                model_config=model,
-                request_rows=3,
-                context_len=4097,
-                num_layers=2,
-                top_k=2048,
-                kv_bytes_per_token=1152,
-                graph_batch_capacity=4,
-            )
-        self.assertEqual(plan.copy_sfa_query_heads, 16)
-        self.assertEqual(plan.manager_buffers["fused_attn_out"].shape, (4, 16, 512))
-        self.assertEqual(plan.adapter_buffers["query_scale"].shape, (4, 32))
+            for total_heads, native_heads in ((80, 10), (384, 48), (768, 128)):
+                with self.subTest(total_heads=total_heads):
+                    model.num_attention_heads = total_heads
+                    plan = get_sparse_kv_budget(
+                        model_config=model,
+                        request_rows=3,
+                        context_len=4097,
+                        num_layers=2,
+                        top_k=2048,
+                        kv_bytes_per_token=1152,
+                        graph_batch_capacity=4,
+                    )
+                    self.assertEqual(plan.copy_sfa_query_heads, native_heads)
+                    self.assertEqual(
+                        plan.manager_buffers["fused_attn_out"].shape,
+                        (4, native_heads, 512),
+                    )
+                    self.assertEqual(plan.adapter_buffers["query_scale"].shape, (4, 32))
 
     def test_graph_alignment_is_reserved_before_buckets_are_resolved(self):
         from sglang.srt.environ import envs

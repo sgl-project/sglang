@@ -9,6 +9,8 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.srt.utils.common import ceil_div
+
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
 
@@ -87,7 +89,7 @@ class BudgetPlan:
         self.kv_cache_dim = kv_lora_rank + qk_rope_head_dim
         self.prefill_workspace_tokens = prefill_workspace_tokens
         self.prefill_workspace_sizing_finalized = False
-        index_dtype = torch.int32
+        metadata_dtype = torch.int32
         self.manager_buffers = {
             "device_kv_buffer": BufferSpec(
                 (request_rows, cache_tokens, 1, self.kv_cache_dim),
@@ -95,17 +97,19 @@ class BudgetPlan:
                 num_layers,
             ),
             "device_slot_map": BufferSpec(
-                (request_rows + 1, context_len), index_dtype, num_layers
+                (request_rows + 1, context_len), metadata_dtype, num_layers
             ),
-            "resident_begin": BufferSpec((num_layers, request_rows), index_dtype),
-            "resident_end": BufferSpec((num_layers, request_rows), index_dtype),
-            "planner_actual_seq_lengths_kv": BufferSpec((batch_capacity,), index_dtype),
-            "planner_num_cache_tokens": BufferSpec((batch_capacity,), index_dtype),
+            "resident_begin": BufferSpec((num_layers, request_rows), metadata_dtype),
+            "resident_end": BufferSpec((num_layers, request_rows), metadata_dtype),
+            "planner_actual_seq_lengths_kv": BufferSpec(
+                (batch_capacity,), metadata_dtype
+            ),
+            "planner_num_cache_tokens": BufferSpec((batch_capacity,), metadata_dtype),
             "planner_hbm_block_table": BufferSpec(
-                (batch_capacity, cache_tokens // page_size), index_dtype
+                (batch_capacity, cache_tokens // page_size), metadata_dtype
             ),
             "planner_dram_block_table": BufferSpec(
-                (batch_capacity, context_len // page_size), index_dtype
+                (batch_capacity, context_len // page_size), metadata_dtype
             ),
             "fused_attn_out": BufferSpec(
                 (
@@ -131,24 +135,26 @@ class BudgetPlan:
             )
         self.adapter_buffers = {
             "source_ids": BufferSpec(
-                (batch_capacity * max_query_width, 1, top_k), index_dtype
+                (batch_capacity * max_query_width, 1, top_k), metadata_dtype
             ),
             "device_slots": BufferSpec(
-                (batch_capacity * max_query_width, 1, top_k), index_dtype
+                (batch_capacity * max_query_width, 1, top_k), metadata_dtype
             ),
-            "topk_misses": BufferSpec((batch_capacity * max_query_width,), index_dtype),
-            "miss_sources": BufferSpec((batch_capacity, MISS_CAPACITY), index_dtype),
-            "miss_slots": BufferSpec((batch_capacity, MISS_CAPACITY), index_dtype),
-            "miss_counts": BufferSpec((batch_capacity,), index_dtype),
+            "topk_misses": BufferSpec(
+                (batch_capacity * max_query_width,), metadata_dtype
+            ),
+            "miss_sources": BufferSpec((batch_capacity, MISS_CAPACITY), metadata_dtype),
+            "miss_slots": BufferSpec((batch_capacity, MISS_CAPACITY), metadata_dtype),
+            "miss_counts": BufferSpec((batch_capacity,), metadata_dtype),
             "query_scale": BufferSpec(
                 (batch_capacity * max_query_width, index_n_heads),
                 self.scale_dtype,
             ),
-            "query_ends": BufferSpec((max_query_width, batch_capacity), index_dtype),
+            "query_ends": BufferSpec((max_query_width, batch_capacity), metadata_dtype),
             "block_table": BufferSpec(
-                (batch_capacity, context_len // page_size), index_dtype
+                (batch_capacity, context_len // page_size), metadata_dtype
             ),
-            "last_prefix": BufferSpec((num_layers, request_rows + 1), index_dtype),
+            "last_prefix": BufferSpec((num_layers, request_rows + 1), metadata_dtype),
         }
         # Per batch row: six int32 metadata arrays and two boolean masks (26 bytes).
         for name in (
@@ -159,7 +165,7 @@ class BudgetPlan:
             "_pre_next_prefix",
             "_pre_cache_sizes",
         ):
-            self.adapter_buffers[name] = BufferSpec((batch_capacity,), index_dtype)
+            self.adapter_buffers[name] = BufferSpec((batch_capacity,), metadata_dtype)
         for name in ("_pre_sparse", "_pre_valid"):
             self.adapter_buffers[name] = BufferSpec((batch_capacity,), torch.bool)
         self.device_kv_bytes = self.manager_buffers["device_kv_buffer"].nbytes
@@ -176,11 +182,6 @@ class BudgetPlan:
             if n.startswith("prefill_")
         )
         self.adapter_bytes = sum(s.nbytes for s in self.adapter_buffers.values())
-        self.host_kv_bytes = BufferSpec(
-            (request_rows, context_len, 1, self.kv_cache_dim),
-            kv_dtype,
-            num_layers,
-        ).nbytes
         self.host_token_capacity = None
         self.host_kv_spec = None
         self.key_scale_spec = None
@@ -195,6 +196,13 @@ class BudgetPlan:
             + self.adapter_bytes
         )
 
+    @property
+    def host_kv_bytes(self) -> int:
+        """Report the physical Host allocation only after native pool binding."""
+        if self.host_kv_spec is None:
+            raise RuntimeError("Bind the native KV pool before reading Host KV bytes.")
+        return self.host_kv_spec.nbytes
+
     def disable_prefill_workspace(self) -> None:
         """Drop the optional allocation before the plan is bound to a pool."""
         if self.host_token_capacity is not None:
@@ -206,14 +214,6 @@ class BudgetPlan:
 
     def bind_native_pool(self, pool) -> BudgetPlan:
         """Bind the native physical layout once, checking subsequent bindings."""
-        if (
-            pool.page_size != self.page_size
-            or pool.layer_num != self.num_layers
-            or pool.store_dtype != self.kv_dtype
-            or (pool.kv_lora_rank, pool.qk_rope_head_dim)
-            != (self.kv_lora_rank, self.qk_rope_head_dim)
-        ):
-            raise ValueError("Native KV pool does not match the sparse budget plan.")
         indexer_layer_ids = getattr(pool, "indexer_layer_ids", (pool.start_layer,))
         if not indexer_layer_ids:
             raise ValueError("Native LIM requires at least one indexer K layer.")
@@ -224,14 +224,9 @@ class BudgetPlan:
             or tuple(key.shape[1:]) != (self.page_size, 1, self.index_head_dim)
         ):
             raise ValueError("Native index keys do not match the model budget plan.")
-        host_token_capacity = (
-            (int(pool.size) + int(pool.page_size) + self.page_size - 1)
-            // self.page_size
-        ) * self.page_size
-        if key.shape[0] != host_token_capacity // self.page_size:
-            raise ValueError(
-                "Native index key pages do not match KV capacity and dummy page."
-            )
+        # get_index_k_buffer returns one layer: [pages, page_size, 1, head_dim].
+        # Its pages already include the native allocator's dummy page.
+        host_token_capacity = key.shape[0] * self.page_size
         key_scale_spec = BufferSpec(tuple(key.shape[:3]), self.scale_dtype)
         if self.host_token_capacity is not None:
             if (
@@ -249,7 +244,6 @@ class BudgetPlan:
             self.kv_dtype,
             self.num_layers,
         )
-        self.host_kv_bytes = self.host_kv_spec.nbytes
         return self
 
     def validate_buffers(self, owner, specs: dict[str, BufferSpec]) -> None:
@@ -279,43 +273,10 @@ def resolve_sparse_kv_budget(
     qk_rope_head_dim = model_config.qk_rope_head_dim
     index_head_dim = model_config.index_head_dim
     index_n_heads = model_config.hf_config.index_n_heads
-    for name, value in (
-        ("page_size", page_size),
-        ("kv_lora_rank", kv_lora_rank),
-        ("qk_rope_head_dim", qk_rope_head_dim),
-        ("index_head_dim", index_head_dim),
-        ("index_n_heads", index_n_heads),
-        ("request_rows", request_rows),
-        ("context_len", context_len),
-        ("num_layers", num_layers),
-        ("kv_bytes_per_token", kv_bytes_per_token),
-        ("top_k", top_k),
-        ("max_query_width", max_query_width),
-        ("copy_sfa_query_heads", copy_sfa_query_heads),
-    ):
-        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-            raise ValueError(f"{name} must be a positive integer.")
-    for name, value in (
-        ("cache_tokens", cache_tokens),
-        ("hbm_budget_bytes", hbm_budget_bytes),
-        ("graph_batch_capacity", graph_batch_capacity),
-        ("prefill_workspace_tokens", prefill_workspace_tokens),
-    ):
-        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-            raise ValueError(f"{name} must be a nonnegative integer.")
-    if top_k != model_config.hf_config.index_topk:
-        raise ValueError("Sparse KV TopK must match the model configuration.")
-    if top_k != 2048 or context_len > 2**21:
-        raise ValueError("Native LIM requires K=2048 and context length <= 2**21.")
-    if page_size != 128 or index_head_dim != 128 or index_n_heads not in (32, 64):
-        raise ValueError(
-            "Native LIM requires page size 128, index dimension 128 and 32/64 index heads."
-        )
-    if (kv_lora_rank, qk_rope_head_dim) != (512, 64):
-        raise ValueError("CopySFA requires model KV dimensions CKV=512 and KPE=64.")
-    if (
-        not 1 <= max_query_width <= MAX_QUERY_WIDTH
-        or not 1 <= copy_sfa_query_heads <= 128
+    if context_len > 2**21:
+        raise ValueError("Native LIM requires context length <= 2**21.")
+    if not 1 <= max_query_width <= MAX_QUERY_WIDTH or not (
+        1 <= copy_sfa_query_heads <= 64 or copy_sfa_query_heads == 128
     ):
         raise ValueError("Invalid native LIM query geometry.")
     if (
@@ -334,7 +295,7 @@ def resolve_sparse_kv_budget(
         )
     result = BudgetPlan(
         request_rows=request_rows,
-        context_len=(context_len + page_size - 1) // page_size * page_size,
+        context_len=ceil_div(context_len, page_size) * page_size,
         num_layers=num_layers,
         top_k=top_k,
         kv_dtype=kv_dtype,

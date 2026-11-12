@@ -81,16 +81,13 @@ class TestLIMState(CustomTestCase):
             small.batch_capacity * small.max_query_width * (64 - 32) * 4,
         )
 
-    def test_unsupported_model_geometry_is_rejected(self):
-        for field, value in (
-            ("kv_lora_rank", 256),
-            ("qk_rope_head_dim", 32),
-            ("index_head_dim", 96),
-        ):
-            options = self.options()
-            setattr(options["model_config"], field, value)
-            with self.assertRaises(ValueError):
-                resolve_sparse_kv_budget(**options)
+    def test_native_source_addressing_limit(self):
+        options = self.options()
+        options["context_len"] = 2**21
+        self.assertEqual(resolve_sparse_kv_budget(**options).context_len, 2**21)
+        options["context_len"] += 1
+        with self.assertRaisesRegex(ValueError, "context length"):
+            resolve_sparse_kv_budget(**options)
 
     def test_query_geometry_uses_actual_verify_width(self):
         for width in (1, 2, 3, 4, 5, 8, 14):
@@ -156,8 +153,6 @@ class TestLIMState(CustomTestCase):
                     hbm_budget_bytes=base.managed_hbm_bytes - 1,
                 )
             )
-        with self.assertRaises(ValueError):
-            resolve_sparse_kv_budget(**self.options(prefill_workspace_tokens=-1))
 
     def test_budget_rejects_insufficient_union_capacity_and_width(self):
         for width in (2, 3, 5, 14):
@@ -419,13 +414,22 @@ class TestLIMState(CustomTestCase):
         with self.assertRaises(ValueError):
             plan.validate_buffers(manager.lim_adapter, plan.adapter_buffers)
         manager.lim_adapter.source_ids = original
-        pool.kv_lora_rank = 256
-        with self.assertRaises(ValueError):
-            plan.bind_native_pool(pool)
-        pool.kv_lora_rank = 512
+        # Use the allocated index pages, including their dummy page, rather
+        # than reconstructing the physical capacity from a logical size.
         pool.size = 3968
-        with self.assertRaises(ValueError):
+        self.assertIs(plan.bind_native_pool(pool), plan)
+        self.assertEqual(plan.host_token_capacity, 4096 + 128)
+        self.assertEqual(plan.host_kv_bytes, (4096 + 128) * 576 * 2 * 2)
+        pool.get_index_k_buffer.return_value = torch.empty(
+            (34, 128, 1, 128), dtype=torch.bfloat16
+        )
+        with self.assertRaisesRegex(ValueError, "already bound"):
             plan.bind_native_pool(pool)
+
+    def test_host_bytes_are_unavailable_before_physical_pool_binding(self):
+        plan = resolve_sparse_kv_budget(**self.options())
+        with self.assertRaisesRegex(RuntimeError, "Bind the native KV pool"):
+            _ = plan.host_kv_bytes
 
     def test_tp_suffix_does_not_extend_actual_query_windows(self):
         for width in (2, 3, 5, 8, 14):

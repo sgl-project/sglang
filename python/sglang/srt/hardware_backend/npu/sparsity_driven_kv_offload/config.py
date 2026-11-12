@@ -25,11 +25,11 @@ from sglang.srt.runtime_context import (
     attention_backends,
     get_disagg,
     get_exec,
-    get_memory,
     get_parallel,
     get_schedule,
     get_spec,
 )
+from sglang.srt.utils.common import ceil_div
 from sglang.srt.utils.device import is_npu
 
 if TYPE_CHECKING:
@@ -38,6 +38,11 @@ if TYPE_CHECKING:
 
 def use_fused_sparse_kv_offload() -> bool:
     return envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.get()
+
+
+def _validate_fused_page_size() -> None:
+    if get_schedule().page_size != 128:
+        raise ValueError("Native LIM integration requires --page-size 128.")
 
 
 def use_pd_split_kv() -> bool:
@@ -51,11 +56,10 @@ def use_pd_split_kv() -> bool:
     disagg = get_disagg()
     if disagg.disaggregation_mode not in ("prefill", "decode"):
         return False
+    _validate_fused_page_size()
     prefill_backend, decode_backend = attention_backends()
-    if not is_npu() or (prefill_backend, decode_backend) != ("ascend", "ascend"):
+    if (prefill_backend, decode_backend) != ("ascend", "ascend"):
         raise ValueError("PD split KV requires the Ascend attention backend.")
-    if get_schedule().page_size != 128:
-        raise ValueError("PD split KV requires page size 128.")
     parallel = get_parallel()
     if parallel.pp_size != 1 or parallel.attn_cp_size != 1 or parallel.dcp_enabled:
         raise ValueError("PD split KV requires PP=1 and context parallelism disabled.")
@@ -70,11 +74,6 @@ def use_pd_split_kv() -> bool:
         and disagg.disaggregation_decode_host_receive_threshold < 1
     ):
         raise ValueError("PD split KV requires host receive threshold 1.")
-    memory = get_memory()
-    if memory.enable_hisparse or memory.enable_hierarchical_cache:
-        raise ValueError("PD split KV cannot share MF with HiSparse or HiCache.")
-    if parallel.nnodes != 1:
-        raise ValueError("PD split KV requires single-node workers.")
     return True
 
 
@@ -117,8 +116,7 @@ def is_sparsity_driven_kv_offload_enabled(
         return False
     if int(get_dsa_index_topk(model_config.hf_config)) != 2048:
         raise ValueError("Native LIM integration requires model index_topk=2048.")
-    if get_schedule().page_size != 128:
-        raise ValueError("Native LIM integration requires --page-size 128.")
+    _validate_fused_page_size()
     if get_parallel().pp_size != 1 or get_parallel().dcp_enabled:
         raise ValueError(
             "Native LIM integration currently requires PP=1 and DCP disabled."
@@ -172,31 +170,7 @@ def get_sparsity_driven_kv_offload_cell_size(
     start_layer: int = 0,
     is_draft_worker: bool = False,
     indexer_layer_ids: Optional[Sequence[int]] = None,
-    kv_cache_dtype: Optional[torch.dtype] = None,
 ) -> Optional[int]:
-    if not use_fused_sparse_kv_offload():
-        if not is_sparsity_driven_kv_offload_enabled(
-            model_config=model_config,
-            use_mla_backend=use_mla_backend,
-        ):
-            return None
-
-        index_head_dim = get_sparsity_driven_kv_offload_index_head_dim(
-            model_config=model_config
-        )
-        from sglang.srt.mem_cache.kv_cache_configurator import (
-            _should_elide_dsa_index_k,
-        )
-
-        if _should_elide_dsa_index_k(is_draft_worker=is_draft_worker):
-            num_indexer_layers = sum(
-                not dsa_layer_skips_topk(model_config.hf_config, layer_id)
-                for layer_id in range(start_layer, start_layer + num_layers)
-            )
-        else:
-            num_indexer_layers = num_layers
-        return index_head_dim * num_indexer_layers * element_size
-
     if not is_sparsity_driven_kv_offload_enabled(
         model_config=model_config,
         use_mla_backend=use_mla_backend,
@@ -207,7 +181,7 @@ def get_sparsity_driven_kv_offload_cell_size(
     index_head_dim = get_sparsity_driven_kv_offload_index_head_dim(
         model_config=model_config
     )
-    if indexer_layer_ids is not None:
+    if use_fused_sparse_kv_offload() and indexer_layer_ids is not None:
         num_indexer_layers = len(indexer_layer_ids)
     else:
         from sglang.srt.mem_cache.kv_cache_configurator import (
@@ -221,11 +195,7 @@ def get_sparsity_driven_kv_offload_cell_size(
             )
         else:
             num_indexer_layers = num_layers
-    layer_bytes = index_head_dim * element_size
-    if kv_cache_dtype == torch.float8_e4m3fn:
-        # NPU FP8 index keys have one FP32 scale per token and indexer layer.
-        layer_bytes += torch.float32.itemsize
-    return layer_bytes * num_indexer_layers
+    return index_head_dim * element_size * num_indexer_layers
 
 
 def get_sparse_kv_budget(
@@ -246,7 +216,8 @@ def get_sparse_kv_budget(
         query_heads = model_config.num_attention_heads // get_parallel().attn_tp_size
         if query_heads <= 0:
             raise ValueError("CopySFA requires a positive per-rank query head count.")
-        copy_sfa_query_heads = 1 << (query_heads - 1).bit_length()
+        # Native SFA accepts 1..64 or 128 query heads per KV head.
+        copy_sfa_query_heads = 128 if 64 < query_heads < 128 else query_heads
     disagg = get_disagg()
     prefill_rows = request_rows - 1
     if disagg.disaggregation_mode == "decode" and not disagg.enable_pd_role_switch:
@@ -254,7 +225,7 @@ def get_sparse_kv_budget(
     elif get_schedule().prefill_max_requests is not None:
         prefill_rows = min(prefill_rows, get_schedule().prefill_max_requests)
     page_size = get_schedule().page_size
-    aligned_context = (context_len + page_size - 1) // page_size * page_size
+    aligned_context = ceil_div(context_len, page_size) * page_size
     if graph_batch_capacity is None:
         # Reserve before admission determines the final request-pool size.
         # Capture buckets may round that size up for attention parallelism.

@@ -18,16 +18,16 @@ from sglang.kernels.ops.attention.npu_copy_sfa import (
     load_copy_sfa_operator,
 )
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
-from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.block_tables import (
-    fused_prefill_current_mapping,
-    make_fused_prefill_plan,
-    prepare_prefill_gather_rows,
-)
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
     use_pd_split_kv,
 )
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.mtp import (
     prepare_mtp_rows,
+)
+from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.prefill_kv_plan import (
+    fused_prefill_current_mapping,
+    make_fused_prefill_plan,
+    prepare_prefill_gather_rows,
 )
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import (

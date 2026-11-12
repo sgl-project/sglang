@@ -505,7 +505,6 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                         and is_deepseek_dsa(model_config.hf_config)
                         else None
                     ),
-                    kv_cache_dtype=kv_cache_dtype,
                 )
                 if offload_cell_size is not None:
                     return offload_cell_size

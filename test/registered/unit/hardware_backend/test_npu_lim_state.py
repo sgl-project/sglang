@@ -10,11 +10,11 @@ from sglang.kernels.ops.attention.npu_lim import (
     fused_lightning_indexer_manage,
     load_fused_lim_operator,
 )
-from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.block_tables import (
-    prepare_prefill_gather_rows,
-)
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.mtp import (
     prepare_mtp_rows,
+)
+from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.prefill_kv_plan import (
+    prepare_prefill_gather_rows,
 )
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -82,7 +82,7 @@ class TestLIMKernelLoad(CustomTestCase):
         package.__path__ = []
         api = ModuleType("sgl_kernel_npu.sparsity_driven_kv_offload")
 
-        def native(*tensors):
+        def native(*tensors, full_visible=False):
             # Emulate the native boundary, not the framework's tensor ordering.
             tensors[13].copy_(torch.arange(2048, dtype=torch.int32).view(1, 1, -1))
             tensors[18].copy_(tensors[9])

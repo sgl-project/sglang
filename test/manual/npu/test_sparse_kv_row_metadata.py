@@ -583,7 +583,9 @@ def large_prefill_cases(args, kernels, results):
                 old = lambda: reference_module.make_fused_prefill_plan(
                     batch, manager, None
                 )
-                new_module = load("candidate_block_tables", SOURCE / "block_tables.py")
+                new_module = load(
+                    "candidate_prefill_kv_plan", SOURCE / "prefill_kv_plan.py"
+                )
                 new = lambda: new_module.make_fused_prefill_plan(batch, manager, None)
                 old_mapping = lambda: reference_module.fused_prefill_current_mapping(
                     plan, batch, current_valid, table.numel()

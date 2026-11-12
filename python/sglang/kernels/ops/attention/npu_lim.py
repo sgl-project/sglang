@@ -96,7 +96,4 @@ def fused_lightning_indexer_manage(
         raise ValueError("LIM inputs and outputs must be on one device.")
     if operator is None:
         operator = load_fused_lim_operator()
-    if full_visible:
-        operator(*inputs, full_visible=True)
-    else:
-        operator(*inputs)
+    operator(*inputs, full_visible=full_visible)

@@ -10,9 +10,9 @@ import torch
 
 PATH = (
     Path(__file__).resolve().parents[3]
-    / "python/sglang/srt/hardware_backend/npu/sparsity_driven_kv_offload/block_tables.py"
+    / "python/sglang/srt/hardware_backend/npu/sparsity_driven_kv_offload/prefill_kv_plan.py"
 )
-spec = importlib.util.spec_from_file_location("prefill_test_block_tables", PATH)
+spec = importlib.util.spec_from_file_location("prefill_test_kv_plan", PATH)
 module = importlib.util.module_from_spec(spec)
 
 sys.modules[spec.name] = module
