@@ -9,8 +9,9 @@ megakernel never gets one, nor a schedule batch.
 
 - A covered target step gets the running forward's ``EagleForwardView`` as
   ``Step.view``: the full-attention and GDN metadata, read from the hybrid attention
-  backend, and the KV and mamba pools. The step takes the replaced forward's
-  arguments as they are.
+  backend, the KV and mamba pools, and the pools' layers (``parts``), whose
+  ``wait_layer`` a megakernel calls before it reads a layer a host load-back may
+  still be bringing in. The step takes the replaced forward's arguments as they are.
 - The EAGLE entries (spec.ENTRIES) get the structs below, built by SGLang from its
   own buffers. A draft model's ``draft_loop`` runs the whole draft decode loop of a
   served draft graph (model steps, token selection, any exchange between steps), and
@@ -36,7 +37,7 @@ from typing import Any, Optional
 import msgspec
 import torch
 
-from sglang.srt.mem_cache.kv.decl import STATE_PART
+from sglang.srt.mem_cache.kv.decl import KV_PART, STATE_PART
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.runtime_context import get_parallel, get_schedule, get_spec
 
@@ -46,6 +47,10 @@ TOLERATED_CALLABLES = (
     # them once, never per step
     "EagleBinding.tp_device_group",
     "EagleBinding.tp_cpu_group",
+    # the pools' layers: a megakernel waits for a layer's host load-back before it
+    # reads the layer, as the pools' own getters do
+    "LayerStateView.wait_layer",
+    "LayerStateView.read",
     "sglang.kernels.ops",  # SGLang's kernel ops
     "the replaced model's modules, weights and quant methods",
 )
@@ -125,6 +130,32 @@ class GdnStepMetadata(msgspec.Struct, frozen=True):
     track_indices: Optional[torch.Tensor]  # [bs] track slot per request
 
 
+class LayerStateView(msgspec.Struct, frozen=True):
+    """The pool's layers, for a megakernel that reads them inside its own kernels.
+
+    ``wait_layer`` waits, as the pool's own getters do, until a layer-wise host
+    load-back (hierarchical cache) has brought the layer's part in; ``read`` waits
+    too and returns the part's view and the id its per-layer methods take."""
+
+    _router: Any  # the pool's KVLayerRouter
+
+    def wait_layer(self, layer_id: int, part: str = KV_PART) -> None:
+        self._router.read(layer_id, part)
+
+    def read(self, layer_id: int, part: str = KV_PART) -> tuple[Any, int]:
+        layer = self._router.read(layer_id, part)
+        return layer.view, layer.view_layer_id
+
+    def part_view(self, part: str) -> Optional[Any]:
+        return self._router.part_view(part)
+
+    def part_indices(self, part: str) -> dict[int, int]:
+        return self._router.part_indices(part)
+
+    def layer_ids(self) -> tuple[int, ...]:
+        return self._router.layer_ids()
+
+
 class EagleForwardView(msgspec.Struct, frozen=True):
     """The running forward's attention data; built at capture for a graph step, so
     its tensors are the ones the graph replays."""
@@ -133,6 +164,7 @@ class EagleForwardView(msgspec.Struct, frozen=True):
     gdn: Optional[GdnStepMetadata]  # None for a model without GDN layers (the draft)
     kv: KvPoolBuffers
     mamba: Optional[MambaPoolBuffers]  # None for a model without GDN layers
+    parts: Optional[LayerStateView] = None
 
 
 class LinearPrefillBuffers(msgspec.Struct, frozen=True):
@@ -273,6 +305,7 @@ class EagleBinding:
             gdn=None if linear is None else gdn_step_metadata(linear),
             kv=self._read("kv", self._kv, backend),
             mamba=None if linear is None else self._read("mamba", self._mamba, backend),
+            parts=self._read("parts", self._parts, backend),
         )
 
     def prefill_view(self) -> LinearPrefillView:
@@ -309,7 +342,12 @@ class EagleBinding:
 
     def assert_live(self) -> None:
         backend = get_attn_backend()
-        readers = {"kv": self._kv, "mamba": self._mamba, "prefill": self._prefill}
+        readers = {
+            "kv": self._kv,
+            "mamba": self._mamba,
+            "prefill": self._prefill,
+            "parts": self._parts,
+        }
         for name, sealed in self._sealed.items():
             if _identity(readers[name](backend)) != sealed:
                 raise RuntimeError(
@@ -340,6 +378,9 @@ class EagleBinding:
 
     def _mamba(self, backend: Any) -> MambaPoolBuffers:
         return mamba_pool_buffers(backend.token_to_kv_pool)
+
+    def _parts(self, backend: Any) -> LayerStateView:
+        return LayerStateView(backend.token_to_kv_pool.layer_router)
 
 
 def split_backend(backend: Any) -> tuple[Any, Optional[Any]]:

@@ -367,6 +367,7 @@ class TestEagleBinding(CustomTestCase):
         # a plugin pins these names: a rename here must fail first
         members = {
             "EagleBinding": set(dir(eb.EagleBinding)),
+            "LayerStateView": set(dir(eb.LayerStateView)),
             "ForwardBatch": set(ForwardBatch.__dataclass_fields__)
             | set(dir(ForwardBatch)),
         }
@@ -374,6 +375,31 @@ class TestEagleBinding(CustomTestCase):
             owner, _, attr = name.partition(".")
             if owner in members:
                 self.assertIn(attr, members[owner], name)
+
+    def test_the_layer_view_waits_for_each_layers_load_back(self):
+        """A megakernel that reads the pools inside its kernels waits per layer, as
+        the pools' getters do, for a hierarchical-cache load-back to land."""
+        backend = _hybrid()
+        pool = backend.token_to_kv_pool
+        parts = _view(eb.EagleBinding(model=torch.nn.Module()), backend).parts
+        self.assertEqual(parts.layer_ids(), (3, 7))
+        self.assertEqual(parts.part_indices(STATE_PART), {0: 1, 2: 0})
+        state_pool = pool.layer_router.part_view(STATE_PART)
+        self.assertIs(parts.part_view(STATE_PART), state_pool)
+        view, view_layer_id = parts.read(7)
+        self.assertIs(view.get_key_buffer(view_layer_id), pool.k[7])
+        self.assertEqual(parts.read(2, STATE_PART), (state_pool, 0))
+        pool.layer_transfer_counter = MagicMock()
+        parts.wait_layer(7)
+        parts.read(3)
+        # a bound part waits only once the host stack loads it layer by layer
+        parts.wait_layer(2, STATE_PART)
+        pool.layer_router.load_parts_layer_wise()
+        parts.wait_layer(2, STATE_PART)
+        self.assertEqual(
+            pool.layer_transfer_counter.wait_until.call_args_list,
+            [call(7 - pool.start_layer), call(0), call(2 - pool.start_layer)],
+        )
 
     def test_pool_views_keep_layer_offsets_and_fp8_scales(self):
         """Routed views use local indices; plain pools use model layer IDs.
@@ -488,6 +514,23 @@ class TestEagleBinding(CustomTestCase):
             backend.token_to_kv_pool.k[3] = torch.zeros(4, 2)
             with self.assertRaisesRegex(RuntimeError, "kv was reallocated"):
                 binding.assert_live()
+        # a rebuilt router over the same buffers
+        backend = _hybrid()
+        binding = eb.EagleBinding(model=torch.nn.Module())
+        self.assertIs(_view(binding, backend).parts, _view(binding, backend).parts)
+        pool, old = backend.token_to_kv_pool, backend.token_to_kv_pool.layer_router
+        router = KVLayerRouter.from_layer_maps(
+            pool, (("full", old.view("full"), {3: 1, 7: 0}),)
+        )
+        state = old.part_view(STATE_PART)
+        router.bind_part(
+            sub_pool="mamba", part=STATE_PART, view=state, indices={0: 1, 2: 0}
+        )
+        with patch.object(eb, "get_attn_backend", return_value=backend):
+            binding.assert_live()
+            pool.layer_router = router
+            with self.assertRaisesRegex(RuntimeError, "parts was reallocated"):
+                binding.assert_live()
 
     def test_a_graph_variant_selects_on_a_lone_requests_committed_kv_length(self):
         """select picks a captured graph from host state alone: init_new hands it a
@@ -513,7 +556,8 @@ class TestEagleBinding(CustomTestCase):
             if isinstance(cls, type) and issubclass(cls, msgspec.Struct)
         }
         allowed = {torch.Tensor, int, float, bool, type(None)} | structs
-        for cls in structs:
+        # the layer view's methods are tolerated callables, its router is not data
+        for cls in structs - {eb.LayerStateView}:
             for field, hint in typing.get_type_hints(cls).items():
                 for leaf in _leaves(hint):
                     self.assertIn(leaf, allowed, f"{cls.__name__}.{field}")
