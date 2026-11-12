@@ -1056,7 +1056,7 @@ class TestUnifiedPostCaptureSizing(CustomTestCase):
                 temporal_dtype=torch.float32,
             ),
             StateReplay(
-                decode=False, speculative=True, is_kda=False, cache_len=8, key_heads=1
+                decode=False, speculative=True, is_kda=False, cache_len=16, key_heads=1
             ),
             layer_ids=(1,),
             speculative_num_draft_tokens=3,

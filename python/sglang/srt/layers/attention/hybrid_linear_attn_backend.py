@@ -1694,11 +1694,11 @@ class HybridLinearAttnBackend(AttentionBackend):
         # committed state after each step as with the KDA fold above; radix
         # donation and state copies read the slot directly. Chain layout only.
         if getattr(mamba_pool, "replayssm_cache_base", None) is not None:
+            if request_number == 0:
+                return
             assert state_slots.ring is not None, (
                 "the GDN ReplaySSM commit needs the ring rows its verify resolved"
             )
-            if request_number == 0:
-                return
             from sglang.kernels.ops.attention.linear.gdn_replayssm_spec_decode import (
                 commit_gdn_replayssm_after_verify,
             )

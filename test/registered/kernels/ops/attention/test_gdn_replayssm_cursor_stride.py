@@ -53,6 +53,10 @@ class TestCursorStride(CustomTestCase):
                 *cursors,
                 num_accepted=accepted,
                 replay_indices=rows,
+                # Every row has a live state slot, so every cursor advances.
+                state_batch_indices=torch.arange(
+                    rows.numel(), dtype=torch.int64, device=device
+                ),
                 max_cache_len=_CACHE_LEN,
                 max_spec_len=_SPEC_LEN,
                 null_block_id=-1,
