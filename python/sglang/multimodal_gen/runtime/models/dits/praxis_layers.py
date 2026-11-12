@@ -8,6 +8,8 @@ Parameter names are the checkpoint key suffixes, so the checkpoint loads without
 
 from __future__ import annotations
 
+import functools
+import importlib.util
 import math
 from collections.abc import Callable, Sequence
 
@@ -26,10 +28,19 @@ _compiled_flex_attention = torch.compile(flex_attention)
 _FLASH_MAJORS = (9, 10)
 
 
+@functools.cache
+def _upstream_fa4_available() -> bool:
+    try:
+        return importlib.util.find_spec("flash_attn.cute") is not None
+    except ImportError:
+        return False
+
+
 def _flex_kernel_options(backend: str, device: torch.device) -> dict[str, str] | None:
     if (
         backend == "flash"
         and torch.cuda.get_device_capability(device)[0] in _FLASH_MAJORS
+        and _upstream_fa4_available()
     ):
         return {"BACKEND": "FLASH"}
     return None
