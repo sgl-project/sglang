@@ -35,7 +35,7 @@ else:
 
 register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 # backend-specific: ROCm resolves the kernel to its Triton port
-register_amd_ci(est_time=17, stage="jit-kernel-unit", runner_config="amd")
+register_amd_ci(est_time=20, stage="jit-kernel-unit", runner_config="amd")
 
 test_cases = [
     (

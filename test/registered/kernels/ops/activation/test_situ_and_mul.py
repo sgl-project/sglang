@@ -9,7 +9,7 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 # backend-specific: the ROCm MoE front fuses routed-input casting with SiTU.
-register_amd_ci(est_time=10, stage="jit-kernel-unit", runner_config="amd")
+register_amd_ci(est_time=20, stage="jit-kernel-unit", runner_config="amd")
 
 _BETA = 4.0
 _LINEAR_BETA = 25.0

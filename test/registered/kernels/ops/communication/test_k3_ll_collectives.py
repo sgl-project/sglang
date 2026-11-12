@@ -10,7 +10,7 @@ from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase, run_distributed_test
 
 # backend-specific: the LL kernels are gfx950 wave64 HIP over aiter's IPC buffers.
-register_amd_ci(est_time=38, suite="stage-c-test-large-8-gpu-amd-mi35x")
+register_amd_ci(est_time=45, suite="stage-c-test-large-8-gpu-amd-mi35x")
 
 WORLD = 8
 # Kimi-K3: hidden 7168, latent 3584, up to 8 bank rows (9 slots).

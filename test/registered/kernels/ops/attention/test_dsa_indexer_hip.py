@@ -39,7 +39,7 @@ from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase, published_topology
 
 # backend-specific: AITER's preshuffled index-K, paged-MQA logits and NoPE prologue.
-register_amd_ci(est_time=15, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=30, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 PAGE, HEADS, HEAD_DIM = 64, 32, 128
 ROWS = 4096
