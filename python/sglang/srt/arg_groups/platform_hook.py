@@ -222,10 +222,12 @@ def handle_sail_backends(server_args: Any):
     if not get_platform().is_sail:
         return
     from sglang.srt.configs.model_config import is_deepseek_dsa
+    from sglang.srt.platforms import current_platform
 
     _disable_sail_unsupported_mhc_paths()
-    # Install the SAIL-only MoE registrations before any model is built.
-    get_platform().register_platform_backends()
+    # Install the SAIL-only MoE registrations before any model is built. The
+    # hook lives on the plugin object, not on the `get_platform()` facts view.
+    current_platform.register_platform_backends()
 
     if not envs.SGLANG_SAIL_DEEPGEMM_DENSE.is_set():
         envs.SGLANG_SAIL_DEEPGEMM_DENSE.set(True)

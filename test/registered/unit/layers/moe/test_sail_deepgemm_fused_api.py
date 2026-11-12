@@ -100,6 +100,7 @@ class TestDeepGemmMaskedActivationContract(CustomTestCase):
     def test_contiguous_oai_output_and_layout_reach_all_gemm2_paths(self):
         """All six GEMM2 kinds must receive the oai output for their weight layout,
         and clamp must not modify the GEMM1 buffer."""
+        from sglang.kernels.ops.activation import silu_mul_quant
         from sglang.kernels.ops.quantization import fp8_kernel, int8_kernel, sail_mxfp4
         from sglang.srt.hardware_backend.sail.moe import activations
         from sglang.srt.hardware_backend.sail.moe import deepgemm_ep as ep_module
@@ -175,6 +176,22 @@ class TestDeepGemmMaskedActivationContract(CustomTestCase):
                     self.assertEqual((axis, enable_fused_moe), (1, False))
                     return x, scales
 
+                def fused_act_quant(
+                    gateup,
+                    swiglu_limit=None,
+                    gemm1_alpha=None,
+                    gemm1_clamp_limit=None,
+                    eps=1e-10,
+                ):
+                    # The fused activation + quant JIT kernel only builds on SAIL;
+                    # stand in with the eager oai-swiglu it must match.
+                    self.assertIsNone(swiglu_limit)
+                    return quantize(
+                        activations.apply_oai_swiglu(
+                            gateup, gemm1_alpha, gemm1_clamp_limit, False
+                        )
+                    )
+
                 with ExitStack() as stack:
                     stack.enter_context(
                         self.subTest(variant=variant, interleaved=interleaved)
@@ -211,6 +228,13 @@ class TestDeepGemmMaskedActivationContract(CustomTestCase):
                     )
                     stack.enter_context(
                         patch.object(sail_mxfp4, "downcast_to_mxfp4", fp4_quantize)
+                    )
+                    stack.enter_context(
+                        patch.object(
+                            silu_mul_quant,
+                            "silu_and_mul_post_per_token_quant_fp8",
+                            fused_act_quant,
+                        )
                     )
                     stack.enter_context(
                         patch.dict(

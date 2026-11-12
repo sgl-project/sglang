@@ -126,6 +126,10 @@ def situ_and_mul_masked(
     scheduling hint."""
     if out is None:
         out = input.new_empty(*input.shape[:-1], input.shape[-1] // 2)
+    if input.numel() == 0:
+        # tvm-ffi rejects the strides of a zero-sized dim as non-contiguous, and
+        # there is nothing to write anyway.
+        return out
     _jit_situ_masked_module().run(
         input,
         out,
@@ -171,6 +175,9 @@ def situ_and_mul_masked_post_quant_mxfp4(
     expected_m: Optional[int] = None,
 ) -> None:
     """Masked SiTU+MXFP4 that preserves padding; scales are [E, D/64, T] uint16."""
+    if input.numel() == 0:
+        # Same zero-sized-dim stride rejection as situ_and_mul_masked.
+        return
     _jit_situ_mxfp4_module(True).run(
         input,
         output,

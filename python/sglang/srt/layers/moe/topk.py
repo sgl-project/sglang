@@ -2682,6 +2682,19 @@ def _post_process_topk_ids(
                 else:
                     _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
                 recorder_was_fused = True
+            elif cast_to_int64:
+                # Same padded-row rule as the shared branch below; SAIL also
+                # widens the ids to int64.
+                topk_ids = _biased_grouped_topk_postprocess(
+                    topk_ids,
+                    expert_location_dispatch_info,
+                    (
+                        None
+                        if padded_rows_masked and expert_location_dispatch_info is None
+                        else num_token_non_padded
+                    ),
+                    cast_to_int64=True,
+                )
             else:
                 # A remap table indexed by -1 aliases its last entry, so only the
                 # identity-remap branch may drop the padded-row mask.
@@ -2693,7 +2706,6 @@ def _post_process_topk_ids(
                         if padded_rows_masked and expert_location_dispatch_info is None
                         else num_token_non_padded
                     ),
-                    cast_to_int64=cast_to_int64,
                 )
     elif _is_hip:
         # On AMD HIP the aiter MoE kernels do not handle topk_ids=-1 safely
