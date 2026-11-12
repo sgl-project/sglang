@@ -411,6 +411,11 @@ class Mxfp4Config(QuantizationConfig):
 
 
 class Mxfp4MoEMethod(FusedMoEMethodBase):
+    # SAIL-only W4A16 modes. Class defaults keep instances built without
+    # __init__ (e.g. via __new__ in tests) on the upstream paths.
+    use_deepgemm_mxfp4_w4a16_valu = False
+    use_deepgemm_mxfp4_w4a16_mma = False
+
     def __init__(
         self,
         prefix: str,
