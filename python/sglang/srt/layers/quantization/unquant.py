@@ -37,6 +37,10 @@ from sglang.srt.layers.quantization.base_config import (
 )
 from sglang.srt.layers.utils import copy_or_rebind_param
 from sglang.srt.layers.utils.common import set_weight_attrs
+from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
+from sglang.srt.model_executor.runner_utils.prefill_graph import (
+    is_in_prefill_graph_scope,
+)
 from sglang.srt.runtime_context import (
     get_exec,
     get_lora,
@@ -603,14 +607,23 @@ def _bf16_low_m_autotune(
     bias: Optional[torch.Tensor],
     out: Optional[torch.Tensor] = None,
 ) -> Optional[torch.Tensor]:
-    """Run bias-free M <= 16 through FlashInfer's autotuned CuTe DSL kernels; None if not taken.
+    """Use autotuned low-M kernels for CUDA graphs, avoiding eager dispatch overhead.
 
     Under FlashInfer autotune, every other eligible call profiles M <= 16 bias-free.
     """
     if _mm_bf16 is None:
         return None
     m = x.numel() // x.shape[-1]
-    taken = bias is None and 0 < m <= _BF16_LOW_M_AUTOTUNE_MAX_M
+    taken = (
+        bias is None
+        and 0 < m <= _BF16_LOW_M_AUTOTUNE_MAX_M
+        and (
+            torch.compiler.is_compiling()
+            or get_is_capture_mode()
+            or is_in_prefill_graph_scope()
+            or (x.is_cuda and torch.cuda.is_current_stream_capturing())
+        )
+    )
     if not (taken or (m > 0 and _flashinfer_autotuner.is_tuning_mode)):
         return None
     if not (
