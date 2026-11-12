@@ -55,6 +55,13 @@ violation. Its count does not prove any destination is idle, so the adapter
 retains ownership and raises instead of freeing a potentially active DMA tail.
 This is not automatic request-level recovery.
 
+When the connector provides `sync_load_ready`, both adapters vote on destination
+allocation after any local eviction/retry and before restore collectives. This
+applies to synchronous and layerwise transfers, independently of optional
+batching. A failed vote releases newly allocated peer slots and held lookups;
+existing GPU prefixes remain tree-owned. Connectors without this API retain the
+local allocation check. Use a connector with the API for cross-rank rollback.
+
 ## Store ownership
 
 A store retains the source radix node until the connector reports completion.

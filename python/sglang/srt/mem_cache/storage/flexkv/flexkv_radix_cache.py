@@ -515,9 +515,17 @@ class FlexKVRadixCache(FlexKVCacheLifecycleMixin, RadixCache):
         if self.token_to_kv_pool_allocator.available_size() < uncached_len:
             self.evict(EvictParams(num_tokens=uncached_len))
         token_slots = self.token_to_kv_pool_allocator.alloc(uncached_len)
-        if token_slots is None:
-            # The reused prefix stays tree-owned. Return None so init_load_back
-            # releases the held task a refreshed lookup may have re-stashed.
+        ready = token_slots is not None
+        sync_ready = getattr(self.flexkv_connector, "sync_load_ready", None)
+        if callable(sync_ready):
+            # Failed allocators must vote too: peers may otherwise enter a
+            # restore collective while this rank returns to the scheduler.
+            ready = sync_ready(ready)
+        if not ready:
+            if token_slots is not None:
+                self.token_to_kv_pool_allocator.free(token_slots)
+            self.flexkv_connector.release_pending(tracking_rid)
+            # Any reused prefix remains tree-owned for the next rematch.
             return None
 
         # The FlexKV ``launch`` interface takes the slot indices for the
