@@ -6,8 +6,8 @@ actions:
 | Action | Effect |
 | --- | --- |
 | `sglang.pin` | Set a TTL, eviction priority, or both for existing host KV. |
-| `sglang.prefetch` | Prepare a supported destination while keeping the source. |
-| `sglang.demote` | Preserve data at a lower tier, then reclaim the eligible source range. |
+| `sglang.prefetch` | Read KV from storage (L3) into host memory (L2), keeping the storage copy. |
+| `sglang.demote` | Preserve host KV (L2) in storage (L3), then reclaim the eligible host range. |
 
 The [Router orchestrator](../../../../../sgl-router/KV_ORCHESTRATION.md) uses
 these actions for application task and tool events. The executing Engine owns
