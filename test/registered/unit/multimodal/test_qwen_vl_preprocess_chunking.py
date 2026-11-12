@@ -85,7 +85,7 @@ class TestChunkedRun(CustomTestCase):
         proc = QwenVLImageProcessor.__new__(QwenVLImageProcessor)
         proc._spatial_merge_size = 2
         proc.mm_preprocess_cache = SimpleNamespace(enabled=True)
-        proc.keep_mm_features_on_device = False
+        proc.mm_feature_transport = "default"
         proc.precompute_hash_before_cpu_transfer = False
         proc._temporary_fast_processor_cuda_pool = lambda d: __import__(
             "contextlib"
