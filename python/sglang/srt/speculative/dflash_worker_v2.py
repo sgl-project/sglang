@@ -3066,11 +3066,15 @@ class DFlashWorkerV2(BaseSpecWorker):
             # Persist the accepted target-verify KV into the host pool and the
             # persistent device buffer, mirroring run_eagle_verify's commit. The
             # DFLASH block is linear, so accepted steps are a prefix: step j
-            # landed at position seq_len + j iff j < commit_lens.
+            # landed at position seq_len + j iff j < commit_lens. accept_indices
+            # values are offsets into the flattened verify buffer, so each
+            # request's steps carry its row offset (i * verify_width).
             steps = torch.arange(block_size, device=device, dtype=torch.int64)
+            verify_width = batch.out_cache_loc.numel() // bs
+            row_offsets = torch.arange(bs, device=device) * verify_width
             accept_indices = torch.where(
                 commit_lens.to(torch.int64).unsqueeze(1) > steps.unsqueeze(0),
-                steps.unsqueeze(0).expand(bs, -1),
+                row_offsets[:, None] + steps.unsqueeze(0),
                 torch.full((bs, block_size), -1, device=device, dtype=torch.int64),
             )
             batch.hisparse_coordinator.commit_spec_accept_tokens(
