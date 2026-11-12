@@ -5,6 +5,7 @@ MMMU evaluation for VLMs using the run_eval simple-evals interface.
 
 from __future__ import annotations
 
+import ast
 import base64
 import io
 import re
@@ -90,26 +91,51 @@ class MMMUVLMEval(Eval):
             ch += 1
         return index2ans, all_choices
 
+    @staticmethod
+    def _load_subject_datasets(subjects: List[str]) -> list:
+        """Validation split of every subject, tagged with `__subject__`.
+
+        Raises if any subject fails to load: the samples are picked from the
+        merged set by id, so a missing subject silently changes which questions
+        are scored and how many.
+        """
+        datasets = []
+        failures = []
+        for subj in subjects:
+            try:
+                d = load_dataset("MMMU/MMMU", subj, split="validation")
+            except Exception as e:
+                failures.append(f"{subj} ({type(e).__name__}: {e})")
+                continue
+            datasets.append(d.add_column("__subject__", [subj] * len(d)))
+        if failures:
+            raise RuntimeError(
+                f"Failed to load {len(failures)} of {len(subjects)} MMMU subjects: "
+                + "; ".join(failures)
+            )
+        return datasets
+
+    @staticmethod
+    def _parse_options(raw_options) -> Optional[List[str]]:
+        """Options as a list, or None. MMMU stores them as a Python list literal."""
+        if isinstance(raw_options, list):
+            options = raw_options
+        else:
+            try:
+                options = ast.literal_eval(raw_options)
+            except (ValueError, SyntaxError, TypeError, MemoryError, RecursionError):
+                return None
+        if not isinstance(options, (list, tuple)) or not options:
+            return None
+        return list(options)
+
     def _prepare_mmmu_samples(self, k: int) -> List[dict]:
         # Subjects and domains copied from MMMU data_utils to categorize results
         subjects: List[str] = []
         for subs in self.DOMAIN_CAT2SUB_CAT.values():
             subjects.extend(subs)
 
-        # Load validation split of each subject
-        datasets = []
-        for subj in subjects:
-            try:
-                d = load_dataset("MMMU/MMMU", subj, split="validation")
-                # attach subject info via transform
-                d = d.add_column("__subject__", [subj] * len(d))
-                datasets.append(d)
-            except Exception:
-                continue
-        if not datasets:
-            raise RuntimeError("Failed to load MMMU datasets")
-
-        merged = concatenate_datasets(datasets)
+        merged = concatenate_datasets(self._load_subject_datasets(subjects))
 
         # Deterministic selection: sort by id (fallback to subject+index)
         def _key(idx):
@@ -135,17 +161,10 @@ class MMMUVLMEval(Eval):
             all_choices = None
             options = None
             if raw_options:
-                try:
-                    options = (
-                        raw_options
-                        if isinstance(raw_options, list)
-                        else list(eval(raw_options))
-                    )
-                    if isinstance(options, list) and len(options) > 0:
-                        index2ans, all_choices = self._build_mc_mapping(options)
-                        question_type = "multiple-choice"
-                except Exception:
-                    options = None
+                options = self._parse_options(raw_options)
+                if options:
+                    index2ans, all_choices = self._build_mc_mapping(options)
+                    question_type = "multiple-choice"
 
             # Build final textual prompt; include choices if MC
             prompt_text = f"{question}\n"
