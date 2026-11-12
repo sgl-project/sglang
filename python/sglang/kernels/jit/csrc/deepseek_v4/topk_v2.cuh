@@ -1252,11 +1252,12 @@ TOPK_KERNEL void topk_split_select(const __grid_constant__ TopKPagedParams param
 struct SplitResources {
   int cu = 0;
   uint32_t max_rows = 0;
+  cudaStream_t owner_stream = nullptr;
   SplitWorkspace ws{};
 
   SplitResources() = default;  // the "no split path here" state
 
-  explicit SplitResources(int device_id) {
+  explicit SplitResources(int device_id, cudaStream_t stream) : owner_stream(stream) {
     hipDeviceProp_t prop{};
     if (hipGetDeviceProperties(&prop, device_id) != hipSuccess) {
       (void)hipGetLastError();  // do not leave it for the next launch to trip on
@@ -1291,23 +1292,34 @@ struct SplitResources {
   }
 };
 
-inline const SplitResources& split_resources(int device_id) {
+inline const SplitResources& split_resources(int device_id, cudaStream_t stream) {
   // One slot per device: the buffer is a raw device pointer, so a single shared
-  // one would be valid on exactly one of them.
+  // one would be valid on exactly one of them. The workspace is also reused
+  // between launches without a reset kernel, so only its first stream may use
+  // the split path; concurrent streams fall back to the one-block path.
   constexpr int kMaxDevices = 16;
   static std::once_flag once[kMaxDevices];
   static const SplitResources* slots[kMaxDevices] = {};
   static const SplitResources kNone{};
   if (device_id < 0 || device_id >= kMaxDevices) return kNone;
-  std::call_once(once[device_id], [device_id] { slots[device_id] = new SplitResources(device_id); });
-  return *slots[device_id];
+  std::call_once(once[device_id], [device_id, stream] { slots[device_id] = new SplitResources(device_id, stream); });
+  return slots[device_id]->owner_stream == stream ? *slots[device_id] : kNone;
 }
 
 /// How many blocks to give each row (zero = one block per row) and their scratch.
 /// Both bounds are measured: split_floor for length, kSplitBlocks for spread.
 inline auto split_plan(uint32_t batch_size, uint32_t max_seq_len, DLDevice device)
     -> std::pair<uint32_t, SplitWorkspace> {
-  const auto& res = split_resources(device.device_id);
+  const auto stream = host::LaunchKernel::resolve_device(device);
+  hipStreamCaptureStatus capture_status = hipStreamCaptureStatusNone;
+  if (hipStreamIsCapturing(stream, &capture_status) != hipSuccess) {
+    (void)hipGetLastError();
+    return {0, {}};
+  }
+  // A graph may be replayed on a different stream from the one that captured
+  // it, bypassing the host-side owner check and racing the baked workspace.
+  if (capture_status != hipStreamCaptureStatusNone) return {0, {}};
+  const auto& res = split_resources(device.device_id, stream);
   if (res.cu <= 0 || batch_size == 0 || batch_size > res.max_rows) return {0, {}};
   const auto split = std::clamp<uint32_t>(kSplitBlocks / batch_size, kSplitMin, kSplitMax);
   const auto floor = split_floor(batch_size);

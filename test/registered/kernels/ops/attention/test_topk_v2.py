@@ -1182,8 +1182,102 @@ def test_topk_v2_zero_candidates_graph_replay(batch: int, seq: int, k: int) -> N
             _assert_topk_values(scores_cpu[row], out_cpu[row], k)
 
 
+def _split_multistream_check() -> None:
+    """Exercise the ROCm split workspace from two concurrent streams."""
+    batch, width, k = 12, 524288, 2048
+
+    def make_inputs(seed: int):
+        generator = torch.Generator(device="cuda").manual_seed(seed)
+        scores = torch.randn(
+            (batch, width), dtype=torch.float32, device="cuda", generator=generator
+        )
+        lengths = torch.tensor(
+            [350000 + 997 * row for row in range(batch)],
+            dtype=torch.int32,
+            device="cuda",
+        )
+        page_table = (
+            torch.arange(width // PAGE_SIZE, dtype=torch.int32, device="cuda")
+            .expand(batch, -1)
+            .contiguous()
+        )
+        return scores, lengths, page_table, _plan(lengths)
+
+    inputs = [make_inputs(17), make_inputs(23)]
+    streams = [torch.cuda.Stream(), torch.cuda.Stream()]
+
+    def launch(pack, out):
+        scores, lengths, page_table, metadata = pack
+        topk_transform_paged_v2(
+            scores, lengths, page_table, out, PAGE_SIZE, metadata
+        )
+
+    # A fresh process makes stream 0 the persistent split workspace's owner.
+    with torch.cuda.stream(streams[0]):
+        control = torch.full((batch, k), -2, dtype=torch.int32, device="cuda")
+        launch(inputs[0], control)
+    streams[0].synchronize()
+
+    def assert_outputs(outputs):
+        for out, (_, lengths, _, _) in zip(outputs, inputs):
+            assert ((out >= 0) & (out < lengths[:, None])).all()
+            ordered = out.sort(dim=1).values
+            assert (ordered[:, 1:] != ordered[:, :-1]).all()
+
+    for _ in range(20):
+        outputs = []
+        for stream, pack in zip(streams, inputs):
+            with torch.cuda.stream(stream):
+                out = torch.full(
+                    (batch, k), -2, dtype=torch.int32, device="cuda"
+                )
+                launch(pack, out)
+                outputs.append(out)
+        for stream in streams:
+            stream.synchronize()
+        assert_outputs(outputs)
+
+    # Captured kernels bake pointer arguments. Capture both graphs on the same
+    # stream, then replay them concurrently on different streams: they must not
+    # bake the same persistent split workspace into both graphs.
+    graphs = []
+    for pack, out in zip(inputs, outputs):
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=streams[0]):
+            launch(pack, out)
+        graphs.append(graph)
+
+    for _ in range(20):
+        for stream, out in zip(streams, outputs):
+            with torch.cuda.stream(stream):
+                out.fill_(-2)
+        for stream in streams:
+            stream.synchronize()
+        for stream, graph in zip(streams, graphs):
+            with torch.cuda.stream(stream):
+                graph.replay()
+        for stream in streams:
+            stream.synchronize()
+        assert_outputs(outputs)
+
+
+@pytest.mark.skipif(not is_hip(), reason="ROCm split workspace only")
+def test_topk_v2_split_multistream() -> None:
+    result = subprocess.run(
+        [sys.executable, os.path.abspath(__file__), "--multistream-check"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=300,
+    )
+    assert result.returncode == 0, result.stdout[-8000:]
+
+
 if __name__ == "__main__":
     if "--mode-check" in sys.argv:
         _mode_check()
+        sys.exit(0)
+    if "--multistream-check" in sys.argv:
+        _split_multistream_check()
         sys.exit(0)
     sys.exit(pytest.main([__file__, "-v"]))
