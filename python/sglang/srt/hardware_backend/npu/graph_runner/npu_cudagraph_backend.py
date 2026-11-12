@@ -35,7 +35,7 @@ from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
     BaseCudaGraphBackend,
 )
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import empty_context, get_bool_env_var, get_compiler_backend
+from sglang.srt.utils import get_bool_env_var, get_compiler_backend
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 if TYPE_CHECKING:
@@ -70,9 +70,6 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         self._memory_saver_adapter: Optional[Any] = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
             and get_bool_env_var("SGLANG_MEMORY_SAVER_CUDA_GRAPH")
-        )
-        self._enable_torch_compile = getattr(
-            cuda_graph_runner, "enable_torch_compile", False
         )
         # Reuse one device-bound worker for graph input updates.
         self._update_executor = ThreadPoolExecutor(
@@ -344,9 +341,12 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
     def prepare_capture_forward(self, model, enable_compile, **kwargs):
         """Yield the capture forward callable; restore temporary state on exit."""
         if enable_compile:
+            # fullgraph=False: holding it would mean reworking the msgspec
+            # state objects on the shared model execution path, which Dynamo
+            # cannot construct, for +0.07%..+1.25%.
             yield torch.compile(
                 torch.no_grad()(model.forward),
-                fullgraph=True,
+                fullgraph=False,
                 dynamic=False,
                 backend=get_compiler_backend("npugraph_ex"),
             )
@@ -415,11 +415,6 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
 
         graph = torch.npu.NPUGraph()
 
-        if self._enable_torch_compile:
-            skip_guard_context = torch.compiler.set_stance(skip_guard_eval_unsafe=True)
-        else:
-            skip_guard_context = empty_context()
-
         graph_ctx: Callable[..., AbstractContextManager]
         if (
             self._memory_saver_adapter is not None
@@ -432,14 +427,11 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         else:
             graph_ctx = torch.npu.graph
 
-        with (
-            skip_guard_context,
-            graph_ctx(
-                graph,
-                pool=self._pool,
-                stream=self._capture_stream,
-                auto_dispatch_capture=True,
-            ),
+        with graph_ctx(
+            graph,
+            pool=self._pool,
+            stream=self._capture_stream,
+            auto_dispatch_capture=True,
         ):
             out = forward_fn()
 
