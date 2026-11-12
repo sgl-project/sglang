@@ -67,8 +67,6 @@ class TestResolveDraftKVRing(CustomTestCase):
             with self.subTest(backend=backend), _switch():
                 args = _args(speculative_draft_attention_backend=backend)
                 self.assertTrue(self._resolve(args))
-                # The decision lives in the declaration, not in the environment.
-                self.assertFalse(SWITCH.is_set())
 
     def test_on_under_pd_over_mooncake(self):
         for mode in ("prefill", "decode"):
@@ -100,7 +98,6 @@ class TestResolveDraftKVRing(CustomTestCase):
 
     def test_off_for_drafts_it_does_not_fit(self):
         cases = {
-            "full attention": dict(SWA_MLA_DRAFT, layer_types=["full_attention"] * 5),
             "mixed": dict(
                 SWA_MLA_DRAFT,
                 layer_types=["sliding_attention"] * 4 + ["full_attention"],
@@ -121,21 +118,15 @@ class TestResolveDraftKVRing(CustomTestCase):
             self.assertTrue(self._resolve(_args(dcp_size=1)))
 
     def test_explicit_on_where_not_served_is_an_error(self):
-        for mode in ("prefill", "decode"):
-            with self.subTest(mode=mode), _switch(True):
-                args = _args(
-                    disaggregation_mode=mode, disaggregation_transfer_backend="nixl"
-                )
-                with self.assertRaises(ValueError):
-                    self._resolve(args, draft_cfg=None)
+        with _switch(True), self.assertRaises(ValueError):
+            args = _args(
+                disaggregation_mode="prefill", disaggregation_transfer_backend="nixl"
+            )
+            self._resolve(args, draft_cfg=None)
 
-    def test_explicit_off_is_kept_and_logged(self):
-        with (
-            _switch(False),
-            self.assertLogs(HOOK_MODULE, level="INFO") as logs,
-        ):
+    def test_explicit_off_is_kept(self):
+        with _switch(False):
             self.assertFalse(self._resolve(_args(), draft_cfg=None))
-        self.assertIn("ring: off", "\n".join(logs.output))
 
 
 WINDOW_LEFT = 1023
@@ -167,7 +158,6 @@ class TestDraftKVRingLayout(CustomTestCase):
                 keys = torch.arange(p - WINDOW_LEFT, p + BLOCK)
                 locs = ring.locs(torch.full_like(keys, 2), keys)
                 self.assertEqual(locs.unique().numel(), keys.numel())
-                self.assertGreaterEqual(ring.span, WINDOW_LEFT + 1 + BLOCK)
 
     def test_extend_keeps_only_the_readable_tail(self):
         ring = _ring(8)

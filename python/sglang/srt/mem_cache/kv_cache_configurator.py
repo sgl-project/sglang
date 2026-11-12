@@ -823,7 +823,6 @@ class KVCacheConfigurator:
                 )
 
         if self._uses_dflash_draft_kv_ring() and req_to_token_pool is not None:
-            # The draft keeps a per-request ring of rows, not one per target slot.
             sizes = msgspec.structs.replace(
                 sizes,
                 max_total_num_tokens=self._dflash_draft_kv_ring_rows(
@@ -2756,8 +2755,8 @@ class KVCacheConfigurator:
     def _dflash_draft_kv_ring_rows(
         self, *, draft_hf_config, req_to_token_rows: int, page_size: int
     ) -> int:
-        """Rows of a DFLASH draft KV pool holding one ring per req_to_token row.
-        The target's budget charge and the draft's allocation both size it here."""
+        """The target's budget charge and the draft's allocation both size the
+        ring pool here."""
         from sglang.srt.speculative.dflash_draft_ring import (
             draft_kv_ring_pool_rows,
             draft_kv_ring_rows_per_req,
@@ -2778,8 +2777,6 @@ class KVCacheConfigurator:
         )
 
     def _dflash_draft_kv_ring_bytes(self) -> int:
-        """The draft runner's KV ring, charged to the target's budget like the
-        other per-request fixed pools, with the pool's padding page."""
         if self.is_draft_worker or not get_spec().speculative_dflash_draft_kv_ring:
             return 0
         draft_model_config = self.spec_aux_config.draft_model_config
@@ -2799,6 +2796,7 @@ class KVCacheConfigurator:
             req_to_token_rows=req_to_token_rows,
             page_size=page_size,
         )
+        # The pool adds one padding page.
         ring_bytes = (rows + page_size) * int(cell_size)
         logger.info(
             "DFLASH draft KV ring: %d rows, %.2f GB charged to the KV budget.",

@@ -1,21 +1,19 @@
 """A per-request ring of draft KV rows for an all-sliding-window MLA DFLASH draft.
 
-The draft attends only to the last ``window_left + 1`` positions, and the KV of
-a position depends on that position's target hidden state alone. So instead of
-one draft row per target slot, each request owns ``rows_per_req`` rows per DCP
-rank, enough for the window plus a verify block:
+The draft reads only the last ``window_left + 1`` positions, and a position's
+draft KV depends on its own target hidden state alone, so each request keeps
+``rows_per_req`` rows per DCP rank, the window plus a verify block:
 
     local row(req, pos) = 1 + req * rows_per_req + (pos // dcp) % rows_per_req
     loc(req, pos)       = local row * dcp + pos % dcp
 
-``loc`` keeps the DCP owner rule of the shared pool (``loc % dcp`` is the owner
-rank, the row is ``loc // dcp``), so the existing sharded writers apply as is.
-Row 0 is the write sink. The window kernel computes the same rows directly
-(``mla_window_sparse_indices(ring_rows_per_req=...)``).
+``loc % dcp`` stays the owner rank, so the draft pool's sharded writers work
+unchanged. Row 0 takes the writes no window reads. ``DFlashDraftKVRing.locs``,
+``dflash_ring_block_locs`` and ``mla_window_sparse_indices(ring_rows_per_req=)``
+compute this layout and change together.
 
-A request's ring holds no positions from before its first prefill chunk (its
-prefix-cache hit) or from a previous request in the same req pool slot;
-``min_pos`` floors the window there.
+``min_pos`` floors each request's window at its prefix-cache hit, whose draft
+KV the ring never had.
 
 Under PD disaggregation prefill sends a request's last window of ring rows
 (``transfer_rows``, positionally matched like the SWA_RING state) and its
@@ -44,8 +42,8 @@ def draft_kv_ring_unsupported_reason(
     enable_unified_memory: bool = False,
     dcp_size: int = 1,
 ) -> Optional[str]:
-    """Why a draft KV ring cannot serve this DFLASH draft, or None if it can.
-    The draft config is loaded only once the launch flags allow a ring."""
+    """Why a ring cannot serve this draft, or None. Loads the draft config only
+    once the launch flags allow a ring."""
     if disaggregation_mode != "null" and disaggregation_transfer_backend != "mooncake":
         return (
             f"the {disaggregation_transfer_backend} PD transfer backend does not "
@@ -72,7 +70,6 @@ def draft_kv_ring_unsupported_reason(
     layer_types = get_dflash_layer_types(draft_hf_config)
     if not layer_types or any(t != "sliding_attention" for t in layer_types):
         return f"not every draft layer is sliding_attention ({layer_types})"
-    # Ring locs follow the DCP owner rule of DCP-collapsed draft rows.
     if dcp_size > 1 and (
         mla_attention_dcp_size(draft_hf_config, dcp_size=dcp_size, is_nextn=True)
         != dcp_size
@@ -158,9 +155,8 @@ class DFlashDraftKVRing:
         extend_lens: torch.Tensor,
         seq_ends: torch.Tensor,
     ) -> torch.Tensor:
-        """Ring locs for one extend's tokens (request-major). A chunk longer than
-        the ring wraps onto itself; only its last ``span`` positions, the ones a
-        later window can read, keep a ring row, the rest go to the sink."""
+        """Ring locs for one extend's tokens (request-major); a chunk longer than
+        the ring keeps only its last ``span`` positions, the rest go to row 0."""
         num_tokens = int(positions.numel())
         req_of_token = torch.repeat_interleave(
             req_pool_indices.to(torch.int64), extend_lens, output_size=num_tokens
@@ -173,8 +169,8 @@ class DFlashDraftKVRing:
         return torch.where(keep, locs, torch.zeros_like(locs))
 
     def record_floors(self, reqs, prefix_lens) -> None:
-        """On a request's first extend, its prefix-cache hit length becomes the
-        earliest position its window may read."""
+        """Sets a slot's floor on its request's first extend. A new Req object
+        marks a new request, not a new rid: a rid can repeat."""
         slots, floors = [], []
         for req, prefix_len in zip(reqs, prefix_lens):
             slot = req.kv.req_pool_idx

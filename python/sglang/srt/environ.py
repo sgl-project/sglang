@@ -1782,9 +1782,8 @@ class Envs:
     SGLANG_OPT_FUSED_KDA_VERIFY = EnvBool(False)
     # A/B: keep the DFLASH draft greedy head eager (not folded in-graph).
     SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
-    # Keep an all-sliding-window MLA DFLASH draft's KV in a per-request ring of
-    # window + verify-block rows instead of one row per target slot. On by default;
-    # resolved at startup to off for drafts or backends it does not fit.
+    # The DFLASH draft KV ring (speculative/dflash_draft_ring.py); resolved at
+    # startup to off where it does not fit.
     SGLANG_ENABLE_DFLASH_DRAFT_KV_RING = EnvBool(True)
     SGLANG_ENABLE_LILICORR_SAMPLING = EnvBool(False)
     SGLANG_LILICORR_REQUIRE_SAMPLING = EnvBool(False)
