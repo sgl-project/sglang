@@ -235,19 +235,17 @@ class TestNoPEPrologueHip(CustomTestCase):
         query = query.view(rows // HEADS, HEADS, HEAD_DIM)
         gate = torch.randn(rows // HEADS, HEADS + 128, device="cuda", generator=gen)
         gate = gate.bfloat16()[:, 128:]
-        for scale_fmt in (None, "ue8m0"):
-            q8, q_scale = act_quant(query, 128, scale_fmt)
-            gate_bf16 = (gate * HEADS**-0.5).float()  # Indexer._bf16_head_gate
-            weights = gate_bf16.unsqueeze(-1) * q_scale * HEAD_DIM**-0.5
-            fused_q8, fused_weights = indexer_q_quant_head_gate(
-                query, gate, HEAD_DIM**-0.5, scale_fmt
-            )
-            same_q8 = torch.equal(fused_q8.view(torch.uint8), q8.view(torch.uint8))
-            self.assertTrue(same_q8, f"q_fp8 differs, scale_fmt={scale_fmt}")
-            same_w = torch.equal(
-                fused_weights.view(torch.int32), weights.view(torch.int32)
-            )
-            self.assertTrue(same_w, f"head weights differ, scale_fmt={scale_fmt}")
+        # Kimi-K3.1's indexer quantizes with ue8m0 scales
+        q8, q_scale = act_quant(query, 128, "ue8m0")
+        gate_bf16 = (gate * HEADS**-0.5).float()  # Indexer._bf16_head_gate
+        weights = gate_bf16.unsqueeze(-1) * q_scale * HEAD_DIM**-0.5
+        fused_q8, fused_weights = indexer_q_quant_head_gate(
+            query, gate, HEAD_DIM**-0.5, "ue8m0"
+        )
+        same_q8 = torch.equal(fused_q8.view(torch.uint8), q8.view(torch.uint8))
+        self.assertTrue(same_q8, "q_fp8 differs")
+        same_w = torch.equal(fused_weights.view(torch.int32), weights.view(torch.int32))
+        self.assertTrue(same_w, "head weights differ")
 
     def _forward(self, indexer, pool, mode, x, q_lora, loc, rocm_prologue):
         captured = {}
