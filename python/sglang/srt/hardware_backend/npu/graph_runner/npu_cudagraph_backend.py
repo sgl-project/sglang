@@ -31,8 +31,8 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.dcp import get_mla_dcp_backend
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
-from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
-    BaseCudaGraphBackend,
+from sglang.srt.model_executor.runner_backend.base_graph_backend import (
+    BaseGraphBackend,
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import empty_context, get_bool_env_var, get_compiler_backend
@@ -48,7 +48,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-class NPUCudaGraphBackend(BaseCudaGraphBackend):
+class NPUCudaGraphBackend(BaseGraphBackend):
     """One torch.npu.NPUGraph per shape; attention metadata captured
     inside the graph. replay_with_input_update substitutes fresh
     seq_lens without re-recording."""
@@ -479,10 +479,17 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
                     "CPU sequence lengths."
                 )
             hf_config = runner.model_runner.model_config.hf_config
+            attn_backend = getattr(runner, "attn_backend", None)
+            full_attn_backend = getattr(attn_backend, "full_attn_backend", attn_backend)
+            needs_cpu_seq_lens = getattr(attn_backend, "needs_cpu_seq_lens", True)
+            # QFA needs no FIA host rebinding even when GDN needs CPU lengths.
+            if getattr(full_attn_backend, "use_quant_flash_attn", False):
+                needs_cpu_seq_lens = False
             # The old multi-layer runner always updated Host lengths. Preserve
             # that contract independently of the generic DSA/V4 opt-out.
-            if is_multi_layer_draft_extend or not (
-                is_deepseek_dsa(hf_config) or is_deepseek_v4(hf_config)
+            if is_multi_layer_draft_extend or (
+                needs_cpu_seq_lens
+                and not (is_deepseek_dsa(hf_config) or is_deepseek_v4(hf_config))
             ):
                 # The EAGLE draft check must precede the decode fallback:
                 # EAGLEDraftCudaGraphRunner also subclasses
