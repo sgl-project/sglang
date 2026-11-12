@@ -350,6 +350,7 @@ POSITIONAL_FIELD_ORDER = (
     "enable_int8_mamba_checkpoint",
     "int8_mamba_ckpt_size",
     "linear_attn_backend",
+    "_linear_attn_backend_explicitly_set",
     "linear_attn_decode_backend",
     "linear_attn_prefill_backend",
     "linear_attn_verify_backend",
