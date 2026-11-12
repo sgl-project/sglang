@@ -14,6 +14,7 @@ import torch
 import zmq
 import zmq.asyncio
 
+import sglang.multimodal_gen.runtime.launch_server as launch_module
 from sglang.multimodal_gen.runtime.disaggregation.deployment import client, transport
 from sglang.multimodal_gen.runtime.disaggregation.deployment.coordinator import (
     DeploymentServer,
@@ -47,6 +48,8 @@ from sglang.multimodal_gen.runtime.pipelines_core.executors.sync_executor import
     SyncExecutor,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
+from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.argparse import FlexibleArgumentParser
 
 
 def specs():
@@ -69,6 +72,59 @@ def specs():
             components=("vae",),
         ),
     )
+
+
+@pytest.mark.parametrize(
+    "argv, expected", [([], 8), (["--disagg-max-slots-per-instance", "3"], 3)]
+)
+def test_stage_launch_uses_real_server_args_capacity(monkeypatch, argv, expected):
+    parser = FlexibleArgumentParser()
+    ServerArgs.add_disagg_cli_args(parser)
+    options = parser.parse_args(argv)
+    # model/device resolution is external to this launch-option contract
+    monkeypatch.setattr(ServerArgs, "__post_init__", lambda self: None)
+    args = ServerArgs(
+        model_path="unused",
+        stage_deployment="plan.json",
+        scheduler_ports=[19021],
+        disagg_max_slots_per_instance=options.disagg_max_slots_per_instance,
+    )
+    deployment = Deployment(
+        {
+            stage.name: RoleSpec((stage.name,), (f"tcp://127.0.0.1:{19100 + i}",))
+            for i, stage in enumerate(specs())
+        }
+    )
+    monkeypatch.setattr(Deployment, "load", lambda _: deployment)
+    monkeypatch.setattr(
+        launch_module,
+        "get_model_info",
+        lambda *args, **kwargs: SimpleNamespace(
+            pipeline_cls=SimpleNamespace(stage_specs=specs())
+        ),
+    )
+    monkeypatch.setattr(launch_module, "configure_logger", lambda _: None)
+    monkeypatch.setattr(launch_module, "launch_http_server_only", lambda _: None)
+    started = []
+    monkeypatch.setattr(
+        DeploymentServer,
+        "start",
+        lambda server, endpoint: started.append(server.capacity),
+    )
+    monkeypatch.setattr(DeploymentServer, "stop", lambda server: None)
+
+    launch_module.launch_stage_deployment(args)
+
+    assert started == [expected]
+
+
+@pytest.mark.parametrize("capacity", [0, -1])
+def test_stage_launch_rejects_nonpositive_capacity(monkeypatch, capacity):
+    monkeypatch.setattr(ServerArgs, "__post_init__", lambda self: None)
+    args = ServerArgs(model_path="unused", disagg_max_slots_per_instance=capacity)
+
+    with pytest.raises(ValueError, match="timeout and capacity must be positive"):
+        launch_module.launch_stage_deployment(args)
 
 
 def test_contracts_compile_and_tensor_tree_round_trip():

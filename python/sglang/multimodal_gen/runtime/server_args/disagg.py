@@ -165,6 +165,12 @@ class DisaggServerArgsMixin:
             f"Default: {cls.disagg_timeout}.",
         )
         parser.add_argument(
+            "--disagg-max-slots-per-instance",
+            type=int,
+            default=cls.disagg_max_slots_per_instance,
+            help="Retained results per stage worker and coordinator request capacity.",
+        )
+        parser.add_argument(
             "--disagg-dispatch-policy",
             type=str,
             default=cls.disagg_dispatch_policy,

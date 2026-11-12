@@ -616,6 +616,7 @@ class ServerArgs(DisaggServerArgsMixin):
     stage_endpoint: str | None = None
     stage_node: str | None = None
     disagg_timeout: int = 3600
+    disagg_max_slots_per_instance: int = 8
     disagg_dispatch_policy: str = "round_robin"
     disagg_mode: bool = False
     disagg_transfer_pool_size: int = 256 * 1024 * 1024
