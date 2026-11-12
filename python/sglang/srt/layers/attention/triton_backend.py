@@ -265,8 +265,11 @@ class TritonAttnBackend(AttentionBackend):
         self.speculative_num_steps = get_spec().speculative_num_steps
         self.topk = get_spec().speculative_eagle_topk or 0
         # Split-KV verify is bit-equivalent only for a pure-causal chain (topk==1)
-        # and is gfx95-only; else fall back to extend_attention_fwd.
-        self.use_verify_splitkv = is_gfx95_supported() and self.topk == 1
+        # and runs on gfx95 and CUDA (its HIP-only launch kwargs are gated inside
+        # verify_splitkv.py); else fall back to extend_attention_fwd. On CUDA that
+        # fallback loops the whole prefix serially per (seq, head), so long-context
+        # verify degrades linearly with prefix length.
+        self.use_verify_splitkv = (_is_cuda or is_gfx95_supported()) and self.topk == 1
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
         # The grouped-head verify kernel is tuned for Kimi-K3 MLA and Qwen3.5
         # GQA with exactly one TP-local KV head.
@@ -1973,11 +1976,11 @@ class TritonAttnBackend(AttentionBackend):
         ):
             return o
 
-        # Split-KV EAGLE-verify fast path (ROCm/Triton). On target-verify
+        # Split-KV EAGLE-verify fast path (Triton, gfx95 and CUDA). On target-verify
         # (topk=1 causal chain), run the bandwidth-efficient split-KV kernel
         # instead of the serial-prefix extend kernel. verify_splitkv_fwd()
         # returns True if it ran (o written), or False for any case it cannot
-        # serve bit-equivalently (its can_handle() gates on non-causal / sinks /
+        # serve bit-equivalently (its can_handle() gates on non-causal /
         # sliding-window / ragged / topk>1), so we fall through to
         # extend_attention_fwd below. Correctness is never at risk.
         # Route target-verify to the grouped-head kernel when eligible, else the
