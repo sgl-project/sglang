@@ -2,16 +2,17 @@ export const config = (() => {
 const sm12Hardware = ["rtx5090", "rtxpro6000", "dgx-spark"];
 // One B200 serves the platform default, cuDNN SDPA: 2.22 s against 2.32 s with FlashAttention for
 // 1024px/40-step generation and 2.70 s against 2.89 s for an edit (2026-11-01, sglang 3a01d4cc).
-const platformAttention = (s) => sm12Hardware.includes(s.hw) ? "sdpa" : s.hw === "b200" && Number(s.gpus_per_node) === 1 ? "cudnn" : "fa";
+const platformAttention = (s) => sm12Hardware.includes(s.hw) || s.hw === "a3" ? "sdpa" : s.hw === "b200" && Number(s.gpus_per_node) === 1 ? "cudnn" : "fa";
 const effectiveAttention = (s) => s.attention === "platform" || (sm12Hardware.includes(s.hw) && s.attention === "fa") ? platformAttention(s) : s.attention;
 
 const config = {
   modelName: "Qwen-Image 2.1 / Turbo",
-  supportedHardware: ["h200", "b200", "rtxpro6000", "rtx5090", "rtx4090", "dgx-spark"],
+  supportedHardware: ["h200", "b200", "rtxpro6000", "rtx5090", "rtx4090", "dgx-spark", "a3"],
   hardware: [
     { id: "rtxpro6000", label: "RTX PRO 6000", vram: "96GB", vendor: "consumer" },
     { id: "rtx5090", label: "RTX 5090", vram: "32GB", vendor: "consumer" },
     { id: "rtx4090", label: "RTX 4090", vram: "24GB", vendor: "consumer" },
+    { id: "a3", label: "Ascend A3", vram: "2 NPUs / card", vendor: "npu" },
   ],
   groupHardware: false,
   matchDims: [],
@@ -50,11 +51,11 @@ const config = {
       options: [
         {
           id: "resident", label: "Resident",
-          recommendedWhen: (s) => ["h200", "b200", "rtxpro6000", "dgx-spark"].includes(s.hw),
+          recommendedWhen: (s) => ["h200", "b200", "rtxpro6000", "dgx-spark", "a3"].includes(s.hw),
           disabled: (s) => ["rtx5090", "rtx4090"].includes(s.hw) && Number(s.gpus_per_node) === 1,
           disableReason: "The full resident pipeline exceeds one consumer GPU's memory. Select CPU offload.",
-          flags: ["--performance-mode speed"],
-          description: "Keep all components resident. Recommended for H200, B200, RTX PRO 6000 96GB, and DGX Spark 128GB unified memory. RTX 5090 and RTX 4090 need offload.",
+          flags: (s) => s.hw === "a3" ? [] : ["--performance-mode speed"],
+          description: "Keep all components resident. Recommended for H200, B200, RTX PRO 6000 96GB, DGX Spark 128GB unified memory, and Ascend NPU. RTX 5090 and RTX 4090 need offload.",
         },
         {
           id: "offload", label: "CPU offload",
@@ -86,9 +87,14 @@ const config = {
         {
           id: "platform", label: "Automatic", recommended: true,
           flags: (s) => s.hw === "b200" && Number(s.gpus_per_node) !== 1 ? ["--attention-backend fa"] : [],
-          description: "Uses cuDNN SDPA on one B200, SDPA on RTX PRO 6000, RTX 5090, and DGX Spark, and FlashAttention on the other listed GPUs.",
+          description: "Uses cuDNN SDPA on one B200, SDPA on RTX PRO 6000, RTX 5090, DGX Spark, and Ascend NPU, and FlashAttention on the other listed GPUs.",
         },
-        { id: "fa", label: "FlashAttention", flags: ["--attention-backend fa"], description: "Exact attention with a fused kernel. This runtime falls back to Torch SDPA on RTX PRO 6000, RTX 5090, and DGX Spark." },
+        {
+          id: "fa", label: "FlashAttention", flags: ["--attention-backend fa"],
+          soft: (s) => s.hw === "a3",
+          softReason: "On Ascend NPU, 'fa' runs the Ascend FlashAttention backend; this combination has not completed HTTP verification — the verified recipe uses Torch SDPA.",
+          description: "Exact attention with a fused kernel. This runtime falls back to Torch SDPA on RTX PRO 6000, RTX 5090, and DGX Spark.",
+        },
         {
           id: "cudnn", label: "cuDNN SDPA", flags: ["--attention-backend dynamic_cudnn_sdpa"],
           soft: (s) => !config.commandBuilder.resource.verifiedRecipes.some((r) => r.hw === s.hw && r.placement === s.placement && r.attentions.includes("cudnn") && Number(s.gpus_per_node) === r.gpus_per_node),
@@ -314,6 +320,7 @@ const config = {
         { id: "rtx5090-1-offload", hw: "rtx5090", nodes: 1, gpus_per_node: 1, placement: "offload", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", attentions: ["sdpa"], default: true },
         { id: "rtx4090-1-offload", hw: "rtx4090", nodes: 1, gpus_per_node: 1, placement: "offload", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", attentions: ["fa", "sdpa"], batchSizes: [1, 2], batchAttentions: ["fa"], default: true },
         { id: "dgx-spark-1-resident", hw: "dgx-spark", nodes: 1, gpus_per_node: 1, placement: "resident", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", attentions: ["sdpa"], batchSizes: [1], default: true },
+        { id: "a3-1-resident", hw: "a3", nodes: 1, gpus_per_node: 1, placement: "resident", tp_size: 1, ulysses_degree: 1, ring_degree: 1, encoder: "auto", attentions: ["sdpa"], batchSizes: [1], default: true },
       ],
       // B200 x2 (b200-2-tp above), 1024x1024 40 steps: TP2 1.43 s vs Ulysses 2
       // 1.59 s.
@@ -374,6 +381,7 @@ const config = {
       if (topology.tp_size > 1) flags.push(`--tp-size ${topology.tp_size}`);
       if (world > 1) flags.push(`--ulysses-degree ${topology.ulysses_degree}`);
       if (topology.ring_degree > 1) flags.push(`--ring-degree ${topology.ring_degree}`);
+      if (s.hw === "a3") flags.push("--warmup-mode request");
       flags.push("--host {{HOST_IP}}", "--port {{PORT}}");
       const warnings = [];
       if (s.hw === "rtx4090" && (Number(s.outputs) > 1 || (s.batching && s.batching !== "off"))) warnings.push("This recipe streams DiT layers for batch memory headroom. Restart with the updated Server command when changing output count or request batching.");

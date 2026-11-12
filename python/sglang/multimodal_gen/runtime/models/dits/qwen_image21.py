@@ -17,7 +17,9 @@ from sglang.kernels.ops.diffusion import (
     qknorm_complex_rope_cuda,
     qknorm_complex_rope_pack_,
     residual_gate_add,
+    rmsnorm_npu_onepass,
     rmsnorm_preserve_reduction,
+    silu_mul_npu,
     tensors_equal,
 )
 from sglang.kernels.ops.diffusion.rope.qknorm_complex_rope_kv_triton import (
@@ -67,6 +69,7 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
 )
 
 _is_cuda = current_platform.is_cuda()
+_is_npu = current_platform.is_npu()
 
 logger = init_logger(__name__)
 _ROPE_FUSION = BitExactFusionGate("Qwen-Image 2.1 complex RoPE")
@@ -87,6 +90,7 @@ _QKV_PACK_FUSION = BitExactFusionGate(
 )
 _QK_NORM_FUSION = BitExactFusionGate("Qwen-Image 2.1 Q/K RMSNorm")
 _MODULATION_FUSION = BitExactFusionGate("Qwen-Image 2.1 LayerNorm modulation")
+_QK_NORM_NPU_FUSION = BitExactFusionGate("Qwen-Image 2.1 Q/K RMSNorm on NPU")
 
 
 def build_layout(image_slots, image_shapes, axes_dims, device):
@@ -191,6 +195,20 @@ def apply_qk_norm_rope(x, norm, rope):
             lambda: qknorm_complex_rope(x, norm.weight, rope, norm.variance_epsilon),
             lambda: apply_rope(norm(x), rope),
             logger=logger,
+        )
+    if (
+        _is_npu
+        and x.is_npu
+        and x.dtype in (torch.float16, torch.bfloat16)
+        and _QK_NORM_NPU_FUSION.can_attempt_once()
+    ):
+        npu_fused = apply_rope(
+            rmsnorm_npu_onepass(x, norm.weight, norm.variance_epsilon), rope
+        )
+        if _QK_NORM_NPU_FUSION.verified:
+            return npu_fused
+        return _QK_NORM_NPU_FUSION.accept_or_fallback(
+            npu_fused, apply_rope(norm(x), rope), logger=logger
         )
     return apply_rope(norm(x), rope)
 
@@ -463,6 +481,18 @@ class QwenImage21FeedForward(nn.Module):
                 lambda: fused_silu_mul_bitexact(gate, value),
                 lambda: nn.functional.silu(gate) * value,
                 logger=logger,
+            )
+        elif (
+            _is_npu
+            and gate.is_npu
+            and gate.dtype is torch.bfloat16
+            and _SILU_MUL_FUSION.can_attempt_once()
+        ):
+            fused = silu_mul_npu(gate, value)
+            if _SILU_MUL_FUSION.verified:
+                return self.out(fused)[0]
+            hidden = _SILU_MUL_FUSION.accept_or_fallback(
+                fused, nn.functional.silu(gate) * value, logger=logger
             )
         else:
             hidden = nn.functional.silu(gate) * value
