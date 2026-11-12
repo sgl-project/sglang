@@ -492,14 +492,27 @@ class SupportsDraftEmbed(Protocol):
     def attach_draft_embed(self, **kwargs: Any) -> None: ...
 
 
+class RecurrentCommitIO(msgspec.Struct, frozen=True):
+    """One chain verify's accepted recurrent state, per request ([bs] tensors). The
+    slots are the verify's resolved ones: the request table may name others."""
+
+    state_slots: torch.Tensor
+    track_slots: Optional[torch.Tensor]
+    request_rows: torch.Tensor
+    accept_lens: torch.Tensor  # including the bonus token
+    last_step: torch.Tensor
+    track_steps: Optional[torch.Tensor]
+    draft_token_num: int
+    src_indices_raw: Optional[torch.Tensor]
+
+
 @runtime_checkable
-class SupportsKdaCommit(Protocol):
-    """A target spec that commits the KDA state after a chain verify in one launch.
+class SupportsRecurrentCommit(Protocol):
+    """A target build committing a chain verify's recurrent state on the current
+    stream. True: SGLang commits only its per-request side states (PLE); False:
+    SGLang commits as without it. Capturable: no collective or host sync."""
 
-    kda_commit returns False, launching nothing, when off; SGLang then commits itself.
-    """
-
-    def kda_commit(self, **kwargs: Any) -> bool: ...
+    def commit_recurrent_state(self, io: RecurrentCommitIO) -> bool: ...
 
 
 @runtime_checkable

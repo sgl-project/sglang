@@ -1319,8 +1319,10 @@ def install_megakernel(
         capture_tail_hooks.append(_CaptureCheck(spec=spec, dispatch=dispatch))
 
 
-def built_megakernel(model: torch.nn.Module) -> Optional[BuiltMegakernel]:
+def built_megakernel(model: Optional[torch.nn.Module]) -> Optional[BuiltMegakernel]:
     """The object the spec built for this model, or None."""
+    if model is None:
+        return None
     installed: Optional[_InstalledMegakernel] = model.__dict__.get("_megakernel")
     return None if installed is None else installed.built
 
