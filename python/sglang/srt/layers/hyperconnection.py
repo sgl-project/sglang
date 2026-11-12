@@ -14,7 +14,9 @@ from sglang.srt.layers.hc_mix_flydsl import (
     flydsl_hc_mix_weights_supported,
     weight_cache_key,
 )
-from sglang.srt.utils import is_gfx95_supported
+from sglang.srt.utils import is_gfx95_supported, is_hip
+
+_use_aiter = envs.SGLANG_USE_AITER.get() and is_hip()
 
 
 @lru_cache(None)
@@ -183,6 +185,7 @@ class GatedResidual(HyperConnectionBase):
             and envs.SGLANG_OPT_QWEN4_FUSED_HC.get()
             and self.hc_count == 4
             and self.config.hc_per_branch_norm
+            and _use_aiter
             and is_gfx95_supported()
             and flydsl_hc_fused_available()
         )
