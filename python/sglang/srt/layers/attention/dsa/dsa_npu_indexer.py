@@ -241,10 +241,14 @@ class DSANPUIndexerMixin:
         attn_backend = get_attn_backend()
         if hasattr(attn_backend, "prepare_dsa_cp_metadata"):
             attn_backend.prepare_dsa_cp_metadata(forward_batch)
-        if get_attn_backend().forward_metadata.seq_lens_cpu_int is None:
-            actual_seq_lengths_kv = get_attn_backend().forward_metadata.seq_lens
+        # Hybrid models (Kimi K2/K3) wrap a full-attn and a linear backend;
+        # the forward metadata consumed here lives on the full-attn side.
+        if hasattr(attn_backend, "full_attn_backend"):
+            attn_backend = attn_backend.full_attn_backend
+        if attn_backend.forward_metadata.seq_lens_cpu_int is None:
+            actual_seq_lengths_kv = attn_backend.forward_metadata.seq_lens
         else:
-            actual_seq_lengths_kv = get_attn_backend().forward_metadata.seq_lens_cpu_int
+            actual_seq_lengths_kv = attn_backend.forward_metadata.seq_lens_cpu_int
         is_prefill = (
             forward_batch.forward_mode.is_extend()
             and not forward_batch.forward_mode.is_draft_extend_v2()
@@ -266,7 +270,11 @@ class DSANPUIndexerMixin:
             if is_prefill and not uses_prefill_cp
             else None
         )
-        q_sliced_early = shard is not None and self.rotary_emb.is_neox_style
+        q_sliced_early = (
+            shard is not None
+            and self.rotary_emb is not None
+            and self.rotary_emb.is_neox_style
+        )
         if q_sliced_early:
             if dynamic_scale is not None:
                 dynamic_scale = shard.take(dynamic_scale)
@@ -275,7 +283,30 @@ class DSANPUIndexerMixin:
         else:
             bs_q = bs
 
-        if self.rotary_emb.is_neox_style:
+        if self.rotary_emb is None:
+            # skip_rope (index_rope_dim == 0, e.g. Kimi K3.1): the indexer
+            # q/k carry no rope part at all, so skip the rope split/apply
+            # entirely; q is all-nope and k needs no rotation.
+            if envs.SGLANG_NPU_USE_MULTI_STREAM.get():
+                indexer_weight_stream = get_indexer_weight_stream()
+                indexer_weight_stream.wait_stream(torch.npu.current_stream())
+                with torch.npu.stream(indexer_weight_stream):
+                    x = x.view(-1, self.hidden_size)
+                    weights = self.weights_proj(x.to(self.weights_proj.weight.dtype))[0]
+                    weights.record_stream(indexer_weight_stream)
+                    weights_event = indexer_weight_stream.record_event()
+            else:
+                x = x.view(-1, self.hidden_size)
+                weights = self.weights_proj(x.to(self.weights_proj.weight.dtype))[0]
+
+            q_lora = (q_lora, dynamic_scale) if dynamic_scale is not None else q_lora
+            q = self.wq_b(q_lora)[0]  # [bs, 1536] @ [1536, 64 * 128] = [bs, 64 * 128]
+            q = q.view(bs, self.n_heads, self.head_dim)  # [bs, 64, 128]
+
+            k_proj = self.wk(x)[0]  # [bs, 7168] @ [7168, 128] = [bs, 128]
+            k = self.k_norm(k_proj).unsqueeze(1)  # [bs, 1, 128]
+
+        elif self.rotary_emb.is_neox_style:
             if not hasattr(forward_batch, "npu_indexer_sin_cos_cache"):
                 cos_sin = self.rotary_emb.cos_sin_cache[positions]
                 cos, sin = cos_sin.chunk(2, dim=-1)
@@ -417,11 +448,9 @@ class DSANPUIndexerMixin:
         if (
             parallel.dcp_enabled
             and parallel.attn_dcp_size > 1
-            and not get_attn_backend().is_draft_worker
+            and not attn_backend.is_draft_worker
         ):
-            indexer_cache_loc = (
-                get_attn_backend().forward_metadata.dcp_origin_out_cache_loc
-            )
+            indexer_cache_loc = attn_backend.forward_metadata.dcp_origin_out_cache_loc
             assert indexer_cache_loc is not None, (
                 "NPU DSA+DCP requires allocator-global origin_out_cache_loc metadata"
             )
@@ -430,6 +459,13 @@ class DSANPUIndexerMixin:
                 f"length: {indexer_cache_loc.shape[0]} != {positions.shape[0]}"
             )
         pool = get_token_to_kv_pool()
+        # Hybrid pools (Kimi K2/K3) keep the index buffers on the inner
+        # full-attn pool, which is keyed by compact (dense) layer ids;
+        # translate the global layer id before unwrapping the wrapper.
+        if hasattr(pool, "full_kv_pool"):
+            pool._wait_for_layer(layer_id)
+            layer_id = pool._transfer_full_attention_id(layer_id)
+            pool = pool.full_kv_pool
         use_quant_indexer = pool.index_k_scale_buffer is not None
         if use_quant_indexer and (self.num_init_tokens or self.num_local_tokens):
             raise NotImplementedError(
@@ -449,21 +485,21 @@ class DSANPUIndexerMixin:
             ):
                 # V2: local metadata already prepared by prepare_dsa_cp_metadata.
                 actual_seq_lengths_q = (
-                    get_attn_backend().forward_metadata.actual_seq_lengths_q
+                    attn_backend.forward_metadata.actual_seq_lengths_q
                 )
                 actual_seq_lengths_kv = (
-                    get_attn_backend().forward_metadata.actual_seq_lengths_kv
+                    attn_backend.forward_metadata.actual_seq_lengths_kv
                 )
             else:
                 actual_seq_lengths_kv = forward_batch.seq_lens
                 actual_seq_lengths_q = forward_batch.extend_seq_lens.cumsum(dim=0)
         else:
-            if get_attn_backend().forward_metadata.actual_seq_lengths_q is None:
+            if attn_backend.forward_metadata.actual_seq_lengths_q is None:
                 if (
                     forward_batch.forward_mode.is_draft_extend_v2()
                     or forward_batch.forward_mode.is_target_verify()
                 ):
-                    num_draft_tokens = get_attn_backend().speculative_num_draft_tokens
+                    num_draft_tokens = attn_backend.speculative_num_draft_tokens
                     actual_seq_lengths_q = torch.arange(
                         num_draft_tokens,
                         num_draft_tokens + bs,
@@ -479,18 +515,25 @@ class DSANPUIndexerMixin:
                     )
             else:
                 actual_seq_lengths_q = (
-                    get_attn_backend().forward_metadata.actual_seq_lengths_q
+                    attn_backend.forward_metadata.actual_seq_lengths_q
                 )
 
-        past_key_states = get_token_to_kv_pool().get_index_k_buffer(layer_id)
+        past_key_states = pool.get_index_k_buffer(layer_id)
 
-        if self.rotary_emb.is_neox_style and self.alt_stream is not None:
+        if (
+            self.rotary_emb is not None
+            and self.rotary_emb.is_neox_style
+            and self.alt_stream is not None
+        ):
             torch.npu.current_stream().wait_event(q_rope_event)
         if envs.SGLANG_NPU_USE_MULTI_STREAM.get():
             torch.npu.current_stream().wait_event(weights_event)
         if _use_ag_after_qlora and input_on_attn_tp_slices:
             weights = scattered_to_tp_attn_full(weights, forward_batch)
-        block_table = get_attn_backend().forward_metadata.block_tables
+        # Take block tables from the (hybrid-unwrapped) full-attn backend:
+        # Kimi K2/K3 wrap full-attn + linear backends and the metadata lives
+        # on the full-attn side (see the unwrap at the top of forward_npu).
+        block_table = attn_backend.forward_metadata.block_tables
         if self.num_init_tokens or self.num_local_tokens:
             return self._forward_npu_lsa_indexer(
                 q.view(-1, self.n_heads, self.head_dim),
