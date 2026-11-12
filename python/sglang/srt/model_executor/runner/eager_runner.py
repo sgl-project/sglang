@@ -35,9 +35,7 @@ from sglang.srt.layers.cp.utils import (
 )
 from sglang.srt.layers.dp_attention import get_eager_max_batch_size, require_mlp_sync
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput
-from sglang.srt.model_executor.cuda_graph_buffer_registry import (
-    build_eager_registry,
-)
+from sglang.srt.model_executor.cuda_graph_buffer_registry import build_eager_registry
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.forward_context import (
     forward_context,
