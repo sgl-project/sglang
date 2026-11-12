@@ -1,4 +1,4 @@
-"""AITER unified-verify metadata when the scheduler hands over no host seq_lens."""
+"""AITER backend workspace allocation and unified-verify metadata, built on CPU."""
 
 import unittest
 from types import SimpleNamespace
@@ -6,7 +6,9 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention import aiter_backend
+from sglang.srt.mem_cache.kv.router import PlainPoolRouter
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -55,6 +57,8 @@ def _unified_verify_backend():
     backend.use_mla = False
     backend._use_unified_verify = True
     backend.use_sliding_window_kv_pool = False
+    backend.use_muse_attention_paths = False
+    backend.muse_reuse_verify_lengths = False
     backend.page_size = 1
     backend.max_context_len = 128
     backend.num_draft_tokens = _VERIFY_TOKENS_PER_REQ
@@ -125,6 +129,70 @@ class TestAiterUnifiedVerifyWithoutHostSeqLens(CustomTestCase):
             backend,
             lambda fb: backend.init_forward_metadata_out_graph(fb, in_capture=False),
         )
+
+
+class _MHAPool:
+    start_layer = 0
+    layer_num = 1
+    requires_physical_write_loc = False
+
+    def __init__(self, kv_cache_layout):
+        self.kv_cache_layout = kv_cache_layout
+        self.layer_router = PlainPoolRouter(self, "full")
+
+    def get_value_buffer(self, _layer_id):
+        return torch.empty(1, 1, 8, 128)
+
+
+def _init_mha_backend(kv_cache_layout):
+    pool = _MHAPool(kv_cache_layout)
+    model_config = SimpleNamespace(
+        dtype=torch.bfloat16,
+        is_multimodal=False,
+        num_attention_heads=32,
+        head_dim=128,
+        get_num_kv_heads=lambda _tp_size: 8,
+        attention_arch=AttentionArch.MHA,
+        context_len=4096,
+    )
+    model_runner = SimpleNamespace(
+        model_config=model_config,
+        device=torch.device("cpu"),
+        kv_cache_dtype=torch.bfloat16,
+        req_to_token_pool=SimpleNamespace(req_to_token=None, size=_BATCH_SIZE),
+        runner_ids=None,
+        token_to_kv_pool=pool,
+        is_draft_worker=False,
+        token_to_kv_pool_allocator=SimpleNamespace(get_kvcache=lambda: pool),
+    )
+    spec = SimpleNamespace(
+        speculative_num_draft_tokens=None, speculative_num_steps=None
+    )
+    parallel = SimpleNamespace(attn_tp_size=1, attn_dcp_size=1)
+    exec_config = SimpleNamespace(
+        deterministic=SimpleNamespace(enable_deterministic_inference=False)
+    )
+    with (
+        patch.object(
+            aiter_backend, "get_schedule", lambda: SimpleNamespace(page_size=1)
+        ),
+        patch.object(aiter_backend, "get_exec", lambda: exec_config),
+        patch.object(aiter_backend, "get_spec", lambda: spec),
+        patch.object(aiter_backend, "get_parallel", lambda: parallel),
+    ):
+        return aiter_backend.AiterAttnBackend(model_runner, skip_prefill=True)
+
+
+class TestAiterDecodeWorkspace(CustomTestCase):
+    """Only paged_attention_ragged reads workspace_buffer; a SHUFFLE 5D pool decodes
+    through pa_decode_gluon, so it must not allocate it."""
+
+    def test_allocated_only_for_paged_ragged_decode(self):
+        allocated = {
+            layout: "workspace_buffer" in vars(_init_mha_backend(layout))
+            for layout in ("nhd", "vectorized_5d")
+        }
+        self.assertEqual(allocated, {"nhd": True, "vectorized_5d": False})
 
 
 if __name__ == "__main__":

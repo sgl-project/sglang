@@ -33,6 +33,11 @@ def tearDownModule():
     _aux_tcp_ctx.__exit__(None, None, None)
 
 
+# Mooncake's same-node RDMA aux send stalls about once per run and 500s a few
+# requests; drop once https://github.com/sgl-project/sglang/issues/45849 is fixed.
+MAX_REQUEST_ERRORS = 5
+
+
 class TestDisaggregationPrefillPPAccuracy(PDDisaggregationServerBase):
     @classmethod
     def setUpClass(cls):
@@ -114,6 +119,7 @@ class TestDisaggregationPrefillPPAccuracy(PDDisaggregationServerBase):
             num_questions=200,
             max_new_tokens=512,
             parallel=128,
+            max_request_errors=MAX_REQUEST_ERRORS,
             host=self.base_host,
             port=int(self.lb_port),
         )
@@ -208,6 +214,7 @@ class TestDisaggregationPrefillPPDynamicChunkAccuracy(PDDisaggregationServerBase
             num_questions=200,
             max_new_tokens=512,
             parallel=128,
+            max_request_errors=MAX_REQUEST_ERRORS,
             host=self.base_host,
             port=int(self.lb_port),
         )
@@ -303,6 +310,7 @@ class TestDisaggregationDecodePPAccuracy(PDDisaggregationServerBase):
             num_questions=200,
             max_new_tokens=512,
             parallel=128,
+            max_request_errors=MAX_REQUEST_ERRORS,
             host=self.base_host,
             port=int(self.lb_port),
         )

@@ -244,17 +244,17 @@ def test_qwen4_ple_offload_avoids_device_table(single_rank_runtime_context):
 
 
 def _file_backend_supported() -> bool:
-    from sglang.srt.models.qwen4_exp_ple_table import device_uses_host_page_tables
+    from sglang.srt.models.qwen4_exp_ple_table import device_reads_pageable_memory
 
     return (
         torch.cuda.is_available()
-        and device_uses_host_page_tables(torch.cuda.current_device()) is True
+        and device_reads_pageable_memory(torch.cuda.current_device()) is True
     )
 
 
 @pytest.mark.skipif(
     not _file_backend_supported(),
-    reason="the file backend needs pageable host memory reachable through host page tables",
+    reason="the file backend needs a device that reads pageable host memory",
 )
 @pytest.mark.parametrize("embedding_dim", [7, 160])
 def test_qwen4_ple_file_backend_matches_pinned(embedding_dim):
@@ -286,7 +286,7 @@ def test_qwen4_ple_file_backend_matches_pinned(embedding_dim):
 
 @pytest.mark.skipif(
     not _file_backend_supported(),
-    reason="the file backend needs pageable host memory reachable through host page tables",
+    reason="the file backend needs a device that reads pageable host memory",
 )
 def test_qwen4_ple_file_backend_fp8_table():
     embedding_dim = 160
