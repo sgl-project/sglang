@@ -581,5 +581,122 @@ class TestRelayedCommitSlots(CustomTestCase):
         self.assertEqual(slots.track.tolist(), f.translate(f.track).tolist())
 
 
+class TestMegakernelOwnState(CustomTestCase):
+    """A megakernel keeping recurrent state of its own beside the state pool
+    (spec.SupportsStateSlotReset) is sized with the pool, restarted wherever a
+    checkpoint is written or bound, and limits what reaches the prefix cache."""
+
+    def tearDown(self):
+        reset_context()
+
+    @staticmethod
+    def _own(**capabilities):
+        return SimpleNamespace(
+            **{
+                "state_bytes_per_slot": 64,
+                "state_bytes_per_request_row": 32,
+                "keeps_draft_ssm": False,
+                "tracks_decode_state": True,
+                "backs_up_state": True,
+                "reset_state_slots": MagicMock(),
+                **capabilities,
+            }
+        )
+
+    def test_the_pool_is_sized_for_it(self):
+        from sglang.srt.model_executor import model_runner
+
+        for own, slot_bytes, row_bytes, intermediate in (
+            (None, 0, 0, True),
+            (self._own(), 64, 32, False),
+        ):
+            with (
+                patch.object(model_runner, "megakernel_state", return_value=own),
+                patch.object(model_runner, "KVCacheConfigurator") as configurator,
+                patch.object(model_runner, "is_post_capture_kv_active"),
+                patch.object(model_runner, "get_parallel"),
+            ):
+                model_runner.ModelRunner.init_kv_cache_configurator(MagicMock())
+            kwargs = configurator.call_args.kwargs
+            self.assertEqual(kwargs["extra_mamba_cache_bytes_per_req"], slot_bytes)
+            self.assertEqual(
+                kwargs["extra_mamba_cache_bytes_per_request_row"], row_bytes
+            )
+            self.assertEqual(kwargs["allocate_intermediate_ssm"], intermediate)
+
+    def test_each_extend_restarts_it_from_the_checkpoint(self):
+        from sglang.srt.model_executor.model_runner import ModelRunner
+
+        f = _Forward(mode=ForwardMode.DECODE, graph=False)
+        own = f.alloc.state.own_state = self._own()
+        runner = SimpleNamespace(
+            req_to_token_pool=f.req,
+            is_draft_worker=False,
+            token_to_kv_pool_allocator=f.alloc,
+            runner_ids=f.reader,
+        )
+        extend = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            req_pool_indices=f.rows,
+            mamba_clear_indices=None,
+            mamba_cow_src_indices=None,
+            mamba_cow_dst_indices=None,
+        )
+        ModelRunner._maybe_execute_deferred_mamba_cow_and_clear(runner, extend)
+        slots, rows = own.reset_state_slots.call_args.args
+        self.assertEqual(slots.tolist(), f.working_physical.tolist())
+        self.assertIs(rows, f.rows)
+
+    def test_a_newly_bound_slot_starts_it_empty(self):
+        from sglang.srt.mem_cache.kv.state_storage import StateStorage
+
+        storage = StateStorage(
+            sub_pool="state",
+            pool=SimpleNamespace(replayssm_write_pos=None, size=8),
+            slots=SimpleNamespace(
+                alloc=lambda n: torch.tensor([3, 4][:n]), translate=lambda m: m + 10
+            ),
+            layer_map={},
+            short_conv_pool=None,
+            ngram_pool=None,
+        )
+        own = storage.own_state = self._own()
+        table = SimpleNamespace(
+            enable_mamba_extra_buffer=False,
+            device="cpu",
+            req_index_to_mamba_index_mapping=torch.zeros(8, dtype=torch.int32),
+        )
+        holding = SimpleNamespace(kv=SimpleNamespace(mamba_pool_idx=torch.tensor(5)))
+        fresh = SimpleNamespace(kv=SimpleNamespace(mamba_pool_idx=None))
+        for req in (holding, fresh):
+            req.kv.holds_mamba = req.kv.mamba_pool_idx is not None
+        storage.acquire(table, [holding, fresh], [1, 2])
+        slots, rows = own.reset_state_slots.call_args.args
+        self.assertEqual((slots.tolist(), rows.tolist()), ([13], [2]))
+
+    def test_its_capabilities_limit_tracking_and_backups(self):
+        from sglang.srt.mem_cache.common import backup_kv_cache
+        from sglang.srt.mem_cache.kv.state_storage import StateStorage
+
+        state = StateStorage.empty("state")
+        state.own_state = self._own(tracks_decode_state=False, backs_up_state=False)
+        allocator = SimpleNamespace(state=state)
+        batch = SimpleNamespace(
+            token_to_kv_pool_allocator=allocator,
+            mamba_track_indices=torch.tensor([7]),
+            mamba_track_mask=torch.tensor([True]),
+        )
+        mamba = SimpleNamespace(enable_mamba_extra_buffer=True)
+        with patch.object(
+            spec_utils, "get_exec", return_value=SimpleNamespace(mamba=mamba)
+        ):
+            spec_utils.prepare_mamba_track_for_verify(batch)
+        self.assertIsNone(batch.mamba_track_indices)
+        self.assertIsNone(batch.mamba_track_mask)
+        req = MagicMock()
+        self.assertFalse(backup_kv_cache(req, None, None, allocator, "cpu_tensor"))
+        req.offload_kv_cache.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

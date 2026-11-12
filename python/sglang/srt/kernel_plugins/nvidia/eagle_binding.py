@@ -223,6 +223,15 @@ class LinearPrefillView(msgspec.Struct, frozen=True):
     track_ssm_h_batch_src: Optional[torch.Tensor] = None
 
 
+class EaglePreparationView(msgspec.Struct, frozen=True):
+    """The pools a build's prepare reads, once they exist and before any capture:
+    the views a forward hands over, and the request table's rows (row 0 pads)."""
+
+    mamba: Optional[MambaPoolBuffers]  # None for a model without GDN layers
+    parts: LayerStateView
+    num_request_rows: int
+
+
 class EagleDraftLoopIO(msgspec.Struct, frozen=True):
     num_requests: int
     num_steps: int
@@ -362,6 +371,16 @@ class EagleBinding:
             ),
             track_chunk_idx=meta.track_chunk_idx,
             track_ssm_h_batch_src=meta.track_ssm_h_batch_src,
+        )
+
+    def preparation_view(self, model_runner: Any) -> EaglePreparationView:
+        """The pools as a build's prepare sees them, sealed as a forward's are."""
+        backend = model_runner.attn_backend
+        linear = split_backend(backend)[1]
+        return EaglePreparationView(
+            mamba=None if linear is None else self._read("mamba", self._mamba, backend),
+            parts=self._read("parts", self._parts, backend),
+            num_request_rows=model_runner.req_to_token_pool.req_to_token.shape[0],
         )
 
     def assert_live(self) -> None:

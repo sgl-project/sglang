@@ -1716,7 +1716,11 @@ class SchedulerBatchResultProcessor:
         Lazy: keep the same index (prealloc handles the swap) and run
         post-decode cleanup to free the temporary second slot.
         """
-        if req.kv.mamba_ping_pong_track_buffer is None:
+        # Without decode-time tracking the keep slot stays the extend-time checkpoint.
+        if (
+            req.kv.mamba_ping_pong_track_buffer is None
+            or not batch.token_to_kv_pool_allocator.state.tracks_decode_state
+        ):
             return
 
         lazy = get_exec().mamba.enable_mamba_extra_buffer_lazy

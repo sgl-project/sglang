@@ -476,6 +476,28 @@ class TestEagleBinding(CustomTestCase):
             with self.assertRaisesRegex(RuntimeError, "kv was reallocated"):
                 binding.assert_live()
 
+    def test_a_builds_prepare_sees_the_pools_a_forward_will(self):
+        """A build sizes and allocates its own per-slot state in prepare, before any
+        capture, from the same sealed pool views its forwards get."""
+        backend = _hybrid()
+        binding = eb.EagleBinding(model=torch.nn.Module())
+        runner = SimpleNamespace(
+            attn_backend=backend,
+            req_to_token_pool=SimpleNamespace(req_to_token=torch.zeros(9, 4)),
+        )
+        prepared = binding.preparation_view(runner)
+        self.assertEqual(prepared.num_request_rows, 9)
+        view = _view(binding, backend)
+        self.assertIs(prepared.mamba, view.mamba)
+        self.assertIs(prepared.parts, view.parts)
+        draft = binding.preparation_view(
+            SimpleNamespace(
+                attn_backend=_trtllm(KvPool()),
+                req_to_token_pool=runner.req_to_token_pool,
+            )
+        )
+        self.assertIsNone(draft.mamba)
+
     def test_the_layer_view_waits_for_each_layers_load_back(self):
         """A megakernel that reads the pools inside its kernels waits per layer, as
         the pools' getters do, for a hierarchical-cache load-back to land."""

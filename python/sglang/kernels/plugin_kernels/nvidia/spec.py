@@ -513,6 +513,41 @@ class RecurrentCommitIO(msgspec.Struct, frozen=True):
 
 
 @runtime_checkable
+class SupportsStateSlotReset(Protocol):
+    """A target build that keeps recurrent state of its own beside SGLang's
+    linear-attention state pool (a verify's ring of records and its cursors, for one),
+    by state slot or by request row, and allocates it in its prepare.
+
+    SGLang charges state_bytes_per_slot per state slot and
+    state_bytes_per_request_row per request-table row to the state budget when it
+    sizes the pool.
+    With keeps_draft_ssm False it allocates no per-draft SSM scratch: the build then
+    covers every target verify and commits it (SupportsRecurrentCommit).
+
+    reset_state_slots(slots, request_rows) empties that state for requests whose
+    checkpoint SGLang has just written or bound: before each target extend reads the
+    pool, on the forward stream, and for state slots newly bound to requests (a PD
+    decode slot runs no extend before its first verify). slots are physical state
+    slots, request_rows the requests' rows, one of each per request. No collective.
+
+    tracks_decode_state False: between commits the checkpoint lags the build's state
+    and its commit writes no decode-time checkpoints, so SGLang caches only the states
+    an extend writes. backs_up_state False: a host backup of a slot would miss the
+    build's state, so SGLang aborts a retracted request instead of backing it up.
+    """
+
+    state_bytes_per_slot: int
+    state_bytes_per_request_row: int
+    keeps_draft_ssm: bool
+    tracks_decode_state: bool
+    backs_up_state: bool
+
+    def reset_state_slots(
+        self, slots: torch.Tensor, request_rows: torch.Tensor
+    ) -> None: ...
+
+
+@runtime_checkable
 class SupportsRecurrentCommit(Protocol):
     """A target build that commits the recurrent state of a chain verify itself.
 

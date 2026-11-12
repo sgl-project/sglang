@@ -1111,6 +1111,10 @@ def prepare_mamba_track_for_verify(batch: ScheduleBatch) -> None:
     """
     if not get_exec().mamba.enable_mamba_extra_buffer:
         return
+    if not batch.token_to_kv_pool_allocator.state.tracks_decode_state:
+        # Only the states an extend writes may reach the prefix cache.
+        batch.mamba_track_indices = batch.mamba_track_mask = None
+        return
     track_positions = None
     if get_exec().mamba.enable_mamba_extra_buffer_lazy:
         track_positions = batch.mamba_lazy_spec_track_positions_cpu
@@ -1436,7 +1440,10 @@ def spec_prepare_for_decode(batch: ScheduleBatch) -> None:
     """eagle/ngram share a stateless free function; dflash keeps stateful
     prep on its draft input -- the dispatcher routes.
     """
-    if get_exec().mamba.enable_mamba_extra_buffer_lazy:
+    if (
+        get_exec().mamba.enable_mamba_extra_buffer_lazy
+        and batch.token_to_kv_pool_allocator.state.tracks_decode_state
+    ):
         # Scheduler phase (outside forward isolation).
         batch.mamba_lazy_spec_prepare(
             mamba_track_grid(batch.tree_cache.page_size),
