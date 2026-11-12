@@ -9,7 +9,8 @@ import warnings
 from contextlib import ExitStack
 from unittest.mock import patch
 
-from sglang.srt.environ import EnvField, _DeprecatedEnv, envs
+import sglang.srt.environ as environ_module
+from sglang.srt.environ import EnvField, _DeprecatedEnv, envs, freeze_env_reads
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
@@ -35,6 +36,7 @@ NV_MEGA_RUNTIME_CHILDREN = (
     "SGLANG_OPT_DSV41_SAMPLING_ACCEPT_GRAPH",
     "SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH",
     "SGLANG_OPT_SPEC_RELAY_IN_PLACE",
+    "SGLANG_OPT_FREEZE_ENV_READS",
     "SGLANG_OPT_SMALL_FIELD_COPY_VECTORIZED",
     "SGLANG_OPT_SPEC_VERIFY_REUSE_STAGED_INPUTS",
     "SGLANG_OPT_SPEC_POST_VERIFY_ONE_LAUNCH_LOAD",
@@ -265,6 +267,41 @@ class TestDeprecatedEnvRegistry(unittest.TestCase):
 
         self._apply(old_name, _DeprecatedEnv(replacement=new_name, transform=str.upper))
         self.assertEqual(os.environ[new_name], "ABC")
+
+
+class TestFreezeEnvReads(unittest.TestCase):
+    def setUp(self):
+        self.addCleanup(setattr, environ_module, "_frozen_reads", None)
+
+    def test_not_frozen_without_the_switch(self):
+        child = envs.SGLANG_OPT_FREEZE_ENV_READS
+        with (
+            envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(False),
+            child.override(False),
+        ):
+            child.clear()
+            self.assertFalse(freeze_env_reads())
+
+    def test_frozen_reads_ignore_raw_environ_writes(self):
+        field = envs.SGLANG_TEST_RETRACT
+        with envs.SGLANG_OPT_FREEZE_ENV_READS.override(True), field.override(False):
+            self.assertTrue(freeze_env_reads())
+            self.assertIs(field.get(), False)
+            os.environ[field.name] = "1"
+            self.assertIs(field.get(), False)
+
+    def test_field_writes_drop_the_memo(self):
+        field = envs.SGLANG_TEST_RETRACT
+        with envs.SGLANG_OPT_FREEZE_ENV_READS.override(True), field.override(False):
+            self.assertTrue(freeze_env_reads())
+            self.assertIs(field.get(), False)
+            with field.override(True):
+                self.assertIs(field.get(), True)
+            self.assertIs(field.get(), False)
+            field.set(True)
+            self.assertIs(field.get(), True)
+            field.clear()
+            self.assertIs(field.get(), field.default)
 
 
 if __name__ == "__main__":

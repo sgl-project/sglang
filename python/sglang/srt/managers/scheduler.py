@@ -123,7 +123,7 @@ from sglang.srt.distributed.parallel_state import (
     close_custom_all_reduce,
 )
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
-from sglang.srt.environ import envs
+from sglang.srt.environ import envs, freeze_env_reads
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.hf_transformers import (
@@ -247,6 +247,8 @@ from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
     retract_all,
+    schedule_batch_field_names,
+    schedule_batch_field_values,
 )
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
@@ -2108,6 +2110,8 @@ class Scheduler(
         # The global WAR barrier fences the scheduler's next shared-buffer write
         # on the previous forward's read of the unified memory pool.
         self._war_barrier_enabled = is_war_barrier_enabled()
+        if freeze_env_reads():
+            logger.info("Environment reads frozen for the event loop.")
         with self.device_module.StreamContext(self.schedule_stream):
             self.metrics_reporter.start_scheduler_time_accounting()
             dispatch_event_loop(self)
@@ -5113,9 +5117,7 @@ class Scheduler(
         #       - for all non-future tensors (produced only by schedule stream),
         #       we shall keep its reference not being release during all the forwarding pass
         # Snapshot all fields: spec V2 rebinds seq_lens / spec_info mid-forward.
-        attr_snapshot = [
-            getattr(batch, f.name, None) for f in dataclasses.fields(batch)
-        ]
+        attr_snapshot = schedule_batch_field_values(batch)
         self.batch_record_ct = (self.batch_record_ct + 1) % 2
         retired = self.batch_record_buf[self.batch_record_ct]
         # List (not tuple) so that workers can register additional refs via
@@ -5150,7 +5152,12 @@ class Scheduler(
         # 1. snapshot
         snapshot_v2_full = not batch.spec_algorithm.is_none()
         sched_snapshot = (
-            {f.name: getattr(batch, f.name) for f in dataclasses.fields(batch)}
+            dict(
+                zip(
+                    schedule_batch_field_names(type(batch)),
+                    schedule_batch_field_values(batch),
+                )
+            )
             if snapshot_v2_full
             else None
         )
@@ -5168,8 +5175,8 @@ class Scheduler(
             yield
         finally:
             if snapshot_v2_full:
-                for name, value in sched_snapshot.items():
-                    setattr(batch, name, value)
+                # Plain dataclass fields (no descriptors, no __setattr__ hook).
+                batch.__dict__.update(sched_snapshot)
             else:
                 batch.sampling_info = sched_sampling_info
 
