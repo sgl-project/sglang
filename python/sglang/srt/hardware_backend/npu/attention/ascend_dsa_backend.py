@@ -20,8 +20,8 @@ from sglang.srt.layers.attention.dsa.kpool_plan import (
     update_kpool_write_plan,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.forward_context import get_token_to_kv_pool
+from sglang.srt.model_executor.forward_mode import ForwardMode
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner

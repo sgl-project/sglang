@@ -126,6 +126,7 @@ from sglang.srt.runtime_context import (
     linear_attn_tp_size,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.utils import is_npu
 from sglang.srt.utils.common import BumpAllocator, LazyValue
 from sglang.srt.utils.log_utils import log_info_on_rank0
 
@@ -1306,10 +1307,16 @@ class Glm5NextForConditionalGeneration(nn.Module):
     hf_to_sglang_mapper = WeightsMapper(
         orig_to_new_substr={
             "model.visual": "visual",
-            # Checkpoint naming variants (e.g. ModelSlim W8A8 exports).
-            ".forget_gate.": ".",
-            ".attn_hc.": ".hc_attn_",
-            ".ffn_hc.": ".hc_ffn_",
+            **(
+                {
+                    # ModelSlim W8A8 checkpoint naming variants.
+                    ".forget_gate.": ".",
+                    ".attn_hc.": ".hc_attn_",
+                    ".ffn_hc.": ".hc_ffn_",
+                }
+                if is_npu()
+                else {}
+            ),
         },
         orig_to_new_prefix={
             "model.language_model.": "model.",
