@@ -295,8 +295,13 @@ class ForwardView:
             # Optional operations stay lazy; hybrid consumers retain only the
             # typed surface above, not a reference to the backend.
             self._backend = backend
-            self.metadata = backend.forward_metadata
             self.kv_pool = KvPoolView(backend.token_to_kv_pool, seal_cache)
+
+    @property
+    def metadata(self) -> Any:
+        # Read on use: a composite backend (e.g. a hybrid of full and linear
+        # attention) keeps its metadata in its children, not on itself.
+        return self._backend.forward_metadata
 
     @property
     def use_fused_topk(self) -> bool:

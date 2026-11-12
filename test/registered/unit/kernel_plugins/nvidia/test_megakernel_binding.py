@@ -520,6 +520,18 @@ class TestMegakernelBinding(CustomTestCase):
         self.assertIs(minimal_view.attention, minimal.forward)
         self.assertTrue(minimal_view.use_fused_topk)
 
+        # A composite backend keeps its metadata in its children: the view still
+        # builds, and reads whatever the backend holds when the consumer asks.
+        composite = SimpleNamespace(token_to_kv_pool=pool)
+        with patch(BACKEND, return_value=composite):
+            composite_view = mb.MegakernelBinding(
+                model=torch.nn.Module()
+            ).forward_view()
+        with self.assertRaises(AttributeError):
+            _ = composite_view.metadata
+        composite.forward_metadata = SimpleNamespace(core_attn_metadata="late")
+        self.assertIs(composite_view.metadata, composite.forward_metadata)
+
         hybrid_view = mb.ForwardView(minimal, legacy=False)
         self.assertFalse(hasattr(hybrid_view, "_backend"))
         self.assertFalse(hasattr(hybrid_view, "metadata"))
