@@ -2231,6 +2231,9 @@ class Envs:
     # Draft sampler uses the Gumbel-max trick (argmax(probs / Exp(1))) instead of
     # torch.multinomial, whose device-side validity assert breaks draft-graph replay.
     SGLANG_OPT_USE_GUMBEL_SAMPLE = EnvBool(True)
+    # Rejection-sampling draft proposal as one fused kernel (softmax + exponential-race draw on
+    # torch's Philox state + greedy argmax). Same distribution as the Gumbel sampler.
+    SGLANG_OPT_USE_FUSED_DRAFT_SAMPLE = EnvBool(False)
     # Multi-layer chain-MTP boundary-KV fix: widen the draft-extend window to
     # rewrite rejected-draft KV rows before reuse (acc_len repair; on by default).
     SGLANG_ENABLE_MTP_BOUNDARY_KV_FIX = EnvBool(True)
