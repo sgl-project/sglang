@@ -221,7 +221,7 @@ jobs:
     #
     # !cancelled() so a skipped call-gate does not take this job with it, since a
     # docs-only PR still installs sglang in every stage.
-    if: |
+    if: &build-gate |
       !cancelled() &&
       needs.check-changes.result == 'success' &&
       (github.event_name != 'pull_request' ||
@@ -234,24 +234,14 @@ jobs:
     with:
       runs_on: ubuntu-22.04
       git_ref: ${{ inputs.git_ref || '' }}
-      skip_pr_test_health_check: ${{ inputs.skip_pr_test_health_check == true || inputs.test_parallel_dispatch == true || inputs.run_all_tests == true }}
     secrets: inherit
 
   # gb300 is Grace, and PyO3 modules are portable across neither arch nor
   # interpreter, so it can use nothing the job above builds.
   rust-ext-build-aarch64:
     needs: [check-changes, call-gate]
-    # Same gate as rust-ext-build: every main-ref run has to seed the cache, and a
-    # docs-only PR still installs sglang on gb300.
-    if: |
-      !cancelled() &&
-      needs.check-changes.result == 'success' &&
-      (github.event_name != 'pull_request' ||
-       needs.check-changes.outputs.multimodal_gen != 'true' ||
-       needs.check-changes.outputs.main_package == 'true' ||
-       needs.check-changes.outputs.jit_kernel == 'true' ||
-       needs.check-changes.outputs.sgl_kernel == 'true') &&
-      (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped')
+    # A docs-only PR still installs sglang on gb300.
+    if: *build-gate
     uses: ./.github/workflows/_pr-test-rust-ext-build.yml
     with:
       runs_on: ubuntu-22.04-arm
@@ -259,47 +249,27 @@ jobs:
       artifact_name: rust-ext-aarch64
       cache_key_prefix: rust-ext-aarch64-cp312
       git_ref: ${{ inputs.git_ref || '' }}
-      skip_pr_test_health_check: ${{ inputs.skip_pr_test_health_check == true || inputs.test_parallel_dispatch == true || inputs.run_all_tests == true }}
     secrets: inherit
 
-  # The router the PD disaggregation tests launch. Same gate as rust-ext-build,
-  # so every main-ref run seeds the cache that nightly, weekly and rerun-test read.
+  # The router the PD disaggregation tests launch.
   sgl-router-build:
     needs: [check-changes, call-gate]
-    if: |
-      !cancelled() &&
-      needs.check-changes.result == 'success' &&
-      (github.event_name != 'pull_request' ||
-       needs.check-changes.outputs.multimodal_gen != 'true' ||
-       needs.check-changes.outputs.main_package == 'true' ||
-       needs.check-changes.outputs.jit_kernel == 'true' ||
-       needs.check-changes.outputs.sgl_kernel == 'true') &&
-      (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped')
+    if: *build-gate
     uses: ./.github/workflows/_pr-test-sgl-router-build.yml
     with:
       runs_on: ubuntu-22.04
       git_ref: ${{ inputs.git_ref || '' }}
-      skip_pr_test_health_check: ${{ inputs.skip_pr_test_health_check == true || inputs.test_parallel_dispatch == true || inputs.run_all_tests == true }}
     secrets: inherit
 
   sgl-router-build-aarch64:
     needs: [check-changes, call-gate]
-    if: |
-      !cancelled() &&
-      needs.check-changes.result == 'success' &&
-      (github.event_name != 'pull_request' ||
-       needs.check-changes.outputs.multimodal_gen != 'true' ||
-       needs.check-changes.outputs.main_package == 'true' ||
-       needs.check-changes.outputs.jit_kernel == 'true' ||
-       needs.check-changes.outputs.sgl_kernel == 'true') &&
-      (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped')
+    if: *build-gate
     uses: ./.github/workflows/_pr-test-sgl-router-build.yml
     with:
       runs_on: ubuntu-22.04-arm
       artifact_name: sgl-router-aarch64
       cache_key_prefix: sgl-router-aarch64
       git_ref: ${{ inputs.git_ref || '' }}
-      skip_pr_test_health_check: ${{ inputs.skip_pr_test_health_check == true || inputs.test_parallel_dispatch == true || inputs.run_all_tests == true }}
     secrets: inherit
 
   call-sgl-kernel-tests:

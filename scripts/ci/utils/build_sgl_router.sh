@@ -1,8 +1,5 @@
 #!/bin/bash
 # Build the sgl-router binary (release) and copy it to <out_dir>/sgl-router.
-#
-# Shared by _pr-test-sgl-router-build.yml and the download-sgl-router action's
-# fallback, so both build the binary the same way.
 # Expects cargo from scripts/ci/utils/install_rustup.sh.
 set -euxo pipefail
 

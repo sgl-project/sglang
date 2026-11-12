@@ -55,7 +55,7 @@ on:
         type: string
         default: ''
       sgl_router_artifact:
-        description: "Artifact name from _pr-test-sgl-router-build.yml in this run; empty restores the aarch64 cache."
+        description: "sgl-router-build's artifact; empty falls back as download-sgl-router describes."
         type: string
         default: ''
       github-token:
@@ -202,8 +202,7 @@ jobs:
               core.notice('[health-check] PASS: no root cause failures detected');
             }
 
-      # The router the PD disaggregation fixture launches. Before the install,
-      # whose build output under rust/ would change the cache key it hashes.
+      # Before the install: its build output under rust/ would change the hashed key.
       - name: Download prebuilt sgl-router
         uses: ./.github/actions/download-sgl-router
         with:

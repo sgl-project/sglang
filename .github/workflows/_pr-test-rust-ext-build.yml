@@ -57,10 +57,6 @@ on:
       git_ref:
         type: string
         default: ''
-      skip_pr_test_health_check:
-        description: 'Forwarded from the caller for the check-maintenance action.'
-        type: boolean
-        default: false
     outputs:
       artifact_name:
         description: 'Artifact holding the built modules. Empty when neither job published one, whether skipped or failed; consumers that still run compile them during install.'
@@ -70,7 +66,6 @@ on:
 # check-maintenance reads.
 env:
   SGLANG_IS_IN_CI: true
-  SKIP_PR_TEST_HEALTH_CHECK: ${{ inputs.skip_pr_test_health_check && 'true' || 'false' }}
   PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
 
 jobs:
@@ -80,6 +75,7 @@ jobs:
     name: Restore Rust Ext
     outputs:
       hit: ${{ steps.cache.outputs.cache-hit }}
+      key: ${{ steps.cache.outputs.cache-primary-key }}
       # From the last step, so a failed job publishes no name for always() consumers.
       artifact_name: ${{ steps.publish.outputs.name }}
     steps:
@@ -307,7 +303,7 @@ jobs:
   # The interpreters compile independently, but the suffix-set check and the cache
   # entry both cover the whole set, so they join in one job that sees all of it.
   collect:
-    needs: compile
+    needs: [restore, compile]
     runs-on: ${{ inputs.collect_runs_on }}
     timeout-minutes: 15
     name: Collect Rust Ext
@@ -358,7 +354,7 @@ jobs:
           path: |
             python/sglang/srt/rust_extensions/_*.so
             python/sglang/srt/mem_cache/rust_tree_core/mem_cache*.so
-          key: ${{ inputs.cache_key_prefix }}-${{ hashFiles('rust/**', 'proto/**', 'python/setup.py', 'python/pyproject.toml', 'python/sglang/srt/rust_extensions/torch_build.py', '.github/workflows/_pr-test-rust-ext-build.yml', 'scripts/ci/utils/stage_rust_ext_modules.sh') }}
+          key: ${{ needs.restore.outputs.key }}
 
       - name: Upload extension modules
         uses: actions/upload-artifact@v4

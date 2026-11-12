@@ -1344,8 +1344,7 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
-      # No artifact: this workflow has no sgl-router-build job; the cache is the
-      # x86_64 entry pr-test.yml seeds. amd_ci_exec.sh forwards the path.
+      # Cache-only: no sgl-router-build here. amd_ci_exec.sh maps the path into the container.
       - uses: ./.github/actions/download-sgl-router
 
       - name: Ensure VRAM is clear

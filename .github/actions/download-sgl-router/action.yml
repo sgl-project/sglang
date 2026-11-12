@@ -1,20 +1,14 @@
 name: 'Download prebuilt sgl-router'
 description: >
-  Put the sgl-router binary at sgl-router-bin/sgl-router in the checkout and set
-  SGLANG_TEST_PD_ROUTER_BINARY to it for the job; the PD disaggregation test
-  fixture launches it. Takes sgl-router-build's artifact, then the cache, and
-  builds from source when both miss. The checkout keeps it visible to CI
-  containers that mount the workspace.
+  Put sgl-router at sgl-router-bin/sgl-router (artifact, else cache, else source
+  build) and export SGLANG_TEST_PD_ROUTER_BINARY. Kept in the checkout so
+  containers that mount the workspace see it.
 
 inputs:
   artifact_name:
     description: "sgl-router-build's artifact in this run; empty uses only the cache."
     required: false
     default: ''
-  cache_key_prefix:
-    description: 'Must match what _pr-test-sgl-router-build.yml saves under. ARM64 runners always restore sgl-router-aarch64.'
-    required: false
-    default: sgl-router-x86_64
 
 runs:
   using: composite
@@ -41,10 +35,10 @@ runs:
       uses: actions/cache/restore@v4
       with:
         path: sgl-router-bin/sgl-router
-        key: ${{ runner.arch == 'ARM64' && 'sgl-router-aarch64' || inputs.cache_key_prefix }}-${{ hashFiles('sgl-router/**', 'rust/**', '.github/workflows/_pr-test-sgl-router-build.yml', 'scripts/ci/utils/build_sgl_router.sh') }}
+        key: sgl-router-${{ runner.arch == 'ARM64' && 'aarch64' || 'x86_64' }}-${{ hashFiles('sgl-router/**', 'rust/**', '.github/workflows/_pr-test-sgl-router-build.yml', 'scripts/ci/utils/build_sgl_router.sh') }}
 
-    # Nightly, weekly and rerun-test have no build job of their own, so a source
-    # change that no main-ref run has cached yet lands here.
+    # Nightly, weekly and rerun-test have no build job; a key no main run has
+    # cached lands here.
     - name: Build sgl-router from source
       if: steps.artifact.outcome != 'success' && steps.cache.outputs.cache-hit != 'true'
       shell: bash

@@ -66,7 +66,7 @@ on:
         type: boolean
         default: false
       sgl_router_artifact:
-        description: 'Artifact holding the sgl-router binary the PD tests launch, from sgl-router-build. Empty, or a download that fails, falls back to the cache; a miss there builds it from source.'
+        description: 'sgl-router-build''s artifact for the PD tests; empty falls back as download-sgl-router describes.'
         type: string
         default: ''
 

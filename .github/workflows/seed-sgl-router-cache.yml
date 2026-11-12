@@ -37,7 +37,6 @@ jobs:
       runs_on: ubuntu-22.04
     secrets: inherit
 
-  # One entry per arch, since the arch is part of the key.
   seed-aarch64:
     uses: ./.github/workflows/_pr-test-sgl-router-build.yml
     with:

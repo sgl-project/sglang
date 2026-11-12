@@ -1,25 +1,16 @@
 name: PR Test - Build sgl-router
 
-# Builds the sgl-router binary once so the test stages that launch it (the PD
-# disaggregation fixture) download it instead of each compiling it.
-#
-# Same two layers as _pr-test-rust-ext-build.yml:
-# - The cache, keyed by a source hash, carries a build across runs.
-# - The artifact hands it to the stages of this run; the cache is evictable.
-#
-# The binary has no interpreter or torch ABI, so one compile job covers the arch.
+# Builds sgl-router once per run for the stages that launch it; the source-hash
+# cache carries it across runs. No interpreter or torch ABI, so one compile job
+# per arch.
 
 on:
   workflow_call:
     inputs:
       runs_on:
-        description: 'Runner label for the compile job. Its glibc has to satisfy max_glibc.'
+        description: 'Runner label for the compile job. Its glibc has to be at most 2.35.'
         type: string
         required: true
-      restore_runs_on:
-        description: 'Runner label for the cache-hit path. Only republishes bytes, so any arch works.'
-        type: string
-        default: ubuntu-latest
       artifact_name:
         description: 'Artifact name. Suffix it per caller: artifacts are immutable per name per run, so two callers sharing a run would collide.'
         type: string
@@ -28,36 +19,26 @@ on:
         description: 'Cache key prefix. Encodes the arch; callers share it to reuse each other''s build.'
         type: string
         default: sgl-router-x86_64
-      max_glibc:
-        description: 'Highest GLIBC symbol version the binary may require: the oldest image that runs it is jammy at 2.35.'
-        type: string
-        default: '2.35'
       git_ref:
         type: string
         default: ''
-      skip_pr_test_health_check:
-        description: 'Forwarded from the caller for the check-maintenance action.'
-        type: boolean
-        default: false
     outputs:
       artifact_name:
         description: 'Artifact holding the binary. Empty when neither job published one; consumers then fall back to the cache, then to a local build.'
         value: ${{ jobs.restore.outputs.artifact_name || jobs.compile.outputs.artifact_name }}
 
-# Reusable workflows do not inherit the caller's env; mirror what
-# check-maintenance reads.
+# check-maintenance reads this; reusable workflows do not inherit the caller's env.
 env:
-  SGLANG_IS_IN_CI: true
-  SKIP_PR_TEST_HEALTH_CHECK: ${{ inputs.skip_pr_test_health_check && 'true' || 'false' }}
   PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
 
 jobs:
   restore:
-    runs-on: ${{ inputs.restore_runs_on }}
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     name: Restore sgl-router
     outputs:
       hit: ${{ steps.cache.outputs.cache-hit }}
+      key: ${{ steps.cache.outputs.cache-primary-key }}
       artifact_name: ${{ steps.publish.outputs.name }}
     steps:
       - uses: actions/checkout@v4
@@ -119,10 +100,11 @@ jobs:
       - name: Build sgl-router
         run: bash scripts/ci/utils/build_sgl_router.sh sgl-router-bin
 
-      # Newer glibc than the test images fails at exec: "GLIBC_2.xx not found".
+      # Newer glibc than the oldest test image (jammy, 2.35) fails at exec:
+      # "GLIBC_2.xx not found".
       - name: Check the binary's glibc requirement
         env:
-          MAX_GLIBC: ${{ inputs.max_glibc }}
+          MAX_GLIBC: '2.35'
         run: |
           set -euo pipefail
           symbols=$(objdump -T sgl-router-bin/sgl-router)
@@ -142,7 +124,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: sgl-router-bin/sgl-router
-          key: ${{ inputs.cache_key_prefix }}-${{ hashFiles('sgl-router/**', 'rust/**', '.github/workflows/_pr-test-sgl-router-build.yml', 'scripts/ci/utils/build_sgl_router.sh') }}
+          key: ${{ needs.restore.outputs.key }}
 
       - name: Upload binary
         uses: actions/upload-artifact@v4
