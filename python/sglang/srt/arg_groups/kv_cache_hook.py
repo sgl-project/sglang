@@ -389,6 +389,12 @@ def handle_cache_compatibility(server_args: Any) -> None:
                 "ever TEL-safe and T-LRU is exactly LRU."
             )
 
+    if cfg.radix_eviction_policy == "gds":
+        from sglang.srt.mem_cache.evict_policy import GDSStrategy
+
+        # Building the strategy checks its cost coefficients.
+        GDSStrategy(**(cfg.radix_eviction_policy_config or {}))
+
     if cfg.enable_hierarchical_cache and cfg.disable_radix_cache:
         raise ValueError(
             "The arguments enable-hierarchical-cache and disable-radix-cache are mutually exclusive "
@@ -459,6 +465,14 @@ def handle_cache_compatibility(server_args: Any) -> None:
             server_args,
             "_handle_cache_compatibility",
             _swa_full_tokens_ratio_explicitly_set=cfg.swa_full_tokens_ratio is not None,
+        )
+    if cfg._max_running_requests_explicitly_set is None:
+        # The record, not the view: a model's default (DeepSeek-V4's) is declared earlier.
+        declare_resolution(
+            server_args,
+            "_handle_cache_compatibility",
+            _max_running_requests_explicitly_set=server_args.max_running_requests
+            is not None,
         )
 
     # Validate the effective ratio: model branches may declare a reset
