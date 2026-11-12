@@ -1021,6 +1021,7 @@ def flush_server_cache(
     base_url: str,
     backend: str,
     flush_cache_timeout: float = _DEFAULT_SGLANG_FLUSH_CACHE_TIMEOUT,
+    admin_api_key: Optional[str] = None,
 ) -> None:
     """Flush an engine's prefix cache after benchmark warmup."""
     if backend.startswith("vllm"):
@@ -1028,7 +1029,6 @@ def flush_server_cache(
             base_url + "/reset_prefix_cache", headers=get_auth_headers()
         )
     elif backend.startswith("sglang"):
-        admin_api_key = getattr(args, "admin_api_key", None)
         response = requests.post(
             base_url + "/flush_cache",
             headers=(
@@ -1531,7 +1531,12 @@ async def benchmark(
         "sglang" in backend and _get_bool_env_var("SGLANG_IS_IN_CI")
     ) or flush_cache
     if should_flush_cache:
-        flush_server_cache(base_url, backend, flush_cache_timeout)
+        flush_server_cache(
+            base_url,
+            backend,
+            flush_cache_timeout,
+            getattr(args, "admin_api_key", None),
+        )
 
     await asyncio.sleep(1.0)
 
