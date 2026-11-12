@@ -488,14 +488,14 @@ def _assert_same(expected, actual):
     "chain,vocab,truncated,threshold_single,threshold_acc,random_draft",
     [
         (True, 9001, True, 0.5, 0.25, True),
-        (False, 11, True, 1, 1, True),
         (False, 9001, False, 0.5, 0.25, False),
-        (True, 11, True, 0, 0, False),
     ],
 )
 def test_matches_reference(
     chain, vocab, truncated, threshold_single, threshold_acc, random_draft
 ):
+    """Random chains and trees over a vocabulary of several blocks; the base
+    known-answer cases cover small vocabularies and thresholds 1 and 0."""
     num_nodes = 6
     inputs = _make_inputs(
         bs=16,
