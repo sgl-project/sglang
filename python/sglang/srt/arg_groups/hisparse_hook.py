@@ -109,11 +109,6 @@ def validate_hisparse_feature_combos(server_args: ServerArgs) -> None:
             "gather and layer-split pool do not translate HiSparse device locations."
         )
     algorithm = (cfg.speculative_algorithm or "").upper()
-    if algorithm == "DFLASH":
-        raise ValueError(
-            "--enable-hisparse does not support --speculative-algorithm DFLASH: "
-            "its verify step does not run the HiSparse speculative swap hooks."
-        )
     if algorithm == "DSPARK":
         from sglang.srt.speculative.ragged_verify import (
             RaggedVerifyMode,
