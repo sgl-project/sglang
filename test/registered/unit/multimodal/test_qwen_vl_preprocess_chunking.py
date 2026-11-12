@@ -61,11 +61,12 @@ class TestEstimate(CustomTestCase):
 
 class TestReleasePreprocessCache(CustomTestCase):
     def _run(self, reserved, allocated):
-        with patch.object(torch.cuda, "is_available", return_value=True), patch.object(
-            torch.cuda, "memory_reserved", return_value=reserved
-        ), patch.object(torch.cuda, "memory_allocated", return_value=allocated), patch.object(
-            torch.cuda, "empty_cache"
-        ) as empty:
+        with (
+            patch.object(torch.cuda, "is_available", return_value=True),
+            patch.object(torch.cuda, "memory_reserved", return_value=reserved),
+            patch.object(torch.cuda, "memory_allocated", return_value=allocated),
+            patch.object(torch.cuda, "empty_cache") as empty,
+        ):
             qwen_vl._release_preprocess_cache()
         return empty
 
@@ -76,9 +77,10 @@ class TestReleasePreprocessCache(CustomTestCase):
         self._run(1 << 30, 1 << 29).assert_not_called()
 
     def test_noop_without_cuda(self):
-        with patch.object(torch.cuda, "is_available", return_value=False), patch.object(
-            torch.cuda, "empty_cache"
-        ) as empty:
+        with (
+            patch.object(torch.cuda, "is_available", return_value=False),
+            patch.object(torch.cuda, "empty_cache") as empty,
+        ):
             qwen_vl._release_preprocess_cache()
         empty.assert_not_called()
 
@@ -133,7 +135,9 @@ class TestChunkedRun(CustomTestCase):
     def test_multi_chunk_on_gpu_joined_on_cpu(self):
         proc, calls = self._make()
         per = qwen_vl._estimate_preprocess_bytes(
-            Image.new("RGB", (64, 64)), factor=28, min_pixels=4 * 28 * 28,
+            Image.new("RGB", (64, 64)),
+            factor=28,
+            min_pixels=4 * 28 * 28,
             max_pixels=qwen_vl.MAX_PIXELS,
         )
         with patch.object(qwen_vl, "_PREPROCESS_GPU_BUDGET_BYTES", per * 2):

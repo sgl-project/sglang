@@ -194,6 +194,7 @@ def floor_by_factor(number: int, factor: int) -> int:
     """Returns the largest integer less than or equal to 'number' that is divisible by 'factor'."""
     return math.floor(number / factor) * factor
 
+
 # Peak GPU memory of the HF image processor is a small multiple of its output
 # (it holds resized, normalized and patchified copies, then torch.cat's them).
 # Bound each processor call by an estimated byte budget so a request with many
@@ -986,7 +987,9 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
     def _maybe_offload_features(self, features):
         if (
             isinstance(features, torch.Tensor)
-            and (self.mm_preprocess_cache.enabled or not self.keep_mm_features_on_device)
+            and (
+                self.mm_preprocess_cache.enabled or not self.keep_mm_features_on_device
+            )
             and not self.precompute_hash_before_cpu_transfer
         ):
             return features.cpu()
