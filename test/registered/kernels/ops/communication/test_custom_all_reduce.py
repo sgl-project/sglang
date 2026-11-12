@@ -227,7 +227,8 @@ def _check_custom_all_reduce(
         graph_inp = torch.zeros((TEST_LAYERS, size), dtype=dtype, device=device)
         outs: list[torch.Tensor] = []
         with comm.capture():
-            with torch.cuda.graph(graph):
+            # the reference NCCL group's watchdog thread queries events meanwhile
+            with torch.cuda.graph(graph, capture_error_mode="thread_local"):
                 for i in range(TEST_LAYERS):
                     outs.append(comm.custom_all_reduce(graph_inp[i]))
                 out_jit_stack = torch.stack(outs)
@@ -309,6 +310,7 @@ def test_custom_all_reduce_eager_plan_follows_config() -> None:
             one_shot_pull_threshold=0,
             two_shot_pull_threshold=0,
             mc=tuned.eager.mc._replace(min_bytes=0, max_bytes=0),
+            two_shot_push_threshold=0,
         )
         comm.config = tuned._replace(eager=eager)
         assert not comm.should_custom_ar(inp[0])

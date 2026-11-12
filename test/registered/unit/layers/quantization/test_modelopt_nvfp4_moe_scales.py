@@ -20,7 +20,7 @@ per-token activations, a 512-aligned hidden; padding must be zero-filled.
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=13, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 import unittest
 from types import SimpleNamespace
@@ -95,7 +95,6 @@ def _nvfp4_loader_layer(*, is_gated=True, tp_rank=0):
     layer.scheme = None
     layer._has_fused_shared = False
     layer.use_flashinfer_trtllm_moe = method.enable_flashinfer_trtllm_moe
-    layer.use_triton_kernels = False
     layer.use_presharded_weights = False
     layer.moe_tp_size = 2
     layer.moe_tp_rank = tp_rank

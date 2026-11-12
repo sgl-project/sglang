@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-from sglang.srt.arg_groups.overrides import (
+from sglang.srt.arg_groups.model_override_base import (
     model_config_of,
     resolved_view,
     resolving_view,
@@ -20,18 +20,25 @@ HISPARSE_CUDA_DSA_BACKENDS_BY_DTYPE = {
     "fp8_e4m3": {"flashmla_kv", "flashinfer_sparse_mla"},
 }
 HISPARSE_ROCM_DSA_BACKENDS = {"tilelang", "triton", "aiter"}
+HISPARSE_XPU_DSA_BACKENDS_BY_DTYPE = {"bfloat16": {"intel_xpu"}}
 HISPARSE_KV_CACHE_DTYPES = ("bfloat16", "fp8_e4m3")
+
+HISPARSE_VALIDATED_SPEC_ALGORITHMS = ("EAGLE", "EAGLE3", "UNO")
 
 
 def _hisparse_default_backend(kv_cache_dtype: str) -> str:
     if get_platform().is_hip:
         return "tilelang"
+    if get_platform().is_xpu:
+        return "intel_xpu"
     return "flashmla_kv" if kv_cache_dtype == "fp8_e4m3" else "flashmla_sparse"
 
 
 def _hisparse_allowed_backends(kv_cache_dtype: str) -> set[str]:
     if get_platform().is_hip:
         return HISPARSE_ROCM_DSA_BACKENDS
+    if get_platform().is_xpu:
+        return HISPARSE_XPU_DSA_BACKENDS_BY_DTYPE.get(kv_cache_dtype, set())
     return HISPARSE_CUDA_DSA_BACKENDS_BY_DTYPE.get(
         kv_cache_dtype, {"flashmla_sparse", "flashmla_kv", "flashinfer_sparse_mla"}
     )
@@ -51,6 +58,20 @@ def validate_hisparse_dsa_backend(
     backend = getattr(view, attr)
     kv_cache_dtype = view.kv_cache_dtype
     allowed_backends = _hisparse_allowed_backends(kv_cache_dtype)
+    if not allowed_backends:
+        # No backend reads this KV layout here, so naming the (empty) allow-set
+        # or suggesting the user omit the option would both be dead ends: the
+        # dtype is the thing to change.
+        usable = " or ".join(
+            f"--kv-cache-dtype={dtype}"
+            for dtype in HISPARSE_KV_CACHE_DTYPES
+            if _hisparse_allowed_backends(dtype)
+        )
+        raise ValueError(
+            f"HiSparse does not support --kv-cache-dtype={kv_cache_dtype} on this "
+            f"platform: no DSA {label} backend reads that KV cache layout. "
+            f"Please use {usable}."
+        )
     if backend is not None and backend not in allowed_backends:
         raise ValueError(
             f"HiSparse supports DSA {label} backend(s) {sorted(allowed_backends)} "
@@ -82,6 +103,12 @@ def validate_hisparse_feature_combos(server_args: ServerArgs) -> None:
     # A mixed batch cannot merge the HiSparse decode batch.
     if cfg.enable_mixed_chunk:
         raise ValueError("--enable-hisparse does not support --enable-mixed-chunk yet.")
+    # A HiSparse decode receives KV into its host pool, which the checksum does not read.
+    if cfg.disaggregation_mode == "decode" and cfg.disaggregation_enable_kv_checksum:
+        raise ValueError(
+            "--enable-hisparse does not support --disaggregation-enable-kv-checksum "
+            "on a decode server yet."
+        )
 
 
 def validate_hisparse(server_args: ServerArgs) -> None:
@@ -111,20 +138,28 @@ def validate_hisparse(server_args: ServerArgs) -> None:
     )
     validate_hisparse_feature_combos(server_args)
 
-    enable_spec = (
-        cfg.speculative_algorithm is not None
-        and cfg.speculative_algorithm.upper() != "NONE"
-    )
-    if enable_spec and (cfg.speculative_eagle_topk or 1) != 1:
-        raise ValueError(
-            "The minimal HiSparse spec integration supports linear speculation "
-            "only; use --speculative-eagle-topk 1."
-        )
-    if enable_spec and cfg.speculative_adaptive:
-        raise ValueError(
-            "HiSparse speculative decoding uses statically sized swap state; "
-            "--speculative-adaptive is not supported."
-        )
+    algorithm = cfg.speculative_algorithm
+    if algorithm is not None and algorithm.upper() != "NONE":
+        if algorithm.upper() not in HISPARSE_VALIDATED_SPEC_ALGORITHMS:
+            raise ValueError(
+                f"--enable-hisparse has not validated speculative algorithm "
+                f"{algorithm!r}. Algorithms whose workers never bind HiSparse "
+                "verify slots would write target-verify KV through unmapped "
+                "device locations (silent corruption); only validated "
+                "combinations are accepted: "
+                f"{', '.join(HISPARSE_VALIDATED_SPEC_ALGORITHMS)} (linear "
+                "speculation only, --speculative-eagle-topk 1)."
+            )
+        if (cfg.speculative_eagle_topk or 1) != 1:
+            raise ValueError(
+                "The minimal HiSparse spec integration supports linear "
+                "speculation only; use --speculative-eagle-topk 1."
+            )
+        if cfg.speculative_adaptive:
+            raise ValueError(
+                "HiSparse speculative decoding uses statically sized swap "
+                "state; --speculative-adaptive is not supported."
+            )
 
     # DSv4 hisparse handles its own dtype/backend pairing elsewhere; the dtype-
     # aware checks below only apply to the DSA hisparse path.

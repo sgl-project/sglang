@@ -164,6 +164,9 @@ class QuantizationConfig(ABC):
     """Base class for quantization configs."""
 
     weight_block_size: Optional[List[int]] = None
+    # None means the global default applies; a config sets it to decide for
+    # itself whether its MXFP8 weights are converted to block-FP8 at load.
+    convert_mxfp8_to_block_fp8: Optional[bool] = None
 
     def __init__(self):
         super().__init__()
