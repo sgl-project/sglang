@@ -14,7 +14,7 @@ from sglang.srt.layers.moe.utils import MoeRunnerBackend, get_moe_runner_backend
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsMoEScheme,
 )
-from sglang.srt.utils import set_weight_attrs
+from sglang.srt.layers.utils.common import set_weight_attrs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -38,8 +38,8 @@ class NPUCompressedTensorsW4A8mxfp4MoE(CompressedTensorsMoEScheme):
 
     def __init__(self):
         self.group_size = 32
-        self.w13_kernel = NPUW4A8MXFP4MoEMethod()
-        self.w2_kernel = NPUW4A8MXFP4MoEMethod()
+        self.w13_kernel = NPUW4A8MXFP4MoEMethod(weight_prefix="w13")
+        self.w2_kernel = NPUW4A8MXFP4MoEMethod(weight_prefix="w2")
 
     def create_weights(
         self,

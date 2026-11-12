@@ -3,7 +3,7 @@ from typing import Optional, Tuple, Union
 
 import torch
 
-from sglang.kernels.ops.attention import kda_fused_decode, kda_fused_decode_aiter_hip
+from sglang.kernels.ops.attention import kda_fused_decode
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_fn,
     causal_conv1d_update,
@@ -25,9 +25,11 @@ from sglang.srt.layers.attention.linear.utils import (
     build_verify_intermediate_state_indices,
     select_verify_intermediate_state_indices,
 )
+from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu
-from sglang.srt.utils.common import is_gfx95_supported, rank0_log
+from sglang.srt.utils.device import is_gfx95_supported
+from sglang.srt.utils.log_utils import rank0_log
 
 # KDA always uses the triton causal_conv1d_fn (no CUDA override).
 # Only causal_conv1d_update needs platform-specific overrides for decode.
@@ -484,6 +486,9 @@ class KDAAttnBackend(MambaAttnBackendBase):
     # forward_extend then runs the graph-safe chain on these static tables.
     prefill_graph_metadata: Optional[KDAPrefillGraphMetadata] = None
 
+    def _create_kernel_dispatcher(self, backends):
+        return KDAKernelDispatcher(backends.decode, backends.prefill, backends.verify)
+
     def __init__(self, model_runner: ModelRunner):
         super().__init__(model_runner)
         self.prefill_graph_max_seqs = envs.SGLANG_KDA_PREFILL_GRAPH_MAX_SEQS.get()
@@ -492,9 +497,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         # The KDA pool stores conv states as [kernel-1, dim] — transposed vs
         # Mamba2/GDN's [dim, kernel-1] — so expose the transposed shape here.
         self.conv_states_shape = (
-            model_runner.req_to_token_pool.mamba_pool.mamba_cache.conv[0]
-            .transpose(-1, -2)
-            .shape
+            self.state_pool.mamba_cache.conv[0].transpose(-1, -2).shape
         )
         backends = model_runner.linear_attn_backends
         decode_backend = backends.decode
@@ -510,9 +513,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 "KDA FlashInfer speculative decoding only supports topk=1 "
                 "(EAGLE tree verify / retrieve_parent_token is unsupported)."
             )
-        self.kernel_dispatcher = KDAKernelDispatcher(
-            decode_backend, prefill_backend, verify_backend
-        )
+        self.kernel_dispatcher = self._create_kernel_dispatcher(backends)
         if prefill_backend.is_flashinfer():
             _validate_flashinfer_kda_prefill(
                 chunk_size=self.mamba_chunk_size,
@@ -707,7 +708,18 @@ class KDAAttnBackend(MambaAttnBackendBase):
             extend_prefix_lens=forward_batch.extend_prefix_lens,
             track_rows=track_rows,
         )
+        if track_rows is None and forward_batch.mamba_track_indices is not None:
+            meta.track_dst[: forward_batch.batch_size].copy_(
+                forward_batch.mamba_track_indices
+            )
         self.prefill_graph_metadata = meta
+        self.forward_metadata = ForwardMetadata(
+            query_start_loc=meta.cu_seqlens,
+            mamba_cache_indices=meta.cache_indices,
+            mamba_track_indices=None
+            if forward_batch.mamba_track_indices is None
+            else meta.track_dst[: forward_batch.batch_size],
+        )
 
     def _prefill_graph_track_rows(
         self, forward_batch: ForwardBatch
@@ -776,7 +788,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         b: torch.Tensor,
         **kwargs,
     ):
-        layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
+        layer_cache = self.state_layer_cache(layer.layer_id)
         conv_states = layer_cache.conv[0]
         ssm_states = layer_cache.temporal
         query_start_loc = self.forward_metadata.query_start_loc
@@ -798,6 +810,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         if replayssm_d is None and deferred_f_b and is_gfx95_supported():
             fused_static = getattr(layer, "_k3_hip_fused_decode_args", None)
             fused_backend = getattr(layer, "_k3_hip_fused_decode_backend", "")
+            fused_ops = getattr(layer, "_k3_hip_fused_decode_ops", None)
             onorm_gate = getattr(layer, "_k3_onorm_gate", None)
             if fused_static is not None and onorm_gate is not None:
                 f_b_weight, norm_weight, norm_eps, a_log = fused_static
@@ -808,7 +821,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 out = mixed_qkv.new_empty(
                     (1, mixed_qkv.shape[0], layer.num_v_heads, layer.head_v_dim)
                 )
-                if fused_backend == "aiter" and kda_fused_decode_aiter_hip.covered(
+                if fused_ops is not None and fused_ops.covered(
                     a,
                     f_b_weight,
                     mixed_qkv,
@@ -819,7 +832,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
                     output_gate,
                     norm_weight,
                 ):
-                    core_attn_out = kda_fused_decode_aiter_hip.run(
+                    core_attn_out = fused_ops.run(
                         f_a=a,
                         f_b_weight=f_b_weight,
                         mixed_qkv=mixed_qkv,
@@ -1024,10 +1037,17 @@ class KDAAttnBackend(MambaAttnBackendBase):
         mixed_qkv: torch.Tensor,
         conv_states: torch.Tensor,
         cache_indices: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return Q/K/V, using contiguous planes for equal-width FlashInfer prefill."""
         # Depthwise conv is channel-independent, so one packed call over the
         # full qkv width matches the decode path and saves two kernel launches.
-        return causal_conv1d_fn(
+        split_size = (
+            layer.q_dim
+            if self.kernel_dispatcher.prefill_backend.is_flashinfer()
+            and layer.q_dim == layer.k_dim == layer.v_dim
+            else 0
+        )
+        conv_output = causal_conv1d_fn(
             mixed_qkv.transpose(0, 1),
             layer.conv_weights,
             layer.bias,
@@ -1037,7 +1057,13 @@ class KDAAttnBackend(MambaAttnBackendBase):
             cache_indices=cache_indices,
             query_start_loc=self.forward_metadata.query_start_loc,
             seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
-        ).transpose(0, 1)
+            output_split_size=split_size,
+        )
+        if split_size:
+            return conv_output.unbind(0)
+        return conv_output.transpose(0, 1).split(
+            [layer.q_dim, layer.k_dim, layer.v_dim], dim=-1
+        )
 
     def forward_extend(
         self,
@@ -1051,12 +1077,37 @@ class KDAAttnBackend(MambaAttnBackendBase):
         # MTP / speculative-decode verify is a multi-token-per-seq path with
         # per-step state checkpointing + central rollback; handled separately.
         if forward_batch.forward_mode.is_target_verify():
-            return self._forward_target_verify(layer, forward_batch, mixed_qkv, a, b)
+            physical_num_tokens = mixed_qkv.shape[0]
+            logical_num_tokens = physical_num_tokens
+            if forward_batch.ragged_verify_layout is None:
+                # MoE may append token padding that is not a complete verify
+                # sequence. Keep it out of convolution and state updates.
+                logical_num_tokens = (
+                    self.forward_metadata.query_start_loc.shape[0] - 1
+                ) * forward_batch.spec_info.draft_token_num
+                mixed_qkv = mixed_qkv[:logical_num_tokens]
+                a = a[:, :logical_num_tokens]
+                b = b[:, :logical_num_tokens]
+            core_attn_out = self._forward_target_verify(
+                layer, forward_batch, mixed_qkv, a, b
+            )
+            if logical_num_tokens < physical_num_tokens:
+                pad = core_attn_out.new_zeros(
+                    (1, physical_num_tokens - logical_num_tokens)
+                    + tuple(core_attn_out.shape[2:])
+                )
+                core_attn_out = torch.cat((core_attn_out, pad), dim=1)
+            return core_attn_out
 
         if self.prefill_graph_metadata is not None:
             # Breakable prefill CUDA graph bucket: host-free chain on static
             # tables refreshed before each replay.
-            layer_cache = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
+            from sglang.srt.model_executor.runner_backend_utils.hicache_graph_events import (
+                capture_layer_wait,
+            )
+
+            capture_layer_wait(layer.layer_id)
+            layer_cache = self.state_layer_cache(layer.layer_id)
             return kda_extend_in_graph(
                 layer=layer,
                 meta=self.prefill_graph_metadata,
@@ -1071,7 +1122,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         query_start_loc = self.forward_metadata.query_start_loc
         cache_indices = self.forward_metadata.mamba_cache_indices
 
-        mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
+        mamba_cache_params = self.state_layer_cache(layer.layer_id)
         conv_states = mamba_cache_params.conv[0].transpose(-1, -2)
 
         ssm_states = mamba_cache_params.temporal
@@ -1101,10 +1152,9 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 self.forward_metadata.conv_states_mask_indices
             ] = mixed_qkv[self.forward_metadata.track_conv_indices]
 
-        qkv = self._convolve_prefill(
+        q, k, v = self._convolve_prefill(
             layer, forward_batch, mixed_qkv, conv_states, cache_indices
         )
-        q, k, v = qkv.split([layer.q_dim, layer.k_dim, layer.v_dim], dim=-1)
 
         q = q.unflatten(-1, (-1, layer.head_q_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
         k = k.unflatten(-1, (-1, layer.head_k_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
@@ -1236,7 +1286,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         retrieve_next_sibling = fm.retrieve_next_sibling
         retrieve_parent_token = fm.retrieve_parent_token
 
-        mamba_cache_params = self.req_to_token_pool.mamba2_layer_cache(layer.layer_id)
+        mamba_cache_params = self.state_layer_cache(layer.layer_id)
         conv_states = mamba_cache_params.conv[0]
         ssm_states = mamba_cache_params.temporal
         intermediate_state_cache = getattr(mamba_cache_params, "intermediate_ssm", None)
@@ -1271,6 +1321,13 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 replayssm_g=replayssm_g,
                 replayssm_beta=replayssm_beta,
             )
+            # Request-scoped rows exist only for the host-only ring. The slot
+            # ring keeps writing at h0_indices, and metadata stubs that predate
+            # the field stay on that path.
+            if self.state_pool is not None and self.state_pool.replayssm_request_ring:
+                ring_indices = fm.replayssm_ring_indices
+                if ring_indices is not None:
+                    ring_kwargs["ring_indices"] = ring_indices
         intermediate_conv_window_cache = mamba_cache_params.intermediate_conv_window[0]
         intermediate_state_indices = select_verify_intermediate_state_indices(
             self.verify_intermediate_state_indices,
@@ -1280,7 +1337,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         )
 
         draft_token_num = forward_batch.spec_info.draft_token_num
-        ragged_layout = forward_batch.spec_info.ragged_verify_layout
+        ragged_layout = forward_batch.ragged_verify_layout
         if self._can_run_dspark_cutedsl_mtp(
             layer=layer,
             mixed_qkv=mixed_qkv,
@@ -1731,6 +1788,11 @@ class KDAAttnBackend(MambaAttnBackendBase):
         """Return whether the fixed Kimi-K3/DSpARK CuTe contract is satisfied."""
         if not self.kernel_dispatcher.verify_backend.is_nv_cutedsl() or not is_cuda():
             return False
+        # Request-scoped rings are indexed by req_pool_idx. This kernel still
+        # writes the ring through the mamba slot, so keep the Triton path.
+        pool = self.state_pool
+        if pool is not None and pool.replayssm_request_ring:
+            return False
         if importlib.util.find_spec("cutlass") is None:
             return False
         if torch.cuda.get_device_capability()[0] != 10:
@@ -1767,9 +1829,16 @@ class KDAAttnBackend(MambaAttnBackendBase):
             return False
         if layer.conv_weights.dtype != torch.float32:
             return False
+        # fp32 or bf16 state (bf16 load/store, fp32 recurrence in-kernel).
+        if ssm_states.dtype == torch.float32:
+            state_align = 4
+        elif ssm_states.dtype == torch.bfloat16:
+            state_align = 8
+        else:
+            return False
+        # 16-byte cp.async of the state: slot pitch / offset in whole vectors.
         if (
-            ssm_states.dtype != torch.float32
-            or tuple(ssm_states.shape[-3:])
+            tuple(ssm_states.shape[-3:])
             != (layer.num_v_heads, layer.head_v_dim, layer.head_k_dim)
             or tuple(ssm_states.stride()[-3:])
             != (
@@ -1777,8 +1846,8 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 layer.head_k_dim,
                 1,
             )
-            or ssm_states.stride(0) % 4 != 0
-            or ssm_states.storage_offset() % 4 != 0
+            or ssm_states.stride(0) % state_align != 0
+            or ssm_states.storage_offset() % state_align != 0
         ):
             return False
         if conv_states.shape[-2] != 3 or intermediate_conv_window_cache.shape[-2] != 3:
@@ -1789,6 +1858,8 @@ class KDAAttnBackend(MambaAttnBackendBase):
             # no recurrent fallback without intermediate_ssm).
             return replayssm_rawv is not None
         if intermediate_state_cache.shape[1] < draft_token_num:
+            return False
+        if intermediate_state_cache.dtype != ssm_states.dtype:
             return False
         if tuple(intermediate_state_cache.shape[-3:]) != (
             layer.num_v_heads,

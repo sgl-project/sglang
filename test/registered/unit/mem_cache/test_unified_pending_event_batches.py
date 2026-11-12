@@ -6,16 +6,16 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.runtime_context import reset_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.unified_allocator_fixtures import (
     build_swa_pool,
     build_tri_pool,
-    reset_context,
     setup_allocator_context,
 )
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 class _Event:
@@ -37,7 +37,7 @@ def _views(bundle, allocator, slots, states):
                 buf = kv.get_value_buffer(layer) if value else kv.get_key_buffer(layer)
                 result.append((member, buf, slots, layer * 2 + int(value)))
     if states is not None:
-        cache = bundle.req_to_token_pool.mamba_pool.mamba_cache
+        cache = allocator.state.pool.mamba_cache
         result.extend(
             (allocator.mamba_allocator, view[0], states, 4 + index)
             for index, view in enumerate([*cache.conv, cache.temporal])
@@ -88,7 +88,7 @@ class TestUnifiedPendingEventBatches(CustomTestCase):
                     for member, buf, ids, tag in _views(
                         bundle, allocator, slots, states
                     ):
-                        buf[member.translate_kv_loc(ids)] = _payload(ids, buf, tag)
+                        buf[member.ids.translate(ids)] = _payload(ids, buf, tag)
                     member = (
                         allocator.full_attn_allocator
                         if owner == "full"
@@ -99,14 +99,16 @@ class TestUnifiedPendingEventBatches(CustomTestCase):
                     all_sources = set()
 
                     def assert_pending():
-                        self.assertEqual(set(member._pending_reuse), set(expected))
+                        self.assertEqual(
+                            set(member.usage.pending_by_key()), set(expected)
+                        )
                         union = set().union(*expected.values()) if expected else set()
-                        self.assertEqual(member._pending_reuse_pages_cpu, union)
+                        self.assertEqual(member.usage.pending_pages, union)
                         free = member._free_phys_pages.tolist()
                         self.assertTrue(union.isdisjoint(free))
                         self.assertEqual(len(free), len(set(free)))
                         for event, sources in expected.items():
-                            cpu, device = member._pending_reuse[event]
+                            cpu, device = member.usage.pending_by_key()[event]
                             self.assertEqual(set(cpu), sources)
                             self.assertEqual(len(cpu), len(sources))
                             self.assertEqual(torch.cat(device).tolist(), cpu)
@@ -117,7 +119,7 @@ class TestUnifiedPendingEventBatches(CustomTestCase):
                         ):
                             self.assertTrue(
                                 torch.equal(
-                                    buf[current.translate_kv_loc(ids)],
+                                    buf[current.ids.translate(ids)],
                                     _payload(ids, buf, tag),
                                 ),
                                 (current.sub_pool_name, tag),
@@ -128,6 +130,7 @@ class TestUnifiedPendingEventBatches(CustomTestCase):
                         event = second if mode == "different" and index else first
                         if index and mode == "fired_between":
                             first.fired = True
+                            member.retire_forward(first)
                             expected.clear()
                         member.set_latest_forward_done_event(event)
                         member.set_inflight_forward(event, None)
@@ -146,9 +149,9 @@ class TestUnifiedPendingEventBatches(CustomTestCase):
                             retained_states = retained_states[
                                 ~torch.isin(retained_states, drop)
                             ]
-                        before = member.virtual_to_physical.clone()
+                        before = member.ids.virtual_to_physical.clone()
                         self.assertGreater(member._flush(urgent=False), 0)
-                        after = member.virtual_to_physical
+                        after = member.ids.virtual_to_physical
                         moved = (
                             (before >= member.min_page_index)
                             & (after >= member.min_page_index)
@@ -159,21 +162,23 @@ class TestUnifiedPendingEventBatches(CustomTestCase):
                         sources = set(before[moved].tolist())
                         self.assertTrue(sources)
                         all_sources.update(sources)
-                        if not event.fired:
+                        if not member.usage.forward_retired(event):
                             expected.setdefault(event, set()).update(sources)
                         assert_pending()
                         assert_payload()
 
                     member._drain_pending_reuse(urgent=False)
                     assert_pending()
-                    for event in (second, first):
+                    # Forwards retire in launch order, each with every earlier one.
+                    for event in (first, second):
                         event.fired = True
+                        member.retire_forward(event)
                         expected.pop(event, None)
                         member._drain_pending_reuse(urgent=False)
                         assert_pending()
                         assert_payload()
-                    self.assertFalse(member._pending_reuse)
-                    self.assertFalse(member._pending_reuse_pages_cpu)
+                    self.assertFalse(member.usage.pending_by_key())
+                    self.assertFalse(member.usage.pending_pages)
                     if mode != "fired_between":
                         self.assertEqual(
                             set(member._free_phys_pages.tolist()), all_sources
@@ -191,14 +196,14 @@ class TestUnifiedPendingEventBatches(CustomTestCase):
                         self.assertIsNotNone(fresh)
                         self.assertEqual(
                             set(
-                                member.virtual_to_physical[
+                                member.ids.virtual_to_physical[
                                     fresh // member.pool_page_size
                                 ].tolist()
                             ),
                             all_sources,
                         )
                         for current, buf, ids, tag in fresh_views:
-                            buf[current.translate_kv_loc(ids)] = _payload(
+                            buf[current.ids.translate(ids)] = _payload(
                                 ids, buf, tag, generation=1
                             )
                         assert_payload()

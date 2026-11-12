@@ -8,11 +8,17 @@ import torch
 import torch.nn as nn
 from einops import rearrange
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.ops import diffusion as diffusion_kernels
 from sglang.kernels.ops.diffusion.sites.bitexact_gate import BitExactFusionGate
+from sglang.kernels.ops.diffusion.sites.fused_linear_gelu_site import (
+    can_use_linear_gelu_static,
+    fused_linear_gelu_tanh,
+)
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.models.dits.joy_image import JoyImageDiTConfig
 from sglang.multimodal_gen.configs.models.fsdp import is_blocks_or_double_blocks
+from sglang.multimodal_gen.configs.sample.sampling_params import quality_allows
 from sglang.multimodal_gen.runtime.distributed import (
     divide,
     get_sp_group,
@@ -31,6 +37,7 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
+from sglang.multimodal_gen.runtime.layers.lora.linear import BaseLayerWithLoRA
 from sglang.multimodal_gen.runtime.layers.mlp import MLP
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
@@ -54,6 +61,7 @@ _JOY_QKV_CAT = BitExactFusionGate(
     "Joy image/text QKV concatenation", per_signature=True
 )
 _JOY_IMAGE_QK_ROPE = BitExactFusionGate("Joy strided image QK RoPE", per_signature=True)
+_JOY_RESIDUAL_GATE = BitExactFusionGate("Joy image residual gate", per_signature=True)
 
 
 def _joy_image_qk_rope(
@@ -189,22 +197,37 @@ def _joy_joint_qkv(*inputs: torch.Tensor) -> tuple[torch.Tensor, ...]:
 def fused_add_gate(
     residual: torch.Tensor, x: torch.Tensor, gate: torch.Tensor
 ) -> torch.Tensor:
-    """Fused residual addition with gate.
+    """Preserve addcmul's FP32 product before the final cast."""
+    gate = gate.unsqueeze(1)
 
-    Computes: residual + x * gate.unsqueeze(1)
+    def reference():
+        return torch.addcmul(residual, x, gate)
 
-    This fuses the gate multiplication and residual addition to reduce
-    intermediate tensor allocations and memory bandwidth.
-
-    Args:
-        residual (torch.Tensor): The residual tensor to add to. Shape: (B, L, D)
-        x (torch.Tensor): The input tensor to be gated. Shape: (B, L, D)
-        gate (torch.Tensor): The gate tensor. Shape: (B, D)
-
-    Returns:
-        torch.Tensor: residual + x * gate.unsqueeze(1)
-    """
-    return torch.addcmul(residual, x, gate.unsqueeze(1))
+    # Keep small text updates on the faster native path.
+    if (
+        torch.compiler.is_compiling()
+        or torch.is_grad_enabled()
+        or not residual.is_cuda
+        or not current_arch().is_sm(10, 3)
+        or residual.numel() < 16 * 1024 * 1024
+        or residual.ndim != 3
+        or residual.shape != x.shape
+        or residual.dtype != torch.bfloat16
+        or x.dtype != residual.dtype
+        or gate.dtype != residual.dtype
+        or x.device != residual.device
+        or gate.device != residual.device
+        or not residual.is_contiguous()
+        or not x.is_contiguous()
+        or gate.shape != (residual.shape[0], 1, residual.shape[2])
+    ):
+        return reference()
+    return _JOY_RESIDUAL_GATE.run(
+        lambda: diffusion_kernels.residual_gate_fp32(residual, x, gate),
+        reference,
+        sig=(residual.device, residual.shape, gate.stride()),
+        logger=logger,
+    )
 
 
 def _joy_complex_freqs(freqs_cis: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
@@ -242,6 +265,39 @@ class ModulateWan(nn.Module):
         return [
             o.squeeze(1) for o in (self.modulate_table + x).chunk(self.factor, dim=1)
         ]
+
+
+def _joy_image_mlp(mlp: MLP, x: torch.Tensor, fuse_gelu: bool) -> torch.Tensor:
+    """Use the SM120 image epilogue when eligible; retain the original MLP otherwise."""
+    fc_in = mlp.fc_in
+    # SM120's epilogue wins for the large image projection, but regresses the
+    # smaller text projection. It also removes the intermediate BF16 rounding.
+    # Native single-reference image buckets have at least 7168 image tokens.
+    if (
+        not fuse_gelu
+        or torch.compiler.is_compiling()
+        or not x.is_cuda
+        or torch.version.hip
+        or x.ndim != 3
+        or x.shape[0] != 1
+        or x.shape[1] < 7168
+        or x.shape[2] != 4096
+        or x.dtype != torch.bfloat16
+        or not x.is_contiguous()
+        or torch.cuda.get_device_capability(x.device) != (12, 0)
+        or not isinstance(mlp.act, nn.GELU)
+        or mlp.act.approximate != "tanh"
+        or (isinstance(fc_in, BaseLayerWithLoRA) and fc_in.lora_active)
+        or not can_use_linear_gelu_static(fc_in)
+        or fc_in.weight.shape != (16384, 4096)
+        or fc_in.weight.dtype != x.dtype
+        or fc_in.weight.device != x.device
+        or fc_in.bias.device != x.device
+    ):
+        return mlp(x)
+    hidden = fused_linear_gelu_tanh(x, fc_in.weight, fc_in.bias)
+    # Keep the output projection wrapper, including LoRA and TP reduction.
+    return mlp.fc_out(hidden)[0]
 
 
 class MMDoubleStreamBlock(nn.Module):
@@ -370,6 +426,7 @@ class MMDoubleStreamBlock(nn.Module):
         vis_complex_freqs: Optional[torch.Tensor] = None,
         txt_complex_freqs: Optional[torch.Tensor] = None,
         num_replicated_suffix: int = 0,
+        fuse_image_gelu: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Forward pass through multimodal double stream block."""
         (
@@ -465,10 +522,12 @@ class MMDoubleStreamBlock(nn.Module):
         img = fused_add_gate(img, self.img_attn_proj(img_attn)[0], img_mod1_gate)
         img = fused_add_gate(
             img,
-            self.img_mlp(
+            _joy_image_mlp(
+                self.img_mlp,
                 self.fused_modulate_img_norm2(
                     img, shift=img_mod2_shift, scale=img_mod2_scale
-                )
+                ),
+                fuse_image_gelu,
             ),
             img_mod2_gate,
         )
@@ -623,6 +682,9 @@ class JoyTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     ) -> torch.Tensor:
         """Forward pass through JoyImage Transformer."""
         forward_batch = get_forward_context().forward_batch
+        fuse_image_gelu = forward_batch is not None and quality_allows(
+            forward_batch.sampling_params.quality, "high"
+        )
         sequence_shard_enabled = (
             forward_batch is not None
             and getattr(forward_batch, "enable_sequence_shard", False)
@@ -715,6 +777,7 @@ class JoyTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 vis_complex_freqs=vis_complex_freqs,
                 txt_complex_freqs=txt_complex_freqs,
                 num_replicated_suffix=txt_suffix_len,
+                fuse_image_gelu=fuse_image_gelu,
             )
 
         if sequence_shard_enabled:

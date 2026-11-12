@@ -3,8 +3,6 @@ from pathlib import Path
 
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.test.server.testcase_configs import (
-    MODELOPT_FLUX1_FP8_TRANSFORMER,
-    MODELOPT_FLUX1_NVFP4_TRANSFORMER,
     MODELOPT_FLUX2_FP8_TRANSFORMER,
     MODELOPT_FLUX2_NVFP4_WEIGHTS,
     MODELOPT_HUNYUANVIDEO_FP8_TRANSFORMER,
@@ -26,6 +24,8 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
     LINGBOT_VIDEO_T2V_CI_sampling_params,
     LONGLIVE2_I2V_CI_sampling_params,
     LONGLIVE2_T2V_CI_sampling_params,
+    MINIMAX_H3_IMAGE_EDIT_sampling_params,
+    MINIMAX_H3_IMAGE_T2I_sampling_params,
     MODELOPT_QWEN_IMAGE_2512_NVFP4_CI_sampling_params,
     MODELOPT_T2I_CI_sampling_params,
     MODELOPT_T2V_CI_sampling_params,
@@ -46,7 +46,6 @@ from sglang.multimodal_gen.test.server.testcase_configs import (
 )
 from sglang.multimodal_gen.test.test_utils import (
     DEFAULT_COSMOS3_NANO_MODEL_NAME_FOR_TEST,
-    DEFAULT_FLUX_1_DEV_MODEL_NAME_FOR_TEST,
     DEFAULT_FLUX_2_DEV_MODEL_NAME_FOR_TEST,
     DEFAULT_FLUX_2_KLEIN_4B_MODEL_NAME_FOR_TEST,
     DEFAULT_FLUX_2_KLEIN_BASE_4B_MODEL_NAME_FOR_TEST,
@@ -137,20 +136,6 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         run_component_accuracy_check=False,
         run_t2v_input_reference_check=False,
     ),
-    DiffusionTestCase(
-        "flux_image_t2i",
-        DiffusionServerArgs(model_path=DEFAULT_FLUX_1_DEV_MODEL_NAME_FOR_TEST),
-    ),
-    # TODO: modeling of flux different from official flux, so weights can't be loaded
-    # consider opting for a different quantized hf-repo
-    # DiffusionTestCase(
-    #     "flux_image_t2i_override_transformer_weights_path_fp8",
-    #     DiffusionServerArgs(
-    #         model_path="black-forest-labs/FLUX.1-dev",
-    #         extras=["--transformer-weights-path black-forest-labs/FLUX.1-dev-FP8"]
-    #     ),
-    #     T2I_sampling_params,
-    # ),
     DiffusionTestCase(
         "flux_2_image_t2i",
         DiffusionServerArgs(model_path=DEFAULT_FLUX_2_DEV_MODEL_NAME_FOR_TEST),
@@ -326,7 +311,8 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
     # request the stage regains that whole transfer, well past the
     # non_denoise_stage tolerance. load_peak_vram carries the placed set, so
     # it also pins that the placement happens at load, not on the first use.
-    # The encoder is already layerwise under the default component set.
+    # The encoder is pinned layerwise: on an 80 GB card auto would keep the
+    # whole 1.3B checkpoint resident.
     # No consistency check: the lifetime moves weights, not math, so the
     # output is the base case's and that case already guards it.
     DiffusionTestCase(
@@ -334,6 +320,7 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         DiffusionServerArgs(
             model_path=DEFAULT_WAN_2_1_T2V_1_3B_MODEL_NAME_FOR_TEST,
             extras=[
+                "--component-residency text_encoder=layerwise-offload "
                 "--layerwise-resident-layers text_encoder=0.8 "
                 "--layerwise-residency-lifetime text_encoder=permanent",
             ],
@@ -416,7 +403,10 @@ ONE_GPU_CASES: list[DiffusionTestCase] = [
         "flux_2_t2i_customized_vae_path",
         DiffusionServerArgs(
             model_path=DEFAULT_FLUX_2_DEV_MODEL_NAME_FOR_TEST,
-            extras=["--vae-path=fal/FLUX.2-Tiny-AutoEncoder"],
+            extras=[
+                "--vae-path=fal/FLUX.2-Tiny-AutoEncoder",
+                "--trust-remote-code",
+            ],
         ),
         T2I_sampling_params,
         run_perf_check=False,
@@ -693,14 +683,6 @@ if current_platform.is_hip():
 else:
     ONE_GPU_MODELOPT_FP8_CASES = [
         _make_modelopt_ci_case(
-            "flux1_modelopt_fp8_t2i",
-            model_path=DEFAULT_FLUX_1_DEV_MODEL_NAME_FOR_TEST,
-            modality="image",
-            sampling_params=MODELOPT_T2I_CI_sampling_params,
-            extras=["--transformer-path", MODELOPT_FLUX1_FP8_TRANSFORMER],
-            run_consistency_check=True,
-        ),
-        _make_modelopt_ci_case(
             "wan22_modelopt_fp8_t2v",
             model_path=MODELOPT_WAN22_FP8_MODEL,
             modality="video",
@@ -736,16 +718,6 @@ else:
         ),
     ]
     ONE_GPU_MODELOPT_NVFP4_CASES = [
-        _make_modelopt_ci_case(
-            "flux1_modelopt_nvfp4_t2i",
-            model_path=DEFAULT_FLUX_1_DEV_MODEL_NAME_FOR_TEST,
-            modality="image",
-            sampling_params=MODELOPT_T2I_CI_sampling_params,
-            extras=["--transformer-path", MODELOPT_FLUX1_NVFP4_TRANSFORMER],
-            env_vars=MODELOPT_NVFP4_B200_ENV_VARS,
-            run_consistency_check=True,
-            run_perf_check=True,
-        ),
         _make_modelopt_ci_case(
             "flux2_modelopt_nvfp4_t2i",
             model_path=DEFAULT_FLUX_2_DEV_MODEL_NAME_FOR_TEST,
@@ -787,6 +759,33 @@ else:
             run_perf_check=True,
         ),
     ]
+
+# MiniMax-H3-Image weights are not public yet, so PR CI cannot download them.
+# Add these cases back to ONE_GPU_B200_CASES together with their B200
+# consistency GT and perf baselines once the checkpoint is published.
+MINIMAX_H3_IMAGE_B200_CASES = [
+    DiffusionTestCase(
+        f"minimax_h3_image_{task}",
+        DiffusionServerArgs(
+            model_path="MiniMaxAI/MiniMax-H3-Image",
+            modality="image",
+            extras=["--component-residency", "all=resident"],
+        ),
+        sampling,
+        perf_warmup_requests=1,
+        perf_repeat_requests=2,
+        # Consistency remains required; pre-release goldens stay private until
+        # the checkpoint and its authorized golden artifacts are published.
+        run_consistency_check=True,
+        # The release provides a native SGLang reference, not a Diffusers pipeline.
+        run_component_accuracy_check=False,
+        run_t2v_input_reference_check=False,
+    )
+    for task, sampling in (
+        ("t2i", MINIMAX_H3_IMAGE_T2I_sampling_params),
+        ("edit", MINIMAX_H3_IMAGE_EDIT_sampling_params),
+    )
+]
 
 ONE_GPU_B200_CASES = ONE_GPU_MODELOPT_NVFP4_CASES
 
@@ -1362,6 +1361,12 @@ TWO_GPU_CASES = [
         DiffusionServerArgs(
             model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
         ),
+        # 85x48 image tokens pad to the 1024x1024 warmup's 4096 (2048 per rank)
+        # over another grid, so RoPE tables kept from the warmup corrupt it
+        lead_sampling_params=DiffusionSamplingParams(
+            prompt=T2I_sampling_params.prompt,
+            output_size="1360x768",
+        ),
     ),
     DiffusionTestCase(
         "zimage_image_t2i_2_gpus_non_square",
@@ -1373,12 +1378,6 @@ TWO_GPU_CASES = [
             output_size="1280x720",
         ),
         run_perf_check=False,
-    ),
-    DiffusionTestCase(
-        "flux_image_t2i_2_gpus",
-        DiffusionServerArgs(
-            model_path=DEFAULT_FLUX_1_DEV_MODEL_NAME_FOR_TEST,
-        ),
     ),
     DiffusionTestCase(
         "flux_2_image_t2i_2_gpus",
@@ -1429,36 +1428,6 @@ def _select_5090_canary_cases(case_ids: tuple[str, ...]) -> list[DiffusionTestCa
         )
         for case_id in case_ids
     ]
-
-
-def _make_5090_flux_layerwise_cpu_offload_case() -> DiffusionTestCase:
-    base_case = next(case for case in ONE_GPU_CASES if case.id == "flux_image_t2i")
-
-    return replace(
-        base_case,
-        id="flux_image_t2i_layerwise_cpu_offload_5090",
-        server_args=replace(
-            base_case.server_args,
-            dit_layerwise_offload=True,
-            dit_offload_prefetch_size=5,
-            text_encoder_cpu_offload=True,
-            extras=[
-                *base_case.server_args.extras,
-                "--dit-cpu-offload",
-                "--pin-cpu-memory",
-            ],
-        ),
-        sampling_params=replace(
-            T2I_sampling_params,
-            output_size="512x512",
-            extras={"num_inference_steps": 4, "seed": 0},
-        ),
-        run_perf_check=True,
-        run_consistency_check=True,
-        run_component_accuracy_check=False,
-        run_models_api_check=False,
-        run_t2v_input_reference_check=False,
-    )
 
 
 def _make_5090_h3_consumer_budget_case() -> DiffusionTestCase:
@@ -1538,13 +1507,12 @@ if not current_platform.is_hip():
     ONE_GPU_5090_CANARY_CASE_IDS += ("turbo_wan2_1_t2v_1.3b",)
 
 ONE_GPU_5090_CASES = _select_5090_canary_cases(ONE_GPU_5090_CANARY_CASE_IDS)
-ONE_GPU_5090_CASES.append(_make_5090_flux_layerwise_cpu_offload_case())
 ONE_GPU_5090_CASES.append(_make_5090_h3_consumer_budget_case())
 
 
 # Intel Arc Pro B60 has 24 GiB of XPU memory, so only sub-~5B-parameter
-# checkpoints fit fully resident. Larger cases in ONE_GPU_CASES (FLUX.1-dev,
-# FLUX.2-dev, Qwen-Image, Hunyuan3D, SANA-Video, image-edit families) OOM on
+# checkpoints fit fully resident. Larger cases in ONE_GPU_CASES (FLUX.2-dev,
+# Qwen-Image, Hunyuan3D, SANA-Video, image-edit families) OOM on
 # 24 GiB, and the FP8/NVFP4 quant paths are CUDA-only.
 ONE_GPU_XPU_CASE_IDS = (
     "zimage_image_t2i",
@@ -1659,6 +1627,7 @@ STANDALONE_FILES = {
     ],
     "1-gpu": [
         "../single_test_file/test_generate_zimage_turbo_cli.py",
+        "../single_test_file/test_nomas_offline.py",
         "../single_test_file/test_update_weights_from_disk.py",
     ],
     "2-gpu": [
@@ -1673,11 +1642,15 @@ STANDALONE_FILES = {
         "../single_test_file/test_dp_serving_2_gpu.py",
         "../single_test_file/test_pynccl_a2a_capture_2_gpu.py",
         "../single_test_file/test_usp_replicated_parity_2_gpu.py",
+        "../single_test_file/test_cosmos3_action_sp_2_gpu.py",
         "../single_test_file/test_vdn_ulysses_exchange_2_gpu.py",
         "../unit/test_async_output_save.py",
         "../unit/test_kandinsky6_sequence_parallel.py",
+        "../unit/test_kandinsky6_sr_decode_parallel.py",
         "../unit/test_kandinsky6_sr_sequence_parallel.py",
+        "../unit/test_nomas_parallel.py",
         "../unit/test_qwen_image21_distributed.py",
+        "../unit/test_text_encoding_cache.py",
     ],
 }
 
@@ -1708,6 +1681,9 @@ STANDALONE_FILE_EST_TIMES = {
     },
     "1-gpu": {
         "../single_test_file/test_generate_zimage_turbo_cli.py": 180.0,
+        # Initial H200 full-process observation: 97 s; refresh on H100 CI.
+        # This is a partitioning estimate, not a performance gate.
+        "../single_test_file/test_nomas_offline.py": 100.0,
         "../single_test_file/test_update_weights_from_disk.py": 200.0,
     },
     "2-gpu": {
@@ -1728,13 +1704,22 @@ STANDALONE_FILE_EST_TIMES = {
         "../single_test_file/test_pynccl_a2a_capture_2_gpu.py": 30.0,
         # two SDPA parity checks on 128+6 rows
         "../single_test_file/test_usp_replicated_parity_2_gpu.py": 30.0,
+        # two spawned ranks on a tiny random-init transformer, no model load;
+        # measured 48 s in CI
+        "../single_test_file/test_cosmos3_action_sp_2_gpu.py": 60.0,
         # no model load; two small all-to-alls
         "../single_test_file/test_vdn_ulysses_exchange_2_gpu.py": 30.0,
         # the unit/ suite runs on one GPU; these files carry its 2-GPU cases
         "../unit/test_async_output_save.py": 20.0,
         "../unit/test_kandinsky6_sequence_parallel.py": 90.0,
+        # 2x GB300: 204 s, six spawned SR decode cases
+        "../unit/test_kandinsky6_sr_decode_parallel.py": 240.0,
         "../unit/test_kandinsky6_sr_sequence_parallel.py": 90.0,
+        # H200: TP/SP parity for SDPA and FA3 (55 s each), window decode (22 s)
+        "../unit/test_nomas_parallel.py": 140.0,
         "../unit/test_qwen_image21_distributed.py": 40.0,
+        # 2x GB300: 101 s, mostly the spawned DP/FSDP cases
+        "../unit/test_text_encoding_cache.py": 120.0,
     },
 }
 
