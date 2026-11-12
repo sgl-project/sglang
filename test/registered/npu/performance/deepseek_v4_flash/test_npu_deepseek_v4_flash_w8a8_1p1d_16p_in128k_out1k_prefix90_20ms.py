@@ -1,3 +1,6 @@
+import logging
+import os
+import subprocess
 import unittest
 from pathlib import Path
 
@@ -8,6 +11,8 @@ from sglang.test.ascend.e2e.test_npu_performance_utils import (
     TestNpuPerfMultiNodePdSepTestCaseBase, AISBENCHMARK_DATASET_GSM8K,
 )
 from sglang.test.ci.ci_register import register_npu_ci
+
+logger = logging.getLogger(__name__)
 
 register_npu_ci(
     est_time=3600,
@@ -145,6 +150,19 @@ DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_PREFILL_ARGS = [
     "stat",
     "--expert-distribution-recorder-buffer-size",
     512,
+    # DSPARK configuration (kept in sync with the decode node).
+    "--speculative-algorithm",
+    "DSPARK",
+    "--speculative-draft-model-path",
+    DEEPSEEK_V4_FLASH_0731_W8A8_MODEL_PATH,
+    "--speculative-draft-model-quantization",
+    "modelslim",
+    "--speculative-draft-attention-backend",
+    "ascend",
+    "--speculative-num-draft-tokens",
+    6,
+    "--speculative-dspark-block-size",
+    5,
 ]
 
 # Decode node launch arguments for DSV4-Flash PD-Sep 128k
@@ -269,6 +287,49 @@ class TestNPUDeepSeekV4FlashW8A81P1D16PIn128kOut1k20msAisBench(TestNpuPerfMultiN
     tpot = 20
     output_token_throughput = 964.864
     ttft = 7000
+
+    @classmethod
+    def setUpClass(cls):
+        # Mirror the accuracy case: on the P (prefill) node, print host memory
+        # before/after dropping the page cache so the prefill pod log shows the
+        # DRAM headroom at launch time (the prefill node now also loads the
+        # DSPARK draft model).
+        if "prefill" in os.environ.get("HOSTNAME", ""):
+            commands = [
+                ("Host memory before cache cleanup", ["free", "-g"], False),
+                (
+                    "drop_caches execution result",
+                    "sync && echo 1 > /proc/sys/vm/drop_caches",
+                    True,
+                ),
+                ("Host memory after cache cleanup", ["free", "-g"], False),
+            ]
+            for description, command, use_shell in commands:
+                result = subprocess.run(
+                    command,
+                    shell=use_shell,
+                    executable="/bin/bash" if use_shell else None,
+                    capture_output=True,
+                    text=True,
+                )
+                logger.info(
+                    "%s: command=%r, returncode=%d\nstdout:\n%s\nstderr:\n%s",
+                    description,
+                    command,
+                    result.returncode,
+                    result.stdout,
+                    result.stderr,
+                )
+                if result.returncode != 0:
+                    # Best-effort host maintenance, not a test assertion: raising
+                    # here makes the prefill pod exit early and the multi-node
+                    # harness then reports a misleading "pod is not running".
+                    logger.warning(
+                        "%s failed with returncode %d; continuing without it",
+                        description,
+                        result.returncode,
+                    )
+        super().setUpClass()
 
     def test_npu_deepseek_v4_flash_w8a8_1p1d_16p_in128k_out1k_20ms(self):
         """Run the 128k pure-decode low-latency TPOT acceptance test."""
