@@ -507,4 +507,20 @@ def resolve_fp8_mqa_logits_fn():
         return _fp8_mqa_logits_torch
     import deep_gemm
 
+    if envs.SGLANG_DSA_MQA_LOGITS_SCHEDULED.get() and hasattr(
+        deep_gemm, "get_mqa_logits_metadata_legacy"
+    ):
+        return _fp8_mqa_logits_scheduled
     return deep_gemm.fp8_mqa_logits
+
+
+def _fp8_mqa_logits_scheduled(q, kv, weights, ks, ke, clean_logits=False):
+    import deep_gemm
+
+    kv_rows = kv[0].shape[0] if isinstance(kv, (tuple, list)) else kv.shape[0]
+    schedule_meta = deep_gemm.get_mqa_logits_metadata_legacy(
+        ks, ke, kv_rows, q.shape[1]
+    )
+    return deep_gemm.fp8_fp4_mqa_logits_legacy(
+        q, kv, weights, ks, ke, clean_logits, 0, torch.float, schedule_meta
+    )
