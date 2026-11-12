@@ -872,7 +872,7 @@ class DeepseekSparseAttnBackend(
                 qk_rope_head_dim=self.qk_rope_head_dim,
                 v_head_dim=model_runner.model_config.v_head_dim,
                 num_q_heads=self.num_q_heads,
-                dcp_size=self.dcp_size,
+                dcp_size=self.attn_dcp_size,
             )
             if _IS_GFX95
             else None
