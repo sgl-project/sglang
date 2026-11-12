@@ -27,6 +27,21 @@ pub(crate) fn run<R>(work: impl FnOnce() -> R) -> R {
     }
 }
 
+/// Body size below which parsing and rebuilding JSON costs less than the
+/// handoff in [`run`]: about 0.5 µs per KiB, against tens of µs per handoff.
+pub(crate) const MIN_OFFLOAD_BODY_BYTES: usize = 256 * 1024;
+
+/// [`run`] for work that grows with a `len`-byte body, such as JSON parse and
+/// rebuild. Smaller bodies run inline and skip the handoff. Render and
+/// tokenize go through [`run`] on their own, whatever the body size.
+pub(crate) fn run_for_body<R>(len: usize, work: impl FnOnce() -> R) -> R {
+    if len >= MIN_OFFLOAD_BODY_BYTES {
+        run(work)
+    } else {
+        work()
+    }
+}
+
 /// Fixtures for asserting that a code path keeps the runtime serving while it
 /// does slow synchronous work.
 #[cfg(test)]
