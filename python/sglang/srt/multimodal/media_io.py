@@ -20,6 +20,7 @@ import ipaddress
 import logging
 import math
 import os
+import socket
 import stat
 import threading
 import time
@@ -157,6 +158,27 @@ def _assert_media_url_allowed(url: str) -> None:
             f"Allowed domains: {sorted(_allowed_media_domains)}; "
             f"input domain: {hostname}"
         )
+    # Local media servers require an explicit operator opt-in.
+    if os.getenv("SGLANG_ALLOW_PRIVATE_MEDIA_URLS") == "1":
+        return
+    try:
+        addresses = socket.getaddrinfo(
+            hostname,
+            parsed.port or (443 if parsed.scheme == "https" else 80),
+            type=socket.SOCK_STREAM,
+        )
+    except OSError as error:
+        raise ValueError("Media URL hostname could not be resolved") from error
+    if not addresses:
+        raise ValueError("Media URL hostname could not be resolved")
+    for _, _, _, _, address in addresses:
+        ip = ipaddress.ip_address(address[0])
+        if isinstance(ip, ipaddress.IPv6Address):
+            ip = ip.ipv4_mapped or (
+                ipaddress.IPv4Address(int(ip)) if int(ip) >> 32 == 0 else ip
+            )
+        if not ip.is_global:
+            raise ValueError("Media URL must not point to a local or private address")
 
 
 def media_url_timeout(default: float) -> float:

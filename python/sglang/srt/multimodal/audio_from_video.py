@@ -67,6 +67,13 @@ def decode_audio_container(
         raise ValueError(_INVALID_AUDIO_CONTAINER_MESSAGE)
     if isinstance(source, bytes) and not source:
         raise ValueError(_INVALID_AUDIO_CONTAINER_MESSAGE)
+    if isinstance(source, str) and source.startswith(("http://", "https://")):
+        from sglang.srt.multimodal.media_io import (
+            download_remote_media,
+            media_url_timeout,
+        )
+
+        source = download_remote_media(source, timeout=media_url_timeout(5))
 
     try:
         import av
