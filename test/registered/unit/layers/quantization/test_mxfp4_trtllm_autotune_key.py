@@ -7,6 +7,8 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
+import sys
+import types
 import unittest
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -17,6 +19,7 @@ import torch
 # The quantization package must load before the MoE runner (circular import otherwise).
 import sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe as mxfp4
 from sglang.srt.environ import envs
+from sglang.srt.layers.moe import topk as topk_module
 from sglang.srt.layers.moe.moe_runner import flashinfer_trtllm
 from sglang.srt.layers.moe.token_dispatcher import StandardDispatchOutput
 from sglang.srt.layers.moe.topk import StandardTopKOutput
@@ -86,6 +89,111 @@ class TestMxfp4AutotuneKey(CustomTestCase):
                             method.apply(layer, dispatch)
                         width = 0 if deferred and rows <= 32 else HIDDEN
                         self.assertEqual(outputs[-1], (rows, width))
+
+
+class TestNvfp4BypassedAutotuneKey(CustomTestCase):
+    """The NVFP4 logits-bypassed call: at TP1 a deferred finalize passes a full-width
+    output, so FlashInfer's AutoTuner looks up the (N, hidden) keys tuned at startup
+    instead of a (N, 0) placeholder that misses them (flashinfer-ai/flashinfer#6077)."""
+
+    def _call(self, rows, deferred, tp_size):
+        seen = []
+
+        def moe_call(**kwargs):
+            seen.append(kwargs)
+            return (torch.zeros(rows, HIDDEN, dtype=torch.bfloat16),)
+
+        fused = types.ModuleType("flashinfer.fused_moe")
+        fused.trtllm_fp4_block_scale_moe = moe_call
+        fused.trtllm_fp4_block_scale_routed_moe = moe_call
+        x = torch.zeros(rows, HIDDEN, dtype=torch.bfloat16)
+        topk = SimpleNamespace(
+            router_logits=torch.zeros(rows, EXPERTS),
+            topk_config=SimpleNamespace(
+                correction_bias=None, top_k=TOP_K, num_expert_group=1, topk_group=1
+            ),
+        )
+        dispatch = SimpleNamespace(
+            hidden_states=x, hidden_states_scale=None, topk_output=topk
+        )
+        info = SimpleNamespace(
+            padded_hidden_size=None,
+            use_per_token_activation=False,
+            w13_input_scale_quant=torch.ones(1),
+            w13_weight=torch.zeros(1),
+            w2_weight=torch.zeros(1),
+            w13_weight_scale=torch.zeros(1, dtype=torch.uint8),
+            w2_weight_scale=torch.zeros(1, dtype=torch.uint8),
+            gemm1_alpha=None,
+            gemm1_beta=None,
+            gemm1_clamp_limit=None,
+            g1_scale_c=torch.ones(1),
+            g1_alphas=torch.ones(1),
+            g2_alphas=torch.ones(1),
+            global_num_experts=EXPERTS,
+            intermediate_size_per_partition=INTER,
+            local_expert_offset=0,
+            local_num_experts=EXPERTS,
+            routing_method_type=None,
+        )
+        config = SimpleNamespace(
+            routed_scaling_factor=None, activation="silu", is_gated=True
+        )
+        quantized = (
+            torch.zeros(rows, HIDDEN // 2, dtype=torch.uint8),
+            torch.zeros(rows, HIDDEN // 16, dtype=torch.uint8),
+        )
+        with (
+            patch.dict(sys.modules, {"flashinfer.fused_moe": fused}),
+            patch.object(
+                flashinfer_trtllm, "quantize_hidden_states_fp4", return_value=quantized
+            ),
+            patch.object(
+                flashinfer_trtllm,
+                "get_parallel",
+                return_value=SimpleNamespace(tp_size=tp_size),
+            ),
+            patch.object(flashinfer_trtllm, "get_activation_type", return_value=0),
+            patch.object(
+                flashinfer_trtllm, "trtllm_moe_enable_pdl", return_value=False
+            ),
+            patch.object(
+                flashinfer_trtllm, "_make_deferred_finalize_output", lambda r, **k: r
+            ),
+            patch.object(
+                flashinfer_trtllm,
+                "_get_fp4_moe_output_buffer",
+                lambda **kw: torch.zeros(kw["num_tokens"], kw["hidden_size"]),
+            ),
+            patch.object(
+                topk_module.TopKOutputChecker,
+                "format_is_standard",
+                return_value=False,
+            ),
+            patch.object(
+                topk_module.TopKOutputChecker,
+                "format_is_bypassed",
+                return_value=True,
+            ),
+            flashinfer_trtllm.flashinfer_trtllm_deferred_finalize_context(deferred),
+        ):
+            flashinfer_trtllm.fused_experts_none_to_flashinfer_trtllm_fp4(
+                dispatch, info, config
+            )
+        return seen[-1]
+
+    def test_deferred_tp1_call_passes_the_full_width_output(self):
+        for rows in (8, 64):
+            for deferred in (False, True):
+                for tp_size in (1, 4):
+                    with self.subTest(rows=rows, deferred=deferred, tp_size=tp_size):
+                        kw = self._call(rows, deferred, tp_size)
+                        self.assertIs(kw["do_finalize"], not deferred)
+                        if deferred and tp_size != 1:
+                            self.assertNotIn("output", kw)
+                        elif deferred:
+                            self.assertEqual(tuple(kw["output"].shape), (rows, HIDDEN))
+                            self.assertEqual(kw["output"].dtype, torch.bfloat16)
 
 
 if __name__ == "__main__":
