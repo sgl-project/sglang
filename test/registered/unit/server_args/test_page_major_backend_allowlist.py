@@ -284,6 +284,37 @@ class TestPageMajorBackendAllowlist(unittest.TestCase):
                         )
                     )
 
+    def test_aiter_bf16_hicache_pages(self):
+        with envs.SGLANG_ENABLE_AITER_UNIFIED_MEMORY.override(True):
+            for page_size in (1, 16):
+                with self.subTest(page_size=page_size):
+                    self.assertTrue(
+                        _accepts(
+                            "aiter",
+                            use_mla=False,
+                            dtype="bfloat16",
+                            kv_cache_dtype="bf16",
+                            page_size=page_size,
+                            enable_hierarchical_cache=True,
+                        )
+                    )
+
+    def test_aiter_pd_remains_rejected_with_or_without_hicache(self):
+        with envs.SGLANG_ENABLE_AITER_UNIFIED_MEMORY.override(True):
+            for mode in ("prefill", "decode"):
+                for hicache in (False, True):
+                    with self.subTest(mode=mode, hicache=hicache):
+                        self.assertFalse(
+                            _accepts(
+                                "aiter",
+                                use_mla=False,
+                                dtype="bfloat16",
+                                kv_cache_dtype="bf16",
+                                disaggregation_mode=mode,
+                                enable_hierarchical_cache=hicache,
+                            )
+                        )
+
     def test_aiter_rejects_unimplemented_arena_contracts(self):
         cases = [
             {"use_mla": True},
@@ -292,8 +323,6 @@ class TestPageMajorBackendAllowlist(unittest.TestCase):
             {"dtype": "float16"},
             {"kv_cache_dtype": "fp8_e4m3"},
             {"speculative_algorithm": "EAGLE"},
-            {"enable_hierarchical_cache": True},
-            {"disaggregation_mode": "decode"},
             {"dcp_size": 2},
             {"attn_cp_size": 2},
             {"enable_prefill_cp": True},
