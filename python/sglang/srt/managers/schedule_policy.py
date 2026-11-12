@@ -932,11 +932,7 @@ class PrefillAdder:
 
     @capacity_decision
     def budget_state(self):
-        no_token = (
-            self.chunked_req_waits
-            or not self.memory_budget.has_capacity()
-            or self.memory_budget.state_slots_exhausted()
-        )
+        no_token = self.chunked_req_waits or not self.memory_budget.admits_more()
         if no_token:
             return AddReqResult.NO_TOKEN
 
