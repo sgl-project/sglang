@@ -1004,6 +1004,7 @@ class DeepseekV4AscendAttnBackend(
             getattr(model_runner, "is_draft_worker", False)
             and self._is_dspark_algorithm
         )
+        self._init_dspark_context_start()
         self._dsv4_graph_tokens_per_req = int(model_runner.decode_num_tokens_per_req())
         self._dsv4_state_pools_by_ratio = {
             pool.ratio: pool
@@ -1013,6 +1014,18 @@ class DeepseekV4AscendAttnBackend(
         # High-water mark of written page-table columns per shared graph
         # buffer; see _copy_page_table_into_graph.
         self._graph_table_high_water: dict[str, int] = {}
+
+    def _init_dspark_context_start(self):
+        if self._is_dspark_draft_worker and not is_npu_arch35():
+            pool = self.token_to_kv_pool
+            if getattr(pool, "_npu_dspark_context_start", None) is None:
+                # Allocate before graph capture. This local cold-start boundary
+                # is not a transferred component of the draft's paged SWA.
+                pool._npu_dspark_context_start = torch.zeros(
+                    pool.num_req_slots,
+                    dtype=torch.int64,
+                    device=self.req_to_token.device,
+                )
 
     def _is_dspark_draft_block(self, forward_batch: ForwardBatch) -> bool:
         spec_algorithm = forward_batch.spec_algorithm
@@ -1093,6 +1106,9 @@ class DeepseekV4AscendAttnBackend(
             req_pool_indices_repeated=req_pool_indices_repeated,
             block_size=block_size,
             swa_window=self._dsv4_sliding_window_size,
+            valid_from=getattr(
+                self.token_to_kv_pool, "_npu_dspark_context_start", None
+            ),
         )
         ori_sparse_indices, _ = BuildDsparkSwaPageIndices.execute(
             req_to_token=self.req_to_token,

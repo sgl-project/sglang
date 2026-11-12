@@ -2105,6 +2105,19 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
         seq_len = fill_len
 
+        if (
+            self.transfer_backend == TransferBackend.ASCEND
+            and self.scheduler.spec_algorithm.is_dspark()
+            and isinstance(self.draft_token_to_kv_pool, DeepSeekV4TokenToKVPool)
+        ):
+            self.kv_manager.initialize_dspark_context(
+                _bootstrap_addr(decode_req.req),
+                self.draft_token_to_kv_pool,
+                decode_req.req.kv.req_pool_idx,
+                seq_len,
+                fake_transfer=_is_fake_transfer(decode_req.req),
+            )
+
         state_types = self.kv_manager.kv_args.state_types
         non_blocking_metadata = (
             self.transfer_queue.enable_staging
