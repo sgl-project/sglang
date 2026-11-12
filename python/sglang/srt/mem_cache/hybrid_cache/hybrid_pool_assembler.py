@@ -243,13 +243,15 @@ def build_kv_host_pool(
     )
     if draft is not None and draft.layer_num:
         info = draft.get_device_pool_infos()[0].buffer_info
-        mixed = _is_modelslim_host_kv(host_input) or _is_modelslim_host_kv(info)
+        modelslim_target = _is_modelslim_host_kv(host_input)
         reserve = (
             memfabric
             and isinstance(info, MLABufferInfo)
             and isinstance(info.buffers, MLASplitBuffers)
         )
-        if reserve or (mixed and host_size > 0):
+        if (modelslim_target or _is_modelslim_host_kv(info)) and (
+            host_size > 0 or reserve
+        ):
             # Replicated drafts span logical target slots, sharded MLA spans local slots.
             dcp_size = parallel.attn_dcp_size if parallel.dcp_enabled else 1
             replicas = (
@@ -260,12 +262,12 @@ def build_kv_host_pool(
             draft_bytes = replicas * _npu_host_row_bytes(draft, info, draft.layer_num)
             if reserve:
                 kwargs["memfabric_sidecar_bytes_per_token"] = draft_bytes
-            if mixed and host_size > 0:
+            if host_size > 0:
                 target_bytes = _npu_host_row_bytes(
                     kv_pool, host_input, geometry.target_layer_num
                 )
                 billed_bytes = target_bytes
-                if use_mla and not _is_modelslim_host_kv(host_input):
+                if use_mla and not modelslim_target:
                     # Ordinary split MLA's existing capacity formula excludes the RoPE mirror.
                     billed_bytes -= _split_row_bytes(
                         host_input, geometry.target_layer_num
@@ -1294,7 +1296,7 @@ def build_hybrid_mamba_stack(
         page_size=params.page_size,
         host_size=kv_host_size,
         mtp_draft_device_pools=config.packed_draft_device_pools,
-        sidecar_draft_device_pools=params.sidecar_draft_device_pools,
+        sidecar_draft_device_pools=getattr(params, "sidecar_draft_device_pools", ()),
     )
     entries = _build_pool_entries(config=config, root_host_pool=kv_host_pool) + [
         _mamba_entry(
@@ -1846,6 +1848,12 @@ def build_full_draft_pools(
     ):
         # A DCP-sharded MLA draft holds only its own rows, like the target.
         parallel = get_parallel()
+        # A pre-reserved Memfabric sidecar must fit the anchor's physical slots.
+        host_token_capacity = None
+        if memfabric_host_memory_enabled():
+            anchor = host_pool_group.anchor_entry.host_pool
+            if getattr(anchor, "_memfabric_sidecar_bytes_per_token", 0):
+                host_token_capacity = host_pool_group.size
         draft_host_pool = _build_mha_mla_host_pool(
             pool=pool,
             buffer_info=buffer_info,
@@ -1854,10 +1862,7 @@ def build_full_draft_pools(
             layout=get_memory().hicache_mem_layout,
             allocator_type=_get_allocator_type(),
             pool_label="draft",
-            # Match the physical anchor exactly for the pre-reserved Memfabric arena.
-            host_token_capacity=(
-                host_pool_group.size if memfabric_host_memory_enabled() else None
-            ),
+            host_token_capacity=host_token_capacity,
             dcp_size=parallel.attn_dcp_size,
             dcp_rank=parallel.attn_dcp_rank,
         )
@@ -2529,7 +2534,8 @@ class _KvStrategy(StackStrategy):
             packed_draft_device_pools=params.mtp_draft_device_pools,
         )
         host_pool_group = build_host_pool_group(
-            config=config, sidecar_draft_device_pools=params.sidecar_draft_device_pools
+            config=config,
+            sidecar_draft_device_pools=getattr(params, "sidecar_draft_device_pools", ()),
         )
         cache_controller = _build_cache_controller(
             params=params,
