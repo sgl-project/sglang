@@ -36,13 +36,13 @@ _CTA_K = 128
 #: Kernel-M tiles; 64 increases CTA count for low-M decode shapes.
 _SUPPORTED_MMA_M = (64, 128)
 
-#: Kernel-N carries public M, which is limited to 32.
+#: Kernel-N tile sizes; kernel-N carries public M, which the grid tiles.
 _SUPPORTED_MMA_N = (8, 16, 32)
 
 #: Physical cluster-K sizes; split 1 compiles out the DSMEM path.
 _SUPPORTED_SPLIT_K = (1, 2, 3, 4, 8, 16)
 
-#: Largest public M this low-M policy serves.
+#: Default bound on public M for this low-M policy; callers may raise it with ``max_m``.
 _MAX_M = 32
 
 #: Bytes per FP32 partial exchanged through DSMEM.
@@ -135,6 +135,7 @@ def validate_tactic(
     k: int,
     *,
     smem_capacity: int = _SMEM_CAPACITY_BYTES,
+    max_m: int = _MAX_M,
 ) -> None:
     """Reject a tactic that cannot serve ``(m, n, k)``."""
     if tactic.mma_m not in _SUPPORTED_MMA_M:
@@ -148,8 +149,8 @@ def validate_tactic(
             f"ab_stages must be in [{_MIN_AB_STAGES}, {_MAX_AB_STAGES}], "
             f"got {tactic.ab_stages}"
         )
-    if not 1 <= m <= _MAX_M:
-        raise ValueError(f"this low-M policy requires 1 <= M <= {_MAX_M}, got {m}")
+    if not 1 <= m <= max_m:
+        raise ValueError(f"this low-M policy requires 1 <= M <= {max_m}, got {m}")
     if n <= 0:
         raise ValueError(f"N must be positive, got {n}")
     if k <= 0 or k % _CTA_K or (k // _CTA_K) % tactic.split_k:
@@ -166,7 +167,7 @@ def validate_tactic(
         )
 
 
-def default_tactic(m: int, n: int, k: int) -> SplitKTactic:
+def default_tactic(m: int, n: int, k: int, *, max_m: int = _MAX_M) -> SplitKTactic:
     """Choose the default occupancy-oriented tactic."""
     if n <= 512:
         mma_m = 64
@@ -203,7 +204,7 @@ def default_tactic(m: int, n: int, k: int) -> SplitKTactic:
             else max_stages
         ),
     )
-    validate_tactic(tactic, m, n, k)
+    validate_tactic(tactic, m, n, k, max_m=max_m)
     return tactic
 
 
@@ -1243,9 +1244,11 @@ def run_splitk_dense_silu(
     pdl: bool,
     tactic: SplitKTactic,
     scale: float,
+    *,
+    max_m: int = _MAX_M,
 ):
     """Run ``bf16(silu(scale * (A[M,K] @ B[K,N])))``."""
-    validate_tactic(tactic, *_validate_runtime_tensors(a, b, None, out))
+    validate_tactic(tactic, *_validate_runtime_tensors(a, b, None, out), max_m=max_m)
     cute_tensors = _to_cute_swap(a, b, out, None)
     compiled = _get_compiled_splitk_kernel(
         dtype=a.dtype,
