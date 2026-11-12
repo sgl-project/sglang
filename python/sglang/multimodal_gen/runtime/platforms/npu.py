@@ -2,6 +2,7 @@
 # Adapted from vllm-ascend: https://github.com/vllm-project/vllm-ascend/blob/main/vllm_ascend/platform.py
 
 import os
+from enum import Enum
 from functools import lru_cache
 from typing import Any
 
@@ -16,6 +17,22 @@ from sglang.multimodal_gen.runtime.platforms.interface import (
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
+
+
+def _check_sgl_kernel_npu_ops(backend: str, operator_names: tuple[str, ...]) -> None:
+    import sgl_kernel_npu  # noqa: F401
+
+    missing = [name for name in operator_names if not hasattr(torch.ops.npu, name)]
+    if missing:
+        operators = ", ".join(f"torch.ops.npu.{name}" for name in missing)
+        platform = NPUPlatformBase.platform_generation().value
+        raise ImportError(
+            f"The installed sgl_kernel_npu is incompatible with {backend} "
+            f"on {platform}: "
+            f"missing registered operators: {operators}. "
+            "Upgrade sgl-kernel-npu to a version providing these operators, "
+            "built for your Ascend device and torch_npu/CANN versions."
+        )
 
 
 def device_id_to_physical_device_id(device_id: int) -> int:
@@ -33,12 +50,26 @@ def device_id_to_physical_device_id(device_id: int) -> int:
         return device_id
 
 
+class NPUGenerationEnum(Enum):
+    ASCEND_910 = "Ascend_910"
+    ASCEND_950 = "Ascend_950"
+
+
 class NPUPlatformBase(Platform):
     _enum = PlatformEnum.NPU
     device_name: str = "npu"
     device_type: str = "npu"
     dispatch_key: str = "NPU"
     device_control_env_var: str = "ASCEND_RT_VISIBLE_DEVICES"
+
+    @classmethod
+    def platform_generation(cls) -> NPUGenerationEnum:
+        soc_version = torch.npu.get_soc_version()
+
+        if soc_version >= 260:
+            return NPUGenerationEnum.ASCEND_950
+
+        return NPUGenerationEnum.ASCEND_910
 
     @classmethod
     @lru_cache(maxsize=1)
@@ -123,15 +154,18 @@ class NPUPlatformBase(Platform):
                     LaserAttentionBackend,
                 )
 
+                _check_sgl_kernel_npu_ops("laser_attn", ("laser_attn",))
                 logger.info("Using Laser Attention backend")
 
                 return "sglang.multimodal_gen.runtime.layers.attention.backends.laser_attn.LaserAttentionBackend"
             except ImportError as e:
                 logger.error(f"Failed to import Laser Attention backend: {e}")
                 raise ImportError(
-                    "Laser Attention backend is not installed. "
-                    "It requires the `attentions` module which can be installed along with sgl_kernel_npu. "
-                    "Manual installation from source is required. See https://github.com/sgl-project/sgl-kernel-npu."
+                    "Laser Attention backend is unavailable. "
+                    "Laser Attention supports Ascend 910 (A2/A3) only. "
+                    "Install sgl_kernel_npu built for your device; "
+                    "on Ascend 950 (A5), select fa or rain_fusion_attn. "
+                    f"Details: {e}"
                 ) from e
 
         elif selected_backend == AttentionBackendEnum.BLOCK_SPARSE_ATTN:
@@ -140,15 +174,21 @@ class NPUPlatformBase(Platform):
                     BlockSparseAttentionBackend,
                 )
 
+                _check_sgl_kernel_npu_ops(
+                    "block_sparse_attn",
+                    ("sparse_block_estimate", "ada_block_sparse_attention"),
+                )
                 logger.info("Using Block Sparse Attention backend")
 
                 return "sglang.multimodal_gen.runtime.layers.attention.backends.block_sparse_attn.BlockSparseAttentionBackend"
             except ImportError as e:
                 logger.error(f"Failed to import Block Sparse Attention backend: {e}")
                 raise ImportError(
-                    "Block Sparse Attention backend is not installed. "
-                    "It requires the `attentions` module which can be installed along with sgl_kernel_npu. "
-                    "Manual installation from source is required. See https://github.com/sgl-project/sgl-kernel-npu."
+                    "Block Sparse Attention backend is unavailable. "
+                    "It supports Ascend 910 (A2/A3) only. "
+                    "Install sgl_kernel_npu built for your device; "
+                    "on Ascend 950 (A5), select fa or rain_fusion_attn. "
+                    f"Details: {e}"
                 ) from e
 
         elif selected_backend == AttentionBackendEnum.RAIN_FUSION_ATTN:
@@ -157,15 +197,20 @@ class NPUPlatformBase(Platform):
                     RainFusionAttentionBackend,
                 )
 
+                if cls.platform_generation() == NPUGenerationEnum.ASCEND_910:
+                    _check_sgl_kernel_npu_ops(
+                        "rain_fusion_attn dense path", ("laser_attn",)
+                    )
                 logger.info("Using Rain Fusion Attention backend")
 
                 return "sglang.multimodal_gen.runtime.layers.attention.backends.rain_fusion_attn.RainFusionAttentionBackend"
             except ImportError as e:
                 logger.error(f"Failed to import Rain Fusion Attention backend: {e}")
                 raise ImportError(
-                    "Rain Fusion Attention backend is not installed. "
-                    "It requires the `attentions` module which can be installed along with sgl_kernel_npu. "
-                    "Manual installation from source is required. See https://github.com/sgl-project/sgl-kernel-npu."
+                    "Rain Fusion Attention backend is unavailable. "
+                    "It requires torch_npu with npu_block_sparse_attention support; "
+                    "on A2/A3, the dense path also requires sgl_kernel_npu. "
+                    f"Details: {e}"
                 ) from e
 
         logger.info("Using Torch SDPA backend.")
