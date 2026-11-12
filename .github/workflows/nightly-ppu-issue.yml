@@ -1,0 +1,96 @@
+name: Nightly PPU Issue Tracker
+
+# Issues only: no Slack, no mail (as requested).
+#
+# Why a separate workflow instead of an if: always() job at the end of the test
+# file: when the build fails, needs holds the whole test line back, so that job
+# never exists -- and "the build failed" is exactly the red most worth recording.
+# Sitting outside both lines, workflow_run sees all four outcomes.
+on:
+  workflow_run:
+    workflows:
+      - "Release Docker Images Nightly (PPU)"
+      - "Nightly Test (PPU K8s)"
+    types: [completed]
+
+permissions:
+  contents: read
+  issues: write
+
+# One event at a time per workflow, so two completions in flight cannot both miss
+# the existing issue and each open one.
+concurrency:
+  group: nightly-ppu-issue
+  cancel-in-progress: false
+
+jobs:
+  track:
+    # Only runs on the default branch leave a trace. Debugging on a feature branch
+    # would open an issue per attempt, fill everyone's list, and then nobody reads
+    # the label any more.
+    if: >-
+      github.event.workflow_run.head_branch == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      REPO: ${{ github.repository }}
+      WF_NAME: ${{ github.event.workflow_run.name }}
+      WF_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+      RUN_URL: ${{ github.event.workflow_run.html_url }}
+      RUN_SHA: ${{ github.event.workflow_run.head_sha }}
+      RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+    steps:
+      - name: Ensure the label exists
+        run: |
+          gh label create nightly-red --repo "$REPO" --color B60205 \
+            --description "nightly red tracking (maintained automatically, closed on recovery)" || true
+
+      - name: Upsert the tracking issue
+        run: |
+          set -euo pipefail
+
+          # Cancelled and skipped are not accounted for: someone stopped it on
+          # purpose, that is not a regression.
+          case "$WF_CONCLUSION" in
+            success) outcome=green ;;
+            cancelled|skipped) echo "conclusion=${WF_CONCLUSION}, not tracked"; exit 0 ;;
+            *) outcome=red ;;
+          esac
+
+          # Claim the issue by a marker in the body rather than by title: the title
+          # may change later while the marker stays put, and a title change would
+          # otherwise leave a second, duplicate issue behind.
+          marker="<!-- nightly-ppu-issue:${WF_NAME} -->"
+          title="[nightly-red] ${WF_NAME}"
+
+          gh issue list --repo "$REPO" --label nightly-red --state open --limit 100 \
+            --json number,body \
+            --jq ".[] | select((.body // \"\") | contains(\"${marker}\")) | .number" \
+            > /tmp/open_nightly_issues.txt
+          number="$(head -1 /tmp/open_nightly_issues.txt)"
+
+          if [ "$outcome" = red ]; then
+            if [ -z "$number" ]; then
+              gh issue create --repo "$REPO" --title "$title" --label nightly-red \
+                --body "$(printf '%s\n\n`%s` failed: **%s** (attempt %s)\n\n- run: %s\n- commit: `%s`\n\nThis issue is maintained by a workflow: the same failure repeating only appends a comment below rather than opening a new one, and it closes itself once the run is green again.\n' \
+                  "$marker" "$WF_NAME" "$WF_CONCLUSION" "$RUN_ATTEMPT" "$RUN_URL" "${RUN_SHA:0:12}")"
+              exit 0
+            fi
+
+            # Retrying the same run delivers the same URL again; keying on the URL
+            # keeps the thread from filling up.
+            if gh issue view "$number" --repo "$REPO" --json comments \
+                --jq '.comments[].body' | grep -qF "$RUN_URL"; then
+              echo "run already recorded in #${number}, not commenting again"
+            else
+              gh issue comment "$number" --repo "$REPO" \
+                --body "$(printf 'Failed again: **%s** (attempt %s)\n\n- run: %s' \
+                  "$WF_CONCLUSION" "$RUN_ATTEMPT" "$RUN_URL")"
+            fi
+          elif [ -n "$number" ]; then
+            gh issue comment "$number" --repo "$REPO" \
+              --body "$(printf 'Recovered (%s)\n\n- run: %s' "$WF_NAME" "$RUN_URL")"
+            gh issue close "$number" --repo "$REPO"
+          else
+            echo "green and no open issue"
+          fi

@@ -1,8 +1,25 @@
 name: Nightly Test (PPU K8s)
 
+# This nightly starts at the build, not here. release-docker-ppu-nightly.yml pushes
+# the image to ghcr at 00:00 Beijing time; this file waits for that to succeed and
+# then tests the very same artifact.
+#
+# The old '0 16 * * *' schedule is gone: it started at the same moment as the
+# build, knew nothing about the outcome, so "which image was actually tested" had
+# no answer. workflow_run now carries that link.
+#
+# A non-empty test_image switches to "test the artifact": the pod runs on that
+# image (it already ships sglang and sgl-kernel, so the source install is skipped)
+# after image_healthcheck.sh has looked at it. Empty keeps the previous behaviour
+# exactly: fixed PPU base image plus a source install.
+#
+# Only the scheduled build is auto-linked. A manually dispatched build may carry
+# push=false and then finish with nothing to pull. To test a manual rebuild,
+# dispatch this file and point test_image at that build's tag.
 on:
-  schedule:
-    - cron: '0 16 * * *'  # 00:00 Beijing Time (UTC+8) every day
+  workflow_run:
+    workflows: ["Release Docker Images Nightly (PPU)"]
+    types: [completed]
   workflow_dispatch:
     inputs:
       ref:
@@ -10,10 +27,20 @@ on:
         required: false
         type: string
         default: ''
+      test_image:
+        description: 'Image under test (tag or image@sha256:...). Empty keeps the fixed PPU base image and installs sglang from source.'
+        required: false
+        type: string
+        default: ''
   workflow_call:
     inputs:
       ref:
         description: 'Git ref (branch, tag, or SHA) to test.'
+        required: false
+        type: string
+        default: ''
+      test_image:
+        description: 'Image under test (tag or image@sha256:...). Empty keeps the fixed PPU base image and installs sglang from source.'
         required: false
         type: string
         default: ''
@@ -35,14 +62,27 @@ env:
 
 jobs:
   prepare:
+    # workflow_run fires on every completed build: the failed ones, and the
+    # push-triggered runs the build file keeps for debugging. Only the scheduled
+    # build on the default branch is what this test line covers; nothing else
+    # enters.
+    if: >-
+      github.event_name != 'workflow_run' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'schedule' &&
+       github.event.workflow_run.head_branch == github.event.repository.default_branch)
     runs-on: ubuntu-latest
     outputs:
       ref: ${{ steps.source.outputs.ref }}
+      test_image: ${{ steps.image.outputs.tag }}
     steps:
       - name: Validate the requested source ref
         id: source
         env:
-          REQUESTED_REF: ${{ inputs.ref || github.sha }}
+          # There are no inputs under workflow_run, and github.sha is the head of
+          # the default branch rather than the commit that was built and is under
+          # test. Only head_sha answers that.
+          REQUESTED_REF: ${{ inputs.ref || github.event.workflow_run.head_sha || github.sha }}
         run: |
           if [[ "$REQUESTED_REF" =~ ^[0-9a-fA-F]{40}$ ]]; then
             :
@@ -54,6 +94,44 @@ jobs:
             exit 1
           fi
           printf 'ref=%s\n' "$REQUESTED_REF" >> "$GITHUB_OUTPUT"
+
+      # Settle "which image is under test" once, in prepare, so all four test jobs
+      # work from the same answer. The tag rule has to match Compute image metadata
+      # in release-docker-ppu-nightly.yml character for character: lowercased owner,
+      # / turned into - in the branch, UTC date, first 7 of the sha. Get it wrong
+      # and the tag does not exist in the registry, which the pod reports as
+      # ImagePullBackOff.
+      - name: Derive the image under test
+        id: image
+        env:
+          REQUESTED_IMAGE: ${{ inputs.test_image }}
+          BUILD_SHA: ${{ github.event.workflow_run.head_sha }}
+          BUILD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          BUILD_STARTED: ${{ github.event.workflow_run.created_at }}
+        run: |
+          set -euo pipefail
+          if [ -n "$REQUESTED_IMAGE" ]; then
+            printf 'tag=%s\n' "$REQUESTED_IMAGE" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ -z "$BUILD_SHA" ]; then
+            # Manual dispatch with no test_image: keep the fixed base image and
+            # the source install.
+            echo 'no build run behind this dispatch and no test_image given; keeping the source path'
+            printf 'tag=\n' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          owner_lc=$(printf '%s' "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          branch=$(printf '%s' "$BUILD_BRANCH" | sed 's|/|-|g; s/[^A-Za-z0-9._-]/-/g')
+          short_sha="${BUILD_SHA:0:7}"
+          # The build runs at most 300 minutes from 16:00 UTC and normally does not
+          # cross midnight. If it ever does, the date composed here is one day
+          # behind the build's own and the symptom is a failed image pull -- check
+          # this line first.
+          start_day=$(printf '%s' "$BUILD_STARTED" | cut -c1-10 | tr -d '-')
+          tag="${branch}-${start_day}-cuda13.0.0-sdk2.2.0-${short_sha}"
+          echo "image under test: ghcr.io/${owner_lc}/sglang-ppu-nightly:${tag}"
+          printf 'tag=ghcr.io/%s/sglang-ppu-nightly:%s\n' "$owner_lc" "$tag" >> "$GITHUB_OUTPUT"
 
   # Run independent workers concurrently. Separate jobs keep GITHUB_JOB unique,
   # so cluster-task staging directories, K8s Job names, and evidence stay isolated.
@@ -71,17 +149,28 @@ jobs:
           fetch-depth: 2
       - name: Resolve the base image digest
         run: bash scripts/ci/ppu/resolve_image_digest.sh
+      # Resolve the artifact's digest separately under the PPU_TEST_IMAGE prefix, so
+      # the base image's digest is never recorded as the artifact's and the
+      # performance trend keeps its attribution.
+      # A failure here is not an error: ghcr may withhold an anonymous token, and
+      # the pod is still pinned to an immutable tag, which names exactly one image.
+      - name: Resolve the image under test
+        if: ${{ needs.prepare.outputs.test_image != '' }}
+        env:
+          PPU_RESOLVE_INPUT: ${{ needs.prepare.outputs.test_image }}
+          PPU_RESOLVE_PREFIX: PPU_TEST_IMAGE
+        run: bash scripts/ci/ppu/resolve_image_digest.sh
       - name: Run PPU nightly tests (1-GPU, partition 1/2) via K8s
         uses: flytiger-eco/shared-workflows/cluster-task@4692d51c552e8cdf4f267adfdef1e484ca685a6a
         with:
-          image: ${{ env.PPU_BASE_IMAGE_REF || env.PPU_BASE_IMAGE }}
+          image: ${{ env.PPU_TEST_IMAGE_REF || env.PPU_BASE_IMAGE_REF || env.PPU_BASE_IMAGE }}
           nnodes: 0
           nproc_per_node: 1
           node_selector: board-type=ZW-810E
           namespace: ppu-sched
           job_suffix: ${{ github.job }}
           host_volumes: "/wl_nas/cache/sglang-jit-ci:/root/.cache/tvm-ffi,/wl_nas/cache/sglang-dg-cache:/root/.cache/sglang/deep_gemm,/wl_nas/cache/sglang-jit:/root/.cache/sglang/jit"
-          extra_env: "PPU_EXPECTED_DEVICES=1,SGLANG_IS_IN_CI=true,SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1,SGL_KERNEL_WHEEL_CACHE_DIR=/nas_aisw/cache/sgl-kernel-wheels,PPU_BASE_IMAGE_REF=${{ env.PPU_BASE_IMAGE_REF || env.PPU_BASE_IMAGE }},PPU_BASE_IMAGE_DIGEST=${{ env.PPU_BASE_IMAGE_DIGEST }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_SDK_VERSION=${{ env.PPU_SDK_VERSION }},SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1,SGLANG_SAIL_PLA_CUDA=0,CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include,HF_HUB_OFFLINE=1,HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_SUPPORTS_FP8=0,PIP_INDEX_URL=https://pypi.org/simple"
+          extra_env: "PPU_EXPECTED_DEVICES=1,SGLANG_IS_IN_CI=true,SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1,SGL_KERNEL_WHEEL_CACHE_DIR=/nas_aisw/cache/sgl-kernel-wheels,PPU_TEST_MODE=${{ needs.prepare.outputs.test_image != '' && 'image' || 'source' }},PPU_TEST_IMAGE_REF=${{ env.PPU_TEST_IMAGE_REF }},PPU_TEST_IMAGE_DIGEST=${{ env.PPU_TEST_IMAGE_DIGEST }},PPU_EXPECTED_COMMIT=${{ needs.prepare.outputs.ref }},PPU_BASE_IMAGE_REF=${{ env.PPU_BASE_IMAGE_REF || env.PPU_BASE_IMAGE }},PPU_BASE_IMAGE_DIGEST=${{ env.PPU_BASE_IMAGE_DIGEST }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_SDK_VERSION=${{ env.PPU_SDK_VERSION }},SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1,SGLANG_SAIL_PLA_CUDA=0,CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include,HF_HUB_OFFLINE=1,HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_SUPPORTS_FP8=0,PIP_INDEX_URL=https://pypi.org/simple"
           command: |
             set -euo pipefail
             cd /workspace/source
@@ -108,6 +197,13 @@ jobs:
             else
               echo 'Skipped JIT mtime pinning; JIT will recompile'
             fi
+            # In image mode, look at the artifact before running any case: the
+            # commit baked into it, whether it imports, whether the tested code
+            # really comes from the image rather than this checkout, the kernel op
+            # surface, and one server brought up for /health plus one request. If
+            # any of that fails, more cases cannot change the conclusion.
+            # In source mode the script exits 0 and behaviour is unchanged.
+            bash scripts/ci/ppu/image_healthcheck.sh "$PPU_EVIDENCE_DIR"
             bash scripts/ci/ppu/run_nightly_suite.sh nightly-1-ppu 0 "$PPU_EVIDENCE_DIR" 6600
           container_options: |
             privileged: true
@@ -150,17 +246,28 @@ jobs:
           fetch-depth: 2
       - name: Resolve the base image digest
         run: bash scripts/ci/ppu/resolve_image_digest.sh
+      # Resolve the artifact's digest separately under the PPU_TEST_IMAGE prefix, so
+      # the base image's digest is never recorded as the artifact's and the
+      # performance trend keeps its attribution.
+      # A failure here is not an error: ghcr may withhold an anonymous token, and
+      # the pod is still pinned to an immutable tag, which names exactly one image.
+      - name: Resolve the image under test
+        if: ${{ needs.prepare.outputs.test_image != '' }}
+        env:
+          PPU_RESOLVE_INPUT: ${{ needs.prepare.outputs.test_image }}
+          PPU_RESOLVE_PREFIX: PPU_TEST_IMAGE
+        run: bash scripts/ci/ppu/resolve_image_digest.sh
       - name: Run PPU nightly tests (1-GPU, partition 2/2) via K8s
         uses: flytiger-eco/shared-workflows/cluster-task@4692d51c552e8cdf4f267adfdef1e484ca685a6a
         with:
-          image: ${{ env.PPU_BASE_IMAGE_REF || env.PPU_BASE_IMAGE }}
+          image: ${{ env.PPU_TEST_IMAGE_REF || env.PPU_BASE_IMAGE_REF || env.PPU_BASE_IMAGE }}
           nnodes: 0
           nproc_per_node: 1
           node_selector: board-type=ZW-810E
           namespace: ppu-sched
           job_suffix: ${{ github.job }}
           host_volumes: "/wl_nas/cache/sglang-jit-ci:/root/.cache/tvm-ffi,/wl_nas/cache/sglang-dg-cache:/root/.cache/sglang/deep_gemm,/wl_nas/cache/sglang-jit:/root/.cache/sglang/jit"
-          extra_env: "PPU_EXPECTED_DEVICES=1,SGLANG_IS_IN_CI=true,SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1,SGL_KERNEL_WHEEL_CACHE_DIR=/nas_aisw/cache/sgl-kernel-wheels,PPU_BASE_IMAGE_REF=${{ env.PPU_BASE_IMAGE_REF || env.PPU_BASE_IMAGE }},PPU_BASE_IMAGE_DIGEST=${{ env.PPU_BASE_IMAGE_DIGEST }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_SDK_VERSION=${{ env.PPU_SDK_VERSION }},SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1,SGLANG_SAIL_PLA_CUDA=0,CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include,HF_HUB_OFFLINE=1,HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_SUPPORTS_FP8=0,PIP_INDEX_URL=https://pypi.org/simple"
+          extra_env: "PPU_EXPECTED_DEVICES=1,SGLANG_IS_IN_CI=true,SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1,SGL_KERNEL_WHEEL_CACHE_DIR=/nas_aisw/cache/sgl-kernel-wheels,PPU_TEST_MODE=${{ needs.prepare.outputs.test_image != '' && 'image' || 'source' }},PPU_TEST_IMAGE_REF=${{ env.PPU_TEST_IMAGE_REF }},PPU_TEST_IMAGE_DIGEST=${{ env.PPU_TEST_IMAGE_DIGEST }},PPU_EXPECTED_COMMIT=${{ needs.prepare.outputs.ref }},PPU_BASE_IMAGE_REF=${{ env.PPU_BASE_IMAGE_REF || env.PPU_BASE_IMAGE }},PPU_BASE_IMAGE_DIGEST=${{ env.PPU_BASE_IMAGE_DIGEST }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_SDK_VERSION=${{ env.PPU_SDK_VERSION }},SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1,SGLANG_SAIL_PLA_CUDA=0,CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include,HF_HUB_OFFLINE=1,HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_SUPPORTS_FP8=0,PIP_INDEX_URL=https://pypi.org/simple"
           command: |
             set -euo pipefail
             cd /workspace/source
@@ -229,17 +336,28 @@ jobs:
           fetch-depth: 2
       - name: Resolve the base image digest
         run: bash scripts/ci/ppu/resolve_image_digest.sh
+      # Resolve the artifact's digest separately under the PPU_TEST_IMAGE prefix, so
+      # the base image's digest is never recorded as the artifact's and the
+      # performance trend keeps its attribution.
+      # A failure here is not an error: ghcr may withhold an anonymous token, and
+      # the pod is still pinned to an immutable tag, which names exactly one image.
+      - name: Resolve the image under test
+        if: ${{ needs.prepare.outputs.test_image != '' }}
+        env:
+          PPU_RESOLVE_INPUT: ${{ needs.prepare.outputs.test_image }}
+          PPU_RESOLVE_PREFIX: PPU_TEST_IMAGE
+        run: bash scripts/ci/ppu/resolve_image_digest.sh
       - name: Run 2-GPU PPU nightly tests via K8s
         uses: flytiger-eco/shared-workflows/cluster-task@4692d51c552e8cdf4f267adfdef1e484ca685a6a
         with:
-          image: ${{ env.PPU_BASE_IMAGE_REF || env.PPU_BASE_IMAGE }}
+          image: ${{ env.PPU_TEST_IMAGE_REF || env.PPU_BASE_IMAGE_REF || env.PPU_BASE_IMAGE }}
           nnodes: 0
           nproc_per_node: 2
           node_selector: board-type=ZW-810E
           namespace: ppu-sched
           job_suffix: ${{ github.job }}
           host_volumes: "/wl_nas/cache/sglang-jit-ci:/root/.cache/tvm-ffi,/wl_nas/cache/sglang-dg-cache:/root/.cache/sglang/deep_gemm,/wl_nas/cache/sglang-jit:/root/.cache/sglang/jit"
-          extra_env: "PPU_EXPECTED_DEVICES=2,SGLANG_IS_IN_CI=true,SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1,SGL_KERNEL_WHEEL_CACHE_DIR=/nas_aisw/cache/sgl-kernel-wheels,PPU_BASE_IMAGE_REF=${{ env.PPU_BASE_IMAGE_REF || env.PPU_BASE_IMAGE }},PPU_BASE_IMAGE_DIGEST=${{ env.PPU_BASE_IMAGE_DIGEST }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_SDK_VERSION=${{ env.PPU_SDK_VERSION }},SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1,SGLANG_SAIL_PLA_CUDA=0,CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include,HF_HUB_OFFLINE=1,HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_SUPPORTS_FP8=0,PIP_INDEX_URL=https://pypi.org/simple"
+          extra_env: "PPU_EXPECTED_DEVICES=2,SGLANG_IS_IN_CI=true,SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1,SGL_KERNEL_WHEEL_CACHE_DIR=/nas_aisw/cache/sgl-kernel-wheels,PPU_TEST_MODE=${{ needs.prepare.outputs.test_image != '' && 'image' || 'source' }},PPU_TEST_IMAGE_REF=${{ env.PPU_TEST_IMAGE_REF }},PPU_TEST_IMAGE_DIGEST=${{ env.PPU_TEST_IMAGE_DIGEST }},PPU_EXPECTED_COMMIT=${{ needs.prepare.outputs.ref }},PPU_BASE_IMAGE_REF=${{ env.PPU_BASE_IMAGE_REF || env.PPU_BASE_IMAGE }},PPU_BASE_IMAGE_DIGEST=${{ env.PPU_BASE_IMAGE_DIGEST }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_SDK_VERSION=${{ env.PPU_SDK_VERSION }},SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1,SGLANG_SAIL_PLA_CUDA=0,CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include,HF_HUB_OFFLINE=1,HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_SUPPORTS_FP8=0,PIP_INDEX_URL=https://pypi.org/simple"
           command: |
             set -euo pipefail
             cd /workspace/source
@@ -299,17 +417,28 @@ jobs:
           fetch-depth: 2
       - name: Resolve the base image digest
         run: bash scripts/ci/ppu/resolve_image_digest.sh
+      # Resolve the artifact's digest separately under the PPU_TEST_IMAGE prefix, so
+      # the base image's digest is never recorded as the artifact's and the
+      # performance trend keeps its attribution.
+      # A failure here is not an error: ghcr may withhold an anonymous token, and
+      # the pod is still pinned to an immutable tag, which names exactly one image.
+      - name: Resolve the image under test
+        if: ${{ needs.prepare.outputs.test_image != '' }}
+        env:
+          PPU_RESOLVE_INPUT: ${{ needs.prepare.outputs.test_image }}
+          PPU_RESOLVE_PREFIX: PPU_TEST_IMAGE
+        run: bash scripts/ci/ppu/resolve_image_digest.sh
       - name: Run 4-GPU PPU nightly tests via K8s
         uses: flytiger-eco/shared-workflows/cluster-task@4692d51c552e8cdf4f267adfdef1e484ca685a6a
         with:
-          image: ${{ env.PPU_BASE_IMAGE_REF || env.PPU_BASE_IMAGE }}
+          image: ${{ env.PPU_TEST_IMAGE_REF || env.PPU_BASE_IMAGE_REF || env.PPU_BASE_IMAGE }}
           nnodes: 0
           nproc_per_node: 4
           node_selector: board-type=ZW-810E
           namespace: ppu-sched
           job_suffix: ${{ github.job }}
           host_volumes: "/wl_nas/cache/sglang-jit-ci:/root/.cache/tvm-ffi,/wl_nas/cache/sglang-dg-cache:/root/.cache/sglang/deep_gemm,/wl_nas/cache/sglang-jit:/root/.cache/sglang/jit"
-          extra_env: "PPU_EXPECTED_DEVICES=4,SGLANG_IS_IN_CI=true,SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1,SGL_KERNEL_WHEEL_CACHE_DIR=/nas_aisw/cache/sgl-kernel-wheels,PPU_BASE_IMAGE_REF=${{ env.PPU_BASE_IMAGE_REF || env.PPU_BASE_IMAGE }},PPU_BASE_IMAGE_DIGEST=${{ env.PPU_BASE_IMAGE_DIGEST }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_SDK_VERSION=${{ env.PPU_SDK_VERSION }},SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1,SGLANG_SAIL_PLA_CUDA=0,CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include,HF_HUB_OFFLINE=1,HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_SUPPORTS_FP8=0,PIP_INDEX_URL=https://pypi.org/simple"
+          extra_env: "PPU_EXPECTED_DEVICES=4,SGLANG_IS_IN_CI=true,SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1,SGL_KERNEL_WHEEL_CACHE_DIR=/nas_aisw/cache/sgl-kernel-wheels,PPU_TEST_MODE=${{ needs.prepare.outputs.test_image != '' && 'image' || 'source' }},PPU_TEST_IMAGE_REF=${{ env.PPU_TEST_IMAGE_REF }},PPU_TEST_IMAGE_DIGEST=${{ env.PPU_TEST_IMAGE_DIGEST }},PPU_EXPECTED_COMMIT=${{ needs.prepare.outputs.ref }},PPU_BASE_IMAGE_REF=${{ env.PPU_BASE_IMAGE_REF || env.PPU_BASE_IMAGE }},PPU_BASE_IMAGE_DIGEST=${{ env.PPU_BASE_IMAGE_DIGEST }},PPU_BASE_IMAGE=${{ env.PPU_BASE_IMAGE }},PPU_SDK_VERSION=${{ env.PPU_SDK_VERSION }},SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1,SGLANG_SAIL_PLA_CUDA=0,CPLUS_INCLUDE_PATH=/usr/local/PPU_SDK/targets/x86_64-linux/include,HF_HUB_OFFLINE=1,HF_HUB_CACHE=/nas_aisw/datasets/hf_cache/hub,PPU_ARTIFACTORY_USER=${{ secrets.PPU_ARTIFACTORY_USER }},PPU_ARTIFACTORY_PASSWORD=${{ secrets.PPU_ARTIFACTORY_PASSWORD }},PPU_SUPPORTS_FP8=0,PIP_INDEX_URL=https://pypi.org/simple"
           command: |
             set -euo pipefail
             cd /workspace/source
@@ -356,7 +485,10 @@ jobs:
   # Restore the 8-PPU job only after real 8-PPU registrations pass hardware validation.
   nightly-test-ppu-finish:
     needs: [prepare, nightly-1a-ppu, nightly-1b-ppu, nightly-2-ppu, nightly-4-ppu]
-    if: always()
+    # When the build fails, prepare holds this whole line back and the red run is
+    # the build's own, already tracked by the issue. Turning this red as well only
+    # reads as "the tests broke", so summarise only when tests actually ran.
+    if: ${{ !cancelled() && needs.prepare.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
       - name: Check all dependent job statuses

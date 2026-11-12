@@ -22,6 +22,25 @@ if [[ -z "${PPU_E2E_PLAN:-}" ]]; then
     git config --global --add safe.directory "${REPO_ROOT}"
 fi
 
+# ==================== No source install when the artifact is the image ==================== #
+# nightly-test-ppu.yml now tests the image release-docker-ppu-nightly.yml built.
+# sglang and sgl-kernel are already installed in it, so installing from source
+# again would quietly swap out the object under test -- exactly what this change
+# removes. With PPU_TEST_MODE=image only the test framework is added (the runtime
+# target of ppu.Dockerfile carries no pytest) and both the source install and the
+# kernel rebuild are skipped wholesale.
+#
+# The items below still run in both modes: the pip/wheel upgrade, the uvicorn
+# 0.37 and dill 0.3.8 corrections, the EIC SDK and mooncake. These are the test
+# bench's own runtime dependencies, not the object under test; missing them
+# produces a pile of failures that only exist on the "install the artifact" line,
+# which is far harder to read than two extra packages.
+PPU_TEST_MODE="${PPU_TEST_MODE:-source}"
+case "$PPU_TEST_MODE" in
+    source|image) ;;
+    *) echo "Unknown PPU_TEST_MODE: ${PPU_TEST_MODE}" >&2; exit 1 ;;
+esac
+
 # Only pip/wheel. Deliberately NOT setuptools or dill: the v2.1.1 image pins them
 # to satisfy constraints that an --upgrade breaks (observed in run 31663500015):
 #   setuptools 84.0.0 -> torch 2.11.0 requires setuptools<82
@@ -63,6 +82,10 @@ ${PIP_INSTALL} /nas_aisw/datasets/packages/uvicorn-0.37.0-py3-none-any.whl --for
 # _abc._abc_data unpicklable with dill<0.3.8, crashing custom_logit_processor
 # tests. Upgrade to 0.3.8 (still satisfies datasets' dill<0.3.9 constraint).
 ${PIP_INSTALL} "dill>=0.3.8,<0.3.9"
+
+if [[ "$PPU_TEST_MODE" == "image" ]]; then
+    echo "PPU_TEST_MODE=image: sglang and sgl-kernel ship in the image under test; skipping the source install and the kernel rebuild"
+else
 
 # ==================== Install SGLang from source ==================== #
 # The version this install reports for itself, settled before pyproject.toml is
@@ -145,6 +168,15 @@ _kernel_start=$SECONDS
 bash "${REPO_ROOT}/scripts/ci/ppu/ppu_build_kernel.sh"
 if [[ "$PPU_INSTALL_PROFILE" == "pr" ]]; then
     printf '{"aot_seconds":%s}\n' "$((SECONDS-_kernel_start))" > "${PPU_INSTALL_EVIDENCE_DIR:-${PPU_EVIDENCE_DIR:?}}/aot.json"
+fi
+
+fi # PPU_TEST_MODE != image
+
+# The runtime target of ppu.Dockerfile carries no test framework, so add it here
+# in image mode. These packages never touch the sglang under test; they are only
+# what run_suite.py needs in order to start.
+if [[ "$PPU_TEST_MODE" == "image" ]]; then
+    ${PIP_INSTALL} pytest==8.3.5 PyYAML==6.0.3 jsonschema tabulate
 fi
 
 # PR suites need pytest but never PD/EIC installation; nightly keeps its defaults.

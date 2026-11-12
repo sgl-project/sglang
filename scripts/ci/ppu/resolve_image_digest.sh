@@ -23,29 +23,49 @@
 # existed; a nightly must not go red over provenance it cannot look up.
 #
 # Reads:
-#   PPU_BASE_IMAGE  the image, in tag form
-#   GITHUB_ENV      appended to, for the steps that follow
+#   PPU_BASE_IMAGE      the image, in tag form
+#   GITHUB_ENV          appended to, for the steps that follow
+#
+# Optional, so that one script serves both images a nightly run touches -- the
+# platform base the pods run on, and the build product they are meant to test:
+#   PPU_RESOLVE_INPUT   image to resolve instead of PPU_BASE_IMAGE
+#   PPU_RESOLVE_PREFIX  variable name prefix to write, default PPU_BASE_IMAGE
+#                       (the artifact image passes PPU_TEST_IMAGE, so the two
+#                       digests land in separate fields and a trend row can tell
+#                       "the platform moved" from "the product moved")
+#   PPU_RESOLVE_STRICT  "1" turns every give-up below into a failure. The base
+#                       image keeps the default: provenance it cannot look up is
+#                       no reason to redden a nightly. The artifact image passes
+#                       it, because there a missing digest means the pods are
+#                       about to run something nobody named.
 #
 # Writes, as environment for later steps:
-#   PPU_BASE_IMAGE_DIGEST  sha256:... , or empty when the lookup failed
-#   PPU_BASE_IMAGE_REF     what the pods should run: image@digest, or the tag
+#   <PREFIX>_DIGEST  sha256:... , or empty when the lookup failed
+#   <PREFIX>_REF     what the pods should run: image@digest, or the tag
 #
 # Usage: bash scripts/ci/ppu/resolve_image_digest.sh
 set -uo pipefail
 
-image="${PPU_BASE_IMAGE:-}"
+image="${PPU_RESOLVE_INPUT:-${PPU_BASE_IMAGE:-}}"
+prefix="${PPU_RESOLVE_PREFIX:-PPU_BASE_IMAGE}"
+strict="${PPU_RESOLVE_STRICT:-0}"
 if [ -z "${image}" ]; then
-  echo "::error::PPU_BASE_IMAGE is not set" >&2
+  echo "::error::PPU_BASE_IMAGE (or PPU_RESOLVE_INPUT) is not set" >&2
   exit 1
 fi
 
 # Give up rather than fail, in one place, so that every unhappy path below leaves
-# the run exactly as it was before this step existed.
+# the run exactly as it was before this step existed -- unless the caller asked
+# for strict, in which case giving up is itself the failure.
 give_up() {
+  if [ "${strict}" = "1" ]; then
+    echo "::error::could not resolve the digest of ${image} (${1})" >&2
+    exit 1
+  fi
   echo "::warning::could not resolve the digest of ${image} (${1}); recording none"
   {
-    echo "PPU_BASE_IMAGE_DIGEST="
-    echo "PPU_BASE_IMAGE_REF=${image}"
+    echo "${prefix}_DIGEST="
+    echo "${prefix}_REF=${image}"
   } >> "${GITHUB_ENV}"
   exit 0
 }
@@ -114,6 +134,6 @@ esac
 
 echo "${image} is ${digest}"
 {
-  echo "PPU_BASE_IMAGE_DIGEST=${digest}"
-  echo "PPU_BASE_IMAGE_REF=${registry}/${repository}@${digest}"
+  echo "${prefix}_DIGEST=${digest}"
+  echo "${prefix}_REF=${registry}/${repository}@${digest}"
 } >> "${GITHUB_ENV}"
