@@ -751,7 +751,9 @@ class UnifiedRadixCache(BasePrefixCache):
         # Fail fast on re-entrancy without touching the in-flight walk.
         assert not self.tree_core.has_ongoing_insert(), "re-entrant insert"
         if self.buffer_pipeline is not None:
-            self.buffer_pipeline.begin_insert_walk()
+            self.buffer_pipeline.begin_insert_walk(
+                is_request_end=params.is_request_end, key_len=len(params.key)
+            )
         # External linker offloads (BackupKV) issued by this insert carry its session.
         self.insert_session_id = params.session_id
         # Pump the resumable insert, applying each step's actions at its barrier.
@@ -762,6 +764,8 @@ class UnifiedRadixCache(BasePrefixCache):
                 if step.result is not None:
                     # Walk actions flow through the steps; the result is action-free.
                     assert not step.result.cache_actions
+                    if self.buffer_pipeline is not None:
+                        self.buffer_pipeline.on_insert_complete(step.result)
                     return step.result
                 step = self.tree_core.resume_insert()
         finally:
@@ -1587,6 +1591,13 @@ class UnifiedRadixCache(BasePrefixCache):
             priority=req.priority or 0,
             session_id=req.session_id,
             rotation_base=req.kv_rotation_base,
+            is_request_end=(
+                is_finished
+                or (
+                    get_disagg().disaggregation_mode == "prefill"
+                    and up_to >= len(req.origin_input_ids)
+                )
+            ),
         )
         effective_cache_len = len(token_ids)
         for comp in self._components_tuple:
