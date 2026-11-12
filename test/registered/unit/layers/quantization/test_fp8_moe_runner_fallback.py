@@ -60,6 +60,33 @@ class TestFp8MoeRunnerFallback(CustomTestCase):
                     )
                     self.assertIsInstance(method, expected)
 
+    def test_mxfp8_routed_experts_leave_the_other_layers_block_wise(self):
+        """Only the routed-expert method sees MXFP8; the config itself stays block-wise FP8."""
+        layer = FusedMoE.__new__(FusedMoE)
+        torch.nn.Module.__init__(layer)
+        with patch.object(
+            fp8,
+            "get_moe_runner_backend",
+            return_value=MoeRunnerBackend.FLASHINFER_TRTLLM_ROUTED,
+        ):
+            for is_mxfp8 in (True, False):
+                with self.subTest(is_mxfp8=is_mxfp8):
+                    config = fp8.Fp8Config(
+                        is_checkpoint_fp8_serialized=True,
+                        weight_block_size=[128, 128],
+                    )
+                    config.is_mxfp8_experts = is_mxfp8
+                    method = config.get_quant_method(
+                        layer, "model.layers.0.mlp.experts"
+                    )
+                    self.assertIsInstance(method, fp8.Fp8MoEMethod)
+                    self.assertEqual(method.use_mxfp8, is_mxfp8)
+                    self.assertEqual(
+                        method.weight_block_size, [1, 32] if is_mxfp8 else [128, 128]
+                    )
+                    self.assertFalse(config.use_mxfp8)
+                    self.assertEqual(config.weight_block_size, [128, 128])
+
     def _runner_backend_for(self, global_backend):
         method = fp8.Fp8MoEMethod.__new__(fp8.Fp8MoEMethod)
         with patch.object(fp8, "get_moe_runner_backend", return_value=global_backend):
