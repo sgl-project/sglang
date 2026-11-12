@@ -14,6 +14,13 @@ register_npu_ci(
     nightly=True,
 )
 
+# TEMP: isolated suite used only by the expandable_segments validation PR.
+register_npu_ci(
+    est_time=3600,
+    suite="nightly-perf-2-npu-a3-temp-27b-1080p",
+    nightly=True,
+)
+
 QWEN3_6_27B_1080P_ENVS = {
     "STREAMS_PER_DEVICE": "32",
     "HCCL_SOCKET_IFNAME": "lo",
