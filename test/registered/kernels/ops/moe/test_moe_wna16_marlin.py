@@ -1251,6 +1251,7 @@ def test_muse_marlin_inactive_routes(
     layer.quant_config = SimpleNamespace(group_size=16)
     layer.moe_runner_config = SimpleNamespace(is_gated=True)
     layer.params_dtype = dtype
+    layer.expert_tp_size = 1
     layer.intermediate_size_per_partition = intermediate
     layer.num_local_experts = local_experts
     layer.global_num_experts = 4 if use_expert_map else local_experts
