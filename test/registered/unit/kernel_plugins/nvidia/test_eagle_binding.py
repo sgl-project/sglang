@@ -544,10 +544,22 @@ class TestEagleBinding(CustomTestCase):
         linear.kernel_dispatcher = SimpleNamespace(extend_kernel=TritonGDNKernel())
         linear.requires_contiguous_prefill_state = True
         binding = eb.EagleBinding(model=torch.nn.Module())
+        forward_batch = SimpleNamespace(extend_prefix_lens=torch.tensor([0, 64]))
+        meta.track_chunk_idx = torch.tensor([1], dtype=torch.int32)
+        meta.track_ssm_h_batch_src = torch.tensor([1], dtype=torch.int64)
         with patch.object(eb, "get_attn_backend", return_value=backend):
-            view = binding.prefill_view()
+            view = binding.prefill_view(forward_batch)
         self.assertIs(view.state.temporal, state.temporal)
         self.assertIs(view.state_indices, meta.mamba_cache_indices)
+        # what a prefill covering the full-attention layers and resumed or
+        # checkpointed GDN state reads
+        attn = backend.full_attn_backend.forward_metadata
+        self.assertIs(view.attn.page_table, attn.page_table)
+        router = backend.token_to_kv_pool.layer_router
+        self.assertIs(view.parts.part_view(STATE_PART), router.part_view(STATE_PART))
+        self.assertIs(view.extend_prefix_lens, forward_batch.extend_prefix_lens)
+        self.assertIs(view.track_chunk_idx, meta.track_chunk_idx)
+        self.assertIs(view.track_ssm_h_batch_src, meta.track_ssm_h_batch_src)
 
     def test_existing_forward_wrapper_selects_the_prefill_data_view(self):
         views = SimpleNamespace(
@@ -561,10 +573,9 @@ class TestEagleBinding(CustomTestCase):
             built=built, original=MagicMock(), binding=views
         ).wrapped()
         with patch.object(torch.cuda, "is_current_stream_capturing", return_value=True):
-            self.assertEqual(
-                wrapped(torch.zeros(5), None, SimpleNamespace(batch_size=5)), "prefill"
-            )
-        views.prefill_view.assert_called_once_with()
+            forward_batch = SimpleNamespace(batch_size=5)
+            self.assertEqual(wrapped(torch.zeros(5), None, forward_batch), "prefill")
+        views.prefill_view.assert_called_once_with(forward_batch)
         views.forward_view.assert_not_called()
 
     def test_prefill_without_an_offered_plan_uses_stock(self):

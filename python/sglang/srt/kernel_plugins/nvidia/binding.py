@@ -1608,7 +1608,7 @@ class _Dispatch:
                         self.binding.seal_capture_view(forward_batch, view)
             else:
                 view = (
-                    self.binding.prefill_view()
+                    self.binding.prefill_view(forward_batch)
                     if step.mode == "prefill"
                     else self.binding.forward_view(forward_batch)
                 )

@@ -207,6 +207,15 @@ class LinearPrefillView(msgspec.Struct, frozen=True):
     num_state_checkpoints: int
     state_checkpoint_every_n_tokens: int
     output: Optional[torch.Tensor] = None
+    # the full-attention layers' step data (attn_step_view) and the pools' layers
+    attn: Optional[msgspec.Struct] = None
+    parts: Optional[LayerStateView] = None
+    # [bs] each request's cached prefix length: > 0 resumes from its state slot
+    extend_prefix_lens: Optional[torch.Tensor] = None
+    # per tracked request: the chunk whose state the track checkpoints, and the
+    # batch row of a chunk-unaligned one in a kernel's track-state snapshot
+    track_chunk_idx: Optional[torch.Tensor] = None
+    track_ssm_h_batch_src: Optional[torch.Tensor] = None
 
 
 class EagleDraftLoopIO(msgspec.Struct, frozen=True):
@@ -311,10 +320,10 @@ class EagleBinding:
             parts=self._read("parts", self._parts, backend),
         )
 
-    def prefill_view(self) -> LinearPrefillView:
+    def prefill_view(self, forward_batch: Optional[Any] = None) -> LinearPrefillView:
         """Publish the active prefill's tensors without speculative pool readers."""
         backend = get_attn_backend()
-        _, linear = split_backend(backend)
+        full, linear = split_backend(backend)
         if linear is None:
             raise RuntimeError(
                 "linear prefill view requires a linear-attention backend"
@@ -341,6 +350,13 @@ class EagleBinding:
             state_checkpoint_cu_starts=meta.state_checkpoint_cu_starts,
             num_state_checkpoints=meta.num_state_checkpoints,
             state_checkpoint_every_n_tokens=meta.state_checkpoint_every_n_tokens,
+            attn=attn_step_view(full, forward_batch),
+            parts=self._read("parts", self._parts, backend),
+            extend_prefix_lens=(
+                None if forward_batch is None else forward_batch.extend_prefix_lens
+            ),
+            track_chunk_idx=meta.track_chunk_idx,
+            track_ssm_h_batch_src=meta.track_ssm_h_batch_src,
         )
 
     def assert_live(self) -> None:
