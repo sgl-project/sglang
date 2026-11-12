@@ -43,8 +43,6 @@ class LIMDecodeAdapter:
         self.rows = manager.size
         self.batch_capacity = manager.batch_capacity
         self.max_query_width = manager.max_query_width
-        self.top_k = manager.sparse_context_len
-        self.source_capacity = manager.max_context_len
         self.index_head_dim = manager.budget.index_head_dim
         self.index_n_heads = manager.budget.index_n_heads
         self.operator = load_fused_lim_operator()

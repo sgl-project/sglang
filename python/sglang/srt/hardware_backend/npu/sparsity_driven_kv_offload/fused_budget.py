@@ -82,8 +82,6 @@ class BudgetPlan:
         self.batch_capacity = batch_capacity
         self.cache_tokens = cache_tokens
         self.page_size = page_size
-        self.kv_lora_rank = kv_lora_rank
-        self.qk_rope_head_dim = qk_rope_head_dim
         self.index_head_dim = index_head_dim
         self.index_n_heads = index_n_heads
         self.kv_cache_dim = kv_lora_rank + qk_rope_head_dim

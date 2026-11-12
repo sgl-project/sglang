@@ -113,7 +113,6 @@ class FusedSparseKVCacheManager:
         self.host_token_capacity = self.budget.host_token_capacity
         self.device_cache_size = self.budget.cache_tokens
         self._prefill_workspace_stream = None
-        self._slot_map_width = self.budget.context_len
         logger.info(
             "Sparse KV per rank: K=%d C=%d, managed HBM=%.2f MiB, host KV=%.2f MiB, host_layout=paged",
             self.sparse_context_len,
@@ -489,7 +488,7 @@ class FusedSparseKVCacheManager:
                     + torch.arange(num_src_kvs, device=device, dtype=torch.long)
                     - flat_seq_starts
                 )
-                token_to_slots, token_positions = flat_req_ids, token_pos
+                token_positions = token_pos
                 valid_mask = (
                     (flat_req_ids > 0)
                     & (token_pos >= 0)
@@ -517,7 +516,6 @@ class FusedSparseKVCacheManager:
                 req_ids_2d = req_ids.unsqueeze(1).expand(batch_size, tokens_per_req)
                 token_pos_2d = extend_prefix_lens.unsqueeze(1) + local_offsets
 
-                token_to_slots = req_ids_2d.reshape(-1).contiguous()
                 token_positions = token_pos_2d.reshape(-1).contiguous()
                 valid_mask = (
                     (local_offsets < extend_seq_lens.unsqueeze(1))
