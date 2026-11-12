@@ -21,7 +21,6 @@ import msgspec
 import torch
 
 from sglang.srt.constants import (
-    GPU_MEMORY_ALL_TYPES,
     GPU_MEMORY_TYPE_CUDA_GRAPH,
     GPU_MEMORY_TYPE_KV_CACHE,
     GPU_MEMORY_TYPE_WEIGHTS,
@@ -64,6 +63,11 @@ from sglang.srt.managers.scheduler_components.request_list import (
 from sglang.srt.model_executor.weight_checker import overall_checksum
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_model, get_parallel
+from sglang.srt.utils.sleep_comm import (
+    all_known_tags,
+    make_sleep_comm_backend,
+    resolve_release_tags,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -468,25 +472,80 @@ class SchedulerWeightUpdaterManager:
             [count for count, _ in outcomes],
         )
 
+    def _sleep_comm_backend(self):
+        """The current platform's comm-tag executor, or None when it has none."""
+        return make_sleep_comm_backend(
+            tp_worker=self.tp_worker,
+            draft_worker=self.draft_worker,
+            scheduler=self.scheduler,
+        )
+
     def release_memory_occupation(self, recv_req: ReleaseMemoryOccupationReqInput):
         scheduler = self.scheduler
-        if not self.is_fully_idle(
+        backend = self._sleep_comm_backend()
+        backend_tag = backend.tag if backend is not None else None
+
+        # Client-caused rejections are returned in the payload: raising here
+        # would take down the scheduler event loop.
+        error = None
+        try:
+            tags = resolve_release_tags(recv_req.tags)
+            if backend_tag is not None and backend_tag in tags:
+                reason = backend.unsupported_reason()
+                if reason is not None:
+                    if recv_req.tags:
+                        raise ValueError(reason)
+                    # A tag-less full release degrades instead of failing.
+                    logger.info("%s Excluding it from the default tag set.", reason)
+                    tags.remove(backend_tag)
+        except ValueError as e:
+            tags, error = None, str(e)
+
+        idle = self.is_fully_idle(
             ignore_waiting=scheduler is not None and scheduler.pause_state.paused
-        ):
-            return ReleaseMemoryOccupationReqOutput(
-                success=False,
-                message="Memory was not released because requests are still "
-                "running or queued. Finish them, or pause generation in retract "
-                "mode, then retry.",
+        )
+        proceed = error is None and idle
+        if backend is not None and error is None and backend_tag in tags:
+            # Only the comm backend runs world-group collectives, so only this
+            # case joins a cross-rank vote.
+            proceed = backend.agree(proceed)
+            if not proceed and idle:
+                error = (
+                    "The release was refused on another rank of this process "
+                    "set; see that rank's log."
+                )
+        if not proceed:
+            if error is None:
+                error = (
+                    "Memory was not released because requests are still running "
+                    "or queued. Finish them, or pause generation in retract mode, "
+                    "then retry."
+                )
+            return ReleaseMemoryOccupationReqOutput(success=False, message=error)
+
+        # Idempotent: skip tags that are already released.
+        tags = [tag for tag in tags if tag not in self.offload_tags]
+        if not tags:
+            return ReleaseMemoryOccupationReqOutput(success=True, message="Success")
+        comm_in_tags = backend_tag is not None and backend_tag in tags
+        # Claim each tag as its step completes, so a partial failure is recorded.
+        applied = set()
+        try:
+            error = self._release_tags(
+                tags, comm_in_tags, backend, backend_tag, applied
             )
+        finally:
+            self.offload_tags |= applied
 
-        tags = recv_req.tags
+        if error is not None:
+            return ReleaseMemoryOccupationReqOutput(success=False, message=error)
+        return ReleaseMemoryOccupationReqOutput(success=True, message="Success")
 
-        if tags is None or len(tags) == 0:
-            tags = GPU_MEMORY_ALL_TYPES
-
-        for tag in tags:
-            self.offload_tags.add(tag)
+    def _release_tags(
+        self, tags, comm_in_tags, backend, backend_tag, applied
+    ) -> Optional[str]:
+        """Apply the tags, claiming each one in ``applied``; return an error."""
+        scheduler = self.scheduler
 
         if GPU_MEMORY_TYPE_KV_CACHE in tags:
             if scheduler is not None:
@@ -503,6 +562,7 @@ class SchedulerWeightUpdaterManager:
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_KV_CACHE)
             # Cannot be refused: its idle gate is the check at the top.
             self.flush_cache()
+            applied.add(GPU_MEMORY_TYPE_KV_CACHE)
 
         if GPU_MEMORY_TYPE_WEIGHTS in tags:
             self._assert_weight_cache_inactive("release_memory_occupation")
@@ -511,25 +571,131 @@ class SchedulerWeightUpdaterManager:
             )
             torch.distributed.barrier(self.tp_cpu_group)
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_WEIGHTS)
+            applied.add(GPU_MEMORY_TYPE_WEIGHTS)
 
+        # The backend owns the graph lifecycle, so the memory saver must not
+        # also pause this tag.
+        graph_tag_owned_by_backend = comm_in_tags and backend.handles_cuda_graph
         if GPU_MEMORY_TYPE_CUDA_GRAPH in tags:
-            self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_CUDA_GRAPH)
+            if graph_tag_owned_by_backend:
+                if GPU_MEMORY_TYPE_CUDA_GRAPH in self.offload_tags:
+                    # Take the graphs back from the memory saver first.
+                    self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_CUDA_GRAPH)
+                self.offload_tags.discard(GPU_MEMORY_TYPE_CUDA_GRAPH)
+                applied.add(GPU_MEMORY_TYPE_CUDA_GRAPH)
+            else:
+                self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_CUDA_GRAPH)
+                applied.add(GPU_MEMORY_TYPE_CUDA_GRAPH)
+
+        if comm_in_tags:
+            try:
+                backend.release()
+            except Exception as e:  # noqa: BLE001 - never kill the scheduler loop
+                logger.exception(
+                    "Releasing the '%s' memory occupation tag failed.",
+                    backend_tag,
+                )
+                # Half destroyed: leave the tag unclaimed so a retry re-runs it.
+                return f"Releasing '{backend_tag}' failed: {e}"
+            applied.add(backend_tag)
 
         torch.get_device_module().synchronize()
-
-        return ReleaseMemoryOccupationReqOutput(success=True, message="Success")
+        return None
 
     def resume_memory_occupation(self, recv_req: ResumeMemoryOccupationReqInput):
-        tags = recv_req.tags
+        backend = self._sleep_comm_backend()
+        backend_tag = backend.tag if backend is not None else None
+        try:
+            if not recv_req.tags:
+                # No tags means "resume what was released", not "resume all".
+                tags = [tag for tag in all_known_tags() if tag in self.offload_tags]
+            else:
+                tags = resolve_release_tags(recv_req.tags)
 
-        if tags is None or len(tags) == 0:
-            tags = GPU_MEMORY_ALL_TYPES
+            comm_released = backend_tag is not None and backend_tag in self.offload_tags
+            if backend_tag is not None and (backend_tag in tags or comm_released):
+                reason = backend.unsupported_reason()
+                if reason is not None:
+                    raise ValueError(reason)
 
-        for tag in tags:
-            self.offload_tags.remove(tag)
+            # Recapturing graphs reads weights and the KV cache, so the comm
+            # rebuild waits for a request that brings them back.
+            pending = (
+                sorted((self.offload_tags & set(backend.resume_requires)) - set(tags))
+                if (comm_released and backend is not None)
+                else []
+            )
 
-        if GPU_MEMORY_TYPE_CUDA_GRAPH in tags:
+            if comm_released and backend_tag not in tags:
+                if pending:
+                    # A legacy client waking in stages: rebuild the comms on the
+                    # request that completes the dependency set, not here.
+                    logger.info(
+                        "'%s' stays released until %s is/are resumed; the device "
+                        "communication domains are rebuilt then.",
+                        backend_tag,
+                        pending,
+                    )
+                else:
+                    logger.info(
+                        "'%s' was released; adding it to the resume tag set so "
+                        "the device communication domains are rebuilt.",
+                        backend_tag,
+                    )
+                    tags.append(backend_tag)
+            elif pending:
+                raise ValueError(
+                    f"Resuming '{backend_tag}' recaptures the CUDA graphs, which "
+                    f"needs the still-released tag(s) {pending} to be resumed in "
+                    "the same request."
+                )
+            comm_in_tags = backend_tag is not None and backend_tag in tags
+
+            not_released = sorted(set(tags) - self.offload_tags)
+            if not_released:
+                raise ValueError(
+                    "Cannot resume memory occupation tag(s) that are not "
+                    f"currently released: {not_released}"
+                )
+        except ValueError as e:
+            # Request-local: no rank enters the backend, so do not join a world
+            # collective (that would hang under pp). Log-only, no error channel.
+            logger.warning("Refusing the resume memory occupation request: %s", e)
+            return ResumeMemoryOccupationReqOutput()
+
+        if comm_in_tags:
+            # Validation passed; align the go decision across the ranks.
+            if not backend.agree(True):
+                logger.warning(
+                    "The resume memory occupation request was refused on another "
+                    "rank of this process set; see that rank's log."
+                )
+                return ResumeMemoryOccupationReqOutput()
+
+        # Claim each tag as its step completes; a backend failure (logged in
+        # place) only gates the cuda_graph claim below.
+        applied = set()
+        error = None
+        try:
+            error = self._resume_tags(tags, comm_in_tags, backend, backend_tag, applied)
+        finally:
+            self.offload_tags -= applied
+            if error is None and comm_in_tags and backend.handles_cuda_graph:
+                # Graphs were recaptured, so cuda_graph is no longer offloaded.
+                self.offload_tags.discard(GPU_MEMORY_TYPE_CUDA_GRAPH)
+
+        return ResumeMemoryOccupationReqOutput()
+
+    def _resume_tags(
+        self, tags, comm_in_tags, backend, backend_tag, applied
+    ) -> Optional[str]:
+        """Restore the tags, claiming each one in ``applied``; return an error."""
+        # The backend recaptures the graphs itself, so skip the memory saver.
+        if GPU_MEMORY_TYPE_CUDA_GRAPH in tags and not (
+            comm_in_tags and backend.handles_cuda_graph
+        ):
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_CUDA_GRAPH)
+            applied.add(GPU_MEMORY_TYPE_CUDA_GRAPH)
 
         if GPU_MEMORY_TYPE_WEIGHTS in tags:
             self._assert_weight_cache_inactive("resume_memory_occupation")
@@ -540,6 +706,7 @@ class SchedulerWeightUpdaterManager:
                 self.stashed_model_static_state,
             )
             del self.stashed_model_static_state
+            applied.add(GPU_MEMORY_TYPE_WEIGHTS)
 
         if GPU_MEMORY_TYPE_KV_CACHE in tags:
             self.memory_saver_adapter.resume(GPU_MEMORY_TYPE_KV_CACHE)
@@ -553,8 +720,20 @@ class SchedulerWeightUpdaterManager:
                     queue = getattr(scheduler, "disagg_prefill_bootstrap_queue", None)
                     if queue is not None:
                         queue.resume_memory_occupation()
+            applied.add(GPU_MEMORY_TYPE_KV_CACHE)
 
-        return ResumeMemoryOccupationReqOutput()
+        # Backend last: recapturing graphs needs the rebuilt comms and weights.
+        if comm_in_tags:
+            try:
+                backend.resume()
+            except Exception as e:  # noqa: BLE001 - never kill the scheduler loop
+                logger.exception(
+                    "Resuming the '%s' memory occupation tag failed.", backend_tag
+                )
+                # Half rebuilt: leave the tag unclaimed so a retry re-runs it.
+                return f"Resuming '{backend_tag}' failed: {e}"
+            applied.add(backend_tag)
+        return None
 
     def check_weights(self, recv_req: CheckWeightsReqInput):
         try:

@@ -2154,6 +2154,16 @@ def _group_coordinator_device(local_rank: int) -> torch.device:
 _WORLD: Optional[GroupCoordinator] = None
 
 
+def get_all_groups() -> List[GroupCoordinator]:
+    """All still-alive registered GroupCoordinators, unsorted."""
+    groups = []
+    for ref in _groups.values():
+        group = ref()
+        if group is not None:
+            groups.append(group)
+    return groups
+
+
 def get_world_group() -> GroupCoordinator:
     return get_parallel().world_group
 

@@ -228,6 +228,12 @@ def init_npu_backend():
         torch_npu.npu.config.allow_internal_format = True
     torch_npu.npu.set_compile_mode(jit_compile=False)
 
+    # Enable the sleep-mode `comm` tag on NPU.
+    from sglang.srt.hardware_backend.npu.sleep_comm import NPUSleepCommBackend
+    from sglang.srt.utils.sleep_comm import register_sleep_comm_backend
+
+    register_sleep_comm_backend(NPUSleepCommBackend)
+
 
 def _is_nz_aligned(tensor: torch.Tensor) -> bool:
     """Check whether the last two dims satisfy FRACTAL_NZ alignment rules.
