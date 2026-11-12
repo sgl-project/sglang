@@ -1128,6 +1128,10 @@ class Envs:
     # shard and the topk results are all-gathered for the MoE, and one all-reduce per layer sums attn + ffn.
     SGLANG_OPT_LAGUNA_PREFILL_SP = EnvBool(False)
     SGLANG_OPT_LAGUNA_PREFILL_SP_MIN_TOKENS = EnvInt(4096)
+    # FlyDSL pa_decode (gfx1250): partition cap of the sliding-window decode plans. 1 (default) = one task per
+    # sequence and direct output; 0 = the device CU count (aiter bounds it by the window's 256-token tiles and
+    # merges a sequence's partitions in the tile kernel); n = at most n partitions.
+    SGLANG_OPT_FLYDSL_PA_SWA_MAX_PARTITIONS = EnvInt(1)
     # Send Qwen3.8's 512-expert softmax router back to aiter `fused_topk`
     # instead of `topk_gating`.
     SGLANG_ROCM_DISABLE_AITER_TOPK_GATING = EnvBool(False)

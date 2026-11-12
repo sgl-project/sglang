@@ -2124,13 +2124,14 @@ class AiterAttnBackend(AttentionBackend):
             ctx = torch.empty(bs, dtype=torch.int32, device=self.device)
             self.flydsl_ctx_lens[bs] = ctx
         ctx.copy_(forward_batch.seq_lens[:bs])
+        swa_parts = envs.SGLANG_OPT_FLYDSL_PA_SWA_MAX_PARTITIONS.get()
         for window in self.flydsl_pa_windows:
             plan = self.flydsl_pa_plans.get((bs, window))
             if plan is None:
                 self.flydsl_pa_plans[(bs, window)] = plan_pa_decode(
                     ctx,
                     self.num_kv_head,
-                    max_partitions=1 if window else None,
+                    max_partitions=(swa_parts or None) if window else None,
                     sliding_window=window,
                 )
             else:
