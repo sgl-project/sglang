@@ -299,7 +299,7 @@ class StreamingSessionKitMixin:
                 "Turn 1 should be aborted, not finished normally",
             )
 
-            # Turn 2: recovery. No inherited context (req_nodes empty).
+            # Turn 2: recovery. No inherited context (turns empty).
             ids_2 = self.tokenizer.encode("Tell me a short joke.")
             for attempt in range(20):
                 resp_2 = requests.post(

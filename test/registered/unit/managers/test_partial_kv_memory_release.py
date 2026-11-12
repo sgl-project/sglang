@@ -7,6 +7,7 @@ from unittest.mock import Mock, patch
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.io_struct import ReleaseMemoryOccupationReqInput
 from sglang.srt.managers.scheduler_components.pause_state import PauseState
+from sglang.srt.managers.scheduler_components.request_list import ListKind
 from sglang.srt.managers.scheduler_components.weight_updater import (
     SchedulerWeightUpdaterManager,
 )
@@ -35,7 +36,9 @@ class TestPartialKvMemoryRelease(CustomTestCase):
         self.pause = PauseState()
         self.saver = Mock(enabled=True)
         scheduler = SimpleNamespace(
-            pause_state=self.pause, disaggregation_mode=DisaggregationMode.NULL
+            pause_state=self.pause,
+            disaggregation_mode=DisaggregationMode.NULL,
+            request_lists=lambda: {ListKind.DECODING: list(self.request_slots)},
         )
         with patch(
             "sglang.srt.managers.scheduler_components.weight_updater.get_parallel",
