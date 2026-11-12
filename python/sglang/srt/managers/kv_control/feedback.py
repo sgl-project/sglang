@@ -18,7 +18,6 @@ from sglang.srt.managers.kv_control.contracts import (
     OperationResult,
     Position,
     Status,
-    TokensTarget,
     Value,
 )
 
@@ -59,7 +58,6 @@ class RequestUse(Value):
     checkpointed: bool
     checkpointed_tokens: Position
     aborted: bool
-    committed_prefix: TokensTarget | None
     # Completion is a request fact; it never implies task/session completion.
     provenance: Literal["engine_request_accounting"] = "engine_request_accounting"
 
@@ -235,9 +233,7 @@ class FeedbackJournal:
             )
         return association
 
-    def finish_request(
-        self, context, req, *, checkpointed, aborted, committed, committed_tokens
-    ):
+    def finish_request(self, context, req, *, checkpointed, aborted, committed_tokens):
         self._owner()
         tracked = self._requests.pop((context.caller_id, context.binding_id), None)
         if tracked is None:
@@ -257,7 +253,6 @@ class FeedbackJournal:
             checkpointed=checkpointed,
             checkpointed_tokens=committed_tokens if checkpointed else 0,
             aborted=aborted,
-            committed_prefix=committed,
         )
         self.append("request_use", context.caller_id, use)
 

@@ -470,14 +470,8 @@ class KVControlService:
             and not isinstance(req.finished_reason, FINISH_ABORT)
         )
         committed = None
-        if (
-            success
-            and committed_len
-            and (
-                context is not None
-                or committed_len <= self.config.limits.max_scope_tokens
-            )
-        ):
+        # Attached actions need the precise checkpoint; feedback uses counts.
+        if context is not None and success and committed_len:
             committed = TokensTarget(
                 namespace=self.config.namespace,
                 token_ids=tuple(req.full_untruncated_fill_ids[:committed_len]),
@@ -494,7 +488,6 @@ class KVControlService:
                 req,
                 checkpointed=success and not aborted,
                 aborted=aborted,
-                committed=committed,
                 committed_tokens=committed_len,
             )
             req.kv_control_feedback_context = None

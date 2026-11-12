@@ -327,9 +327,37 @@ class TestKVControlFeedback(cache_fixtures.KVCacheTestCase):
             ][-1]
             self.assertEqual(unknown_use["tier_accounting"], "unknown")
             self.assertIsNone(unknown_use["device_tokens"])
-            self.assertIsNone(unknown_use["committed_prefix"])
+            self.assertEqual(unknown_use["checkpointed_tokens"], 0)
             self.assertEqual(service.cache_watermark(), initial)
             self.assertEqual(cache.take_events(), [])
+
+    def test_long_request_accounting_does_not_evict_control_feedback(self):
+        config = ServiceConfig(
+            namespace="ns",
+            engine_id="engine",
+            feedback_limits=FeedbackLimits(max_bytes=4096),
+        )
+        with transfer_fixtures.hicache(self, config=config) as owner:
+            _, _, service, _ = owner
+            start = events(service)["next_cursor"]
+            service.feedback.append("operation", "A", {"message_id": "previous"})
+            req = service_fixtures.serving_request()
+            service.prepare_request(req)
+            req.full_untruncated_fill_ids.extend([12345] * 16384)
+            req.finished_reason = FINISH_LENGTH(1)
+            service.finish_request(req, committed_len=16384, checkpointed=True)
+
+            page = events(service, cursor=start)
+            self.assertFalse(page["gap"])
+            self.assertEqual(page["items"][0]["payload"]["message_id"], "previous")
+            usage = [
+                event["payload"]
+                for event in events(service, caller="request")["items"]
+                if event["kind"] == "request_use"
+            ]
+            self.assertEqual(len(usage), 1)
+            self.assertEqual(usage[0]["checkpointed_tokens"], 16384)
+            self.assertNotIn("committed_prefix", usage[0])
 
     def test_flush_restart_and_storage_detach_invalidate_only_owner_observations(self):
         with transfer_fixtures.hicache(self, namespace_keys=True) as owner:
