@@ -194,6 +194,74 @@ def floor_by_factor(number: int, factor: int) -> int:
     """Returns the largest integer less than or equal to 'number' that is divisible by 'factor'."""
     return math.floor(number / factor) * factor
 
+# Peak GPU memory of the HF image processor is a small multiple of its output
+# (it holds resized, normalized and patchified copies, then torch.cat's them).
+# Bound each processor call by an estimated byte budget so a request with many
+# or very large images cannot spike GPU memory.
+_PREPROCESS_BYTES_PER_PIXEL = 24
+_PREPROCESS_PEAK_FACTOR = 3
+_PREPROCESS_GPU_BUDGET_BYTES = 512 * 1024 * 1024
+
+
+def _media_size(media) -> Optional[tuple[int, int]]:
+    """Return (height, width) of a decoded image, or None if unknown."""
+    size = getattr(media, "size", None)
+    if isinstance(media, Image.Image):
+        return size[1], size[0]
+    shape = getattr(media, "shape", None)
+    if shape is not None and len(shape) >= 2:
+        if len(shape) == 3 and shape[0] in (1, 3, 4) and shape[-1] not in (1, 3, 4):
+            return int(shape[1]), int(shape[2])  # CHW
+        return int(shape[0]), int(shape[1])  # HWC / HW
+    return None
+
+
+def _estimate_preprocess_bytes(
+    media, *, factor: int, min_pixels: int, max_pixels: int
+) -> int:
+    """Conservative estimate of peak GPU bytes to preprocess one image."""
+    hw = _media_size(media)
+    if hw is None:
+        return _PREPROCESS_GPU_BUDGET_BYTES  # unknown size: isolate it
+    height, width = hw
+    try:
+        h_bar, w_bar = smart_resize(
+            height, width, factor=factor, min_pixels=min_pixels, max_pixels=max_pixels
+        )
+        pixels = h_bar * w_bar
+    except ValueError:
+        pixels = min(height * width, max_pixels)
+    return pixels * _PREPROCESS_BYTES_PER_PIXEL * _PREPROCESS_PEAK_FACTOR
+
+
+def _chunk_by_byte_budget(
+    costs: list[int], budget: int
+) -> list[tuple[list[int], bool]]:
+    """Greedily pack consecutive indices into groups whose cost sums to <= budget.
+
+    Returns ``(indices, oversized)`` groups in input order. An image whose own
+    cost exceeds the budget forms a single-image oversized group, which the
+    caller runs on CPU.
+    """
+    groups: list[tuple[list[int], bool]] = []
+    current: list[int] = []
+    current_cost = 0
+    for idx, cost in enumerate(costs):
+        if cost > budget:
+            if current:
+                groups.append((current, False))
+                current, current_cost = [], 0
+            groups.append(([idx], True))
+            continue
+        if current and current_cost + cost > budget:
+            groups.append((current, False))
+            current, current_cost = [], 0
+        current.append(idx)
+        current_cost += cost
+    if current:
+        groups.append((current, False))
+    return groups
+
 
 def smart_nframes(
     ele: dict,
@@ -778,6 +846,116 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
             mrope_position_delta=mrope_position_delta,
         )
 
+    def _run_image_processor(self, processor, entries, image_kwargs, device):
+        kwargs = dict(image_kwargs)
+        if device is not None:
+            kwargs["device"] = device
+        else:
+            kwargs.pop("device", None)
+        result = processor.image_processor(
+            images=[entry.media for entry in entries],
+            return_tensors="pt",
+            **kwargs,
+        )
+        features = self._get_processor_output_value(result, "pixel_values")
+        image_grid_thw = self._get_processor_output_value(result, "image_grid_thw")
+        return features, image_grid_thw
+
+    def _preprocess_cost_params(self, processor, image_kwargs):
+        ip = processor.image_processor
+        patch = getattr(ip, "patch_size", 14)
+        merge = getattr(ip, "merge_size", self._spatial_merge_size)
+        size = getattr(ip, "size", None) or {}
+        min_pixels = image_kwargs.get("min_pixels") or getattr(ip, "min_pixels", None)
+        max_pixels = image_kwargs.get("max_pixels") or getattr(ip, "max_pixels", None)
+        if isinstance(size, dict):
+            min_pixels = min_pixels or size.get("shortest_edge")
+            max_pixels = max_pixels or size.get("longest_edge")
+        return (
+            int(patch) * int(merge),
+            int(min_pixels or MIN_PIXELS),
+            int(max_pixels or MAX_PIXELS),
+        )
+
+    def _run_image_processor_chunked(
+        self, processor, entries, image_kwargs, processor_device
+    ):
+        """Run the HF image processor under a bounded GPU memory budget.
+
+        Images are split into byte-capped chunks; each chunk's output is moved
+        to CPU and joined there. Single images over budget, and chunks that hit
+        a GPU OOM, are retried on CPU.
+        """
+        on_gpu = processor_device is not None and str(processor_device) != "cpu"
+        if not on_gpu:
+            with self._temporary_fast_processor_cuda_pool(processor_device):
+                features, grid = self._run_image_processor(
+                    processor, entries, image_kwargs, processor_device
+                )
+            return self._maybe_offload_features(features), grid
+
+        factor, min_pixels, max_pixels = self._preprocess_cost_params(
+            processor, image_kwargs
+        )
+        costs = [
+            _estimate_preprocess_bytes(
+                e.media, factor=factor, min_pixels=min_pixels, max_pixels=max_pixels
+            )
+            for e in entries
+        ]
+        groups = _chunk_by_byte_budget(costs, _PREPROCESS_GPU_BUDGET_BYTES)
+
+        if len(groups) == 1 and not groups[0][1]:
+            try:
+                with self._temporary_fast_processor_cuda_pool(processor_device):
+                    features, grid = self._run_image_processor(
+                        processor, entries, image_kwargs, processor_device
+                    )
+                return self._maybe_offload_features(features), grid
+            except torch.cuda.OutOfMemoryError:
+                logger.warning("Qwen-VL image preprocessing OOM; retrying on CPU")
+            return self._run_image_processor_on_cpu(processor, entries, image_kwargs)
+
+        feature_parts, grid_parts = [], []
+        for indices, oversized in groups:
+            chunk = [entries[i] for i in indices]
+            done = False
+            if not oversized:
+                try:
+                    with self._temporary_fast_processor_cuda_pool(processor_device):
+                        f, g = self._run_image_processor(
+                            processor, chunk, image_kwargs, processor_device
+                        )
+                        if isinstance(f, torch.Tensor):
+                            f = f.cpu()
+                    done = True
+                except torch.cuda.OutOfMemoryError:
+                    logger.warning(
+                        "Qwen-VL image preprocessing OOM on a chunk; retrying on CPU"
+                    )
+            if not done:
+                f, g = self._run_image_processor_on_cpu(processor, chunk, image_kwargs)
+            feature_parts.append(f)
+            grid_parts.append(torch.as_tensor(g, dtype=torch.long))
+        if not all(isinstance(f, torch.Tensor) for f in feature_parts):
+            raise TypeError("Qwen-VL image processor must return pixel_values")
+        return torch.cat(feature_parts, dim=0), torch.cat(grid_parts, dim=0)
+
+    def _run_image_processor_on_cpu(self, processor, entries, image_kwargs):
+        features, grid = self._run_image_processor(
+            processor, entries, image_kwargs, "cpu"
+        )
+        return features, grid
+
+    def _maybe_offload_features(self, features):
+        if (
+            isinstance(features, torch.Tensor)
+            and (self.mm_preprocess_cache.enabled or not self.keep_mm_features_on_device)
+            and not self.precompute_hash_before_cpu_transfer
+        ):
+            return features.cpu()
+        return features
+
     def prepare_artifact_batch(
         self,
         entries: list[MediaArtifactInput],
@@ -799,23 +977,9 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
             if processor_device is not None:
                 image_kwargs["device"] = processor_device
 
-        with self._temporary_fast_processor_cuda_pool(processor_device):
-            result = processor.image_processor(
-                images=[entry.media for entry in entries],
-                return_tensors="pt",
-                **image_kwargs,
-            )
-            features = self._get_processor_output_value(result, "pixel_values")
-            image_grid_thw = self._get_processor_output_value(result, "image_grid_thw")
-            if (
-                isinstance(features, torch.Tensor)
-                and (
-                    self.mm_preprocess_cache.enabled
-                    or not self.keep_mm_features_on_device
-                )
-                and not self.precompute_hash_before_cpu_transfer
-            ):
-                features = features.cpu()
+        features, image_grid_thw = self._run_image_processor_chunked(
+            processor, entries, image_kwargs, processor_device
+        )
 
         if not isinstance(features, torch.Tensor):
             raise TypeError("Qwen-VL image processor must return pixel_values")
