@@ -106,6 +106,30 @@ Then state the result three ways: the **`r` value**, the **predicted clamp** (if
 3. Compute `r*`. If `r*` would drive the state pool below one request's worth (`mamba_budget < S · per_req`, happens at very long `L`), **switch to pinning `--max-mamba-cache-size = target_concurrency · S`** and let the rest go to KV — a sub-0.15 `r` is fragile.
 4. Report `r`, predicted clamp, binding pool, and any dtype accuracy gate that applies.
 
+## Multi-turn and agentic traffic: size for residency, not only concurrency
+
+The formula balances the pools for the requests that are *running*. When sessions come back turn after turn (agents, chat with long history), the KV pool must also keep every live session's prefix resident between turns, or the prefix cache misses on every turn. That demand is not in `r*`, and it is the one that binds on long-context agentic traffic.
+
+- **KV demand** ≈ live sessions × average session context (not running requests × `L`). Once it exceeds the KV pool, LRU evicts each session before its next turn and the hit rate falls off a cliff, not gradually.
+- **State demand** is still `S` (+`D`) slots per *running* request. With one cached state per path (`--mamba-max-states-per-path 1`), a finished session keeps about one state, which fits in the slack between peak and average concurrency; do not budget extra slots per cached session.
+- So: pin `--max-mamba-cache-size` ≈ `S × peak concurrency` plus some margin (a third was free in the measurement below), give everything else to KV, then check that the KV pool holds `sessions × context`. Prefer `extra_buffer_lazy` (`S` 4 instead of 5) where it is supported; it turns slots into KV.
+- The resulting ratio is usually far below the running-request `r*`, and well below the 0.9 default for models whose state is large relative to KV per token.
+
+Measured (GLM-5.3-Flash NVFP4, TP2 B300, AgentX trace replay, 48 sessions, pools fixed at a 67 GB budget, device only, one state per path; the S=3 rows add `SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK=1` to `extra_buffer_lazy`):
+
+| state slots / KV tokens (S) | effective `r` | hit rate | output tok/min/GPU |
+|---|---|---|---|
+| 429 / 5.89M (S=5, default 0.9) | 0.90 | 0.06 | 7.6K |
+| 300 / 7.48M (S=5) | 0.48 | 0.22 | 9.2K |
+| 240 / 8.22M (S=5) | 0.36 | 0.85 | 29.8K |
+| 192 / 8.81M (S=4, lazy) | 0.27 | 0.89 | 36.4K |
+| 144 / 9.41M (S=3) | 0.18 | 0.88 | 35.1K |
+| 120 / 9.70M (S=3, running capped at 40) | 0.15 | 0.84 | 29.7K |
+
+Peak concurrency was 48 (p50 27); state-pool usage never passed 72% even at 144 slots. GLM-5.3-Flash now defaults to `r = 0.25` with `extra_buffer_lazy` (model override), and its high-throughput recipes pin 0.9.
+
+The direction is model-specific: a model whose KV per token is tiny relative to its state (MLA/DSA attention, e.g. Kimi-K3.1) may want a ratio above 0.9 instead. Measure; do not carry a ratio across models.
+
 ## Worked examples (TP8, B300, validated against measured clamps)
 
 Constants (from boot logs): `state_bytes_per_slot ≈ 56.4 MB` (fp32 ssm), `kv_bytes_per_token ≈ 13.8 KB` (fp8) → `token_equiv ≈ 4080`. Cache strategy `extra_buffer_lazy` → `S = 4`. Workload `L = 9216` (8192 in + 1024 out). NOSPEC → `D = 0`.

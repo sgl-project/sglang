@@ -1,0 +1,58 @@
+---
+title: "Hybrid Model Memory Pools"
+metatags:
+    description: "Split memory between the linear-attention state pool and the KV pool of a hybrid (Mamba / GDN / KDA) model with --mamba-full-memory-ratio, and size it for concurrency or for multi-turn prefix reuse."
+---
+
+Hybrid models mix full-attention layers with linear-attention layers (Mamba, Gated DeltaNet, KDA). SGLang keeps two separate pools for them, sized once at startup:
+
+| Pool | Holds | Caps |
+|---|---|---|
+| **State pool** | The recurrent state of each linear-attention layer, one slot per running request plus the states the prefix cache keeps. | How many requests run at once. Every running request reserves its slots up front. |
+| **KV pool** | Full-attention KV, one row per token. | How many tokens are cached or in flight: running contexts plus the prefixes kept for reuse. |
+
+`--mamba-full-memory-ratio r` splits the memory left after weights: state pool : KV pool = `r`. The default is `0.9`; some models override it (see [Model defaults](#model-defaults)). `--max-mamba-cache-size N` pins the state pool to `N` slots instead, and the KV pool takes the rest.
+
+## Read the split from the boot log
+
+Each rank prints both pools:
+
+```
+Mamba Cache is allocated. max_mamba_cache_size: 429, conv_state size: 1.00GB, ssm_state size: 28.55GB
+KV Cache is allocated. dtype: torch.float8_e4m3fn, #tokens: 5890560, KV size: 32.89 GB
+max_running_requests is capped to 85 by the mamba state cache (max_mamba_cache_size=429, 5 state slots per request)
+```
+
+A running request holds several state slots: 5 with the default `extra_buffer` strategy and the overlap scheduler, 4 with `--mamba-radix-cache-strategy extra_buffer_lazy`, plus speculative draft states. The last line appears when the state pool, not the KV pool, limits concurrency.
+
+## Two ways to run out
+
+- **Concurrency-bound** (many short requests): the state pool fills first and caps `max_running_requests` while KV is idle. Raise the ratio or pin a larger `--max-mamba-cache-size`.
+- **Residency-bound** (multi-turn chat, agents): sessions return turn after turn, and their prefixes must stay in the KV pool between turns. When the sessions' total context exceeds the KV pool, the cache evicts each session before its next turn and the hit rate collapses. The state pool sits mostly idle. Lower the ratio.
+
+The residency cliff is sharp. GLM-5.3-Flash on an AgentX trace replay (48 sessions, TP2, pools fixed at the same total memory):
+
+| State slots / KV tokens | Prefix-cache hit rate | Output throughput |
+|---|---|---|
+| 429 / 5.89M (ratio 0.9) | 0.06 | 1x |
+| 300 / 7.48M | 0.22 | 1.2x |
+| 192 / 8.81M (`extra_buffer_lazy`) | 0.89 | 4.8x |
+
+## Size the pools
+
+1. Estimate the peak number of running requests `R` and the per-request slot count `S` from the boot log.
+2. For residency-bound traffic, pin `--max-mamba-cache-size` to about `S × R` plus a margin, and check that the KV pool's `#tokens` covers the live sessions' total context. For concurrency-bound traffic, start from the balanced ratio the [`compute-mamba-ratio`](https://github.com/sgl-project/sglang/blob/main/.claude/skills/compute-mamba-ratio/SKILL.md) skill computes from your average request length.
+3. Raise `--mem-fraction-static` first if the boot log shows idle memory after the pools; it grows both.
+4. Verify on your traffic: hit rate (`--enable-cache-report`, or `sglang:cached_tokens_total` with `--enable-metrics`) and whether startup still caps `max_running_requests`.
+
+The right ratio depends on the model: it scales with the size of one state slot relative to one KV token, so a model with compact attention KV (MLA / DSA) can need a ratio above `0.9`, while a model with large per-token KV needs one far below. Do not copy a ratio between models.
+
+## Model defaults
+
+| Model | Default | Notes |
+|---|---|---|
+| Most hybrid models | `0.9` | Generic starting point. Cookbook recipes pass an explicit value where it was tuned. |
+| Inkling | `0.1` | |
+| GLM-5.3-Flash | `0.25` with `extra_buffer_lazy` | Sized for multi-turn agent traffic. The cookbook's High Throughput recipes pin `0.9`. |
+
+An explicit `--mamba-full-memory-ratio`, `--max-mamba-cache-size` or `--mamba-radix-cache-strategy` always overrides the model default.
