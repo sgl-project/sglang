@@ -32,7 +32,7 @@ from sglang.srt.configs.model_config import get_dsa_mtp_topk_width, is_deepseek_
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST
 from sglang.srt.distributed.communication_tags import P2PTag
-from sglang.srt.distributed.parallel_state import GroupCoordinator
+from sglang.srt.distributed.pp_relay import PPRelay
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
     get_disagg,
@@ -61,42 +61,13 @@ logger = logging.getLogger(__name__)
 #########################
 
 
-def pp_sync_polls(
-    polls: Optional[List[int]],
-    pp_group: GroupCoordinator,
-    pp_rank: int,
-    pp_size: int,
-    sync_work_list: List,
-) -> List[int]:
-    """Synchronize poll states from PP0 through the PP pipeline.
-
-    PP0 provides the data. Each later PP rank receives it from the previous
-    rank and asynchronously forwards it to the next rank.
-    """
-    if pp_size <= 1:
+def pp_sync_polls(polls: Optional[List[int]], relay: PPRelay) -> List[int]:
+    """PP0 provides the polls; every later rank receives them from the previous rank."""
+    if not relay.active:
         assert polls is not None
         return polls
-
-    for p2p_work in sync_work_list:
-        p2p_work.work.wait()
-    sync_work_list.clear()
-
-    data = polls
-    if pp_rank > 0:
-        data = pp_group.recv_object(
-            src=pp_rank - 1,
-            tag=P2PTag.DISAGG_BOOTSTRAP_PP_SYNC,
-        )
-    if pp_rank + 1 < pp_size:
-        sync_work_list.extend(
-            pp_group.send_object(
-                data,
-                dst=pp_rank + 1,
-                async_send=True,
-                tag=P2PTag.DISAGG_BOOTSTRAP_PP_SYNC,
-            )
-        )
-    return data
+    relay.open_round()
+    return relay.relay_object(polls)
 
 
 def poll_and_all_reduce_pp(
@@ -121,18 +92,15 @@ def poll_and_all_reduce_prefill_pp(
     pollers: List[CommonKVSender],
     attn_cp_cpu_group: dist.ProcessGroup,
     attn_tp_cpu_group: dist.ProcessGroup,
-    pp_group: GroupCoordinator,
-    pp_rank: int,
-    pp_size: int,
-    pp_poll_sync_work_list: List[torch.distributed.Work],
+    relay: PPRelay,
 ) -> List[int]:
     polls: List[int] = []
-    if pp_rank == 0:
+    if relay.pp_rank == 0:
         polls = _poll_with_failure_injection_pp(pollers)
         polls = _all_reduce_polls(polls, attn_tp_cpu_group)
         polls = _all_reduce_polls(polls, attn_cp_cpu_group)
     # Propagate PP0's data to other ranks
-    polls = pp_sync_polls(polls, pp_group, pp_rank, pp_size, pp_poll_sync_work_list)
+    polls = pp_sync_polls(polls=polls, relay=relay)
     return polls
 
 

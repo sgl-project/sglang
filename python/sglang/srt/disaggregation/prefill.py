@@ -45,6 +45,8 @@ from sglang.srt.disaggregation.common.staging_buffer import (
 )
 from sglang.srt.disaggregation.minimax import minimax_index_transfer_pages
 from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST, DisaggregationMode
+from sglang.srt.distributed.communication_tags import P2PTag
+from sglang.srt.distributed.pp_relay import PPRelay
 from sglang.srt.disaggregation.utils import (
     CustomizedInfoError,
     KVClassType,
@@ -310,7 +312,17 @@ class PrefillBootstrapQueue:
             shard_size=self.scheduler.kv_shard_widening,
         )
         self.transfer_backend = transfer_backend
-        self.pp_poll_sync_work_list: List = []
+        self.pp_relay = PPRelay(
+            group=(
+                self.scheduler.pp_group.cpu_group
+                if self.scheduler.pp_group is not None
+                else None
+            ),
+            pp_rank=self.pp_rank,
+            pp_size=self.pp_size,
+            tag=P2PTag.DISAGG_BOOTSTRAP_PP_SYNC,
+            window=self.pp_size + get_parallel().pp_async_batch_depth,
+        )
         if envs.SGLANG_DISAGG_STAGING_BUFFER.get():
             if self.is_mla_backend:
                 raise RuntimeError(
@@ -605,10 +617,7 @@ class PrefillBootstrapQueue:
                 [req.disagg_kv_sender for req in queue],
                 self.scheduler.attn_cp_cpu_group,
                 self.scheduler.attn_tp_cpu_group,
-                self.scheduler.pp_group,
-                self.pp_rank,
-                self.pp_size,
-                self.pp_poll_sync_work_list,
+                self.pp_relay,
             )
         else:
             polls = poll_and_all_reduce_attn_cp_tp_group(
