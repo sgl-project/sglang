@@ -1,0 +1,34 @@
+---
+title: "Hybrid Model Prefix-Cache Checkpoints"
+metatags:
+    description: "Choose where the prefix cache of a hybrid (Mamba / GDN / KDA) model keeps recurrent-state checkpoints with --hybrid-cache-checkpoints-level, and what each level costs."
+---
+
+A hybrid model's linear-attention layers carry a recurrent state instead of per-token KV. The prefix cache can reuse a cached prefix only up to a position where it also kept that state, called a checkpoint. `--hybrid-cache-checkpoints-level` decides where checkpoints are kept.
+
+| Level | Checkpoints | Best for |
+|---|---|---|
+| `2` (default) | Where two requests' prompts diverge, and where each request ends (on a PD prefill worker, where its prompt ends). One checkpoint per path. | Multi-turn chat, agents and tool loops, where each request extends the previous one's full context. |
+| `3` | Also every prefill chunk and every `--mamba-track-interval` decode tokens. | Traffic that reuses the middle of an earlier prompt that no other request has diverged from yet. |
+
+## What level 2 changes
+
+- **Reuse of a continued conversation is unchanged.** The next turn starts from the previous turn's end, and that checkpoint is kept.
+- **Host and storage tiers write far fewer states.** HiCache, storage backends and the external linker receive only the kept checkpoints, so interior checkpoints no longer use host slots or push other sessions' states out.
+- **A late fork from the middle of a prompt recomputes.** If a request shares only the first part of an earlier prompt, and no request has diverged at that point before, the cache has KV there but no state, and it resumes from the nearest earlier checkpoint. The first such request creates a checkpoint at the divergence point, so later ones hit.
+- **A prompt joins the cache when its request finishes**, not chunk by chunk while it prefills.
+
+Models with both sliding-window and linear-attention layers keep checkpointing every prefill chunk at level 2.
+
+## Measured
+
+| Workload (B300) | Level 3 | Level 2 |
+|---|---|---|
+| GLM-5.3-Flash, AgentX trace replay with HiCache: hit rate / output tok/min/GPU | 0.943 / 42,741 (one state per path) | 0.961 / 45,442 |
+| Qwen3.8-27B multi-turn sessions with HiCache: continuation hit / states written to host / host write bytes | 0.993 / 304 / 66.7 GB | 0.993 / 87 / 33.4 GB |
+| Qwen3.8-Flash-Next, AgentX trace replay (cookbook TP1 MTP recipe): hit rate / output tok/min/GPU | 0.961 / 59,480 | 0.960 / 60,525 |
+
+## Related options
+
+- `--mamba-max-states-per-path N` is deprecated. When set, it still caps the checkpoints kept per path at either level (`-1` means unlimited).
+- The size of the state pool that holds the checkpoints is set by `--mamba-full-memory-ratio` or `--max-mamba-cache-size`; see [Hybrid Model Memory Pools](/docs/advanced_features/hybrid_model_memory).
