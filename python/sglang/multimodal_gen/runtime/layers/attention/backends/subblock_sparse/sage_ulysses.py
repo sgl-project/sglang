@@ -83,7 +83,7 @@ class _SparseSageA2ACompute:
             and os.environ.get("SGLANG_DIFFUSION_H3_SAGE_FUSED_PREPOST", "1") != "0"
         )
         if fused:
-            from .sage_a2a_kernels import (
+            from .cake_prepost_kernels import (
                 mixed_row_indices,
                 pack_cake_operands,
                 route_prequantized,

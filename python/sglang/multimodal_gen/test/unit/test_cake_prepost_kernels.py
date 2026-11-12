@@ -18,7 +18,7 @@ def test_pack_pool_and_output_are_exact(used, nq, nk):
     from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse import (
         SubBlockRouter,
     )
-    from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse.sage_a2a_kernels import (
+    from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse.cake_prepost_kernels import (
         pack_cake_operands,
         route_prequantized,
         write_cake_output,
@@ -62,7 +62,7 @@ def test_pack_pool_and_output_are_exact(used, nq, nk):
 @pytest.mark.parametrize("mask_kind", ["mixed", "dense", "sparse"])
 @pytest.mark.parametrize("stride", [1, 2])
 def test_mixed_rows_preserve_dense_modalities(mask_kind, stride):
-    from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse.sage_a2a_kernels import (
+    from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse.cake_prepost_kernels import (
         mixed_row_indices,
     )
 

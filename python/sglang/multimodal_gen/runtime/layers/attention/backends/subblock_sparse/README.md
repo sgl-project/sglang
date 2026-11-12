@@ -259,7 +259,7 @@ establish equivalence to BF16 routing.
 Validation entry points:
 
 ```bash
-python -m pytest python/sglang/multimodal_gen/test/unit/test_minimax_h3_prepared_sage.py python/sglang/multimodal_gen/test/unit/test_cake_sage_a2a_kernels.py -q
+python -m pytest python/sglang/multimodal_gen/test/unit/test_minimax_h3_prepared_sage.py python/sglang/multimodal_gen/test/unit/test_cake_prepost_kernels.py -q
 torchrun --standalone --nproc_per_node=4 test/manual/attention/test_h3_prepared_sage_ulysses.py
 H3_BENCH_RESULT=result.json torchrun --standalone --nproc_per_node=4 test/manual/attention/bench_h3_prepared_sage_ulysses.py
 ```
