@@ -749,6 +749,13 @@ class KDAAttnBackend(MambaAttnBackendBase):
         # An eager forward never runs on a graph bucket's tables.
         self.prefill_graph_metadata = None
         super().init_forward_metadata(forward_batch)
+        if (
+            self.kernel_dispatcher.extend_kernel.wants_int64_query_start_loc
+            and forward_batch.forward_mode.is_extend_without_speculative()
+        ):
+            self.forward_metadata.query_start_loc_i64 = (
+                self.forward_metadata.query_start_loc.to(torch.int64)
+            )
         if self.forward_metadata.has_mamba_track_mask:
             if self.forward_metadata.mamba_track_mask_indices is None:
                 self.forward_metadata.mamba_track_mask_indices = (
@@ -1201,6 +1208,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             ssm_states=ssm_states,
             cache_indices=cache_indices,
             query_start_loc=query_start_loc,
+            query_start_loc_i64=self.forward_metadata.query_start_loc_i64,
             A_log=layer.A_log,
             dt_bias=layer.dt_bias,
             lower_bound=layer.lower_bound,
