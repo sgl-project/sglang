@@ -4687,6 +4687,7 @@ impl ::serde::Serialize for GetServerInfoResponse {
             "num_reserved_tokens",
             &self.num_reserved_tokens,
         )?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "instance_id", &self.instance_id)?;
         ::serde::ser::SerializeMap::end(map)
     }
 }
@@ -4718,6 +4719,7 @@ impl<'de> ::serde::Deserialize<'de> for GetServerInfoResponse {
                 let mut f_allow_auto_truncate = None;
                 let mut f_skip_tokenizer_init = None;
                 let mut f_num_reserved_tokens = None;
+                let mut f_instance_id = None;
                 while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
                     match key.as_ref() {
                         "model_path" => {
@@ -4836,6 +4838,13 @@ impl<'de> ::serde::Deserialize<'de> for GetServerInfoResponse {
                             }
                             f_num_reserved_tokens = Some(map.next_value::<u64>()?);
                         }
+                        "instance_id" => {
+                            if f_instance_id.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("instance_id"));
+                            }
+                            f_instance_id =
+                                Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
                         _ => {
                             map.next_value::<::serde::de::IgnoredAny>()?;
                         }
@@ -4858,6 +4867,7 @@ impl<'de> ::serde::Deserialize<'de> for GetServerInfoResponse {
                     allow_auto_truncate: f_allow_auto_truncate.unwrap_or_default(),
                     skip_tokenizer_init: f_skip_tokenizer_init.unwrap_or_default(),
                     num_reserved_tokens: f_num_reserved_tokens.unwrap_or_default(),
+                    instance_id: f_instance_id.unwrap_or_default(),
                 })
             }
         }
