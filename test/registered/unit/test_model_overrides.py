@@ -237,6 +237,7 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "speculative_draft_kv_cache_dtype",
                     "speculative_draft_model_quantization",
                     "speculative_dspark_lm_head_dtype",
+                    "speculative_dflash_draft_kv_ring",
                     "aux_hidden_state_capture",
                     "watermark_context_window",
                     "watermark_default_enabled",
