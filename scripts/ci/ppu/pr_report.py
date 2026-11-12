@@ -135,6 +135,7 @@ def export_evidence(directory, destination):
                     ".log",
                     ".tsv",
                     ".status",
+                    ".txt",
                 ):
                     continue
                 fd = os.open(

@@ -279,6 +279,12 @@ OTHER_SUITES = {
         # readability only; validation reads their union.
         "weekly-test-8-gpu-h200",
     ],
+    HWBackend.PPU: [
+        # Manual-only known regressions. These never join the PR gate or the
+        # scheduled nightly inventory.
+        "known-issues-1-ppu",
+        "known-issues-2-ppu",
+    ],
 }
 
 

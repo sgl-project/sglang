@@ -361,6 +361,7 @@ class EvidenceExportTest(unittest.TestCase):
                 source
                 / "environment-pods.timing.tsv": "2026-01-01T00:00:00Z\t2026-01-01T00:00:03Z\t2026-01-01T00:00:11Z\n",
                 source / "environment-pods.status": "export-fixture-value",
+                source / "checkout_sha.txt": "export-fixture-value",
                 nested / "case.xml": '<testsuite><testcase name="ok"/></testsuite>',
                 nested / "case.log": "password=export-fixture-value",
                 source / "ignored.bin": "export-fixture-value",
@@ -375,6 +376,7 @@ class EvidenceExportTest(unittest.TestCase):
                 destination = root / "export"
                 REPORT.export_evidence(source, destination)
                 self.assertFalse((destination / "ignored.bin").exists())
+                self.assertTrue((destination / "checkout_sha.txt").is_file())
                 for path in destination.rglob("*"):
                     if path.is_file():
                         text = path.read_text()
