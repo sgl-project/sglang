@@ -20,9 +20,9 @@ use crate::utils::{
     fsm::{Event, RequestState, ValidationOutcome},
 };
 
-/// Longest client-supplied rid accepted. It keys the detok table and travels on
-/// every chunk, so its length is a recurring cost; Python mints 32-byte uuid hex.
-pub(super) const MAX_RID_LEN: usize = 128;
+/// Longest client-supplied rid accepted, in UTF-8 bytes. Namespaced caller IDs
+/// can exceed a UUID; keep their per-step wire and detokenizer-table cost bounded.
+pub(super) const MAX_RID_LEN: usize = 256;
 
 /// Intake FSM dispatcher stage. Owns its inbox + downstream handles, so the
 /// runtime spawns it as a [`Runnable`] rather than calling a free `run_*` fn
