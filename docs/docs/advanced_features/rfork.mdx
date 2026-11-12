@@ -100,3 +100,17 @@ python -m sglang.launch_server [args] \
 ```
 
 All SGLang instances use the same command shape. If no ready source exists, the instance loads weights natively and publishes metadata to ModelExpress. If a compatible source exists, it loads weights through ModelExpress P2P transfer. Set <code>"transport": "transfer_engine"</code> to use Mooncake TransferEngine instead of the default NIXL transport.
+
+#### Releasing and reloading weights
+
+Releasing the `weights` tag through `/release_memory_occupation` stops ModelExpress from serving this instance as a source.
+
+- With `--enable-weights-cpu-backup`, `/resume_memory_occupation` restores the weights and the instance is published again.
+- Without it, the weights are discarded. Resume the weights and reload them before you resume any other tags. The reload copies from another ModelExpress source, or loads from disk if none is ready, and then publishes the instance again.
+
+```bash
+curl -X POST http://HOST:PORT/resume_memory_occupation -H "Content-Type: application/json" -d '{"tags": ["weights"]}'
+curl -X POST http://HOST:PORT/update_weights_from_disk -H "Content-Type: application/json" -d '{"model_path": "MODEL_PATH", "load_format": "remote_instance"}'
+```
+
+After the reload, resume any other tags you released. `model_path` must be the path the server was started with.
