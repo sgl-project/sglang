@@ -2738,9 +2738,9 @@ class KVCacheConfigurator:
             dsa_pool_class=dsa_pool_class,
         )
         if (
-            get_memory().enable_hisparse
+            extra_args.get("use_dsa")
             and not self.is_draft_worker
-            and extra_args.get("use_dsa")
+            and get_memory().enable_hisparse
         ):
             reject_out_of_tree_path(
                 current_platform, subsystem="the HiSparse DSA KV pool"
