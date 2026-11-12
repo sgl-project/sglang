@@ -1819,13 +1819,7 @@ class Envs:
     # set False to fall back to the per-image loop.
     SGLANG_VIT_ENABLE_VECTORIZED_POS_EMBED = EnvBool(True)
     SGLANG_MM_SKIP_COMPUTE_HASH = EnvBool(False)
-    # Decode and preprocess images on the CPU. Kimi-K2.5 and native diffusion
-    # RGB input preprocessing honor it on every platform; BaseMultimodalProcessor
-    # honors it on NVIDIA CUDA (no nvJPEG decode, fast image processor on the
-    # CPU). Not covered: Kimi-K3, Step3-VL and InternVL preprocess on the device
-    # themselves, the Transformers backend decodes with its own loader, and
-    # MiMo-V2 and the encoder-disaggregation preprocessor follow
-    # SGLANG_ENCODER_IMAGE_PROCESSOR_USE_GPU.
+    # Decode and preprocess images on the CPU; see environment_variables.mdx.
     SGLANG_FORCE_CPU_IMAGE_PREPROCESSING = EnvBool(False)
     # For pre-tokenized (list[int]) multimodal prompts,
     # preserve the user's original tokens to avoid retokenization drift.

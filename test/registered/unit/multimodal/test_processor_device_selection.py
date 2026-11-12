@@ -228,7 +228,7 @@ class TestForceCpuImagePreprocessing(CustomTestCase):
         self.assertEqual(calls[False], [True, "nvjpeg_fancy", False])
         self.assertEqual(calls[True], [False, False, False])
 
-    def test_warns_only_when_several_workers_use_the_gpu(self):
+    def test_logs_only_when_several_workers_use_the_gpu(self):
         from transformers import BaseImageProcessor
 
         class _CpuDecode(_StubProcessor):
@@ -236,33 +236,74 @@ class TestForceCpuImagePreprocessing(CustomTestCase):
 
         fast = SimpleNamespace(image_processor=BaseImageProcessor(), tokenizer=None)
 
-        def warnings(force, workers, cls=None, _processor=None):
+        def messages(force, workers, cls=None, _processor=None):
             with (
                 self._cuda(),
                 self._force(force),
-                patch(f"{BASE}.logger.warning") as warning,
+                patch(f"{BASE}.logger.info") as info,
             ):
                 self._construct(cls, workers, _processor)
-            return [c.args[0] % c.args[1:] for c in warning.call_args_list]
+            return [
+                c.args[0] % c.args[1:]
+                for c in info.call_args_list
+                if "SGLANG_FORCE_CPU_IMAGE_PREPROCESSING" in c.args[0]
+            ]
 
-        decode_only = warnings(False, 8)
+        decode_only = messages(False, 8)
         self.assertEqual(len(decode_only), 1)
         self.assertIn("8 tokenizer workers each decode JPEG images on", decode_only[0])
         self.assertNotIn("fast image processor", decode_only[0])
         self.assertIn("SGLANG_FORCE_CPU_IMAGE_PREPROCESSING=1", decode_only[0])
-        fast_only = warnings(False, 8, _CpuDecode, fast)
+        fast_only = messages(False, 8, _CpuDecode, fast)
         self.assertEqual(len(fast_only), 1)
         self.assertIn("each run the fast image processor on", fast_only[0])
-        self.assertEqual(warnings(True, 8), [])
-        self.assertEqual(warnings(False, 1), [])
+        self.assertEqual(messages(True, 8), [])
+        self.assertEqual(messages(False, 1), [])
         with (
             self._cuda(nvidia=False),
             self._force(False),
-            patch(f"{BASE}.logger.warning") as warning,
+            patch(f"{BASE}.logger.info") as info,
         ):
             self._construct(tokenizer_worker_num=8)
             self._construct(_CpuDecode, 8, fast)
-        self.assertFalse(warning.called)
+        self.assertFalse(
+            any(
+                "SGLANG_FORCE_CPU_IMAGE_PREPROCESSING" in c.args[0]
+                for c in info.call_args_list
+            )
+        )
+
+    def test_ernie45_vl_fast_processor_follows_the_variable(self):
+        """Ernie4.5-VL sets the fast processor's device itself."""
+        from transformers import BaseImageProcessor
+
+        from sglang.srt.multimodal.processors.ernie45_vl import (
+            Ernie4_5_VLImageProcessor,
+        )
+
+        class _Stop(Exception):
+            pass
+
+        seen = []
+
+        class _HFProcessor:
+            image_processor = BaseImageProcessor()
+            tokenizer = None
+
+            def __call__(self, **kwargs):
+                seen.append(kwargs.get("device"))
+                raise _Stop
+
+        processor = Ernie4_5_VLImageProcessor.__new__(Ernie4_5_VLImageProcessor)
+        processor.image_config = None
+        processor.video_config = None
+        processor.disable_fast_image_processor = False
+        for force in (False, True):
+            with self._cuda(), self._force(force), self.assertRaises(_Stop):
+                processor.process_mm_data(
+                    "<image>", images=[object()], processor=_HFProcessor()
+                )
+        self.assertEqual(seen, ["cuda", "cpu"])
 
     def test_other_platforms_keep_their_placement(self):
         """Honored on NVIDIA CUDA only; e.g. ROCm keeps the device path."""

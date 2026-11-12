@@ -64,12 +64,7 @@ _is_xpu = is_xpu()
 
 
 def _force_cpu_image_preprocessing() -> bool:
-    """SGLANG_FORCE_CPU_IMAGE_PREPROCESSING, as this module applies it.
-
-    Honored here on NVIDIA CUDA only, the platform it was validated on; other
-    platforms keep their placement. Kimi-K2.5 and diffusion read the variable
-    themselves, on every platform.
-    """
+    """SGLANG_FORCE_CPU_IMAGE_PREPROCESSING; honored on NVIDIA CUDA only."""
     return (
         envs.SGLANG_FORCE_CPU_IMAGE_PREPROCESSING.get()
         and platforms.current_platform.is_cuda()
@@ -312,9 +307,7 @@ class BaseMultimodalProcessor(ABC):
             self.image_processor_backend = "pil"
         self.disable_fast_image_processor = self.image_processor_backend == "pil"
         if _force_cpu_image_preprocessing():
-            # Decode on the CPU too: nvJPEG would still put every tokenizer
-            # worker on the GPU. `_load_single_item` (a classmethod) reads the
-            # variable itself; this keeps the instance and its cache keys honest.
+            # Decode with PIL, not nvJPEG; the cache fingerprint reads this.
             self.gpu_image_decode = False
         self.skip_tokenizer_init = get_serving().skip_tokenizer_init
 
@@ -358,7 +351,7 @@ class BaseMultimodalProcessor(ABC):
             )
 
         self._tokenizer = _tokenizer_of(self._processor)
-        self._warn_if_tokenizer_workers_share_the_gpu()
+        self._log_tokenizer_workers_on_the_gpu()
 
         # Same guard as in serving_chat.py against double BOS.
         try:
@@ -778,14 +771,9 @@ class BaseMultimodalProcessor(ABC):
             return self._processor, self._tokenizer
         return processor, _tokenizer_of(processor)
 
-    def _warn_if_tokenizer_workers_share_the_gpu(self) -> None:
-        """Point at SGLANG_FORCE_CPU_IMAGE_PREPROCESSING when it is likely needed.
-
-        Each tokenizer worker that decodes JPEGs with nvJPEG or runs the fast
-        image processor on the accelerator opens its own device context next to
-        the scheduler's memory pool; with many workers that can exhaust device
-        memory. Placement is left unchanged; this only warns.
-        """
+    def _log_tokenizer_workers_on_the_gpu(self) -> None:
+        """With several tokenizer workers that each use the GPU for images,
+        mention SGLANG_FORCE_CPU_IMAGE_PREPROCESSING. Placement is unchanged."""
         workers = get_serving().tokenizer_worker_num
         if workers <= 1 or not platforms.current_platform.is_cuda():
             return
@@ -803,11 +791,10 @@ class BaseMultimodalProcessor(ABC):
             )
             if on
         )
-        logger.warning(
-            "%d tokenizer workers each %s on the GPU, so each opens its own device "
-            "context next to the model. If image requests fail with out of "
-            "memory, set SGLANG_FORCE_CPU_IMAGE_PREPROCESSING=1 to decode and "
-            "preprocess images on the CPU.",
+        logger.info(
+            "%d tokenizer workers each %s on the GPU (one device context per "
+            "worker). To decode and preprocess images on the CPU instead, set "
+            "SGLANG_FORCE_CPU_IMAGE_PREPROCESSING=1.",
             workers,
             on_gpu,
         )
@@ -865,8 +852,8 @@ class BaseMultimodalProcessor(ABC):
             or get_exec().deterministic.rl_on_policy_target is not None
             or _force_cpu_image_preprocessing()
         ):
-            # An explicit "cpu": left unset, the processor would follow an
-            # input tensor's device.
+            # Return "cpu" explicitly when forcing cpu image preprocessing. Otherwise,
+            # the processor would follow the input tensor's device.
             return "cpu"
         if _is_xpu:
             return "xpu"
@@ -1089,7 +1076,6 @@ class BaseMultimodalProcessor(ABC):
             return data
         try:
             if modality == Modality.IMAGE:
-                # Not `x and not env`: that would turn "nvjpeg_fancy" into True.
                 gpu_image_decode = (
                     False if _force_cpu_image_preprocessing() else cls.gpu_image_decode
                 )
