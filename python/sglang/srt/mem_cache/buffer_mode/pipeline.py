@@ -919,8 +919,7 @@ class BufferModePipeline:
                 if not keys:
                     continue  # covered since admission
                 if intent.pool == PoolName.MAMBA and self._mamba_request_end_only:
-                    # A split must not turn one admitted endpoint checkpoint
-                    # into additional intermediate-state writes.
+                    # A split adds no state writes beyond the admitted endpoint.
                     if any(key not in intent.keys for key in keys):
                         continue
                 repaired = _UnifiedBackupIntent(

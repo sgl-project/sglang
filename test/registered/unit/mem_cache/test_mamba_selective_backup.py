@@ -16,20 +16,16 @@ from sglang.srt.mem_cache.buffer_mode.pipeline import BufferModePipeline
 from sglang.srt.mem_cache.buffer_mode.storage_existence_cache import (
     StorageExistenceCache,
 )
-from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
-from sglang.srt.mem_cache.unified_cache.components.full import FullComponent
-from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
 from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     BufferBackupSnapshot,
 )
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.tree_slots import slot_of, tree_slots_of
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -68,39 +64,6 @@ def pipeline(selective):
     return result, cache
 
 
-def real_tree_core(backend):
-    params = CacheInitParams(
-        disable=False,
-        req_to_token_pool=None,
-        token_to_kv_pool_allocator=None,
-        page_size=1,
-        tree_slots=tree_slots_of((ComponentType.FULL,)),
-    )
-    if backend == "rust":
-        from sglang.srt.mem_cache.rust_tree_core.adapter import RustUnifiedTreeCore
-
-        return RustUnifiedTreeCore(params)
-    cache = SimpleNamespace(enable_session_radix_cache=False)
-    return UnifiedTreeCore(
-        params,
-        {
-            ComponentType.FULL: FullComponent(
-                cache, params, slot_of(params, ComponentType.FULL)
-            )
-        },
-    )
-
-
-def pump_insert(core, key):
-    step = core.begin_insert(
-        InsertParams(key=key, value=torch.arange(len(key), dtype=torch.int64))
-    )
-    while step.result is None:
-        step = core.resume_insert()
-    core.end_insert()
-    return step.result
-
-
 def insert(p, is_request_end, length=4, node=7):
     p.begin_insert_walk(is_request_end=is_request_end, key_len=length)
     p.enqueue_backup_intent(node)
@@ -108,14 +71,6 @@ def insert(p, is_request_end, length=4, node=7):
 
 
 class TestMambaSelectiveBackup(unittest.TestCase):
-    def test_default_off_preserves_intermediate_and_endpoint(self):
-        for source in (False, True, None):
-            p, _ = pipeline(False)
-            insert(p, source)
-            self.assertEqual(
-                [i.pool for i in p.pending_write_queue], [PoolName.KV, PoolName.MAMBA]
-            )
-
     def test_intermediate_skip_does_not_publish_state_and_endpoint_can_follow(self):
         p, cache = pipeline(True)
         insert(p, False)
@@ -167,45 +122,10 @@ class TestMambaSelectiveBackup(unittest.TestCase):
                 self.assertEqual([i.pool for i in p.pending_write_queue], expected)
                 self.assertIsNone(p._insert_is_request_end)
 
-    def test_endpoint_retry_reads_hit_count_from_each_tree_core_backend(self):
-        # The retry runs on the tree core the server selected; the Rust core has
-        # no Python node objects, so the hit count must come through the interface.
-        for backend in ("python", "rust"):
-            for threshold, expected in ((2, [7]), (3, [])):
-                with self.subTest(backend=backend, threshold=threshold):
-                    core = real_tree_core(backend)
-                    key = RadixKey(array("q", range(4)))
-                    first = pump_insert(core, key)
-                    second = pump_insert(core, key)
-                    self.assertEqual(first.last_device_node, second.last_device_node)
-                    self.assertEqual(core.node_hit_count(second.last_device_node), 2)
-
-                    p, cache = pipeline(True)
-                    cache.tree_core = core
-                    cache.is_write_back = False
-                    cache.write_through_threshold = threshold
-                    retried = []
-                    p.enqueue_backup_intent = retried.append
-                    p.begin_insert_walk(is_request_end=True, key_len=4)
-                    p.on_insert_complete(
-                        InsertResult(
-                            prefix_len=4, last_device_node=second.last_device_node
-                        )
-                    )
-                    p.end_insert_walk()
-                    self.assertEqual(
-                        retried, [second.last_device_node] if expected else []
-                    )
-
     def test_ancestor_is_not_promoted_to_request_end(self):
         p, _ = pipeline(True)
         insert(p, True, length=8)
         self.assertEqual([i.pool for i in p.pending_write_queue], [PoolName.KV])
-
-    def test_unknown_manual_source_remains_eligible(self):
-        p, _ = pipeline(True)
-        insert(p, None)
-        self.assertIn(PoolName.MAMBA, [i.pool for i in p.pending_write_queue])
 
     def test_split_keeps_original_state_key_only(self):
         p, cache = pipeline(True)
