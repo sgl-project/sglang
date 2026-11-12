@@ -126,6 +126,28 @@ def _transfer_timeout_ns() -> int:
     return max(_MIN_TRANSFER_TIMEOUT_S, timeout_s) * 1_000_000_000
 
 
+def _import_tent():
+    # A source build with -DUSE_TENT=ON puts a top-level `tent` on PYTHONPATH;
+    # Mooncake's wheels ship the binding, when at all, as `mooncake.tent`.
+    try:
+        import tent
+    except ImportError:
+        pass
+    else:
+        return tent
+    try:
+        from mooncake import tent
+    except ImportError as e:
+        raise ImportError(
+            "SGLANG_MOONCAKE_TRANSFER_ENGINE=tent needs Mooncake's native `tent` "
+            "module, which no CUDA wheel ships yet: build Mooncake with "
+            "-DUSE_TENT=ON and put tent.*.so on PYTHONPATH. (The "
+            "mooncake-transfer-engine-memfabric wheel ships it as mooncake.tent, "
+            "built against Ascend CANN.)"
+        ) from e
+    return tent
+
+
 @dataclass
 class _Segment:
     """An open peer segment, shared by every in-flight transfer to that peer."""
@@ -147,16 +169,7 @@ class TentTransferEngine(KVTransferEngine):
     def __init__(
         self, hostname: str, ib_device: Optional[str], gpu_id: Optional[int] = None
     ):
-        try:
-            import tent
-        except ImportError as e:
-            raise ImportError(
-                "SGLANG_MOONCAKE_TRANSFER_ENGINE=tent needs the native `tent` "
-                "module. Please install mooncake-transfer-engine>=0.3.14, or "
-                "build Mooncake with -DUSE_TENT=ON and put tent.*.so on "
-                "PYTHONPATH."
-            ) from e
-        self._tent = tent
+        tent = self._tent = _import_tent()
         # The intent only tags requests with a priority and intent type. Traffic
         # is isolated only if SGLANG_TENT_CONFIG_OVERRIDE configures separate
         # foreground/background QP pools; otherwise both share the same QPs.
@@ -236,14 +249,17 @@ class TentTransferEngine(KVTransferEngine):
         except self._tent.TentException as exc:
             raise RuntimeError("TENT memory deregistration failed") from exc
 
-    def batch_register(self, ptrs: List[int], lengths: List[int]) -> int:
+    def batch_register(self, ptrs: List[int], lengths: List[int]) -> None:
+        # Callers no longer check a return value (classic TE raises too), so a
+        # rejected region must fail here rather than at the first transfer.
         try:
             self.engine.register_local_memory_batch(list(ptrs), list(lengths))
         except self._tent.TentException as exc:
-            logger.debug("TENT batch memory registration failed: %s", exc)
-            return -1
+            raise RuntimeError(
+                f"TENT failed to register {len(ptrs)} memory regions "
+                f"({sum(lengths)} bytes) on device {self.ib_device!r}"
+            ) from exc
         self._registered.update(zip(ptrs, lengths))
-        return 0
 
     def batch_deregister(self, ptrs: List[int]) -> int:
         lengths = [self._registered.pop(ptr, 0) for ptr in ptrs]

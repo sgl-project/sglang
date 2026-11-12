@@ -33,7 +33,8 @@ class KVTransferEngine(ABC):
     def deregister(self, ptr: int) -> None: ...
 
     @abstractmethod
-    def batch_register(self, ptrs: List[int], lengths: List[int]) -> int: ...
+    def batch_register(self, ptrs: List[int], lengths: List[int]) -> None:
+        """Register every region, raising RuntimeError if the engine rejects one."""
 
     @abstractmethod
     def batch_deregister(self, ptrs: List[int]) -> int: ...

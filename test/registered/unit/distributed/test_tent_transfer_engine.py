@@ -239,9 +239,31 @@ class TestTentTransferEngine(CustomTestCase):
 
     def test_deregister_passes_registered_lengths(self):
         engine, _ = self._engine()
-        self.assertEqual(engine.batch_register([10, 20], [4096, 8192]), 0)
+        self.assertIsNone(engine.batch_register([10, 20], [4096, 8192]))
         self.assertEqual(engine.batch_deregister([20, 10]), 0)
         self.assertEqual(engine.engine.unregistered, [([20, 10], [8192, 4096])])
+
+    def test_rejected_batch_register_raises_like_classic_te(self):
+        engine, _ = self._engine()
+
+        def reject(ptrs, lengths):
+            raise engine._tent.InternalError("injected register failure")
+
+        engine.engine.register_local_memory_batch = reject
+        with self.assertRaisesRegex(RuntimeError, "TENT failed to register 2"):
+            engine.batch_register([10, 20], [4096, 8192])
+        self.assertEqual(engine._registered, {})
+
+    def test_tent_binding_falls_back_to_the_memfabric_wheel(self):
+        from sglang.srt.distributed.device_communicators import tent_transfer_engine
+
+        fake = _make_fake_tent()
+        mooncake = types.ModuleType("mooncake")
+        mooncake.tent = fake
+        with patch.dict(
+            sys.modules, {"tent": None, "mooncake": mooncake, "mooncake.tent": fake}
+        ):
+            self.assertIs(tent_transfer_engine._import_tent(), fake)
 
     def test_session_id_matches_classic_host_port_format(self):
         engine, _ = self._engine()
@@ -381,19 +403,17 @@ class TestTransferEngineSelector(CustomTestCase):
                 with self.assertRaises(ValueError):
                     mte.init_mooncake_transfer_engine(hostname="10.0.0.1")
 
-    def test_missing_tent_module_names_the_mooncake_version(self):
+    def test_missing_tent_module_points_at_the_source_build(self):
         from sglang.srt.distributed.device_communicators import (
             mooncake_transfer_engine as mte,
         )
 
         with (
             patch.object(mte, "_mooncake_transfer_engine", None),
-            patch.dict(sys.modules, {"tent": None}),
+            patch.dict(sys.modules, {"tent": None, "mooncake.tent": None}),
         ):
             with envs.SGLANG_MOONCAKE_TRANSFER_ENGINE.override("tent"):
-                with self.assertRaisesRegex(
-                    ImportError, r"mooncake-transfer-engine>=0\.3\.14"
-                ):
+                with self.assertRaisesRegex(ImportError, r"-DUSE_TENT=ON"):
                     mte.init_mooncake_transfer_engine(hostname="10.0.0.1")
             self.assertIsNone(mte._mooncake_transfer_engine)
 
