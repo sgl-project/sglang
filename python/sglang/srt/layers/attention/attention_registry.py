@@ -664,6 +664,6 @@ def create_mlu_backend(runner):
         raise NotImplementedError(
             "The MLU attention backend supports dense GQA models."
         )
-    from sglang.srt.hardware_backend.mlu.attention.mlu_backend import MLUAttnBackend
+    from sglang.srt.hardware_backend.mlu.attention.mha_backend import MLUMHABackend
 
-    return MLUAttnBackend(runner)
+    return MLUMHABackend(runner)

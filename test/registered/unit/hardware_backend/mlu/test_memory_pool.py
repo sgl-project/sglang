@@ -2,7 +2,7 @@
 
 Cover the MLU writer and HND storage without loading model weights.
 Run with SGLANG_PLUGINS=none on one free MLU:
-    python test/registered/kernels/ops/kvcache/test_mlu_kv_cache.py -f
+    python test/registered/unit/hardware_backend/mlu/test_memory_pool.py -f
 """
 
 import unittest
@@ -12,7 +12,7 @@ import torch
 import torch_mlu  # noqa: F401
 
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.mlu.memory_pool_mlu import MLUMHATokenToKVPool
+from sglang.srt.hardware_backend.mlu.memory_pool import MLUMHATokenToKVPool
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.test.ci.ci_register import register_mlu_ci
 from sglang.test.test_utils import CustomTestCase

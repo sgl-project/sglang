@@ -8,8 +8,8 @@ import torch
 import torch_mlu  # noqa: F401
 import torch_mlu_ops
 
-from sglang.srt.hardware_backend.mlu.attention.mlu_backend import MLUAttnBackend
-from sglang.srt.hardware_backend.mlu.memory_pool_mlu import MLUMHATokenToKVPool
+from sglang.srt.hardware_backend.mlu.attention.mha_backend import MLUMHABackend
+from sglang.srt.hardware_backend.mlu.memory_pool import MLUMHATokenToKVPool
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_mlu_ci
@@ -36,7 +36,7 @@ class TestAttentionMLU(CustomTestCase):
             req[i, : 16 * len(pages)] = torch.cat(
                 [torch.arange(p * 16, (p + 1) * 16, device="mlu") for p in pages]
             )
-        backend = MLUAttnBackend(
+        backend = MLUMHABackend(
             NS(
                 device="mlu",
                 page_size=16,

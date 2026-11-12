@@ -108,7 +108,7 @@ class MluSRTPlatform(MluDeviceMixin, SRTPlatform):
 
     def get_kv_pool_cls(self, *, kind):
         if kind == "mha":
-            from sglang.srt.hardware_backend.mlu.memory_pool_mlu import (
+            from sglang.srt.hardware_backend.mlu.memory_pool import (
                 MLUMHATokenToKVPool,
             )
 
