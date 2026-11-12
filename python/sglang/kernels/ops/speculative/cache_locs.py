@@ -721,7 +721,9 @@ def assign_extend_cache_locs_func(
             dtype=torch.int32,
             device=device,
         )
-        torch.ops.npu.cache_loc_update(
+        from sgl_kernel_npu.operators.mem_cache import cache_loc_update
+
+        cache_loc_update(
             req_pool_indices,
             req_to_token,
             start_offset,

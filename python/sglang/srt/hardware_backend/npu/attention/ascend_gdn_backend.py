@@ -2,7 +2,6 @@ from typing import Optional, Tuple, Union
 
 import torch
 from sgl_kernel_npu.fla.fused_gdn_gating import fused_gdn_gating_kernel_without_sigmoid
-from sgl_kernel_npu.fla.l2norm import l2norm_fwd
 from sgl_kernel_npu.fla.utils import prepare_chunk_indices
 from sgl_kernel_npu.operators.attention.gdn import (
     chunk_gated_delta_rule,
@@ -10,6 +9,7 @@ from sgl_kernel_npu.operators.attention.gdn import (
     recurrent_gated_delta_rule,
 )
 from sgl_kernel_npu.operators.mamba import causal_conv1d
+from sgl_kernel_npu.operators.norm import l2norm_fwd
 
 from sglang.srt.hardware_backend.npu.attention.ascend_hybrid_linear_attn_backend import (
     AscendMambaAttnBackendBase,

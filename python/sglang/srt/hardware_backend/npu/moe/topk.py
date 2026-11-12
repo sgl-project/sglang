@@ -59,7 +59,7 @@ def fused_topk_npu(
         )
 
         if renormalize:
-            from sgl_kernel_npu.norm.l1_norm import l1_norm
+            from sgl_kernel_npu.operators.norm import l1_norm
 
             topk_weights = l1_norm(
                 topk_weights
