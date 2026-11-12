@@ -75,15 +75,8 @@ logger = logging.getLogger(__name__)
 
 _is_cuda = get_platform().is_cuda
 
-# The width-generic K=7 conv is a CuTe DSL kernel. It was first tuned for Blackwell
-# datacenter (sm100/sm103) but is pure-SIMT (no MMA/TMA/tensor-core ops); its only
-# arch-specific feature is PDL (griddepcontrol + use_pdl), which Hopper (sm90) and
-# consumer Blackwell (sm120) also support. Validated numerically against the torch
-# reference on sm90 (H100), sm100, and sm120 (RTX PRO 6000 Blackwell — full
-# test_cutedsl_gated_conv suite), so enable on all three. Gate on cuda first
-# (short-circuit so the sm-probe never runs on ROCm/CPU) and import lazily — on any
-# other platform fall back to the torch F.conv1d path so ROCm / non-CUDA builds are
-# unaffected.
+# The SIMT kernel needs PDL, available on Hopper and Blackwell.
+# Gate on CUDA before probing SM support so ROCm/CPU keep the torch fallback.
 _use_cute_conv = _is_cuda and (
     get_platform().is_sm100 or get_platform().is_sm90 or get_platform().is_sm120
 )

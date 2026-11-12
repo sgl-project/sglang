@@ -24,7 +24,6 @@ result is cast back to the tensor dtype.
 
   decode : (B, dim) one token/req + (slots, dim, K-1) state -> (B, dim), state updated
   prefill: (T, dim) varlen token-major + state + has_initial_state -> (T, dim)
-Validated against the PyTorch reference in tests/test_cutedsl_gated_conv.py.
 """
 
 from __future__ import annotations
