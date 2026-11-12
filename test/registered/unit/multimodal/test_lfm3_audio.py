@@ -7,7 +7,7 @@ import pytest
 import torch
 from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
-from transformers import PreTrainedTokenizerFast
+from transformers import FeatureExtractionMixin, PreTrainedTokenizerFast
 
 from sglang.srt.configs.lfm3_audio import Lfm3AudioConfig
 from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_spec
@@ -41,6 +41,34 @@ def tokenizer():
         "{% endfor %}{% if add_generation_prompt %}assistant:{% endif %}"
     )
     return tokenizer
+
+
+def test_from_pretrained_loads_processor_components(tokenizer):
+    from unittest.mock import MagicMock, patch
+
+    feature_extractor = MagicMock(spec=FeatureExtractionMixin)
+    with (
+        patch(
+            "sglang.srt.hf_transformers.tokenizer.get_tokenizer",
+            return_value=tokenizer,
+        ) as get_tokenizer,
+        patch(
+            "sglang.srt.multimodal.lfm3_audio.AutoFeatureExtractor.from_pretrained",
+            return_value=feature_extractor,
+        ) as from_pretrained,
+    ):
+        processor = Lfm3AudioProcessor.from_pretrained(
+            "model", revision="revision", trust_remote_code=True
+        )
+
+    assert processor.tokenizer is tokenizer
+    assert processor.feature_extractor is feature_extractor
+    get_tokenizer.assert_called_once_with(
+        "model", tokenizer_revision="revision", trust_remote_code=True
+    )
+    from_pretrained.assert_called_once_with(
+        "model", revision="revision", trust_remote_code=True
+    )
 
 
 @pytest.mark.parametrize("cache_mb", [0, 256])

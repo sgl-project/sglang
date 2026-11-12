@@ -48,7 +48,7 @@ class Lfm3AudioProcessor(ProcessorMixin):
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, **kwargs):
-        from sglang.srt.utils.hf_transformers.tokenizer import get_tokenizer
+        from sglang.srt.hf_transformers.tokenizer import get_tokenizer
 
         revision = kwargs.pop("revision", None)
         return cls(
