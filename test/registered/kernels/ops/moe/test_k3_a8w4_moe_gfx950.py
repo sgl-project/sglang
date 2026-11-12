@@ -8,7 +8,7 @@ import torch
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_amd_ci(est_time=90, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=25, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 _FP4_MAGNITUDES = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
 FP4_LUT = _FP4_MAGNITUDES + [-v for v in _FP4_MAGNITUDES]  # e2m1 code -> value

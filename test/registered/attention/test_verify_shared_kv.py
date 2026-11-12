@@ -23,7 +23,7 @@ from sglang.srt.utils import get_hip_version, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_amd_ci(est_time=40, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=35, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 BF16_ATOL = 2e-2
 BF16_RTOL = 1e-2
