@@ -3265,7 +3265,15 @@ class DFlashWorkerV2(BaseSpecWorker):
             # The non-overlap (sync) scheduler path advances batch.seq_lens
             # from the result; overlap carries it via next_draft_input instead.
             new_seq_lens=new_seq_lens,
-            routed_experts_output=target_out.routed_experts_output,
-            indexer_topk_output=target_out.indexer_topk_output,
-            kv_weight_version_record=target_out.kv_weight_version_record,
+            # The dynamic AdaFlash path's target_out is the slim
+            # TargetVerifyResult (logits_output, can_run_cuda_graph only);
+            # it carries no MoE/indexer/weight-version metadata, unlike the
+            # static path's richer target_worker.forward_batch_generation()
+            # result. GenerationBatchResult defaults all three to None, so
+            # fall back to that default instead of a hard AttributeError.
+            routed_experts_output=getattr(target_out, "routed_experts_output", None),
+            indexer_topk_output=getattr(target_out, "indexer_topk_output", None),
+            kv_weight_version_record=getattr(
+                target_out, "kv_weight_version_record", None
+            ),
         )
