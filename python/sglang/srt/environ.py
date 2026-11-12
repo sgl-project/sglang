@@ -708,6 +708,10 @@ class Envs:
     # Internal/testing only - users should not need to change this.
     SGLANG_PREFILL_TILE_BUDGET_MODE = EnvStr("compact")
     SGLANG_PREFILL_DELAYER_MAX_PREFILL_BS_WINDOW_SIZE = EnvInt(16)
+    # Prefill the part of a long prompt that does not fill a whole chunk first,
+    # then whole chunks, so the short chunk's attention sees almost no context
+    # instead of the whole prompt. See PrefillAdder.remainder_first_len.
+    SGLANG_CHUNKED_PREFILL_REMAINDER_FIRST = EnvBool(False)
 
     # ===================================================================
     # Scheduler polling, timeouts, and output
