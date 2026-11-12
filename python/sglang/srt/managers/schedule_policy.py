@@ -432,10 +432,16 @@ class SchedulePolicy:
         ):
             return None
         remaining = len(chunked_req.full_untruncated_fill_ids) - chunked_req.prefix_len
+        replay = get_exec().features.enable_encoder_swa_bounded_replay
         reserved = 0
         for req in waiting_queue:
             work = self._shortest_prefill_work(req)
             charge = _ceil_div(work, page_size) * page_size
+            if replay and encoder_swa_replay.resets_swa_window(req):
+                # Admission also charges the replay rows to the chunk; a
+                # reservation short of them makes the request miss the chunk
+                # fit, which ends admission and wastes the whole reservation.
+                charge += encoder_swa_replay.replay_len(req.num_matched_prefix_tokens)
             if work >= remaining or reserved + charge > budget - page_size:
                 break
             reserved += charge
