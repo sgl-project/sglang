@@ -87,16 +87,17 @@ class MluSRTPlatform(MluDeviceMixin, SRTPlatform):
             raise NotImplementedError("MLU speculative decoding is not supported yet.")
         if server_args.sampling_backend not in (None, "pytorch"):
             raise ValueError("MLU inference requires the pytorch sampling backend.")
+        default_attention_backend = server_args.attention_backend or "mlu"
         for field in (
             "attention_backend",
             "prefill_attention_backend",
             "decode_attention_backend",
         ):
             backend = getattr(server_args, field)
-            if backend not in (None, "mlu"):
-                raise ValueError(f"MLU inference requires {field}='mlu'.")
+            if backend not in (None, "mlu", "triton"):
+                raise ValueError(f"MLU inference requires {field}='mlu' or 'triton'.")
             if backend is None:
-                setattr(server_args, field, "mlu")
+                setattr(server_args, field, default_attention_backend)
         if server_args.sampling_backend is None:
             server_args.sampling_backend = "pytorch"
         if server_args.page_size is None:
