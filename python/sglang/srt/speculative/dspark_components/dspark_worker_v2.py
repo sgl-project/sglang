@@ -224,46 +224,27 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._target_tp_rank = get_parallel().tp_rank
         load_group = get_pp_stage_load_group()
         quarot_scope = nullcontext()
-        quarot_config = None
         apply_quarot_to_draft = envs.SGLANG_NPU_GLM_DSPARK_APPLY_QUAROT_TO_DRAFT.get()
         if apply_quarot_to_draft and not _is_npu:
             logger.warning_once(
                 "SGLANG_NPU_GLM_DSPARK_APPLY_QUAROT_TO_DRAFT=true was not "
                 "applied because this is not an NPU runtime."
             )
-        elif apply_quarot_to_draft and self._draft_is_moe:
-            logger.warning_once(
-                "SGLANG_NPU_GLM_DSPARK_APPLY_QUAROT_TO_DRAFT=true was not "
-                "applied because the QuaRot adapter supports dense drafts only."
-            )
         elif apply_quarot_to_draft:
             from sglang.srt.hardware_backend.npu.dspark_quarot import (
-                build_glm_dspark_quarot_config,
-                glm_dspark_quarot_scope,
-                validate_glm_dspark_quarot_draft_loader,
+                prepare_glm_dspark_quarot_scope,
             )
 
-            quarot_config = build_glm_dspark_quarot_config(
+            quarot_scope = prepare_glm_dspark_quarot_scope(
+                draft_is_moe=self._draft_is_moe,
                 device=self.device,
-                enabled=apply_quarot_to_draft,
                 target_model_config=target_worker.model_runner.model_config,
                 target_model=target_worker.model_runner.model,
+                load_format=(
+                    server_args.speculative_draft_load_format or server_args.load_format
+                ),
+                weight_cache_mode=server_args.weight_cache_mode,
             )
-            if quarot_config is None:
-                logger.warning_once(
-                    "SGLANG_NPU_GLM_DSPARK_APPLY_QUAROT_TO_DRAFT=true was not "
-                    "applied because the target is not a supported GLM DSA "
-                    "ModelSlim model."
-                )
-            else:
-                validate_glm_dspark_quarot_draft_loader(
-                    load_format=(
-                        server_args.speculative_draft_load_format
-                        or server_args.load_format
-                    ),
-                    weight_cache_mode=server_args.weight_cache_mode,
-                )
-            quarot_scope = glm_dspark_quarot_scope(quarot_config)
 
         with draft_pp_context(), self._draft_context(), quarot_scope:
             bundle = build_draft_tp_worker(

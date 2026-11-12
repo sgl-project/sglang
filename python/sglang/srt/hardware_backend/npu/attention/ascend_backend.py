@@ -705,16 +705,7 @@ class AscendAttnBackend(AttentionBackend):
         # Device lengths hold the committed prefix even when the CPU mirror
         # has already been advanced for a speculative step.
         kv_lens = seq_lens[:bs].int() + verify_lens
-        if metadata.block_tables is None:
-            metadata.actual_seq_lengths_q = q_ends
-            metadata.seq_lens = kv_lens
-            metadata.actual_seq_lengths_kv = kv_lens
-            metadata.block_tables = self._gather_block_tables(
-                req_pool_indices[:bs], int(kv_lens.max().item())
-            ).int()
-            return
-
-        # Graph replay and DP eager fallback both include token-tier padding.
+        # Both graph replay and eager fallback can retain token-tier padding.
         # Assign it to a separate row mapped to the reserved KV page 0.
         metadata.actual_seq_lengths_q[:bs].copy_(q_ends)
         metadata.actual_seq_lengths_q[bs:-1].copy_(q_ends[-1])
@@ -734,24 +725,11 @@ class AscendAttnBackend(AttentionBackend):
         self.forward_metadata = ForwardMetadata()
         layout = self._glm_compact_layout(forward_batch)
         if layout is not None:
-            if get_parallel().attn_dp_enabled:
-                self.forward_metadata = self._allocate_padded_verify_metadata(
-                    forward_batch.batch_size, layout.graph_num_tokens
-                )
-            else:
-                # Without DP or a graph, request rows and input tokens are unpadded.
-                if layout.bs != forward_batch.seq_lens.numel():
-                    raise ValueError(
-                        "NPU eager ragged verify requires one length per request"
-                    )
-                total = layout.total_verify_tokens
-                if total is None:
-                    total = int(layout.qo_indptr_device[-1].item())
-                if (
-                    total != layout.graph_num_tokens
-                    or total != forward_batch.input_ids.numel()
-                ):
-                    raise ValueError("NPU eager ragged verify requires unpadded inputs")
+            # A selected graph tier survives a later graph-admission failure.
+            # Use the same sink-row contract in eager, with or without DP.
+            self.forward_metadata = self._allocate_padded_verify_metadata(
+                forward_batch.batch_size, layout.graph_num_tokens
+            )
             self._update_ragged_verify_metadata(
                 self.forward_metadata,
                 layout,

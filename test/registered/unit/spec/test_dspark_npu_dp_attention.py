@@ -380,3 +380,7 @@ def test_execution_policy_publishes_counts_after_target_coordination(busy):
     )
     prepare.assert_called_once_with(forward_batch, runner)
     assert [call[0] for call in calls.mock_calls] == ["coordinate", "prepare"]
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

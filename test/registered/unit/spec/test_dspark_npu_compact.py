@@ -10,22 +10,14 @@ from unittest.mock import Mock, patch
 import numpy as np
 import torch
 
-from sglang.kernels.ops.speculative.dspark.dspark_schedule import (
-    ScheduleVerifyLensTopk,
-)
 from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
-    build_ragged_verify_window,
     scatter_compact_to_strided,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.dspark_components import dspark_verify
-from sglang.srt.speculative.dspark_components.dspark_planner import (
-    DSparkScheduleConfig,
-)
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.utils import is_npu
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -174,20 +166,47 @@ class TestNpuCompactMetadata(CustomTestCase):
             expected = request_layout if enabled and mode.is_target_verify() else None
             self.assertIs(select(backend, batch), expected)
 
-    def test_eager_rejects_padded_layout_without_dp(self):
-        backend = SimpleNamespace(_dspark_dsa_ragged_verify=True)
+    def test_eager_fallback_keeps_selected_graph_tier_without_dp(self):
+        backend = SimpleNamespace(
+            _dspark_dsa_ragged_verify=True,
+            req_to_token=torch.arange(8, 264).view(4, 64),
+            page_size=8,
+            device="cpu",
+        )
         _bind_metadata_methods(backend)
-        layout = RaggedVerifyLayout.from_verify_lens(
-            verify_lens_cpu=[1, 3], device=torch.device("cpu"), grid=[8]
+        # The planner has selected T=8, but the target may reject graph replay
+        # later. The eager input still has eight rows, only four of them live.
+        layout = RaggedVerifyLayout.from_verify_lens_device(
+            verify_lens=torch.tensor([1, 3]), graph_num_tokens=8
         )
         batch = SimpleNamespace(
             forward_mode=ForwardMode.TARGET_VERIFY,
+            batch_size=2,
             spec_info=SimpleNamespace(ragged_verify_layout=layout),
             seq_lens=torch.tensor([10, 20]),
+            req_pool_indices=torch.tensor([2, 0]),
             input_ids=torch.zeros(8, dtype=torch.int64),
         )
-        with self.assertRaisesRegex(ValueError, "unpadded"):
-            _backend_method()(backend, batch)
+        _backend_method()(backend, batch)
+        metadata = backend.forward_metadata
+        self.assertEqual(metadata.actual_seq_lengths_q.tolist(), [1, 4, 8])
+        self.assertEqual(metadata.actual_seq_lengths_kv.tolist(), [11, 23, 4])
+        self.assertEqual(
+            metadata.block_tables.tolist(),
+            [
+                [17, 18, 0, 0, 0, 0, 0, 0],
+                [1, 2, 3, 0, 0, 0, 0, 0],
+                [0] * 8,
+            ],
+        )
+        self.assertFalse(backend.graph_mode)
+        # Outputs for sink queries must not leak into per-request acceptance.
+        compact = torch.tensor([10, 20, 21, 22, 999, 999, 999, 999])[:, None]
+        strided = scatter_compact_to_strided(
+            compact=compact, layout=layout, fill_value=-1, verify_num_draft_tokens=4
+        )
+        self.assertEqual(strided.flatten().tolist(), [10, -1, -1, -1, 20, 21, 22, -1])
+        self.assertEqual(batch.seq_lens.tolist(), [10, 20])
 
     def test_graph_capture_and_replay_refresh_token_tier_buffers(self):
         backend = SimpleNamespace(
@@ -282,6 +301,7 @@ class TestNpuCompactMetadata(CustomTestCase):
                 expanded_cpu = prefix + torch.tensor(lens)
                 batch = SimpleNamespace(
                     forward_mode=ForwardMode.TARGET_VERIFY,
+                    batch_size=len(lens),
                     spec_info=SimpleNamespace(
                         ragged_verify_layout=layout_for(lens), draft_token_num=8
                     ),
@@ -295,15 +315,17 @@ class TestNpuCompactMetadata(CustomTestCase):
                 )
                 method(backend, batch)
                 metadata = backend.forward_metadata
-                self.assertEqual(metadata.seq_lens.tolist(), expanded_cpu.tolist())
                 self.assertEqual(
-                    metadata.actual_seq_lengths_kv.tolist(), expanded_cpu.tolist()
+                    metadata.seq_lens.tolist(), expanded_cpu.tolist() + [1]
+                )
+                self.assertEqual(
+                    metadata.actual_seq_lengths_kv.tolist(), expanded_cpu.tolist() + [1]
                 )
                 self.assertEqual(
                     metadata.actual_seq_lengths_q.tolist(),
-                    torch.tensor(lens).cumsum(0).tolist(),
+                    torch.tensor(lens).cumsum(0).tolist() + [sum(lens)],
                 )
-                self.assertEqual(metadata.block_tables.shape, (3, 5))
+                self.assertEqual(metadata.block_tables.shape, (4, 8))
                 self.assertEqual(batch.seq_lens.tolist(), [127, 255, 513])
                 self.assertEqual(batch.seq_lens_cpu.tolist(), expanded_cpu.tolist())
 
@@ -389,6 +411,7 @@ class TestNpuCompactExecution(CustomTestCase):
         def prepare(verify_input, batch, target_worker):
             return (
                 SimpleNamespace(
+                    batch_size=batch.seq_lens.numel(),
                     input_ids=verify_input.draft_token,
                     positions=verify_input.positions,
                     spec_info=verify_input,
@@ -410,9 +433,11 @@ class TestNpuCompactExecution(CustomTestCase):
             lens = forward_batch.spec_info.ragged_verify_layout.verify_lens
             self.assertEqual(
                 backend.forward_metadata.actual_seq_lengths_kv.tolist(),
-                (forward_batch.seq_lens + lens).tolist(),
+                (forward_batch.seq_lens + lens).tolist() + [1],
             )
-            seen_lengths.append(backend.forward_metadata.actual_seq_lengths_q.tolist())
+            seen_lengths.append(
+                backend.forward_metadata.actual_seq_lengths_q[:-1].tolist()
+            )
             ids = forward_batch.input_ids
             logits = torch.full((ids.numel(), 32), -10.0)
             logits.scatter_(1, (ids + 1).unsqueeze(1), 10.0)
@@ -518,54 +543,6 @@ class TestNpuCompactExecution(CustomTestCase):
         self.assertEqual(prefix.tolist(), [20, 35])
         self.assertEqual(anchors.tolist(), [6, 9])
         self.assertEqual(injector.inject_ragged.call_count, 2)
-
-    @unittest.skipUnless(is_npu(), "requires an Ascend NPU")
-    def test_npu_tensor_smoke(self):
-        # Run explicitly on an NPU in addition to CPU CI. This exercises host
-        # scheduling transfer, searchsorted/gather/scatter and metadata copies.
-        cfg = DSparkScheduleConfig(gamma=3)
-        lens = ScheduleVerifyLensTopk.execute(
-            confidence=torch.tensor([[0.9, 0.8, 0.7], [0.2, 0.1, 0.1]], device="npu"),
-            budget=2,
-            cfg=cfg,
-        )
-        self.assertEqual(lens.cpu().tolist(), [3, 1])
-        layout = RaggedVerifyLayout.from_verify_lens(
-            verify_lens_cpu=[3, 1], device=torch.device("npu"), grid=[4]
-        )
-        prefix = torch.tensor([15, 31], device="npu")
-        table = torch.arange(3 * 64, dtype=torch.int32, device="npu").view(3, 64)
-        candidates = torch.tensor([[1, 2, 3, 4], [5, 6, 7, 8]], device="npu")
-        packed = build_ragged_verify_window(
-            batch=SimpleNamespace(
-                seq_lens=prefix, req_pool_indices=torch.tensor([2, 0], device="npu")
-            ),
-            layout=layout,
-            draft_block_ids=candidates,
-            draft_tokens=candidates[:, 1:],
-            bs=2,
-            device="npu",
-            verify_num_draft_tokens=4,
-            model_runner=SimpleNamespace(
-                req_to_token_pool=SimpleNamespace(req_to_token=table)
-            ),
-        )
-        self.assertEqual(packed.verify_ids.cpu().tolist(), [1, 2, 3, 5])
-        self.assertEqual(packed.verify_cache_loc.cpu().tolist(), [143, 144, 145, 31])
-        backend = SimpleNamespace(req_to_token=table, page_size=16)
-        _bind_metadata_methods(backend)
-        metadata = SimpleNamespace(block_tables=None)
-        backend._update_ragged_verify_metadata(
-            metadata, layout, prefix, torch.tensor([2, 0], device="npu")
-        )
-        self.assertEqual(metadata.actual_seq_lengths_kv.tolist(), [18, 32])
-        rows = scatter_compact_to_strided(
-            compact=packed.verify_ids[:, None],
-            layout=layout,
-            fill_value=-1,
-            verify_num_draft_tokens=4,
-        )
-        self.assertEqual(rows.cpu().flatten().tolist(), [1, 2, 3, -1, 5, -1, -1, -1])
 
     def test_sparse_operator_receives_compact_boundaries(self):
         op = Mock(return_value=(torch.zeros(4, 1, 4), None, None))

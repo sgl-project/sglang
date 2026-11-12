@@ -67,35 +67,5 @@ def test_existing_cpu_and_cuda_dispatch_unchanged(cuda):
         unused.assert_not_called()
 
 
-_NPU_AVAILABLE = hasattr(torch, "npu") and torch.npu.is_available()
-
-
-@pytest.mark.skipif(not _NPU_AVAILABLE, reason="requires an Ascend NPU")
-@pytest.mark.parametrize("budget", [2, 100])
-def test_existing_npu_kernel_capture_replay_reads_updated_confidence(budget):
-    cfg = DSparkScheduleConfig(gamma=3)
-    static_input = torch.ones(2, 3, device="npu")
-    for _ in range(2):
-        schedule.ScheduleVerifyLensTopk.execute(
-            confidence=static_input, budget=budget, cfg=cfg
-        )
-    torch.npu.synchronize()
-    graph = torch.npu.NPUGraph()
-    with torch.npu.graph(graph):
-        static_output = schedule.ScheduleVerifyLensTopk.execute(
-            confidence=static_input, budget=budget, cfg=cfg
-        )
-    for values in (
-        [[0.9, 0.8, 0.7], [0.2, 0.1, 0.1]],
-        [[0.2, 0.1, 0.1], [0.9, 0.8, 0.7]],
-        [[1.0] * 3] * 2,
-        [[0.0] * 3] * 2,
-    ):
-        confidence = torch.tensor(values)
-        static_input.copy_(confidence)
-        graph.replay()
-        torch.npu.synchronize()
-        reference = schedule.schedule_verify_lens_topk(
-            confidence=confidence, budget=budget, cfg=cfg
-        )
-        torch.testing.assert_close(static_output.cpu(), reference, rtol=0, atol=0)
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

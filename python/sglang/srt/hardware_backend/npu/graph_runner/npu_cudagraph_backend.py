@@ -211,6 +211,7 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
             or (
                 runner.ragged_verify_mode
                 and forward_batch.ragged_verify_layout is not None
+                and getattr(runner.attn_backend, "_dspark_dsa_ragged_verify", False)
             )
         ):
             return False

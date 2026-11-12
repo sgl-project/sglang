@@ -169,7 +169,7 @@ def prepare_compact_dp_forward_batch(forward_batch, model_runner):
     if not is_glm_compact_dp_batch(forward_batch, model_runner):
         return
     tokens = forward_batch.spec_info.ragged_verify_layout.graph_num_tokens
-    forward_batch.npu_dspark_compact_dp = True
+    forward_batch.dp_verify_uses_packed_tokens = True
     counts = [tokens] * get_parallel().num_dp_ranks
     forward_batch.global_num_tokens_cpu = counts
     forward_batch.global_num_tokens_for_logprob_cpu = counts.copy()

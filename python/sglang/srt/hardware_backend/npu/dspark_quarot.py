@@ -75,6 +75,41 @@ def validate_glm_dspark_quarot_draft_loader(
         )
 
 
+def prepare_glm_dspark_quarot_scope(
+    *,
+    draft_is_moe: bool,
+    device,
+    target_model_config,
+    target_model,
+    load_format,
+    weight_cache_mode: str,
+):
+    """Prepare the opt-in correction around draft construction, not execution."""
+    config = None
+    if draft_is_moe:
+        logger.warning_once(
+            "SGLANG_NPU_GLM_DSPARK_APPLY_QUAROT_TO_DRAFT=true was not "
+            "applied because the QuaRot adapter supports dense drafts only."
+        )
+    else:
+        config = build_glm_dspark_quarot_config(
+            device=device,
+            enabled=True,
+            target_model_config=target_model_config,
+            target_model=target_model,
+        )
+        if config is None:
+            logger.warning_once(
+                "SGLANG_NPU_GLM_DSPARK_APPLY_QUAROT_TO_DRAFT=true was not "
+                "applied because the target is not a supported GLM DSA ModelSlim model."
+            )
+        else:
+            validate_glm_dspark_quarot_draft_loader(
+                load_format=load_format, weight_cache_mode=weight_cache_mode
+            )
+    return glm_dspark_quarot_scope(config)
+
+
 def log_glm_dspark_quarot_runtime_status(*, requested: bool, draft_model) -> None:
     config = getattr(draft_model, "_glm_dspark_quarot_config", None)
     enabled = config is not None

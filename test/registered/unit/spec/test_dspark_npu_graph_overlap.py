@@ -51,18 +51,56 @@ def method(path, cls, name, **namespace):
     return scope[name]
 
 
-def test_npu_runner_defers_compact_to_common_token_tier_loader():
+@pytest.mark.parametrize("glm", [False, True])
+@pytest.mark.parametrize("ragged", [False, True])
+@pytest.mark.parametrize("needs_metadata", [False, True])
+def test_npu_runner_defers_only_glm_compact_to_common_loader(
+    glm, ragged, needs_metadata
+):
     prepare = method(
         "hardware_backend/npu/graph_runner/npu_cudagraph_backend.py",
         "NPUCudaGraphBackend",
         "prepare_replay",
+        envs=SimpleNamespace(
+            SGLANG_ENABLE_OVERLAP_PLAN_STREAM=SimpleNamespace(get=lambda: False)
+        ),
     )
-    runner = SimpleNamespace(ragged_verify_mode=True)
+    # An unrelated backend (including DSV4) need not expose the GLM capability.
+    attn_backend = SimpleNamespace(
+        **({"_dspark_dsa_ragged_verify": True} if glm else {})
+    )
+    runner = SimpleNamespace(
+        ragged_verify_mode=ragged,
+        attn_backend=attn_backend,
+        model_runner=SimpleNamespace(
+            spec_algorithm=SimpleNamespace(is_dflash=lambda: False)
+        ),
+        buffers=SimpleNamespace(
+            input_ids=torch.zeros(4, dtype=torch.int64),
+            positions=torch.zeros(4, dtype=torch.int64),
+        ),
+        raw_num_token=4,
+        bs=2,
+        _make_graph_key=Mock(return_value="legacy-key"),
+    )
     backend = SimpleNamespace(_decode_runner=runner)
     fb = SimpleNamespace(
-        needs_forward_metadata_init=lambda: False, ragged_verify_layout=object()
+        needs_forward_metadata_init=lambda: needs_metadata,
+        ragged_verify_layout=object() if ragged else None,
+        input_ids=torch.tensor([1, 2, 3, 4]),
+        positions=torch.tensor([10, 11, 20, 21]),
+        mrope_positions=None,
     )
-    assert prepare(backend, fb) is False
+    deferred = needs_metadata or (glm and ragged)
+    assert prepare(backend, fb) is (not deferred)
+    if deferred:
+        assert runner.buffers.input_ids.tolist() == [0] * 4
+        runner._make_graph_key.assert_not_called()
+    else:
+        torch.testing.assert_close(runner.buffers.input_ids, fb.input_ids)
+        torch.testing.assert_close(runner.buffers.positions, fb.positions)
+        runner._make_graph_key.assert_called_once_with(2)
+        assert runner._replay_graph_key == "legacy-key"
 
 
 @pytest.mark.parametrize(
@@ -388,3 +426,7 @@ def test_idle_executor_uses_backend_prefix_contract_and_execution_policy(idle_se
     with patch.object(dspark_verify.DFlashVerifyInput, "prepare_for_verify", prepare):
         executor.run_idle_participation(batch=batch, idle_layout=layout)
     executor.target_worker.forward_batch_generation.assert_called_once()
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))

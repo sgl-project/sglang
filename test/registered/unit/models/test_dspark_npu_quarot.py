@@ -61,6 +61,56 @@ class TestGlmDSparkQuaRot(unittest.TestCase):
         arguments.update(overrides)
         return qr.build_glm_dspark_quarot_config(**arguments)
 
+    def test_prepared_scope_validates_loader_and_restores_outer_config(self):
+        arguments = dict(
+            draft_is_moe=False,
+            device="npu:0",
+            target_model_config=self.model_config,
+            target_model=self.model,
+            load_format="safetensors",
+            weight_cache_mode="off",
+        )
+        outer = qr.GlmDSparkQuaRotConfig("outer", 3, "outer-model")
+        with qr.glm_dspark_quarot_scope(outer):
+            scope = qr.prepare_glm_dspark_quarot_scope(**arguments)
+            self.assertIs(qr.get_glm_dspark_quarot_config(), outer)
+            with self.assertRaisesRegex(RuntimeError, "load failed"):
+                with scope:
+                    self.assertEqual(qr.get_glm_dspark_quarot_config(), self.config)
+                    raise RuntimeError("load failed")
+            self.assertIs(qr.get_glm_dspark_quarot_config(), outer)
+            with self.assertRaisesRegex(ValueError, "IPC draft loader"):
+                qr.prepare_glm_dspark_quarot_scope(
+                    **(arguments | {"weight_cache_mode": "read"})
+                )
+            self.assertIs(qr.get_glm_dspark_quarot_config(), outer)
+        self.assertIsNone(qr.get_glm_dspark_quarot_config())
+
+    def test_prepared_scope_leaves_moe_and_unrelated_targets_unadapted(self):
+        for moe, config in ((True, self.config), (False, None)):
+            with (
+                self.subTest(moe=moe),
+                patch.object(
+                    qr, "build_glm_dspark_quarot_config", return_value=config
+                ) as build,
+                patch.object(qr, "validate_glm_dspark_quarot_draft_loader") as validate,
+                patch.object(qr.logger, "warning_once", create=True),
+                qr.glm_dspark_quarot_scope(self.config),
+            ):
+                scope = qr.prepare_glm_dspark_quarot_scope(
+                    draft_is_moe=moe,
+                    device="npu:0",
+                    target_model_config=self.model_config,
+                    target_model=self.model,
+                    load_format="auto",
+                    weight_cache_mode="off",
+                )
+                with scope:
+                    self.assertIsNone(qr.get_glm_dspark_quarot_config())
+                self.assertIs(qr.get_glm_dspark_quarot_config(), self.config)
+                validate.assert_not_called()
+                self.assertEqual(build.call_count, 0 if moe else 1)
+
     def test_target_metadata_is_read_only_and_config_is_frozen(self):
         before = copy.deepcopy(self.description)
         self.assertEqual(self.build(), self.config)
