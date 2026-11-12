@@ -1868,7 +1868,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
     def test_layer_types_hybrid_swa_memory_off_on_default_aiter(self):
         # The gate has to see the default backend, which resolves after the
         # model overrides run.
-        with override_platform(is_cuda=False, is_hip=True):
+        with override_platform(is_cuda=False, is_hip=True, is_musa=False):
             sa = self._construct(
                 "Gemma3ForCausalLM", "llama", config_extra=self._SWA_MIX
             )
@@ -4417,6 +4417,26 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             {"swa_full_tokens_ratio": 1.0, "disable_hybrid_swa_memory": True},
         )
         self.assertEqual(_step3p_overrides(_args(), None), {})
+
+
+class TestMusaAttentionBackendDefault(CustomTestCase):
+    def test_fa3_is_the_default_on_musa(self):
+        """fa3 is the only backend the attention registry wires for MUSA; the
+        generic MHA/MLA fallthrough would land on backends with no MUSA path."""
+        args = SimpleNamespace(
+            attention_backend=None,
+            prefill_attention_backend=None,
+            decode_attention_backend=None,
+        )
+        model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=["LlamaForCausalLM"])
+        )
+        for use_mla in (False, True):
+            with self.subTest(use_mla=use_mla), override_platform(is_musa=True):
+                self.assertEqual(
+                    base_module.get_default_attn_backend(args, use_mla, model_config),
+                    "fa3",
+                )
 
 
 class TestDeclarationValidation(CustomTestCase):
