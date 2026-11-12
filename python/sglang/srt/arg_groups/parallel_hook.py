@@ -302,11 +302,12 @@ def handle_combined_context_parallelism(server_args: Any):
     if not (
         (platform.is_sm90 or platform.is_sm100)
         and cfg.nnodes == cfg.pp_size == cfg.dp_size == cfg.attn_dp_size == 1
-        and cfg.tp_size == cfg.attn_cp_size == cfg.dcp_size
+        and cfg.attn_cp_size == cfg.dcp_size
+        and cfg.tp_size % cfg.dcp_size == 0
     ):
         raise ValueError(
             "Combined prefill CP and DCP requires single-node SM90 or SM100, "
-            "PP1, DP1, and --dcp-size = --attn-cp-size = --tp-size."
+            "PP1, DP1, and --dcp-size = --attn-cp-size dividing --tp-size."
         )
     prefill_backend = "fa4" if platform.is_sm100 else "fa3"
     model_config = model_config_of(server_args)

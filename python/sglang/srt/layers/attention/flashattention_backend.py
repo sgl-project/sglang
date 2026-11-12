@@ -2201,6 +2201,12 @@ class FlashAttentionBackend(AttentionBackend):
                         attention_backend=CPAttentionBackendKind.FLASH_ATTENTION,
                     )
                 else:
+                    padded_rows = 0
+                    if dcp_prefill_kv is not None and q_nope.shape[0] > max_seqlen_q:
+                        # Short extends can skip zigzag while the FFN still
+                        # needs rows padded for its attention-TP collective.
+                        padded_rows = q_nope.shape[0] - max_seqlen_q
+                        q_nope, q_rope = q_nope[:max_seqlen_q], q_rope[:max_seqlen_q]
                     result = self.flash_attn_with_kvcache(
                         q=q_rope,
                         k_cache=k_rope_cache,
@@ -2252,6 +2258,8 @@ class FlashAttentionBackend(AttentionBackend):
                         )
                     else:
                         o = result
+                        if padded_rows > 0:
+                            o = torch.nn.functional.pad(o, (0, 0, 0, 0, 0, padded_rows))
 
         o = o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
         if return_lse:

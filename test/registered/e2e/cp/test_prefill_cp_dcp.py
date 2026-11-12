@@ -4,6 +4,7 @@ By default the test builds a tiny local model and scores a prompt on one GPU
 before starting the distributed server. Set SGLANG_TEST_PCP_DCP_MODEL to "dummy"
 for config-only smoke testing, or to a DeepSeek dense MLA checkpoint path or
 model ID to test pretrained weights. These modes skip the single-GPU reference.
+With eight GPUs the test uses TP8/PCP4/DCP4 and the tiny model includes a MoE layer.
 """
 
 import math
@@ -27,11 +28,13 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=240, stage="extra-a", runner_config="2-gpu-large")
 register_cuda_ci(est_time=240, stage="extra-b", runner_config="4-gpu-h100")
 register_cuda_ci(est_time=300, stage="extra-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=360, stage="extra-b", runner_config="8-gpu-h200")
+register_cuda_ci(est_time=360, stage="extra-b", runner_config="8-gpu-b300")
 
 LONG_PROMPT = [3 + position % 127 for position in range(257)]
 
 
-def _write_tiny_mla_model(model_dir, *, dummy):
+def _write_tiny_mla_model(model_dir, *, dummy, with_moe):
     from transformers import DeepseekV3Config
 
     config = DeepseekV3Config(
@@ -41,8 +44,9 @@ def _write_tiny_mla_model(model_dir, *, dummy):
         hidden_size=256,
         intermediate_size=512,
         num_hidden_layers=2,
-        # Leave both decoder layers dense. The architecture still uses MLA.
-        first_k_dense_replace=3,
+        first_k_dense_replace=1 if with_moe else 3,
+        moe_layer_freq=1,
+        scoring_func="sigmoid",
         n_routed_experts=8,
         num_experts_per_tok=2,
         n_group=1,
@@ -77,8 +81,10 @@ class TestPrefillCpDcp(CustomTestCase):
     def setUpClass(cls):
         super().setUpClass()
         cls.parallel_size = torch.cuda.device_count()
-        if cls.parallel_size not in (2, 4):
-            raise RuntimeError("Set CUDA_VISIBLE_DEVICES to exactly 2 or 4 GPUs")
+        if cls.parallel_size not in (2, 4, 8):
+            raise RuntimeError("Set CUDA_VISIBLE_DEVICES to exactly 2, 4 or 8 GPUs")
+        cls.cp_size = 4 if cls.parallel_size == 8 else cls.parallel_size
+        with_moe = cls.parallel_size == 8
         majors = {
             torch.cuda.get_device_capability(i)[0] for i in range(cls.parallel_size)
         }
@@ -92,7 +98,7 @@ class TestPrefillCpDcp(CustomTestCase):
         else:
             model_dir = tempfile.TemporaryDirectory(prefix="pcp-dcp-mla-")
             cls.addClassCleanup(model_dir.cleanup)
-            _write_tiny_mla_model(model_dir.name, dummy=cls.dummy)
+            _write_tiny_mla_model(model_dir.name, dummy=cls.dummy, with_moe=with_moe)
             cls.model = model_dir.name
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.reference_logprobs = None
@@ -121,9 +127,9 @@ class TestPrefillCpDcp(CustomTestCase):
                 "--tp-size",
                 str(cls.parallel_size),
                 "--attn-cp-size",
-                str(cls.parallel_size),
+                str(cls.cp_size),
                 "--dcp-size",
-                str(cls.parallel_size),
+                str(cls.cp_size),
                 "--enable-prefill-cp",
                 "--cp-strategy",
                 "zigzag",
@@ -133,6 +139,12 @@ class TestPrefillCpDcp(CustomTestCase):
                 "flashinfer",
                 "--chunked-prefill-size",
                 "128",
+                # Exercise dispatch/combine for the tiny MoE's hidden size.
+                *(
+                    ["--deepep-mode", "normal"]
+                    if with_moe and (not model or cls.dummy)
+                    else []
+                ),
             ]
         )
 
@@ -214,8 +226,9 @@ class TestPrefillCpDcp(CustomTestCase):
         response = requests.get(self.base_url + "/server_info", timeout=30)
         self.assertEqual(response.status_code, 200, response.text)
         info = response.json()
-        for field in ("tp_size", "attn_cp_size", "dcp_size"):
-            self.assertEqual(info[field], self.parallel_size, field)
+        self.assertEqual(info["tp_size"], self.parallel_size)
+        for field in ("attn_cp_size", "dcp_size"):
+            self.assertEqual(info[field], self.cp_size, field)
         self.assertTrue(info["enable_prefill_cp"])
         self.assertEqual(info["dcp_comm_backend"], "ag_ar")
         self.assertEqual(info["prefill_attention_backend"], self.prefill_backend)

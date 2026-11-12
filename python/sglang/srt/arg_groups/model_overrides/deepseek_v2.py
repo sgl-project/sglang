@@ -211,9 +211,8 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
             logger.warning(
                 "For MLA CP, we have the following restrictions: moe_dense_tp_size == 1, moe_a2a_backend == deepep, ep_size == tp_size, batch_size == 1"
             )
-            # FIXME(kpham-sgl): Keep attn_tp_size == 1 under MLA CP.
-            # The DSA / MLA CP gather and reduce-scatter
-            # (the dsa_cp_* helpers in adapters/context_parallel.py) assume it.
+            # Keep attention TP at width one for standalone MLA CP. Combined
+            # CP+DCP can retain attention TP and uses CP for each KV shard group.
             attn_cp_size = (
                 cfg.attn_cp_size
                 if cfg.dcp_size > 1 and cfg.attn_cp_size > 1
