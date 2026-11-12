@@ -24,15 +24,9 @@ from typing import Dict, List, Optional
 # Mapping from list variable names to suite names
 CASE_LIST_TO_SUITE = {
     "ONE_GPU_CASES": "1-gpu",
-    "ONE_GPU_CASES_A": "1-gpu",
-    "ONE_GPU_CASES_B": "1-gpu",
-    "ONE_GPU_CASES_C": "1-gpu-b200",
     "ONE_GPU_MODELOPT_FP8_CASES": "1-gpu",
-    "ONE_GPU_MODELOPT_CASES": "1-gpu-b200",
     "ONE_GPU_B200_CASES": "1-gpu-b200",
     "TWO_GPU_CASES": "2-gpu",
-    "TWO_GPU_CASES_A": "2-gpu",
-    "TWO_GPU_CASES_B": "2-gpu",
 }
 
 # Default estimated time for cases without baseline (5 minutes)
