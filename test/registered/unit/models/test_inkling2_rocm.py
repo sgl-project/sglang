@@ -947,16 +947,17 @@ def test_decode_stage2_tree_merge_matches_loop(
 @pytest.mark.parametrize("weight_dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("with_residual", [False, True])
 def test_hip_rmsnorm_triton_matches_native(shape, weight_dtype, with_residual):
-    """ROCm without vLLM's kernels: an opted-in RMSNorm's (the DSpark draft's)
-    forward_hip Triton kernel matches forward_native, the residual sum bitwise and
-    the output to within one BF16 ulp."""
-    from sglang.srt.layers.layernorm import RMSNorm
+    """ROCm without vLLM's kernels: the DSpark draft's TritonRMSNorm.forward_hip
+    matches forward_native, the residual sum bitwise and the output to within one
+    BF16 ulp."""
+    from sglang.srt.layers import layernorm
+    from sglang.srt.models.inkling2_mtp_hip import TritonRMSNorm
 
+    if layernorm._has_vllm_rms_norm:
+        pytest.skip("vLLM's or aiter's RMSNorm serves forward_hip")
     torch.manual_seed(len(shape) + with_residual)
-    norm = RMSNorm(shape[-1], eps=1e-6).cuda()
-    # only opted-in norms take the Triton kernel; other models keep forward_native
-    assert not norm.uses_hip_triton()
-    norm.hip_triton = True
+    norm = TritonRMSNorm(shape[-1], eps=1e-6).cuda()
+    assert norm.uses_triton()
     norm.weight.data = (torch.rand(shape[-1], device="cuda") + 0.5).to(weight_dtype)
     x = (torch.randn(*shape, device="cuda") * 3).bfloat16()
     residual = torch.randn_like(x) if with_residual else None
@@ -1166,14 +1167,16 @@ def test_ctx_kv_store_matches_separate(heads, reqs, width):
     write_target_hidden_kv's separate kernels do: k_norm_ctx (Triton RMSNorm), the
     rotary kernel through apply_k_rope, and set_kv_buffer_prefix_valid's store."""
     from sglang.kernels.ops.inkling2.mtp_hip import ctx_kv_store
-    from sglang.srt.layers.layernorm import RMSNorm
+    from sglang.srt.layers import layernorm
     from sglang.srt.layers.rotary_embedding import get_rope
     from sglang.srt.mem_cache.memory_pool import _set_kv_buffer_prefix_valid_impl
+    from sglang.srt.models.inkling2_mtp_hip import TritonRMSNorm
 
+    if layernorm._has_vllm_rms_norm:
+        pytest.skip("vLLM's or aiter's RMSNorm serves the draft's K norm")
     torch.manual_seed(heads * 100 + reqs * 10 + width)
-    norm = RMSNorm(D, eps=1e-6).cuda()
-    norm.hip_triton = True  # as use_triton_norms sets it on the draft
-    assert norm.uses_hip_triton()
+    norm = TritonRMSNorm(D, eps=1e-6).cuda()  # as use_triton_norms makes the draft's
+    assert norm.uses_triton()
     norm.weight.data = (torch.rand(D, device="cuda") + 0.5).bfloat16()
     rope = get_rope(D, rotary_dim=D, max_position=262144, base=1e6).cuda()
     rows, size = reqs * width, 4096

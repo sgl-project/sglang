@@ -10,6 +10,9 @@ from sglang.kernels.ops.inkling2.mtp_hip import (
     rnn_step,
     rnn_step_fits,
 )
+from sglang.kernels.ops.inkling2.rmsnorm_triton import rmsnorm as triton_rmsnorm
+from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+from sglang.srt.layers import layernorm
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.rotary_embedding import RotaryEmbedding
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
@@ -22,7 +25,8 @@ def _ctx_kv_write_target(pool, attn, cache_loc_2d, swa_loc, dtype):
     None."""
     rope = attn.rotary_emb
     if not (
-        attn.k_norm_ctx.uses_hip_triton()
+        isinstance(attn.k_norm_ctx, TritonRMSNorm)
+        and attn.k_norm_ctx.uses_triton()
         and type(rope) is RotaryEmbedding
         and rope.use_fallback_kernel
         and rope.is_neox_style
@@ -136,9 +140,36 @@ def store_last_f_rnn(model, req_pool_indices, target_hidden, commit_lens):
     )
 
 
+class TritonRMSNorm(RMSNorm):
+    """The DSpark draft's RMSNorm on ROCm without vLLM's or aiter's norms: the plain
+    and fused-residual norms run rmsnorm_triton (forward_native's semantics), which
+    ctx_kv_store's K norm reproduces bitwise; the rest take RMSNorm.forward_hip."""
+
+    def uses_triton(self, residual=None, post_residual_addition=None) -> bool:
+        return (
+            not layernorm._has_vllm_rms_norm
+            and post_residual_addition is None
+            and not self.cast_x_before_out_mul
+            and self.variance_size_override is None
+            and self.override_orig_dtype is None
+            and not (residual is not None and self.fp32_residual)
+            and not is_batch_invariant_mode_enabled()
+        )
+
+    def forward_hip(
+        self, x, residual=None, post_residual_addition=None, quant_linear=None
+    ):
+        if (
+            self.uses_triton(residual, post_residual_addition)
+            and x.shape[-1] == self.hidden_size
+            and x.numel()
+        ):
+            return triton_rmsnorm(x, self.weight.data, self.variance_epsilon, residual)
+        return super().forward_hip(x, residual, post_residual_addition, quant_linear)
+
+
 def use_triton_norms(model):
-    """The draft's RMSNorms take rmsnorm_triton on gfx95 without vLLM's norms, which
-    ctx_kv_store's K norm reproduces bitwise."""
+    """The draft's RMSNorms become TritonRMSNorm (other models keep RMSNorm)."""
     for module in model.modules():
-        if isinstance(module, RMSNorm):
-            module.hip_triton = True
+        if type(module) is RMSNorm:
+            module.__class__ = TritonRMSNorm
