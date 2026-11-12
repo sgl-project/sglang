@@ -158,6 +158,45 @@ class TestSchedulerLoadInquirer(unittest.TestCase):
         self.assertEqual(loads.queues.prealloc_ready, 1)
         self.assertEqual(loads.num_prealloc_ready_tokens, 30)
 
+    def get_loads_with_used_tokens(self, inquirer, num_used_tokens):
+        inquirer = replace(
+            inquirer,
+            pool_stats_observer=SimpleNamespace(
+                get_pool_stats=lambda: SimpleNamespace(
+                    get_kv_token_stats=lambda: (num_used_tokens, 0.0)
+                )
+            ),
+            spec_algorithm=SimpleNamespace(is_none=lambda: True),
+            get_running_batch=lambda: SimpleNamespace(reqs=[]),
+            get_stats=SchedulerStats,
+            get_request_lists=lambda: {},
+            get_total_prefill_uncached_tokens=lambda: 0,
+            get_total_prefill_busy_us=lambda: 0,
+            get_decode_moment_totals=lambda: (0,),
+        )
+        module = "sglang.srt.managers.scheduler_components.load_inquirer"
+        with (
+            patch(
+                f"{module}.get_lora", return_value=SimpleNamespace(enable_lora=False)
+            ),
+            patch(f"{module}.get_parallel", return_value=SimpleNamespace(dp_rank=0)),
+        ):
+            return inquirer.get_loads()
+
+    def test_total_tokens_count_the_rest_of_a_chunked_prefill(self):
+        """The unprefilled part of the chunked request counts toward the DP load."""
+        loads = self.get_loads_with_used_tokens(self.make_inquirer(), 200)
+
+        # 200 KV tokens in use + 100 waiting + (50 - 10) still to prefill.
+        self.assertEqual(loads.num_total_tokens, 340)
+        self.assertEqual(loads.num_active_tokens, 340)
+
+    def test_total_tokens_without_a_chunked_prefill(self):
+        inquirer = replace(self.make_inquirer(), get_chunked_req=lambda: None)
+        loads = self.get_loads_with_used_tokens(inquirer, 200)
+
+        self.assertEqual(loads.num_total_tokens, 300)
+
     def test_storage_exclusion_requires_per_request_matching(self):
         for prefix_matched, expected in ((True, 60), (False, 65)):
             with self.subTest(prefix_matched=prefix_matched):

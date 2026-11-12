@@ -143,6 +143,13 @@ class SchedulerLoadInquirer:
         num_total_tokens = num_used_tokens + sum(
             req.seqlen for queue in pending_token_queues for req in queue
         )
+        # A chunked-prefill request holds KV only for the chunks already run and
+        # is in neither the running batch nor the waiting queue, so count the
+        # rest of its prompt as well. Otherwise a rank in the middle of a long
+        # prefill looks nearly idle to the total_tokens DP router.
+        chunked_req = self.get_chunked_req()
+        if chunked_req is not None:
+            num_total_tokens += max(0, chunked_req.seqlen - chunked_req.prefix_len)
         num_active_tokens = max(0, num_total_tokens - awaiting_kv_tokens)
 
         memory = None
