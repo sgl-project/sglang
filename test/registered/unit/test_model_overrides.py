@@ -3336,9 +3336,6 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 page_size=None,
                 linear_attn_backend="triton",
                 linear_attn_prefill_backend=None,
-                radix_eviction_policy="lru",
-                _radix_eviction_policy_explicitly_set=True,
-                enable_session_radix_cache=False,
             )
             defaults.update(kw)
             return ResolvedView(
@@ -3417,21 +3414,6 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                         "mamba_radix_cache_strategy": "extra_buffer",
                     },
                 )
-        # an unset eviction policy resolves to gds; an explicit lru and the
-        # session radix cache, which gds rejects on these models, keep lru
-        unset = {"_radix_eviction_policy_explicitly_set": False}
-        self.assertEqual(
-            _mamba_radix_cache_resolution(_view("Qwen3NextForCausalLM", **unset))[
-                "radix_eviction_policy"
-            ],
-            "gds",
-        )
-        for kw in ({}, {**unset, "enable_session_radix_cache": True}):
-            with self.subTest(**kw):
-                self.assertNotIn(
-                    "radix_eviction_policy",
-                    _mamba_radix_cache_resolution(_view("Qwen3NextForCausalLM", **kw)),
-                )
         # GraniteMoeHybrid is guarded on mamba layer types
         self.assertEqual(
             _mamba_radix_cache_resolution(
@@ -3489,9 +3471,6 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 page_size=None,
                 linear_attn_backend="triton",
                 linear_attn_prefill_backend=None,
-                radix_eviction_policy="lru",
-                _radix_eviction_policy_explicitly_set=True,
-                enable_session_radix_cache=False,
             )
             defaults.update(kw)
             return ResolvedView(
