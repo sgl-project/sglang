@@ -2,6 +2,7 @@
 
 import unittest
 
+from sglang.srt.arg_groups.model_override_base import resolving_view
 from sglang.srt.arg_groups.overrides import collect_model_override_declarations
 from sglang.srt.configs.model_config import UNLIMITED_OCR_V2_ARCH
 from sglang.srt.configs.unlimited_ocr import UnlimitedVLConfig
@@ -59,6 +60,39 @@ class TestUnsupportedServingModes(CustomTestCase):
         overrides = _declared_overrides()
         self.assertEqual(overrides["attention_backend"], "unlimited_ocr_v2")
         self.assertEqual(overrides["page_size"], 32)
+
+    def test_mps_enables_startup_warmup_and_window_kv_cap_by_default(self):
+        from unittest import mock
+
+        from sglang.srt.arg_groups.model_overrides import unlimited_ocr_v2 as uocr_ov
+
+        def run(*, mem_mib=12124, **fields):
+            sa = ServerArgs(model_path="/tmp/uocr", device="mps", **fields)
+            with (
+                mock.patch.object(uocr_ov, "use_mlx", return_value=False),
+                mock.patch.object(
+                    uocr_ov, "get_device_memory_capacity", return_value=mem_mib
+                ),
+            ):
+                uocr_ov.apply_unlimited_ocr_v2_mps_defaults(sa)
+            return resolving_view(sa)
+
+        split = dict(uocr_doc_split=True, uocr_max_page_tokens=8000)
+        # 16 GB Mac (~12 GiB recommended working set) -> 1 window (15,168 tokens).
+        resolved_16g = run(**split)
+        self.assertEqual(resolved_16g.warmups, "unlimited_ocr_v2")
+        self.assertEqual(resolved_16g.max_total_tokens, 15168)
+        # 64 GB Mac (~48 GiB working set) scales up to 5 windows (75,840 tokens).
+        resolved_64g = run(mem_mib=48 * 1024, **split)
+        self.assertEqual(resolved_64g.max_total_tokens, 5 * 15168)
+        # The per-window slack is one prefill chunk, so a larger chunk widens it.
+        self.assertEqual(
+            run(chunked_prefill_size=4096, **split).max_total_tokens, 15168 + 2048
+        )
+        self.assertIsNone(run(skip_server_warmup=True).warmups)
+        self.assertEqual(run(warmups="custom").warmups, "custom")
+        self.assertEqual(run(max_total_tokens=16384, **split).max_total_tokens, 16384)
+        self.assertIsNone(run(uocr_doc_split=False).max_total_tokens)
 
     def test_data_parallelism_is_rejected_while_documents_split(self):
         for fields in ({"dp_size": 2}, {"attn_dp_size": 2, "tp_size": 2}):

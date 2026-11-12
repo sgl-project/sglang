@@ -4,10 +4,14 @@ DASH maps each sparse block to one KV page, whose counters radix reuse loses.
 """
 
 import logging
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from sglang.srt.arg_groups.model_override_base import _register_for, resolving_view
+from sglang.srt.arg_groups.overrides import declare_resolution
+from sglang.srt.configs.unlimited_ocr_v2 import UocrDocumentConfig
+from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.runtime_context import attn_dp_enabled_of
+from sglang.srt.utils.device import get_device_memory_capacity
 
 logger = logging.getLogger(__name__)
 
@@ -92,3 +96,53 @@ def _unlimited_ocr_v2_overrides(server_args: Any, hf_config: Any) -> dict:
 
     # CUDA graph defaults run earlier because they are not model-overridable.
     return overrides
+
+
+# Document windows the default KV pool holds, by the Metal working-set limit
+# (torch.mps.recommended_max_memory): one up to 14 GiB, which covers a 16 GB Mac
+# (12 GiB limit, ~6 GB of it BF16 weights plus the vision workspace), and one
+# more for each further 8 GiB, up to eight.
+_MPS_BASE_WORKING_SET_MIB = 14 * 1024
+_MPS_MIB_PER_EXTRA_WINDOW = 8 * 1024
+_MPS_MAX_DEFAULT_WINDOWS = 8
+
+
+def _mps_window_budget(gpu_mem_mib: Optional[float]) -> int:
+    if gpu_mem_mib is None or gpu_mem_mib <= _MPS_BASE_WORKING_SET_MIB:
+        return 1
+    extra = int(gpu_mem_mib - _MPS_BASE_WORKING_SET_MIB) // _MPS_MIB_PER_EXTRA_WINDOW
+    return min(1 + extra, _MPS_MAX_DEFAULT_WINDOWS)
+
+
+def apply_unlimited_ocr_v2_mps_defaults(server_args: Any) -> None:
+    """Default MPS warmup and memory-scaled window KV cap for Unlimited-OCR v2."""
+    cfg = resolving_view(server_args)
+    if cfg.device != "mps" or use_mlx():
+        return
+    updates: Dict[str, Any] = {}
+    if not cfg.skip_server_warmup and cfg.warmups is None:
+        updates["warmups"] = "unlimited_ocr_v2"
+    if cfg.max_total_tokens is None:
+        doc_cfg = UocrDocumentConfig.from_args(cfg)
+        if doc_cfg.uocr_doc_split and doc_cfg.uocr_max_page_tokens > 0:
+            page_size = int(cfg.page_size or 32)
+            try:
+                gpu_mem_mib = get_device_memory_capacity("mps")
+            except (RuntimeError, ValueError):
+                gpu_mem_mib = None
+            windows = _mps_window_budget(gpu_mem_mib)
+            window_tokens = doc_cfg.default_context_length()
+            # Plus one prefill chunk for the retained tail a follow-up copies.
+            # handle_gpu_memory_settings has resolved the chunk size by now;
+            # 2048, its smallest default, also covers chunking turned off (-1).
+            chunk = max(cfg.chunked_prefill_size or 0, 2048)
+            per_window = (
+                (window_tokens + chunk + page_size - 1) // page_size * page_size
+            )
+            updates["max_total_tokens"] = windows * per_window
+    if updates:
+        declare_resolution(
+            server_args,
+            "apply_unlimited_ocr_v2_mps_defaults",
+            **updates,
+        )
