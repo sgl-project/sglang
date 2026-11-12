@@ -54,7 +54,7 @@ class ForwardMetadata:
     mixed_prefill_tokens: int = 0
 
 
-class MLUAttnBackend(AttentionBackend):
+class MLUMHABackend(AttentionBackend):
     def __init__(self, model_runner):
         self.device = model_runner.device
         self.page_size = model_runner.page_size
