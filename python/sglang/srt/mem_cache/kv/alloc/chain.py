@@ -231,12 +231,20 @@ def take_new_pages(
             if owner.place_pages(new_virtual_pages, num_new_pages, consumer) is None:
                 return None
         else:
-            owner.ids.bind(new_virtual_pages, physical_pages)
-            owner._maybe_zero_pages(physical_pages)
+            owner._bind_pages(new_virtual_pages, physical_pages)
     # A rebind moves the capacity epoch; a step within its pages takes none.
     if num_new_pages > 0:
         owner.free_virtual_ids = owner.free_virtual_ids[num_new_pages:]
     return out_indices
+
+
+def _shared_copy(ids, bands: int):
+    """Ids that ``bands`` ledgers record, as ``(ids, copy)`` for each band's
+    `Band.set_inflight_forward`: one copy they share when several record a
+    tensor (a ledger never writes its ids), else the ids for a band to copy."""
+    if bands > 1 and isinstance(ids, torch.Tensor) and ids.numel() > 0:
+        return ids.clone(), False
+    return ids, True
 
 
 class ChainAllocator(BaseTokenToKVPoolAllocator):
@@ -1508,6 +1516,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         request_rows: Optional[torch.Tensor] = None,
         token_writes_unknown: bool = False,
         state_writes_unknown: bool = False,
+        state_slots_owned: bool = False,
     ) -> None:
         """Hand the forward's metadata to every member; token bands translate the
         write set through their own v2p. The state band, written in place by
@@ -1515,22 +1524,38 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         state slots the forward writes; a request band takes the batch's request
         rows, its virtual ids. ``token_writes_unknown`` /
         ``state_writes_unknown``: the token / state bands cannot read this
-        forward's write ids before it ends."""
+        forward's write ids before it ends. ``state_slots_owned``: the caller
+        hands ``state_slots_virtual`` over, so the state band keeps it as its
+        ledger's copy. Bands that record the same ids share one copy."""
         with record_function("ChainAllocator.set_inflight_forward"):
             requests = set(self.request_allocators.values())
+            token_bands = sum(
+                member is not self.mamba_allocator and member not in requests
+                for member in self.members
+            )
+            tokens, copy_tokens = _shared_copy(
+                None if token_writes_unknown else out_cache_loc_virtual, token_bands
+            )
+            rows, copy_rows = _shared_copy(request_rows, len(requests))
             for member in self.members:
                 if member in requests:
                     member.set_inflight_forward(
-                        forward_done, request_rows, writes_unknown=False
+                        forward_done, rows, writes_unknown=False, copy=copy_rows
                     )
                     continue
-                is_state = member is self.mamba_allocator
+                if member is self.mamba_allocator:
+                    member.set_inflight_forward(
+                        forward_done,
+                        state_slots_virtual,
+                        writes_unknown=state_writes_unknown,
+                        copy=not state_slots_owned,
+                    )
+                    continue
                 member.set_inflight_forward(
                     forward_done,
-                    state_slots_virtual if is_state else out_cache_loc_virtual,
-                    writes_unknown=(
-                        state_writes_unknown if is_state else token_writes_unknown
-                    ),
+                    tokens,
+                    writes_unknown=token_writes_unknown,
+                    copy=copy_tokens,
                 )
 
     def settle_pending_for_recovery(self, bands=None):
@@ -1625,8 +1650,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
                     )
                 continue
             assert bind.numel() == pages.numel()
-            window.ids.bind(bind, pages)
-            window._maybe_zero_pages(pages)
+            window._bind_pages(bind, pages)
         return out
 
     def _plan_and_take(
@@ -2117,8 +2141,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
                     f"{need_size} slots was refused"
                 )
         else:
-            state.ids.bind(slots, pages)
-            state._maybe_zero_pages(pages)
+            state._bind_pages(slots, pages)
         state.free_virtual_ids = state.free_virtual_ids[need_size:]
         return state._expand_pages_to_tokens(slots)
 
@@ -2147,8 +2170,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
                         "refused"
                     )
             else:
-                band.ids.bind(rows, pages)
-                band._maybe_zero_pages(pages)
+                band._bind_pages(rows, pages)
         return True
 
     def free_request_rows(self, rows: torch.Tensor) -> None:
