@@ -265,21 +265,6 @@ class ClaimState(Value):
     location: PublicLocation | None = None
 
 
-class CopyTo(Value):
-    target: Target
-    src: Location
-    dst: Location
-
-
-class MoveTo(Value):
-    target: Target
-    src: Location
-    dst: Location
-
-
-Primitive: TypeAlias = CopyTo | MoveTo
-
-
 Payload: TypeAlias = Prefetch | Demote | Pin
 
 

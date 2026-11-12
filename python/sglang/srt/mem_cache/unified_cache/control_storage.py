@@ -11,8 +11,8 @@ import torch
 
 from sglang.srt.managers.kv_control.contracts import (
     ControlError,
+    Demote,
     ExecutionUpdate,
-    MoveTo,
     Status,
     TargetOutcome,
     TokenRange,
@@ -61,13 +61,14 @@ class StorageCacheTransfers:
     def start(self, work):
         payload, adapter = work.payload, self.executor.storage_adapter
         if (
-            not isinstance(payload, MoveTo)
-            or (payload.src.tier, payload.dst.tier) not in adapter.move_paths
-            or payload.dst.backend not in (None, adapter.backend)
-            or payload.src.backend is not None
+            not isinstance(payload, Demote)
+            or (payload.source.tier, payload.destination.tier)
+            not in adapter.demote_paths
+            or payload.destination.backend not in (None, adapter.backend)
+            or payload.source.backend is not None
             or any(
                 loc.engine_id not in (None, self.executor.engine_id)
-                for loc in (payload.src, payload.dst)
+                for loc in (payload.source, payload.destination)
             )
         ):
             raise ControlError(

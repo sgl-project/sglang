@@ -8,10 +8,7 @@ from sglang.srt.managers.kv_control.contracts import (
     HASH_SCHEME,
     PROTOCOL_VERSION,
     ControlError,
-    CopyTo,
     Demote,
-    Location,
-    MoveTo,
     Pin,
     PrefixTarget,
     PublicLocation,
@@ -27,25 +24,23 @@ PUBLIC_ACTIONS = ("sglang.prefetch", "sglang.demote", "sglang.pin")
 def public_capabilities(caps):
     directions = caps.get("directions", {})
     paths = {}
-    for name, primitive, permitted in (
+    for action, permitted in (
         (
-            "sglang.prefetch",
-            "copy_to",
+            "prefetch",
             (("storage", "host"),),
         ),
         (
-            "sglang.demote",
-            "move_to",
+            "demote",
             (("host", "storage"),),
         ),
     ):
         available = (
-            directions.get(primitive, ())
+            directions.get(action, ())
             if caps.get("available", True)
-            and "sglang." + primitive in caps.get("actions", ())
+            and "sglang." + action in caps.get("actions", ())
             else ()
         )
-        paths[name] = tuple(p for p in permitted if p in available)
+        paths["sglang." + action] = tuple(p for p in permitted if p in available)
     pins = caps.get("pin_protections", ()) if caps.get("available", True) else ()
     actions = {name: (ACTION_VERSION,) for name, values in paths.items() if values}
     if pins:
@@ -173,24 +168,7 @@ def normalize_public(payload, caps):
             cache_salt=c.cache_salt or None,
             layout_id=c.layout_id,
         )
-    if isinstance(payload, Pin):
-        return msgspec.structs.replace(payload, target=target)
-    primitive = MoveTo if isinstance(payload, Demote) else CopyTo
-    return primitive(
-        target=target,
-        src=Location(
-            tier=payload.source.tier,
-            engine_id=payload.source.engine_id,
-            backend=payload.source.backend,
-            backend_namespace=payload.source.backend_namespace,
-        ),
-        dst=Location(
-            tier=payload.destination.tier,
-            engine_id=payload.destination.engine_id,
-            backend=payload.destination.backend,
-            backend_namespace=payload.destination.backend_namespace,
-        ),
-    )
+    return msgspec.structs.replace(payload, target=target)
 
 
 def project_result(current, update, sequence):

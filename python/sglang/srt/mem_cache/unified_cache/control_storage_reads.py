@@ -13,9 +13,9 @@ import msgspec
 from sglang.srt.managers.kv_control.contracts import (
     CacheCompatibility,
     ControlError,
-    CopyTo,
     ExecutionUpdate,
     Location,
+    Prefetch,
     Status,
     TargetOutcome,
     TokenRange,
@@ -345,15 +345,16 @@ class StorageCacheReads:
     def _scope(self, work):
         payload = work.payload
         if (
-            not isinstance(payload, CopyTo)
-            or (payload.src.tier, payload.dst.tier) != ("storage", "host")
-            or (payload.src.tier, payload.dst.tier)
-            not in self.executor.storage_adapter.copy_paths
-            or payload.src.backend not in (None, self.executor.storage_adapter.backend)
-            or payload.dst.backend is not None
+            type(payload) is not Prefetch
+            or (payload.source.tier, payload.destination.tier) != ("storage", "host")
+            or (payload.source.tier, payload.destination.tier)
+            not in self.executor.storage_adapter.prefetch_paths
+            or payload.source.backend
+            not in (None, self.executor.storage_adapter.backend)
+            or payload.destination.backend is not None
             or any(
                 p.engine_id not in (None, self.executor.engine_id)
-                for p in (payload.src, payload.dst)
+                for p in (payload.source, payload.destination)
             )
         ):
             raise ControlError(

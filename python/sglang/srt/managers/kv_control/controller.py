@@ -14,16 +14,14 @@ from sglang.srt.managers.kv_control.contracts import (
     PROTOCOL_VERSION,
     ControlContext,
     ControlError,
-    CopyTo,
+    Demote,
     ExecutionUpdate,
     Limits,
-    MoveTo,
     OperationRef,
     OperationResult,
     Pin,
     Prefetch,
     ResolvedTarget,
-    Primitive,
     Status,
     Submission,
     TokensTarget,
@@ -42,11 +40,9 @@ from sglang.srt.managers.kv_hints import KvHintsEnvelope
 
 class ExecutionRequest(Value):
     ref: OperationRef
-    payload: Primitive
+    payload: Prefetch
     target: ResolvedTarget
     max_result_targets: int = 4096
-    # Owner-selected semantics, never a caller-controlled primitive field.
-    public_demote: bool = False
 
 
 class Executor(Protocol):
@@ -59,8 +55,8 @@ class Executor(Protocol):
     are cumulative. Terminal updates certify quiescence of this caller's resource
     obligations; shared jobs keep their own holds until all worker access stops.
 
-    COPY requires destination publication after every required component/rank;
-    MOVE reports destination publication and source reclamation separately.
+    PREFETCH requires destination publication after every required component/rank;
+    DEMOTE reports destination publication and source reclamation separately.
     Cancelling work drains outstanding backend access before releasing holds.
     """
 
@@ -76,7 +72,7 @@ class Executor(Protocol):
 @dataclass
 class _Pending:
     ref: OperationRef
-    payload: Primitive | Pin
+    payload: Prefetch | Pin
     target: ResolvedTarget | None
     started: bool = False
     cancel_sent: bool = False
@@ -141,7 +137,6 @@ class KVControl:
         # Resolve every historical selector against the state at submission,
         # before any sibling can mutate the index. List order is no dependency API.
         prepared = []
-        public_payloads = {}
         for frozen in batch.actions:
             try:
                 if not self.enabled:
@@ -157,7 +152,6 @@ class KVControl:
                         "JSON numbers must be finite and within the exact integer bound",
                     )
                 scope = None
-                public_payloads[frozen.action_id] = payload
                 if self.executor is None or not execute_primitives:
                     raise ControlError(
                         "unsupported", "No cache executor for this request"
@@ -167,7 +161,7 @@ class KVControl:
                 locations = (
                     (payload.location,)
                     if isinstance(payload, Pin)
-                    else (payload.src, payload.dst)
+                    else (payload.source, payload.destination)
                 )
                 if any(
                     loc.engine_id not in (None, context.engine_id) for loc in locations
@@ -191,27 +185,25 @@ class KVControl:
         for result, item in zip(submission.results, prepared):
             if not isinstance(item, ControlError):
                 payload, scope = item
-                if isinstance(payload, (CopyTo, MoveTo)) or (
+                if isinstance(payload, Prefetch) or (
                     isinstance(payload, Pin)
                     and payload.mode == "acquire"
                     and payload.target == "request_cached"
                 ):
-                    public = public_payloads.get(result.ref.action_id)
                     self._pending[result.ref.operation_id] = _Pending(
                         result.ref,
                         payload,
                         scope,
-                        deadline=self._clock() + public.timeout_ms / 1000
-                        if isinstance(public, Prefetch)
-                        and public.timeout_ms is not None
+                        deadline=self._clock() + payload.timeout_ms / 1000
+                        if isinstance(payload, Prefetch)
+                        and payload.timeout_ms is not None
                         else None,
                     )
-                    if public is not None:
-                        self.registry.set_public_scope(
-                            result.ref,
-                            requested_outcomes(scope) if scope is not None else (),
-                            self.executor.capabilities().get("cache_generation"),
-                        )
+                    self.registry.set_public_scope(
+                        result.ref,
+                        requested_outcomes(scope) if scope is not None else (),
+                        self.executor.capabilities().get("cache_generation"),
+                    )
         for result, item in zip(submission.results, prepared):
             if self.registry.get(result.ref).status.terminal:
                 continue
@@ -337,7 +329,6 @@ class KVControl:
                     payload=pending.payload,
                     target=pending.target,
                     max_result_targets=self.limits.max_scope_spans,
-                    public_demote=current.action_type == "sglang.demote",
                 )
             )
             self._execution_update(pending, update)
@@ -426,22 +417,22 @@ class KVControl:
                 "Executors cannot report logical mutations or create child operations",
             )
         payload = pending.payload
-        location = payload.dst
+        location = payload.destination
         required = (
             ("destination_ready", "source_reclaimed")
-            if isinstance(payload, MoveTo)
+            if isinstance(payload, Demote)
             else ("destination_ready",)
         )
         successful = []
         if "source_reclaimed" in update.completed_steps and (
-            not isinstance(payload, MoveTo)
+            not isinstance(payload, Demote)
             or "destination_ready" not in update.completed_steps
             or update.completed_steps.index("source_reclaimed")
             < update.completed_steps.index("destination_ready")
         ):
             raise ControlError(
                 "invalid_completion",
-                "Only MOVE can reclaim a source, after destination publication",
+                "Only DEMOTE can reclaim a source, after destination publication",
             )
         for outcome in update.target_outcomes:
             if outcome.branch_index != 0:
@@ -451,7 +442,7 @@ class KVControl:
             if not outcome.completed_steps:
                 continue
             if "source_reclaimed" in outcome.completed_steps and (
-                not isinstance(payload, MoveTo)
+                not isinstance(payload, Demote)
                 or "destination_ready" not in outcome.completed_steps
                 or outcome.completed_steps.index("source_reclaimed")
                 < outcome.completed_steps.index("destination_ready")

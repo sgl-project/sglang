@@ -13,16 +13,16 @@ import msgspec
 from sglang.srt.managers.kv_control.contracts import (
     ContentSpan,
     ControlError,
-    CopyTo,
     ExecutionUpdate,
     Location,
+    Prefetch,
+    ResolvedTarget,
     Status,
     TargetOutcome,
     TokenRange,
-    ResolvedTarget,
-    resolve_prefix,
     Value,
     cache_compatibility,
+    resolve_prefix,
     validated,
 )
 from sglang.srt.managers.kv_control.controller import ExecutionRequest
@@ -50,7 +50,7 @@ class ResidencySnapshot(Value):
 
 
 class _StorageScope(Value):
-    payload: CopyTo
+    payload: Prefetch
     target: ResolvedTarget
     max_result_targets: int
 
@@ -255,7 +255,7 @@ class UnifiedCacheExecutor:
             "cache_generation": self.generation,
             "tree_core": "python",
             "layout_id": self.layout_id,
-            "actions": ("sglang.copy_to", "sglang.move_to")
+            "actions": ("sglang.prefetch", "sglang.demote")
             if supported and self.host_control
             else (),
             "components": tuple(ct.name.lower() for ct in self.core.component_types)
@@ -264,10 +264,10 @@ class UnifiedCacheExecutor:
             "tier": "gpu",
             "directions": (
                 {
-                    "copy_to": self.storage_adapter.copy_paths
+                    "prefetch": self.storage_adapter.prefetch_paths
                     if self.storage_adapter
                     else (),
-                    "move_to": self.storage_adapter.move_paths
+                    "demote": self.storage_adapter.demote_paths
                     if self.storage_adapter
                     else (),
                     "storage_backend": self.storage_adapter.backend
@@ -595,7 +595,7 @@ class UnifiedCacheExecutor:
         try:
             self._refresh_storage_adapter()
             payload = work.payload
-            for location in (payload.src, payload.dst):
+            for location in (payload.source, payload.destination):
                 if location.backend_namespace is not None and (
                     location.tier != "storage"
                     or self.storage_adapter is None
@@ -612,9 +612,9 @@ class UnifiedCacheExecutor:
                 raise ControlError("stale_epoch", "Executor owner identity differs")
             if not self.host_control:
                 raise ControlError("unsupported", "Cache movement requires HiCache")
-            if payload.dst.tier == "storage" and self.storage is not None:
+            if payload.destination.tier == "storage" and self.storage is not None:
                 return self.storage.start(work)
-            if payload.src.tier == "storage" and self.storage_reads is not None:
+            if payload.source.tier == "storage" and self.storage_reads is not None:
                 return self.storage_reads.start(work)
             raise ControlError("unsupported", "Only L2 to/from storage is supported")
         except ControlError as error:

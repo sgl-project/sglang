@@ -25,8 +25,8 @@ class StorageExecutionAdapter(Protocol):
     profile: str
     backend_namespace: str
     store: object
-    copy_paths: tuple[tuple[str, str], ...]
-    move_paths: tuple[tuple[str, str], ...]
+    prefetch_paths: tuple[tuple[str, str], ...]
+    demote_paths: tuple[tuple[str, str], ...]
 
     def describe_pages(self, hashes: list[str]) -> list[dict]: ...
 
@@ -34,8 +34,8 @@ class StorageExecutionAdapter(Protocol):
 
 
 class _Adapter:
-    copy_paths = (("storage", "host"),)
-    move_paths = (("host", "storage"),)
+    prefetch_paths = (("storage", "host"),)
+    demote_paths = (("host", "storage"),)
 
     def __init__(self, store, pool, domain):
         self.store, self.pool = store, pool
@@ -86,7 +86,7 @@ class FileExecutionAdapter(_Adapter):
         # Destructive host moves require fresh backend existence checks;
         # unified file chunks already bypass that cache and validate sizes.
         if store.metadata_cache is not None and store._unified_suffixes is None:
-            self.move_paths = ()
+            self.demote_paths = ()
 
     def describe_pages(self, hashes):
         return [
