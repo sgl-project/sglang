@@ -36,6 +36,7 @@ NV_MEGA_RUNTIME_CHILDREN = (
     "SGLANG_OPT_DSV41_SAMPLING_ACCEPT_GRAPH",
     "SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH",
     "SGLANG_OPT_SPEC_RELAY_IN_PLACE",
+    "SGLANG_OPT_FREEZE_ENV_READS",
     "SGLANG_OPT_SMALL_FIELD_COPY_VECTORIZED",
     "SGLANG_OPT_SPEC_VERIFY_REUSE_STAGED_INPUTS",
     "SGLANG_OPT_SPEC_POST_VERIFY_ONE_LAUNCH_LOAD",
@@ -272,7 +273,7 @@ class TestFreezeEnvReads(unittest.TestCase):
     def test_field_writes_drop_the_memo(self):
         self.addCleanup(setattr, environ_module, "_frozen_reads", None)
         field = envs.SGLANG_TEST_RETRACT
-        with field.override(False):
+        with envs.SGLANG_OPT_FREEZE_ENV_READS.override(True), field.override(False):
             freeze_env_reads()
             self.assertIs(field.get(), False)
             # Every EnvField write drops the memo (a raw os.environ write would not).

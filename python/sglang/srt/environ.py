@@ -49,14 +49,13 @@ _frozen_reads: Optional[Dict[str, Any]] = None
 def freeze_env_reads() -> None:
     """Serve every later ``EnvField.get`` from a per-process memo.
 
-    For a process whose hot loop reads the same variables every step, once its
-    startup is over (the scheduler calls it when its event loop starts). Writes
-    through ``set`` / ``override`` / ``clear`` drop the memo; a raw ``os.environ``
-    write after this call is not seen, which is why sglang-owned variables are
-    written only through the ``EnvField`` API.
+    Gated by SGLANG_OPT_FREEZE_ENV_READS, for a process whose hot loop reads the
+    same variables every step, once its startup is over. Writes through ``set`` /
+    ``override`` / ``clear`` drop the memo; a raw ``os.environ`` write after this
+    call is not seen.
     """
     global _frozen_reads
-    if _frozen_reads is None:
+    if _frozen_reads is None and envs.SGLANG_OPT_FREEZE_ENV_READS.get():
         _frozen_reads = {}
 
 
@@ -1753,6 +1752,13 @@ class Envs:
     # Let an unchanged top-k-1 EAGLE round read the previous round's top-1 and hidden
     # rows where the draft-extend graph left them instead of relaying copies.
     SGLANG_OPT_SPEC_RELAY_IN_PLACE = EnvBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
+    # Once the scheduler's event loop starts, serve EnvField reads from a memo
+    # (freeze_env_reads). Opt-in: torch.compile traces EnvField.get, so a function
+    # compiled before the freeze and called outside graph replay recompiles once at
+    # the freeze and again whenever a new variable enters the memo.
+    SGLANG_OPT_FREEZE_ENV_READS = EnvBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
     # Runtime optimizations that follow SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION. Each
