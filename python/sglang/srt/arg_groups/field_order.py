@@ -569,5 +569,6 @@ POSITIONAL_FIELD_ORDER = (
     "allow_local_media_files",
     "paged_experts_host_memory_gb",
     "_max_running_requests_explicitly_set",
+    "enable_kv_cache_cpu_backup",
 )
 # fmt: on

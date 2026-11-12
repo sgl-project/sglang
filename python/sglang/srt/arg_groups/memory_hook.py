@@ -20,7 +20,7 @@ from sglang.srt.arg_groups.overrides import (
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase
 from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
-from sglang.srt.utils.device import get_device_memory_capacity
+from sglang.srt.utils.device import get_device, get_device_memory_capacity
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +30,31 @@ _DEFAULT_PP_PREFILL_CUDA_GRAPH_MAX_TOKENS = 8192
 def handle_offload_compatibility(server_args: Any) -> None:
     """Flag-only check; re-run after the model overrides fill in the PLE default."""
     cfg = resolving_view(server_args)
+    if cfg.enable_kv_cache_cpu_backup:
+        if not cfg.enable_memory_saver:
+            raise ValueError(
+                "--enable-kv-cache-cpu-backup requires --enable-memory-saver"
+            )
+        if not cfg.enable_weights_cpu_backup:
+            raise ValueError(
+                "--enable-kv-cache-cpu-backup requires --enable-weights-cpu-backup "
+                "to preserve runtime tensors sharing the weight memory region"
+            )
+        if (
+            (cfg.device or get_device()) != "cuda"
+            or cfg.pp_size != 1
+            or cfg.disaggregation_mode != "null"
+            or cfg.enable_hierarchical_cache
+            or cfg.enable_lmcache
+            or cfg.enable_unified_memory
+            or cfg.speculative_algorithm is not None
+            or cfg.weight_cache_mode != "off"
+        ):
+            raise ValueError(
+                "--enable-kv-cache-cpu-backup requires CUDA, PP=1, static KV pools, "
+                "and no disaggregation, hierarchical cache, LMCache, speculative decoding, "
+                "or IPC weight cache"
+            )
     if cfg.ple_offload_embedding and (
         cfg.cpu_offload_gb > 0 or cfg.offload_group_size > 0
     ):
@@ -366,7 +391,6 @@ def handle_gpu_memory_settings(server_args: Any):
 
 
 def reserve_for_graph_mb(server_args: Any) -> float:
-
     cfg = resolving_view(server_args)
     decode_cuda_graph_config = cfg.cuda_graph_config.decode
     prefill_cuda_graph_config = cfg.cuda_graph_config.prefill
