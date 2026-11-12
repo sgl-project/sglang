@@ -4767,9 +4767,14 @@ class Scheduler(
 
         new_batch.prepare_for_extend()
 
-        if self.tp_worker.model_runner.prefill_aware_swa and _is_npu:
+        if self.tp_worker.model_runner.prefill_aware_swa:
             for req in can_run_list:
-                req.kv.shield_window_prefill(len(req.origin_input_ids))
+                if _is_npu:
+                    # A re-prefill after retraction may append generated
+                    # tokens; only the prompt is a reference on Ascend.
+                    req.kv.shield_window_prefill(len(req.origin_input_ids))
+                else:
+                    req.kv.shield_window_prefill(req.extend_end)
 
         # Record prefill stats for logging after forward.
         new_batch.prefill_stats = PrefillStats.from_adder(

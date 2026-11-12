@@ -120,7 +120,7 @@ class DeepseekMLP(nn.Module):
 def _uses_unlimited_parallel_moe(config):
     return (
         _is_npu
-        and getattr(config, "model_type", None) == "unlimited_language"
+        and config.model_type == "unlimited_language"
         and (get_parallel().moe_ep_size > 1 or get_parallel().attn_dp_size > 1)
     )
 

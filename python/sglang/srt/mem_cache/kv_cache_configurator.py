@@ -2805,12 +2805,13 @@ class KVCacheConfigurator:
                 or self.hybrid_gdn_config is not None
             ):
                 if self.is_hybrid_swa:
-                    # DSV4 on NPU: SWA allocator subclass that also drives the
-                    # c4/c128 allocators, producing a DSV4OutCacheLoc per alloc.
-                    if (
-                        sizes.full_max_total_num_tokens == 0
-                        and getattr(self.model_config.hf_config, "model_type", None)
-                        == "unlimited-ocr"
+                    # Ascend Unlimited-OCR has no full-attention side, so the
+                    # pure-SWA allocator drives the paged pool directly. Both
+                    # checkpoint spellings: the re-saved revision renamed the
+                    # top-level model_type to "unlimited_ocr".
+                    if sizes.full_max_total_num_tokens == 0 and (
+                        self.model_config.hf_config.model_type
+                        in ("unlimited-ocr", "unlimited_ocr")
                     ):
                         token_to_kv_pool_allocator = PureSWATokenToKVPoolAllocator(
                             sizes.swa_max_total_num_tokens,
@@ -2821,6 +2822,8 @@ class KVCacheConfigurator:
                             need_sort=need_sort,
                         )
                         return token_to_kv_pool_allocator
+                    # DSV4 on NPU: SWA allocator subclass that also drives the
+                    # c4/c128 allocators, producing a DSV4OutCacheLoc per alloc.
                     if is_compressed_kv_model:
                         from sglang.srt.hardware_backend.npu.dsv4.dsv4_allocator import (
                             DSV4NPUTokenToKVPoolAllocator,

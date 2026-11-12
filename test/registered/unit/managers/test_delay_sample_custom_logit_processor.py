@@ -76,6 +76,9 @@ def _make_worker(req, sample_history):
     worker = TpModelWorker.__new__(TpModelWorker)
     worker.enable_overlap = True
     worker.enable_spec = False
+    # The delay is scoped to Ascend Unlimited-OCR in ``__init__``; the stub
+    # worker bypasses it, so state the resolved gate directly.
+    worker.delay_sample_custom_logit_processor = True
     worker.dllm_algorithm = None
     worker.pp_group = SimpleNamespace(is_last_rank=True)
 

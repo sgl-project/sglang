@@ -756,7 +756,6 @@ class PureSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         kvcache: BaseSWAKVPool,
         need_sort: bool,
     ):
-        assert page_size == 1 or _is_npu
         assert isinstance(kvcache, BaseSWAKVPool)
 
         self.page_size = page_size
@@ -769,12 +768,13 @@ class PureSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
             self.swa_attn_allocator = TokenToKVPoolAllocator(
                 size_swa, dtype, device, kvcache.swa_kv_pool, need_sort
             )
-        elif _is_npu:
+        else:
+            # Ascend page-major pools have no token-granular allocator, so the
+            # pure-SWA pool needs the paged one.
+            assert _is_npu, "PureSWA page_size > 1 requires NPU"
             self.swa_attn_allocator = NPUPagedTokenToKVPoolAllocator(
                 size_swa, page_size, dtype, device, kvcache.swa_kv_pool, need_sort
             )
-        else:
-            raise ValueError("PureSWA page_size > 1 requires NPU")
         self.full_attn_allocator = self.swa_attn_allocator
 
         self.full_to_swa_index_mapping = torch.cat(
@@ -839,14 +839,14 @@ class PureSWATokenToKVPoolAllocator(SWATokenToKVPoolAllocator):
         return self.swa_attn_allocator.alloc(need_size)
 
     def alloc_extend(self, *args, **kwargs):
-        if not _is_npu:
+        if self.page_size == 1:
             raise NotImplementedError(
                 "PureSWATokenToKVPoolAllocator does not support page_size > 1."
             )
         return self.swa_attn_allocator.alloc_extend(*args, **kwargs)
 
     def alloc_decode(self, *args, **kwargs):
-        if not _is_npu:
+        if self.page_size == 1:
             raise NotImplementedError(
                 "PureSWATokenToKVPoolAllocator does not support page_size > 1."
             )

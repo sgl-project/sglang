@@ -14,6 +14,9 @@ from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,
 )
+from sglang.srt.utils import is_npu
+
+_is_npu = is_npu()
 
 _IMAGE_MODE_PRESETS = {
     "tiny": (512, 512, False),
@@ -65,11 +68,13 @@ class UnlimitedOCRProcessor(BaseMultimodalProcessor):
 
     def collect_mm_items_from_processor_output(self, data_dict, modality=None):
         items = super().collect_mm_items_from_processor_output(data_dict, modality)
+        if not _is_npu:
+            return items
         for item in items:
             spatial_crop = item.model_specific_data.get("images_spatial_crop")
             if isinstance(spatial_crop, torch.Tensor):
-                # HF emits [1, pages, 2]. Expose the page axis to the generic
-                # item splitter, alongside pixel_values and images_crop.
+                # HF emits [1, pages, 2]. Expose the page axis so the generic
+                # item splitter slices it alongside pixel_values.
                 item.images_spatial_crop = spatial_crop.reshape(-1, 2)
         return items
 

@@ -2,9 +2,12 @@
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
+import sglang.srt.models.unlimited_ocr as unlimited_ocr_module
+import sglang.srt.multimodal.processors.unlimited_ocr as unlimited_ocr_processor_module
 from sglang.srt.managers.mm_utils import get_new_expanded_mm_items
 from sglang.srt.models.unlimited_ocr import UnlimitedOCRForCausalLM
 from sglang.srt.multimodal.modality import Modality
@@ -16,6 +19,17 @@ register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 
 class TestUnlimitedOCRImageInput(CustomTestCase):
+    def setUp(self):
+        # The per-page encoder path and the crop-metadata reshape are the
+        # Ascend branch of two platform forks; force that branch on CPU.
+        for module in (
+            unlimited_ocr_module,
+            unlimited_ocr_processor_module,
+        ):
+            patcher = patch.object(module, "_is_npu", True)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
     @staticmethod
     def _item(value, crops, has_local_crops):
         return SimpleNamespace(
@@ -45,6 +59,10 @@ class TestUnlimitedOCRImageInput(CustomTestCase):
         """Stacking 2-crop and 3-crop pages raises before encoding either page."""
         items = [self._item(1.0, 2, True), self._item(2.0, 3, True)]
         encoder = SimpleNamespace(
+            config=SimpleNamespace(
+                architectures=["UnlimitedOCRForCausalLM"],
+                sparse_attention_config=None,
+            ),
             vision_model=SimpleNamespace(dtype=torch.float32),
             _collect_mm_flag=UnlimitedOCRForCausalLM._collect_mm_flag,
             _pixel_values_to_embedding=self._encoder,
@@ -58,6 +76,10 @@ class TestUnlimitedOCRImageInput(CustomTestCase):
         """A page without local crops must not inherit another page's flag."""
         items = [self._item(1.0, 2, False), self._item(2.0, 3, True)]
         encoder = SimpleNamespace(
+            config=SimpleNamespace(
+                architectures=["UnlimitedOCRForCausalLM"],
+                sparse_attention_config=None,
+            ),
             vision_model=SimpleNamespace(dtype=torch.float32),
             _collect_mm_flag=UnlimitedOCRForCausalLM._collect_mm_flag,
             _pixel_values_to_embedding=self._encoder,
@@ -80,6 +102,10 @@ class TestUnlimitedOCRImageInput(CustomTestCase):
             has_local_crops=[False, True],
         )
         encoder = SimpleNamespace(
+            config=SimpleNamespace(
+                architectures=["UnlimitedOCRForCausalLM"],
+                sparse_attention_config=None,
+            ),
             vision_model=SimpleNamespace(dtype=torch.float32),
             _collect_mm_flag=UnlimitedOCRForCausalLM._collect_mm_flag,
             _pixel_values_to_embedding=self._encoder,
@@ -118,6 +144,10 @@ class TestUnlimitedOCRImageInput(CustomTestCase):
             [tuple(item.images_spatial_crop.shape) for item in items], [(1, 2), (1, 2)]
         )
         encoder = SimpleNamespace(
+            config=SimpleNamespace(
+                architectures=["UnlimitedOCRForCausalLM"],
+                sparse_attention_config=None,
+            ),
             vision_model=SimpleNamespace(dtype=torch.float32),
             _collect_mm_flag=UnlimitedOCRForCausalLM._collect_mm_flag,
             _pixel_values_to_embedding=self._encoder,

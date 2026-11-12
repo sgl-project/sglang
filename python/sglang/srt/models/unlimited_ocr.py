@@ -7,6 +7,7 @@ from typing import Iterable, List, Optional, Set, Tuple, TypeAlias, Union
 import torch
 from torch import Tensor, nn
 
+from sglang.srt.configs.model_config import is_unlimited_ocr_v2
 from sglang.srt.configs.unlimited_ocr import UnlimitedVLConfig
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
@@ -26,10 +27,11 @@ from sglang.srt.models.deepseek_ocr import (
 )
 from sglang.srt.models.transformers import maybe_prefix
 from sglang.srt.models.unlimited_ocr_moe import load_unlimited_ocr_expert_weight
-from sglang.srt.utils import cpu_has_amx_support, is_cpu
+from sglang.srt.utils import cpu_has_amx_support, is_cpu, is_npu
 
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
+_is_npu = is_npu()
 
 NestedTensors: TypeAlias = Union[
     list["NestedTensors"],
@@ -271,13 +273,59 @@ class UnlimitedOCRForCausalLM(nn.Module):
 
     def _process_image_input(self, mm_items: List[MultimodalDataItem]) -> torch.Tensor:
         """Process multimodal data items into concatenated vision features."""
+        # Guard clause rather than a call-site fork: v2 overrides this method
+        # and calls super(), so the choice has to follow virtual dispatch.
+        if _is_npu and not is_unlimited_ocr_v2(self.config):
+            return self._process_image_input_per_page(mm_items)
+
         target_dtype = self.vision_model.dtype
-        # Local crop counts vary with each image's aspect ratio.  Keep the
-        # per-item encoder inputs separate, as in DeepseekOCRForCausalLM.
+        has_local_crops = self._collect_mm_flag(mm_items, "has_local_crops")
+        pixel_values = torch.stack([item.feature for item in mm_items], dim=0).type(
+            target_dtype
+        )
+
+        images_crop, images_spatial_crop = self._stack_crop_inputs(
+            mm_items,
+            has_local_crops=has_local_crops,
+            target_dtype=target_dtype,
+            device=pixel_values.device,
+        )
+        pixel_values = pixel_values.view(
+            pixel_values.shape[0] * pixel_values.shape[1], 1, *pixel_values.shape[2:]
+        )
+        images_crop = images_crop.view(
+            images_crop.shape[0] * images_crop.shape[1], 1, *images_crop.shape[2:]
+        )
+        images_spatial_crop = images_spatial_crop.view(
+            images_spatial_crop.shape[0] * images_spatial_crop.shape[1],
+            1,
+            *images_spatial_crop.shape[2:],
+        )
+
+        assert images_crop.dim() == 6
+        assert images_spatial_crop.dim() == 3
+
+        vision_feature_lists = self._pixel_values_to_embedding(
+            pixel_values=pixel_values,
+            images_crop=images_crop,
+            images_spatial_crop=images_spatial_crop,
+            has_local_crops=has_local_crops,
+        )
+        vision_features = torch.cat(vision_feature_lists, dim=0).type(target_dtype)
+        return vision_features
+
+    def _process_image_input_per_page(
+        self, mm_items: List[MultimodalDataItem]
+    ) -> torch.Tensor:
+        """Ascend: encode each item, and each bundled page, on its own.
+
+        Local crop counts vary with an image's aspect ratio, so stacking items
+        breaks multi-image batches; a processor item may also bundle several
+        pages that must stay distinct through the encoder.
+        """
+        target_dtype = self.vision_model.dtype
         vision_feature_lists: List[torch.Tensor] = []
         for item in mm_items:
-            # A processor item can still bundle several pages. Normalize its
-            # page axis before _pixel_values_to_embedding loops over pages.
             pixel_values = item.feature.type(target_dtype).reshape(
                 -1, 1, *item.feature.shape[-3:]
             )
@@ -286,14 +334,15 @@ class UnlimitedOCRForCausalLM(nn.Module):
                 .to(device=pixel_values.device)
                 .reshape(-1, 1, *item.images_crop.shape[-4:])
             )
-            images_spatial_crop = item.images_spatial_crop.type(torch.long).to(
-                device=pixel_values.device
+            images_spatial_crop = (
+                item.images_spatial_crop.type(torch.long)
+                .to(device=pixel_values.device)
+                .reshape(-1, 1, 2)
             )
-            images_spatial_crop = images_spatial_crop.reshape(-1, 1, 2)
 
+            num_pages = pixel_values.shape[0]
             assert images_crop.dim() == 6
             assert images_spatial_crop.dim() == 3
-            num_pages = pixel_values.shape[0]
             assert images_crop.shape[0] == images_spatial_crop.shape[0] == num_pages
             item_has_local_crops = self._collect_mm_flag([item], "has_local_crops")
             if item_has_local_crops is not None:
@@ -309,8 +358,7 @@ class UnlimitedOCRForCausalLM(nn.Module):
                 )
             )
 
-        vision_features = torch.cat(vision_feature_lists, dim=0).type(target_dtype)
-        return vision_features
+        return torch.cat(vision_feature_lists, dim=0).type(target_dtype)
 
     def get_language_model(self) -> torch.nn.Module:
         """Return the underlying language model."""
@@ -400,12 +448,15 @@ class UnlimitedOCRForCausalLM(nn.Module):
                 ):
                     name = name.replace("model.", "model.model.")
 
-            expert_name = load_unlimited_ocr_expert_weight(
-                params_dict, name, loaded_weight
-            )
-            if expert_name is not None:
-                loaded_params.add(expert_name)
-                continue
+            # Only the Ascend expert-parallel FusedMoE has w13/w2 parameters;
+            # the default DeepseekMoE keeps per-expert ModuleList names.
+            if _is_npu:
+                expert_name = load_unlimited_ocr_expert_weight(
+                    params_dict, name, loaded_weight
+                )
+                if expert_name is not None:
+                    loaded_params.add(expert_name)
+                    continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:

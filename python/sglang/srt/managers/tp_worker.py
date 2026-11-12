@@ -64,7 +64,12 @@ from sglang.srt.runtime_context import (
     get_spec,
 )
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import MultiprocessingSerializer, broadcast_pyobj, set_random_seed
+from sglang.srt.utils import (
+    MultiprocessingSerializer,
+    broadcast_pyobj,
+    is_npu,
+    set_random_seed,
+)
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
 
@@ -388,6 +393,14 @@ class TpModelWorker(BaseTpWorker):
 
         self.enable_overlap = not get_schedule().disable_overlap_schedule
         self.enable_spec = get_spec().speculative_algorithm is not None
+        # Ascend Unlimited-OCR: the OCR no-repeat processor reads req.output_ids,
+        # which the overlap loop commits one batch late, so defer its sampling
+        # like a grammar. Other platforms keep the eager path.
+        self.delay_sample_custom_logit_processor = (
+            is_npu()
+            and self.model_config.hf_config.model_type
+            in ("unlimited-ocr", "unlimited_ocr")
+        )
         self.hicache_layer_transfer_counter = None
 
     def alloc_memory_pool(
@@ -733,11 +746,6 @@ class TpModelWorker(BaseTpWorker):
 
             # Delay sampling only for normal generation requests.
             # Keep the existing grammar behavior unchanged.
-            # Custom logit processors rebuild the token history from
-            # req.output_ids, which the overlap loop only commits for the
-            # previous batch before launch_batch_sample_if_needed() runs.
-            # Deferring their sampling keeps the invariant: when sampling the
-            # k-th token, req.output_ids contains exactly the first k-1 tokens.
             if (
                 self.enable_overlap
                 and not self.enable_spec
@@ -746,8 +754,11 @@ class TpModelWorker(BaseTpWorker):
                     or (
                         not forward_batch.is_prefill_only
                         and (
-                            forward_batch.sampling_info.has_custom_logit_processor
-                            or envs.SGLANG_ENABLE_DELAY_SAMPLE.get()
+                            envs.SGLANG_ENABLE_DELAY_SAMPLE.get()
+                            or (
+                                self.delay_sample_custom_logit_processor
+                                and forward_batch.sampling_info.has_custom_logit_processor
+                            )
                         )
                     )
                 )

@@ -77,7 +77,7 @@ The SGLang integration loads the standalone Unlimited-OCR architecture with SAM 
 - **Attention backend**: on H100 use `--attention-backend fa3 --page-size 1`. The prefill-aware SWA page table is built with token-level locations, so page size 1 is required. On Ascend A3 use `--attention-backend ascend --device npu --page-size 128`.
 - **Radix cache**: keep `--disable-radix-cache` for batch OCR over different documents. If your workload repeatedly asks about the same image and prompt, remove this flag to allow prefix reuse through `PureSWARadixCache`.
 - **Long OCR generations**: keep the default prefill-aware SWA path enabled. It retains prompt and image KV while still applying a sliding window to generated text.
-- **Ascend NPU**: keep overlap scheduling enabled. The validated configuration is TP1 on one A3 die, context length 32768, mem fraction 0.8, and the default graph capture and chunked-prefill settings; TP, DP, and image modes other than the ones listed below were not validated.
+- **Ascend NPU**: keep overlap scheduling enabled. The validated configuration is TP1 on one A3 die, context length 32768, mem fraction 0.8, and the default graph capture and chunked-prefill settings. EP2 on two dies is supported with `deepep` or `ascend_ops` (see [3.3](#33-running-on-two-ascend-dies-with-expert-parallelism)); DP and image modes other than the ones listed below were not validated.
 - **Custom logit processor**: keep `--enable-custom-logit-processor` in the launch command.
 - **Image modes**: pass `images_config.image_mode` per request. Supported modes are `tiny`, `small`, `base`, `large`, and `gundam`. Multiple images are supported only for `tiny`, `small`, and `base`.
 - **Default image mode**: when `images_config.image_mode` is omitted, SGLang uses `gundam`.
@@ -159,3 +159,21 @@ Use lower modes to reduce prefill cost for simple images, and use `gundam` for h
     </tr>
   </tbody>
 </table>
+
+### 3.3 Running on two Ascend dies with expert parallelism
+
+The language backbone has 64 routed experts. To spread them across two A3 dies, set `--tp-size 2 --ep-size 2` and pick an expert-communication backend. On top of the A3 recipe:
+
+```bash Command
+export HCCL_BUFFSIZE=512
+python -m sglang.launch_server \
+  --model-path baidu/Unlimited-OCR \
+  --device npu --attention-backend ascend \
+  --tp-size 2 --ep-size 2 --moe-a2a-backend deepep \
+  --page-size 128 --context-length 32768 \
+  --mem-fraction-static 0.8 \
+  --enable-custom-logit-processor --disable-radix-cache
+```
+
+- **`HCCL_BUFFSIZE`**: the DeepEP dispatch kernel needs about 221 MB at batch size 139. The 200 MB default fails with `aclnnCamMoeDispatchNormal ... Failed to execute tiling function`; 512 MB is enough.
+- **Backends**: `deepep` and `ascend_ops` both work. `ascend_fuseep` requires an int8-quantized checkpoint: its `fuseep_mode=2` default rejects these bf16 weights (`does not support BF16 (unquantized) weights`), and `fuseep_mode=1` fails at the first fused-MoE op because the kernel expects quantized weight types.

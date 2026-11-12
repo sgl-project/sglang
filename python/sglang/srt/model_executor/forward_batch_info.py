@@ -1001,7 +1001,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             reference_lens_cpu=(
                 [len(req.origin_input_ids) for req in batch.reqs]
                 if _is_npu
-                and getattr(model_runner, "prefill_aware_swa", False)
+                and model_runner.prefill_aware_swa
                 and batch.forward_mode.is_extend_without_speculative()
                 else None
             ),
