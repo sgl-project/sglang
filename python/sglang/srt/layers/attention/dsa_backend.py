@@ -511,14 +511,14 @@ def _validate_triton_sparse_mla_backend(
             )
 
 
-def _validate_prims_ts_dcp(*, dcp_size: int) -> None:
+def _validate_prims_ts_dcp(*, dcp_size: int, shards_index_k: bool) -> None:
     # Prims-TS partials carry a natural-log LSE, but the DCP combine merges DSA
-    # partials base 2 (is_mla_dcp_lse_base_on_e).
-    if dcp_size > 1:
+    # partials base e only under sharded index-K (is_mla_dcp_lse_base_on_e).
+    if dcp_size > 1 and not shards_index_k:
         raise ValueError(
-            "--dsa-*-backend prims_ts does not support --dcp-size > 1: the DSA "
-            "DCP combine merges base-2 LSE partials, and Prims-TS returns a "
-            "natural-log LSE. Use trtllm, or --dcp-size 1."
+            "--dsa-*-backend prims_ts supports --dcp-size > 1 only with sharded "
+            "index-K DCP (Kimi-K3.1); this model keeps index-K replicated, whose "
+            "DCP combine merges base-2 LSE partials. Use trtllm, or --dcp-size 1."
         )
 
 
@@ -759,7 +759,10 @@ class DeepseekSparseAttnBackend(
                 raise ValueError(
                     "--dsa-*-backend prims_ts needs --kv-cache-dtype fp8_e4m3."
                 )
-            _validate_prims_ts_dcp(dcp_size=get_parallel().attn_dcp_size)
+            _validate_prims_ts_dcp(
+                dcp_size=get_parallel().attn_dcp_size,
+                shards_index_k=self.dsa_shards_index_k,
+            )
             check_prims_ts_sparse_mla_support(
                 device=torch.device(self.device),
                 num_heads=self.num_q_heads,
@@ -4484,6 +4487,8 @@ class DeepseekSparseAttnBackend(
                 layer=layer,
                 k_scale=k_scale,
                 is_prefill=is_prefill,
+                partial=replicated_dcp or dcp_partial,
+                clamp_lengths=not dcp_partial,
                 row_plan=row_plan,
             )
 
@@ -4565,18 +4570,21 @@ class DeepseekSparseAttnBackend(
         layer: RadixAttention,
         k_scale: float,
         is_prefill: bool,
+        partial: bool,
+        clamp_lengths: bool,
         row_plan: _RowPlan,
-    ) -> torch.Tensor:
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         assert self._prims_ts is not None
         rows = q_all.shape[0]
         assert q_all.shape[1] == layer.tp_q_head_num
         lengths = metadata.cache_seqlens_int32 if seq_lens is None else seq_lens
         if is_prefill:
             lengths = lengths[:rows]
-        # Decode passes the full KV length; only the first top-k width
-        # slots of a row hold its selected keys.
-        lengths = torch.clamp(lengths, max=page_table_1.shape[1])
-        out, _ = self._prims_ts.forward(
+        if clamp_lengths:
+            # Decode passes the full KV length; only the first top-k width
+            # slots of a row hold its selected keys.
+            lengths = torch.clamp(lengths, max=page_table_1.shape[1])
+        out, lse = self._prims_ts.forward(
             q=q_all,
             kv_cache=kv_cache,
             indices=page_table_1,
@@ -4584,7 +4592,14 @@ class DeepseekSparseAttnBackend(
             sm_scale=layer.scaling,
             kv_scale=k_scale,
         )
-        return _restore_live_rows(out, row_plan)
+        out = _restore_live_rows(out, row_plan)
+        if not partial:
+            return out
+        if row_plan.q_pad_rows:
+            lse = torch.cat(
+                [lse, lse.new_full((row_plan.q_pad_rows, lse.shape[1]), -torch.inf)]
+            )
+        return out, lse
 
     def _pad_topk_indices(
         self, topk_indices: torch.Tensor, num_tokens: int
