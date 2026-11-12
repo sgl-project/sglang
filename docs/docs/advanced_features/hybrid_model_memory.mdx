@@ -53,6 +53,6 @@ The right ratio depends on the model: it scales with the size of one state slot 
 |---|---|---|
 | Most hybrid models | `0.9` | Generic starting point. Cookbook recipes pass an explicit value where it was tuned. |
 | Inkling | `0.1` | |
-| GLM-5.3-Flash | `0.25` with `extra_buffer_lazy` | Sized for multi-turn agent traffic. The cookbook's High Throughput recipes pin `0.9`. |
+| GLM-5.3-Flash | `0.25` with `extra_buffer_lazy` | Sized for multi-turn agent traffic. High Throughput recipes on GPUs where it would cap running requests pin `0.9`. |
 
 An explicit `--mamba-full-memory-ratio`, `--max-mamba-cache-size` or `--mamba-radix-cache-strategy` always overrides the model default.

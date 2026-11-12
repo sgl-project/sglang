@@ -126,7 +126,7 @@ Measured (GLM-5.3-Flash NVFP4, TP2 B300, AgentX trace replay, 48 sessions, pools
 | 144 / 9.41M (S=3) | 0.18 | 0.88 | 35.1K |
 | 120 / 9.70M (S=3, running capped at 40) | 0.15 | 0.84 | 29.7K |
 
-Peak concurrency was 48 (p50 27); state-pool usage never passed 72% even at 144 slots. GLM-5.3-Flash now defaults to `r = 0.25` with `extra_buffer_lazy` (model override), and its high-throughput recipes pin 0.9.
+Peak concurrency was 48 (p50 27); state-pool usage never passed 72% even at 144 slots. GLM-5.3-Flash now defaults to `r = 0.25` with `extra_buffer_lazy` (model override), and its high-throughput recipes pin 0.9 on GPUs where 0.25 would cap running requests below the benchmarked concurrency (e.g. GB300 TP4 FP8: 219 running requests at 0.25).
 
 The direction is model-specific: a model whose KV per token is tiny relative to its state (MLA/DSA attention, e.g. Kimi-K3.1) may want a ratio above 0.9 instead. Measure; do not carry a ratio across models.
 
