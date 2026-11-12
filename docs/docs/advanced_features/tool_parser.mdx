@@ -274,6 +274,8 @@ Collect argument fragments by tool call `index` within each choice. Wait for the
 
 If the choice ends with `finish_reason="length"`, the last tool call may still have partial arguments even when the assembled JSON parses and passes schema validation.
 
+`finish_reason="tool_calls"` means generation ended without reaching a limit, but most tool parsers do not check that the model closed each call. A custom `stop` sequence that matches inside a tool argument still ends a streamed choice with `tool_calls`, with arguments that parse as valid JSON but are cut off. Avoid `stop` sequences that can appear in tool arguments.
+
 ```python Example
 arguments_by_index = {}
 for tool_call in tool_calls:
@@ -292,6 +294,11 @@ if finish_reason == "tool_calls":
         print_highlight(f"Streamed function call {index} arguments: {full_arguments}")
 elif finish_reason == "length":
     print_highlight("The response reached its token limit. Tool arguments may be incomplete.")
+elif arguments_by_index:
+    print_highlight(
+        f"The response ended with finish_reason={finish_reason!r}. "
+        "Do not treat its tool calls as complete."
+    )
 ```
 
 ### Define a Tool Function
