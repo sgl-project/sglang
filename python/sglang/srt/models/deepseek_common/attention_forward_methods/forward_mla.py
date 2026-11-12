@@ -28,7 +28,10 @@ from sglang.srt.layers.dcp import (
     dcp_push_combine_fits,
     dcp_push_combine_reduce,
 )
-from sglang.srt.layers.dcp.layout import dsa_shards_index_k
+from sglang.srt.layers.dcp.layout import (
+    dsa_shards_index_k,
+    is_mla_dcp_lse_base_on_e,
+)
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
 from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
 from sglang.srt.lora.utils import kv_b_lora_correction
@@ -93,13 +96,6 @@ def _select_local_dcp_heads_for_autotune(
     return attn_output.narrow(1, rank * num_local_heads, num_local_heads)
 
 
-def is_mla_dcp_lse_base_on_e(attention_backend: Optional[str]) -> bool:
-    if attention_backend == "dsa":
-        # trtllm-gen partials carry a base-2 LSE.
-        return dsa_shards_index_k() and get_exec().kernel.dsa_decode_backend != "trtllm"
-    return attention_backend in {"flashmla", "cutedsl_mla", "aiter"}
-
-
 @eager_on_graph(True)
 def bcg_dcp_extend_kv_gather(
     token_to_kv_pool,
@@ -115,9 +111,11 @@ def bcg_dcp_extend_kv_gather(
         forward_batch = get_forward_batch()
     metadata = forward_batch.attn_dcp_metadata
     if metadata.dcp_extend_prefix_lens_sum == 0:
-        # No prefix KV on any DCP rank: skip the collective.
-        metadata.dcp_kv_buffer[..., :kv_lora_rank] = k_nope
-        metadata.dcp_kv_buffer[..., kv_lora_rank:] = k_pe
+        # No prefix KV on any DCP rank: skip the collective. The buffer holds the
+        # real tokens; a replayed k_nope/k_pe is padded to the bucket.
+        num_tokens = metadata.dcp_kv_buffer.shape[0]
+        metadata.dcp_kv_buffer[..., :kv_lora_rank] = k_nope[:num_tokens]
+        metadata.dcp_kv_buffer[..., kv_lora_rank:] = k_pe[:num_tokens]
         return
     all_gather_kv_cache_for_mla_extend(
         token_to_kv_pool,
