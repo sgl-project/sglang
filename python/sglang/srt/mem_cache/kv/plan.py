@@ -711,6 +711,18 @@ def plan_kv_storage(
                 ),
             )
         )
+    # The router routes a part other than KV by its name alone, across every
+    # sub-pool, so the parts kept beside KV need names unique to the plan.
+    owners: Dict[str, str] = {}
+    for sub_pool in sub_pools:
+        for part in sub_pool.parts[1:]:
+            other = owners.setdefault(part.name, sub_pool.name)
+            if other != sub_pool.name:
+                raise ValueError(
+                    f"sub-pools {other!r} and {sub_pool.name!r} both keep a "
+                    f"{part.name!r} part; a part's name names it in the whole "
+                    "plan, so each part needs its own"
+                )
     scratch = [
         ScratchDecl(
             part=msgspec.structs.replace(part, name=f"{sub_pool.name}.{part.name}")

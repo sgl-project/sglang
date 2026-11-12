@@ -29,10 +29,14 @@ from sglang.srt.mem_cache.kv.build import (
 from sglang.srt.mem_cache.kv.decl import (
     KV_PART,
     FullLayerParts,
+    FullLifetime,
+    KVLayerDecl,
+    KVPartDecl,
     MHAGeometry,
     MLAGeometry,
     StateGeometry,
     WindowLayers,
+    WindowLifetime,
     kv_layer_decls,
 )
 from sglang.srt.mem_cache.kv.layout.composite import (
@@ -389,6 +393,26 @@ class TestComposition(CustomTestCase):
                         ValueError, "which no view reads from a composite unit"
                     ):
                         plan_kv_storage(decls, page_size=_PAGE)
+
+    def test_a_part_name_names_one_part_in_the_plan(self):
+        """The router names a part other than KV by its name in the whole
+        plan, so two sub-pools that both keep a part of one name are refused
+        when planned rather than when their views are bound."""
+        decls = [
+            KVLayerDecl(
+                layer_id=layer_id,
+                parts=(
+                    KVPartDecl(lifetime=lifetime, geometry=_PagedRows(row_bytes=32)),
+                    KVPartDecl(lifetime=lifetime, geometry=_Blobs(bytes_per_token=12)),
+                ),
+            )
+            for layer_id, lifetime in (
+                (0, FullLifetime()),
+                (1, WindowLifetime(window=64)),
+            )
+        ]
+        with self.assertRaisesRegex(ValueError, "both keep a 'blobs' part"):
+            plan_kv_storage(decls, page_size=_PAGE)
 
     def test_two_kv_layouts_are_refused(self):
         decls = kv_layer_decls(
