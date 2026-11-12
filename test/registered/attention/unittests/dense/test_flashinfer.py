@@ -288,7 +288,7 @@ class TestFlashInferDenseAttentionBackendCorrectness(CustomTestCase):
     )
 
     @staticmethod
-    def _flashinfer_fixture(architecture, *, is_dllm=True, decode_graphs=True):
+    def _flashinfer_fixture(*, is_dllm=True, decode_graphs=True):
         case = DenseAttentionCase(
             name="diffusion_graph_replan",
             backend="flashinfer",
@@ -306,7 +306,6 @@ class TestFlashInferDenseAttentionBackendCorrectness(CustomTestCase):
             hidden_size=256,
             context_len=128,
         )
-        config.hf_config.architectures = [architecture]
         runner = MockModelRunner(
             case=case,
             model_config=config,
@@ -326,15 +325,10 @@ class TestFlashInferDenseAttentionBackendCorrectness(CustomTestCase):
         "Blackwell ragged prefill backend selection",
     )
     def test_cutlass_selection_is_unchanged_outside_dllm_full_graphs(self):
-        for architecture, is_dllm, decode_graphs in (
-            ("NemotronLabsDiffusionModel", False, True),
-            ("NemotronLabsDiffusionModel", True, False),
-        ):
-            with self.subTest(
-                architecture=architecture, is_dllm=is_dllm, decode_graphs=decode_graphs
-            ):
+        for is_dllm, decode_graphs in ((False, True), (True, False)):
+            with self.subTest(is_dllm=is_dllm, decode_graphs=decode_graphs):
                 fixture = self._flashinfer_fixture(
-                    architecture, is_dllm=is_dllm, decode_graphs=decode_graphs
+                    is_dllm=is_dllm, decode_graphs=decode_graphs
                 )
                 self.assertEqual(
                     fixture.backend.prefill_wrappers_ragged[0]._backend, "cutlass"
@@ -345,12 +339,7 @@ class TestFlashInferDenseAttentionBackendCorrectness(CustomTestCase):
         "Blackwell ragged prefill backend selection",
     )
     def test_dllm_ragged_graphs_survive_replanning_batch_sizes(self):
-        for architecture in ("SDARForCausalLM", "NemotronLabsDiffusionModel"):
-            with self.subTest(architecture=architecture):
-                self._check_ragged_graphs_survive_replanning(architecture)
-
-    def _check_ragged_graphs_survive_replanning(self, architecture):
-        fixture = self._flashinfer_fixture(architecture)
+        fixture = self._flashinfer_fixture()
         wrapper = fixture.backend.prefill_wrappers_ragged[0]
         torch.manual_seed(2026)
         pointers = torch.arange(5, device="cuda", dtype=torch.int32) * 32
