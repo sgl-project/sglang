@@ -417,7 +417,7 @@ def fused_experts_none_to_flashinfer_cutlass(
     return StandardCombineInput(hidden_states=output)
 
 
-@register_fused_func("flashinfer", "flashinfer_cutlass")
+@register_fused_func("flashinfer_nvlink_one_sided", "flashinfer_cutlass")
 def fused_experts_flashinfer_to_flashinfer_cutlass(
     dispatch_output: FlashinferDispatchOutput | StandardDispatchOutput,
     quant_info: MoeQuantInfo,

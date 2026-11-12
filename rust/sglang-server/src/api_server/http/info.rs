@@ -479,14 +479,15 @@ mod tests {
         flume::Receiver<TmEvent>,
         flume::Receiver<crate::tokenizer_manager::wiring::AbortSource>,
     ) {
-        test_state_with_peers(server_args, Vec::new())
+        test_state_with_peers(server_args, Vec::new(), Vec::new())
     }
 
     /// A state whose core answers for the DP ranks `peer_endpoints` reach as
-    /// well as its own.
+    /// well as its own, and reports `server_info_state_keys` on `/server_info`.
     fn test_state_with_peers(
         server_args: ServerArgs,
         peer_endpoints: Vec<Arc<dyn ControlTarget>>,
+        server_info_state_keys: Vec<String>,
     ) -> (
         Arc<AppState>,
         flume::Receiver<TmEvent>,
@@ -506,7 +507,8 @@ mod tests {
                 mm_limits: Default::default(),
                 multimodal: false,
                 peer_endpoints,
-                metadata: CoreMetadata::from(server_args.as_ref()),
+                metadata: CoreMetadata::from(server_args.as_ref())
+                    .with_server_info_state_keys(server_info_state_keys),
                 metrics: None,
                 request_log: None,
                 generate_validator: None,
@@ -635,27 +637,32 @@ mod tests {
             Some(_) => vec![endpoint(1, listeners[1]), endpoint(0, listeners[0])],
             None => Vec::new(),
         };
-        let (state, intake_rx, abort_rx) = test_state(ServerArgs {
-            deployment_info: DeploymentInfo {
-                dp_rank,
-                rust_server_endpoints,
+        // An embedding package registers its own scheduler fields by name.
+        let (state, intake_rx, abort_rx) = test_state_with_peers(
+            ServerArgs {
+                deployment_info: DeploymentInfo {
+                    dp_rank,
+                    rust_server_endpoints,
+                    ..Default::default()
+                },
+                model_path: "/model".into(),
+                served_model_name: "served".into(),
+                tokenizer_path: "/local-tokenizer-copy".into(),
+                public_tokenizer_path: "/tokenizer".into(),
+                model_config: ModelConfig {
+                    context_len: 4096,
+                    ..Default::default()
+                },
+                max_total_num_tokens: 8192,
+                version: "1.2.3".into(),
+                launch_server_info: crate::message::config::JsonObject(Arc::new(
+                    launch_fields.as_object().unwrap().clone(),
+                )),
                 ..Default::default()
             },
-            model_path: "/model".into(),
-            served_model_name: "served".into(),
-            tokenizer_path: "/local-tokenizer-copy".into(),
-            public_tokenizer_path: "/tokenizer".into(),
-            model_config: ModelConfig {
-                context_len: 4096,
-                ..Default::default()
-            },
-            max_total_num_tokens: 8192,
-            version: "1.2.3".into(),
-            launch_server_info: crate::message::config::JsonObject(Arc::new(
-                launch_fields.as_object().unwrap().clone(),
-            )),
-            ..Default::default()
-        });
+            Vec::new(),
+            vec!["package_state".into(), "unset_package_state".into()],
+        );
         let request = tokio::spawn(
             routes().with_state(state).oneshot(
                 HttpRequest::builder()
@@ -688,6 +695,13 @@ mod tests {
                 rmpv::Value::from("must-not-leak"),
             ),
             (
+                rmpv::Value::from("package_state"),
+                rmpv::Value::Map(vec![(
+                    rmpv::Value::from("tokens_per_owner"),
+                    rmpv::Value::Map(vec![(rmpv::Value::from(0), rmpv::Value::from(7))]),
+                )]),
+            ),
+            (
                 rmpv::Value::from("last_gen_throughput"),
                 rmpv::Value::from(1.5),
             ),
@@ -704,6 +718,13 @@ mod tests {
                     (rmpv::Value::from("kvcache"), kvcache),
                     (rmpv::Value::from("token_capacity"), rmpv::Value::from(8192)),
                     (rmpv::Value::from("token_capacity_swa"), rmpv::Value::Nil),
+                    (
+                        rmpv::Value::from("token_capacity_window"),
+                        rmpv::Value::Map(vec![(
+                            rmpv::Value::from("window_4096"),
+                            rmpv::Value::from(2048),
+                        )]),
+                    ),
                     (
                         rmpv::Value::from("future_uncontracted_metric"),
                         rmpv::Value::from(99),
@@ -771,6 +792,27 @@ mod tests {
             3
         );
         assert_eq!(body["internal_states"][0]["last_gen_throughput"], 1.5);
+        // A registered field passes through after the typed ones, its integer
+        // keys stringified as Python's are; one the scheduler did not set
+        // stays absent.
+        assert_eq!(
+            body["internal_states"][0]["package_state"],
+            serde_json::json!({"tokens_per_owner": {"0": 7}})
+        );
+        assert_eq!(
+            body["internal_states"][0]
+                .as_object()
+                .unwrap()
+                .keys()
+                .next_back()
+                .unwrap(),
+            "package_state"
+        );
+        assert!(
+            body["internal_states"][0]
+                .get("unset_package_state")
+                .is_none()
+        );
         assert_eq!(
             body["internal_states"][0]["memory_usage"]["kvcache"],
             expected_kvcache
@@ -782,6 +824,10 @@ mod tests {
         assert_eq!(
             body["internal_states"][0]["memory_usage"]["token_capacity_swa"],
             serde_json::Value::Null
+        );
+        assert_eq!(
+            body["internal_states"][0]["memory_usage"]["token_capacity_window"],
+            serde_json::json!({"window_4096": 2048})
         );
         assert_eq!(
             body["internal_states"][0]["step_time_dict"]["4"],
@@ -953,6 +999,7 @@ mod tests {
                 ..Default::default()
             },
             peers,
+            Vec::new(),
         );
         let core = state.core.clone();
         let app = routes().with_state(state);
@@ -1065,6 +1112,7 @@ mod tests {
                 ..Default::default()
             },
             peers,
+            Vec::new(),
         );
         // Aborts are idempotent in the core, so count the requests served.
         let served = Arc::new(std::sync::atomic::AtomicUsize::new(0));

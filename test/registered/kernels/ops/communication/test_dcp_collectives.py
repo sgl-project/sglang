@@ -181,8 +181,6 @@ def test_request_ordered_byte_gather():
 
 
 def test_candidate_merge_scratch_and_graph_replay():
-    from functools import partial
-
     from sglang.kernels.ops.attention.dsv4.topk import plan_topk_v2
     from sglang.srt.layers.attention.dsa import dsa_dcp_sharded as dsa_dcp
 
@@ -202,7 +200,7 @@ def test_candidate_merge_scratch_and_graph_replay():
             local = (lengths + world - 1 - rank) // world
             table = torch.arange(64, device="cuda", dtype=torch.int32).expand(rows, -1)
 
-            def call(scores, local, lengths, table, **kwargs):
+            def call(scores, local, lengths, table):
                 return dsa_dcp.dcp_global_topk(
                     scores,
                     local,
@@ -211,7 +209,6 @@ def test_candidate_merge_scratch_and_graph_replay():
                     2048,
                     64,
                     plan_topk_v2(lengths),
-                    **kwargs,
                 )
 
             for _ in range(2):
@@ -227,13 +224,9 @@ def test_candidate_merge_scratch_and_graph_replay():
                 scores.uniform_()
                 lengths.fill_(length)
                 local.copy_((lengths + world - 1 - rank) // world)
-                expected = call(
-                    scores,
-                    local,
-                    lengths,
-                    table,
-                    all_gather=partial(group.all_gather, dim=0),
-                )
+                # Eager reference through the plain group all-gather.
+                with patch.object(dsa_dcp, "_CANDIDATE_ALL_GATHER", None):
+                    expected = call(scores, local, lengths, table)
                 graph.replay()
                 torch.cuda.synchronize()
                 # The top-k contract specifies the selected set, not output order.
@@ -249,6 +242,7 @@ def test_token_packing_after_dcp_gather():
     rank, world_size = group.rank_in_group, group.world_size
     if not get_platform().is_sm100:
         pytest.skip("token packing requires SM100")
+    from sglang.kernels.ops.attention import flash_mla_interface
     from sglang.kernels.ops.attention.dsa.dequant_k_cache import dequantize_k_cache
     from sglang.kernels.ops.attention.dsa.flashmla_token_pack import (
         flashmla_kv_token_packed,
@@ -341,21 +335,17 @@ def test_token_packing_after_dcp_gather():
             actual = flashmla_kv_token_packed(
                 q[:, :, :512], q[:, :, 512:], cache, rows, 192**-0.5
             )
-            reference = torch.ops.sgl_kernel.sparse_decode_fwd.default(
-                q.unsqueeze(1),
-                cache,
-                rows.unsqueeze(1),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                512,
-                192**-0.5,
-                "V32",
-                0,
+            reference = flash_mla_interface.flash_mla_with_kvcache(
+                q=q.unsqueeze(1),
+                k_cache=cache,
+                block_table=None,
+                cache_seqlens=None,
+                head_dim_v=512,
+                tile_scheduler_metadata=flash_mla_interface.get_mla_metadata()[0],
+                softmax_scale=192**-0.5,
+                is_fp8_kvcache=True,
+                indices=rows.unsqueeze(1),
+                kv_format="V32",
             )[0]
             # Packing reorders KV rows, so compare both BF16 kernels
             # with a complete FP32 reference before checking their pairwise

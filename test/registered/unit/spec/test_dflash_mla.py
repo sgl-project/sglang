@@ -254,6 +254,45 @@ class TestDFlashMLA(CustomTestCase):
                     attn.w_vc, w_vc.transpose(1, 2), rtol=0, atol=0
                 )
 
+    def test_sliding_layers_require_a_window_backend(self):
+        config = Qwen3Config(
+            **_export_fields(),
+            layer_types=["sliding_attention"],
+            use_sliding_window=True,
+            sliding_window=4,
+        )
+        resolve = "sglang.srt.speculative.draft_worker_common.resolve_draft_worker_attention_backend"
+        with patch(resolve, return_value="flashinfer"):
+            with self.assertRaisesRegex(ValueError, "require .* triton"):
+                DFlashMLAAttention(config, layer_id=0)
+        for backend in ("triton", "trtllm_mla", "cutedsl_mla"):
+            with self.subTest(backend=backend), patch(resolve, return_value=backend):
+                attn = DFlashMLAAttention(config, layer_id=0)
+                self.assertEqual(attn.attn_mqa.sliding_window_size, 3)
+        # DSPARK's worker runs cutedsl_mla / trtllm_mla drafts on flashinfer.
+        with (
+            patch(
+                resolve,
+                side_effect=lambda algo_label=None: (
+                    "cutedsl_mla" if algo_label == "DFLASH" else "flashinfer"
+                ),
+            ),
+            patch(
+                "sglang.srt.models.dflash.get_spec",
+                return_value=SimpleNamespace(speculative_algorithm="DSPARK"),
+            ),
+        ):
+            with self.assertRaisesRegex(ValueError, "require .* triton"):
+                DFlashMLAAttention(config, layer_id=0)
+        config.is_causal = False
+        with patch(resolve, return_value="cutedsl_mla"):
+            with self.assertRaisesRegex(ValueError, "causally"):
+                DFlashMLAAttention(config, layer_id=0)
+        config.layer_types = ["full_attention"]
+        with patch(resolve, return_value="trtllm_mla"):
+            with self.assertRaisesRegex(ValueError, "causally"):
+                DFlashMLAAttention(config, layer_id=0)
+
     def test_matches_specforge_reference(self):
         """Context-KV materialization and the block forward reproduce SpecForge's
         expanded attention: partial RoPE, pair convention, K/V of different width."""

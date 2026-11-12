@@ -142,6 +142,55 @@ def claim_sigterm_before_compiles() -> None:
     signal.signal(signal.SIGTERM, terminate)
 
 
+def _is_plain_dp() -> bool:
+    """DP over replicas, each its own TP group, rather than attention DP."""
+    parallel = get_parallel()
+    return not parallel.attn_dp_enabled and parallel.dp_size > 1
+
+
+def listener_port_offset(tp_rank: int, dp_rank: Optional[int]) -> int:
+    """The offset from ``--port`` of the listener that global TP rank
+    ``tp_rank`` (of replica ``dp_rank`` under plain DP) hosts: a node's
+    listeners bind consecutive ports, one per DP group led there."""
+    if _is_plain_dp():
+        # One TP group per replica, every leader on the same node.
+        return dp_rank
+    parallel = get_parallel()
+    if get_exec().moe.is_ep_scale_joiner:
+        # The joining TP group is entirely local to this node.
+        tp_size_per_node = parallel.tp_size
+    else:
+        nnodes_per_pp_rank = max(parallel.nnodes // parallel.pp_size, 1)
+        tp_size_per_node = parallel.tp_size // nnodes_per_pp_rank
+    dp_group_width = parallel.attn_tp_size * parallel.attn_cp_size
+    return (tp_rank % tp_size_per_node) // dp_group_width
+
+
+def node_listener_ports() -> List[int]:
+    """The ports this node's Rust listeners bind, ascending, assuming Rust
+    mode: one per DP group led on this node, none on a node that leads none.
+    Callable from the launching process, before any scheduler starts."""
+    from sglang.srt.entrypoints.engine import (
+        _calculate_rank_ranges,
+        _rank_hosts_rust_listener,
+    )
+
+    parallel = get_parallel()
+    pp_rank_range, tp_rank_range, _, _ = _calculate_rank_ranges(parallel.node_rank)
+    if 0 not in pp_rank_range:
+        return []
+    if get_exec().moe.is_ep_scale_joiner:
+        # Scale joiners launch their full TP group on this node.
+        tp_rank_range = range(parallel.tp_size)
+    dp_ranks = range(parallel.dp_size) if _is_plain_dp() else [None]
+    return sorted(
+        get_serving().port + listener_port_offset(tp_rank, dp_rank)
+        for tp_rank in tp_rank_range
+        if _rank_hosts_rust_listener(0, tp_rank)
+        for dp_rank in dp_ranks
+    )
+
+
 class RustServer:
     """Owns the embedded multi-threaded Rust server (``sglang_server.Server``).
 
@@ -292,17 +341,8 @@ class RustServer:
     @classmethod
     def _port_offset(cls) -> int:
         """This listener's offset from the base port based on per-node DP rank."""
-        if get_exec().moe.is_ep_scale_joiner:
-            # The joining TP group is entirely local to this node.
-            tp_size_per_node = get_parallel().tp_size
-        else:
-            nnodes_per_pp_rank = max(get_parallel().nnodes // get_parallel().pp_size, 1)
-            tp_size_per_node = get_parallel().tp_size // nnodes_per_pp_rank
-        dp_group_width = get_parallel().attn_tp_size * get_parallel().attn_cp_size
-        if not get_parallel().attn_dp_enabled and get_parallel().dp_size > 1:
-            # Plain DP: one TP group per replica, every leader on this node.
-            return get_parallel().dp_rank
-        return (get_parallel().tp_rank % tp_size_per_node) // dp_group_width
+        dp_rank = get_parallel().dp_rank if _is_plain_dp() else None
+        return listener_port_offset(get_parallel().tp_rank, dp_rank)
 
     @classmethod
     def _advertised_host(cls) -> str:
@@ -458,6 +498,7 @@ class RustServer:
                 default_max_new_tokens=cls._default_max_new_tokens(scheduler),
                 request_class=cls._request_input_class(),
                 server_added_custom_params=cls._server_added_custom_params(),
+                port_offset=port_offset,
             ),
             # None runs unpinned; otherwise the list carries the pinning decision.
             cores=server_cores,

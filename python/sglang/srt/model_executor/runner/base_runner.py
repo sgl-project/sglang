@@ -45,6 +45,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.model_executor.runner.flashinfer_autotune import (
+    autotune_dummy_run_ctx,
     maybe_flashinfer_autotune_extend,
     run_flashinfer_autotune_forward,
     should_run_flashinfer_autotune,
@@ -412,17 +413,12 @@ class BaseRunner(ABC):
         runner exists; a freshly-allocated dummy set in the eager path).
         """
         mr = self.model_runner
-        canary_run_ctx = (
-            c.with_active_single_forward_manager(0)
-            if (c := mr.canary_manager) is not None
-            else empty_context()
-        )
 
         def forward_fn():
             self._dummy_run(
                 batch_size=batch_size,
                 buffers=buffers,
-                run_ctx=canary_run_ctx,
+                run_ctx=autotune_dummy_run_ctx(mr, buffers),
             )
 
         run_flashinfer_autotune_forward(
@@ -691,6 +687,17 @@ class BaseRunner(ABC):
         else:
             lora_ids = None
 
+        # kv-canary token-oracle request ids; the buffers hold them only when
+        # the oracle is enabled.
+        rids_int = (
+            buffers.rids_int[:batch_size] if buffers.rids_int is not None else None
+        )
+        bootstrap_room_ids_int = (
+            buffers.bootstrap_room_ids_int[:batch_size]
+            if buffers.bootstrap_room_ids_int is not None
+            else None
+        )
+
         forward_batch = ForwardBatch(
             forward_mode=capture_forward_mode,
             batch_size=batch_size,
@@ -727,6 +734,8 @@ class BaseRunner(ABC):
             ),
             global_forward_mode=capture_forward_mode,
             lora_ids=lora_ids,
+            rids_int=rids_int,
+            bootstrap_room_ids_int=bootstrap_room_ids_int,
         )
         mr.runner_ids.bind_runner_slots(forward_batch)
 

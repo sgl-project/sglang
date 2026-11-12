@@ -63,6 +63,7 @@ from sglang.srt.runtime_context import (
     num_dp_ranks_of,
 )
 from sglang.srt.utils.device import (
+    is_confidential_compute,
     is_fi_a2a_supported,
     is_gfx95_supported,
     xpu_has_xmx_support,
@@ -556,7 +557,7 @@ def _check_dsa_backend_constraints(
     """Validate DSA backend / platform / kv-cache-dtype constraints."""
     chosen = {prefill_backend, decode_backend}
 
-    # The SM100/SM103 check is check_prims_ts_sparse_mla_support, at backend init.
+    # The SM100/SM103/SM107 check is check_prims_ts_sparse_mla_support, at backend init.
     if "prims_ts" in chosen and (hip or kv_cache_dtype != "fp8_e4m3"):
         raise ValueError(
             "The prims_ts DSA backend needs CUDA and --kv-cache-dtype fp8_e4m3."
@@ -1098,7 +1099,14 @@ def _flashinfer_allreduce_fusion_auto_enable(view: Any) -> dict:
         and (view.nnodes == 1 or get_platform().is_sm100)
         and view.moe_a2a_backend == "none"
     ):
-        backend = "cutedsl" if is_mimo else "auto"
+        if is_confidential_compute():
+            # mnnvl, cutedsl and multi-node fusion need NVLink multicast, which
+            # Confidential Computing does not provide.
+            if is_mimo or view.nnodes > 1:
+                return {}
+            backend = "trtllm"
+        else:
+            backend = "cutedsl" if is_mimo else "auto"
         logger.info(
             "Auto-enabling FlashInfer AllReduce Fusion (%s) for %s", backend, model_arch
         )
@@ -1792,7 +1800,7 @@ def _a2a_fusion_adjustments(view: Any) -> dict:
             )
             return {"disable_shared_experts_fusion": False}
         return {}
-    if view.moe_a2a_backend in ("flashinfer", "flashinfer_megamoe"):
+    if view.moe_a2a_backend in ("flashinfer_nvlink_one_sided", "flashinfer_megamoe"):
         logger.warning(
             "Flashinfer MoE A2A is enabled. --disable-shared-experts-fusion is automatically set."
         )
@@ -1812,7 +1820,7 @@ _A2A_EP_SPANNING_BACKENDS = frozenset(
         "mooncake",
         "nixl",
         "ascend_fuseep",
-        "flashinfer",
+        "flashinfer_nvlink_one_sided",
         "flashinfer_megamoe",
         "mori",
         "pplx",

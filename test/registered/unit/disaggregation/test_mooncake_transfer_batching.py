@@ -413,6 +413,9 @@ class TestDcpDsaIndexKTransfer(unittest.TestCase):
                     max_transfer_batch_indices=0,
                     enable_custom_mem_pool=False,
                     _transfer_data=transfer,
+                    _await_transfer_futures=lambda futures: max(
+                        f.result() for f in futures
+                    ),
                     get_mla_kv_ptrs_with_pp=lambda src, dst, *_: (src, dst, len(src)),
                 )
                 manager._dsa_index_k_dcp_params = lambda *args, **kwargs: (
@@ -551,6 +554,8 @@ class TestMooncakeEarlySend(CustomTestCase):
             check_status=lambda room: KVPoll.WaitingForInput,
             transfer_infos={1: {"127.0.0.1:80": object()}},
             transfer_queues=[queue],
+            send_record=MagicMock(),
+            note_send_enqueued=MagicMock(),
         )
         indices_ready = MagicMock()
         MooncakeKVManager.add_transfer_request(
@@ -612,6 +617,7 @@ class TestMooncakeEarlySend(CustomTestCase):
             _maybe_ack_drained_abort=MagicMock(),
             validate_aux_buffers=MagicMock(),
             bootstrap_port=8998,
+            note_send_finished=MagicMock(),
         )
         manager.check_status = lambda room: manager.request_status[room]
         return manager, queue

@@ -219,6 +219,7 @@ impl Server {
             None,
             None,
             None,
+            Vec::new(),
         )
     }
 
@@ -399,8 +400,11 @@ impl Server {
     /// [`Server::start`] with a model package's extensions, the boot of the
     /// package's own server class: `http_layer` wraps the HTTP app (see
     /// [`HttpLayer`]), `generate_hook` adds the package's keys to native
-    /// `/generate` frames (see [`GenerateHook`]), and `generate_validator`
-    /// refuses generations from every ingress (see [`GenerateValidator`]).
+    /// `/generate` frames (see [`GenerateHook`]), `generate_validator`
+    /// refuses generations from every ingress (see [`GenerateValidator`]), and
+    /// `server_info_state_keys` names the package scheduler's own
+    /// `internal_state` fields, which `/server_info` reports as the scheduler
+    /// set them; a name it already reports, or one given twice, fails the start.
     #[allow(clippy::too_many_arguments)]
     pub fn start_with_extensions(
         server_args: ServerArgs,
@@ -412,6 +416,7 @@ impl Server {
         http_layer: Option<HttpLayer>,
         generate_hook: Option<Arc<dyn GenerateHook>>,
         generate_validator: Option<Arc<dyn GenerateValidator>>,
+        server_info_state_keys: Vec<String>,
     ) -> PyResult<Self> {
         // `server_args` already arrived typed (pyo3 rejected any missing/extra/
         // mistyped field when Python constructed it); only value checks remain.
@@ -441,6 +446,7 @@ impl Server {
             server_args: std::sync::Arc::new(server_args),
             generate_hook,
             generate_validator,
+            server_info_state_keys,
         };
         let rt =
             runtime::start(cfg, http_layer).map_err(|e| value_error("runtime start failed", e))?;

@@ -281,19 +281,15 @@ def _fast_flashmla_sched_shape(q: torch.Tensor) -> bool:
     # These layouts use the head64 kernel's schedule constants. Native heads
     # require the newer kernel; V4's specialized head128 kernel stays excluded.
     num_heads, head_dim = q.shape[-2], q.shape[-1]
-    return (
-        q.is_cuda
-        and get_platform().is_blackwell
-        and (
-            num_heads == 64
-            or (num_heads == 128 and head_dim == 576)
-            or (
-                1 <= num_heads < 128
-                and get_platform().is_sm100
-                and hasattr(torch.ops.sgl_kernel, "sparse_decode_num_sm_parts")
-            )
-        )
-    )
+    if not (q.is_cuda and get_platform().is_blackwell):
+        return False
+    if num_heads == 64 or (num_heads == 128 and head_dim == 576):
+        return True
+    if not (1 <= num_heads < 128 and get_platform().is_sm100):
+        return False
+    from sglang.kernels.ops.attention import flash_mla_interface
+
+    return flash_mla_interface.supports_native_heads()
 
 
 def _maybe_precompute_flashmla_sched_meta(
@@ -316,16 +312,17 @@ def _maybe_precompute_flashmla_sched_meta(
         return
     if not _fast_flashmla_sched_shape(q):
         return
+    from sglang.kernels.ops.attention import flash_mla_interface
     from sglang.kernels.ops.attention.dsv4.flashmla_sched_meta import (
         META_INTS,
         flashmla_sched_meta,
     )
 
     b, s_q = q.shape[0], q.shape[1]
-    if hasattr(torch.ops.sgl_kernel, "sparse_decode_num_sm_parts"):
+    if flash_mla_interface.supports_native_heads():
         # The native-head kernel divides the SMs across head blocks at small
         # batch sizes. The schedule must use the same partition count.
-        num_sm_parts = torch.ops.sgl_kernel.sparse_decode_num_sm_parts(
+        num_sm_parts = flash_mla_interface.sparse_decode_num_sm_parts(
             b, s_q, q.shape[2]
         )
     else:
@@ -1029,6 +1026,8 @@ class LateLayerTail(msgspec.Struct, frozen=True):
     pad_rows: int = 0
     cp_metadata: Optional[InterleaveContextParallelMetadata] = None
     local_lens_cpu: Optional[List[int]] = None
+    # Original extend rows in global request order; token_indices is rank-local under CP.
+    global_token_indices: Optional[torch.Tensor] = None
     req_global: Optional[torch.Tensor] = None
     pos_global: Optional[torch.Tensor] = None
     # Prefill CUDA graph: token_indices/positions are persistent buffers of a fixed
@@ -1323,7 +1322,7 @@ class DeepseekV4AttnBackend(
     ):
         super().__init__()
         self.model_runner = model_runner
-        # Run at every KV store-location read; the DSpark deferred context-KV commit
+        # Run at every KV store-location read; the DSpark deferred draft KV store
         # joins its forked write there (SGLANG_DSPARK_DEFER_CONTEXT_KV).
         self.pre_kv_store_hook: Optional[Callable[[], None]] = None
         self.encoder_replay = False
@@ -1375,15 +1374,16 @@ class DeepseekV4AttnBackend(
             candidate_topk_blocks=getattr(cfg, "candidate_topk_blocks", 0),
             candidate_block_size=getattr(cfg, "candidate_block_size", 0),
         )
+        self.index_topk = getattr(cfg, "index_topk", DEFAULT_INDEX_TOPK)
         self.full_topk_indexer = make_full_topk_indexer(
-            token_to_kv_pool=self.token_to_kv_pool, req_to_token=self.req_to_token
+            token_to_kv_pool=self.token_to_kv_pool,
+            req_to_token=self.req_to_token,
+            index_heads=int(cfg.index_n_heads),
+            index_topk=self.index_topk,
         )
         self.MAX_SEQ_LEN_FOR_CAPTURE = self.req_to_token.shape[1]
 
         assert isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool)
-        self.index_topk = getattr(
-            model_runner.model_config.hf_text_config, "index_topk", DEFAULT_INDEX_TOPK
-        )
 
         kernel = get_exec().kernel
         self.enable_deepseek_v4_fp4_indexer = kernel.enable_deepseek_v4_fp4_indexer
@@ -2110,6 +2110,7 @@ class DeepseekV4AttnBackend(
                 pad_rows=cp_tail["pad_rows"],
                 cp_metadata=cp_tail["cp_metadata"],
                 local_lens_cpu=cp_tail["local_lens_cpu"],
+                global_token_indices=token_indices,
                 req_global=metadata.low_ratio_req_indices,
                 pos_global=metadata.low_ratio_pos_i64,
             )

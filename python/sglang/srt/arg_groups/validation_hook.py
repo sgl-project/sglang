@@ -124,7 +124,6 @@ RUST_SERVER_UNSUPPORTED_ARGS = (
     "allowed_media_domains",
     # The Rust media fetcher caps a download at this field's default, 64 MiB.
     "media_url_max_file_size_mb",
-    "enable_cache_report",
     "enable_trace",
     "warmups",
     "completion_template",
@@ -272,26 +271,18 @@ def check_pipeline_parallel_compat(cfg: Any) -> None:
                 "PP + speculative decoding (MTP) is only supported on prefill nodes "
                 "(disaggregation-mode=prefill)"
             )
+    # Stage 0 relays its received requests to the next stage every
+    # iteration, but later stages only receive on the iterations the recv
+    # skipper lets through, so the stages fall out of step.
+    assert cfg.scheduler_recv_interval <= 1, (
+        "--scheduler-recv-interval > 1 is not supported with pipeline "
+        "parallelism; use --scheduler-recv-interval 1"
+    )
     assert cfg.min_free_slots_delay is None, (
         "--min-free-slots-delay is not supported with pipeline "
         "parallelism: allocatable slots per microbatch are bounded by "
         "pp-max-micro-batch-size, so the threshold may never be reached"
     )
-
-
-def check_rust_server_request_logging(cfg: Any) -> None:
-    """The Rust server logs requests as text to stdout only."""
-    if cfg.log_requests_format != "text":
-        raise ValueError(
-            f"--log-requests-format {cfg.log_requests_format} is not supported "
-            "with SGLANG_RUST_SERVER; it logs requests in the text format"
-        )
-    # `stdout` is the default target, matched as `create_log_targets` does.
-    if any(target.lower() != "stdout" for target in cfg.log_requests_target or ()):
-        raise ValueError(
-            f"--log-requests-target {' '.join(cfg.log_requests_target)} is not "
-            "supported with SGLANG_RUST_SERVER; it logs requests to stdout"
-        )
 
 
 def check_server_args(server_args: Any):
@@ -309,19 +300,6 @@ def check_server_args(server_args: Any):
         "pp_max_micro_batch_size must be a positive integer or None (for auto-compute). "
         f"Got: {cfg.pp_max_micro_batch_size}"
     )
-    assert (
-        cfg.pp_min_chunked_prefill_size is None or cfg.pp_min_chunked_prefill_size >= 1
-    ), (
-        "--pp-min-chunked-prefill-size must be a positive integer. "
-        f"Got: {cfg.pp_min_chunked_prefill_size}"
-    )
-    assert cfg.pp_chunk_overhead_tokens is None or (
-        cfg.pp_chunk_overhead_tokens >= 1
-        and cfg.pp_min_chunked_prefill_size is not None
-    ), (
-        "--pp-chunk-overhead-tokens must be a positive integer and needs "
-        f"--pp-min-chunked-prefill-size. Got: {cfg.pp_chunk_overhead_tokens}"
-    )
 
     assert not (cfg.disable_cuda_graph_padding and cfg.enable_torch_compile), (
         "--disable-cuda-graph-padding is incompatible with --enable-torch-compile. "
@@ -333,9 +311,6 @@ def check_server_args(server_args: Any):
 
     if cfg.pp_size > 1:
         check_pipeline_parallel_compat(cfg)
-
-    if envs.SGLANG_RUST_SERVER.get() and cfg.log_requests:
-        check_rust_server_request_logging(cfg)
 
     assert not (cfg.dp_size > 1 and cfg.nnodes != 1), (
         "multi-node data-parallel replicas are not supported; use attention DP "
@@ -417,6 +392,13 @@ def check_server_args(server_args: Any):
         ], (
             f"To use priority scheduling, schedule_policy must be 'fcfs' or 'lof'. '{cfg.schedule_policy}' is not supported."
         )
+        if cfg.enable_unified_memory and not cfg.disable_priority_preemption:
+            logger.warning(
+                "--enable-unified-memory turns priority preemption off: a "
+                "higher-priority request is admitted first but does not retract "
+                "running requests. Pass --disable-priority-preemption to silence "
+                "this warning."
+            )
         if cfg.default_priority_value is None:
             logger.warning(
                 "--default-priority-value is not set while --enable-priority-scheduling is enabled. "
@@ -720,10 +702,23 @@ def validate_experimental_sgl_marlin(server_args: Any):
     validate_experimental_sgl_marlin_server_args(server_args, view)
 
 
+# Multimodal architectures whose processor, encoder and decoder run on MPS.
+_MPS_MULTIMODAL_ARCHITECTURES = frozenset({"UnlimitedOCRV2ForCausalLM"})
+# Model-specific attention backends with an MPS implementation, by architecture.
+_MPS_MODEL_ATTENTION_BACKENDS = {"unlimited_ocr_v2": "UnlimitedOCRV2ForCausalLM"}
+
+
+def _model_architectures(model_config: Any) -> tuple:
+    return tuple(model_config.hf_config.architectures or ())
+
+
 def validate_mps_model_config(
     model_config: Any,
     *,
     lora_enabled: bool = False,
+    attention_backend: Optional[str] = None,
+    prefill_attention_backend: Optional[str] = None,
+    decode_attention_backend: Optional[str] = None,
 ) -> None:
     """Validate checkpoint-derived MPS constraints."""
     quantization = getattr(model_config, "quantization", None)
@@ -733,7 +728,21 @@ def validate_mps_model_config(
             "the resolved model configuration detected "
             f"quantization={quantization!r}"
         )
-    if bool(getattr(model_config, "is_multimodal", False)):
+    for backend in (
+        attention_backend,
+        prefill_attention_backend,
+        decode_attention_backend,
+    ):
+        if backend in _MPS_MODEL_ATTENTION_BACKENDS:
+            required = _MPS_MODEL_ATTENTION_BACKENDS[backend]
+            if required not in _model_architectures(model_config):
+                raise ValueError(
+                    f"The {backend} attention backend on Torch MPS serves "
+                    f"only {required}"
+                )
+    if bool(getattr(model_config, "is_multimodal", False)) and not (
+        _MPS_MULTIMODAL_ARCHITECTURES.intersection(_model_architectures(model_config))
+    ):
         raise ValueError(
             "Torch MPS multimodal serving does not yet have a model-specific "
             "end-to-end contract; use a text-only model until its encoder, "
@@ -763,7 +772,13 @@ def validate_standard_mps_server_args(server_args: Any):
     """Validate execution modes supported by the Torch MPS path."""
 
     cfg = resolving_view(server_args)
-    supported_attention_backends = {None, "torch_native"}
+    # Model-specific backends are checked against the architecture in
+    # validate_mps_model_config.
+    supported_attention_backends = {
+        None,
+        "torch_native",
+        *_MPS_MODEL_ATTENTION_BACKENDS,
+    }
     for field in (
         "attention_backend",
         "prefill_attention_backend",
