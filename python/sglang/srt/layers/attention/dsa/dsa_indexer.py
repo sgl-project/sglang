@@ -1926,10 +1926,19 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if tp_split is not None:
             if not need_chunk:
                 max_rows = row_hi - row_lo
-            # Per-row outputs, so the local rows go to a buffer gathered below.
-            dst = torch.empty(
-                (row_hi - row_lo, self.index_topk), device=device, dtype=torch.int32
+            # Per-row outputs: each rank writes its rows into its own slot of an
+            # equal-stride buffer, so the gather below is an in-place
+            # all_gather_into_tensor (aiter custom all-gather on ROCm) instead of
+            # PyNCCL all_gatherv.
+            group, _, _, sizes = tp_split
+            slot = max(sizes)
+            gather_buf = torch.empty(
+                (group.world_size * slot, self.index_topk),
+                device=device,
+                dtype=torch.int32,
             )
+            mine = group.rank_in_group * slot
+            dst = gather_buf[mine : mine + row_hi - row_lo]
             dst_base = row_lo
 
         start = row_lo
@@ -2005,9 +2014,17 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             if topk_dst is not topk_result:
                 topk_result[:q_offset] = topk_dst[:q_offset]
         if tp_split is not None:
-            # Rank order == row order, so the gather rebuilds rows [0, q_offset).
-            group, _, _, sizes = tp_split
-            group.all_gatherv(dst, sizes=sizes, output=topk_result[:q_offset])
+            # int32 rows travel as float32 bits (the custom all-gather is typed).
+            group.all_gather_into_tensor(
+                gather_buf.view(torch.float32),
+                gather_buf[mine : mine + slot].view(torch.float32),
+            )
+            # Rank order == row order: drop each slot's padding to rebuild
+            # rows [0, q_offset).
+            torch.cat(
+                [gather_buf[r * slot : r * slot + n] for r, n in enumerate(sizes)],
+                out=topk_result[:q_offset],
+            )
         return topk_result
 
     @staticmethod
@@ -2057,13 +2074,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         group = get_parallel().attn_tp_group
         tp = group.world_size
         min_rows = max(tp, self.tp_split_min_rows)
-        if (
-            tp <= 1
-            or q_offset < min_rows
-            # the top-k gather is all_gatherv, which runs on PyNCCL only
-            or group.pynccl_comm is None
-            or not group.pynccl_comm.available
-        ):
+        if tp <= 1 or q_offset < min_rows:
             return None
         bounds = self._indexer_tp_split_bounds(
             seq_lens_cpu=forward_batch.seq_lens_cpu,
