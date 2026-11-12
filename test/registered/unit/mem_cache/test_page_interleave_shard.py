@@ -41,10 +41,10 @@ Pins the pure arithmetic that rotated owner-classed allocation hangs on:
    owner-classed host slots, the per-rank narrowing of a transfer, an N-rank
    backup -> evict -> load-back round trip, and the layer-load waits.
 
-The real NCCL MLA/MHA/MTP gathers and symmetric buffer lifetime tests live in
-``test_page_interleave_gather_multi_gpu.py``; the zero-SM gathers, which need
-a newer NCCL than CI has, live in
-``test/manual/mem_cache/test_page_interleave_zero_sm_gather.py``. DSA indexer
+The real MLA/MHA/MTP gathers (multicast and NCCL) and their fallbacks live in
+``test_page_interleave_gather_multi_gpu.py``; ``MulticastAllGather`` itself is
+checked against NCCL in
+``test/registered/unit/distributed/test_multicast_all_gather.py``. DSA indexer
 and attention coverage lives in ``test_page_sharded_dsa_attention.py``.
 """
 
@@ -104,12 +104,11 @@ from sglang.srt.mem_cache.page_interleave import (
     make_page_shard_spec,
 )
 from sglang.srt.mem_cache.page_interleave_pool import (
-    _NCCL_SYMMETRIC_SCRATCH_MIN_VERSION,
     PageInterleaveKVPoolMixin,
     PageInterleaveMHATokenToKVPool,
     PageInterleaveMLATokenToKVPool,
+    _multicast_gather_supported,
     _symmetric_scratch_layout,
-    _symmetric_scratch_supported,
 )
 from sglang.srt.mem_cache.pool_host import PoolEntry
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
@@ -277,44 +276,15 @@ class TestPageShardScratchSizing(CustomTestCase):
                     math.prod(shape) * dtype.itemsize for shape, dtype in specs.values()
                 )
                 self.assertEqual(estimated, actual)
-                # The zero-SM buffer adds at most one window alignment per tensor.
+                # The symmetric buffer adds at most one alignment per tensor.
                 _, symmetric_bytes = _symmetric_scratch_layout(specs, num_slots=2)
                 self.assertGreaterEqual(symmetric_bytes, estimated)
                 self.assertLess(symmetric_bytes, estimated + 2 * len(specs) * 4096)
 
 
 class TestZeroSmScratchLayout(CustomTestCase):
-    def test_requires_nccl_with_copy_engine_race_fix(self):
-        self.assertEqual(_NCCL_SYMMETRIC_SCRATCH_MIN_VERSION, 23102)
-        for version in (22902, 23007, 23101, 23102):
-            with (
-                self.subTest(version=version),
-                envs.SGLANG_ENABLE_KV_SHARD_ZERO_SM_GATHER.override(True),
-                unittest.mock.patch(
-                    "sglang.srt.mem_cache.page_interleave_pool.is_cuda",
-                    return_value=True,
-                ),
-                unittest.mock.patch(
-                    "sglang.srt.mem_cache.page_interleave_pool.NCCLLibrary"
-                ) as library,
-                unittest.mock.patch(
-                    "sglang.srt.mem_cache.page_interleave_pool.in_the_same_node_as",
-                    return_value=[True, True],
-                ) as same_node,
-            ):
-                library.return_value.ncclGetRawVersion.return_value = version
-                self.assertEqual(
-                    _symmetric_scratch_supported(
-                        memory_saver_enabled=False,
-                        custom_mem_pool=None,
-                        shard_group=SimpleNamespace(cpu_group=object()),
-                    ),
-                    version >= _NCCL_SYMMETRIC_SCRATCH_MIN_VERSION,
-                )
-                if version < _NCCL_SYMMETRIC_SCRATCH_MIN_VERSION:
-                    same_node.assert_not_called()
-
-    def test_cross_node_group_keeps_sm_gather(self):
+    @contextmanager
+    def _support(self, *, multicast, same_node):
         with (
             envs.SGLANG_ENABLE_KV_SHARD_ZERO_SM_GATHER.override(True),
             unittest.mock.patch(
@@ -322,29 +292,67 @@ class TestZeroSmScratchLayout(CustomTestCase):
                 return_value=True,
             ),
             unittest.mock.patch(
-                "sglang.srt.mem_cache.page_interleave_pool.NCCLLibrary"
-            ) as library,
+                "sglang.srt.mem_cache.page_interleave_pool.has_multicast_support",
+                return_value=multicast,
+            ) as has_multicast,
             unittest.mock.patch(
                 "sglang.srt.mem_cache.page_interleave_pool.in_the_same_node_as",
-                return_value=[True, False],
-            ) as same_node,
+                return_value=same_node,
+            ) as in_same_node,
         ):
-            library.return_value.ncclGetRawVersion.return_value = (
-                _NCCL_SYMMETRIC_SCRATCH_MIN_VERSION
-            )
-            cpu_group = object()
-            self.assertFalse(
-                _symmetric_scratch_supported(
-                    memory_saver_enabled=False,
-                    custom_mem_pool=None,
-                    shard_group=SimpleNamespace(cpu_group=cpu_group),
-                )
-            )
-            same_node.assert_called_once_with(cpu_group, source_rank=0)
+            yield has_multicast, in_same_node
+
+    @staticmethod
+    def _supported(cpu_group=None, **kwargs):
+        return _multicast_gather_supported(
+            **{
+                "memory_saver_enabled": False,
+                "custom_mem_pool": None,
+                "shard_group": SimpleNamespace(cpu_group=cpu_group),
+                "device": torch.device("cuda", 3),
+                **kwargs,
+            }
+        )
+
+    def test_requires_multicast_support(self):
+        for multicast in (False, True):
+            with (
+                self.subTest(multicast=multicast),
+                self._support(multicast=multicast, same_node=[True, True]) as (
+                    has_multicast,
+                    in_same_node,
+                ),
+            ):
+                self.assertEqual(self._supported(), multicast)
+                has_multicast.assert_called_once_with(torch.device("cuda", 3))
+                # The node check is collective; a local refusal skips it on
+                # every rank alike.
+                self.assertEqual(in_same_node.called, multicast)
+
+    def test_memory_saver_and_custom_pool_keep_torch_scratch(self):
+        for kwargs in ({"memory_saver_enabled": True}, {"custom_mem_pool": object()}):
+            with (
+                self.subTest(**kwargs),
+                self._support(multicast=True, same_node=[True, True]) as (
+                    _,
+                    in_same_node,
+                ),
+            ):
+                self.assertFalse(self._supported(**kwargs))
+                in_same_node.assert_not_called()
+
+    def test_cross_node_group_keeps_nccl_gather(self):
+        cpu_group = object()
+        with self._support(multicast=True, same_node=[True, False]) as (
+            _,
+            in_same_node,
+        ):
+            self.assertFalse(self._supported(cpu_group=cpu_group))
+            in_same_node.assert_called_once_with(cpu_group, source_rank=0)
 
     def test_slot_tensors_are_window_aligned_and_disjoint(self):
-        """Both slots share one symmetric window: every tensor must start on
-        NCCL's 4 KiB window alignment and no two tensors may overlap."""
+        """Both slots share one symmetric buffer: every tensor must start on
+        a 4 KiB boundary and no two tensors may overlap."""
         rows = 13 * 16  # neither row width below fills a whole 4 KiB block
         specs = {
             "kv": ((rows, 1, 576), torch.bfloat16),
@@ -2233,16 +2241,17 @@ class TestGatherWaitsForLayerLoad(CustomTestCase):
     """A HiCache load-back writes pool rows on its own stream; the gather
     reads them directly, not through the waiting getters, so it waits first."""
 
-    def _pool(self, events, counter):
+    def _pool(self, events, counter, multicast_gather=None):
         slot = SimpleNamespace(
             tensors={"k": torch.zeros(N * PS, 1)},
-            ready=SimpleNamespace(record=lambda stream: None),
+            ready=SimpleNamespace(record=lambda stream: events.append("ready")),
+            ticket=None,
             resident_key=None,
         )
 
         def gather_pairs(local_layer):
             events.append(("gather", local_layer))
-            return [(torch.zeros(4 * PS, 1), "k")]
+            return [(torch.arange(4 * PS, dtype=torch.float32)[:, None], "k")]
 
         return SimpleNamespace(
             start_layer=2,
@@ -2251,15 +2260,16 @@ class TestGatherWaitsForLayerLoad(CustomTestCase):
             _epoch=1,
             _block_pages=1,
             shard_spec=SimpleNamespace(page_size=PS),
-            shard_rank=0,
+            shard_rank=1,
             shard_size=N,
             _send_rows=torch.arange(PS),
-            _gather_send_rows=lambda name: torch.arange(PS),
+            _gather_send_rows=lambda name: torch.arange(PS, 2 * PS),
             _gather_pairs=gather_pairs,
             kv_gather_stream=SimpleNamespace(wait_stream=lambda stream: None),
             device_module=SimpleNamespace(
                 stream=lambda stream: nullcontext(), current_stream=lambda: None
             ),
+            _multicast_gather=multicast_gather,
             kv_gather_comm=SimpleNamespace(
                 change_state=lambda enable: nullcontext(),
                 all_gather=lambda out, inp: events.append("all_gather"),
@@ -2271,12 +2281,52 @@ class TestGatherWaitsForLayerLoad(CustomTestCase):
         events = []
         counter = SimpleNamespace(wait_until=lambda i: events.append(("wait", i)))
         PageInterleaveKVPoolMixin._prefetch_layer(self._pool(events, counter), 3)
-        self.assertEqual(events, [("wait", 1), ("gather", 1), "all_gather"])
+        self.assertEqual(events, [("wait", 1), ("gather", 1), "all_gather", "ready"])
 
     def test_no_counter_no_wait(self):
         events = []
         PageInterleaveKVPoolMixin._prefetch_layer(self._pool(events, None), 3)
-        self.assertEqual(events, [("gather", 1), "all_gather"])
+        self.assertEqual(events, [("gather", 1), "all_gather", "ready"])
+
+    def test_multicast_gather_runs_after_the_pack(self):
+        events = []
+        counter = SimpleNamespace(wait_until=lambda i: events.append(("wait", i)))
+
+        def run(send, *, output, after):
+            events.append("multicast")
+            self.assertIs(after, pool.kv_gather_stream)
+            # In place: the packed rows are this rank's block of the output.
+            self.assertEqual(output.shape[0], N * PS)
+            self.assertEqual(send.data_ptr(), output[PS:].data_ptr())
+            torch.testing.assert_close(
+                send[:, 0], torch.arange(PS, 2 * PS, dtype=torch.float32)
+            )
+            return 7
+
+        pool = self._pool(events, counter, SimpleNamespace(run=run))
+        PageInterleaveKVPoolMixin._prefetch_layer(pool, 3)
+        # The ticket, not an event on the side stream, marks the slot ready.
+        self.assertEqual(events, [("wait", 1), ("gather", 1), "multicast"])
+        self.assertEqual(pool._slots[1].ticket, 7)
+        self.assertEqual(pool._slots[1].resident_key, (3, 1))
+
+    def test_read_waits_for_the_multicast_ticket(self):
+        events, current = [], object()
+        slot = SimpleNamespace(ticket=7, resident_key=(3, 1))
+        chain = SimpleNamespace(
+            wait=lambda ticket, stream: events.append(("wait", ticket, stream))
+        )
+        pool = SimpleNamespace(
+            _shard_extend_active=True,
+            _slots=[None, slot],
+            _block_pages=1,
+            _epoch=1,
+            device_module=SimpleNamespace(current_stream=lambda: current),
+            _multicast_gather=SimpleNamespace(chain=chain),
+            _prefetch_layer=lambda layer_id: events.append(("prefetch", layer_id)),
+        )
+        self.assertIs(PageInterleaveKVPoolMixin._acquire_slot_for_read(pool, 3), slot)
+        self.assertEqual(events, [("wait", 7, current), ("prefetch", 4)])
 
 
 if __name__ == "__main__":

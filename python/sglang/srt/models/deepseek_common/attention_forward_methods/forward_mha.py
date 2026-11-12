@@ -9,6 +9,7 @@ from sglang.kernels.ops.attention.dsa.dequant_k_cache import (
 )
 from sglang.kernels.ops.attention.mla_qk_prep import concat_and_cast_mha_k_triton
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsa_backend import uses_raw_fp8_dsa_kv_layout
 from sglang.srt.layers.attention.index_topk_share import write_mtp_seed
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.dcp import (
@@ -258,8 +259,10 @@ class DeepseekMHAForwardMixin:
                 self.use_dsa
                 and self.kv_cache_dtype == "fp8_e4m3"
                 and (
-                    not get_exec().kernel.dsa_decode_backend == "trtllm"
-                    or not get_exec().kernel.dsa_prefill_backend == "trtllm"
+                    not uses_raw_fp8_dsa_kv_layout(get_exec().kernel.dsa_decode_backend)
+                    or not uses_raw_fp8_dsa_kv_layout(
+                        get_exec().kernel.dsa_prefill_backend
+                    )
                 )
             ):
                 # FP8 path: dequantize DSA-specific FP8 format to BF16

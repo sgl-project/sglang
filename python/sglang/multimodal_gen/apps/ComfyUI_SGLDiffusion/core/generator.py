@@ -12,6 +12,7 @@ import sys
 import torch
 
 from ..executors.flux import FluxExecutor
+from ..executors.ltx_av import LTXAVExecutor
 from ..executors.minimax_h3 import (
     FastH3Executor,
     MiniMaxH3Executor,
@@ -239,6 +240,7 @@ def _load_executor_classes():
         MiniMaxH3Executor,
         FastH3Executor,
         VDNH3Executor,
+        LTXAVExecutor,
         QwenImage21Executor,
     ]
     try:
@@ -400,7 +402,7 @@ class SGLDiffusionGenerator:
             kwargs.setdefault("model_id", _H3_MODEL_IDS[pipeline_class_name])
         kwargs = self._server_args_kwargs(kwargs)
         try:
-            from sglang.multimodal_gen.apps.comfyui_worker_patches import (
+            from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.worker_patches import (
                 scheduler_profiles,
             )
 
@@ -680,7 +682,7 @@ class SGLDiffusionGenerator:
             )
         check_sgld_options(sgld_options)
         plugin = {k: sgld_options.pop(k) for k in PLUGIN_KEYS if k in sgld_options}
-        from sglang.multimodal_gen.apps.comfyui_worker_patches import (
+        from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.worker_patches import (
             canonical_profiles,
             validate_options,
         )

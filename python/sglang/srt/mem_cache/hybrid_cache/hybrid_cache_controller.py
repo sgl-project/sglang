@@ -950,7 +950,10 @@ class HybridCacheController(BaseHiCacheController):
         """Atomically allocate every prefetch slice from a shared arena."""
         anchor = self.mem_pool_host.anchor_entry
         if not uses_shared_host_layout(anchor.host_pool):
-            return super().alloc_prefetch_host_buffers(operation, need_size)
+            host_indices = super().alloc_prefetch_host_buffers(operation, need_size)
+            if host_indices is not None:
+                self._sync_prefetch_trailing_keys(operation, need_size)
+            return host_indices
 
         requests, independent_transfers = self._shared_prefetch_requests(
             operation, need_size
@@ -959,6 +962,16 @@ class HybridCacheController(BaseHiCacheController):
         allocated = self._alloc_shared_host_requests_with_reclaim(requests)
         if allocated is None:
             return None
+        self._sync_prefetch_trailing_keys(operation, need_size)
+        for transfer, indices in zip(independent_transfers, allocated[1:], strict=True):
+            transfer.host_indices = indices
+        return allocated[0]
+
+    def _sync_prefetch_trailing_keys(
+        self, operation: StorageOperation, need_size: int
+    ) -> None:
+        # Scheduler thread, rank-agreed hit: a rank whose KV read falls short
+        # skips the sidecar read, yet its discard must heal the same keys.
         self._sync_trailing_keys(
             operation.pool_transfers or [],
             operation.sidecar_hash_values or operation.hash_value,
@@ -968,9 +981,6 @@ class HybridCacheController(BaseHiCacheController):
                 else need_size // self.page_size
             ),
         )
-        for transfer, indices in zip(independent_transfers, allocated[1:], strict=True):
-            transfer.host_indices = indices
-        return allocated[0]
 
     def allocate_storage_hit(
         self,

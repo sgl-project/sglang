@@ -13,9 +13,7 @@ use crate::server::app::pod_id;
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::server::metrics::{outcome_from_status, RequestLogContext};
-use crate::server::routes::chat::{
-    prompt_ids, route_grpc, route_typed, Endpoint, MAX_CHAT_BODY_BYTES,
-};
+use crate::server::routes::chat::{prompt_ids, route_grpc, route_typed, Endpoint};
 use crate::workers::GRPC_MAX_MESSAGE_BYTES;
 use axum::http::{HeaderMap, HeaderName, HeaderValue};
 use bytes::Bytes;
@@ -44,7 +42,12 @@ pub async fn serve(
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
     let service = SglangServiceServer::new(RouterGrpc { ctx })
-        .max_decoding_message_size(MAX_CHAT_BODY_BYTES)
+        // Not the HTTP body cap (`max_chat_body_bytes`): the request goes on
+        // to an engine over a GRPC_MAX_MESSAGE_BYTES channel, and grows on the
+        // way, so an inbound message past half of it would fail only after
+        // selection and rendering. Raising SGLANG_ROUTER_MAX_BODY_BYTES does
+        // not raise this.
+        .max_decoding_message_size(GRPC_MAX_MESSAGE_BYTES / 2)
         .max_encoding_message_size(GRPC_MAX_MESSAGE_BYTES);
     tonic::transport::Server::builder()
         .add_service(service)
