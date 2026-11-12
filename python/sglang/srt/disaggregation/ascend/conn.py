@@ -15,11 +15,7 @@ from sglang.srt.disaggregation.mooncake.conn import (
     MooncakeKVReceiver,
     MooncakeKVSender,
 )
-from sglang.srt.disaggregation.utils import (
-    check_state_wire,
-    resolve_dcp_dst_entry_indices,
-    state_wire,
-)
+from sglang.srt.disaggregation.utils import resolve_dcp_dst_entry_indices, state_wire
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.runtime_context import get_parallel, get_spec
 from sglang.srt.utils.network import get_local_ip_auto
@@ -109,7 +105,7 @@ class AscendKVManager(MooncakeKVManager):
         self._dcp_remote_decode_layout = (
             None if dcp_remote_decode_layout is None else list(dcp_remote_decode_layout)
         )
-        self._dspark_cold_start = (
+        self._supports_draftless_dspark = (
             str(get_spec().speculative_algorithm).upper() == "DSPARK"
             and not is_npu_arch35()
         )
@@ -118,23 +114,23 @@ class AscendKVManager(MooncakeKVManager):
     def _draftless_dspark_prefill(self, info) -> bool:
         # A3 Flash has four target state entries followed by draft SWA. Only
         # that trailing draft entry may be absent, never a target component.
-        wire = state_wire(self.kv_args)
-        return bool(
-            self._dspark_cold_start
+        target_wire = [
+            ["swa", None],
+            ["c128_state", None],
+            ["dsv4_c128", None],
+            ["dsv4_c4_state", None],
+        ]
+        return (
+            self._supports_draftless_dspark
             and self.pp_size == info.pp_size == 1
             and info.spec_kv_layout is None
             and not self.kv_args.num_draft_entries
-            and wire is not None
-            and [entry[0] for entry in wire]
-            == ["swa", "c128_state", "dsv4_c128", "dsv4_c4_state", "swa"]
-            and all(entry[1:] == [None] for entry in wire)
-            and info.state_wire is not None
-            and len(info.state_wire) == len(wire) - 1
+            and info.state_wire == target_wire
+            and state_wire(self.kv_args) == target_wire + [["swa", None]]
         )
 
     def _check_prefill_state_entries(self, info) -> None:
         if self._draftless_dspark_prefill(info):
-            check_state_wire(info.state_wire, state_wire(self.kv_args)[:-1])
             logger.info(
                 "DSpark prefill has no draft SWA: start draft context at the "
                 "prompt boundary and populate it from verified target tokens"
@@ -145,19 +141,15 @@ class AscendKVManager(MooncakeKVManager):
     def initialize_dspark_context(
         self, bootstrap_addr, draft_pool, req_slot, seq_len, *, fake_transfer=False
     ):
-        if not self._dspark_cold_start:
+        if not self._supports_draftless_dspark:
             return
-        # The synthetic startup warmup has no registered prefill peer and no
-        # transferred prompt context, just like a cold draft's first block.
-        if fake_transfer:
-            draft_pool._npu_dspark_context_start[req_slot] = seq_len
-            return
-        info = self.prefill_info_table[bootstrap_addr]
+        # Synthetic startup warmup has no registered prefill peer.
+        cold_start = fake_transfer or self._draftless_dspark_prefill(
+            self.prefill_info_table[bootstrap_addr]
+        )
         # Reset on every placement, including a slot previously used by a
         # draftless peer. The next forward must never read stale prompt rows.
-        draft_pool._npu_dspark_context_start[req_slot] = (
-            seq_len if self._draftless_dspark_prefill(info) else 0
-        )
+        draft_pool._npu_dspark_context_start[req_slot] = seq_len if cold_start else 0
 
     def _uses_page_interleaved_dcp(self) -> bool:
         return (

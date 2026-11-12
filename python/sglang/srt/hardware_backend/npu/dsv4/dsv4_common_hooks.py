@@ -71,6 +71,9 @@ def dsv4_state_payloads(
     page_size: int,
     *,
     prefix_len: int = 0,
+    req: Req | None = None,
+    kv_manager=None,
+    draft_pool=None,
 ):
     """Build NPU-specific DSV4 PD payloads.
 
@@ -82,15 +85,32 @@ def dsv4_state_payloads(
       and decode derive physical rows using their own local ring sizes, so
       decode-only MTP can safely transfer from an 8-row ring to a 16-row ring.
       Both A3 and Ascend 950 derive rows from their local SWA pages.
+
+    Decode also initializes the local DSpark context before publishing these
+    destinations; prefill callers do not pass a request or draft pool.
     """
 
     import numpy as np
 
-    from sglang.srt.disaggregation.ascend.conn import AscendStateType
+    from sglang.srt.disaggregation.ascend.conn import AscendKVManager, AscendStateType
+    from sglang.srt.disaggregation.utils import _is_fake_transfer
     from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+    from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+    from sglang.srt.utils.network import NetworkAddress
 
     seq_len = max(0, int(seq_len))
     prefix_len = max(0, min(int(prefix_len), seq_len))
+
+    if isinstance(kv_manager, AscendKVManager) and isinstance(
+        draft_pool, DeepSeekV4TokenToKVPool
+    ):
+        kv_manager.initialize_dspark_context(
+            NetworkAddress(req.bootstrap_host, req.bootstrap_port).to_host_port_str(),
+            draft_pool,
+            req.kv.req_pool_idx,
+            seq_len,
+            fake_transfer=_is_fake_transfer(req),
+        )
 
     def c128_kv_pages():
         c128_page_size = req_to_token_pool.c128_page_size
