@@ -241,6 +241,7 @@ class TestDSparkPPOutput(CustomTestCase):
                     bonus_tokens=tokens, new_seq_lens=batch.seq_lens
                 ),
                 logits_output=None,
+                routed_experts_output=None,
             ),
             batch,
         )

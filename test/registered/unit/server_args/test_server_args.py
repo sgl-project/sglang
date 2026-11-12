@@ -117,6 +117,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
 from sglang.srt.runtime_context import (
     describe_kv_events_publisher,
     get_context,
+    get_memory,
     get_serving,
     override_platform,
 )
@@ -127,6 +128,7 @@ from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST_QWEN,
     CustomTestCase,
     enter_scope,
+    published_topology,
 )
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
@@ -456,23 +458,67 @@ class TestPrepareServerArgs(CustomTestCase):
                 )
 
     def test_radix_eviction_policy_explicitness_is_preserved(self):
-        omitted = prepare_server_args(["--model-path", "dummy"])
-        separated = prepare_server_args(
-            ["--model-path", "dummy", "--radix-eviction-policy", "lru"]
-        )
-        joined = prepare_server_args(
-            ["--model-path", "dummy", "--radix-eviction-policy=lru"]
-        )
+        """Model defaults may replace only a policy the caller left unset, so every
+        way of building the record must tell an explicit lru from the default."""
         with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
             f.write("model-path: dummy\nradix-eviction-policy: lru\n")
             config_path = f.name
         self.addCleanup(os.unlink, config_path)
-        configured = prepare_server_args(["--config", config_path])
+        # Launchers with their own parser (bench_offline_throughput) use from_cli_args.
+        parser = argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        dummy = ["--model-path", "dummy"]
+        cases = {
+            "cli omitted": (prepare_server_args(dummy), False),
+            "cli": (
+                prepare_server_args(dummy + ["--radix-eviction-policy", "lru"]),
+                True,
+            ),
+            "cli joined": (
+                prepare_server_args(dummy + ["--radix-eviction-policy=lru"]),
+                True,
+            ),
+            "config file": (prepare_server_args(["--config", config_path]), True),
+            "own parser omitted": (
+                ServerArgs.from_cli_args(parser.parse_args(dummy)),
+                False,
+            ),
+            "own parser": (
+                ServerArgs.from_cli_args(
+                    parser.parse_args(dummy + ["--radix-eviction-policy", "lru"])
+                ),
+                True,
+            ),
+            # Engine(**kwargs), RayEngine and Runtime build the record from keywords.
+            "keywords omitted": (ServerArgs(model_path="dummy"), False),
+            "keywords": (
+                ServerArgs(model_path="dummy", radix_eviction_policy="lru"),
+                True,
+            ),
+        }
+        for name, (args, explicit) in cases.items():
+            with self.subTest(name):
+                handle_missing_default_values(args)
+                self.assertEqual(
+                    resolution_result(args, "radix_eviction_policy"), "lru"
+                )
+                self.assertIs(
+                    resolution_result(args, "_radix_eviction_policy_explicitly_set"),
+                    explicit,
+                )
+                # The scheduler rebuilds the record from its fields and resolves again.
+                rebuilt = ServerArgs(**msgspec.structs.asdict(args))
+                handle_missing_default_values(rebuilt)
+                self.assertIs(
+                    resolution_result(rebuilt, "_radix_eviction_policy_explicitly_set"),
+                    explicit,
+                )
 
-        self.assertFalse(omitted._radix_eviction_policy_explicitly_set)
-        self.assertTrue(separated._radix_eviction_policy_explicitly_set)
-        self.assertTrue(joined._radix_eviction_policy_explicitly_set)
-        self.assertTrue(configured._radix_eviction_policy_explicitly_set)
+    def test_unset_radix_eviction_policy_publishes_lru_on_a_dummy_model(self):
+        """A dummy-model record skips the hook that fills the policy; the scheduler
+        still calls .lower() on the published value."""
+        with published_topology():
+            self.assertEqual(get_memory().radix_eviction_policy, "lru")
 
     def test_monokernel_flag_spellings_in_config_and_cli(self):
         """The deprecated --monokernel-backend amd|msa sets --enable-amd-monokernel or
@@ -3500,6 +3546,7 @@ class TestPipelineParallelCompat(CustomTestCase):
             disaggregation_mode="prefill",
             min_free_slots_delay=None,
             scheduler_recv_interval=1,
+            enable_return_routed_experts=False,
         )
         cfg.update(overrides)
         return SimpleNamespace(**cfg)
