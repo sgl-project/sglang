@@ -253,7 +253,7 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
                 k=tuple(self.k_scale_buffer),
                 v=tuple(self.v_scale_buffer),
                 layout=KVScaleLayout.MODELSLIM_MXFP8,
-                k_transfer_buffer=lambda: self._hicache_k_scale_buffer,
+                k_transfer_buffer=self._hicache_k_scale_buffer,
             )
         return MHABufferInfo(
             buffers=KVBuffers(

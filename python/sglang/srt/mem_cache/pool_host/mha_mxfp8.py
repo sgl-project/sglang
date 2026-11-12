@@ -341,7 +341,7 @@ class NPUModelSlimMXFP8Host(MHATokenToKVPoolHost):
         yield from super()._npu_transfer_buffers()
         layer_start = 0
         for info in self._buffer_infos:
-            k_scale = info.scales.k_transfer_buffer().flatten(-2)
+            k_scale = info.scales.k_transfer_buffer.flatten(-2)
             layer_end = layer_start + k_scale.shape[0]
             yield (
                 k_scale,
