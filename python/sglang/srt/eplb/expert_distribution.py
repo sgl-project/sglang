@@ -40,6 +40,7 @@ import torch.distributed
 
 from sglang.kernels.ops.moe.eplb_map_record import record_physical_counts
 from sglang.srt.environ import envs
+from sglang.srt.eplb.expert_location import get_eplb_group
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.observability.metrics_collector import (
@@ -50,6 +51,7 @@ from sglang.srt.observability.metrics_collector import (
 from sglang.srt.runtime_context import get_device as get_device_namespace
 from sglang.srt.runtime_context import (
     get_exec,
+    get_parallel,
     get_platform,
     get_schedule,
     logs_expert_balancedness_to_server_log,
@@ -780,6 +782,15 @@ class _Accumulator(ABC):
     ):
         self._expert_location_metadata = expert_location_metadata
         self._rank = rank
+        self._communication_group = get_eplb_group()
+        self._communication_root = (
+            0
+            if self._communication_group is None
+            else torch.distributed.get_global_rank(self._communication_group, 0)
+        )
+        self._is_communication_root = (
+            torch.distributed.get_rank() == self._communication_root
+        )
 
     def get_single_pass_gatherer_keys(self):
         return [_SINGLE_PASS_GATHERER_KEY_PRIMARY]
@@ -810,6 +821,20 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
         self._enable = reports_expert_balancedness()
 
         if self._enable:
+            self._pipeline_layer_slice = None
+            parallel = get_parallel()
+            if parallel.pp_size > 1:
+                from sglang.srt.distributed import get_pp_indices
+
+                # Ownership is fixed for this recorder. Cache the range rather
+                # than parsing the pipeline partition on every recorded pass.
+                self._pipeline_layer_slice = slice(
+                    *get_pp_indices(
+                        self._expert_location_metadata.num_layers,
+                        parallel.pp_rank,
+                        parallel.pp_size,
+                    )
+                )
             self.window_sizes = EPLB_BALANCEDNESS_WINDOW_SIZES
             self._history = _DequeCollection(maxlens=self.window_sizes)
             self._reset_server_log_history = True
@@ -854,15 +879,22 @@ class _UtilizationRateAccumulatorMixin(_Accumulator):
         )
         gpu_physical_count = gpu_physical_count.to(get_device_namespace().device)
         torch.distributed.reduce(
-            gpu_physical_count, dst=0, op=torch.distributed.ReduceOp.SUM
+            gpu_physical_count,
+            dst=self._communication_root,
+            op=torch.distributed.ReduceOp.SUM,
+            group=self._communication_group,
         )
 
-        if self._rank == 0:
+        if self._is_communication_root:
             self._handle_metric_eplb_heatmap(gpu_physical_count)
 
-            utilization_rate_gpu = torch.mean(
-                compute_utilization_rate(gpu_physical_count)
-            )
+            layer_utilization = compute_utilization_rate(gpu_physical_count)
+            if self._pipeline_layer_slice is not None:
+                # Counts are reduced within this stage but indexed by global
+                # layer ID. Use ownership rather than observed traffic so a
+                # valid layer with zero sampled tokens is still included.
+                layer_utilization = layer_utilization[self._pipeline_layer_slice]
+            utilization_rate_gpu = layer_utilization.mean()
             should_track_history = not math.isclose(
                 get_exec().moe.eplb_min_rebalancing_utilization_threshold, 1.0
             )
@@ -1022,7 +1054,9 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
             torch.get_device_module().empty_cache()
 
         torch.distributed.all_reduce(
-            logical_count_of_buffered_step, op=torch.distributed.ReduceOp.SUM
+            logical_count_of_buffered_step,
+            op=torch.distributed.ReduceOp.SUM,
+            group=self._communication_group,
         )
 
         output = dict(
@@ -1031,13 +1065,25 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
             average_utilization_rate_over_window=self._get_global_average_utilization_rate(),
         )
 
-        if output_mode == "file":
-            if self._rank == 0:
-                _dump_to_file(f"expert_distribution_recorder_{time.time()}.pt", output)
-        elif output_mode == "object":
+        if output_mode == "object":
             return output
-        else:
+        if output_mode != "file":
             raise NotImplementedError
+        if not self._is_communication_root:
+            return
+
+        parallel = get_parallel()
+        suffix = ""
+        if parallel.pp_size > 1:
+            # The scheduler forwards this request after handling it.
+            # Save each stage locally; a WORLD gather here would block
+            # the request from reaching the next stage.
+            suffix = f"_pp{parallel.pp_rank}"
+            output.update(
+                pipeline_parallel_rank=parallel.pp_rank,
+                pipeline_parallel_size=parallel.pp_size,
+            )
+        _dump_to_file(f"expert_distribution_recorder_{time.time()}{suffix}.pt", output)
 
     def _get_global_average_utilization_rate(self):
         if not self._enable or math.isclose(
@@ -1045,7 +1091,7 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
         ):
             return None
 
-        if self._rank == 0:
+        if self._is_communication_root:
             utilization_mean_rates = self._history.mean()
             window_index = self.window_sizes[-1]
             average_utilization_rate_over_window = (
@@ -1065,7 +1111,11 @@ class _StatAccumulator(_UtilizationRateAccumulatorMixin):
                 dtype=torch.float32,
                 device=get_device_namespace().device,
             )
-        torch.distributed.broadcast(avg_rate_tensor, src=0)
+        torch.distributed.broadcast(
+            avg_rate_tensor,
+            src=self._communication_root,
+            group=self._communication_group,
+        )
         return avg_rate_tensor.item()
 
 
