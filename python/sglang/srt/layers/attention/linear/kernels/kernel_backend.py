@@ -15,6 +15,10 @@ class LinearAttnKernelBase(ABC):
     # Opt in only when target-verify kernels honor non-unit token strides.
     supports_strided_target_verify_qkv: bool = False
 
+    # True when extend() computes the gates itself, so the caller may pass
+    # g/beta as None and skip the separate gating launch.
+    defers_prefill_gates: bool = False
+
     # True when extend() honors the fp32 track snapshot (track_state /
     # track_chunk_idx), natively or by routing tracked batches to a kernel
     # that does. KDAAttnBackend asserts this before allocating the snapshot
