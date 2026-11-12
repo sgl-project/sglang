@@ -55,6 +55,7 @@ class _CrateSpec:
     manifest: Path
     workspace: Path
     features: tuple[str, ...]
+    source_inputs: tuple[Path, ...]
 
 
 @dataclass(frozen=True)
@@ -80,7 +81,8 @@ def load_rust_extension(
     The crate is discovered from the workspace under ``rust/``: the one whose
     Cargo manifest declares ``[package.metadata.sglang] python-module`` equal
     to ``python_module`` (the same metadata setup.py uses for wheel builds), so
-    new crates need no registration here.
+    new crates need no registration here. Crates may declare ``source-inputs``
+    relative to their manifest for build inputs outside the Rust workspace.
 
     ``auto`` prefers a module bundled in an installed wheel. In a source tree,
     it ignores unverified in-package artifacts and uses the fingerprinted cache
@@ -152,9 +154,12 @@ def load_rust_extension(
             features=features,
             build_environment=build_environment,
         )
-        if _source_digest(crate.workspace) != context.source_digest:
+        if (
+            _source_digest(crate.workspace, crate.source_inputs)
+            != context.source_digest
+        ):
             raise RuntimeError(
-                f"Rust sources under {crate.workspace} changed during the build; "
+                f"Rust extension sources for {crate.package} changed during the build; "
                 "the result was not cached"
             )
         _stage_atomically(artifact, extension_path)
@@ -216,6 +221,10 @@ def _discover_crate(workspace: Path, python_module: str) -> _CrateSpec:
                 manifest=manifest,
                 workspace=crate_workspace,
                 features=tuple(sglang_metadata.get("features", ())),
+                source_inputs=tuple(
+                    (manifest.parent / path).resolve()
+                    for path in sglang_metadata.get("source-inputs", ())
+                ),
             )
         )
 
@@ -245,7 +254,7 @@ def _build_context(
         features = crate.features
     if extension_module is None:
         extension_module = crate.python_module
-    source_digest = _source_digest(crate.workspace)
+    source_digest = _source_digest(crate.workspace, crate.source_inputs)
     toolchain = {
         "cargo": _command_version(
             "cargo", "--version", "--verbose", cwd=crate.workspace
@@ -289,10 +298,16 @@ def _build_context(
     )
 
 
-def _source_digest(workspace: Path) -> str:
+def _source_digest(workspace: Path, source_inputs: tuple[Path, ...] = ()) -> str:
     digest = hashlib.sha256()
-    for path in _source_files(workspace):
-        relative_path = path.relative_to(workspace).as_posix().encode()
+    paths = set(_source_files(workspace))
+    for source_input in source_inputs:
+        if source_input.is_dir():
+            paths.update(_source_files(source_input))
+        else:
+            paths.add(source_input)
+    for path in sorted(paths, key=lambda item: os.path.relpath(item, workspace)):
+        relative_path = Path(os.path.relpath(path, workspace)).as_posix().encode()
         digest.update(len(relative_path).to_bytes(8, "big"))
         digest.update(relative_path)
         if path.is_symlink():

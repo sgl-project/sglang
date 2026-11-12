@@ -28,6 +28,7 @@ from sglang.srt.layers.quantization.gptq import (
     GPTQXPUConfig,
 )
 from sglang.srt.layers.quantization.humming import HummingConfig
+from sglang.srt.layers.quantization.minimax_m3_nvfp4 import MiniMaxM3Nvfp4Config
 from sglang.srt.layers.quantization.mlx import MlxQuantizationConfig
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
@@ -52,6 +53,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_gfx95_supported,
+    is_hip,
     is_mps,
     is_npu,
     is_xpu,
@@ -63,6 +65,7 @@ _is_gfx95_supported = is_gfx95_supported()
 BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "fp8": Fp8Config,
     "mxfp8": Fp8Config,
+    "minimax_m3_nvfp4": MiniMaxM3Nvfp4Config,
     "blockwise_int8": BlockInt8Config,
     "modelopt": ModelOptFp8Config,  # Auto-detect, defaults to FP8
     "modelopt_fp8": ModelOptFp8Config,
@@ -75,7 +78,6 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "awq_marlin": AWQMarlinConfig,
     "bitsandbytes": BitsAndBytesConfig,
     "gguf": GGUFConfig,
-    "gptq": GPTQConfig,
     "gptq_marlin": GPTQMarlinConfig,
     "moe_wna16": MoeWNA16Config,
     "compressed-tensors": CompressedTensorsConfig,
@@ -112,6 +114,26 @@ if is_npu():
             # upstream `Mxfp4Config` OCP-MoE path is only registered on
             # cpu/cuda/hip above, so there is no collision here).
             "mxfp4": Mxfp4W4A4Config,
+        }
+    )
+
+
+if is_cpu():
+    # Plain GPTQ is CUDA-only in name: the kernel is gone, but the Intel AMX
+    # path below is untouched. `get_quantization_config` rejects anything
+    # missing from this registry before it can consult CPU_QUANTIZATION_METHODS,
+    # so the key has to exist here for the CPU path to stay reachable.
+    BASE_QUANTIZATION_METHODS.update(
+        {
+            "gptq": CPUGPTQConfig,
+        }
+    )
+
+
+if is_hip():
+    BASE_QUANTIZATION_METHODS.update(
+        {
+            "gptq": GPTQConfig,
         }
     )
 

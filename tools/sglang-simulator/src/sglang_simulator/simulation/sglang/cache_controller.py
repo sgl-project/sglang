@@ -52,12 +52,16 @@ class C_HiCacheController(BaseHook):
         def override_backup_thread_func(self, *args, **kwargs):
             # Async thread: perform no action
             # The action will be performed by `handle_backup_operation`
-            pass
+            # Stay alive until the controller stops its workers: SGLang fails
+            # the rank when a started storage worker exits early.
+            self.storage_stop_event.wait()
 
         def override_prefetch_thread_func(self, *args, **kwargs):
             # Async thread: perform no action
             # The action will be performed by `handle_prefetch_operation`
-            pass
+            # Stay alive until the controller stops its workers: SGLang fails
+            # the rank when a started storage worker exits early.
+            self.storage_stop_event.wait()
 
         def handle_backup_operation(self):
             if not self.enable_storage:
@@ -251,7 +255,7 @@ class C_HiCacheController(BaseHook):
 
         def wrapped_terminate_prefetch(self, operator):
             result = original_terminate_prefetch(self, operator)
-            # This value may be a float if prefetch progress is interrupted by HiRadixCache.check_prefetch_progress.
+            # This value may be a float if prefetch progress is interrupted mid-transfer.
             result = (int(result[0]), result[1])
             # operation.completed_tokens, operation.hash_value = result
             req_stats = request_stats_manager.get_req_stats(operator.request_id)

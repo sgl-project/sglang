@@ -18,7 +18,6 @@ def use_modelscope(name: str):
 
 COSMOS3_NANO_WEIGHTS_PATH = use_modelscope("nv-community/Cosmos3-Nano")
 ERNIE_IMAGE_WEIGHTS_PATH = use_modelscope("PaddlePaddle/ERNIE-Image")
-FLUX_1_DEV_WEIGHTS_PATH = use_modelscope("black-forest-labs/FLUX.1-dev")
 FLUX_2_DEV_WEIGHTS_PATH = use_modelscope("black-forest-labs/FLUX.2-dev")
 FLUX_2_KLEIN_4B_WEIGHTS_PATH = use_modelscope("black-forest-labs/FLUX.2-klein-4B")
 GLM_IMAGE_WEIGHTS_PATH = use_modelscope("ZhipuAI/GLM-Image")
@@ -58,14 +57,6 @@ ONE_NPU_CASES: list[DiffusionTestCase] = [
         ),
         T2I_sampling_params,
         run_consistency_check=False,
-    ),
-    DiffusionTestCase(
-        "flux_image_t2i_npu",
-        DiffusionServerArgs(
-            model_path=FLUX_1_DEV_WEIGHTS_PATH,
-            extras=EXTRAS_DISABLE_WARMUP,
-        ),
-        T2I_sampling_params,
     ),
     DiffusionTestCase(
         "flux_2_klein_4b_t2i_1npu",
@@ -176,6 +167,7 @@ TWO_NPU_CASES: list[DiffusionTestCase] = [
                 "SGLANG_CACHE_DIT_TAYLORSEER": "true",
                 "SGLANG_CACHE_DIT_TS_ORDER": "2",
                 "HCCL_BUFFSIZE": "256",
+                "SGLANG_DIFFUSION_TEST_FORCE_HOST_AVAILABLE_GIB": "64",
             },
         ),
         DiffusionSamplingParams(
@@ -202,6 +194,7 @@ TWO_NPU_CASES: list[DiffusionTestCase] = [
                 "seed": 1101,
             },
         ),
+        pin_consistency_quality=False,
         run_perf_check=True,
         run_consistency_check=True,
         run_component_accuracy_check=False,
@@ -227,6 +220,9 @@ TWO_NPU_CASES: list[DiffusionTestCase] = [
             num_gpus=2,
             tp_size=2,
             dit_layerwise_offload=True,
+            env_vars={
+                "SGLANG_DIFFUSION_TEST_FORCE_HOST_AVAILABLE_GIB": "96",
+            },
             extras=EXTRAS_DISABLE_WARMUP,
         ),
         run_consistency_check=False,

@@ -17,7 +17,7 @@ from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.common import _release_overallocated_kv_indices
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=15, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 PAGE_SIZE = 4
 NUM_PAGES = 64
@@ -136,6 +136,7 @@ class TestFreeSegment(unittest.TestCase):
         row = _make_kv_row(alloc, 2 * PAGE_SIZE)
         tree_cache = SimpleNamespace(
             token_to_kv_pool_allocator=alloc,
+            logical_page_size=alloc.page_size,
             req_to_token_pool=SimpleNamespace(req_to_token=row.unsqueeze(0)),
         )
         req = SimpleNamespace(kv=ReqKvInfo(req_pool_idx=0))

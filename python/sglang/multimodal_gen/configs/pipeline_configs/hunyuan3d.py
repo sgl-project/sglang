@@ -6,10 +6,8 @@ from sglang.multimodal_gen.configs.models import DiTConfig, VAEConfig
 from sglang.multimodal_gen.configs.models.dits.hunyuan3d import Hunyuan3DDiTConfig
 from sglang.multimodal_gen.configs.models.encoders.clip import CLIPTextConfig
 from sglang.multimodal_gen.configs.models.vaes.hunyuan3d import Hunyuan3DVAEConfig
-from sglang.multimodal_gen.configs.pipeline_configs.base import (
-    ModelTaskType,
-    PipelineConfig,
-)
+from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
+from sglang.multimodal_gen.configs.task_type import ModelTaskType
 
 
 @dataclass
@@ -54,7 +52,6 @@ class Hunyuan3D2PipelineConfig(PipelineConfig):
     delight_enable: bool = True
     delight_prompt: str = ""
     delight_negative_prompt: str = ""
-    delight_strength: float = 1.0
     delight_num_inference_steps: int = 50
     delight_guidance_scale: float = 1.0
     delight_cfg_image: float = 1.5
@@ -66,6 +63,7 @@ class Hunyuan3D2PipelineConfig(PipelineConfig):
     paint_resolution: int = 512
     paint_render_size: int = 2048
     paint_texture_size: int = 2048
+    # Decimate the mesh to 40k faces before UV unwrapping, as Hunyuan3D-2.1 does
     paint_use_remesh: bool = True
     paint_save_glb: bool = True
     paint_turbo_mode: bool = False
@@ -78,3 +76,19 @@ class Hunyuan3D2PipelineConfig(PipelineConfig):
         latent_shape = self.vae_config.arch_config.latent_shape
         shape = (batch_size, *latent_shape)
         return shape
+
+
+def register():
+    from sglang.multimodal_gen.configs.sample.hunyuan3d import (
+        Hunyuan3DSamplingParams,
+    )
+    from sglang.multimodal_gen.registry import register_configs
+
+    register_configs(
+        sampling_param_cls=Hunyuan3DSamplingParams,
+        pipeline_config_cls=Hunyuan3D2PipelineConfig,
+        hf_model_paths=[
+            "tencent/Hunyuan3D-2",
+        ],
+        model_detectors=[lambda hf_id: "hunyuan3d" in hf_id.lower()],
+    )

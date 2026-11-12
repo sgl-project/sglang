@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.jit.utils import cache_once, load_jit
 
 if TYPE_CHECKING:
@@ -12,12 +13,6 @@ if TYPE_CHECKING:
 
 _HIDDEN = 6144
 _ALIGNMENT = 32
-
-
-def _blackwell_or_newer(device: torch.device) -> bool:
-    return (
-        torch.cuda.is_available() and torch.cuda.get_device_capability(device)[0] >= 10
-    )
 
 
 def _aligned(tensor: torch.Tensor) -> bool:
@@ -62,7 +57,7 @@ def can_defer_flux2_gated_residual(
         and update.shape == residual.shape
         and update.is_contiguous()
         and _aligned(update)
-        and _blackwell_or_newer(residual.device)
+        and current_arch().is_sm_at_least(10)
     ):
         return False
     return _row_bf16(gate, residual.device) is not None

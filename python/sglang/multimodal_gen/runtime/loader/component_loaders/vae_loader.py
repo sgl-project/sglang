@@ -1,17 +1,16 @@
 import hashlib
 import importlib.util
 import os
-from collections.abc import Iterable
+from collections.abc import Callable
 
 import torch
 import torch.nn as nn
-from safetensors.torch import load_file as safetensors_load_file
 from safetensors.torch import safe_open
 from safetensors.torch import save_file as safetensors_save_file
-from torch.nn.utils import parametrize
 
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.models.vaes.base import VAEConfig
+from sglang.multimodal_gen.configs.pipeline_configs.cosmos3 import Cosmos3Config
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import LTX2PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     QwenImagePipelineConfig,
@@ -25,10 +24,12 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader imp
 from sglang.multimodal_gen.runtime.loader.utils import (
     _list_safetensors_files,
     _normalize_component_type,
+    adopt_plain_weight_norm_state,
     checkpoint_bytes,
+    initialize_model,
     keep_checkpoint_mapped,
+    load_model_state_dict,
     set_default_torch_dtype,
-    skip_init_modules,
 )
 from sglang.multimodal_gen.runtime.loader.weight_utils import (
     safetensors_weights_iterator,
@@ -46,10 +47,10 @@ from sglang.multimodal_gen.runtime.utils.precision import (
     resolve_component_precision,
     resolve_decode_precision,
 )
+from sglang.multimodal_gen.runtime.utils.precision_types import PRECISION_TO_TYPE
 from sglang.multimodal_gen.runtime.weights.source import (
     filter_duplicate_precision_variant_safetensors,
 )
-from sglang.multimodal_gen.utils import PRECISION_TO_TYPE
 from sglang.srt.model_loader.checkpoint_quantization import (
     resolve_checkpoint_quant_spec,
 )
@@ -113,16 +114,17 @@ def _backfill_ltx2_audio_vae_latent_stats(
         loaded["latents_std"] = loaded[std_key]
 
 
-def _convert_conv3d_weights_to_channels_last_3d(module: nn.Module) -> int:
+def _convert_conv3d_weights_to_channels_last_3d(
+    module: nn.Module, prefix: str = ""
+) -> int:
     """
-    Convert Conv3d weights to channels_last_3d (NDHWC) memory format.
+    Convert Conv3d weights whose module name starts with ``prefix`` to
+    channels_last_3d (NDHWC) memory format.
     Returns the number of Conv3d modules converted.
     """
-    if not hasattr(torch, "channels_last_3d"):
-        return 0
     num_converted = 0
-    for m in module.modules():
-        if isinstance(m, nn.Conv3d):
+    for name, m in module.named_modules():
+        if isinstance(m, nn.Conv3d) and name.startswith(prefix):
             try:
                 m.weight.data = m.weight.data.to(memory_format=torch.channels_last_3d)
                 num_converted += 1
@@ -138,11 +140,15 @@ def _should_use_channels_last_3d(
     if component_type not in (
         "vae",
         "video_vae",
-    ) or not (current_platform.is_cuda() or current_platform.is_rocm()):
+    ) or not (
+        current_platform.is_cuda()
+        or current_platform.is_rocm()
+        or current_platform.is_cpu()
+        or current_platform.is_xpu()
+    ):
         return False
 
-    override = os.getenv(VAE_CHANNELS_LAST_3D_ENV)
-    if override is not None and override.strip().lower() != "auto":
+    if _channels_last_3d_overridden():
         return get_bool_env_var(VAE_CHANNELS_LAST_3D_ENV)
 
     if server_args is None:
@@ -151,23 +157,66 @@ def _should_use_channels_last_3d(
     pipeline_config = server_args.pipeline_config
     if isinstance(pipeline_config, QwenImagePipelineConfig):
         return True
-    if (
-        isinstance(pipeline_config, (WanT2V480PConfig, LTX2PipelineConfig))
-        and server_args.num_gpus == 1
-    ):
+    # Wan's spatial-parallel decode exchanges halos in either layout
+    if isinstance(pipeline_config, (WanT2V480PConfig, Cosmos3Config)):
+        return True
+    if isinstance(pipeline_config, LTX2PipelineConfig) and server_args.num_gpus == 1:
         return True
     return False
 
 
+def _channels_last_3d_overridden() -> bool:
+    override = os.getenv(VAE_CHANNELS_LAST_3D_ENV)
+    return override is not None and override.strip().lower() != "auto"
+
+
+def _channels_last_3d_prefix(server_args: ServerArgs | None) -> str:
+    """Module-name prefix of the Conv3d weights to convert to channels_last_3d."""
+    # by default multi-GPU Wan / Cosmos3 convert only their decoder:
+    # channels_last_3d convs round differently, and the encode output seeds I2V
+    # sampling; an explicit override converts the whole VAE
+    if (
+        not _channels_last_3d_overridden()
+        and server_args is not None
+        and server_args.num_gpus > 1
+        and isinstance(server_args.pipeline_config, (WanT2V480PConfig, Cosmos3Config))
+    ):
+        return "decoder."
+    return ""
+
+
 def _decode_dtype_store_path(
-    component_model_path: str, component_name: str, dtype: torch.dtype
+    component_model_path: str, component_name: str, dtype: torch.dtype, vae=None
 ) -> str:
+    # The module layout is part of the key: two runtime versions that expose a
+    # different parameter set for the same checkpoint must not share a store.
+    layout = ""
+    if vae is not None:
+        layout = "|" + ",".join(
+            f"{name}:{tuple(tensor.shape)}" for name, tensor in vae.state_dict().items()
+        )
     key = hashlib.sha1(
-        f"{os.path.realpath(component_model_path)}|{component_name}|{dtype}".encode()
+        f"{os.path.realpath(component_model_path)}|{component_name}|{dtype}{layout}".encode()
     ).hexdigest()[:16]
     return os.path.join(
         envs.SGLANG_DIFFUSION_CACHE_ROOT, "decode_dtype_store", f"{key}.safetensors"
     )
+
+
+def _load_safetensors_file(path: str) -> dict:
+    """The VAE checkpoint itself: read-only where host copies are redundant."""
+    from sglang.multimodal_gen.runtime.loader.utils import (
+        _load_safetensors_file as _load,
+    )
+
+    return _load(path)
+
+
+def _load_store(path: str) -> dict:
+    """Map the store read-only where host copies are redundant (see loader.utils)."""
+    from sglang.multimodal_gen.runtime.loader.utils import _load_safetensors_file
+
+    return _load_safetensors_file(path)
 
 
 def _assign_matching_store(vae, mapped: dict, dtype: torch.dtype) -> bool:
@@ -196,10 +245,10 @@ def _rehome_cast_weights_to_file(
 
     Returns (weights held, file-backed?).
     """
-    path = _decode_dtype_store_path(component_model_path, component_name, dtype)
+    path = _decode_dtype_store_path(component_model_path, component_name, dtype, vae)
     try:
         if os.path.exists(path):
-            mapped = safetensors_load_file(path)
+            mapped = _load_store(path)
             if mapped and _assign_matching_store(vae, mapped, dtype):
                 return len(mapped), True
             raise ValueError("existing decode-dtype store does not match the module")
@@ -215,7 +264,7 @@ def _rehome_cast_weights_to_file(
         tmp = f"{path}.tmp.{os.getpid()}"
         safetensors_save_file({k: v.contiguous() for k, v in cast_state.items()}, tmp)
         os.replace(tmp, path)
-        mapped = safetensors_load_file(path)
+        mapped = _load_store(path)
         if set(mapped) != set(cast_state):
             raise ValueError("decode-dtype store does not match the cast weights")
         vae.load_state_dict(mapped, strict=False, assign=True)
@@ -281,56 +330,6 @@ def _hold_decoder_weights_in_decode_dtype(
             dtype,
             "file-backed" if file_backed else "anonymous host memory",
         )
-
-
-def _match_checkpoint_dtypes(loaded: dict, target_state: dict) -> dict:
-    """Convert checkpoint tensors whose dtype differs from their parameter's.
-
-    Assignment replaces the parameter rather than writing through it, so a
-    mismatched dtype would silently change the module's. Converting makes a
-    copy, which is the point: only the tensors that already match can stay on
-    the mapping.
-    """
-    for name, tensor in list(loaded.items()):
-        param = target_state.get(name)
-        if param is not None and param.dtype != tensor.dtype:
-            loaded[name] = tensor.to(dtype=param.dtype)
-    return loaded
-
-
-def _adopt_plain_weight_norm_state(
-    module: nn.Module, loaded_names: Iterable[str]
-) -> int:
-    """Make deparameterized checkpoint weights native module state.
-
-    PyTorch's weight-norm load hook accepts legacy ``weight_g``/``weight_v``
-    tensors, while inference exports commonly fold those tensors into one
-    plain ``weight``. Removing only the matching parametrizations preserves
-    that already-computed weight exactly and leaves every other parameterized
-    module untouched.
-    """
-    state_names = set(module.state_dict())
-    module_by_name = dict(module.named_modules())
-    owners: set[str] = set()
-    for name in loaded_names:
-        if name == "weight":
-            owner_name = ""
-        elif name.endswith(".weight"):
-            owner_name = name.removesuffix(".weight")
-        else:
-            continue
-        state_prefix = f"{owner_name}." if owner_name else ""
-        if {
-            f"{state_prefix}parametrizations.weight.original0",
-            f"{state_prefix}parametrizations.weight.original1",
-        }.issubset(state_names):
-            owners.add(owner_name)
-
-    for owner_name in sorted(owners):
-        parametrize.remove_parametrizations(
-            module_by_name[owner_name], "weight", leave_parametrized=True
-        )
-    return len(owners)
 
 
 def _vae_checkpoint_arch_metadata_names(
@@ -442,9 +441,11 @@ def _assign_direct_gpu_vae_state(
     component_name: str,
     device: torch.device,
     vae_config: VAEConfig,
+    key_filter: Callable[[str], bool] | None = None,
+    key_mapper: Callable[[str], str] | None = None,
 ) -> tuple[int, tuple[str, ...]]:
     """Stream a complete standard VAE state directly onto its target device."""
-    num_deparameterized = _adopt_plain_weight_norm_state(
+    num_deparameterized = adopt_plain_weight_norm_state(
         vae, _vae_checkpoint_tensor_names(weight_files)
     )
     target_state, slots = _direct_gpu_vae_state_slots(vae, component_name)
@@ -453,9 +454,9 @@ def _assign_direct_gpu_vae_state(
     metadata: dict[str, torch.Tensor] = {}
     with torch.no_grad():
         for raw_name, tensor in safetensors_weights_iterator(
-            weight_files, to_cpu=device.type == "cpu"
+            weight_files, to_cpu=device.type == "cpu", key_filter=key_filter
         ):
-            name = raw_name
+            name = key_mapper(raw_name) if key_mapper is not None else raw_name
             if name in metadata_names:
                 metadata[name] = tensor
                 continue
@@ -634,6 +635,11 @@ class VAELoader(WeightOverrideComponentLoader):
                 "consume a weights-only override"
             )
         if auto_model_map and not native_only:
+            if not server_args.trust_remote_code:
+                raise ComponentCheckpointUnsupportedError(
+                    f"{component_name!r} uses custom auto_map code; "
+                    "pass --trust-remote-code only after reviewing the model code"
+                )
             module_path, cls_name = auto_model_map.rsplit(".", 1)
             custom_module_file = os.path.join(component_model_path, f"{module_path}.py")
             spec = importlib.util.spec_from_file_location("_custom", custom_module_file)
@@ -648,7 +654,9 @@ class VAELoader(WeightOverrideComponentLoader):
                 )
             vae = vae.to(device=target_device, dtype=vae_dtype)
             if _should_use_channels_last_3d(server_args, component_type):
-                n = _convert_conv3d_weights_to_channels_last_3d(vae)
+                n = _convert_conv3d_weights_to_channels_last_3d(
+                    vae, _channels_last_3d_prefix(server_args)
+                )
                 if n > 0:
                     logger.info(
                         "VAE: converted %d Conv3d weights to channels_last_3d", n
@@ -662,23 +670,6 @@ class VAELoader(WeightOverrideComponentLoader):
             )
             vae = current_platform.optimize_vae(vae)
             return vae
-
-        # Load from ModelRegistry (standard VAE classes)
-        if direct_gpu_weight_loading:
-            with (
-                set_default_torch_dtype(vae_dtype),
-                skip_init_modules(),
-                torch.device("meta"),
-            ):
-                vae_cls, _ = ModelRegistry.resolve_model_cls(class_name)
-                vae = vae_cls(vae_config)
-        else:
-            with (
-                set_default_torch_dtype(vae_dtype),
-                skip_init_modules(),
-            ):
-                vae_cls, _ = ModelRegistry.resolve_model_cls(class_name)
-                vae = vae_cls(vae_config).to(target_device)
 
         if os.path.isfile(component_weights_path):
             if not component_weights_path.endswith(".safetensors"):
@@ -707,17 +698,47 @@ class VAELoader(WeightOverrideComponentLoader):
         assert len(safetensors_list) >= 1, (
             f"Found no safetensors files in {component_weights_path}"
         )
-        if direct_gpu_weight_loading:
+        # Load from ModelRegistry (standard VAE classes)
+        vae_cls, _ = ModelRegistry.resolve_model_cls(class_name)
+        # A model hook may validate a serialized checkpoint and return a
+        # configurator to apply on meta before streaming mixed-dtype weights.
+        prepare_checkpoint_load = getattr(vae_cls, "prepare_checkpoint_load", None)
+        configure_checkpoint = (
+            prepare_checkpoint_load(safetensors_list, vae_dtype)
+            if prepare_checkpoint_load is not None
+            else None
+        )
+        stream_checkpoint = (
+            direct_gpu_weight_loading or configure_checkpoint is not None
+        )
+        vae = initialize_model(
+            vae_cls,
+            {"config": vae_config},
+            vae_dtype,
+            torch.device("meta") if stream_checkpoint else None,
+        )
+        if configure_checkpoint is not None:
+            configure_checkpoint(vae)
+        if not stream_checkpoint:
+            vae = vae.to(target_device)
+
+        checkpoint_key_filter = getattr(vae, "checkpoint_key_filter", None)
+        checkpoint_key_mapper = getattr(vae, "checkpoint_key_mapper", None)
+        if stream_checkpoint:
             adaptations = _assign_direct_gpu_vae_state(
                 vae,
                 safetensors_list,
                 component_name=component_name,
                 device=target_device,
                 vae_config=vae_config,
+                key_filter=checkpoint_key_filter,
+                key_mapper=checkpoint_key_mapper,
             )
             _log_vae_checkpoint_adaptations(*adaptations)
             if _should_use_channels_last_3d(server_args, component_name):
-                n = _convert_conv3d_weights_to_channels_last_3d(vae)
+                n = _convert_conv3d_weights_to_channels_last_3d(
+                    vae, _channels_last_3d_prefix(server_args)
+                )
                 if n > 0:
                     logger.info(
                         "VAE: converted %d Conv3d weights to channels_last_3d", n
@@ -727,9 +748,21 @@ class VAELoader(WeightOverrideComponentLoader):
 
         loaded = {}
         for sf_path in safetensors_list:
-            loaded.update(safetensors_load_file(sf_path))
+            state = _load_safetensors_file(sf_path)
+            if checkpoint_key_filter is not None:
+                state = {
+                    name: tensor
+                    for name, tensor in state.items()
+                    if checkpoint_key_filter(name)
+                }
+            if checkpoint_key_mapper is not None:
+                state = {
+                    checkpoint_key_mapper(name): tensor
+                    for name, tensor in state.items()
+                }
+            loaded.update(state)
         _backfill_ltx2_audio_vae_latent_stats(loaded, component_type)
-        num_deparameterized = _adopt_plain_weight_norm_state(vae, loaded)
+        num_deparameterized = adopt_plain_weight_norm_state(vae, loaded)
         target_state = vae.state_dict()
         consumed_metadata = _consume_vae_checkpoint_arch_metadata(
             loaded, vae_config, target_state
@@ -759,9 +792,8 @@ class VAELoader(WeightOverrideComponentLoader):
                 component=f"{component_name or 'vae'} (VAE)",
             )
         )
-        if keep_mapping:
-            _match_checkpoint_dtypes(loaded, target_state)
-        vae.load_state_dict(
+        load_model_state_dict(
+            vae,
             loaded,
             strict=strict_load,
             assign=keep_mapping,
@@ -778,7 +810,9 @@ class VAELoader(WeightOverrideComponentLoader):
                 logger.warning("VAE unexpected keys: %s", unexpected_keys)
 
         if _should_use_channels_last_3d(server_args, component_type):
-            n = _convert_conv3d_weights_to_channels_last_3d(vae)
+            n = _convert_conv3d_weights_to_channels_last_3d(
+                vae, _channels_last_3d_prefix(server_args)
+            )
             if n > 0:
                 logger.info("VAE: converted %d Conv3d weights to channels_last_3d", n)
 

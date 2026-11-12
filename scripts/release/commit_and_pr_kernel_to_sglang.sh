@@ -42,7 +42,7 @@ git push origin "${BRANCH_NAME}"
 # Create pull request
 echo "Creating pull request..."
 PR_URL=$(gh pr create \
-  --title "chore: bump sglang-kernel version to ${KERNEL_VERSION}" \
+  --title "[Chore] release: Bump sglang-kernel version to ${KERNEL_VERSION}" \
   --body "## Summary
 
 This PR bumps the \`sglang-kernel\` version to \`${KERNEL_VERSION}\` across SGLang files to match the version defined in \`python/sglang/kernels/aot/pyproject.toml\`.

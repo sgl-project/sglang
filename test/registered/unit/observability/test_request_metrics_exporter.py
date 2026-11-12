@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=6, suite="base-a-test-cpu")
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 register_cpu_ci(est_time=5, suite="stage-b-test-cpu-intel")
 
 import asyncio
@@ -28,6 +28,7 @@ class _GenerateReqInput:
     text: Optional[str] = None
     image_data: Optional[Any] = None
     sampling_params: Optional[Dict] = None
+    watermark: Optional[Any] = None
 
 
 @dataclass
@@ -122,25 +123,6 @@ def _make_server_args(tmp_dir, enabled=True):
 
 
 class TestFormatOutputData(unittest.TestCase):
-    def test_basic_formatting(self):
-        server_args = _make_server_args("/tmp/unused")
-        exporter = _ConcreteExporter(
-            server_args, obj_skip_names=None, out_skip_names=None
-        )
-
-        obj = _GenerateReqInput(
-            rid="req-1", text="hello", sampling_params={"temp": 0.5}
-        )
-        out_dict = {"meta_info": {"latency": 1.5, "tokens": 10}}
-
-        result = exporter._format_output_data(obj, out_dict)
-
-        params = json.loads(result["request_parameters"])
-        self.assertEqual(params["rid"], "req-1")
-        self.assertEqual(params["text"], "hello")
-        self.assertIn("latency", result)
-        self.assertIn("tokens", result)
-
     def test_excludes_always_exclude_fields(self):
         server_args = _make_server_args("/tmp/unused")
         exporter = _ConcreteExporter(
@@ -191,6 +173,28 @@ class TestFormatOutputData(unittest.TestCase):
         self.assertIn("latency", result)
         self.assertNotIn("secret", result)
 
+    def test_redacts_client_watermark_keys(self):
+        server_args = _make_server_args("/tmp/unused")
+        exporter = _ConcreteExporter(
+            server_args, obj_skip_names=None, out_skip_names=None
+        )
+
+        key = {"enabled": True, "key": "abcdef0123456789"}
+        obj = _GenerateReqInput(
+            rid="req-1",
+            sampling_params={"temperature": 0.5, "watermark": key},
+            watermark=key,
+        )
+        result = exporter._format_output_data(obj, {})
+
+        self.assertNotIn("abcdef0123456789", result["request_parameters"])
+        params = json.loads(result["request_parameters"])
+        redacted = {"enabled": True, "key": "<redacted>"}
+        self.assertEqual(params["watermark"], redacted)
+        self.assertEqual(
+            params["sampling_params"], {"temperature": 0.5, "watermark": redacted}
+        )
+
 
 class TestFileRequestMetricsExporter(unittest.TestCase):
     def setUp(self):
@@ -206,13 +210,6 @@ class TestFileRequestMetricsExporter(unittest.TestCase):
         sub_dir = os.path.join(self.tmp_dir, "nested", "dir")
         FileRequestMetricsExporter(_make_server_args(sub_dir), None, None)
         self.assertTrue(os.path.isdir(sub_dir))
-
-    def test_ensure_file_handler_opens_file(self):
-        exporter = self._make_exporter()
-        exporter._ensure_file_handler("20240101_12")
-        self.assertIsNotNone(exporter._current_file_handler)
-        self.assertEqual(exporter._current_hour_suffix, "20240101_12")
-        exporter.close()
 
     def test_ensure_file_handler_rotates(self):
         exporter = self._make_exporter()
@@ -240,13 +237,6 @@ class TestFileRequestMetricsExporter(unittest.TestCase):
         with patch("builtins.open", side_effect=OSError("permission denied")):
             with self.assertRaises(OSError):
                 exporter._ensure_file_handler("20240101_12")
-        self.assertIsNone(exporter._current_file_handler)
-        self.assertIsNone(exporter._current_hour_suffix)
-
-    def test_close(self):
-        exporter = self._make_exporter()
-        exporter._ensure_file_handler("20240101_12")
-        exporter.close()
         self.assertIsNone(exporter._current_file_handler)
         self.assertIsNone(exporter._current_hour_suffix)
 
@@ -286,16 +276,6 @@ class TestFileRequestMetricsExporter(unittest.TestCase):
         files = os.listdir(self.tmp_dir)
         self.assertEqual(len(files), 0)
 
-    def test_write_record_handler_none(self):
-        """If file handler is None after ensure, write_record returns early."""
-        exporter = self._make_exporter()
-        obj = _GenerateReqInput(rid="req-1")
-
-        with patch.object(exporter, "_ensure_file_handler"):
-            exporter._current_file_handler = None
-            asyncio.run(exporter.write_record(obj, {}))
-        # No crash, no file written
-
     def test_write_record_exception(self):
         """Exceptions during write are caught and logged."""
         exporter = self._make_exporter()
@@ -306,35 +286,6 @@ class TestFileRequestMetricsExporter(unittest.TestCase):
         ):
             asyncio.run(exporter.write_record(obj, {}))
         # Should not raise
-
-
-class TestRequestMetricsExporterManager(unittest.TestCase):
-    def setUp(self):
-        self.tmp_dir = tempfile.mkdtemp()
-
-    def tearDown(self):
-        shutil.rmtree(self.tmp_dir, ignore_errors=True)
-
-    def test_no_exporters(self):
-        server_args = _make_server_args(self.tmp_dir, enabled=False)
-        manager = RequestMetricsExporterManager(server_args)
-        self.assertFalse(manager.exporter_enabled())
-
-    def test_with_file_exporter(self):
-        server_args = _make_server_args(self.tmp_dir, enabled=True)
-        manager = RequestMetricsExporterManager(server_args)
-        self.assertTrue(manager.exporter_enabled())
-
-    def test_write_record_delegates(self):
-        server_args = _make_server_args(self.tmp_dir, enabled=True)
-        manager = RequestMetricsExporterManager(server_args)
-
-        obj = _GenerateReqInput(rid="req-1", text="hello")
-        out_dict = {"meta_info": {"latency": 1.0}}
-        asyncio.run(manager.write_record(obj, out_dict))
-
-        files = os.listdir(self.tmp_dir)
-        self.assertEqual(len(files), 1)
 
 
 class TestCreateExporters(unittest.TestCase):

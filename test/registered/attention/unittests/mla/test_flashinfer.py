@@ -4,7 +4,7 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.kits.attention_unittest.attention_methods.mla_attention import (
     MLAAttentionCase,
     make_mla_cases,
@@ -34,8 +34,8 @@ MLA_SHAPE_KWARGS = dict(
 
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=25, stage="base-b", runner_config="4-gpu-b200")
-register_cuda_ci(est_time=25, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=13, stage="base-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-large")
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "CUDA is required")
@@ -184,10 +184,10 @@ class TestFlashInferMLAAttentionBackendCorrectness(CustomTestCase):
     def test_cuda_graph_replay_updates_wrapper_kv_indptr_buffer(self):
         from sglang.srt.layers.attention import flashinfer_mla_backend
 
-        class PassthroughTranslator:
+        class PassthroughRunnerIds:
             needs_read_translate = False
 
-            def fill_packed_read_stream(self, **kwargs):
+            def pack_read_stream(self, plan, **kwargs):
                 return True
 
         updater = flashinfer_mla_backend.FlashInferMLAIndicesUpdaterDecode.__new__(
@@ -198,9 +198,7 @@ class TestFlashInferMLAAttentionBackendCorrectness(CustomTestCase):
         updater.num_local_heads = 4
         updater.kv_lora_rank = 512
         updater.qk_rope_head_dim = 64
-        updater.attn_backend = SimpleNamespace(
-            kv_index_translator=PassthroughTranslator()
-        )
+        updater.attn_backend = SimpleNamespace(runner_ids=PassthroughRunnerIds())
 
         paged_kernel_lens = torch.tensor([2, 3], dtype=torch.int32, device="cuda")
         eager_kv_indptr = torch.full((3,), -1, dtype=torch.int32, device="cuda")
@@ -220,6 +218,7 @@ class TestFlashInferMLAAttentionBackendCorrectness(CustomTestCase):
                 kv_indptr=eager_kv_indptr,
                 init_metadata_replay=True,
                 spec_info=None,
+                plan=MagicMock(),
                 req_pool_indices=torch.tensor([0, 1], device="cuda"),
                 qo_indptr_cpu=torch.tensor([0, 1, 2], dtype=torch.int32),
                 kv_indptr_cpu=torch.tensor([0, 2, 5], dtype=torch.int32),

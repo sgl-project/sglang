@@ -74,16 +74,10 @@ def _inputs(seq_lens, head_num, page_size, max_kv_splits, seed):
     total = sum(seq_lens)
     n_slots = total + 64
 
-    if page_size == 1:
-        pool = torch.randn(
-            n_slots, 1, LK, dtype=torch.bfloat16, device=dev, generator=gen
-        )
-    else:
-        n_pages = (n_slots + page_size - 1) // page_size
-        pool = torch.randn(
-            n_pages, page_size, 1, LK, dtype=torch.bfloat16, device=dev, generator=gen
-        )
-        n_slots = n_pages * page_size
+    if page_size > 1:
+        n_slots = ((n_slots + page_size - 1) // page_size) * page_size
+    # Unified memory exposes dense 3-D KV views even when the allocator uses pages.
+    pool = torch.randn(n_slots, 1, LK, dtype=torch.bfloat16, device=dev, generator=gen)
 
     kv_indptr = torch.zeros(batch + 1, dtype=torch.int32, device=dev)
     kv_indptr[1:] = torch.cumsum(

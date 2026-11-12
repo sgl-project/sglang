@@ -30,7 +30,7 @@ custom_api = client.CustomObjectsApi()
 batch_api = client.BatchV1Api()
 rbac_api = client.RbacAuthorizationV1Api()
 
-LOCAL_TIMEOUT = 10800
+LOCAL_TIMEOUT = 12600
 
 script_path = os.path.dirname(os.path.abspath(__file__))
 
@@ -501,6 +501,13 @@ def monitor_pod_logs(
 
 
 def generate_metrics_json(metrics_data_file, test_case, status):
+    """Collect [METRIC] lines from the log and write metrics.json.
+
+    This writes ${metrics_data_file}/metrics.json only, which feeds the
+    persistence-directory output (e.g. /root/.cache/tests/output/...).
+    It is NOT consumed by CI artifacts (the former /tmp/metrics.json +
+    'Upload metrics' path was removed).
+    """
     log_file = os.path.join(metrics_data_file, "test_output.log")
 
     metrics = {}
@@ -553,10 +560,6 @@ def generate_metrics_json(metrics_data_file, test_case, status):
         json.dump(output, f, indent=2)
     logger.info(f"Metrics JSON written to {output_path}")
 
-    with open("/tmp/metrics.json", "w") as f:
-        json.dump(output, f, indent=2)
-    logger.info("Metrics JSON written to /tmp/metrics.json")
-
 
 def run_npu_e2e_test_case(
     docker_image_url: str,
@@ -573,6 +576,7 @@ def run_npu_e2e_test_case(
     trouble_shotting=False,
     transformers_version="",
     run_id: str = "",
+    accuracy_dataset: str = "",
 ):
     """The method for running a npu e2e test case.
     Args:
@@ -590,6 +594,8 @@ def run_npu_e2e_test_case(
         env (str): the environment to run the test on.  Choose one in ["debug", "ci"]
         run_id (str): the GitHub Actions run_id, used to label pods for run-scoped
             isolation when multiple runs share the same k8s namespace.
+        accuracy_dataset (str): dataset name injected into multi-node pods as
+            NPU_ACCURACY_DATASET (gsm8k on weekdays, gpqa_diamond on weekends).
     """
     random_str = get_unique_random_string(16, True)
 
@@ -666,6 +672,7 @@ def run_npu_e2e_test_case(
                 "transformers_version": transformers_version,
                 "run_label": run_label,
                 "run_id": run_id,
+                "accuracy_dataset": accuracy_dataset,
             }
             template_key = (
                 KUBE_JOB_MULTI_PD_MIX_GREEN if env == "green" else kube_job_type
@@ -695,6 +702,7 @@ def run_npu_e2e_test_case(
                 "transformers_version": transformers_version,
                 "run_label": run_label,
                 "run_id": run_id,
+                "accuracy_dataset": accuracy_dataset,
             }
             template_key = (
                 KUBE_JOB_MULTI_PD_SEPARATION_GREEN if env == "green" else kube_job_type
@@ -895,6 +903,15 @@ if __name__ == "__main__":
         help="GitHub Actions run_id, used to label pods for run-scoped isolation.",
     )
 
+    parser.add_argument(
+        "--accuracy-dataset",
+        type=str,
+        required=False,
+        default="",
+        help="Dataset injected into multi-node pods as NPU_ACCURACY_DATASET "
+        "(gsm8k on weekdays, gpqa_diamond on weekends).",
+    )
+
     args = parser.parse_args()
 
     docker_image_url = args.image
@@ -912,6 +929,7 @@ if __name__ == "__main__":
     trouble_shotting = args.trouble_shotting
     transformers_version = args.transformers_version
     run_id = args.run_id
+    accuracy_dataset = args.accuracy_dataset
 
     kube_name_space = args.kube_name_space
     kube_job_type = args.kube_job_type
@@ -942,4 +960,5 @@ if __name__ == "__main__":
         trouble_shotting=trouble_shotting,
         transformers_version=transformers_version,
         run_id=run_id,
+        accuracy_dataset=accuracy_dataset,
     )

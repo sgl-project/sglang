@@ -1,78 +1,169 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
+
+import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import maybe_stub_sgl_kernel
+from sglang.test.test_utils import (
+    CustomTestCase,
+    enter_scope,
+    maybe_stub_sgl_kernel,
+    published_topology,
+)
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.distributed.parallel_state_wrapper import ParallelState  # noqa: E402
+from sglang.srt.managers.io_struct import (  # noqa: E402
+    ReleaseMemoryOccupationReqInput,
+    ReleaseMemoryOccupationReqOutput,
+)
 from sglang.srt.managers.scheduler_components.request_receiver import (  # noqa: E402
     SchedulerRequestReceiver,
 )
-from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin  # noqa: E402
+from sglang.srt.managers.scheduler_pp_mixin import (  # noqa: E402
+    PPBatchMetadata,
+    SchedulerPPMixin,
+)
+from sglang.srt.runtime_context import get_parallel  # noqa: E402
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
-def _make_ps(**overrides) -> ParallelState:
-    defaults = dict(
+def _published_topology():
+    """Publish WORLD rank 12 with TP=8 and PP=2.
+
+    This gives TP rank 4, PP rank 1, attention-DP rank 1, and attention-TP rank 0.
+    """
+    return published_topology(
+        role="scheduler",
+        ranks={"world_rank": 12, "dp_rank": 1},
         tp_size=8,
-        pp_rank=1,
         pp_size=2,
-        dp_rank=None,
-        attn_tp_size=2,
-        attn_cp_size=2,
-        attn_dp_rank=1,
         attn_dp_size=2,
-        moe_dp_rank=None,
+        attn_cp_size=2,
     )
-    defaults.update(overrides)
-    return ParallelState.trivial(**defaults)
 
 
 def _fake_group() -> SimpleNamespace:
     return SimpleNamespace(rank=0, ranks=[0], cpu_group=object())
 
 
-def _make_receiver(ps: ParallelState) -> SchedulerRequestReceiver:
-    group = _fake_group()
+def _make_receiver() -> SchedulerRequestReceiver:
     return SchedulerRequestReceiver(
         recv_from_tokenizer=None,
         recv_from_rpc=None,
         recv_skipper=None,
         input_blocker=None,
         mm_receiver=None,
-        ps=ps,
-        tp_group=group,
-        tp_cpu_group=group,
-        attn_tp_group=group,
-        attn_tp_cpu_group=group,
-        attn_cp_group=group,
-        attn_cp_cpu_group=group,
-        world_group=group,
         server_args=SimpleNamespace(
-            enable_dp_attention=True,
             enable_dp_attention_local_control_broadcast=False,
         ),
         model_config=SimpleNamespace(is_multimodal=False),
         max_recv_per_poll=-1,
-        stream_output=lambda *args, **kwargs: None,
+        request_retirer=None,
         get_last_batch=lambda: None,
+        rust_server_mode=False,
     )
+
+
+class TestRequestReceiverBroadcast(unittest.TestCase):
+    def test_local_control_skips_full_tp_broadcast_for_decode_dp(self):
+        # Decode uses pure DP attention (attn_tp=attn_cp=1). The DP controller
+        # sends control requests to every local leader, so no per-tick Gloo
+        # broadcast should remain in SchedulerRequestReceiver.
+        receiver = _make_receiver()
+        control_req = SimpleNamespace(kind="control")
+        parallel = SimpleNamespace(
+            attn_dp_enabled=True,
+            enable_dp_attention_local_control_broadcast=True,
+            attn_tp_rank=0,
+            attn_cp_rank=0,
+            attn_tp_size=1,
+            attn_cp_size=1,
+            tp_size=32,
+        )
+
+        with (
+            patch(
+                "sglang.srt.managers.scheduler_components.request_receiver."
+                "get_parallel",
+                return_value=parallel,
+            ),
+            patch(
+                "sglang.srt.managers.scheduler_components.request_receiver."
+                "attn_cp_tp_broadcast_pyobj",
+                side_effect=lambda requests: requests,
+            ),
+            patch(
+                "sglang.srt.managers.scheduler_components.request_receiver."
+                "broadcast_pyobj"
+            ) as broadcast,
+        ):
+            result = receiver._broadcast_reqs_across_ranks([control_req])
+
+        self.assertEqual(result, [control_req])
+        broadcast.assert_not_called()
+
+    def test_default_control_uses_full_tp_broadcast(self):
+        receiver = _make_receiver()
+        control_req = SimpleNamespace(kind="control")
+        parallel = SimpleNamespace(
+            attn_dp_enabled=True,
+            enable_dp_attention_local_control_broadcast=False,
+            attn_tp_rank=0,
+            attn_cp_rank=0,
+            attn_tp_size=1,
+            attn_cp_size=1,
+            tp_size=32,
+            tp_group=_fake_group(),
+        )
+
+        with (
+            patch(
+                "sglang.srt.managers.scheduler_components.request_receiver."
+                "get_parallel",
+                return_value=parallel,
+            ),
+            patch(
+                "sglang.srt.managers.scheduler_components.request_receiver.get_exec",
+                return_value=SimpleNamespace(
+                    moe=SimpleNamespace(is_ep_scale_joiner=False)
+                ),
+            ),
+            patch(
+                "sglang.srt.managers.scheduler_components.request_receiver."
+                "attn_cp_tp_broadcast_pyobj",
+                side_effect=lambda requests: requests,
+            ),
+            patch(
+                "sglang.srt.managers.scheduler_components.request_receiver."
+                "broadcast_pyobj",
+                side_effect=lambda requests, *_args, **_kwargs: requests,
+            ) as broadcast,
+        ):
+            result = receiver._broadcast_reqs_across_ranks([control_req])
+
+        self.assertEqual(result, [control_req])
+        broadcast.assert_called_once_with(
+            [control_req],
+            parallel.tp_group.rank,
+            parallel.tp_group.cpu_group,
+            src=parallel.tp_group.ranks[0],
+        )
 
 
 class TestPPCPRankOffsets(unittest.TestCase):
     def test_request_receiver_uses_cp_size_for_pp_recv_rank(self):
-        ps = _make_ps()
+        enter_scope(self, _published_topology())
+        enter_scope(self, get_parallel().override(world_group=_fake_group()))
         calls = []
 
         def fake_point_to_point_pyobj(data, rank, group, src, dst, **kwargs):
             calls.append((rank, src, dst))
             return ["req"]
 
-        receiver = _make_receiver(ps)
+        receiver = _make_receiver()
         with patch(
             "sglang.srt.managers.scheduler_components.request_receiver."
             "point_to_point_pyobj",
@@ -83,9 +174,8 @@ class TestPPCPRankOffsets(unittest.TestCase):
         self.assertEqual(calls, [(12, 4, 12)])
 
     def test_pp_mixin_uses_cp_size_for_pyobj_send_and_recv_rank(self):
-        ps = _make_ps()
+        enter_scope(self, _published_topology())
         scheduler = SchedulerPPMixin()
-        scheduler.ps = ps
         scheduler.world_group = _fake_group()
         scheduler.attn_tp_group = _fake_group()
         scheduler.attn_tp_cpu_group = _fake_group()
@@ -120,6 +210,130 @@ class TestPPCPRankOffsets(unittest.TestCase):
                 (12, 4, 12, False),
             ],
         )
+
+
+class TestDSparkPPOutput(CustomTestCase):
+    def test_output_ring_rebinds_dspark_state_on_each_stage(self):
+        from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+        from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
+        from sglang.srt.speculative.dspark_components.dspark_draft import (
+            make_next_draft_input,
+        )
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        payloads = []
+        scheduler = SimpleNamespace(
+            _pp_spec_relay=False,
+            pp_group=SimpleNamespace(is_first_rank=False),
+            future_map=SimpleNamespace(
+                stash=lambda indices, value: payloads.append(value)
+            ),
+        )
+        tokens = torch.tensor([13, 29])
+        batch = SimpleNamespace(
+            return_logprob=False,
+            req_pool_indices=torch.tensor([0, 1]),
+            seq_lens=torch.tensor([8, 15]),
+            spec_algorithm=SpeculativeAlgorithm.DSPARK,
+            spec_info=object(),
+        )
+        wire = SchedulerPPMixin._pp_prepare_tensor_dict(
+            scheduler,
+            SimpleNamespace(
+                next_token_ids=tokens,
+                next_draft_input=make_next_draft_input(
+                    bonus_tokens=tokens, new_seq_lens=batch.seq_lens
+                ),
+                logits_output=None,
+                routed_experts_output=None,
+            ),
+            batch,
+        )
+        self.assertNotIn("draft_topk_p", wire)
+        result = SchedulerPPMixin._pp_prep_batch_result(
+            scheduler,
+            batch,
+            PPBatchMetadata(can_run_cuda_graph=False),
+            PPProxyTensors(wire),
+        )
+        self.assertIsInstance(result.next_draft_input, DFlashDraftInputV2)
+        self.assertIs(batch.spec_info, result.next_draft_input)
+        torch.testing.assert_close(batch.spec_info.bonus_tokens, tokens)
+        torch.testing.assert_close(batch.spec_info.new_seq_lens, batch.seq_lens)
+        torch.testing.assert_close(payloads[0].bonus_tokens, tokens)
+        self.assertEqual(payloads[0].hidden_states.numel(), 0)
+
+
+class TestReleaseVerdictRing(CustomTestCase):
+    REQUEST = ReleaseMemoryOccupationReqInput()
+    RELEASED = ReleaseMemoryOccupationReqOutput(success=True, message="Success")
+    REFUSED = ReleaseMemoryOccupationReqOutput(success=False, message="busy")
+
+    def _stage(self, *, is_first_rank, is_last_rank=False, from_prev_stage=None):
+        return SimpleNamespace(
+            pp_group=SimpleNamespace(
+                is_first_rank=is_first_rank, is_last_rank=is_last_rank
+            ),
+            _pp_release_reqs_awaiting_verdict=(),
+            _pp_release_verdict_send_work=[],
+            _pp_commit_comm_work=Mock(),
+            _pp_send_pyobj_to_next_stage=Mock(return_value=["send"]),
+            _pp_recv_pyobj_from_prev_stage=Mock(return_value=from_prev_stage),
+            send_control_output=Mock(),
+        )
+
+    def test_the_first_stage_answers_with_the_verdict_that_came_round(self):
+        """Answering at dispatch tells the caller memory is free while later stages hold it."""
+        stage = self._stage(is_first_rank=True, from_prev_stage=[self.REFUSED])
+
+        SchedulerPPMixin._pp_pass_release_verdict(stage, self.RELEASED, self.REQUEST)
+        stage.send_control_output.assert_not_called()
+
+        SchedulerPPMixin._pp_answer_release_requests(stage)
+        stage.send_control_output.assert_called_once_with(self.REFUSED, self.REQUEST)
+
+    def test_a_busy_first_stage_answers_without_waiting_for_later_stages(self):
+        """Later stages need the first stage's next iterations to reach the request."""
+        stage = self._stage(is_first_rank=True)
+
+        SchedulerPPMixin._pp_pass_release_verdict(stage, self.REFUSED, self.REQUEST)
+
+        stage.send_control_output.assert_called_once_with(self.REFUSED, self.REQUEST)
+        self.assertEqual(stage._pp_release_reqs_awaiting_verdict, ())
+
+    def test_a_later_stage_passes_on_an_earlier_refusal(self):
+        stage = self._stage(is_first_rank=False, from_prev_stage=[True, self.REFUSED])
+
+        SchedulerPPMixin._pp_pass_release_verdict(stage, self.RELEASED, self.REQUEST)
+
+        (sent,), _ = stage._pp_send_pyobj_to_next_stage.call_args
+        self.assertEqual(sent, [True, self.REFUSED])
+
+    def test_verdict_sends_wait_until_the_requests_are_relayed(self):
+        """The next stage receives a verdict only after the request list, so waiting
+        on a send between two requests of one poll never returns."""
+        stage = self._stage(is_first_rank=True)
+
+        for _ in range(2):
+            SchedulerPPMixin._pp_pass_release_verdict(
+                stage, self.RELEASED, self.REQUEST
+            )
+        stage._pp_commit_comm_work.assert_not_called()
+
+        relayed = SchedulerPPMixin._pp_send_reqs_to_next_stage(stage, [])
+        self.assertEqual(relayed, ["send", "send", "send"])
+        self.assertEqual(stage._pp_release_verdict_send_work, [])
+
+    def test_the_last_stage_replies_only_to_a_first_stage_that_waits(self):
+        stage = self._stage(
+            is_first_rank=False,
+            is_last_rank=True,
+            from_prev_stage=[False, self.REFUSED],
+        )
+
+        SchedulerPPMixin._pp_pass_release_verdict(stage, self.RELEASED, self.REQUEST)
+
+        stage._pp_send_pyobj_to_next_stage.assert_not_called()
 
 
 if __name__ == "__main__":

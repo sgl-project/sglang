@@ -7,6 +7,9 @@ import torch
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     is_layerwise_offloaded_module,
 )
+from sglang.multimodal_gen.runtime.managers.memory_managers.weight_snapshot import (
+    restore_weight_snapshot,
+)
 from sglang.multimodal_gen.runtime.pipelines_core import ComposedPipelineBase
 from sglang.multimodal_gen.runtime.post_training.weights_updater import (
     get_updatable_modules,
@@ -20,7 +23,7 @@ def _module_to_pinned_cpu(module: torch.nn.Module) -> None:
     # Async D2H into pinned host memory; caller synchronizes once after the batch.
     for t in list(module.parameters()) + list(module.buffers()):
         if t.device.type == "cuda":
-            # Mirror stride/layout like srt/utils/offloader.py: torch.empty() would force
+            # Mirror stride/layout like srt/layers/offloader.py: torch.empty() would force
             # contiguous and silently drop channels_last_3d VAE weights.
             pin = torch.empty_strided(
                 size=t.size(),
@@ -78,6 +81,14 @@ def _move_unregistered_tensors(module: torch.nn.Module, device: str) -> None:
             attrs[attr_name] = moved_value
 
 
+def _release_cuda_graphs(module: torch.nn.Module) -> None:
+    # Graph pools and captured outputs stay on the GPU after the weights move.
+    for submodule in module.modules():
+        release = getattr(submodule, "release_cuda_graphs", None)
+        if callable(release):
+            release()
+
+
 def _is_layerwise_offload_managed(module: torch.nn.Module) -> bool:
     return is_layerwise_offloaded_module(module)
 
@@ -132,7 +143,8 @@ class MemoryOccupationController:
                 module = modules[name]
                 src_device_map[name] = _get_module_device(module)
                 if device.startswith("cpu"):
-                    _module_to_pinned_cpu(module)
+                    if not restore_weight_snapshot(module):
+                        _module_to_pinned_cpu(module)
                 else:
                     module.to(device, non_blocking=True)
                 moved.append(name)
@@ -154,6 +166,8 @@ class MemoryOccupationController:
     def _offload_active_modules_to_cpu(self) -> dict[str, str]:
         restore_map: dict[str, str] = {}
         for name, module in get_updatable_modules(self.pipeline).items():
+            # also for modules already offloaded between uses
+            _release_cuda_graphs(module)
             if _is_layerwise_offload_managed(module):
                 continue
             device = _get_module_device(module)

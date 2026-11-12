@@ -55,6 +55,7 @@ from sglang.srt.entrypoints.openai.streaming_asr import (
 )
 from sglang.srt.entrypoints.openai.transcription_adapters import resolve_adapter
 from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.runtime_context import get_serving
 
 if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
@@ -74,7 +75,7 @@ class OpenAIServingTranscription(OpenAIServingBase):
         # Cap concurrent /v1/realtime sessions. The Semaphore is bound to the
         # event loop on first acquire (uvicorn's loop in normal serving).
         self._session_semaphore = asyncio.Semaphore(
-            tokenizer_manager.server_args.asr_max_concurrent_sessions
+            get_serving().asr_max_concurrent_sessions
         )
 
     def _request_id_prefix(self) -> str:
@@ -118,7 +119,7 @@ class OpenAIServingTranscription(OpenAIServingBase):
             # soundfile can't parse some containers (e.g. mp3 on older
             # libsndfile builds); fall back to a full decode.
             try:
-                from sglang.srt.utils import load_audio
+                from sglang.srt.multimodal.media_io import load_audio
 
                 audio = load_audio(audio_data, sr=16000, mono=True)
                 return audio.shape[-1] / 16000.0
@@ -498,11 +499,7 @@ class OpenAIServingTranscription(OpenAIServingBase):
         # the cumulative text. Always reconstruct cumulative text locally
         # so the rest of the loop (prefix parse + visible-buffer slice)
         # works uniformly under either mode.
-        incremental = getattr(
-            self.tokenizer_manager.server_args,
-            "incremental_streaming_output",
-            False,
-        )
+        incremental = get_serving().incremental_streaming_output
         cumulative_text = ""
 
         try:
@@ -613,11 +610,7 @@ class OpenAIServingTranscription(OpenAIServingBase):
         model = request.model
         fused_mode = getattr(request, "_fused_autodetect", False)
         ts_variant = getattr(request, "_fused_ts_variant", False)
-        incremental = getattr(
-            self.tokenizer_manager.server_args,
-            "incremental_streaming_output",
-            False,
-        )
+        incremental = get_serving().incremental_streaming_output
 
         def _frame(delta: Optional[str], finish_reason: Optional[str] = None) -> str:
             chunk = TranscriptionStreamResponse(

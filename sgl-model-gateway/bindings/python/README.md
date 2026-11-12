@@ -18,9 +18,8 @@ bindings/python/
 │       └── mini_lb.py
 ├── tests/                  # Python unit tests
 │   ├── conftest.py
-│   ├── test_validation.py
 │   ├── test_arg_parser.py
-│   ├── test_router_config.py
+│   ├── test_pyo3_binding.py
 │   └── test_startup_sequence.py
 ├── Cargo.toml              # Rust package configuration for bindings
 ├── pyproject.toml          # Python package configuration

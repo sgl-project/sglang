@@ -1,5 +1,113 @@
+import torch
 import triton
 import triton.language as tl
+
+# The request-to-token assignment scan still specializes on this width.
+# Paged extend/decode allocation below uses fixed blocks for every batch size.
+_MIN_BATCH_SCAN_WIDTH = 64
+
+
+def batch_scan_width(bs: int) -> int:
+    return max(1 << max(bs - 1, 0).bit_length(), _MIN_BATCH_SCAN_WIDTH)
+
+
+@triton.jit(do_not_specialize=["num_pages", "full_page_representatives"])
+def get_and_clear_swa_pages_kernel(
+    full_page_representatives,
+    mapping,
+    swa_pages,
+    peers_mapped,
+    page_mappings_valid,
+    num_pages,
+    index_stride: tl.constexpr,
+    page_size: tl.constexpr,
+    CHECK_PAGE_MAPPINGS: tl.constexpr,
+    BLOCK_PAGES: tl.constexpr,
+    BLOCK_OFFSETS: tl.constexpr,
+):
+    rep_offsets = tl.program_id(0) * BLOCK_PAGES + tl.arange(0, BLOCK_PAGES)
+    rep_mask = rep_offsets < num_pages
+    full_reps = tl.load(
+        full_page_representatives + rep_offsets * index_stride,
+        mask=rep_mask,
+        other=0,
+    ).to(tl.int64)
+
+    # Resolve one SWA page per FULL-page representative:
+    # swa_reps = mapping[full_reps]
+    # swa_pages = swa_reps // page_size
+    swa_reps = tl.load(mapping + full_reps, mask=rep_mask, other=0)
+    tl.store(swa_pages + rep_offsets, swa_reps // page_size, mask=rep_mask)
+    tl.store(peers_mapped + rep_offsets, swa_reps > 0, mask=rep_mask)
+
+    page_offsets = tl.arange(0, BLOCK_OFFSETS)
+    full_page_starts = full_reps // page_size * page_size
+    mapping_offsets = full_page_starts[:, None] + page_offsets[None, :]
+    mapping_mask = rep_mask[:, None] & (page_offsets[None, :] < page_size)
+    if CHECK_PAGE_MAPPINGS:
+        page_mapping = tl.load(
+            mapping + mapping_offsets,
+            mask=mapping_mask,
+            other=0,
+        )
+        # Ignore zeros; each mapped slot must share its representative's SWA page.
+        same_swa_page = page_mapping // page_size == swa_reps[:, None] // page_size
+        page_mapping_valid = (swa_reps > 0) & (
+            tl.sum(((page_mapping > 0) & ~same_swa_page).to(tl.int32), axis=1) == 0
+        )
+        tl.store(
+            page_mappings_valid + rep_offsets,
+            page_mapping_valid,
+            mask=rep_mask,
+        )
+
+    # `mapping_offsets` includes `full_reps`. Finish every `mapping[full_reps]`
+    # load before any warp clears `mapping[mapping_offsets]`.
+    tl.debug_barrier()
+    tl.store(
+        mapping + mapping_offsets,
+        0,
+        mask=mapping_mask,
+    )
+
+
+def get_and_clear_swa_pages(
+    full_page_representatives: torch.Tensor,
+    mapping: torch.Tensor,
+    page_size: int,
+    check_page_mappings: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """Resolve and clear mappings; input must represent distinct FULL pages."""
+    if check_page_mappings:
+        assert torch.all(
+            (full_page_representatives >= 0)
+            & (full_page_representatives < mapping.numel() // page_size * page_size)
+        ), "FULL page representative out of bounds"
+    num_pages = full_page_representatives.numel()
+    swa_pages = torch.empty(num_pages, dtype=mapping.dtype, device=mapping.device)
+    peers_mapped = torch.empty(num_pages, dtype=torch.bool, device=mapping.device)
+    page_mappings_valid = (
+        torch.empty(num_pages, dtype=torch.bool, device=mapping.device)
+        if check_page_mappings
+        else None
+    )
+    if num_pages:
+        block_offsets = triton.next_power_of_2(page_size)
+        block_pages = max(1, 256 // block_offsets)
+        get_and_clear_swa_pages_kernel[(triton.cdiv(num_pages, block_pages),)](
+            full_page_representatives,
+            mapping,
+            swa_pages,
+            peers_mapped,
+            page_mappings_valid if page_mappings_valid is not None else peers_mapped,
+            num_pages,
+            full_page_representatives.stride(0),
+            page_size,
+            check_page_mappings,
+            block_pages,
+            block_offsets,
+        )
+    return swa_pages, peers_mapped, page_mappings_valid
 
 
 # free_page_ptr aliases self.free_pages, which the paged allocator re-slices
@@ -19,15 +127,27 @@ def alloc_extend_kernel(
     last_loc_ptr,
     free_page_ptr,
     out_indices,
-    bs_upper: tl.constexpr,
     page_size: tl.constexpr,
 ):
     pid = tl.program_id(0)
 
-    load_offset = tl.arange(0, bs_upper)
-    seq_lens = tl.load(seq_lens_ptr + load_offset, mask=load_offset <= pid)
-    pre_lens = tl.load(pre_lens_ptr + load_offset, mask=load_offset <= pid)
+    # A fixed-width scan avoids recompilation as the running batch grows.
+    BLOCK_BS: tl.constexpr = 256
+    load_offset = tl.arange(0, BLOCK_BS)
+    seq_lens = tl.load(seq_lens_ptr + load_offset, mask=load_offset <= pid, other=0)
+    pre_lens = tl.load(pre_lens_ptr + load_offset, mask=load_offset <= pid, other=0)
     extend_lens = seq_lens - pre_lens
+    num_new_pages = (seq_lens + page_size - 1) // page_size - (
+        pre_lens + page_size - 1
+    ) // page_size
+    for block_start in range(BLOCK_BS, pid + 1, BLOCK_BS):
+        load_offset = block_start + tl.arange(0, BLOCK_BS)
+        seq_lens = tl.load(seq_lens_ptr + load_offset, mask=load_offset <= pid, other=0)
+        pre_lens = tl.load(pre_lens_ptr + load_offset, mask=load_offset <= pid, other=0)
+        extend_lens += seq_lens - pre_lens
+        num_new_pages += (seq_lens + page_size - 1) // page_size - (
+            pre_lens + page_size - 1
+        ) // page_size
 
     seq_len = tl.load(seq_lens_ptr + pid)
     pre_len = tl.load(pre_lens_ptr + pid)
@@ -35,10 +155,6 @@ def alloc_extend_kernel(
 
     sum_extend_lens = tl.sum(extend_lens)
     output_start_loc = sum_extend_lens - extend_len
-
-    num_pages_after = (seq_lens + page_size - 1) // page_size
-    num_pages_before = (pre_lens + page_size - 1) // page_size
-    num_new_pages = num_pages_after - num_pages_before
 
     num_page_start_loc_self = (seq_len + page_size - 1) // page_size - (
         pre_len + page_size - 1
@@ -105,21 +221,29 @@ def alloc_decode_kernel(
     last_loc_ptr,
     free_page_ptr,
     out_indices,
-    bs_upper: tl.constexpr,
     page_size: tl.constexpr,
 ):
     pid = tl.program_id(0)
 
-    load_offset = tl.arange(0, bs_upper)
-    seq_lens = tl.load(seq_lens_ptr + load_offset, mask=load_offset <= pid)
-    pre_lens = tl.where(load_offset <= pid, seq_lens - 1, seq_lens)
+    BLOCK_BS: tl.constexpr = 256
+    load_offset = tl.arange(0, BLOCK_BS)
+    mask = load_offset <= pid
+    seq_lens = tl.load(seq_lens_ptr + load_offset, mask=mask, other=0)
+    pre_lens = tl.where(mask, seq_lens - 1, seq_lens)
+    num_new_pages = (seq_lens + page_size - 1) // page_size - (
+        pre_lens + page_size - 1
+    ) // page_size
+    for block_start in range(BLOCK_BS, pid + 1, BLOCK_BS):
+        load_offset = block_start + tl.arange(0, BLOCK_BS)
+        mask = load_offset <= pid
+        seq_lens = tl.load(seq_lens_ptr + load_offset, mask=mask, other=0)
+        pre_lens = tl.where(mask, seq_lens - 1, seq_lens)
+        num_new_pages += (seq_lens + page_size - 1) // page_size - (
+            pre_lens + page_size - 1
+        ) // page_size
 
     seq_len = tl.load(seq_lens_ptr + pid)
     pre_len = seq_len - 1
-
-    num_pages_after = (seq_lens + page_size - 1) // page_size
-    num_pages_before = (pre_lens + page_size - 1) // page_size
-    num_new_pages = num_pages_after - num_pages_before
 
     num_page_start_loc_self = (seq_len + page_size - 1) // page_size - (
         pre_len + page_size - 1

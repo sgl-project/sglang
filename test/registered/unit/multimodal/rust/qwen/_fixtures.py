@@ -6,6 +6,7 @@ from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import WhitespaceSplit
 from transformers import (
     PreTrainedTokenizerFast,
+    Qwen2_5_VLConfig,
     Qwen2VLProcessor,
     Qwen2VLVideoProcessor,
 )
@@ -57,20 +58,19 @@ def make_processor(case, config, image_processor_cls=None):
         video_processor=Qwen2VLVideoProcessor(),
         tokenizer=tokenizer,
     )
-    hf_config = SimpleNamespace(
-        model_type="qwen2_5_vl",
+    hf_config = Qwen2_5_VLConfig(
         architectures=["Qwen2_5_VLForConditionalGeneration"],
         vision_start_token_id=1,
         image_token_id=2,
         vision_end_token_id=3,
         video_token_id=5,
-        vision_config=SimpleNamespace(spatial_merge_size=2, tokens_per_second=2),
+        vision_config={"spatial_merge_size": 2, "tokens_per_second": 2},
     )
     server_args = SimpleNamespace(
         # Non-auto: get_resolved_model_impl would choke on a SimpleNamespace.
         model_impl="sglang",
-        keep_mm_feature_on_device=False,
         mm_feature_transport="cpu",
+        mm_enable_dp_encoder=False,
         image_processor_backend="auto",
         disable_fast_image_processor=True,
         skip_tokenizer_init=False,
@@ -94,6 +94,11 @@ def make_processor(case, config, image_processor_cls=None):
     publish(
         ServerArgs(
             model_path="dummy",
+            # Mirrored for the same reason the stub sets it: `get_mm_processor_cls`
+            # reads `model_impl` from this bag now, and "auto" would send it into
+            # `get_resolved_model_impl`, which chokes on the SimpleNamespace
+            # `model_config` these tests hand it.
+            model_impl=server_args.model_impl,
             mm_feature_transport=server_args.mm_feature_transport,
             mm_process_config=server_args.mm_process_config,
             allowed_media_domains=server_args.allowed_media_domains,

@@ -5,12 +5,14 @@ from unittest.mock import MagicMock
 
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 from sglang.srt.mem_cache.common import evict_from_tree_cache
+from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.tree_slots import index_slots
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestUnifiedRadixAllocationEviction(CustomTestCase):
@@ -19,14 +21,20 @@ class TestUnifiedRadixAllocationEviction(CustomTestCase):
         cache = object.__new__(UnifiedRadixCache)
         cache.disable = False
         cache.tree_components = (ComponentType.FULL, ComponentType.MAMBA)
+        index_slots(cache, cache.tree_components)
         cache.is_swa_enabled = False
+        cache.evicts_by_joint_lru = False
         cache.cache_controller = None
         cache.metrics_collector = None
         cache.tree_core = MagicMock()
+        cache.tree_core.full_evictable_size.return_value = 80
 
         capacity = {"available": 30}
         allocator = MagicMock()
         allocator.available_size.side_effect = lambda: capacity["available"]
+        allocator.owner_available_size.side_effect = lambda: capacity["available"]
+        # Pools that share no memory: the tree walks each target itself.
+        allocator.pools_share_memory = False
         cache.token_to_kv_pool_allocator = allocator
         cache.req_to_token_pool = MagicMock()
 
@@ -53,12 +61,40 @@ class TestUnifiedRadixAllocationEviction(CustomTestCase):
     def test_allocation_eviction_stops_when_shared_capacity_is_sufficient(self):
         cache, capacity, leaf_count = self._build_cache(collateral_capacity_gain=70)
 
-        result = cache.evict_for_alloc(EvictParams(num_tokens=70))
+        # 30 available: a 100-token demand is 70 short.
+        result = cache.evict_for_alloc(KVDemand(full_tokens=100))
 
         self.assertEqual(capacity["available"], 100)
         self.assertEqual(leaf_count["value"], 1)
         self.assertEqual(result.num_tokens_evicted, 20)
         self.assertEqual(result.mamba_num_evicted, 1)
+
+    def test_allocation_eviction_runs_to_the_target_when_frees_stay_hidden(self):
+        """An allocator can hide freed pages behind a clamp or page rounding, so
+        freeing exactly the shortfall may leave the demand unmet; an
+        allocation-driven FULL walk must keep going until the demand fits."""
+        cache, capacity, leaf_count = self._build_cache(collateral_capacity_gain=0)
+        cache.tree_core.full_evictable_size.return_value = 60
+        quota = {}
+        cache.tree_core.evict_device_start.side_effect = quota.__setitem__
+
+        def next_node(component_type, tracker):
+            # The tree yields victims only up to the quota the walk opened with.
+            if tracker[component_type] >= quota[component_type]:
+                return None, False
+            return leaf_count["value"] + 1, True
+
+        cache._evict_device_next_node.side_effect = next_node
+
+        # 30 available: a 50-token demand is 20 short.
+        result = cache.evict_for_alloc(KVDemand(full_tokens=50))
+
+        self.assertEqual(leaf_count["value"], 2)
+        self.assertEqual(capacity["available"], 50)
+        self.assertEqual(result.num_tokens_evicted, 40)
+        cache.tree_core.evict_device_start.assert_called_once_with(
+            ComponentType.FULL, 60
+        )
 
     def test_explicit_evict_preserves_component_count_semantics(self):
         cache, _, leaf_count = self._build_cache(collateral_capacity_gain=70)
@@ -86,18 +122,21 @@ class TestUnifiedRadixAllocationEviction(CustomTestCase):
         cache = object.__new__(UnifiedRadixCache)
         cache.disable = False
         cache.tree_components = (ComponentType.FULL, ComponentType.MAMBA)
+        index_slots(cache, cache.tree_components)
         cache.is_swa_enabled = False
         cache.cache_controller = None
         cache.metrics_collector = None
         cache.tree_core = MagicMock()
         cache.token_to_kv_pool_allocator = MagicMock()
+        cache.token_to_kv_pool_allocator.pools_share_memory = False
 
         capacity = {"available": 0}
         mamba_allocator = MagicMock()
         mamba_allocator.schedulable_available_size.side_effect = lambda: capacity[
             "available"
         ]
-        cache.req_to_token_pool = MagicMock(mamba_allocator=mamba_allocator)
+        cache.token_to_kv_pool_allocator.state_slots = mamba_allocator
+        cache.req_to_token_pool = MagicMock()
 
         def next_node(component_type, tracker):
             return (None, False) if tracker[component_type] >= 3 else (1, True)
@@ -111,7 +150,7 @@ class TestUnifiedRadixAllocationEviction(CustomTestCase):
         cache._evict_device_next_node = MagicMock(side_effect=next_node)
         cache._evict_device_leaf = MagicMock(side_effect=evict_leaf)
 
-        result = cache.evict_for_alloc(EvictParams(mamba_num=3))
+        result = cache.evict_for_alloc(KVDemand(state_slots=3))
 
         self.assertEqual(capacity["available"], 3)
         self.assertEqual(result.num_tokens_evicted, 20)
@@ -119,13 +158,61 @@ class TestUnifiedRadixAllocationEviction(CustomTestCase):
 
     def test_common_helper_uses_allocation_aware_entry_point(self):
         tree_cache = MagicMock()
-        tree_cache.is_chunk_cache.return_value = False
-        tree_cache.token_to_kv_pool_allocator.available_size.return_value = 30
+        tree_cache.supports_prefix_sharing.return_value = True
+        from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
+
+        allocator = object.__new__(TokenToKVPoolAllocator)
+        allocator.available_size = lambda: 30
+        tree_cache.token_to_kv_pool_allocator = allocator
 
         evict_from_tree_cache(tree_cache, num_tokens=100)
 
-        tree_cache.evict_for_alloc.assert_called_once_with(EvictParams(num_tokens=70))
+        tree_cache.evict_for_alloc.assert_called_once_with(KVDemand(full_tokens=100))
         tree_cache.evict.assert_not_called()
+
+    def test_default_cache_evicts_the_shortfall_of_a_demand(self):
+        from types import SimpleNamespace
+
+        from sglang.srt.mem_cache.base_prefix_cache import (
+            BasePrefixCache,
+            EvictResult,
+        )
+
+        for supports_swa, demand, expected in [
+            (False, KVDemand(full_tokens=100), EvictParams(num_tokens=70)),
+            (False, KVDemand(full_tokens=30), None),
+            (
+                True,
+                KVDemand(full_tokens=100, window_tokens={"swa": 100}),
+                EvictParams(num_tokens=60, window_num_tokens={"swa": 90}),
+            ),
+            (True, KVDemand(full_tokens=40, window_tokens={"swa": 10}), None),
+        ]:
+            with self.subTest(supports_swa=supports_swa, demand=demand):
+                # Pools of their own; a window pool beside the token pool
+                # leaves the token pool its full side (40 of 30 + 10).
+                allocator = SimpleNamespace(
+                    pools_share_memory=False,
+                    owner_available_size=lambda: 40 if supports_swa else 30,
+                    window_available_size=lambda name: 10,
+                )
+                cache = SimpleNamespace(
+                    token_to_kv_pool_allocator=allocator,
+                    supports_swa=lambda: supports_swa,
+                    window_sub_pools=lambda: (("swa", 4),) if supports_swa else (),
+                    window_available_size=lambda name: allocator.window_available_size(
+                        name
+                    ),
+                    evict=MagicMock(return_value=EvictResult(num_tokens_evicted=1)),
+                )
+                cache.evict_pool_shortfalls = lambda d, cache=cache: (
+                    BasePrefixCache.evict_pool_shortfalls(cache, d)
+                )
+                BasePrefixCache.evict_for_alloc(cache, demand)
+                if expected is None:
+                    cache.evict.assert_not_called()
+                else:
+                    cache.evict.assert_called_once_with(expected)
 
 
 if __name__ == "__main__":

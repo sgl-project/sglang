@@ -16,6 +16,7 @@
 """Inference-only MiniCPM-o model compatible with HuggingFace weights."""
 
 import math
+from array import array
 from dataclasses import dataclass
 from typing import Any, Iterable, List, Literal, Optional, Tuple, Union
 
@@ -39,22 +40,18 @@ from transformers.models.whisper.modeling_whisper import (
 
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternTokenPairs,
     general_mm_embed_routine,
+    pad_mm_token_pairs,
 )
-from sglang.srt.managers.schedule_batch import (
-    MultimodalDataItem,
-    MultimodalInputFormat,
-    MultimodalInputs,
-    flatten_nested_list,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.idefics2 import Idefics2VisionTransformer
 from sglang.srt.models.minicpmv import MiniCPMBaseModel, Resampler2_5
 from sglang.srt.models.qwen2 import Qwen2ForCausalLM
-from sglang.srt.utils import get_device, logger
+from sglang.srt.multimodal.modality import MultimodalInputFormat
+from sglang.srt.utils import flatten_nested_list, get_device, logger
 
 try:
     # `LogitsWarper` was removed in transformers v4.48 (merged into
@@ -1518,7 +1515,7 @@ class MiniCPMO(MiniCPMBaseModel):
 
         return resampler.to(device=get_device(), dtype=torch.get_default_dtype())
 
-    def pad_input_ids(self, input_ids: List[int], mm_input: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, mm_input: MultimodalInputs) -> array:
         # Get all special token IDs
         im_start_id: int = mm_input.im_start_id
         im_end_id: int = mm_input.im_end_id
@@ -1531,11 +1528,13 @@ class MiniCPMO(MiniCPMBaseModel):
             (mm_input.audio_start_id, mm_input.audio_end_id),
         ]
         data_start_token_ids = [im_start_id, mm_input.audio_start_id]
-        pattern = MultiModalityDataPaddingPatternTokenPairs(
-            data_token_pairs=data_token_pairs, data_start_token_ids=data_start_token_ids
-        )
 
-        return pattern.pad_input_tokens(input_ids, mm_input)
+        return pad_mm_token_pairs(
+            input_ids,
+            mm_input,
+            data_token_pairs=data_token_pairs,
+            data_start_token_ids=data_start_token_ids,
+        )
 
     def _get_feat_extract_output_lengths(self, input_lengths: torch.LongTensor):
         """

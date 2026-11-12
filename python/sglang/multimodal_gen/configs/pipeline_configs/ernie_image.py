@@ -11,10 +11,10 @@ from sglang.multimodal_gen.configs.models.encoders.mistral3 import Mistral3Encod
 from sglang.multimodal_gen.configs.models.vaes.ernie_image import ErnieImageVAEConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ImagePipelineConfig,
-    ModelTaskType,
     pad_text_embeddings_with_mask,
     shard_rotary_emb_for_sp,
 )
+from sglang.multimodal_gen.configs.task_type import ModelTaskType
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -130,6 +130,10 @@ class ErnieImagePipelineConfig(ImagePipelineConfig):
         num_channels = self.dit_config.arch_config.in_channels  # 128
         shape = (batch_size, num_channels, latent_h, latent_w)
         return shape
+
+    def shard_latents_for_sp(self, batch, latents):
+        # The DiT shards tokens after embedding the spatial latent tensor.
+        return latents, False
 
     def maybe_pack_latents(self, latents, batch_size, batch):
         return latents
@@ -258,3 +262,22 @@ class ErnieImagePipelineConfig(ImagePipelineConfig):
 
     def post_denoising_loop(self, latents, batch):
         return latents
+
+
+def register():
+    from sglang.multimodal_gen.configs.sample.ernie_image import (
+        ErnieImageSamplingParams,
+    )
+    from sglang.multimodal_gen.registry import register_configs
+
+    register_configs(
+        sampling_param_cls=ErnieImageSamplingParams,
+        pipeline_config_cls=ErnieImagePipelineConfig,
+        hf_model_paths=[
+            "baidu/ERNIE-Image",
+            "baidu/ERNIE-Image-Turbo",
+        ],
+        model_detectors=[
+            lambda hf_id: "ernie-image" in hf_id.lower(),
+        ],
+    )

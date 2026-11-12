@@ -55,7 +55,7 @@ class TestMemoryConsumptionAscend(CustomTestCase):
                 "2",
                 "--mem-fraction-static",
                 "0.8",
-                "--cuda-graph-bs",
+                "--cuda-graph-bs-decode",
                 "1",
                 "--max-total-tokens",
                 "1024",

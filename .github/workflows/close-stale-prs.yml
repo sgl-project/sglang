@@ -38,7 +38,7 @@ jobs:
             const QUOTA_IDLE = 7;
             const STALE_DAYS = 90;
 
-            const KEEP_LABELS = new Set(['high priority', 'keep-open', 'good first issue']);
+            const KEEP_LABELS = new Set(['highest-priority', 'keep-open', 'good first issue']);
             const WIP_MARKER = /^\s*\[?\s*(wip|do[ _-]?not[ _-]?merge|dnm|draft)\s*\]?/i;
 
             // Scheduled runs always act; only manual runs can be dry.

@@ -53,7 +53,7 @@ export const config = {
     flags.some((flag) => flag === "--hicache-storage-backend mooncake"),
 
   benchmarkCommands: {
-    speed: `python3 -m sglang.bench_serving \\
+    speed: `python3 -m sglang.benchmark.serving \\
   --backend sglang \\
   --host {{CURL_HOST}} --port {{CURL_PORT}} \\
   --model {{MODEL_NAME}} \\
@@ -114,7 +114,7 @@ sgl-eval run gsm8k \\
     hicache: {
       defaultBackend: "mooncake",
       requiredFlags: [
-        "--mamba-scheduler-strategy extra_buffer",
+        "--mamba-radix-cache-strategy extra_buffer",
         "--enable-cache-report",
       ],
       backends: [
@@ -618,7 +618,7 @@ sgl-eval run gsm8k \\
         "--hicache-storage-backend mooncake",
         "--hicache-io-backend direct",
         "--hicache-mem-layout page_first_direct",
-        "--mamba-scheduler-strategy extra_buffer",
+        "--mamba-radix-cache-strategy extra_buffer",
         "--enable-cache-report",
         "--hicache-storage-prefetch-policy wait_complete",
         "--hicache-storage-backend-extra-config '{\"hicache_storage_pass_prefix_keys\":true}'",
@@ -647,7 +647,7 @@ sgl-eval run gsm8k \\
         "--hicache-storage-backend mooncake",
         "--hicache-io-backend direct",
         "--hicache-mem-layout page_first_direct",
-        "--mamba-scheduler-strategy extra_buffer",
+        "--mamba-radix-cache-strategy extra_buffer",
         "--enable-cache-report",
         "--hicache-storage-prefetch-policy wait_complete",
         "--hicache-storage-backend-extra-config '{\"hicache_storage_pass_prefix_keys\":true}'",
@@ -675,7 +675,7 @@ sgl-eval run gsm8k \\
         "--hicache-storage-backend mooncake",
         "--hicache-io-backend direct",
         "--hicache-mem-layout page_first_direct",
-        "--mamba-scheduler-strategy extra_buffer",
+        "--mamba-radix-cache-strategy extra_buffer",
         "--enable-cache-report",
         "--hicache-storage-prefetch-policy wait_complete",
         "--hicache-storage-backend-extra-config '{\"hicache_storage_pass_prefix_keys\":true}'",
@@ -704,7 +704,7 @@ sgl-eval run gsm8k \\
         "--hicache-storage-backend mooncake",
         "--hicache-io-backend direct",
         "--hicache-mem-layout page_first_direct",
-        "--mamba-scheduler-strategy extra_buffer",
+        "--mamba-radix-cache-strategy extra_buffer",
         "--enable-cache-report",
         "--hicache-storage-prefetch-policy wait_complete",
         "--hicache-storage-backend-extra-config '{\"hicache_storage_pass_prefix_keys\":true}'",

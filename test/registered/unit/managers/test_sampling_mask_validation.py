@@ -1,0 +1,178 @@
+import unittest
+from types import SimpleNamespace
+
+from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.observability.req_time_stats import APIServerReqTimeStats
+from sglang.srt.runtime_context import get_context
+from sglang.srt.sampling.custom_logit_processor import (
+    DisallowedTokensLogitsProcessor,
+    Qwen3ThinkingBudgetLogitProcessor,
+)
+from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
+
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
+
+class TestSamplingMaskValidation(CustomTestCase):
+    def setUp(self):
+        override = get_context().override_server_args(
+            enable_custom_logit_processor=True
+        )
+        override.install()
+        self.addCleanup(override.restore)
+        self.manager = TokenizerManager.__new__(TokenizerManager)
+        self.manager.context_len = 128
+        self.manager.num_reserved_tokens = 0
+        self.manager.allow_auto_truncate = False
+        self.manager.validate_total_tokens = False
+        self.manager.is_generation = True
+        self.manager.model_config = SimpleNamespace(
+            joint_head_config=None, pointer_head=None
+        )
+
+    def _validate(
+        self,
+        processor,
+        return_sampling_mask=True,
+        sampling_logprobs_mode=None,
+    ):
+        req = GenerateReqInput(
+            input_ids=[1, 2, 3],
+            sampling_params={"top_k": 10},
+            custom_logit_processor=processor,
+            return_sampling_mask=return_sampling_mask,
+            sampling_logprobs_mode=sampling_logprobs_mode,
+        )
+        self.manager._validate_one_request(req, req.input_ids)
+
+    def test_top_logprobs_num_must_be_a_valid_count_when_logprobs_requested(self):
+        """A malformed or oversized candidate count must not reach the scheduler."""
+        self.manager.model_config.vocab_size = 32
+        for top_logprobs_num, return_logprob, accepted in (
+            (None, True, True),
+            (0, True, True),
+            (32, True, True),
+            (33, True, False),
+            (-3, True, False),
+            ([33], True, False),
+            (33, False, True),
+        ):
+            with self.subTest(top_logprobs_num=top_logprobs_num, rl=return_logprob):
+                req = GenerateReqInput(
+                    input_ids=[1, 2, 3],
+                    sampling_params={},
+                    return_logprob=return_logprob,
+                    top_logprobs_num=top_logprobs_num,
+                )
+                if accepted:
+                    self.manager._validate_one_request(req, req.input_ids)
+                else:
+                    with self.assertRaisesRegex(ValueError, "top_logprobs"):
+                        self.manager._validate_one_request(req, req.input_ids)
+
+    def test_logprob_start_len_must_be_at_least_minus_one(self):
+        for logprob_start_len, return_logprob, accepted in (
+            (None, True, True),
+            (-1, True, True),
+            (0, True, True),
+            (2, True, True),
+            (-2, True, False),
+            (-5, True, False),
+            ([0], True, False),
+            (-5, False, True),
+        ):
+            with self.subTest(logprob_start_len=logprob_start_len, rl=return_logprob):
+                req = GenerateReqInput(
+                    input_ids=[1, 2, 3],
+                    sampling_params={},
+                    return_logprob=return_logprob,
+                    logprob_start_len=logprob_start_len,
+                )
+                if accepted:
+                    self.manager._validate_one_request(req, req.input_ids)
+                else:
+                    with self.assertRaisesRegex(ValueError, "logprob_start_len"):
+                        self.manager._validate_one_request(req, req.input_ids)
+
+    def test_mixed_batch_forwards_zero_count_for_logprob_disabled_items(self):
+        """Disabled items must not contribute their raw count to a shared topk.
+
+        Each enabled item keeps its own count.
+        """
+        self.manager.model_config.vocab_size = 32
+        self.manager.preferred_sampling_params = None
+        self.manager.sampling_params_class = SamplingParams
+        self.manager.tokenizer = None
+        self.manager.fake_bootstrap_room_counter = 0
+        req = GenerateReqInput(
+            input_ids=[[1, 2, 3], [4, 5, 6], [7, 8, 9], [10, 11, 12]],
+            sampling_params={},
+            return_logprob=[True, False, False, True],
+            top_logprobs_num=[5, 33, "many", 7],
+        )
+        req.normalize_batch_and_arguments()
+        self.manager.rid_to_state = {
+            rid: SimpleNamespace(time_stats=APIServerReqTimeStats()) for rid in req.rid
+        }
+        forwarded_counts = []
+        for i in range(4):
+            self.manager._validate_one_request(req[i], req[i].input_ids)
+            tokenized_request = self.manager._create_tokenized_object(
+                req[i], "", req[i].input_ids
+            )
+            forwarded_counts.append(tokenized_request.top_logprobs_num)
+        self.assertEqual(forwarded_counts, [5, 0, 0, 7])
+
+    def test_accepts_hard_exclusion(self):
+        class BoundMask(DisallowedTokensLogitsProcessor):
+            def __call__(self, logits, custom_param_list=None):
+                logits[..., [2]] = -float("inf")
+                return logits
+
+        for processor in (
+            DisallowedTokensLogitsProcessor.to_str(),
+            BoundMask.to_str(),
+        ):
+            with self.subTest(processor=processor):
+                self._validate(processor)
+
+    def test_rejects_unsupported_or_malformed_processors(self):
+        for processor in (
+            Qwen3ThinkingBudgetLogitProcessor.to_str(),
+            "invalid processor",
+            '{"callable": "00"}',
+        ):
+            with self.subTest(processor=processor):
+                with self.assertRaisesRegex(
+                    ValueError, "only supports DisallowedTokensLogitsProcessor"
+                ):
+                    self._validate(processor)
+
+    def test_other_processors_still_work_without_sampling_masks(self):
+        self._validate(
+            Qwen3ThinkingBudgetLogitProcessor.to_str(), return_sampling_mask=False
+        )
+
+    def test_sampling_logprobs_mode_requires_sampling_mask(self):
+        self._validate(None, return_sampling_mask=False)
+        for mode in ("selected", "support"):
+            with self.subTest(mode=mode):
+                with self.assertRaisesRegex(
+                    ValueError, "can only be set when return_sampling_mask=true"
+                ):
+                    self._validate(
+                        None,
+                        return_sampling_mask=False,
+                        sampling_logprobs_mode=mode,
+                    )
+
+        for mode in (None, "selected", "support"):
+            with self.subTest(mode=mode):
+                self._validate(None, sampling_logprobs_mode=mode)
+
+
+if __name__ == "__main__":
+    unittest.main()
