@@ -2669,6 +2669,20 @@ class KVCacheConfigurator:
             mla_pool_class=mla_pool_class,
             dsa_pool_class=dsa_pool_class,
         )
+        if (
+            get_memory().enable_hisparse
+            and not self.is_draft_worker
+            and extra_args.get("use_dsa")
+        ):
+            reject_out_of_tree_path(
+                current_platform, subsystem="the HiSparse DSA KV pool"
+            )
+            from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+
+            full_pool_class = HiSparseDSATokenToKVPool
+            extra_args["host_to_device_ratio"] = (
+                parse_hisparse_config().host_to_device_ratio
+            )
         from sglang.srt.layers.attention.qsa.config import (
             parse_qsa_profile,
         )
