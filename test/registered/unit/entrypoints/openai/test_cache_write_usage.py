@@ -13,6 +13,7 @@ from sglang.srt.entrypoints.anthropic.serving import (  # noqa: E402
     _anthropic_usage_from_openai,
 )
 from sglang.srt.entrypoints.openai.protocol import (  # noqa: E402
+    ChatCompletionStreamResponse,
     ResponsesResponse,
 )
 from sglang.srt.entrypoints.openai.usage_processor import UsageProcessor  # noqa: E402
@@ -199,6 +200,73 @@ class TestCacheWriteUsage(CustomTestCase):
                     asyncio.run(collect())
                 self.assertEqual(len(seen), 1)
                 details = seen[0]["prompt_tokens_details"]
+                if n == 1:
+                    self.assertEqual(details["cache_write_tokens"], 16)
+                else:
+                    self.assertNotIn("cache_write_tokens", details)
+
+    def test_tool_call_multi_choice_continuous_writes_remain_unknown(self):
+        # The tool-call streaming branch builds its usage snapshot separately
+        # from the content branch, so it needs the same n>1 contract: a single
+        # measured total cannot be attributed to one of several choices.
+        from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
+        from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
+
+        class _StubParser:
+            """Stands in for FunctionCallParser on the calls-only path."""
+
+            def parse_stream_chunk(self, delta):
+                return "", [
+                    SimpleNamespace(
+                        source_text=delta,
+                        name=None,
+                        parameters='{"a": 1}',
+                        tool_index=0,
+                    )
+                ]
+
+        for n in (1, 2):
+            with self.subTest(n=n):
+                server = OpenAIServingChat.__new__(OpenAIServingChat)
+                server._encoding_adapter = None
+                server._effective_tools = lambda request: []
+                request = ChatCompletionRequest(
+                    model="test", messages=[{"role": "user", "content": "test"}], n=n
+                )
+                usage_chunks = []
+
+                async def collect():
+                    async for sse in OpenAIServingChat._process_tool_call_stream(
+                        server,
+                        0,
+                        "tok",
+                        {0: _StubParser()},
+                        {
+                            "meta_info": {
+                                "id": "test-id",
+                                "prompt_tokens": 20,
+                                "cached_tokens": 4,
+                                "cache_write_tokens": 16,
+                            }
+                        },
+                        request,
+                        {},
+                        0,
+                        continuous_usage_stats=True,
+                    ):
+                        usage_chunks.append(sse)
+
+                with patch(
+                    "sglang.srt.entrypoints.openai.serving_chat.get_serving",
+                    return_value=SimpleNamespace(enable_cache_report=True),
+                ):
+                    asyncio.run(collect())
+
+                self.assertEqual(len(usage_chunks), 1)
+                wire_chunk = ChatCompletionStreamResponse.model_validate_json(
+                    usage_chunks[0].removeprefix("data: ").rstrip("\n")
+                )
+                details = wire_chunk.usage.prompt_tokens_details.model_dump()
                 if n == 1:
                     self.assertEqual(details["cache_write_tokens"], 16)
                 else:

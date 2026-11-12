@@ -3890,7 +3890,9 @@ class OpenAIServingChat(OpenAIServingBase):
                         prompt_tokens=prompt_tokens,
                         completion_tokens=completion_tokens,
                         reasoning_tokens=reasoning_tokens,
-                        cached_tokens=self._continuous_usage_cached_details(content),
+                        cached_tokens=self._continuous_usage_cached_details(
+                            content, request.n
+                        ),
                     )
 
                 yield f"data: {chunk.model_dump_json(context=wire.serialization_context)}\n\n"
