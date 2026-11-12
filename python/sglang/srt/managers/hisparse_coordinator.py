@@ -345,20 +345,7 @@ class HiSparseSpecSwapManager:
                 f"got {verify_cache_locs.numel()}."
             )
 
-        # CPU-side logical reservations cover verify even when overlap lags seq_lens.
-        for req in batch.reqs:
-            req_pool_idx = req.kv.req_pool_idx
-            allocated_len = int(
-                coordinator.req_to_host_pool_allocated_len[req_pool_idx]
-            )
-            if req.kv.kv_allocated_len > allocated_len:
-                coordinator.mem_pool_host.alloc_paged_token_slots(
-                    coordinator.req_to_host_pool,
-                    coordinator.req_to_host_pool_allocated_len,
-                    req_pool_idx,
-                    allocated_len,
-                    req.kv.kv_allocated_len - allocated_len,
-                )
+        coordinator.reserve_spec_host_slots(batch)
 
         extra_start = coordinator.device_buffer_size + 1
         row_indices = torch.repeat_interleave(req_pool_indices, self.num_draft_tokens)
@@ -415,8 +402,36 @@ class HiSparseSpecSwapManager:
         coordinator._has_pending_backup = True
         coordinator.wait_for_pending_backup()
 
+    def commit_accepted_prefix(
+        self,
+        batch: ScheduleBatch,
+        *,
+        prefix_lens: torch.Tensor,
+        commit_lens: torch.Tensor,
+    ) -> None:
+        """Persist the verified KV prefix, including its anchor."""
+        if batch.forward_mode.is_idle():
+            return
+        batch_size = batch.req_pool_indices.numel()
+        verify_slots = batch.out_cache_loc.numel()
+        if batch_size == 0 or verify_slots == 0:
+            return
+        if verify_slots % batch_size:
+            raise ValueError("HiSparse verify cache locations are not request-aligned.")
+        verify_width = verify_slots // batch_size
+        steps = torch.arange(verify_width, device=commit_lens.device)
+        rows = torch.arange(batch_size, device=commit_lens.device)[:, None]
+        accept_indices = torch.where(
+            steps < commit_lens[:, None], rows * verify_width + steps, -1
+        )
+        self.commit_accept_tokens(batch, accept_indices, prefix_lens=prefix_lens)
+
     def commit_accept_tokens(
-        self, batch: ScheduleBatch, accept_indices: torch.Tensor
+        self,
+        batch: ScheduleBatch,
+        accept_indices: torch.Tensor,
+        *,
+        prefix_lens: Optional[torch.Tensor] = None,
     ) -> None:
         """Persist accepted target-verify KV in host and the persistent buffer."""
         if batch.forward_mode.is_idle():
@@ -434,7 +449,8 @@ class HiSparseSpecSwapManager:
         valid = accept_indices >= 0
         counts = valid.sum(dim=1)
         steps = torch.arange(accept_indices.shape[1], device=accept_indices.device)
-        positions = batch.seq_lens[:, None].to(torch.int64) + steps
+        prefix_lens = batch.seq_lens if prefix_lens is None else prefix_lens
+        positions = prefix_lens[:, None].to(torch.int64) + steps
         mapping = (
             coordinator.token_to_kv_pool_allocator.full_to_hisparse_device_index_mapping
         )
@@ -1105,6 +1121,21 @@ class HiSparseCoordinator:
 
     def prepare_spec_verify(self, batch: ScheduleBatch) -> None:
         self.spec_swap.prepare_verify(batch)
+
+    def reserve_spec_host_slots(self, batch: ScheduleBatch) -> None:
+        """Cover verify's allocation watermark even when CPU seq_lens lag."""
+        for req in batch.reqs:
+            rid = req.kv.req_pool_idx
+            target_len = req.kv.kv_allocated_len // self.compress_ratio
+            allocated_len = int(self.req_to_host_pool_allocated_len[rid])
+            if target_len > allocated_len:
+                self.mem_pool_host.alloc_paged_token_slots(
+                    self.req_to_host_pool,
+                    self.req_to_host_pool_allocated_len,
+                    rid,
+                    allocated_len,
+                    target_len - allocated_len,
+                )
 
     def commit_spec_accept_tokens(
         self, batch: ScheduleBatch, accept_indices: torch.Tensor
