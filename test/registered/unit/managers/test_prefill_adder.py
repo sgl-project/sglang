@@ -23,6 +23,7 @@ from sglang.srt.managers.schedule_policy import (
 from sglang.srt.mem_cache.allocator.hisparse import HiSparseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.page_interleave import PageInterleavePoolAllocator
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     DecLockRefParams,
@@ -1239,16 +1240,25 @@ class TestPrefillAdder(CustomTestCase):
                 max_prefix_tokens=max_prefix_tokens,
                 chunk_tokens=chunk_tokens,
             )
-        allocator = PageInterleavePoolAllocator(
-            size=allocator_size,
-            physical_page_size=shard_spec.page_size,
-            shard_size=shard_spec.shard_size,
-            dtype=torch.int64,
-            device="cpu",
-            kvcache=None,
-            need_sort=False,
-            shard_spec=shard_spec,
-        )
+        if shard_spec.shard_size == 1:
+            allocator = TokenToKVPoolAllocator(
+                size=allocator_size,
+                dtype=torch.int64,
+                device="cpu",
+                kvcache=None,
+                need_sort=False,
+            )
+        else:
+            allocator = PageInterleavePoolAllocator(
+                size=allocator_size,
+                physical_page_size=shard_spec.page_size,
+                shard_size=shard_spec.shard_size,
+                dtype=torch.int64,
+                device="cpu",
+                kvcache=None,
+                need_sort=False,
+                shard_spec=shard_spec,
+            )
         return self.create_adder(
             self.create_running_batch(),
             page_size=shard_spec.page_size,
@@ -1433,17 +1443,17 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(adder.kv_shard_block_bound_pages, 2)
         self.assertEqual(adder.kv_shard_chunk_pages, 1)
 
-    def test_bootstrap_limit_is_the_sharded_admission_boundary(self):
-        """The P/D bootstrap check rejects every prompt that sharded admission
-        can never fit, so none of them waits in the queue forever."""
+    def test_bootstrap_limit_is_the_admission_boundary(self):
+        """The P/D bootstrap check rejects every prompt that admission can
+        never fit, so none of them waits in the queue forever."""
         page_size, tokens_per_rank = 64, 16384
         self.assertEqual(
             max_bootstrap_input_len(capacity=32768, page_size=64, shard_size=2), 32576
         )
         self.assertEqual(
-            max_bootstrap_input_len(capacity=16384, page_size=64, shard_size=1), 16384
+            max_bootstrap_input_len(capacity=16384, page_size=64, shard_size=1), 16256
         )
-        for shard_size in (2, 4):
+        for shard_size in (1, 2, 4):
             capacity = shard_size * tokens_per_rank
             queue = PrefillBootstrapQueue.__new__(PrefillBootstrapQueue)
             queue.scheduler = SimpleNamespace(
