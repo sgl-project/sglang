@@ -396,6 +396,7 @@ pub struct TreeCoreInitParamsBinding {
     pub slru_protected_threshold: i64,
     pub tlru_tail_budget: usize,
     pub tlru_float_config: Option<TlruFloatConfigBinding>,
+    pub gds_cost: Option<(f64, f64)>,
     pub page_size: usize,
     pub is_write_back: bool,
     pub enable_hicache: bool,
@@ -418,6 +419,7 @@ impl TreeCoreInitParamsBinding {
             slru_protected_threshold: self.slru_protected_threshold,
             tlru_tail_budget: self.tlru_tail_budget,
             tlru_float_config: self.tlru_float_config.as_ref().map(|value| value.config),
+            gds_cost: self.gds_cost,
             page_size: self.page_size,
             is_write_back: self.is_write_back,
             enable_hicache: self.enable_hicache,
@@ -439,7 +441,7 @@ impl TreeCoreInitParamsBinding {
 #[pymethods]
 impl TreeCoreInitParamsBinding {
     #[new]
-    #[pyo3(signature = (eviction_policy = "lru".to_string(), page_size = 1, is_write_back = false, enable_hicache = false, write_through_threshold = 256, device = "cpu".to_string(), swa_sliding_window_size = None, enable_kv_cache_events = false, mamba_cache_chunk_size = None, mamba_max_states_per_path = None, slru_protected_threshold = 2, swa_req_ring = false, tlru_tail_budget = 0, tlru_float_config = None, dynamo_kv_event_format = false, mamba_host_only_checkpoint = false))]
+    #[pyo3(signature = (eviction_policy = "lru".to_string(), page_size = 1, is_write_back = false, enable_hicache = false, write_through_threshold = 256, device = "cpu".to_string(), swa_sliding_window_size = None, enable_kv_cache_events = false, mamba_cache_chunk_size = None, mamba_max_states_per_path = None, slru_protected_threshold = 2, swa_req_ring = false, tlru_tail_budget = 0, tlru_float_config = None, dynamo_kv_event_format = false, mamba_host_only_checkpoint = false, gds_cost = None))]
     fn new(
         eviction_policy: String,
         page_size: usize,
@@ -457,12 +459,14 @@ impl TreeCoreInitParamsBinding {
         tlru_float_config: Option<TlruFloatConfigBinding>,
         dynamo_kv_event_format: bool,
         mamba_host_only_checkpoint: bool,
+        gds_cost: Option<(f64, f64)>,
     ) -> Self {
         TreeCoreInitParamsBinding {
             eviction_policy,
             slru_protected_threshold,
             tlru_tail_budget,
             tlru_float_config,
+            gds_cost,
             page_size,
             is_write_back,
             enable_hicache,
