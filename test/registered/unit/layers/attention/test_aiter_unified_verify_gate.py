@@ -4,6 +4,8 @@ import os
 import unittest
 from unittest.mock import patch
 
+import torch
+
 from sglang.srt.layers.attention import aiter_backend
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -85,6 +87,33 @@ class TestAiterUnifiedDraftExtendGate(CustomTestCase):
         self.assertTrue(enabled(True, True))
         self.assertFalse(enabled(False, True))
         self.assertFalse(enabled(False, False))
+
+
+class TestAiterUnifiedPageTableWidth(CustomTestCase):
+    """Verify writes ceil((seq_len + draft tokens) / page) page ids per row."""
+
+    def _blocks(self, context_len, page_size, req_to_token_cols):
+        backend = aiter_backend.AiterAttnBackend.__new__(aiter_backend.AiterAttnBackend)
+        backend.max_context_len = context_len
+        backend.page_size = page_size
+        backend.req_to_token = (
+            None
+            if req_to_token_cols is None
+            else torch.zeros((2, req_to_token_cols), dtype=torch.int32)
+        )
+        return backend._unified_page_table_blocks()
+
+    def test_covers_speculative_headroom_past_context_len(self):
+        # context 4096, 8 draft tokens: the longest admitted prompt (4091) plus
+        # its verify tokens needs 257 pages of 16; req_to_token rows hold
+        # context_len + 4 + draft tokens.
+        blocks = self._blocks(4096, 16, 4096 + 4 + 8)
+        self.assertGreaterEqual(blocks * 16, 4091 + 8)
+        self.assertEqual(blocks, 257)
+
+    def test_never_narrower_than_context_len(self):
+        self.assertEqual(self._blocks(4096, 16, 4096), 256)
+        self.assertEqual(self._blocks(4096, 16, None), 256)
 
 
 if __name__ == "__main__":

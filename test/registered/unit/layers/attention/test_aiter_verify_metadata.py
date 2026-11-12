@@ -269,6 +269,7 @@ def _init_mha_backend(kv_cache_layout):
         head_dim=128,
         get_num_kv_heads=lambda _tp_size: 8,
         attention_arch=AttentionArch.MHA,
+        hf_config=SimpleNamespace(model_type="llama"),
         context_len=4096,
     )
     model_runner = SimpleNamespace(
