@@ -21,7 +21,7 @@ individual keys of the defaults below::
 Requirements inherited from the kernels: compute capability 9.0 (Hopper) or
 10.0/12.0 (Blackwell), bf16, head_dim 128. Hopper uses SGLang's CuTe-DSL SM90
 block-sparse FlashAttention kernel by default; ``compute_mode="sage_fp8"``
-selects native SageAttention2 on SM90 and FlashInfer's CuTe-DSL Sage kernel
+selects native SageAttention2 on SM90 and FlashInfer's CAKE Sage kernel
 on SM120, both using INT8 QK and FP8 PV. SM100 uses the BF16 kernel because
 its Sage path does not support SubBlock's variable counts and partial blocks.
 Inside the DiT, unsupported calls run dense instead; unsupported GPU
@@ -253,8 +253,8 @@ def _load_sm120_sage_ops():
         )
     except (ImportError, OSError) as exc:
         raise ImportError(
-            "SM120 SubBlock sage_fp8 requires FlashInfer with the CuTe-DSL "
-            "SM120 Sage backend and quantize_sage_qkv_sm120."
+            "SM120 SubBlock sage_fp8 requires FlashInfer with the "
+            "SM120 CAKE Sage backend and quantize_sage_qkv_sm120."
         ) from exc
     return quantize_sage_qkv_sm120, bsa_attn_sm120_blk64_sage_fwd
 
@@ -268,9 +268,11 @@ def _sm120_sage_fp8_sparse_attention(
     softmax_scale: float,
     block_counts: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Quantize BSHD activations online and execute a Q64 x K64 Sage plan."""
+    """Quantize BSHD views online and execute a Q64 x K64 CAKE Sage plan."""
     quantize, attention = _load_sm120_sage_ops()
-    q_hnd, k_hnd, v_hnd = (x.transpose(1, 2).contiguous() for x in (q, k, v))
+    # The quantizer reads BHSD strides; only the head dimension must be
+    # contiguous. Preserve packed QKV views instead of copying BF16 inputs.
+    q_hnd, k_hnd, v_hnd = (x.transpose(1, 2) for x in (q, k, v))
     quantized = quantize(q_hnd, k_hnd, v_hnd)
     out = attention(
         *quantized,
@@ -281,9 +283,14 @@ def _sm120_sage_fp8_sparse_attention(
             block_counts.contiguous() if block_counts is not None else None
         ),
         softmax_scale=softmax_scale,
-        backend="cute_dsl",
+        out=torch.empty(q_hnd.shape, dtype=torch.bfloat16, device=q.device),
+        uniform_block_count=block_counts is None,
+        contiguous_block_indices=False,
+        backend="cake",
     )
-    return out.transpose(1, 2).contiguous()
+    # Packed callers copy each segment into their output buffer, so returning
+    # the BSHD view avoids another full attention-output copy here.
+    return out.transpose(1, 2)
 
 
 def _sm120_sparse_attention(

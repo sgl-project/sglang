@@ -4,7 +4,7 @@ Routes a SubBlock plan to SGLang's CuTe-DSL block-sparse FlashAttention kernel
 on SM90 or FlashInfer's architecture-specific blk64 kernels on SM100 and SM120.
 The architecture-neutral `"compute_mode": "sage_fp8"` selects online Sage-style
 FP8 compute; its current SM90 implementation uses the native SageAttention2
-INT8-QK/FP8-PV Hopper kernel. SM120 uses FlashInfer's CuTe-DSL Sage kernel
+INT8-QK/FP8-PV Hopper kernel. SM120 uses FlashInfer's CAKE Sage kernel
 with Q64 x K64 blocks. SM100 supports BF16 only.
 Nothing is trained and no weights change: a cheap estimator runs before
 attention and hands the selected kernel a `q2k_block_index`.
@@ -46,7 +46,7 @@ are listed below.
 
 | | |
 | --- | --- |
-| GPU | **compute capability 9.0, 10.0, or 12.0** — H100 / H200 use SGLang's CuTe-DSL SM90 block-sparse FlashAttention kernel or the current `sage_fp8` implementation; B200 / GB200 use FlashInfer's architecture-specific `sm_100a` BF16 kernel; SM120 devices use FlashInfer's CuTe-DSL BF16 or Sage FP8 kernel. Other capabilities, including 10.3 (B300 / GB300), are rejected. |
+| GPU | **compute capability 9.0, 10.0, or 12.0** — H100 / H200 use SGLang's CuTe-DSL SM90 block-sparse FlashAttention kernel or the current `sage_fp8` implementation; B200 / GB200 use FlashInfer's architecture-specific `sm_100a` BF16 kernel; SM120 devices use FlashInfer's CuTe-DSL BF16 kernel or CAKE Sage FP8 kernel. Other capabilities, including 10.3 (B300 / GB300), are rejected. |
 | dtype | bfloat16 |
 | head_dim | 128 |
 | attention | non-causal, one contiguous sequence per call |
@@ -107,10 +107,15 @@ the normal router's 16-token key pooling cells. Install the optional dependency:
 pip install git+https://github.com/thu-ml/SpargeAttn.git --no-build-isolation
 ```
 
-SM120 requires FlashInfer's CuTe-DSL SM120 Sage backend and
+SM120 uses FlashInfer's CAKE backend with caller-owned contiguous BF16 output
+and the online quantizer
 `quantize_sage_qkv_sm120`, added in
 [FlashInfer #4691](https://github.com/flashinfer-ai/flashinfer/pull/4691),
 which the default FlashInfer install includes.
+The quantizer reads strided BHSD views, avoiding BF16 Q/K/V copies before
+quantization. The adapter returns a BSHD view of CAKE's output; the packed
+document path writes that view directly into its destination buffer.
+Sparse block indices and per-row counts are made contiguous for CAKE.
 
 Enable it on SM90 or SM120 with:
 

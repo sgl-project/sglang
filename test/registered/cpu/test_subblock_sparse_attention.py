@@ -194,33 +194,80 @@ class TestSubBlockSparseAttentionDispatch(CustomTestCase):
             )
 
     def test_sm120_sage_preserves_partial_blocks_and_variable_counts(self):
-        q = torch.randn(1, 65, 2, 128, dtype=torch.bfloat16)
-        k = torch.randn(1, 129, 2, 128, dtype=torch.bfloat16)
-        v = torch.randn_like(k)
-        index = torch.tensor([[[[2, 0], [1, 0]], [[0, 2], [2, 1]]]], dtype=torch.int32)
-        counts = torch.tensor([[[2, 1], [0, 2]]], dtype=torch.int32)
-        quantized = tuple(object() for _ in range(6))
-        quantize = Mock(return_value=quantized)
-        attention = Mock(return_value=q.transpose(1, 2).contiguous())
-        with patch(
-            "sglang.multimodal_gen.runtime.layers.attention.backends."
-            "subblock_sparse_attn._load_sm120_sage_ops",
-            return_value=(quantize, attention),
-        ):
-            result = _sm120_sage_fp8_sparse_attention(q, k, v, index, 2, 0.125, counts)
-        torch.testing.assert_close(result, q)
-        for actual, source in zip(quantize.call_args.args, (q, k, v)):
-            torch.testing.assert_close(actual, source.transpose(1, 2))
-            self.assertTrue(actual.is_contiguous())
-        self.assertEqual(attention.call_args.args[:6], quantized)
-        torch.testing.assert_close(attention.call_args.args[6], index)
-        kwargs = attention.call_args.kwargs
-        torch.testing.assert_close(
-            kwargs["block_sizes"], torch.tensor([64, 64, 1], dtype=torch.int32)
-        )
-        torch.testing.assert_close(kwargs["q2k_block_nums"], counts)
-        self.assertEqual(kwargs["backend"], "cute_dsl")
-        self.assertEqual(kwargs["softmax_scale"], 0.125)
+        for packed in (False, True):
+            for variable_counts in (False, True):
+                with self.subTest(packed=packed, variable_counts=variable_counts):
+                    if packed:
+                        q = torch.randn(2, 65, 2, 3, 128, dtype=torch.bfloat16)[
+                            ..., 0, :
+                        ]
+                        _, k, v = torch.randn(
+                            2, 129, 2, 3, 128, dtype=torch.bfloat16
+                        ).unbind(dim=3)
+                    else:
+                        q = torch.randn(2, 65, 2, 128, dtype=torch.bfloat16)
+                        k = torch.randn(2, 129, 2, 128, dtype=torch.bfloat16)
+                        v = torch.randn_like(k)
+                    index = torch.tensor(
+                        [[[[2, 0], [1, 0]], [[0, 2], [2, 1]]]], dtype=torch.int32
+                    )
+                    # CAKE needs contiguous metadata even when the routing
+                    # plan is a strided view or broadcast across batches.
+                    index = torch.stack((index, index), dim=-1)[..., 0].expand(
+                        2, -1, -1, -1
+                    )
+                    counts = None
+                    if variable_counts:
+                        counts = torch.tensor([[[2, 1], [0, 2]]], dtype=torch.int32)
+                        counts = torch.stack((counts, counts), dim=-1)[..., 0].expand(
+                            2, -1, -1
+                        )
+                    quantized = tuple(object() for _ in range(6))
+                    quantize = Mock(return_value=quantized)
+                    attention = Mock(
+                        side_effect=lambda *args, source=q, **kwargs: kwargs[
+                            "out"
+                        ].copy_(source.transpose(1, 2))
+                    )
+                    with patch(
+                        "sglang.multimodal_gen.runtime.layers.attention.backends."
+                        "subblock_sparse_attn._load_sm120_sage_ops",
+                        return_value=(quantize, attention),
+                    ):
+                        result = _sm120_sage_fp8_sparse_attention(
+                            q, k, v, index, 2, 0.125, counts
+                        )
+                    torch.testing.assert_close(result, q)
+                    for actual, source in zip(quantize.call_args.args, (q, k, v)):
+                        torch.testing.assert_close(actual, source.transpose(1, 2))
+                        self.assertEqual(actual.data_ptr(), source.data_ptr())
+                        self.assertEqual(
+                            actual.stride(), source.transpose(1, 2).stride()
+                        )
+                        self.assertEqual(actual.stride(-1), 1)
+                    self.assertEqual(attention.call_args.args[:6], quantized)
+                    torch.testing.assert_close(attention.call_args.args[6], index)
+                    self.assertTrue(attention.call_args.args[6].is_contiguous())
+                    kwargs = attention.call_args.kwargs
+                    torch.testing.assert_close(
+                        kwargs["block_sizes"],
+                        torch.tensor([64, 64, 1], dtype=torch.int32),
+                    )
+                    if variable_counts:
+                        torch.testing.assert_close(kwargs["q2k_block_nums"], counts)
+                        self.assertTrue(kwargs["q2k_block_nums"].is_contiguous())
+                    else:
+                        self.assertIsNone(kwargs["q2k_block_nums"])
+                    self.assertEqual(kwargs["backend"], "cake")
+                    self.assertEqual(kwargs["softmax_scale"], 0.125)
+                    self.assertIs(kwargs["uniform_block_count"], not variable_counts)
+                    self.assertIs(kwargs["contiguous_block_indices"], False)
+                    self.assertEqual(kwargs["out"].shape, (2, 2, 65, 128))
+                    self.assertEqual(kwargs["out"].dtype, torch.bfloat16)
+                    self.assertEqual(kwargs["out"].device, q.device)
+                    self.assertTrue(kwargs["out"].is_contiguous())
+                    self.assertEqual(result.data_ptr(), kwargs["out"].data_ptr())
+                    self.assertEqual(result.stride(-1), 1)
 
     def test_platform_resolver_loads_sm120_dependency(self):
         capability = Mock(major=12, minor=0)
