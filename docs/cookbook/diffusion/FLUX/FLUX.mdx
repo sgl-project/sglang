@@ -49,7 +49,7 @@ See [Performance Optimization](/docs/sglang-diffusion/performance-optimization) 
 
 - `--vae-path`: Path to a custom VAE model or HuggingFace model ID (e.g., fal/FLUX.2-Tiny-AutoEncoder). If not specified, the VAE will be loaded from the main model path.
 - `--num-gpus`: Number of GPUs to use
-- `--tp-size`: Tensor parallelism size; shards the FLUX DiT across GPUs (should not be larger than 1 if text encoder offload is enabled, as layer-wise offload plus prefetch is faster)
+- `--tp-size`: Tensor parallelism size; shards the FLUX DiT across GPUs. Text encoder offload does not require TP 1; see [Encoder Parallelism](/docs/sglang-diffusion/encoder_parallel) for encoder placement and sharding.
 - `--sp-degree`: Sequence parallelism size (typically should match the number of GPUs)
 - `--ulysses-degree`: The degree of DeepSpeed-Ulysses-style SP in USP
 - `--ring-degree`: The degree of ring attention-style SP in USP

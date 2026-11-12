@@ -56,7 +56,7 @@ Use the [command builder](#1-quick-start) above.
 See [Performance Optimization](/docs/sglang-diffusion/performance-optimization) for acceleration features and their runtime requirements.
 
 - `--num-gpus`: Number of GPUs to use
-- `--tp-size`: Tensor parallelism size (should not be larger than 1 if text encoder offload is enabled, as layer-wise offload plus prefetch is faster)
+- `--tp-size`: Tensor parallelism size. Text encoder offload does not require TP 1; see [Encoder Parallelism](/docs/sglang-diffusion/encoder_parallel) for encoder placement and sharding.
 - `--ring-degree`: The degree of ring attention-style SP in USP
 - `--ulysses-degree`: The degree of DeepSpeed-Ulysses-style SP in USP
 - `--adjust-frames`: `sglang generate` / request sampling option that adjusts the frame count automatically; it already defaults to `false` for MOVA

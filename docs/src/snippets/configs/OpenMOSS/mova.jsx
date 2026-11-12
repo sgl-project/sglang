@@ -18,7 +18,7 @@ export const config = (() => {
             "--ulysses-degree 4",
             "--tp-size 1",
             "--enable-torch-compile",
-            '--output-path "$SG_OUTPUT_DIR"',
+            "--output-path ./outputs",
           ],
           gpus: 8,
           topology: { tp_size: 1, ulysses_degree: 4, ring_degree: 2 },
