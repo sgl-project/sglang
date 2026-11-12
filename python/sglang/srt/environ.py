@@ -1550,6 +1550,11 @@ class Envs:
     # is a hit on the second run, and a cache hit has nothing to report, so pair
     # this with SGLANG_JIT_FORCE_RECOMPILE to see the report every time.
     SGLANG_JIT_LOG_RESOURCE_USAGE = EnvBool(False)
+    # Compile every JIT module with source-line info (nvcc -lineinfo, hipcc
+    # -gline-tables-only) for profiler source views. It only adds debug
+    # sections, the SASS is unchanged; like the flag above, it gets its own
+    # cache entry.
+    SGLANG_JIT_ENABLE_LINEINFO = EnvBool(False)
     # Drop the GB/s and TFLOPS columns from the benchmark marker's table.
     SGLANG_JIT_BENCHMARK_DISABLE_LOG_BANDWIDTH = EnvBool(False)
     SGLANG_JIT_BENCHMARK_DISABLE_LOG_FLOPS = EnvBool(False)
