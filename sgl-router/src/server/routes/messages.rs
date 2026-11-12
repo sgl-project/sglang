@@ -34,7 +34,7 @@ pub(crate) async fn messages(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response<Body> {
-    let prepared = off_worker::run(|| {
+    let prepared = off_worker::run_for_body(body.len(), || {
         let converted = parse(&body, false)?;
         let chat_body = Bytes::from(serde_json::to_vec(&converted.chat).expect("serialize chat"));
         Ok::<_, ApiError>((converted, chat_body))
@@ -55,7 +55,7 @@ pub(crate) async fn count_tokens(
     State(ctx): State<Arc<AppContext>>,
     body: Bytes,
 ) -> Response<Body> {
-    let mut converted = match off_worker::run(|| parse(&body, true)) {
+    let mut converted = match off_worker::run_for_body(body.len(), || parse(&body, true)) {
         Ok(c) => c,
         Err(e) => return adapt(e.into_response(), None).await,
     };
@@ -127,8 +127,8 @@ async fn adapt(resp: Response<Body>, echo: Option<(EchoContext, bool)>) -> Respo
         return Response::from_parts(parts, Body::from(bytes));
     };
     // A non-streaming reply can be as large as a request body.
-    off_worker::run(
-        || match serde_json::from_slice::<serde_json::Value>(&bytes) {
+    off_worker::run_for_body(bytes.len(), || {
+        match serde_json::from_slice::<serde_json::Value>(&bytes) {
             Ok(chat) => {
                 let body = serde_json::to_vec(&chat_to_message(&chat, &echo)).expect("serialize");
                 rebuild(parts, body)
@@ -141,8 +141,8 @@ async fn adapt(resp: Response<Body>, echo: Option<(EchoContext, bool)>) -> Respo
                     anthropic::error_body(502, "upstream reply is not a valid chat completion"),
                 )
             }
-        },
-    )
+        }
+    })
 }
 
 /// The body limit rejects oversized requests before the handler runs; give

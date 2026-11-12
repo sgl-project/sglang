@@ -1194,19 +1194,16 @@ def _static_state_entries(
                 c128_item_lens,
             )
 
-        # On Ascend 950, register C4 state by row so prefill and decode can
-        # pair logical positions even when their SWA-page ring sizes differ.
-        from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
-
-        if is_npu_arch35():
-            c4_ptrs, c4_lens, c4_item_lens = token_to_kv_pool.get_c4_state_buf_infos()
-            if c4_ptrs:
-                add(
-                    AscendStateType.DSV4_C4_STATE,
-                    c4_ptrs,
-                    c4_lens,
-                    c4_item_lens,
-                )
+        # Register C4 state by row on both A3 and Ascend 950 so prefill and
+        # decode can pair logical positions even when their ring sizes differ.
+        c4_ptrs, c4_lens, c4_item_lens = token_to_kv_pool.get_c4_state_buf_infos()
+        if c4_ptrs:
+            add(
+                AscendStateType.DSV4_C4_STATE,
+                c4_ptrs,
+                c4_lens,
+                c4_item_lens,
+            )
 
     # DSV4 NextN shares the target allocator, so target and draft use the same
     # local SWA indices. Keep draft buffers in a separate positional component

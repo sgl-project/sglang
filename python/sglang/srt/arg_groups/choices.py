@@ -112,6 +112,8 @@ DRAFT_ATTENTION_BACKEND_CHOICES = [
     "intel_xpu",
 ]
 
+DFLASH_MLA_ONLY_DRAFT_BACKENDS = ("cutedsl_mla", "trtllm_mla")
+
 DETERMINISTIC_ATTENTION_BACKEND_CHOICES = [
     "ascend",
     "fa3",
