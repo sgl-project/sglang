@@ -741,7 +741,7 @@ jobs:
             --retry 3 \
             --retry-delay 5 \
             --retry-all-errors \
-            "https://sglang-npu.obs.cn-southwest-2.myhuaweicloud.com/coverage/test_case_map.json" \
+            "https://sglang-npu.obs.cn-southwest-2.myhuaweicloud.com/coverage/pr/test_case_map.json" \
             -o test_case_map.json
           test -s test_case_map.json
           echo "Downloaded test_case_map.json"
@@ -755,7 +755,7 @@ jobs:
             --retry 3 \
             --retry-delay 5 \
             --retry-all-errors \
-            "https://sglang-npu.obs.cn-southwest-2.myhuaweicloud.com/coverage/outputs.tar.gz" \
+            "https://sglang-npu.obs.cn-southwest-2.myhuaweicloud.com/coverage/pr/outputs.tar.gz" \
             -o outputs.tar.gz
           test -s outputs.tar.gz
           echo "Downloaded outputs.tar.gz"
@@ -1127,7 +1127,6 @@ jobs:
           RUN_DIR="/root/.cache/tests/precise-test/${{ github.run_id }}-attempt-${{ github.run_attempt }}"
           OBS_ENDPOINT="${OBS_ENDPOINT:-obs.cn-southwest-2.myhuaweicloud.com}"
           OBS_BUCKET="${OBS_BUCKET:-sglang-npu}"
-          # TEMP: debug prefix, revert to "coverage" once verified.
           OBS_PREFIX="${OBS_PREFIX:-coverage/pr}"
 
           # All three files are the baseline product; a missing or empty file
