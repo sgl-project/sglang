@@ -12,6 +12,9 @@ import numpy as np
 import torch
 
 from sglang.srt.managers.io_struct import GenerateReqInput
+from sglang.srt.managers.multimodal_preprocessing_admission import (
+    track_mm_preprocessing_future,
+)
 from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
 from sglang.srt.models.dots3 import Dots3NoteForCausalLM
 from sglang.srt.models.dots3_common.dots_omni_audio import OmniAudioConfig
@@ -416,15 +419,13 @@ class DotsNoteOmniProcessor(BaseMultimodalProcessor):
                     "sampling_params as a dictionary."
                 )
             max_new_tokens = sampling_params.get("max_new_tokens") or 0
-            loop = asyncio.get_running_loop()
             preprocess_started = time.perf_counter()
             video_media = {}
             total_content_items = 0
             total_frames = 0
             total_audio_segments = 0
             for video_index, video in enumerate(video_data):
-                content = await loop.run_in_executor(
-                    self.io_executor,
+                future = self.io_executor.submit(
                     lambda video=video: preprocess_dots_video(
                         video,
                         question,
@@ -435,6 +436,11 @@ class DotsNoteOmniProcessor(BaseMultimodalProcessor):
                         k_mode=k_mode,
                         max_new_tokens=max_new_tokens,
                     ),
+                )
+                track_mm_preprocessing_future(future)
+                content = await asyncio.wrap_future(
+                    future,
+                    loop=asyncio.get_running_loop(),
                 )
                 total_content_items += len(content)
                 total_frames += sum(item.get("type") == "image_url" for item in content)

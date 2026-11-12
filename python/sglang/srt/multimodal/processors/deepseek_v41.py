@@ -2,11 +2,15 @@
 
 import asyncio
 import logging
+from concurrent.futures import Future
 from functools import partial
 
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.managers.multimodal_preprocessing_admission import (
+    track_mm_preprocessing_future,
+)
 from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
 from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
 from sglang.srt.multimodal.deepseek_v41_image_processing import (
@@ -25,6 +29,28 @@ from sglang.srt.runtime_context import get_mm
 from sglang.srt.rust_extensions import load_rust_extension
 
 logger = logging.getLogger(__name__)
+
+
+async def _to_thread_with_admission_tracking(func, /, *args, **kwargs):
+    """Track native work while preserving to_thread's executor and context."""
+    work_done = Future()
+    track_mm_preprocessing_future(work_done)
+
+    def run():
+        if not work_done.set_running_or_notify_cancel():
+            return
+        try:
+            return func(*args, **kwargs)
+        finally:
+            work_done.set_result(None)
+
+    try:
+        return await asyncio.to_thread(run)
+    except BaseException:
+        # Cancellation can skip queued work, but running work retains its lease
+        # until the native call finishes, even after its asyncio waiter exits.
+        work_done.cancel()
+        raise
 
 
 class DeepseekV41ImageProcessor(BaseMultimodalProcessor):
@@ -92,13 +118,13 @@ class DeepseekV41ImageProcessor(BaseMultimodalProcessor):
             image = next(images)
             plan = None
             if self.preprocess_backend == "gpu":
-                patches, plan, lh, lw = await asyncio.to_thread(
+                patches, plan, lh, lw = await _to_thread_with_admission_tracking(
                     prepare_image_gpu, image, self.hf_config
                 )
                 h = plan["height"] // plan["patch_size"]
                 w = plan["width"] // plan["patch_size"]
             else:
-                patches, h, w, lh, lw = await asyncio.to_thread(
+                patches, h, w, lh, lw = await _to_thread_with_admission_tracking(
                     self.cpu_patchify, image, self.hf_config
                 )
             if self.keep_mm_features_on_device:
