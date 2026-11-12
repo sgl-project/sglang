@@ -4613,5 +4613,57 @@ class TestDeterministicAttentionBackendOnXpu(unittest.TestCase):
         self.assertEqual(updates, {})
 
 
+class TestGlm5NextAgenticMambaPool(CustomTestCase):
+    ARCH = "Glm5NextForConditionalGeneration"
+
+    def _declared(self, supports_extra_buffer=True, **fields):
+        from sglang.srt.arg_groups.model_overrides.glm5_next import (
+            _glm5_next_overrides,
+        )
+
+        args = dict(
+            mamba_full_memory_ratio=None,
+            mamba_radix_cache_strategy="auto",
+            disaggregation_mode="null",
+            disable_overlap_schedule=False,
+            pp_size=1,
+        )
+        args.update(fields)
+        with patch.object(
+            overrides_module,
+            "supports_mamba_cache_extra_buffer",
+            return_value=supports_extra_buffer,
+        ):
+            return _glm5_next_overrides(
+                SimpleNamespace(**args), SimpleNamespace(architectures=[self.ARCH])
+            )
+
+    def test_defaults_to_agentic_pool(self):
+        self.assertEqual(
+            self._declared(),
+            {
+                "mamba_full_memory_ratio": 0.25,
+                "mamba_radix_cache_strategy": "extra_buffer_lazy",
+            },
+        )
+
+    def test_explicit_values_and_unsupported_lazy_keep_their_strategy(self):
+        self.assertEqual(
+            self._declared(mamba_full_memory_ratio=0.9),
+            {"mamba_radix_cache_strategy": "extra_buffer_lazy"},
+        )
+        for fields in (
+            dict(mamba_radix_cache_strategy="extra_buffer"),
+            dict(supports_extra_buffer=False),
+            dict(disaggregation_mode="prefill"),
+            dict(disable_overlap_schedule=True),
+            dict(pp_size=2),
+        ):
+            with self.subTest(**fields):
+                self.assertEqual(
+                    self._declared(**fields), {"mamba_full_memory_ratio": 0.25}
+                )
+
+
 if __name__ == "__main__":
     unittest.main()
