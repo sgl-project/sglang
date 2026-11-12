@@ -1,9 +1,18 @@
-// Paged experts (srt/layers/moe/paged_experts) on the GPU: a decode step pages experts with no
-// host sync, so the whole step can be captured in a CUDA graph.
-// decide: keep the resident experts the step uses, evict LRU slots it does not need, and write
-// both the page-in plan and the runner's slot/weight inputs.
-// gather: copy the planned experts of a layer from the pinned host store in one launch; the
-// count is read on the device, so a replayed graph moves exactly what its decide chose.
+// Paged experts (srt/layers/moe/paged_experts): the residency decision and the expert page-in on
+// the GPU, so a decode step pages experts without a host sync and can be captured in a CUDA graph.
+//
+// decide: for a step whose routed (token, expert) entries fit the K slots, keep every resident
+// expert the step uses, give each missing expert the least recently used slot the step does not
+// need, and write the page-in plan (src expert -> dst slot, count) to device buffers. It also
+// writes the runner's inputs: each routed entry's slot and router weight, slot 0 and weight 0 for
+// padding, so no further kernel is needed to build them.
+// gather: copy the planned experts from the pinned host store into their slots, for every paged
+// tensor of a layer in one launch. The count is read on the device, so a replayed graph moves
+// exactly the experts its decide chose.
+// tiered_plan / rows_to_slots: with the experts in pinned host rows (the rest on disk), copy a
+// planned expert from its row into its slot; the row keeps it (inclusive rows: nothing is written
+// back). Experts only on disk are flagged for the host, which reads them while the captured step
+// waits for them (await_rows), or after the step.
 
 #pragma once
 
@@ -150,13 +159,29 @@ __global__ void paged_experts_decide_kernel(
     slot_lastuse[i] = s_lastuse[i];
 }
 
-template <typename T>
-__device__ void
-copy_rows(const T* host, T* gpu, long row, int n, const int32_t* src, const int32_t* dst, long tid, long stride) {
-  for (long j = tid; j < n * row; j += stride) {
-    const long i = j / row, off = j % row;
-    gpu[dst[i] * row + off] = host[src[i] * row + off];
+// Calls ``op(host, gpu, row)`` with each paged tensor's rows typed by the widest load their size
+// allows: 16 bytes, which the host link needs, else 4 (small per-expert scalars) or 2 (e.g. an
+// NVFP4 Marlin global scale). ``row`` is in elements of that type.
+template <typename Op>
+__device__ void for_each_tensor(const int64_t* hosts, const int64_t* gpus, const int64_t* row_bytes, int P, Op op) {
+  for (int p = 0; p < P; ++p) {
+    const long bytes = row_bytes[p];
+    if (bytes % 16 == 0) {
+      op(reinterpret_cast<float4*>(hosts[p]), reinterpret_cast<float4*>(gpus[p]), bytes / 16);
+    } else if (bytes % 4 == 0) {
+      op(reinterpret_cast<int32_t*>(hosts[p]), reinterpret_cast<int32_t*>(gpus[p]), bytes / 4);
+    } else {
+      op(reinterpret_cast<int16_t*>(hosts[p]), reinterpret_cast<int16_t*>(gpus[p]), bytes / 2);
+    }
   }
+}
+
+__device__ inline long grid_stride() {
+  return static_cast<long>(gridDim.x) * blockDim.x;
+}
+
+__device__ inline long grid_tid() {
+  return static_cast<long>(blockIdx.x) * blockDim.x + threadIdx.x;
 }
 
 __global__ void paged_experts_gather_kernel(
@@ -169,41 +194,147 @@ __global__ void paged_experts_gather_kernel(
     const int32_t* count) {
   const int n = *count;
   if (n == 0) return;  // most decode steps page nothing
-  const long stride = static_cast<long>(gridDim.x) * blockDim.x;
-  const long tid = static_cast<long>(blockIdx.x) * blockDim.x + threadIdx.x;
-  for (int p = 0; p < P; ++p) {
-    const long bytes = row_bytes[p];
-    if (bytes % 16 == 0) {  // copy in float4, which the host link needs
-      copy_rows(
-          reinterpret_cast<const float4*>(hosts[p]),
-          reinterpret_cast<float4*>(gpus[p]),
-          bytes / 16,
-          n,
-          src,
-          dst,
-          tid,
-          stride);
-    } else if (bytes % 4 == 0) {  // small per-expert scalars
-      copy_rows(
-          reinterpret_cast<const int32_t*>(hosts[p]),
-          reinterpret_cast<int32_t*>(gpus[p]),
-          bytes / 4,
-          n,
-          src,
-          dst,
-          tid,
-          stride);
-    } else {  // 16-bit per-expert scalars (e.g. an NVFP4 Marlin global scale)
-      copy_rows(
-          reinterpret_cast<const int16_t*>(hosts[p]),
-          reinterpret_cast<int16_t*>(gpus[p]),
-          bytes / 2,
-          n,
-          src,
-          dst,
-          tid,
-          stride);
+  const long stride = grid_stride();
+  for_each_tensor(hosts, gpus, row_bytes, P, [&](auto* host, auto* gpu, long row) {
+    for (long j = grid_tid(); j < n * row; j += stride) {
+      const long i = j / row, off = j % row;
+      gpu[dst[i] * row + off] = host[src[i] * row + off];
     }
+  });
+}
+
+// Copies host row ``rows[i]`` into GPU slot ``slots[i]`` element by element, one way: the row
+// keeps its expert and nothing is written back (inclusive host rows). Rows below zero are skipped.
+__global__ void paged_experts_rows_to_slots_kernel(
+    const int64_t* hosts,
+    const int64_t* gpus,
+    const int64_t* row_bytes,
+    int P,
+    const int32_t* rows,
+    const int32_t* slots,
+    const int32_t* count) {
+  const int n = *count;
+  for_each_tensor(hosts, gpus, row_bytes, P, [&](auto* host, auto* gpu, long row) {
+    const long stride = grid_stride();
+    for (long j = grid_tid(); j < n * row; j += stride) {
+      const long i = j / row, off = j % row;
+      const int r = rows[i];
+      if (r < 0) continue;  // not in host memory: the host pages it in
+      gpu[slots[i] * row + off] = host[r * row + off];
+    }
+  });
+}
+
+// One block, one thread per planned entry: record what the copy will leave on disk (doorbell rows:
+// missing, src, dst), each entry's host row (``rows_out``, -1: on disk or unused) and
+// stamp the rows the copy reads. The maps keep every expert where it is (inclusive rows). Then,
+// with ``publish_row``, write the layer's state row to the host and the new clock as its flag.
+__global__ void paged_experts_tiered_update_kernel(
+    const int32_t* src,
+    const int32_t* dst,
+    const int32_t* count,
+    const int32_t* expert_row,
+    int32_t* row_stamp,
+    int32_t* clock,
+    int32_t* doorbell,  // [3, K]
+    int K,
+    int32_t* rows_out,               // [K]
+    volatile int32_t* publish_row,   // null, or the layer's mailbox row, UVA
+    volatile int32_t* publish_flag,  // ... and its flag
+    int row_len) {                   // the state row: doorbell [3K] first, the clock last
+  // The step's stamp, read once: with more than one warp, a thread reading ``clock`` after thread 0
+  // advanced it would stamp its rows one ahead of the published clock.
+  __shared__ int step_stamp;
+  if (threadIdx.x == 0) step_stamp = *clock + 1;
+  __syncthreads();
+  const int n = *count;
+  const int stamp = step_stamp;
+  int e = -1, s = 0, r = -1;
+  const int i = threadIdx.x;
+  if (i < K) {
+    if (i < n) {
+      e = src[i];
+      s = dst[i];
+      r = expert_row[e];
+    }
+    doorbell[i] = (i < n && r < 0) ? 1 : 0;
+    doorbell[K + i] = e;
+    doorbell[2 * K + i] = s;
+    rows_out[i] = r;
+  }
+  if (i < K && i < n && r >= 0) row_stamp[r] = stamp;
+  if (i == 0) *clock = stamp;
+  if (publish_row == nullptr) return;
+  // The state row to the host, then the clock as its flag (the host polls the flag).
+  __syncthreads();
+  for (int j = threadIdx.x; j < row_len; j += blockDim.x)
+    publish_row[j] = doorbell[j];
+  __threadfence_system();  // each thread's part of the row before the flag
+  __syncthreads();
+  if (i == 0) publish_flag[0] = stamp;
+}
+
+// A captured step that left experts of a layer on disk waits here for the host instead of
+// running on with the slots' old experts: one thread spins on the layer's reply row in pinned
+// host memory until its ticket equals the step's ``clock`` (the host echoes the clock it saw in
+// the published row), then the block copies the host's (row, slot) plan to ``plan`` ``[1 + 2K]``
+// for the copy launched after it, writes the host's row maps into ``maps``, clears the missing
+// flags and acks the ticket. A layer that left nothing on disk does not wait. After
+// ``timeout_ns`` the step runs on unchanged (an empty plan, the flags kept): the replay that
+// follows serves the layer as before.
+// Reply row: [ticket, n, rows[K], slots[K], maps[E + 2R + 1]].
+__device__ __forceinline__ unsigned long long global_timer_ns() {
+  unsigned long long t;
+  asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+  return t;
+}
+
+__global__ void paged_experts_await_rows_kernel(
+    int32_t* doorbell,  // [3, K]
+    int32_t* maps,      // [E + 2R + 1]
+    int maps_len,
+    const int32_t* clock,
+    const volatile int32_t* reply,
+    volatile int32_t* ack,
+    int32_t* plan,  // [1 + 2K]: n, rows, slots
+    int K,
+    long long timeout_ns) {
+  __shared__ int served, ticket;
+  if (threadIdx.x == 0) {
+    int missing = 0;
+    for (int i = 0; i < K; ++i)
+      missing |= doorbell[i];
+    served = 0;
+    plan[0] = 0;
+    ticket = *clock;  // ``maps`` ends with the clock: read before the copy replaces it
+    if (missing) {
+      const unsigned long long start = global_timer_ns();
+      while (true) {
+        if (reply[0] == ticket) {
+          served = 1;
+          break;
+        }
+        if (static_cast<long long>(global_timer_ns() - start) > timeout_ns) break;
+        __nanosleep(1000);
+      }
+    }
+    __threadfence_system();  // the reply's payload after its ticket
+  }
+  __syncthreads();
+  if (!served) return;
+  const int n = reply[1];
+  for (int i = threadIdx.x; i < K; i += blockDim.x) {
+    plan[1 + i] = i < n ? reply[2 + i] : -1;
+    plan[1 + K + i] = i < n ? reply[2 + K + i] : 0;
+    doorbell[i] = 0;
+  }
+  for (int j = threadIdx.x; j < maps_len; j += blockDim.x)
+    maps[j] = reply[2 + 2 * K + j];
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    plan[0] = n;
+    __threadfence_system();
+    ack[0] = ticket;
   }
 }
 
@@ -297,6 +428,115 @@ void paged_experts_gather(
       static_cast<const int32_t*>(src.data_ptr()),
       static_cast<const int32_t*>(dst.data_ptr()),
       static_cast<const int32_t*>(count.data_ptr()));
+}
+
+void paged_experts_rows_to_slots(
+    tvm::ffi::TensorView hosts,
+    tvm::ffi::TensorView gpus,
+    tvm::ffi::TensorView row_bytes,
+    tvm::ffi::TensorView rows,
+    tvm::ffi::TensorView slots,
+    tvm::ffi::TensorView count) {
+  using namespace sglang::host;
+  using sglang::kDLGPU;
+
+  SymbolicSize P = {"num_tensors"}, N = {"num_pairs"}, One = {"one"};
+  SymbolicDevice device_;
+  device_.set_options<kDLGPU>();
+  TensorMatcher({P}).with_dtype<int64_t>().with_device<kDLGPU>(device_).verify(hosts).verify(gpus).verify(row_bytes);
+  TensorMatcher({N}).with_dtype<int32_t>().with_device<kDLGPU>(device_).verify(rows).verify(slots);
+  TensorMatcher({One}).with_dtype<int32_t>().with_device<kDLGPU>(device_).verify(count);
+
+  LaunchKernel(256, 256, device_.unwrap())(
+      paged_experts_rows_to_slots_kernel,
+      static_cast<const int64_t*>(hosts.data_ptr()),
+      static_cast<const int64_t*>(gpus.data_ptr()),
+      static_cast<const int64_t*>(row_bytes.data_ptr()),
+      static_cast<int>(P.unwrap()),
+      static_cast<const int32_t*>(rows.data_ptr()),
+      static_cast<const int32_t*>(slots.data_ptr()),
+      static_cast<const int32_t*>(count.data_ptr()));
+}
+
+void paged_experts_tiered_plan(
+    tvm::ffi::TensorView src,
+    tvm::ffi::TensorView dst,
+    tvm::ffi::TensorView count,
+    tvm::ffi::TensorView expert_row,
+    tvm::ffi::TensorView row_expert,
+    tvm::ffi::TensorView row_stamp,
+    tvm::ffi::TensorView clock,
+    tvm::ffi::TensorView doorbell,
+    tvm::ffi::TensorView rows_out,
+    int64_t publish_row_address,
+    int64_t publish_flag_address,
+    int64_t row_len) {
+  using namespace sglang::host;
+  using sglang::kDLGPU;
+
+  SymbolicSize K = {"num_slots"}, One = {"one"}, E = {"num_experts"}, R = {"num_rows"}, Three = {"three"};
+  SymbolicDevice device_;
+  device_.set_options<kDLGPU>();
+  TensorMatcher({K}).with_dtype<int32_t>().with_device<kDLGPU>(device_).verify(src).verify(dst).verify(rows_out);
+  TensorMatcher({One}).with_dtype<int32_t>().with_device<kDLGPU>(device_).verify(count).verify(clock);
+  TensorMatcher({E}).with_dtype<int32_t>().with_device<kDLGPU>(device_).verify(expert_row);
+  TensorMatcher({R}).with_dtype<int32_t>().with_device<kDLGPU>(device_).verify(row_expert).verify(row_stamp);
+  TensorMatcher({Three, K}).with_dtype<int32_t>().with_device<kDLGPU>(device_).verify(doorbell);
+  const int k = static_cast<int>(K.unwrap());
+  RuntimeCheck(k <= 1024, "paged experts: more slots than one block has threads");
+  RuntimeCheck(
+      publish_row_address == 0 || (publish_flag_address != 0 && row_len >= 3 * k),
+      "paged experts: a publish needs the flag and the whole state row");
+  // The missing flags and the rows first, so the step can publish its disk misses before it copies
+  // its host-row hits (paged_experts_rows_to_slots over rows_out).
+  LaunchKernel(1, (k + 31) / 32 * 32, device_.unwrap())(
+      paged_experts_tiered_update_kernel,
+      static_cast<const int32_t*>(src.data_ptr()),
+      static_cast<const int32_t*>(dst.data_ptr()),
+      static_cast<const int32_t*>(count.data_ptr()),
+      static_cast<const int32_t*>(expert_row.data_ptr()),
+      static_cast<int32_t*>(row_stamp.data_ptr()),
+      static_cast<int32_t*>(clock.data_ptr()),
+      static_cast<int32_t*>(doorbell.data_ptr()),
+      k,
+      static_cast<int32_t*>(rows_out.data_ptr()),
+      reinterpret_cast<volatile int32_t*>(publish_row_address),
+      reinterpret_cast<volatile int32_t*>(publish_flag_address),
+      static_cast<int>(row_len));
+}
+
+void paged_experts_await_rows(
+    tvm::ffi::TensorView doorbell,
+    tvm::ffi::TensorView maps,
+    tvm::ffi::TensorView clock,
+    int64_t reply_address,
+    int64_t ack_address,
+    tvm::ffi::TensorView plan,
+    int64_t timeout_ns) {
+  using namespace sglang::host;
+  using sglang::kDLGPU;
+
+  SymbolicSize K = {"num_slots"}, M = {"maps"}, One = {"one"}, Three = {"three"}, Plan = {"plan"};
+  SymbolicDevice device_;
+  device_.set_options<kDLGPU>();
+  TensorMatcher({Three, K}).with_dtype<int32_t>().with_device<kDLGPU>(device_).verify(doorbell);
+  TensorMatcher({M}).with_dtype<int32_t>().with_device<kDLGPU>(device_).verify(maps);
+  TensorMatcher({One}).with_dtype<int32_t>().with_device<kDLGPU>(device_).verify(clock);
+  TensorMatcher({Plan}).with_dtype<int32_t>().with_device<kDLGPU>(device_).verify(plan);
+  const int k = static_cast<int>(K.unwrap());
+  RuntimeCheck(static_cast<int>(Plan.unwrap()) == 1 + 2 * k, "paged experts: the plan holds 1 + 2K entries");
+
+  LaunchKernel(1, 128, device_.unwrap())(
+      paged_experts_await_rows_kernel,
+      static_cast<int32_t*>(doorbell.data_ptr()),
+      static_cast<int32_t*>(maps.data_ptr()),
+      static_cast<int>(M.unwrap()),
+      static_cast<const int32_t*>(clock.data_ptr()),
+      reinterpret_cast<const volatile int32_t*>(reply_address),
+      reinterpret_cast<volatile int32_t*>(ack_address),
+      static_cast<int32_t*>(plan.data_ptr()),
+      k,
+      static_cast<long long>(timeout_ns));
 }
 
 int64_t paged_experts_host_device_pointer(tvm::ffi::TensorView pinned) {
