@@ -488,6 +488,19 @@ def _validate_triton_sparse_mla_backend(
             )
 
 
+def _supports_mha_one_shot(
+    *, attn_dcp_size: int, shards_index_k: bool, kv_shard_pool, deterministic: bool
+) -> bool:
+    # The dense one-shot prefill is chosen per batch (by its longest KV and its
+    # size), so under deterministic inference a request's attention kernel would
+    # follow its batchmates; every prefill stays on the sparse path instead.
+    if deterministic:
+        return False
+    # Dense MHA expands prefix KV outside the DSA metadata path. Keep
+    # sharded prefill on the sparse kernels with explicit scratch addresses.
+    return (attn_dcp_size == 1 or shards_index_k) and kv_shard_pool is None
+
+
 def _resolve_dsa_triton_union(*, union: int, deterministic: bool) -> int:
     # Union makes a token's output depend on which tokens share its group and
     # on the T % G tail, which breaks the batch invariance deterministic
@@ -670,11 +683,12 @@ class DeepseekSparseAttnBackend(
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
 
         self.use_mha: bool = False
-        # Dense MHA expands prefix KV outside the DSA metadata path. Keep
-        # sharded prefill on the sparse kernels with explicit scratch addresses.
-        self.supports_mha_one_shot: bool = (
-            self.attn_dcp_size == 1 or self.dsa_shards_index_k
-        ) and self._kv_shard_pool is None
+        self.supports_mha_one_shot: bool = _supports_mha_one_shot(
+            attn_dcp_size=self.attn_dcp_size,
+            shards_index_k=self.dsa_shards_index_k,
+            kv_shard_pool=self._kv_shard_pool,
+            deterministic=get_exec().deterministic.enable_deterministic_inference,
+        )
         self.dsa_prefill_impl: _DSA_IMPL_T = get_exec().kernel.dsa_prefill_backend
         self.dsa_decode_impl: _DSA_IMPL_T = get_exec().kernel.dsa_decode_backend
         if (

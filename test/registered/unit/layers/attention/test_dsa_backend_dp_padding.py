@@ -12,6 +12,7 @@ from sglang.srt.layers.attention.dsa_backend import (
     _plan_live_rows,
     _restore_live_rows,
     _RowPlan,
+    _supports_mha_one_shot,
 )
 from sglang.srt.layers.dp_attention import DpPaddingMode
 from sglang.srt.layers.moe.utils import MoeA2ABackend
@@ -379,6 +380,36 @@ class TestDSABackendDPPadding(CustomTestCase):
         self.assertEqual(output.shape, (2 if is_prefill else 4, 1, 2, 2))
         self.assertTrue(torch.all(output[:2] == 1))
         self.assertTrue(torch.all(output[2:] == 0))
+
+
+class TestDSADeterministicPrefillPath(CustomTestCase):
+    def test_deterministic_never_takes_the_dense_one_shot_prefill(self):
+        """The dense prefill is chosen per batch, so under deterministic inference a short prompt ran dense
+        alone and sparse next to a request longer than the dense threshold, and its output changed."""
+        for dcp, shards, pool in (
+            (1, False, None),
+            (2, True, None),
+            (2, False, None),
+            (1, False, object()),
+        ):
+            with self.subTest(dcp=dcp, shards=shards, pool=pool is not None):
+                self.assertFalse(
+                    _supports_mha_one_shot(
+                        attn_dcp_size=dcp,
+                        shards_index_k=shards,
+                        kv_shard_pool=pool,
+                        deterministic=True,
+                    )
+                )
+                self.assertEqual(
+                    _supports_mha_one_shot(
+                        attn_dcp_size=dcp,
+                        shards_index_k=shards,
+                        kv_shard_pool=pool,
+                        deterministic=False,
+                    ),
+                    (dcp == 1 or shards) and pool is None,
+                )
 
 
 if __name__ == "__main__":
