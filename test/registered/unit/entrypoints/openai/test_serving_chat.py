@@ -2804,9 +2804,7 @@ class ServingChatTestCase(CustomTestCase):
                     "role": "developer",
                     "content": "<|kimi_image_placeholder|>",
                 },
-                # Tools ride on their own content-less message: the K3 encoder
-                # renders a tools-carrying system message as a tool declaration
-                # and drops its content, so the two cannot share one message.
+                # A message declaring tools carries no content.
                 {"role": "developer", "content": "", "tools": [tool]},
                 {
                     "role": "user",

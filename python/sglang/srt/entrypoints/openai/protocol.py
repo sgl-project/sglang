@@ -995,9 +995,8 @@ ReasoningEffortType = Optional[
 ]
 
 
-# Dynamic tools may only be declared in a system (or its developer alias)
-# message. The K3 name shape is stricter than OpenAI's
-# ``^[a-zA-Z0-9_-]+$``: a leading digit is rejected, and the ceiling is 256.
+# Kimi-K3 dynamic tools: declared on a system or developer message only; the name
+# shape is stricter than OpenAI's (no leading digit, at most 256 characters).
 _DYNAMIC_TOOL_ROLES = ("system", "developer")
 _TOOL_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_-]*$")
 _TOOL_NAME_MAX_LEN = 256
@@ -1243,10 +1242,8 @@ class ChatCompletionRequest(PDRoutingFields):
         request._message_tools_indices = message_tools_indices
         return request
 
-    # Dynamic tools are declared in a system message that carries no content;
-    # every other placement is a client error, and the model would never see the
-    # tool. Runs "before" because pydantic drops an unknown `tools` key on a user
-    # message, leaving an "after" validator nothing to reject.
+    # mode="before": pydantic drops an unknown `tools` key on a user message,
+    # so an "after" validator would have nothing to reject.
     @model_validator(mode="before")
     @classmethod
     def validate_message_level_tools(cls, values):
@@ -1262,8 +1259,7 @@ class ChatCompletionRequest(PDRoutingFields):
             role = message.get("role")
             role = role.lower() if isinstance(role, str) else role
             if role == "root":
-                # A root message's tools follow its own (MiniMax-M3) contract,
-                # content included; the K3 dynamic-tool rules below do not apply.
+                # MiniMax-M3 root messages carry tools under their own contract.
                 continue
             if role not in _DYNAMIC_TOOL_ROLES:
                 raise ValueError(
