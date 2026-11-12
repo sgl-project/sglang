@@ -31,6 +31,8 @@ from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+# The DeepGEMM FP4 and CuTe DSL paged MQA logits readers need SM100.
+register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 PAGE_SIZE = 64
 HEAD_DIM = 128
