@@ -11,6 +11,11 @@ from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 
 
+from sglang.srt.hardware_backend.npu.utils import init_npu_backend
+
+init_npu_backend()
+
+
 class TestAdaFlashRaggedAttention(unittest.TestCase):
     def test_mixed_query_lengths_across_kv_pages(self):
         torch.manual_seed(23)

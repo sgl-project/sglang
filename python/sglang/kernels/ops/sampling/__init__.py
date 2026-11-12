@@ -124,8 +124,11 @@ def argmax(logits: torch.Tensor) -> torch.Tensor:
             )
             and logits.shape[1] >= 4096
         ):
-            from sgl_kernel_npu.operators.sample import row_argmax
-
+            try:
+                from sgl_kernel_npu.operators.sample import row_argmax
+            except ImportError:
+                # Older CANN-compatible kernel wheels have no fused argmax.
+                return torch.argmax(logits, dim=-1)
             return row_argmax(logits)
         return torch.argmax(logits, dim=-1)
 

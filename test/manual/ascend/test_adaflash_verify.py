@@ -7,6 +7,11 @@ from torch import nn
 from sglang.srt.speculative.adaflash_verify import AdaFlashVerify
 
 
+from sglang.srt.hardware_backend.npu.utils import init_npu_backend
+
+init_npu_backend()
+
+
 class FixedRatios(nn.Module):
     def forward(self, hidden):
         return hidden[:, :1, 0]
