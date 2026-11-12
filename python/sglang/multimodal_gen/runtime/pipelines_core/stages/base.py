@@ -100,10 +100,6 @@ class PipelineStage(StageDedupMixin, ABC):
         """Logs a warning message with the stage name as a prefix."""
         logger.warning(f"[{self.__class__.__name__}] {msg}", *args)
 
-    def log_error(self, msg, *args):
-        """Logs an error message with the stage name as a prefix."""
-        logger.error(f"[{self.__class__.__name__}] {msg}", *args)
-
     def log_debug(self, msg, *args):
         """Logs a debug message with the stage name as a prefix."""
         logger.debug(f"[{self.__class__.__name__}] {msg}", *args)
@@ -180,6 +176,9 @@ class PipelineStage(StageDedupMixin, ABC):
         Load the model for the stage.
         """
         pass
+
+    def drop_breakable_cuda_graphs(self, reason: str) -> None:
+        """Disable captured graphs whose weights changed; stages without graphs do nothing."""
 
     def iter_sequential_requests(
         self, batch: Req, server_args: ServerArgs

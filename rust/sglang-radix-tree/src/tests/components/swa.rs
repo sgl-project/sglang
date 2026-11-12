@@ -3379,6 +3379,58 @@ fn internal_swa_backup_counts_the_collected_window_including_page_overshoot() {
 }
 
 #[test]
+fn a_backup_window_reads_past_nodes_a_queued_eviction_copy_covers() {
+    // a -> b -> {c1 -> c2, d}, one token each, window 3. A queued write-back
+    // copy of c2 covers c2, c1 and b; d's window then reaches a through b, as
+    // it does once that copy's ack has landed.
+    let mut tc = UnifiedTreeCore::new(
+        CacheInitParams {
+            page_size: 1,
+            swa_sliding_window_size: Some(3),
+            enable_hicache: true,
+            has_swa_host_pool: true,
+            is_write_back: true,
+            ..Default::default()
+        },
+        vec![FULL, SWA],
+    );
+    let keys = [
+        vec![1],
+        vec![1, 2],
+        vec![1, 2, 3],
+        vec![1, 2, 3, 4],
+        vec![1, 2, 5],
+    ];
+    let mut ids = Vec::new();
+    for key in &keys {
+        let values: Vec<i64> = key.iter().map(|t| t + 10).collect();
+        let id = tc
+            .insert(&insert_params_swa(key, &values, 0, 0))
+            .last_device_node_id
+            .unwrap();
+        let idx = tc.arena.resolve(id).unwrap();
+        store_swa_device(&mut tc, idx);
+        ids.push(id);
+    }
+    let (a, b, c1, c2, d) = (ids[0], ids[1], ids[2], ids[3], ids[4]);
+    let (full, mut transfers) = tc.build_backup_spec(c2).unwrap();
+    let mut covered = transfers[&SWA][0].nodes_to_load.clone().unwrap();
+    covered.sort_unstable();
+    assert_eq!(covered, vec![b, c1, c2]);
+    for transfer in transfers.values_mut().flatten() {
+        transfer.host_indices = Some(transfer.device_indices.as_ref().unwrap() + 1000);
+    }
+    tc.commit_backup(c2, full + 1000, transfers).unwrap();
+    let covered = tc.mark_write_through_pending(covered, c2).unwrap();
+    tc.mark_write_back_queued(c2, covered).unwrap();
+
+    let (_, transfers) = tc.build_backup_spec(d).unwrap();
+    let mut window = transfers[&SWA][0].nodes_to_load.clone().unwrap();
+    window.sort_unstable();
+    assert_eq!(window, vec![a, d]);
+}
+
+#[test]
 fn internal_swa_backup_guards_keep_the_existing_inline_tombstone() {
     for guard in [
         "no_hicache",
@@ -5237,9 +5289,8 @@ fn prefetch_commit_without_a_target_releases_the_whole_buffer() {
 }
 
 #[test]
-fn prefetch_commit_releases_a_shortened_window_under_a_non_root_anchor() {
-    // root -> a -> b -> c, one token each; anchor b, target c: the loaded
-    // window is missing its head and cannot be reused as a complete SWA window.
+fn prefetch_commit_attaches_a_sub_window_hit_under_a_non_root_anchor() {
+    // root -> a -> b -> c, one token each; anchor b, target c.
     let mut tc = swa_core(/* window = */ 4, /* page_size = */ 1);
     let [a, b, c] = chain::<3>(&mut tc);
     let mut cache_actions = Vec::new();
@@ -5249,8 +5300,8 @@ fn prefetch_commit_releases_a_shortened_window_under_a_non_root_anchor() {
         ..InsertResult::default()
     };
     let storage_result = PoolTransferResult {
-        kv_hit_pages: 3,
-        extra_pool_hit_pages: HashMap::from([(PoolName::Swa, 2)]),
+        kv_hit_pages: 1,
+        extra_pool_hit_pages: HashMap::from([(PoolName::Swa, 1)]),
     };
     swa_component(4).commit_hicache_transfer(
         &mut tc,
@@ -5258,21 +5309,23 @@ fn prefetch_commit_releases_a_shortened_window_under_a_non_root_anchor() {
         CacheTransferPhase::Prefetch,
         vec![PoolTransfer {
             name: PoolName::Swa,
-            host_indices: Some(Tensor::from_slice(&[30i64, 31])),
+            host_indices: Some(Tensor::from_slice(&[31i64])),
             ..Default::default()
         }],
         &mut cache_actions,
         Some(&mut insert_result),
         Some(&storage_result),
     );
-    assert!(!tc.arena.node(c).has_host_value(SWA));
+    assert!(
+        tc.arena
+            .node(c)
+            .host_value(SWA)
+            .equal(&Tensor::from_slice(&[31i64]))
+    );
+    assert!(tc.host_lru_list(SWA).in_list(Some(c)));
     assert!(!tc.arena.node(b).has_host_value(SWA));
     assert!(!tc.arena.node(a).has_host_value(SWA));
-    assert!(!tc.host_lru_list(SWA).in_list(Some(c)));
-    assert_eq!(cache_actions.len(), 1);
-    let FreeComponentHostSlot { host_indices, .. } =
-        expect_action::<FreeComponentHostSlot>(cache_actions[0].as_ref());
-    assert!(host_indices[0].equal(&Tensor::from_slice(&[30i64, 31])));
+    assert!(cache_actions.is_empty());
 }
 
 #[test]

@@ -2040,7 +2040,10 @@ export const Playground = ({ config }) => {
         ...((multinode || pdMode) ? fabricFlags.map((x) => "  " + x) : []),
         // The NPU device block already mounts ~/.cache/.
         ...(npuDevices ? [] : ["  -v ~/.cache/huggingface:/root/.cache/huggingface"]),
-        ...[...(config.dockerMounts || []), ...(cell.pd ? cell.dockerMounts || [] : [])].map((mount) => `  -v ${mount}`),
+        ...[
+          ...(typeof config.dockerMounts === "function" ? config.dockerMounts(sel) : config.dockerMounts || []),
+          ...(cell.pd ? cell.dockerMounts || [] : []),
+        ].map((mount) => `  -v ${mount}`),
         `  --env "HF_TOKEN={{HF_TOKEN}}"`,
         ...cellEnv.map((e) => `  --env ${e}`),
         "  --ipc=host",
@@ -2589,7 +2592,17 @@ export const Playground = ({ config }) => {
   const [routerCopied, setRouterCopied] = useState(false);
   const [envDraft, setEnvDraft] = useState(env);
   useEffect(() => { if (modal === "env") setEnvDraft(env); }, [modal, env]);
-  const [runMode, setRunMode] = useState("python");
+  // Honor the same per-platform output modes as the Deployment panel.
+  const configuredRunModes = typeof config.runModes === "function"
+    ? config.runModes(base) : config.runModes;
+  const runModes = configuredRunModes || ["python", "docker"];
+  const [runMode, setRunMode] = useState(runModes[0]);
+  const hasRunMode = runModes.includes(runMode);
+  const fallbackRunMode = runModes[0];
+  const activeRunMode = hasRunMode ? runMode : fallbackRunMode;
+  useEffect(() => {
+    if (!hasRunMode) setRunMode(fallbackRunMode);
+  }, [hasRunMode, fallbackRunMode]);
 
   // Submit-verified-cell modal state, reset each time the modal opens.
   const [submitDraft, setSubmitDraft] = useState({
@@ -2720,11 +2733,11 @@ export const Playground = ({ config }) => {
     return out;
   };
   if (baseCell) {
-    baseCommand = renderCommandLines(baseCell, withRatio(baseCell.flags, pgRatios.base), baseCell.env, base, env, null, runMode);
+    baseCommand = renderCommandLines(baseCell, withRatio(baseCell.flags, pgRatios.base), baseCell.env, base, env, null, activeRunMode);
     const { flags: pgFlags, env: pgEnv, pdMode } = applyAllDeltas(baseCell.flags, baseCell.env, deltas, base, derivedMap);
     pgFlagsLatest = pgFlags;
     pgEnvLatest = pgEnv;
-    playgroundCommand = renderCommandLines(baseCell, withRatio(pgFlags, pgRatios.eff), pgEnv, base, env, pdMode, runMode);
+    playgroundCommand = renderCommandLines(baseCell, withRatio(pgFlags, pgRatios.eff), pgEnv, base, env, pdMode, activeRunMode);
     diffLines = computeDiff(baseCommand, playgroundCommand);
   }
   // Broadcast both configs for outside consumers (the mamba ratio calculator):
@@ -2930,6 +2943,44 @@ export const Playground = ({ config }) => {
     );
   };
 
+  // Mirrors renderWarn in _deployment.jsx (Mintlify strips module state, so the
+  // engines cannot share it): [label](#anchor) links become scrollIntoView
+  // buttons, so the hash that carries the selection is not overwritten.
+  const renderWarn = (text) => {
+    const out = [];
+    const re = /\[([^\]]+)\]\(#([^)]+)\)/g;
+    let last = 0;
+    for (let m; (m = re.exec(text)); last = m.index + m[0].length) {
+      if (m.index > last) out.push(text.slice(last, m.index));
+      const anchor = m[2];
+      out.push(
+        <button
+          key={m.index}
+          type="button"
+          onClick={() => {
+            const el = document.getElementById(anchor);
+            if (el) el.scrollIntoView({ behavior: "smooth", block: "start" });
+          }}
+          style={{
+            background: "transparent",
+            border: "none",
+            padding: 0,
+            color: isDark ? "#FDBA74" : "#C2410C",
+            cursor: "pointer",
+            font: "inherit",
+            fontWeight: 600,
+            textDecoration: "underline",
+            textUnderlineOffset: "2px",
+          }}
+        >
+          {m[1]}
+        </button>
+      );
+    }
+    if (last < text.length) out.push(text.slice(last));
+    return out;
+  };
+
   // ==========================================================================
   // 12. JSX render
   // ==========================================================================
@@ -2937,6 +2988,15 @@ export const Playground = ({ config }) => {
     <div style={s.baseStrip}>
       Select Prefill or Decode in the Deployment panel to tune that worker.
       The Router tab contains the shared frontend command.
+    </div>
+  );
+  // A redirect cell's flags are a pointer, not a launch command, so there is
+  // nothing to compose on top of it; show the same banner as the Deploy panel.
+  if (baseCell && baseCell.redirect) return (
+    <div style={s.baseStrip}>
+      ⚠️ {baseCell.warn
+        ? renderWarn(baseCell.warn)
+        : "This platform is not configured through the Playground."}
     </div>
   );
   return (
@@ -3026,22 +3086,19 @@ export const Playground = ({ config }) => {
                 </span>
               )}
               <div style={s.runModeWrap} role="tablist" aria-label="Output format">
-                <span
-                  style={s.runModeChip(runMode === "python")}
-                  onClick={() => setRunMode("python")}
-                  role="tab"
-                  aria-selected={runMode === "python"}
-                >
-                  Python
-                </span>
-                <span
-                  style={s.runModeChipLast(runMode === "docker")}
-                  onClick={() => setRunMode("docker")}
-                  role="tab"
-                  aria-selected={runMode === "docker"}
-                >
-                  Docker
-                </span>
+                {runModes.map((mode, index) => (
+                  <span
+                    key={mode}
+                    style={index === runModes.length - 1
+                      ? s.runModeChipLast(activeRunMode === mode)
+                      : s.runModeChip(activeRunMode === mode)}
+                    onClick={() => setRunMode(mode)}
+                    role="tab"
+                    aria-selected={activeRunMode === mode}
+                  >
+                    {mode === "docker" ? "Docker" : "Python"}
+                  </span>
+                ))}
               </div>
             </div>
             <div style={s.iconRow}>
