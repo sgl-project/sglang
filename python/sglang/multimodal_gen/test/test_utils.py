@@ -47,7 +47,7 @@ SGL_TEST_FILES_CI_DATA_REVISION = "c7258eb56e9951878c66fc0fb3673d9f4775b0b2"
 # on main pins quality='exact', which disables MiniMax-H3's env-selected Cache-DiT
 # and produces a golden from a different code path than the test runs.
 if current_platform.is_npu():
-    SGL_TEST_FILES_CI_DATA_REVISION = "2173af2fe762e2c95e18b06d017604d520196eff"
+    SGL_TEST_FILES_CI_DATA_REVISION = "09d116eac094de57eaac167210271e88cd981a01"
 
 SGL_TEST_FILES_CONSISTENCY_GT_ROOT = (
     "https://raw.githubusercontent.com/"

@@ -194,6 +194,7 @@ from sglang.srt.managers.io_struct import (
     PluginWeightUpdateReqInput,
     ProfileReq,
     ReleaseMemoryOccupationReqInput,
+    ReleaseMemoryOccupationReqOutput,
     ReleaseUocrDocReqInput,
     RemoveExternalCorpusReqInput,
     RemoveExternalCorpusReqOutput,
@@ -2366,6 +2367,11 @@ class Scheduler(
                 if self.rust_server is None and isinstance(output, RpcReqOutput):
                     if self.ipc_channels.recv_from_rpc is not None:
                         sock_send(self.ipc_channels.recv_from_rpc, output)
+                elif get_parallel().pp_size > 1 and isinstance(
+                    output, ReleaseMemoryOccupationReqOutput
+                ):
+                    # Answered by the first stage once every stage has released.
+                    self._pp_pass_release_verdict(output, recv_req)
                 else:
                     self.send_control_output(output, recv_req)
 

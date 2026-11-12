@@ -32,7 +32,6 @@ from sglang.srt.mem_cache.events import (
     enable_mm_routing_labels,
     mm_routing_spans,
 )
-from sglang.srt.mem_cache.evict_policy import GDSStrategy
 from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, PoolName, PoolTransfer
 from sglang.srt.mem_cache.kv.plan import TREE_STATE, TREE_WINDOW
 from sglang.srt.mem_cache.radix_cache import RadixKey
@@ -592,11 +591,6 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                 ),
                 tlru_tail_budget=tlru_tail_budget,
                 tlru_float_config=tlru_float_config,
-                gds_cost=(
-                    (eviction_strategy.d, eviction_strategy.e)
-                    if isinstance(eviction_strategy, GDSStrategy)
-                    else None
-                ),
                 page_size=params.page_size,
                 is_write_back=False,
                 enable_hicache=False,
