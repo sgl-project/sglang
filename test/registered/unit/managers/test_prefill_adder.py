@@ -1595,6 +1595,7 @@ class TestPrefillAdder(CustomTestCase):
             prefill_retire_lag=0, decode_retire_lag=0, eviction_interval=1
         )
         budget.checkpoint_interval = 0
+        budget._demands = {}
         # 48 owner tokens free; nothing else holds memory to give back.
         budget._fits = lambda full, windows, state_slots, **kwargs: full <= 48
         budget._others_hold_memory = lambda req: False
