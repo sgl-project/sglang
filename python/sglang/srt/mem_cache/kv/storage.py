@@ -222,8 +222,6 @@ class KVStorage:
                 name,
                 capacity * factor,
                 band.page_size,
-                store_dtype=getattr(view, "store_dtype", None),
-                value_dtype=getattr(view, "dtype", None),
             )
         return layout
 

@@ -501,12 +501,11 @@ class TestHiCacheL3ObjectLayout(CustomTestCase):
             DeepSeekV4TokenToKVPool
         )
         # The storage config reads the pool's layer range through its router.
+        controller.mem_pool_device.dtype = torch.bfloat16
         controller.mem_pool_device.start_layer = 0
         controller.mem_pool_device.layer_num = 1
         controller.mem_pool_host = SimpleNamespace(
-            layout="page_first",
-            storage_format_tag=None,
-            get_storage_dtype=lambda: torch.bfloat16,
+            layout="page_first", storage_format_tag=None
         )
         controller.storage_host_pool = controller.mem_pool_host
         controller.enable_storage_metrics = False

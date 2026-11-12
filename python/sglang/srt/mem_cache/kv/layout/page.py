@@ -18,9 +18,6 @@ class PageEnvelopeHostLayout(msgspec.Struct, frozen=True, kw_only=True):
     start_layer: int = 0
     end_layer: int = 0
     device_layer_num: int = 1
-    # Mirrored K/V encoding. The envelope itself is raw bytes.
-    store_dtype: Optional[torch.dtype] = None
-    value_dtype: Optional[torch.dtype] = None
 
     @property
     def size(self):
@@ -67,15 +64,7 @@ class PageEnvelopeHostLayout(msgspec.Struct, frozen=True, kw_only=True):
         )
 
 
-def page_envelope_host_layout(
-    arena,
-    name,
-    capacity,
-    page_size,
-    *,
-    store_dtype: Optional[torch.dtype] = None,
-    value_dtype: Optional[torch.dtype] = None,
-):
+def page_envelope_host_layout(arena, name, capacity, page_size):
     band = arena.band(name)
     page_bytes = band.unit_bytes
     pages = arena.num_entries(name) // band.unit_entries
@@ -85,6 +74,4 @@ def page_envelope_host_layout(
         registration_bytes=arena.accessible_bytes,
         page_size=page_size,
         capacity=capacity,
-        store_dtype=store_dtype,
-        value_dtype=value_dtype,
     )

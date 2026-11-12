@@ -419,8 +419,6 @@ class MLAView(MLAKVView):
                 if self.host_capacity_tokens is None
                 else self.host_capacity_tokens,
                 self.page_size,
-                store_dtype=self.store_dtype,
-                value_dtype=self.dtype,
             )
         (info,) = self.get_device_pool_infos()
         return MLAHostLayout(
@@ -448,7 +446,6 @@ class MLAView(MLAKVView):
             qk_rope_head_dim=self.qk_rope_head_dim,
             kv_cache_dim=self.kv_cache_dim,
             dtype=self.store_dtype,
-            value_dtype=self.dtype,
             device=self.data_ptrs.device,
             packed_fp8=False,
             scales=None,

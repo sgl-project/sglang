@@ -7,7 +7,7 @@ import torch
 
 from sglang.srt.mem_cache.device_pool_info import MHABufferInfo, PageEnvelopeBufferInfo
 from sglang.srt.mem_cache.kv.memory.host_backing import _SharedPageEnvelopeHostBacking
-from sglang.srt.mem_cache.pool_host.base import HostKVCache, resolve_storage_dtype
+from sglang.srt.mem_cache.pool_host.base import HostKVCache
 from sglang.srt.utils import is_cuda, is_hip
 
 _is_cuda = is_cuda()
@@ -126,22 +126,6 @@ class UnifiedPageEnvelopeHostPool(HostKVCache):
         self.lock = _shared_backing.lock
         self._destroyed = False
         _shared_backing.retain(pool_label)
-
-    def get_storage_dtype(self) -> torch.dtype:
-        # The uint8 envelope mirrors the pool's stored K/V representation.
-        # Page-envelope layouts carry that pair explicitly; older device pools
-        # expose it as store_dtype plus dtype.
-        pool = self.device_pool
-        store_dtype = getattr(pool, "store_dtype", None)
-        value_dtype = getattr(pool, "value_dtype", None)
-        if value_dtype is None:
-            value_dtype = getattr(pool, "dtype", None)
-        if store_dtype is None or value_dtype is None:
-            raise ValueError(
-                "Page-envelope storage requires both store_dtype and value_dtype "
-                "to identify the persisted KV encoding."
-            )
-        return resolve_storage_dtype(store_dtype, value_dtype)
 
     @classmethod
     def build_hybrid_swa_pool_pair(
