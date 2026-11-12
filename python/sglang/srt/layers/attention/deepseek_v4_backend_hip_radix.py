@@ -133,6 +133,10 @@ logger = logging.getLogger(__name__)
 _DSPARK_DRAFT_RAW_METADATA = envs.SGLANG_HIP_DSPARK_DRAFT_RAW_METADATA.get()
 
 SWA_WINDOW = 128
+# HIP prefill graphs do not capture DecoderReplayTail.run_in_prefill_graph.
+# With decoder SWA bounded replay, the late layers then run on every extend row.
+# Above this many rows the graph is slower than an eager prefill that keeps the tail.
+_HIP_PREFILL_GRAPH_MAX_EXTEND_TOKENS = 2048
 DEFAULT_INDEX_TOPK = 512
 PAGE_INDEX_ALIGNED_SIZE = 64
 
@@ -903,7 +907,16 @@ class DeepseekV4HipRadixBackend(
         if seq_lens_cpu is None or seq_lens_cpu.numel() == 0:
             return True
         max_seq_len = self._prefill_graph_seq_limit()
-        return max_seq_len is None or int(seq_lens_cpu.max().item()) <= max_seq_len
+        if max_seq_len is not None and int(seq_lens_cpu.max().item()) > max_seq_len:
+            return False
+        if self.enable_decoder_swa_bounded_replay:
+            extend_lens_cpu = forward_batch.extend_seq_lens_cpu
+            if (
+                extend_lens_cpu is not None
+                and sum(extend_lens_cpu) > _HIP_PREFILL_GRAPH_MAX_EXTEND_TOKENS
+            ):
+                return False
+        return True
 
     _prefill_graph_seq_limit = DeepseekV4AttnBackend._prefill_graph_seq_limit
     _low_ratio_in_prefill_graph = DeepseekV4AttnBackend._low_ratio_in_prefill_graph
