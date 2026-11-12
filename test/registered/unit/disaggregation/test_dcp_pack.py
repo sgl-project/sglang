@@ -233,7 +233,7 @@ class TestHostTensorIndicesEvent(CustomTestCase):
         manager = SimpleNamespace(
             enable_all_cp_ranks_for_transfer=False,
             kv_shard_size=4,
-            kv_args=SimpleNamespace(state_types=[]),
+            kv_args=SimpleNamespace(state_types=[], state_sub_pools=[]),
         )
         sender = SimpleNamespace(
             supports_host_tensor_indices=True,
@@ -255,6 +255,7 @@ class TestHostTensorIndicesEvent(CustomTestCase):
             token_to_kv_pool_allocator=SimpleNamespace(
                 page_size=page_size,
                 translate_kv_indices_for_transfer=lambda x: x,
+                storage=None,
             ),
             req_to_token_pool=SimpleNamespace(
                 req_to_token=torch.arange(5 * page_size, 5 * page_size + total).reshape(
