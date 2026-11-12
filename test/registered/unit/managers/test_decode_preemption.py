@@ -16,6 +16,7 @@ from sglang.srt.managers.scheduler_components import request_retirer
 from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
     ListKind,
+    move,
 )
 from sglang.srt.managers.scheduler_components.request_retirer import RequestRetirer
 from sglang.srt.runtime_context import get_context
@@ -201,11 +202,11 @@ class TestDecodePreemptor(CustomTestCase):
         self.assertEqual(victim.num_preemptions, 1)
 
         # The scheduler's waiting queue is an IndexedReqList (no list
-        # mutators); the promoted order is applied with replace().
+        # mutators); the promoted order is applied with reorder().
         a, b = _req("a", input_len=10), _req("b", input_len=10)
         queue = IndexedReqList(ListKind.WAITING)
-        queue.join([a, b, waiter, victim])
-        queue.replace(pre.promote_target(queue))
+        move([a, b, waiter, victim], queue)
+        queue.reorder(pre.promote_target(queue))
         self.assertEqual([r.rid for r in queue], ["w", "a", "b", "v"])
 
         # Within the cooldown no second plan, even with a starving waiter.

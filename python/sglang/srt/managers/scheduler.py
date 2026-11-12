@@ -4564,7 +4564,7 @@ class Scheduler(
             )
         )
         if self.decode_preemptor is not None:
-            self.waiting_queue.replace(
+            self.waiting_queue.reorder(
                 self.decode_preemptor.promote_target(self.waiting_queue)
             )
 
