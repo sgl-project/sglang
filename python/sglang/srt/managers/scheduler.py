@@ -2183,6 +2183,17 @@ class Scheduler(
         else:
             self.schedule_stream.wait_stream(self.forward_stream)
 
+    def _join_schedule_stream(self, batch: ScheduleBatch, staged_seq_lens) -> None:
+        """Order the forward after the schedule stream's work since the last join, and with it
+        after the WAR barrier queued there. SGLANG_OPT_SPEC_STAGED_SEQ_LENS: a pass whose lengths
+        come from the post-verify graph and whose decode preparation launched nothing on the
+        schedule stream (no KV allocation) has nothing there to wait for."""
+        if staged_seq_lens is not None:
+            sched_idle, batch.spec_prep_sched_idle = batch.spec_prep_sched_idle, False
+            if sched_idle:
+                return
+        overlap_events.wait_stream(self.forward_stream, self.schedule_stream)
+
     def increment_scheduler_iterations(self) -> None:
         if get_observability().enable_metrics:
             self.metrics_collector.increment_scheduler_iterations()
@@ -5370,22 +5381,20 @@ class Scheduler(
                     and self._confidence_budget_prepare is None
                     and not getattr(self.future_map, "needs_cpu_seq_lens", True)
                 )
+                staged_seq_lens = (
+                    self._staged_seq_lens(batch)
+                    if self._staged_seq_lens is not None and not gpu_only_lens
+                    else None
+                )
                 if not gpu_only_lens:
                     self.future_map.resolve_seq_lens_cpu(
-                        batch,
-                        staged_seq_lens=(
-                            None
-                            if self._staged_seq_lens is None
-                            else self._staged_seq_lens(batch)
-                        ),
+                        batch, staged_seq_lens=staged_seq_lens
                     )
                 if self._confidence_budget_prepare is not None:
                     self._confidence_budget_prepare(batch, self.future_map)
 
                 with self.forward_stream_ctx:
-                    overlap_events.wait_stream(
-                        self.forward_stream, self.schedule_stream
-                    )
+                    self._join_schedule_stream(batch, staged_seq_lens)
                     if gpu_only_lens:
                         # publish_ready was recorded on forward_stream: stream order
                         # fences the gather, no host sync / event wait needed.

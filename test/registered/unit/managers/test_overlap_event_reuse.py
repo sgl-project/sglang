@@ -7,6 +7,8 @@ from unittest.mock import Mock, patch
 import torch
 
 from sglang.srt.managers import overlap_utils
+from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.speculative import eagle_utils
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import overlap_events, round_outputs, scheduler_affinity
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -201,6 +203,75 @@ class TestSchedulerMainThreadAffinity(unittest.TestCase):
                 for _ in range(3):
                     affinity.maybe_repin()
             self.assertEqual(scan.call_count, 2)
+
+
+class TestStagedRoundScheduleJoin(unittest.TestCase):
+    def test_a_staged_round_with_an_idle_preparation_skips_the_join(self):
+        """SGLANG_OPT_SPEC_STAGED_SEQ_LENS: the forward skips its join on the schedule stream
+        only for a staged round whose decode preparation launched nothing there; the flag is
+        consumed. Any other round joins as before."""
+        staged = torch.tensor([3, 4])
+        for staged_lens, idle, joins in (
+            (None, True, True),
+            (None, False, True),
+            (staged, False, True),
+            (staged, True, False),
+        ):
+            sched = SimpleNamespace(forward_stream=object(), schedule_stream=object())
+            batch = SimpleNamespace(spec_prep_sched_idle=idle)
+            with (
+                self.subTest(staged=staged_lens is not None, idle=idle),
+                patch.object(overlap_events, "wait_stream") as wait_stream,
+            ):
+                Scheduler._join_schedule_stream(sched, batch, staged_lens)
+                self.assertEqual(wait_stream.called, joins)
+                if staged_lens is not None:
+                    self.assertFalse(batch.spec_prep_sched_idle)
+
+    def test_the_preparation_is_idle_only_without_allocation_or_schedule_stream_work(
+        self,
+    ):
+        """eagle_prepare_for_decode marks a round idle when it allocates nothing and neither
+        penalties, SWA eviction nor the lazy Mamba extra buffer launch on the schedule stream."""
+        for penalized, swa, lazy, expected in (
+            (False, False, False, True),
+            (True, False, False, False),
+            (False, True, False, False),
+            (False, False, True, False),
+        ):
+            batch = SimpleNamespace(
+                maybe_evict_swa=Mock(),
+                sampling_info=SimpleNamespace(
+                    penalizer_orchestrator=SimpleNamespace(is_required=penalized)
+                ),
+                cumulate_penalty_output_tokens=Mock(),
+                token_to_kv_pool_allocator=SimpleNamespace(page_size=64),
+                reqs=[SimpleNamespace(decode_batch_idx=0)],
+                seq_lens_cpu=torch.tensor([10]),
+                tree_cache=SimpleNamespace(supports_swa=lambda swa=swa: swa),
+                req_to_token_pool=None,
+                spec_prep_sched_idle=None,
+            )
+            mamba = SimpleNamespace(enable_mamba_extra_buffer_lazy=lazy)
+            with (
+                self.subTest(penalized=penalized, swa=swa, lazy=lazy),
+                patch.object(eagle_utils, "_DECODE_EMPTY_ALLOCATION", True),
+                patch.object(
+                    eagle_utils, "get_alloc_reserve_per_decode", return_value=0
+                ),
+                patch.object(
+                    eagle_utils,
+                    "page_aligned_decode_alloc_lens",
+                    return_value=([10], [10], 0),
+                ),
+                patch.object(eagle_utils, "alloc_for_spec_decode") as alloc,
+                patch.object(
+                    eagle_utils, "get_exec", return_value=SimpleNamespace(mamba=mamba)
+                ),
+            ):
+                eagle_utils.eagle_prepare_for_decode(batch)
+                alloc.assert_called_once()
+                self.assertIs(batch.spec_prep_sched_idle, expected)
 
 
 if __name__ == "__main__":

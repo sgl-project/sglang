@@ -2100,6 +2100,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # Speculative decoding
     spec_algorithm: SpeculativeAlgorithm = None
+    # SGLANG_OPT_SPEC_STAGED_SEQ_LENS: this iteration's decode preparation launched nothing on
+    # the schedule stream; set by eagle_prepare_for_decode, consumed by the forward's join
+    spec_prep_sched_idle: bool = False
 
     # Whether to return hidden states
     return_hidden_states: bool = False
