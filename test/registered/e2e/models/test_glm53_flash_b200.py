@@ -114,8 +114,6 @@ class TestGLM53FlashB200HighThroughput(
         "--attn-dp-size",
         "4",
         "--mm-enable-dp-encoder",
-        "--mamba-full-memory-ratio",
-        "0.9",
     ]
 
 
