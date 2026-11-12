@@ -25,19 +25,17 @@ whose shard tiles the grid derives the same keys for the same bytes. A TP2
 rank's objects are exactly the union of two TP4 ranks'; a PP1 rank's are the
 union of the stages'.
 
-For a dense MHA/MLA pool, two fleet-wide agreements set the grid:
-``head_group`` (kv heads per chunk) and
+Two fleet-wide agreements set the grid: ``head_group`` (kv heads per chunk) and
 ``layer_partition`` (layers per chunk). They are not local tuning knobs --
 they fix chunk boundaries, and boundaries are namespace identity. Left unset,
 each falls back to this rank's own shard, which shares only with its own
 topology.
 
-DeepSeek V4/V4.1 native pools instead store one complete native page per global
-owner/source layer, with the pool role and byte encoding in the digest. Their
-head and layer partitions must be unset or 1. A zero-byte KV marker anchors the
-logical page; the attention, indexer and checkpoint pools carry its payloads.
-This data layout is independent of TP/PP; model execution must also support the
-requested topology. CP, DCP and draft sidecars are unsupported for these pools.
+DSA and DeepSeek V4/V4.1 native pools instead store one complete native page per
+global owner layer, with the pool role and byte encoding in the digest; both
+partitions must be unset or 1. DSA keeps its real MLA KV anchor plus indexer
+pages, while DeepSeek V4 anchors the logical page with a zero-byte KV marker.
+CP, DCP and draft sidecars are unsupported for these pools.
 
 The digest prefixes every key, so any identity mismatch misses rather than
 collides. dtype is the LOGICAL one: fp8_e4m3 and fp8_e5m2 never share a

@@ -132,6 +132,7 @@ class TestDSV4ControllerUnifiedKeys(CustomTestCase):
     def _config(self, *, tp_rank=0, cp_size=1, dcp_size=1):
         device = object.__new__(DeepSeekV4TokenToKVPool)
         device.dtype = torch.float16
+        device.page_size = 16
         device.index_pools = {}
         info = DevicePoolInfo(
             pool_name=PoolName.DEEPSEEK_V4_C4,

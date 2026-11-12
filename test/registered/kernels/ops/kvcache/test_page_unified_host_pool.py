@@ -282,7 +282,6 @@ def test_mla_page_unified(kv_lora_rank, qk_rope_head_dim, dtype, preallocate):
         ), f"latent KV mismatch at layer {layer}"
 
 
-@pytest.mark.parametrize("io_backend", ["kernel", "direct"])
 @pytest.mark.parametrize(
     "kind,dtype",
     [
@@ -293,7 +292,7 @@ def test_mla_page_unified(kv_lora_rank, qk_rope_head_dim, dtype, preallocate):
         ("state", torch.float32),
     ],
 )
-def test_dsv4_native_page_unified(kind, dtype, io_backend):
+def test_dsv4_native_page_unified(kind, dtype):
     """Native page widths are bytes even when the device stores FP16/FP32."""
     from sglang.srt.mem_cache.deepseek_v4_buffer_info import DSV4StateBufferInfo
     from sglang.srt.mem_cache.memory_pool_host import (
@@ -346,18 +345,10 @@ def test_dsv4_native_page_unified(kind, dtype, io_backend):
                 **common,
             )
 
-    index_device = "cpu" if io_backend == "direct" else DEVICE
-    device_indices = _page_indices([2, 4], PAGE_SIZE).to(index_device)
-    host_indices = _page_indices([1, 3], PAGE_SIZE).to(index_device)
-    # HiCache transfers use dedicated streams. The direct transport's
-    # cudaMemcpyBatchAsync API cannot run on the legacy NULL stream.
-    transfer_stream = torch.cuda.Stream()
-    transfer_stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(transfer_stream):
-        host.backup_from_device_all_layer(
-            None, host_indices, device_indices, io_backend
-        )
-    transfer_stream.synchronize()
+    device_indices = _page_indices([2, 4], PAGE_SIZE).to(DEVICE)
+    host_indices = _page_indices([1, 3], PAGE_SIZE).to(DEVICE)
+    host.backup_from_device_all_layer(None, host_indices, device_indices, "kernel")
+    torch.cuda.synchronize()
     stored = [host.get_data_page(page * PAGE_SIZE).clone() for page in (1, 3)]
     host.kv_buffer.zero_()
     for page, data in zip((6, 2), stored):
@@ -365,15 +356,13 @@ def test_dsv4_native_page_unified(kind, dtype, io_backend):
     for buffer in buffers:
         buffer.zero_()
 
-    restored_host = _page_indices([6, 2], PAGE_SIZE).to(index_device)
-    restored_device = _page_indices([5, 6], PAGE_SIZE).to(index_device)
-    transfer_stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(transfer_stream):
-        for layer in range(layers):
-            host.load_to_device_per_layer(
-                None, restored_host, restored_device, layer, io_backend
-            )
-    transfer_stream.synchronize()
+    restored_host = _page_indices([6, 2], PAGE_SIZE).to(DEVICE)
+    restored_device = _page_indices([5, 6], PAGE_SIZE).to(DEVICE)
+    for layer in range(layers):
+        host.load_to_device_per_layer(
+            None, restored_host, restored_device, layer, "kernel"
+        )
+    torch.cuda.synchronize()
     for actual, expected in zip(buffers, originals):
         assert torch.equal(actual[[5, 6]], expected[[2, 4]])
 

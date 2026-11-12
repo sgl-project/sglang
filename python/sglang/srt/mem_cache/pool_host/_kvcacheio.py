@@ -60,6 +60,19 @@ MLA_KVCACHEIO_OPS = MappingProxyType(
     }
 )
 
+# DSA indexer and DeepSeek-V4 pools keep page_first bytes under page_unified.
+MLA_PAGE_UNIFIED_KVCACHEIO_OPS = MappingProxyType(
+    {
+        **MLA_KVCACHEIO_OPS,
+        "kernel": MappingProxyType(
+            {
+                **MLA_KVCACHEIO_OPS["kernel"],
+                "page_unified": MLA_KVCACHEIO_OPS["kernel"]["page_first"],
+            }
+        ),
+    }
+)
+
 
 def require_kvcacheio_ops(
     *, pool: str, layout: str, ops: Mapping[str, Mapping[str, tuple[str, ...]]]

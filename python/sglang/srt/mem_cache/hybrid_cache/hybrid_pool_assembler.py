@@ -668,16 +668,65 @@ def _dsv4_pool_infos(kvcache: Any) -> dict[PoolName, DevicePoolInfo]:
     return {info.pool_name: info for info in kvcache.get_device_pool_infos()}
 
 
-def build_dsa_unified_pool_plans(
-    model_id: str, kvcache: Any, host_group: HostPoolGroup, page_size: int
-) -> dict[str, UnifiedPoolPlan]:
-    """Name ordinary MLA KV and native FP8 index pages by their owner layers."""
+def _require_unified_native_entries(host_group: HostPoolGroup, label: str) -> None:
+    memory = get_memory()
+    for name in ("hicache_storage_head_partition", "hicache_storage_layer_partition"):
+        if getattr(memory, name, None) not in (None, 1):
+            raise NotImplementedError(
+                f"Unified {label} storage requires whole heads and single layers "
+                f"({name} must be unset or 1)."
+            )
+    for entry in host_group.entries:
+        if entry.packed_draft_device_pools:
+            raise NotImplementedError(
+                f"Unified {label} storage does not support drafts."
+            )
+        if entry.host_pool.layout != "page_unified":
+            raise ValueError(f"Unified {label} storage requires page_unified pools.")
+
+
+def _unified_digest(identity: tuple) -> str:
     import hashlib
 
     import msgspec
 
+    return hashlib.sha256(msgspec.msgpack.encode(identity)).hexdigest()[:16]
+
+
+def _unified_layer_plan(
+    tag: str, identity: tuple, layer_ids, geometries, layer_bytes: int, host_layers
+) -> UnifiedPoolPlan:
+    """One object per global layer, keyed by that layer's native page format."""
+    from sglang.srt.mem_cache.hicache_key_scheme import UnifiedPoolPlan
+
+    if len(layer_ids) != host_layers:
+        raise ValueError(f"Unified storage layer counts differ for {identity[2]}.")
+    suffixes = tuple(
+        f"{tag}-{_unified_digest((*identity, layer_bytes, geometry))}"
+        f"_L{layer}-{layer + 1}"
+        for layer, geometry in zip(layer_ids, geometries, strict=True)
+    )
+    return UnifiedPoolPlan(
+        suffixes, tuple((i * layer_bytes, layer_bytes) for i in range(len(suffixes)))
+    )
+
+
+def _dsa_indexer_preshuffle_tile() -> int:
+    from sglang.srt.layers.attention.dsa import utils
+
+    return (
+        utils.INDEXER_K_CACHE_PRESHUFFLE_TILE
+        if utils.aiter_can_use_preshuffle_paged_mqa()
+        else 0
+    )
+
+
+def build_dsa_unified_pool_plans(
+    model_id: str, kvcache: Any, host_group: HostPoolGroup, page_size: int
+) -> dict[str, UnifiedPoolPlan]:
+    """Name ordinary MLA KV and native FP8 index pages by their owner layers."""
     from sglang.srt.mem_cache.device_pool_info import IndexKeyBufferInfo, MLABufferInfo
-    from sglang.srt.mem_cache.hicache_key_scheme import UnifiedPoolPlan, normalize_dtype
+    from sglang.srt.mem_cache.hicache_key_scheme import normalize_dtype
     from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 
     if type(kvcache) is not DSATokenToKVPool:
@@ -686,65 +735,42 @@ def build_dsa_unified_pool_plans(
         )
     if not model_id or page_size <= 0 or page_size != kvcache.page_size:
         raise ValueError("Unified DSA storage requires a model ID and complete pages.")
-    parallel = get_parallel()
-    if (
-        parallel.attn_cp_size > 1
-        or parallel.attn_dcp_size > 1
-        or kvcache.layer_shard_enabled
-        or kvcache.dcp_replicated
-    ):
-        raise NotImplementedError("Unified DSA storage does not support CP or DCP.")
+    if kvcache.layer_shard_enabled or kvcache.dcp_replicated:
+        raise NotImplementedError("Unified DSA storage requires unsharded pages.")
     if kvcache.index_kpool != 1 or kvcache.index_kpool_compress:
         raise NotImplementedError(
             "Unified DSA storage does not support pooled index keys."
         )
-    memory = get_memory()
-    for name in ("hicache_storage_head_partition", "hicache_storage_layer_partition"):
-        if getattr(memory, name, None) not in (None, 1):
-            raise NotImplementedError(
-                "Unified DSA storage requires whole heads and single layers "
-                f"({name} must be unset or 1)."
-            )
-    infos = {info.pool_name: info for info in kvcache.get_device_pool_infos()}
+    _require_unified_native_entries(host_group, "DSA")
+    infos = _dsv4_pool_infos(kvcache)
     if {name for name, info in infos.items() if info.layer_ids} != {
         entry.name for entry in host_group.entries
     }:
         raise ValueError("Unified DSA storage requires every native host pool.")
     plans = {}
     for entry in host_group.entries:
-        if entry.packed_draft_device_pools:
-            raise NotImplementedError("Unified DSA storage does not support drafts.")
         host, info = entry.host_pool, infos[entry.name]
         region = info.buffer_info
-        if host.layout != "page_unified" or host.page_size != page_size:
-            raise ValueError(
-                "Unified DSA storage requires complete page_unified pages."
-            )
-        if info.indices_from_pool != PoolName.KV:
-            raise ValueError(
-                "Unified DSA index pages must derive their indices from KV."
-            )
+        if host.page_size != page_size or info.indices_from_pool != PoolName.KV:
+            raise ValueError("Unified DSA storage requires complete KV-indexed pages.")
         region.validate(layer_ids=info.layer_ids)
         if entry.name == PoolName.KV and isinstance(region, MLABufferInfo):
-            if not isinstance(region.buffers, tuple) or region.scales is not None:
-                raise NotImplementedError(
-                    "Unified DSA storage requires native MLA rows."
-                )
             layout = host.page_unified_layout
             if (
-                layout is None
+                not isinstance(region.buffers, tuple)
+                or region.scales is not None
+                or layout is None
                 or not layout.is_mla
                 or layout.layer_num != len(info.layer_ids)
                 or host.kv_cache_dim != region.kv_cache_dim
                 or host.dtype != region.dtype
                 or info.layer_ids != kvcache.model_layer_ids
             ):
-                raise ValueError(
-                    "Unified DSA MLA host geometry differs from its device rows."
+                raise NotImplementedError(
+                    "Unified DSA storage requires native MLA rows matching the host."
                 )
             layer_bytes = layout.layer_bytes
-            # The packed writer stores FN values, FP32 block scales and BF16
-            # RoPE in a uint8 row; logical dtype alone cannot describe that row.
+            # Packed rows hold FN values, FP32 block scales and BF16 RoPE as uint8.
             geometry = (
                 "mla-packed-fn-scales-f32-rope-bf16"
                 if region.packed_fp8
@@ -760,53 +786,39 @@ def build_dsa_unified_pool_plans(
                 or region.compress_ratio != 1
                 or region.page_size != page_size
                 or region.kernel_page_bytes != region.page_bytes
+                or host.indexer_page_stride_size != region.page_bytes
             ):
                 raise NotImplementedError(
                     "Unified DSA storage requires unpooled FP8 index pages."
                 )
             from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
-            from sglang.srt.layers.attention.dsa.utils import (
-                INDEXER_K_CACHE_PRESHUFFLE_TILE,
-                aiter_can_use_preshuffle_paged_mqa,
-            )
 
-            layer_bytes = host.indexer_page_stride_size
-            if layer_bytes != region.page_bytes:
-                raise ValueError(
-                    "Unified DSA index host geometry differs from its device pages."
-                )
+            layer_bytes = region.page_bytes
             geometry = (
                 region.key_layout.value,
                 region.kernel_page_size or region.page_size,
                 kvcache.index_head_dim,
                 kvcache.quant_block_size,
                 str(fp8_dtype),
-                INDEXER_K_CACHE_PRESHUFFLE_TILE
-                if aiter_can_use_preshuffle_paged_mqa()
-                else 0,
+                _dsa_indexer_preshuffle_tile(),
             )
         else:
             raise NotImplementedError(f"Unsupported unified DSA pool: {entry.name}.")
-        if not info.layer_ids or len(info.layer_ids) != host.layer_num:
-            raise ValueError("Unified DSA native and host layer counts differ.")
-        suffixes = []
-        for layer_id, buffer in zip(info.layer_ids, region.buffers, strict=True):
-            identity = (
-                "dsa-page-unified-v1",
-                model_id,
-                entry.name.value,
-                normalize_dtype(kvcache.dtype),
-                page_size,
-                layer_bytes,
-                geometry,
-                str(buffer.dtype),
-                tuple(buffer.shape[1:]),
-            )
-            digest = hashlib.sha256(msgspec.msgpack.encode(identity)).hexdigest()[:16]
-            suffixes.append(f"udsav1-{digest}_L{layer_id}-{layer_id + 1}")
-        plans[entry.name.value] = UnifiedPoolPlan(
-            tuple(suffixes),
-            tuple((i * layer_bytes, layer_bytes) for i in range(host.layer_num)),
+        identity = (
+            "dsa-page-unified-v1",
+            model_id,
+            entry.name.value,
+            normalize_dtype(kvcache.dtype),
+            page_size,
+            geometry,
+        )
+        plans[entry.name.value] = _unified_layer_plan(
+            "udsav1",
+            identity,
+            info.layer_ids,
+            [(str(b.dtype), tuple(b.shape[1:])) for b in region.buffers],
+            layer_bytes,
+            host.layer_num,
         )
     return plans
 
@@ -815,42 +827,34 @@ def build_dsv4_unified_pool_plans(
     model_id: str, kvcache: Any, host_group: HostPoolGroup, page_size: int
 ) -> dict[str, UnifiedPoolPlan]:
     """Name complete native DSV4 layer pages independently of TP and PP."""
-    import hashlib
-
-    import msgspec
-
     from sglang.srt.mem_cache.deepseek_v4_buffer_info import (
         DSV4CheckpointBufferInfo,
         DSV4PagedBufferInfo,
     )
+    from sglang.srt.mem_cache.deepseek_v4_memory_pool import _DSV4_REGION_NAMES
     from sglang.srt.mem_cache.hicache_key_scheme import UnifiedPoolPlan
 
-    if not model_id or page_size <= 0:
-        raise ValueError("Unified DSV4 storage requires a model ID and page size.")
-    memory = get_memory()
-    for name in ("hicache_storage_head_partition", "hicache_storage_layer_partition"):
-        if getattr(memory, name, None) not in (None, 1):
-            raise NotImplementedError(
-                "Unified DSV4 storage supports only whole heads and single layers "
-                f"({name} must be unset or 1)."
-            )
+    if not model_id or page_size <= 0 or page_size != kvcache.page_size:
+        raise ValueError("Unified DSV4 storage requires a model ID and complete pages.")
+    _require_unified_native_entries(host_group, "DSV4")
     infos = _dsv4_pool_infos(kvcache)
-    missing_pools = {name for name, info in infos.items() if info.layer_ids} - {
+    missing = {name for name, info in infos.items() if info.layer_ids} - {
         entry.name for entry in host_group.entries
     }
-    if missing_pools:
+    if missing:
         raise ValueError(
             "Unified DSV4 storage is missing host pools: "
-            + ", ".join(sorted(name.value for name in missing_pools))
+            + ", ".join(sorted(name.value for name in missing))
         )
+    index_ratios = {
+        name: ratio
+        for ratio, names in _DSV4_REGION_NAMES.items()
+        for name in names[2:]
+        if name is not None
+    }
     plans = {}
     for entry in host_group.entries:
-        if entry.packed_draft_device_pools:
-            raise NotImplementedError("Unified DSV4 storage does not support drafts.")
-        name = entry.name
-        host = entry.host_pool
-        if host.layout != "page_unified":
-            raise ValueError("Unified DSV4 storage requires page_unified host pools.")
+        name, host = entry.name, entry.host_pool
         identity = (
             "dsv4-page-unified-v1",
             model_id,
@@ -859,33 +863,18 @@ def build_dsv4_unified_pool_plans(
             host.page_size,
         )
         if name == PoolName.KV:
-            digest = hashlib.sha256(msgspec.msgpack.encode(identity)).hexdigest()[:16]
+            # Every PP stage writes this zero-byte anchor; side pools carry data.
             plans[name.value] = UnifiedPoolPlan(
-                (f"udsv4v1-{digest}_marker",), ((0, 0),)
+                (f"udsv4v1-{_unified_digest(identity)}_marker",), ((0, 0),)
             )
             continue
         info = infos.get(name)
         if info is None:
             raise ValueError(f"Unified DSV4 storage has no native region for {name}.")
         region = info.buffer_info
-        index_format = ()
-        index_pool = None
-        if "indexer" in name.value:
-            ratio = next(
-                ratio
-                for ratio in (1, 2, 4, 128)
-                if name.value.startswith(f"deepseek_v4_c{ratio}_")
-            )
-            index_pool = kvcache.index_pools[ratio]
-            index_format = tuple(
-                bool(getattr(index_pool, flag, False))
-                for flag in (
-                    "use_fp4_indexer",
-                    "index_k_page8",
-                    "index_k_rne",
-                    "uses_aiter_fp4_layout",
-                )
-            )
+        index_pool = (
+            kvcache.index_pools[index_ratios[name]] if name in index_ratios else None
+        )
         if isinstance(region, DSV4PagedBufferInfo):
             layer_bytes = host.item_bytes
             fp8_indexer = region.layout == "index_fused" and not getattr(
@@ -893,33 +882,32 @@ def build_dsv4_unified_pool_plans(
             )
             encoding = ()
             if (
-                region.layout in ("v4", "v41", "v41_fp4", "v41_new", "v41_fp4_new")
+                region.layout
+                in ("v4", "v41", "v41_fp4", "v41_new", "v41_fp4_new", "uniform_fp8")
                 or fp8_indexer
                 or (
                     region.layout == "unified"
-                    and getattr(kvcache, "_unified_kv_fp8", False)
+                    and kvcache._unified_kv_fp8
                     and name in (PoolName.DEEPSEEK_V4_C4, PoolName.DEEPSEEK_V4_C128)
                 )
             ):
-                # The writers use this logical encoding even when their native
-                # buffer is exposed as uint8 (FN on CUDA/gfx95, FNUZ on gfx94).
+                # uint8 views still hold FN (CUDA/gfx95) or FNUZ (gfx94) bytes.
                 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
 
                 encoding = (("fp8", str(fp8_dtype)),)
             if fp8_indexer:
-                from sglang.srt.layers.attention.dsa.utils import (
-                    INDEXER_K_CACHE_PRESHUFFLE_TILE,
-                    aiter_can_use_preshuffle_paged_mqa,
+                encoding += (("indexer_preshuffle", _dsa_indexer_preshuffle_tile()),)
+            if index_pool is not None:
+                encoding += tuple(
+                    bool(getattr(index_pool, flag, False))
+                    for flag in (
+                        "use_fp4_indexer",
+                        "index_k_page8",
+                        "index_k_rne",
+                        "uses_aiter_fp4_layout",
+                    )
                 )
-
-                # Match both the fused compressor and Triton indexer writers.
-                tile = (
-                    INDEXER_K_CACHE_PRESHUFFLE_TILE
-                    if aiter_can_use_preshuffle_paged_mqa()
-                    else 0
-                )
-                encoding += (("indexer_preshuffle", tile),)
-            native = [
+            geometries = [
                 (
                     region.layout,
                     str(buffer.dtype),
@@ -932,34 +920,14 @@ def build_dsv4_unified_pool_plans(
             ]
         elif isinstance(region, DSV4CheckpointBufferInfo):
             layer_bytes = host.state_page_bytes
-            native = [
-                (
-                    "checkpoint",
-                    str(state.dtype),
-                    tuple(state.pages.shape[1:]),
-                    state.ring_size,
-                    state.pages.shape[1] * state.pages.element_size(),
-                )
-                for state in region.states
+            geometries = [
+                ("checkpoint", str(s.dtype), tuple(s.pages.shape[1:]), s.ring_size)
+                for s in region.states
             ]
         else:
             raise TypeError(f"Unsupported unified DSV4 region: {type(region).__name__}")
-        if len(native) != len(info.layer_ids) or len(native) != host.layer_num:
-            raise ValueError(f"Unified DSV4 storage layer counts differ for {name}.")
-        if not native or layer_bytes <= 0:
-            raise ValueError(
-                f"Unified DSV4 storage requires nonempty pages for {name}."
-            )
-        suffixes = []
-        for layer_id, geometry in zip(info.layer_ids, native, strict=True):
-            encoded = msgspec.msgpack.encode(
-                (*identity, layer_bytes, geometry, index_format)
-            )
-            digest = hashlib.sha256(encoded).hexdigest()[:16]
-            suffixes.append(f"udsv4v1-{digest}_L{layer_id}-{layer_id + 1}")
-        plans[name.value] = UnifiedPoolPlan(
-            tuple(suffixes),
-            tuple((index * layer_bytes, layer_bytes) for index in range(len(native))),
+        plans[name.value] = _unified_layer_plan(
+            "udsv4v1", identity, info.layer_ids, geometries, layer_bytes, host.layer_num
         )
     return plans
 

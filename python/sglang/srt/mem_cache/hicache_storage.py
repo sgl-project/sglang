@@ -860,21 +860,12 @@ class HiCacheFile(HiCacheStorage):
             self.tp_config_suffix += dcp_suffix
 
     def _init_pool_plans(self, storage_config: HiCacheStorageConfig) -> None:
-        if (
-            storage_config.unified_suffixes is not None
-            or self._unified_chunk_spans is not None
-        ):
-            raise ValueError(
-                "Unified pool plans cannot use single-pool chunk settings."
-            )
         if storage_config.dcp_size != 1:
             raise ValueError("Unified storage requires full pages without DCP.")
         if PoolName.KV not in self._unified_pool_plans:
             raise ValueError("Unified pool plans require the KV anchor plan.")
         suffixes = []
         for name, plan in self._unified_pool_plans.items():
-            if not plan.suffixes or len(plan.suffixes) != len(plan.chunk_spans):
-                raise ValueError("Each unified pool suffix requires one chunk span.")
             if plan.chunk_spans == ((0, 0),) and name != PoolName.KV:
                 raise ValueError("Only the logical KV anchor can use an empty marker.")
             for suffix, (_, length) in zip(plan.suffixes, plan.chunk_spans):
@@ -964,7 +955,9 @@ class HiCacheFile(HiCacheStorage):
 
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         if self._unified_pool_plans is not None:
-            self._register_pool_page_bytes(PoolName.KV, mem_pool_host)
+            self._validate_pool_page_bytes(
+                PoolName.KV, mem_pool_host.get_dummy_flat_data_page()
+            )
         elif self._unified_chunk_spans is not None:
             self._validate_unified_page_bytes(
                 mem_pool_host.page_unified_layout.bytes_per_page
@@ -973,7 +966,9 @@ class HiCacheFile(HiCacheStorage):
 
     def register_mem_host_pool_v2(self, host_pool: HostKVCache, host_pool_name):
         if self._unified_pool_plans is not None:
-            self._register_pool_page_bytes(host_pool_name, host_pool)
+            self._validate_pool_page_bytes(
+                host_pool_name, host_pool.get_dummy_flat_data_page()
+            )
         elif self._unified_suffixes is not None:
             if host_pool_name != PoolName.KV:
                 raise NotImplementedError(
@@ -985,23 +980,19 @@ class HiCacheFile(HiCacheStorage):
                 )
         super().register_mem_host_pool_v2(host_pool, host_pool_name)
 
-    def _register_pool_page_bytes(self, name: str, host_pool: HostKVCache) -> None:
-        page_bytes = host_pool.get_dummy_flat_data_page().nbytes
-        self._validate_pool_page_bytes(name, page_bytes)
-
-    def _validate_pool_page_bytes(self, name: str, page_bytes: int) -> None:
+    def _validate_pool_page_bytes(self, name: str, page: torch.Tensor) -> None:
         plan = self._unified_pool_plans.get(name)
         if plan is None:
             raise ValueError(f"Missing unified storage plan for pool {name}.")
-        if page_bytes != plan.page_bytes:
+        if page.nbytes != plan.page_bytes:
             raise ValueError(
                 f"Unified pool {name} chunks cover {plan.page_bytes} bytes, "
-                f"but the page has {page_bytes} bytes."
+                f"but the page has {page.nbytes} bytes."
             )
 
     def _page_chunks(self, key: str, page: torch.Tensor, pool_name=PoolName.KV):
         if self._unified_pool_plans is not None:
-            self._validate_pool_page_bytes(pool_name, page.nbytes)
+            self._validate_pool_page_bytes(pool_name, page)
             plan = self._unified_pool_plans[pool_name]
             data = page.contiguous().view(torch.uint8).reshape(-1)
             return [
@@ -1029,14 +1020,9 @@ class HiCacheFile(HiCacheStorage):
 
     def _get_component_keys(self, key: str, component_name: Optional[str] = None):
         if self._unified_pool_plans is not None:
-            name = (
-                PoolName.KV
-                if component_name in (None, "__default__")
-                else component_name
-            )
-            plan = self._unified_pool_plans.get(name)
-            if plan is None:
-                raise ValueError(f"Missing unified storage plan for pool {name}.")
+            if component_name in (None, "__default__"):
+                component_name = PoolName.KV
+            plan = self._unified_pool_plans[component_name]
             return tuple(f"{key}_{suffix}" for suffix in plan.suffixes)
         if self._unified_suffixes is None:
             return (self._get_component_key(key, component_name),)
