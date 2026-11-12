@@ -23,6 +23,9 @@ A span has two independent emitters:
 
 Decoupling the two lets every annotation site -- scheduler stages, batch-overlap
 ops, and the speculative-decoding / forward spans -- share one primitive.
+Gates: ``SGLANG_ENABLE_NVTX_SCHEDULER`` (scheduler stages),
+``SGLANG_ENABLE_NVTX_OPERATIONS`` (batch-overlap ops) and
+``SGLANG_ENABLE_NVTX_FORWARD`` (per-step ``step[...]`` and spec-decode spans).
 """
 
 import logging
@@ -38,9 +41,10 @@ logger = logging.getLogger(__name__)
 
 _SCHEDULER_NVTX = envs.SGLANG_ENABLE_NVTX_SCHEDULER.get()
 _OPERATIONS_NVTX = envs.SGLANG_ENABLE_NVTX_OPERATIONS.get()
+_FORWARD_NVTX = envs.SGLANG_ENABLE_NVTX_FORWARD.get()
 
 _nvtx_module = None
-if _SCHEDULER_NVTX or _OPERATIONS_NVTX:
+if _SCHEDULER_NVTX or _OPERATIONS_NVTX or _FORWARD_NVTX:
     try:
         import nvtx as _nvtx_module  # type: ignore
     except ImportError:
@@ -54,6 +58,7 @@ NVTX_AVAILABLE = _nvtx_module is not None
 # package is importable. The record_function path is independent of both.
 NVTX_SCHEDULER_ENABLED = _SCHEDULER_NVTX and NVTX_AVAILABLE
 NVTX_OPERATIONS_ENABLED = _OPERATIONS_NVTX and NVTX_AVAILABLE
+NVTX_FORWARD_ENABLED = _FORWARD_NVTX and NVTX_AVAILABLE
 
 # Default nvtx colors for statically-named spans (only used on the nvtx path).
 _NVTX_COLOR_MAP = {
@@ -117,3 +122,8 @@ def profile_method(
 # ranges only when that subsystem's gate is on.
 scheduler_nvtx_method = partial(profile_method, nvtx_enabled=NVTX_SCHEDULER_ENABLED)
 operations_nvtx_range = partial(profile_range, nvtx_enabled=NVTX_OPERATIONS_ENABLED)
+# Forward-pass spans: the per-step ``step[...]`` label built by
+# ``build_step_span_name`` and the speculative-decoding stage spans. With
+# ``SGLANG_ENABLE_NVTX_FORWARD`` set they also appear as NVTX ranges, so an
+# Nsight Systems timeline carries each step's forward mode and batch size.
+forward_nvtx_range = partial(profile_range, nvtx_enabled=NVTX_FORWARD_ENABLED)
