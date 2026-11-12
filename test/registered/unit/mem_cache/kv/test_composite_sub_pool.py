@@ -6,10 +6,14 @@ it keeps beside it), the plan composes them into one unit: per-token parts side
 by side in each token entry, then per-page parts after the page's entries,
 padded to every part's grid. Each part is addressed by physical page, a unit
 apart, so a part whose readers take one uniform token stride cannot share a
-unit with per-page parts. Plans of one geometry per sub-pool do not change.
+unit with per-page parts. Token-major MHA and MLA KV has no view inside a
+unit yet, so its layers keep no other part. The planner accepts exactly the
+compositions the builder constructs. Plans of one geometry per sub-pool do not
+change.
 """
 
 import hashlib
+import itertools
 import unittest
 from types import SimpleNamespace
 from typing import ClassVar
@@ -17,7 +21,11 @@ from typing import ClassVar
 import msgspec
 import torch
 
-from sglang.srt.mem_cache.kv.build import _bind_unit_parts
+from sglang.srt.mem_cache.kv.build import (
+    UnifiedBuildContext,
+    _bind_unit_parts,
+    build_kv_storage,
+)
 from sglang.srt.mem_cache.kv.decl import (
     KV_PART,
     FullLayerParts,
@@ -37,12 +45,24 @@ from sglang.srt.mem_cache.kv.memory.arena import KVArena, plan_bands
 from sglang.srt.mem_cache.kv.memory.snapshot import _band_ids, _whole_pages
 from sglang.srt.mem_cache.kv.plan import plan_kv_storage, sub_pool_names
 from sglang.srt.mem_cache.kv.router import KVLayerRouter
+from sglang.srt.mem_cache.kv.sizing import KVSizingInputs, size_plan
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.unified_allocator_fixtures import setup_allocator_context
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 _PAGE = 4
+
+
+class _PartView:
+    """What a test part's readers take: its per-layer buffers over the unit."""
+
+    dtype = store_dtype = torch.uint8
+
+    def __init__(self, *, arena, spec, part):
+        self.buffers = spec.part_views(arena, part.name)
+        self.layer_ids = part.layer_ids
 
 
 class _PagedRows(msgspec.Struct, frozen=True, kw_only=True):
@@ -58,9 +78,30 @@ class _PagedRows(msgspec.Struct, frozen=True, kw_only=True):
         return LayerMajorRows(name=name, layer_num=layer_num, row_bytes=self.row_bytes)
 
     def unit_view(self, *, arena, spec, part, page_size):
-        return SimpleNamespace(
-            buffers=spec.part_views(arena, part.name), layer_ids=part.layer_ids
+        return _PartView(arena=arena, spec=spec, part=part)
+
+
+class _TokenRows(msgspec.Struct, frozen=True, kw_only=True):
+    """Rows inside every token entry, read by page or, when not
+    ``page_address``, as one run at the token entry stride."""
+
+    row_bytes: int
+    page_address: bool = True
+    part_name: str = KV_PART
+
+    def requires_unit_layout(self) -> bool:
+        return True
+
+    def unit_part(self, *, name, layer_num):
+        return TokenRows(
+            name=name,
+            layer_num=layer_num,
+            row_bytes=self.row_bytes,
+            readers_page_address=self.page_address,
         )
+
+    def unit_view(self, *, arena, spec, part, page_size):
+        return _PartView(arena=arena, spec=spec, part=part)
 
 
 class _Blobs(msgspec.Struct, frozen=True, kw_only=True):
@@ -78,9 +119,7 @@ class _Blobs(msgspec.Struct, frozen=True, kw_only=True):
         )
 
     def unit_view(self, *, arena, spec, part, page_size):
-        return SimpleNamespace(
-            buffers=spec.part_views(arena, part.name), layer_ids=part.layer_ids
-        )
+        return _PartView(arena=arena, spec=spec, part=part)
 
 
 def _state():
@@ -101,6 +140,35 @@ def _composite_decls(kv=None):
         ),
         state_layer_ids=(1, 3),
         state_geometry=_state(),
+    )
+
+
+def _build(plan, full_tokens=64):
+    """The storage production builds for ``plan``, on CPU."""
+    sized = size_plan(
+        plan,
+        KVSizingInputs(
+            full_tokens=full_tokens,
+            state_slots=4,
+            max_running_requests=2,
+            context_len=64,
+            alignment=1,
+        ),
+    )
+    layer_ids = [i for s in plan.sub_pools for i in s.layer_ids]
+    return build_kv_storage(
+        plan,
+        sized,
+        UnifiedBuildContext(
+            device="cpu",
+            start_layer=0,
+            end_layer=max(layer_ids) + 1,
+            enable_memory_saver=False,
+            need_sort=False,
+            max_num_reqs=2,
+            model_context_len=64,
+            disable_overlap_schedule=True,
+        ),
     )
 
 
@@ -288,8 +356,17 @@ class TestComposition(CustomTestCase):
         self.assertFalse(spec.copies_whole_units)
 
     def test_parts_read_at_a_uniform_stride_are_refused(self):
-        """Token-major KV is read as one run at the entry stride: it cannot sit
-        beside per-page parts."""
+        """Rows read as one run at the entry stride cannot sit beside per-page
+        parts."""
+        with self.assertRaisesRegex(ValueError, "read by page"):
+            plan_kv_storage(
+                _composite_decls(_TokenRows(row_bytes=32, page_address=False)),
+                page_size=_PAGE,
+            )
+
+    def test_token_major_kv_keeps_no_other_part(self):
+        """No view reads MHA or MLA KV from a composite unit yet, so their
+        layers keep no other part, even one that leaves the unit uniform."""
         for kv in (
             MLAGeometry(
                 kv_lora_rank=8, qk_rope_head_dim=8, kv_cache_dtype=torch.bfloat16
@@ -298,9 +375,20 @@ class TestComposition(CustomTestCase):
                 head_num=1, head_dim=8, v_head_dim=8, kv_cache_dtype=torch.bfloat16
             ),
         ):
-            with self.subTest(kv=type(kv).__name__):
-                with self.assertRaisesRegex(ValueError, "read by page"):
-                    plan_kv_storage(_composite_decls(kv), page_size=_PAGE)
+            for extra in (
+                _TokenRows(row_bytes=32, part_name="rows"),
+                _Blobs(bytes_per_token=12),
+            ):
+                decls = kv_layer_decls(
+                    full_layer_ids=(0,),
+                    full_geometry=kv,
+                    full_layer_parts=(FullLayerParts(layer_ids=(0,), geometry=extra),),
+                )
+                with self.subTest(kv=type(kv).__name__, extra=type(extra).__name__):
+                    with self.assertRaisesRegex(
+                        ValueError, "which no view reads from a composite unit"
+                    ):
+                        plan_kv_storage(decls, page_size=_PAGE)
 
     def test_two_kv_layouts_are_refused(self):
         decls = kv_layer_decls(
@@ -411,6 +499,151 @@ class TestRetractionCopiesWholeUnits(CustomTestCase):
     def test_whole_pages(self):
         ids = torch.tensor([8, 9, 10, 11, 12, 13])
         self.assertEqual(_whole_pages(ids, 4).tolist(), list(range(8, 16)))
+
+
+_KV_GEOMETRIES = {
+    "mha": MHAGeometry(
+        head_num=1, head_dim=8, v_head_dim=8, kv_cache_dtype=torch.bfloat16
+    ),
+    "mla": MLAGeometry(
+        kv_lora_rank=8, qk_rope_head_dim=8, kv_cache_dtype=torch.bfloat16
+    ),
+    "layer_major_rows": _PagedRows(row_bytes=32),
+    "rows_read_by_page": _TokenRows(row_bytes=32),
+    "rows_read_flat": _TokenRows(row_bytes=32, page_address=False),
+}
+_EXTRA_PARTS = {
+    "rows_read_by_page": _TokenRows(row_bytes=16, part_name="paged"),
+    "rows_read_flat": _TokenRows(row_bytes=16, page_address=False, part_name="flat"),
+    "blobs": _Blobs(bytes_per_token=12),
+    "state": _state(),
+}
+
+
+def _accepted(kv: str, extras) -> bool:
+    """The compositions the builder can construct."""
+    if kv in ("mha", "mla"):
+        # Token-major KV: its own layout, alone.
+        return not extras
+    if "state" in extras:
+        return False
+    flat = kv == "rows_read_flat" or "rows_read_flat" in extras
+    # Rows read at one token stride need pages of plain token entries.
+    return not (flat and (kv == "layer_major_rows" or "blobs" in extras))
+
+
+class TestPlannedIsBuildable(CustomTestCase):
+    """The planner accepts exactly the compositions the builder constructs:
+    every accepted one builds, and every part of it is routed to a view over
+    its layers."""
+
+    @classmethod
+    def setUpClass(cls):
+        setup_allocator_context()
+
+    def test_every_composition(self):
+        for kv, n in itertools.product(_KV_GEOMETRIES, range(len(_EXTRA_PARTS) + 1)):
+            for extras in itertools.combinations(_EXTRA_PARTS, n):
+                with self.subTest(kv=kv, extras=extras):
+                    self._check(kv, extras)
+
+    def _check(self, kv, extras):
+        decls = kv_layer_decls(
+            full_layer_ids=(0, 2),
+            full_geometry=_KV_GEOMETRIES[kv],
+            full_layer_parts=tuple(
+                FullLayerParts(layer_ids=(2,), geometry=_EXTRA_PARTS[e]) for e in extras
+            ),
+            state_layer_ids=(1,),
+            state_geometry=_state(),
+        )
+        try:
+            plan = plan_kv_storage(decls, page_size=_PAGE)
+        except ValueError:
+            self.assertFalse(_accepted(kv, extras), "refused")
+            return
+        self.assertTrue(_accepted(kv, extras), "accepted")
+        router = _build(plan).allocator.get_kvcache().layer_router
+        owner = plan.owner()
+        for part in owner.parts or (SimpleNamespace(name=KV_PART, layer_ids=(0, 2)),):
+            for i, layer_id in enumerate(part.layer_ids):
+                layer = router.layer(layer_id, part.name)
+                self.assertEqual(layer.route.sub_pool, owner.name)
+                self.assertEqual(layer.view_layer_id, i)
+                if owner.parts:
+                    self.assertEqual(len(layer.view.buffers), len(part.layer_ids))
+
+
+class TestRetractionRoundTrip(CustomTestCase):
+    """A request's composite pages survive retraction: copied out whole, then
+    restored into other virtual and physical pages, every KV row and every
+    per-page blob of its pages reads back as written, and no other byte of the
+    buffer changes."""
+
+    @classmethod
+    def setUpClass(cls):
+        setup_allocator_context()
+
+    def test_restore_into_other_pages(self):
+        plan = plan_kv_storage(_composite_decls(), page_size=_PAGE)
+        storage = _build(plan)
+        allocator = storage.allocator
+        router = allocator.get_kvcache().layer_router
+        ids = allocator.full_attn_allocator.ids
+        rows = router.layer(0, KV_PART).view.buffers
+        blobs = router.layer(0, "blobs").view.buffers
+        unit = plan.owner().spec.page_bytes()
+        raw = allocator.arena.raw
+        generator = torch.Generator().manual_seed(0)
+
+        def scramble():
+            raw.copy_(torch.randint(0, 256, raw.shape, generator=generator).to(raw))
+
+        # Six tokens over virtual pages 1 and 2: the second page is partial.
+        old_tokens = torch.arange(_PAGE, _PAGE + 6)
+        ids.bind(torch.tensor([1, 2]), torch.tensor([5, 3]))
+        scramble()
+        written_rows = [
+            torch.stack(
+                [
+                    view[p, s]
+                    for p, s in ((5, 0), (5, 1), (5, 2), (5, 3), (3, 0), (3, 1))
+                ]
+            )
+            for view in rows
+        ]
+        written_blobs = [torch.stack([view[5], view[3]]) for view in blobs]
+        written_units = [raw[p * unit : (p + 1) * unit].clone() for p in (5, 3)]
+        saved = allocator.get_cpu_copy(old_tokens)
+
+        # The request comes back on virtual pages 6 and 7, over physical
+        # pages 2 and 6 (one of them a page it held before).
+        ids.reset()
+        ids.bind(torch.tensor([6, 7]), torch.tensor([2, 6]))
+        scramble()
+        before = raw.clone()
+        new_tokens = torch.arange(6 * _PAGE, 6 * _PAGE + 6)
+        allocator.load_cpu_copy(saved, new_tokens)
+
+        for view, written in zip(rows, written_rows):
+            restored = torch.stack(
+                [
+                    view[p, s]
+                    for p, s in ((2, 0), (2, 1), (2, 2), (2, 3), (6, 0), (6, 1))
+                ]
+            )
+            self.assertTrue(torch.equal(restored, written))
+        for view, written in zip(blobs, written_blobs):
+            self.assertTrue(torch.equal(torch.stack([view[2], view[6]]), written))
+        # Only the two units changed, whole: the partial page's unused entries
+        # come back as they were too.
+        changed = raw != before
+        units = torch.zeros_like(changed)
+        for page in (2, 6):
+            units[page * unit : (page + 1) * unit] = True
+        self.assertFalse(bool((changed & ~units).any()))
+        for page, written in zip((2, 6), written_units):
+            self.assertTrue(torch.equal(raw[page * unit : (page + 1) * unit], written))
 
 
 if __name__ == "__main__":

@@ -35,7 +35,6 @@ from sglang.srt.mem_cache.kv.decl import (
 from sglang.srt.mem_cache.kv.layout.base import SubPoolSpec, _store_dtype_for
 from sglang.srt.mem_cache.kv.layout.composite import (
     CompositeSubPoolSpec,
-    TokenRows,
     UnitPart,
     UnitPartGeometry,
 )
@@ -486,23 +485,16 @@ def _part_name(geometry: PartGeometry) -> str:
     return KV_PART
 
 
+def _has_unit_view(geometry: PartGeometry) -> bool:
+    """Whether a view reads the geometry's part from a composite unit: what
+    `build._unit_view` builds. Token-major MHA and MLA rows have none yet."""
+    return isinstance(geometry, UnitPartGeometry)
+
+
 def _unit_part(geometry: PartGeometry, *, name: str, layer_num: int) -> UnitPart:
     """A geometry's bytes in a composite unit."""
-    if isinstance(geometry, UnitPartGeometry):
-        return geometry.unit_part(name=name, layer_num=layer_num)
-    # Token-major rows: their backends read one run at the token entry stride.
-    if isinstance(geometry, MLAGeometry):
-        row_bytes = (
-            geometry.kv_lora_rank + geometry.qk_rope_head_dim
-        ) * geometry.kv_cache_dtype.itemsize
-    else:
-        assert isinstance(geometry, MHAGeometry), geometry
-        row_bytes = (
-            geometry.head_num
-            * (geometry.head_dim + geometry.v_head_dim)
-            * geometry.kv_cache_dtype.itemsize
-        )
-    return TokenRows(name=name, layer_num=layer_num, row_bytes=row_bytes)
+    assert _has_unit_view(geometry), geometry
+    return geometry.unit_part(name=name, layer_num=layer_num)
 
 
 def _planned_parts(
@@ -527,6 +519,13 @@ def _planned_parts(
             f"({[type(p.geometry).__name__ for p in parts]}); a sub-pool holds "
             "one KV layout, beside which its layers may keep other parts"
         )
+    for part in parts:
+        if not _has_unit_view(part.geometry):
+            raise ValueError(
+                f"layers {list(part.layer_ids)} keep {type(part.geometry).__name__} "
+                "KV, which no view reads from a composite unit yet; they cannot "
+                "keep other parts beside it"
+            )
     kv_layers = set(parts[0].layer_ids)
     for part in parts[1:]:
         stray = set(part.layer_ids) - kv_layers
