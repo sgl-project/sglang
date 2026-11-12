@@ -8,7 +8,11 @@ from torch.nn import functional as F
 
 from sglang.kernels.ops.diffusion import (
     BitExactFusionGate,
+    can_use_rmsnorm_cast_before_weight,
+    can_use_rmsnorm_cast_before_weight_scale,
     fused_packed_silu_mul_bitexact,
+    rmsnorm_cast_before_weight_bitexact,
+    rmsnorm_cast_before_weight_scale_bitexact,
 )
 from sglang.multimodal_gen.runtime.distributed import get_sp_world_size
 from sglang.multimodal_gen.runtime.distributed.sp_shard_utils import (
@@ -17,13 +21,21 @@ from sglang.multimodal_gen.runtime.distributed.sp_shard_utils import (
     shard_seq,
     tail_attn_meta,
 )
-from sglang.multimodal_gen.runtime.models.dits.zimage import ZImageTransformer2DModel
+from sglang.multimodal_gen.runtime.models.dits.zimage import (
+    ZImageTransformer2DModel,
+    ZImageTransformerBlock,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.layers.layernorm import RMSNorm
 
 logger = init_logger(__name__)
 _MING_SWIGLU_FUSION = BitExactFusionGate(
     "Ming-Image packed SiLU-mul", per_signature=True
+)
+
+_MING_RMSNORM_FUSION = BitExactFusionGate("Ming-Image RMSNorm", per_signature=True)
+_MING_NORM_SCALE_FUSION = BitExactFusionGate(
+    "Ming-Image RMSNorm epilogue", per_signature=True
 )
 
 
@@ -37,6 +49,78 @@ class MingRMSNorm(RMSNorm):
         # unlike Z-Image, Ming's reference accumulates the variance in fp32
         super().__init__(dim, eps=eps, cast_x_before_out_mul=True, force_native=True)
 
+    def forward_native(
+        self, x, residual=None, post_residual_addition=None, quant_linear=None
+    ):
+        native = super().forward_native
+        if (
+            torch.compiler.is_compiling()
+            or residual is not None
+            or x.shape[-1] != self.hidden_size
+            or self.weight.dtype != x.dtype
+            or not self.weight.is_contiguous()
+            or not can_use_rmsnorm_cast_before_weight(
+                device=x.device,
+                dtype=x.dtype,
+                contiguous=x.is_contiguous(),
+                eps=self.variance_epsilon,
+            )
+        ):
+            return native(x, residual, post_residual_addition, quant_linear)
+        return _MING_RMSNORM_FUSION.run(
+            lambda: rmsnorm_cast_before_weight_bitexact(
+                x, self.weight, self.variance_epsilon
+            ),
+            lambda: native(x),
+            sig=(
+                x.device.index,
+                x.dtype,
+                x.shape[-1],
+                x.numel() // x.shape[-1] >= 16,
+                x.numel() >= 2**29,
+                self.variance_epsilon,
+            ),
+            logger=logger,
+            reraise=(ValueError,),
+        )
+
+
+def _ming_norm_scale(x, scale, norm, enable_fused, residual=None):
+    def reference():
+        y = norm(x) * scale
+        return y if residual is None else residual + y
+
+    if (
+        not enable_fused
+        or torch.compiler.is_compiling()
+        or norm.variance_epsilon not in (1e-6, 1e-5)
+        or not can_use_rmsnorm_cast_before_weight_scale(x, norm.weight, scale, residual)
+    ):
+        return reference()
+    return _MING_NORM_SCALE_FUSION.run(
+        lambda: rmsnorm_cast_before_weight_scale_bitexact(
+            x, norm.weight, scale, residual, norm.variance_epsilon
+        ),
+        reference,
+        sig=(x.device, x.dtype, norm.variance_epsilon, residual is not None),
+        logger=logger,
+        reraise=(ValueError,),
+    )
+
+
+class MingImageTransformerBlock(ZImageTransformerBlock):
+    def __init__(self, *args, quant_config=None, **kwargs):
+        super().__init__(*args, quant_config=quant_config, **kwargs)
+        self.enable_ming_norm_fusion = quant_config is None
+
+    def _norm_scale(self, x, scale, norm):
+        return _ming_norm_scale(x, scale, norm, self.enable_ming_norm_fusion)
+
+    def _norm_tanh_mul_add(self, x, gate, residual, norm):
+        return _ming_norm_scale(
+            x, torch.tanh(gate), norm, self.enable_ming_norm_fusion, residual
+        )
+
 
 class MingSiluAndMul(nn.Module):
     def forward(self, x):
@@ -45,8 +129,7 @@ class MingSiluAndMul(nn.Module):
             return _eager_silu_and_mul(x)
 
         can_fuse = (
-            not _MING_SWIGLU_FUSION.disabled
-            and x.is_cuda
+            x.is_cuda
             and x.dtype is torch.bfloat16
             and x.dim() == 3
             and x.stride(-1) == 1
@@ -58,28 +141,19 @@ class MingSiluAndMul(nn.Module):
         if not can_fuse:
             return _eager_silu_and_mul(x)
 
-        # The first tensor of each layout is compared bit-for-bit against
-        # eager. Avoid a host synchronization inside CUDA graph capture.
-        sig = (x.dtype, x.device, x.shape[0], x.shape[-1], x.stride(-2), x.stride(-1))
-        verified = _MING_SWIGLU_FUSION.is_verified(sig)
-        if not verified and torch.cuda.is_current_stream_capturing():
-            return _eager_silu_and_mul(x)
-        try:
-            out = fused_packed_silu_mul_bitexact(x)
-        except Exception as exc:
-            _MING_SWIGLU_FUSION.on_exception(exc, logger=logger)
-            return _eager_silu_and_mul(x)
-        if verified:
-            return out
-        return _MING_SWIGLU_FUSION.accept_or_fallback(
-            out,
-            _eager_silu_and_mul(x),
-            sig=sig,
-            logger=logger,
-            mismatch_msg=(
-                "Ming-Image packed SiLU-mul is not bit-exact on this platform; "
-                "falling back to eager"
+        # The first tensor of each layout is compared bit-for-bit against eager.
+        return _MING_SWIGLU_FUSION.run(
+            lambda: fused_packed_silu_mul_bitexact(x),
+            lambda: _eager_silu_and_mul(x),
+            sig=(
+                x.dtype,
+                x.device,
+                x.shape[0],
+                x.shape[-1],
+                x.stride(-2),
+                x.stride(-1),
             ),
+            logger=logger,
         )
 
 
@@ -87,6 +161,8 @@ class MingImageTransformer2DModel(ZImageTransformer2DModel):
     """Ming-Image's joint DiT, sharing Z-Image blocks and TP/SP attention."""
 
     norm_cls = MingRMSNorm
+    block_cls = MingImageTransformerBlock
+    _no_split_modules = ["MingImageTransformerBlock"]
     _aliases = ["DiffusionTransformer"]
 
     def __init__(self, config, hf_config, quant_config=None):

@@ -44,7 +44,8 @@ from sglang.srt.layers.quantization.utils import (
     requantize_with_max_scale,
 )
 from sglang.srt.layers.utils.common import copy_or_rebind_param
-from sglang.srt.utils.common import is_flashinfer_available, round_up
+from sglang.srt.utils.common import round_up
+from sglang.srt.utils.device import is_flashinfer_available
 
 logger = logging.getLogger(__name__)
 
@@ -101,7 +102,7 @@ def _prepare_nvfp4_swiglu_fusion_weights(
     weight: torch.Tensor,
     scales: torch.Tensor,
 ) -> None:
-    from sglang.kernels.ops.quantization.nvfp4_gemm_swiglu_nvfp4_quant import (
+    from sglang.kernels.ops.gemm.nvfp4_gemm_swiglu_nvfp4_quant import (
         interleave_linear_and_gate,
         swizzle_blockscale_2d,
     )
@@ -192,17 +193,6 @@ def _rebase_partition_weight_scales(
         rebased[offset : offset + width].mul_(partition_scale / global_scale)
         offset += width
     return rebased.to(torch.float8_e4m3fn)
-
-
-def _nvfp4_uses_tma_scale_layout(
-    flashinfer_backend: str | None, *, uses_flux1_scale_layout: bool = False
-) -> bool:
-    return uses_flux1_scale_layout or flashinfer_backend in {
-        None,
-        "auto",
-        "cudnn",
-        "cutlass",
-    }
 
 
 def _dynamic_nvfp4_input_scale(layer: torch.nn.Module, x: torch.Tensor) -> torch.Tensor:
@@ -983,7 +973,7 @@ def apply_nvfp4_gemm_swiglu_quant(
     if fp4_quantize is None:
         raise RuntimeError("No FP4 quantization kernel available. Install flashinfer.")
 
-    from sglang.kernels.ops.quantization.nvfp4_gemm_swiglu_nvfp4_quant import (
+    from sglang.kernels.ops.gemm.nvfp4_gemm_swiglu_nvfp4_quant import (
         nvfp4_gemm_swiglu_nvfp4_quant,
     )
 

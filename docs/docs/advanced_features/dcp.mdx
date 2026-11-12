@@ -123,7 +123,7 @@ For context partition `r`, the kernel returns locally normalized output `o_r` an
 
 ### Query-projection replication
 
-Normally each layer all-gathers its absorbed and rotary query components. `--dcp-replicate-q-proj` gathers the query-projection and `w_kc` weights once at startup and computes the full DCP-group query locally. The trade is more weight memory and GEMM work for one fewer collective per layer. Only unquantized BF16/FP16 weights use this path; other layers fall back to the query all-gather.
+Normally each layer all-gathers its absorbed and rotary query components. `--dcp-replicate-q-proj` gathers the query-projection and `w_kc` weights once at startup and computes the full DCP-group query locally. The trade is more weight memory and GEMM work for one fewer collective per layer. `w_kc` must be BF16/FP16, and the query projection may be unquantized BF16/FP16 or 128x128 block-FP8 (gathered as FP8 weight plus block scales, then post-processed like the per-rank shard so it runs the same GEMM); other layers fall back to the query all-gather.
 
 ### Communication backends
 

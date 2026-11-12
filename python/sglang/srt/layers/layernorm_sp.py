@@ -73,16 +73,34 @@ def layernorm_sp_enabled() -> bool:
     return get_flags().sp.enabled
 
 
-def runs_sp(forward_mode) -> bool:
-    """Whether this forward runs SP: an enabled model, prefill only.
+def runs_sp(forward_mode, num_tokens: Optional[int] = None) -> bool:
+    """Whether this forward runs SP: an enabled model, prefill only, and more
+    than --layernorm-sp-min-tokens tokens (0, the default, admits every pass).
+
+    ``num_tokens`` is the pass's token count, before the entry scatter. Every
+    in-tree caller passes it, so the entry scatter, the layer-boundary entry and
+    the exit gathers take the same decision for one pass. In a captured prefill
+    graph the entry decides on the bucket size while the exit gather outside
+    the graph sees the real count; they agree because the threshold is a
+    captured bucket (checked at resolution, ``handle_layernorm_sp``). A caller
+    that asks only about decode / verify passes may omit the count: those
+    never run SP. An extend pass without it raises.
 
     Code outside the CUDA-graph-captured region must use this and not
     ``get_forward().sp_active``: Python writes made inside that region do not
     re-execute on graph replay, so the flag is stale there.
     """
-    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+    from sglang.srt.model_executor.forward_mode import ForwardMode
 
-    return layernorm_sp_enabled() and forward_mode == ForwardMode.EXTEND
+    if not (layernorm_sp_enabled() and forward_mode == ForwardMode.EXTEND):
+        return False
+    if num_tokens is None:
+        raise ValueError(
+            "runs_sp needs num_tokens (the pass's token count) for an extend pass: "
+            "without it the caller skips --layernorm-sp-min-tokens and, on a pass "
+            "at or under the threshold, disagrees with the entry and exit gathers."
+        )
+    return num_tokens > get_parallel().layernorm_sp_min_tokens
 
 
 class _SPForwardState:
@@ -156,7 +174,7 @@ def maybe_exit_gather(
     and the predicate from ``runs_sp``, so this stays correct on CUDA graph
     replay, where the writes made inside the captured region do not re-execute.
     """
-    if not runs_sp(forward_mode) or input_ids is None:
+    if input_ids is None or not runs_sp(forward_mode, input_ids.shape[0]):
         return hidden_states, hidden_states_before_norm
     num_tokens = input_ids.shape[0]
     hidden_states = sp_exit_gather(hidden_states, num_tokens=num_tokens)
@@ -216,12 +234,18 @@ def column_parallel_g_matmul(
     num_tokens = sp_num_tokens()
     if sp_fused_matmul_eligible(linear):
         if getattr(linear, "_sp_use_cutlass", False):
-            from sglang.kernels.ops.gemm.sp_collective_gemm import all_gather_matmul
+            from sglang.kernels.ops.communication.sp_collective_gemm import (
+                all_gather_matmul,
+            )
+            from sglang.srt.layers.communication.sp_collective_gemm_workspace import (
+                sp_collective_gemm_workspace,
+            )
 
             return all_gather_matmul(
                 input_parallel.contiguous(),
                 linear.weight,
                 get_parallel().tp_group.device_group,
+                workspace=sp_collective_gemm_workspace,
             )[:num_tokens]
         group_name = get_parallel().tp_group.device_group.group_name
         _, mm_outputs = torch.ops.symm_mem.fused_all_gather_matmul(
@@ -252,10 +276,18 @@ def row_parallel_gbar_matmul(linear, input_: torch.Tensor, bias) -> torch.Tensor
         x = torch.nn.functional.pad(x, (0, 0, 0, padded - num_tokens))
     if sp_fused_matmul_eligible(linear):
         if getattr(linear, "_sp_use_cutlass", False):
-            from sglang.kernels.ops.gemm.sp_collective_gemm import matmul_reduce_scatter
+            from sglang.kernels.ops.communication.sp_collective_gemm import (
+                matmul_reduce_scatter,
+            )
+            from sglang.srt.layers.communication.sp_collective_gemm_workspace import (
+                sp_collective_gemm_workspace,
+            )
 
             return matmul_reduce_scatter(
-                x, linear.weight, get_parallel().tp_group.device_group
+                x,
+                linear.weight,
+                get_parallel().tp_group.device_group,
+                workspace=sp_collective_gemm_workspace,
             )
         group_name = get_parallel().tp_group.device_group.group_name
         return torch.ops.symm_mem.fused_matmul_reduce_scatter(

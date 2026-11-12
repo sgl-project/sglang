@@ -40,17 +40,24 @@ class OpenAIServingBase(ABC):
     def _parse_model_parameter(self, model: str) -> Tuple[str, Optional[str]]:
         """Parse 'base-model:adapter-name' syntax to extract LoRA adapter.
 
-        Returns (base_model, adapter_name) or (model, None) if no colon present.
+        Returns (base_model, adapter_name), preserving an exact served model
+        name even when it contains colons (e.g. an object-storage URI).
         """
         if ":" not in model:
             return model, None
 
-        # Split on first colon only to handle model paths with multiple colons
-        parts = model.split(":", 1)
-        base_model = parts[0].strip()
-        adapter_name = parts[1].strip() or None
+        served_model_name = self.tokenizer_manager.served_model_name
+        if model == served_model_name:
+            return model, None
 
-        return base_model, adapter_name
+        # Match the full served name before splitting URI schemes like s3://.
+        if model.startswith(f"{served_model_name}:"):
+            base_model = served_model_name
+            adapter_name = model[len(served_model_name) + 1 :]
+        else:
+            base_model, adapter_name = model.split(":", 1)
+
+        return base_model.strip(), adapter_name.strip() or None
 
     def _resolve_lora_path(
         self,
@@ -194,6 +201,12 @@ class OpenAIServingBase(ABC):
     def _validate_request(self, _: OpenAIServingRequest) -> Optional[str]:
         """Validate request"""
         pass
+
+    def _top_logprobs_error(self, field: str, value: Optional[int]) -> Optional[str]:
+        vocab_size = self.tokenizer_manager.model_config.vocab_size
+        if value is not None and not 0 <= value <= vocab_size:
+            return f"{field} must be in [0, {vocab_size}], got {value}."
+        return None
 
     def create_error_response(
         self,

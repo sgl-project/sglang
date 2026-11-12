@@ -14,27 +14,10 @@
 """`place_fused_draft` and the target's fused-draft decision: which drafts
 fuse into the host's entries, and where each runner's layers land.
 
-A decline keeps a draft on a private pool (or refuses it at boot); admitting
-one that cannot read the fused rows correctly gives silently wrong drafts.
-Pinned:
-  - a replicated head under multi-layer EAGLE gets one lane RANGE per runner
-    (one shared region would let the runners clobber each other's KV);
-  - a per-depth head serves one depth per runner and needs one runner per
-    depth;
-  - a draft with a layer kind no registered host kind serves declines, and
-    so do asymmetric K/V rows unless every resolved backend, the draft's
-    included, carries v_head_dim through to the kernel;
-  - so does a draft whose attention backend is off the translated MHA rails
-    (it would read the fused rows with virtual ids), a draft under
-    --dcp-size > 1 (each rank's rows hold only its share of the tokens), an
-    explicit draft KV dtype unlike the host's, and a draft under HiCache or
-    host-pool decode retraction (they build the draft's host pool off a
-    device pool of its own);
-  - the profile divides the draft's heads by attn_tp, as the target does,
-    and owns recurrent state only for a per-depth conv-chain head;
-  - the registry refuses a duplicate host or a second primary host for one
-    layer kind and reports hosts in registration order, every placed host
-    reports itself in the boot log, and runner ranges must tile a region.
+Lifetimes determine shared or independent bands. Each runner owns disjoint
+lanes; row geometry and dtype belong to its parts. DCP replicas and complete
+host envelopes are priced in the same plan. Invalid layer declarations fail
+before allocation.
 
     python -m pytest test/registered/unit/mem_cache/test_fused_draft_placement.py -v
 """
@@ -45,7 +28,7 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.srt.arg_groups.kv_cache_hook import ASYMMETRIC_KV_BACKENDS
+from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.mem_cache import kv_cache_configurator as kcc
 from sglang.srt.mem_cache.layout.fused_draft import (
     FULL_HOST,
@@ -69,13 +52,17 @@ from sglang.srt.mem_cache.layout.fused_draft import (
     register_host_kind,
 )
 from sglang.srt.runtime_context import get_parallel, override_platform
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, published_topology
 
-register_cpu_ci(est_time=15, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
-_HOSTS = ("full", "swa")
-_HOSTS_TRI = ("full", "swa", "mamba")
+# The target's sub-pools; TARGET_WINDOW stands for its window sub-pool, named by the
+# target window `_place` is given.
+TARGET_WINDOW = object()
+_HOSTS = ("full", TARGET_WINDOW)
+_HOSTS_TRI = ("full", TARGET_WINDOW, "mamba")
 _DTYPE = torch.bfloat16
 _WINDOW = DraftKVGeometry(head_num=2, head_dim=64, v_head_dim=64)
 _STATE = DraftStateGeometry(
@@ -116,22 +103,16 @@ def _profile(
     return DraftKVProfile(num_layers=num_layers, num_depths=num_depths, kinds=kinds)
 
 
-def _place(
-    profile,
-    num_runners=1,
-    asymmetric_rows_ok=False,
-    host_names=_HOSTS,
-    target_window=None,
-    draft_backends=("triton",),
-):
+def _place(profile, num_runners=1, host_names=_HOSTS, target_window=None):
+    from sglang.srt.mem_cache.kv.decl import window_sub_pool_name
+
+    window = window_sub_pool_name(target_window)
     return place_fused_draft(
         profile=profile,
         num_runners=num_runners,
         ctx=PlacementContext(
-            host_names=host_names,
-            target_window=target_window,
-            asymmetric_rows_ok=asymmetric_rows_ok,
-            draft_backends=draft_backends,
+            host_names=tuple(window if h is TARGET_WINDOW else h for h in host_names),
+            target_windows=() if target_window is None else (target_window,),
         ),
         store_dtype=_DTYPE,
     )
@@ -150,7 +131,7 @@ class TestPlaceFusedDraft(CustomTestCase):
         self.assertEqual(placement.hosts(), ("full",))
         for r in range(3):
             self.assertEqual(placement.lanes_for(r, "full"), range(2 * r, 2 * r + 2))
-            self.assertEqual(placement.lanes_for(r, "swa"), range(0))
+            self.assertEqual(placement.lanes_for(r, "window"), range(0))
 
     def test_per_depth_head_serves_one_depth_per_runner(self):
         decision = _place(_profile(num_layers=8, num_depths=8), num_runners=2)
@@ -160,7 +141,7 @@ class TestPlaceFusedDraft(CustomTestCase):
         self.assertEqual(placement.lanes_for(1, "full"), range(1, 2))
 
     def test_a_tri_pool_host_fuses_a_full_only_draft(self):
-        decision = _place(_profile(), host_names=("full", "swa", "mamba"))
+        decision = _place(_profile(), host_names=_HOSTS_TRI)
         self.assertIsNotNone(decision.placement, decision.declined)
         self.assertEqual(decision.placement.hosts(), ("full",))
 
@@ -174,12 +155,12 @@ class TestPlaceFusedDraft(CustomTestCase):
         placement = decision.placement
         self.assertIsNotNone(placement, decision.declined)
         self.assertIsNone(decision.note)
-        self.assertEqual(placement.hosts(), ("swa",))
+        self.assertEqual(placement.hosts(), ("window_128",))
         self.assertIsNone(placement.region("full"))
-        self.assertEqual(placement.region("swa").lane_num, 3)
-        self.assertEqual(placement.region("swa").head_num, _WINDOW.head_num)
+        self.assertEqual(placement.region("window_128").lane_num, 3)
+        self.assertEqual(placement.region("window_128").head_num, _WINDOW.head_num)
         for r in range(3):
-            self.assertEqual(placement.lanes_for(r, "swa"), range(r, r + 1))
+            self.assertEqual(placement.lanes_for(r, "window_128"), range(r, r + 1))
             self.assertEqual(placement.lanes_for(r, "full"), range(0))
 
     def test_per_depth_head_places_each_depth_by_its_kind(self):
@@ -192,56 +173,72 @@ class TestPlaceFusedDraft(CustomTestCase):
         placement = decision.placement
         self.assertIsNotNone(placement, decision.declined)
         self.assertEqual(placement.region("full").lane_num, 2)
-        self.assertEqual(placement.region("swa").lane_num, 1)
+        self.assertEqual(placement.region("window_64").lane_num, 1)
         self.assertEqual(placement.lanes_for(0, "full"), range(0, 1))
-        self.assertEqual(placement.lanes_for(1, "swa"), range(0, 1))
+        self.assertEqual(placement.lanes_for(1, "window_64"), range(0, 1))
         self.assertEqual(placement.lanes_for(1, "full"), range(0))
         self.assertEqual(placement.lanes_for(2, "full"), range(1, 2))
 
-    def test_window_layers_fall_back_to_the_full_sub_pool(self):
-        """A window wider than the target's, an undeclared window, or a host
-        without an swa sub-pool sends the window layers to the full sub-pool
-        with their own row geometry; the decision says why."""
-        for kwargs in (
-            dict(window=256, target_window=128),
-            dict(window=None, target_window=128),
-            dict(window=64, target_window=None),
-            dict(window=64, target_window=128, host_names=("full", "mamba")),
+    def test_inactive_depth_kinds_do_not_declare_storage(self):
+        """Unused checkpoint depths cannot add a regionless window band."""
+        from sglang.srt.mem_cache.kv.decl import MHAGeometry, kv_layer_decls
+        from sglang.srt.mem_cache.kv.plan import plan_kv_storage
+
+        placement = _place(
+            _profile(num_layers=8, num_depths=8, window_layer_ids=(3,), window=64),
+            num_runners=2,
+            target_window=128,
+        ).placement
+        dense = MHAGeometry(
+            head_num=1, head_dim=8, v_head_dim=8, kv_cache_dtype=torch.bfloat16
+        )
+        plan = plan_kv_storage(
+            kv_layer_decls(
+                full_layer_ids=(0,),
+                full_geometry=dense,
+                window_layer_ids=(1,),
+                window_geometry=dense,
+                window=128,
+            ),
+            page_size=4,
+            fused_draft=placement,
+        )
+        self.assertEqual(placement.hosts(), ("full",))
+        self.assertEqual(placement.new_bands, {})
+        self.assertEqual({s.name for s in plan.sub_pools}, {"full", "window_128"})
+
+    def test_unmatched_windows_get_independent_bands(self):
+        # A window the target does not declare gets a band named by its own
+        # length.
+        for window, hosts, target_window, name in (
+            (256, _HOSTS, 128, "window_256"),
+            (64, _HOSTS, 128, "window_64"),
+            (64, ("full", "mamba"), None, "window_64"),
         ):
-            profile = _profile(window_layer_ids=(0,), window=kwargs.pop("window"))
-            decision = _place(profile, num_runners=2, **kwargs)
+            decision = _place(
+                _profile(window_layer_ids=(0,), window=window),
+                num_runners=2,
+                target_window=target_window,
+                host_names=hosts,
+            )
             placement = decision.placement
             self.assertIsNotNone(placement, decision.declined)
-            self.assertIn("ride in the 'full' sub-pool", decision.note)
-            self.assertIsNone(placement.region("swa"))
-            self.assertEqual(placement.region("full").lane_num, 2)
-            self.assertEqual(placement.region("full").head_num, _WINDOW.head_num)
-            self.assertEqual(placement.lanes_for(1, "full"), range(1, 2))
+            self.assertIsNone(placement.region("full"))
+            self.assertEqual(placement.new_bands[name].window, window)
+            self.assertEqual(placement.region(name).lane_num, 2)
+            self.assertEqual(placement.lanes_for(1, name), range(1, 2))
 
-    def test_a_fold_cannot_mix_two_row_geometries(self):
-        """One region holds one row geometry: window layers the swa sub-pool
-        turns away fold into the full sub-pool only when their rows match the
-        full layers', else the whole draft declines."""
+    def test_distinct_lifetimes_keep_different_geometries(self):
         decision = _place(
             _profile(num_layers=2, window_layer_ids=(1,), window=256),
             target_window=128,
         )
-        self.assertIsNone(decision.placement)
-        self.assertIn("cannot share", decision.declined)
-
-    def test_a_window_draft_needs_a_rail_carrying_draft_backend(self):
-        """Only the Triton multi-step draft backend builds the per-step window
-        rails; any other draft backend would sink-write the window layers."""
-        decision = _place(
-            _profile(window_layer_ids=(0,), window=128),
-            target_window=128,
-            draft_backends=("fa3",),
+        self.assertIsNotNone(decision.placement, decision.declined)
+        self.assertEqual(decision.placement.hosts(), ("full", "window_256"))
+        self.assertNotEqual(
+            decision.placement.region("full").head_num,
+            decision.placement.region("window_256").head_num,
         )
-        self.assertIsNone(decision.placement)
-        self.assertIn("['fa3']", decision.declined)
-        self.assertIn("triton", decision.declined)
-        # A full-only draft never consults the rail rule.
-        self.assertIsNotNone(_place(_profile(), draft_backends=("fa3",)).placement)
 
     def test_per_depth_head_needs_one_runner_per_depth(self):
         self.assertIsNone(_place(_profile(num_layers=8, num_depths=8), 1).placement)
@@ -259,9 +256,9 @@ class TestPlaceFusedDraft(CustomTestCase):
         self.assertEqual(placement.hosts(), ("full", "mamba"))
         self.assertEqual(placement.region("mamba").lane_num, 3)
         self.assertEqual(placement.region("mamba").state, _STATE)
-        self.assertEqual(
-            placement.region("mamba").entry_bytes(), 3 * _STATE.layer_bytes()
-        )
+        # Three lanes have 96 bytes of conv payload; temporal rows begin at
+        # the next 64-byte boundary, followed by three 256-byte state rows.
+        self.assertEqual(placement.region("mamba").entry_bytes(), 128 + 3 * 256)
         for r in range(3):
             self.assertEqual(placement.lanes_for(r, "mamba"), range(r, r + 1))
         # A replicated head carries every state layer per runner.
@@ -273,10 +270,13 @@ class TestPlaceFusedDraft(CustomTestCase):
         self.assertEqual(placement.region("mamba").lane_num, 4)
         self.assertEqual(placement.lanes_for(1, "mamba"), range(2, 4))
 
-    def test_state_layers_decline_without_a_state_host(self):
+    def test_recurrent_draft_requires_a_target_checkpoint_policy(self):
+        """Storage geometry cannot supply a missing recurrent checkpoint execution path."""
         decision = _place(_profile(state_layer_ids=(0,)), host_names=_HOSTS)
         self.assertIsNone(decision.placement)
-        self.assertIn("'mamba'", decision.declined)
+        self.assertIn("checkpoint policy", decision.declined)
+        with self.assertRaisesRegex(ValueError, "checkpoint policy"):
+            kcc.KVCacheConfigurator._fused_draft_for_pool_factory(None, decision)
 
     def test_a_layer_kind_with_no_host_kind_declines(self):
         with _dense_only_registry():
@@ -288,32 +288,22 @@ class TestPlaceFusedDraft(CustomTestCase):
                 self.assertIsNone(decision.placement)
                 self.assertIn(f"1 {noun} layer(s)", decision.declined)
 
-    def test_asymmetric_and_misaligned_rows_decline(self):
-        for profile, reason in (
-            (_profile(head_dim=64, v_head_dim=32), "asymmetric"),
-            # 4 heads x 5 dims x 2 B = 40 B: not a 16-B-aligned entry part.
-            (_profile(head_dim=5, v_head_dim=5), "40 B"),
-        ):
-            decision = _place(profile)
-            self.assertIsNone(decision.placement)
-            self.assertIn(reason, decision.declined)
+    def test_short_rows_reserve_padding_between_parts(self):
+        region = _place(_profile(head_dim=5, v_head_dim=5)).placement.region("full")
+        self.assertEqual(region.entry_bytes(), 96)
+        k, v = region.parts(64)
+        self.assertEqual((k.row_bytes(), v.row_bytes()), (40, 40))
+        self.assertEqual((k.offset_bytes, v.offset_bytes), (64, 112))
 
-    def test_asymmetric_rows_fuse_with_their_v_width_when_backends_allow(self):
-        placement = _place(
-            _profile(head_dim=64, v_head_dim=32), asymmetric_rows_ok=True
-        ).placement
+    def test_asymmetric_rows_fuse_with_their_v_width(self):
+        placement = _place(_profile(head_dim=64, v_head_dim=32)).placement
         self.assertIsNotNone(placement)
         self.assertEqual(placement.region("full").resolved_v_head_dim(), 32)
         self.assertEqual(placement.region("full").entry_bytes(), 4 * (64 + 32) * 2)
-        # Symmetric rows never consult the rule.
-        self.assertIsNotNone(_place(_profile(), asymmetric_rows_ok=False).placement)
 
-    def test_a_misaligned_v_row_declines_even_when_backends_allow(self):
-        # K rows are 4 x 64 x 2 B = 512 B; V rows 4 x 5 x 2 B = 40 B are not a
-        # 16-B-aligned entry part.
-        decision = _place(_profile(head_dim=64, v_head_dim=5), asymmetric_rows_ok=True)
-        self.assertIsNone(decision.placement)
-        self.assertIn("40 B", decision.declined)
+    def test_short_v_rows_have_their_own_padding(self):
+        region = _place(_profile(head_dim=64, v_head_dim=5)).placement.region("full")
+        self.assertEqual(region.entry_bytes(), 512 + 48)
 
     def test_region_carries_the_profile_geometry(self):
         placement = _place(_profile()).placement
@@ -327,8 +317,9 @@ class TestPlaceFusedDraft(CustomTestCase):
 
 def _config(**overrides):
     fields = dict(
+        attention_arch=AttentionArch.MHA,
         is_hybrid_swa=True,
-        is_deepseek_v4_arch=False,
+        is_compressed_kv_arch=False,
         swa_attention_layer_ids=[0],
         num_nextn_predict_layers=None,
         hf_text_config=SimpleNamespace(),
@@ -354,9 +345,39 @@ _TRUNK_STATE = SimpleNamespace(
 
 
 class TestDraftKVProfile(CustomTestCase):
+    def test_mla_window_routing_keeps_latent_geometry(self):
+        """A routed window uses the draft's MLA row layout, just like FULL."""
+        from sglang.srt.mem_cache.layout.fused_draft import (
+            DraftMLAGeometry,
+            MLADraftRegion,
+        )
+
+        config = _config(
+            attention_arch=AttentionArch.MLA,
+            kv_lora_rank=8,
+            qk_rope_head_dim=8,
+            hf_config=SimpleNamespace(architectures=["DeepseekV2ForCausalLM"]),
+        )
+        with patch("sglang.srt.configs.hybrid_arch.mambaish_config", return_value=None):
+            profile = draft_kv_profile(config, num_layers=2, attn_tp_size=1, window=128)
+        placement = _place(profile, target_window=16).placement
+        for kind, host in ((LAYER_FULL, "full"), (LAYER_WINDOW, "window_128")):
+            self.assertIsInstance(profile.kinds[kind].geometry, DraftMLAGeometry)
+            self.assertIsInstance(placement.region(host), MLADraftRegion)
+
+    def test_window_layers_require_a_retention_length(self):
+        for window in (None, 0, -1):
+            with (
+                self.subTest(window=window),
+                self.assertRaisesRegex(ValueError, "positive window"),
+            ):
+                _place(_profile(window_layer_ids=(0,), window=window))
+
     def test_heads_are_divided_by_attn_tp(self):
         with patch("sglang.srt.configs.hybrid_arch.mambaish_config", return_value=None):
-            profile = draft_kv_profile(_config(), num_layers=2, attn_tp_size=2)
+            profile = draft_kv_profile(
+                _config(), num_layers=2, attn_tp_size=2, window=128
+            )
         self.assertEqual(profile.num_depths, 1)
         self.assertEqual(set(profile.kinds), {LAYER_FULL, LAYER_WINDOW})
         full = profile.kinds[LAYER_FULL]
@@ -402,37 +423,6 @@ class TestDraftKVProfile(CustomTestCase):
         self.assertEqual(state.geometry, _STATE)
 
 
-class TestAsymmetricBackendRule(CustomTestCase):
-    """The rule reads the TARGET's resolved backends and the draft's explicit
-    one (unset inherits the target's); one shared-head_dim backend anywhere
-    disqualifies asymmetric rows."""
-
-    def _carries(self, *, backends, draft_backend=None):
-        cfg = kcc.KVCacheConfigurator.__new__(kcc.KVCacheConfigurator)
-        with (
-            patch.object(kcc, "attention_backends", return_value=tuple(backends)),
-            patch.object(
-                kcc,
-                "get_spec",
-                return_value=SimpleNamespace(
-                    speculative_draft_attention_backend=draft_backend
-                ),
-            ),
-        ):
-            return cfg._draft_backends_carry_v_head_dim()
-
-    def test_every_split_stride_backend_qualifies(self):
-        for backend in sorted(ASYMMETRIC_KV_BACKENDS):
-            self.assertTrue(self._carries(backends=(backend,)), backend)
-
-    def test_a_shared_head_dim_backend_anywhere_disqualifies(self):
-        self.assertNotIn("flashinfer", ASYMMETRIC_KV_BACKENDS)
-        self.assertFalse(self._carries(backends=("flashinfer",)))
-        self.assertFalse(
-            self._carries(backends=("triton",), draft_backend="flashinfer")
-        )
-
-
 class TestHostKindRegistry(CustomTestCase):
     """Registration is the extension point: a silent overwrite or a second
     primary host would re-route every draft of that kind."""
@@ -449,10 +439,6 @@ class TestHostKindRegistry(CustomTestCase):
     def test_one_primary_host_per_layer_kind(self):
         with _dense_only_registry(), self.assertRaises(AssertionError):
             register_host_kind(self._dense(serves=LAYER_FULL))
-
-    def test_a_fallback_host_must_be_registered_first(self):
-        with _dense_only_registry(), self.assertRaises(AssertionError):
-            register_host_kind(self._dense(fallback_host="ghost"))
 
     def test_hosts_follow_registration_order(self):
         """Binders and the boot log walk `hosts()`; dict order of a placement's
@@ -555,20 +541,54 @@ class TestBootLogReportsEveryPlacedHost(CustomTestCase):
         )
 
 
+def _fused_plan(cfg, placement, host):
+    """``host``'s spec in the plan the pool is built from, and the fused entry
+    the configurator prices for it."""
+    from sglang.srt.mem_cache.kv.plan import plan_kv_storage
+
+    # A slotted dataclass: the decision is patched on the class.
+    with patch.object(
+        kcc.KVCacheConfigurator,
+        "_fused_draft_decision",
+        return_value=FusedDraftDecision(placement=placement),
+    ):
+        entry_bytes = cfg.fused_entry_bytes(host)
+    plan = plan_kv_storage(
+        cfg._kv_layer_decls(), page_size=cfg.page_size, fused_draft=placement
+    )
+    return plan.sub_pool(host).spec, entry_bytes
+
+
 class TestMambaHostPricing(CustomTestCase):
     """The mamba sub-pool's fused entry is priced from THIS runner's state
-    layers, as the mamba factory slices them; the whole model's list would
-    also count other pipeline ranks'."""
+    layers, as the pool slices them; the whole model's list would also count
+    other pipeline ranks'."""
 
     def test_a_mamba_region_prices_this_runners_state_layers(self):
         cfg = kcc.KVCacheConfigurator.__new__(kcc.KVCacheConfigurator)
-        cfg.layer_info = SimpleNamespace(start_layer=2, end_layer=4)
+        self.enterContext(published_topology(role="tokenizer", device="cpu"))
+        cfg.sliding_window_size = None
+        cfg.hybrid_gdn_config = None
+        cfg.hybrid_kda_config = None
+        self.enterContext(patch.object(kcc, "mamba_cache_chunk_size", return_value=64))
+        cfg.is_hybrid_swa = False
+        cfg.use_mla_backend = False
+        cfg.kv_cache_dtype = _DTYPE
+        cfg.page_size = 1
+        cfg.layer_info = SimpleNamespace(start_layer=2, end_layer=5)
+        cfg.model_config = SimpleNamespace(
+            get_num_kv_heads=lambda tp, dcp: 2, head_dim=8, v_head_dim=8
+        )
         cfg.mambaish_config = SimpleNamespace(
+            full_attention_layer_ids=[4],
             mamba2_cache_params=SimpleNamespace(
                 layers=[0, 1, 2, 3],
-                shape=SimpleNamespace(conv=[(2, 2)], temporal=(2, 2)),
+                shape=SimpleNamespace(
+                    conv=[(2, 2)], temporal=(2, 2), num_k_heads_per_tp=2
+                ),
                 dtype=SimpleNamespace(conv=_DTYPE, temporal=_DTYPE),
-            )
+                is_kda=False,
+            ),
         )
         state = DraftStateRegion(
             lane_num=1,
@@ -579,9 +599,18 @@ class TestMambaHostPricing(CustomTestCase):
                 temporal_dtype=_DTYPE,
             ),
         )
-        spec = cfg._mamba_host_spec(state)
+        with get_parallel().override(attn_tp_size=1, attn_dcp_size=1):
+            spec, entry_bytes = _fused_plan(
+                cfg,
+                FusedDraftPlacement(
+                    runners=(RunnerLanes(ranges={"mamba": (0, 1)}),),
+                    regions={"mamba": state},
+                ),
+                "mamba",
+            )
         self.assertEqual(spec.layer_num, 2)
         self.assertIs(spec.draft_region, state)
+        self.assertEqual(entry_bytes, spec.entry_bytes())
 
 
 class TestUnifiedSWAHeadGeometry(CustomTestCase):
@@ -591,14 +620,24 @@ class TestUnifiedSWAHeadGeometry(CustomTestCase):
 
     def _configurator(self):
         cfg = kcc.KVCacheConfigurator.__new__(kcc.KVCacheConfigurator)
+        # The window the runner resolved for its layers.
+        cfg.sliding_window_size = 128
+        cfg.draft_parallel_layout = None
         cfg.is_hybrid_swa = True
         cfg.is_hybrid_swa_compress = False
+        cfg.mambaish_config = None
         cfg.use_mla_backend = False
         cfg.kv_cache_dtype = _DTYPE
+        cfg.page_size = 1
         cfg.layer_info = SimpleNamespace(
-            full_attention_layer_ids=[0, 3], swa_attention_layer_ids=[1, 2]
+            start_layer=0,
+            end_layer=4,
+            full_attention_layer_ids=[0, 3],
+            swa_attention_layer_ids=[1, 2],
         )
         cfg.model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=["MiMoV2FlashForCausalLM"]),
+            sliding_window_size=128,
             get_num_kv_heads=lambda tp, dcp: 4,
             head_dim=192,
             v_head_dim=128,
@@ -623,21 +662,62 @@ class TestUnifiedSWAHeadGeometry(CustomTestCase):
             lane_num=1, head_num=4, head_dim=64, store_dtype=_DTYPE
         )
         with get_parallel().override(attn_tp_size=1, attn_dcp_size=1):
-            spec = self._configurator()._full_host_spec(region)
+            spec, entry_bytes = _fused_plan(
+                self._configurator(),
+                FusedDraftPlacement(
+                    runners=(RunnerLanes(ranges={"full": (0, 1)}),),
+                    regions={"full": region},
+                ),
+                "full",
+            )
         self.assertEqual(
             (spec.layer_num, spec.head_dim, spec.v_head_dim), (2, 192, 128)
         )
+        self.assertIs(spec.draft_region, region)
+        self.assertEqual(entry_bytes, spec.entry_bytes())
 
     def test_the_swa_fused_price_reads_this_runners_window_layers(self):
         region = DenseDraftRegion(
             lane_num=1, head_num=4, head_dim=64, store_dtype=_DTYPE
         )
         with get_parallel().override(attn_tp_size=1, attn_dcp_size=1):
-            spec = self._configurator()._swa_host_spec(region)
+            spec, entry_bytes = _fused_plan(
+                self._configurator(),
+                FusedDraftPlacement(
+                    runners=(RunnerLanes(ranges={"window_128": (0, 1)}),),
+                    regions={"window_128": region},
+                    hosted={"window_128": "window"},
+                ),
+                "window_128",
+            )
         self.assertEqual(
             (spec.layer_num, spec.head_num, spec.head_dim, spec.v_head_dim),
             (2, 8, 192, 128),
         )
+        self.assertIs(spec.draft_region, region)
+        self.assertEqual(entry_bytes, spec.entry_bytes())
+
+
+class _RawWindowDraft:
+    """A draft architecture whose runner attends over its config's window."""
+
+
+class _MinusOneWindowDraft:
+    """A draft architecture attending over one less than its config's window."""
+
+    @staticmethod
+    def sliding_layer_window_size(config):
+        return config.sliding_window - 1
+
+    def get_attention_sliding_window_size(self):
+        return self.sliding_layer_window_size(self.config)
+
+
+class _InstanceOnlyDraft:
+    """A draft architecture whose window rule reads the built model."""
+
+    def get_attention_sliding_window_size(self):
+        return self.config.sliding_window - 1
 
 
 class TestFusedDraftDecision(CustomTestCase):
@@ -652,25 +732,52 @@ class TestFusedDraftDecision(CustomTestCase):
         kv_cache_dtype_flag="auto",
         draft_backend=None,
         target_backends=("triton", "triton"),
+        tp_size=1,
+        attn_cp_size=1,
+        attn_dp_size=1,
         dcp_size=1,
+        draft_mla=False,
+        draft_hf_config=None,
         hicache=False,
         retraction_backup=None,
+        draft_parallel_layout=None,
+        is_hip=False,
+        resolved_window=128,
+        draft_window=None,
+        draft_cls=None,
     ):
         from sglang.srt.configs.model_config import AttentionArch
         from sglang.srt.mem_cache import kv_cache_configurator as kvc
         from sglang.srt.speculative import draft_worker_common
 
         cfg = kvc.KVCacheConfigurator.__new__(kvc.KVCacheConfigurator)
+        # The window the runner resolved for its layers.
+        cfg.sliding_window_size = resolved_window
+        cfg.draft_parallel_layout = draft_parallel_layout
         cfg.is_hybrid_swa = True
+        cfg.is_hybrid_swa_compress = False
         cfg.mambaish_config = None
         cfg.use_mla_backend = False
         cfg.is_draft_worker = False
-        cfg.spec_algorithm = SimpleNamespace(
-            is_eagle=lambda: algorithm == "EAGLE",
-            is_dflash_family=lambda: algorithm in ("DFLASH", "DSPARK"),
+        cfg.spec_algorithm = SpeculativeAlgorithm.from_string(algorithm)
+        # A hybrid sliding-window host: one full and one window layer, whose
+        # declarations name the sub-pools the draft may fuse into.
+        cfg.layer_info = SimpleNamespace(
+            start_layer=0,
+            end_layer=2,
+            full_attention_layer_ids=[0],
+            swa_attention_layer_ids=[1],
         )
         cfg.model_config = SimpleNamespace(
-            is_multi_layer_eagle=False, sliding_window_size=None
+            is_multi_layer_eagle=False,
+            sliding_window_size=128,
+            hf_config=SimpleNamespace(architectures=["GptOssForCausalLM"]),
+            get_num_kv_heads=lambda tp, dcp: 4,
+            head_dim=64,
+            v_head_dim=64,
+            get_swa_num_kv_heads=lambda tp: 4,
+            swa_head_dim=64,
+            swa_v_head_dim=64,
         )
         cfg.kv_cache_dtype = host_kv_dtype
         cfg.spec_aux_config = SimpleNamespace(
@@ -678,14 +785,29 @@ class TestFusedDraftDecision(CustomTestCase):
             draft_kv_num_layers=1,
             dflash_draft_num_layers=1,
             draft_model_config=SimpleNamespace(
-                is_hybrid_swa=False,
-                is_deepseek_v4_arch=False,
+                model_path="draft-model",
+                revision="test-revision",
+                is_hybrid_swa=draft_window is not None,
+                swa_attention_layer_ids=[0],
+                sliding_window_size=draft_window,
+                attention_chunk_size=None,
+                get_swa_num_kv_heads=lambda tp: max(1, 4 // tp),
+                swa_head_dim=64,
+                swa_v_head_dim=64,
+                is_compressed_kv_arch=False,
                 num_nextn_predict_layers=None,
-                get_num_kv_heads=lambda tp: 4,
+                get_num_kv_heads=lambda tp: max(1, 4 // tp),
                 head_dim=64,
                 v_head_dim=64,
                 dtype=torch.bfloat16,
-                attention_arch=AttentionArch.MHA,
+                attention_arch=AttentionArch.MLA if draft_mla else AttentionArch.MHA,
+                kv_lora_rank=8,
+                qk_rope_head_dim=4,
+                hf_config=draft_hf_config
+                or SimpleNamespace(
+                    architectures=["BailingMoeForCausalLMNextN"],
+                    sliding_window=draft_window,
+                ),
             ),
         )
         memory = SimpleNamespace(
@@ -697,7 +819,13 @@ class TestFusedDraftDecision(CustomTestCase):
             speculative_draft_attention_backend=draft_backend,
         )
         with (
+            published_topology(
+                tp_size=tp_size,
+                attn_cp_size=attn_cp_size,
+                attn_dp_size=attn_dp_size,
+            ),
             patch.object(kvc, "get_memory", return_value=memory),
+            patch.object(kvc, "_is_hip", is_hip),
             patch.object(
                 kvc,
                 "get_disagg",
@@ -717,51 +845,189 @@ class TestFusedDraftDecision(CustomTestCase):
                 draft_worker_common, "attention_backends", return_value=target_backends
             ),
             patch("sglang.srt.configs.hybrid_arch.mambaish_config", return_value=None),
-            get_parallel().override(attn_tp_size=1, attn_dcp_size=dcp_size),
+            get_parallel().override(attn_dcp_size=dcp_size),
             override_platform(is_xpu=False, is_hip=False),
+            patch(
+                "sglang.srt.model_loader.utils.get_model_architecture",
+                return_value=(draft_cls or _RawWindowDraft, "Draft"),
+            ),
         ):
             return cfg._fused_draft_decision()
 
     def test_a_stateless_draft_is_placed(self):
         self.assertIsNotNone(self._decide().placement)
 
-    def test_a_draft_kv_dtype_unlike_the_host_keeps_the_private_pool(self):
-        """A fused draft stores its rows in the host's KV dtype; an explicit
-        draft dtype that differs declines instead of mis-typing those rows,
-        and one that matches the host's fuses."""
-        self.assertIsNotNone(self._decide(draft_kv_dtype="auto").placement)
-        declined = self._decide(draft_kv_dtype="fp8_e4m3")
-        self.assertIsNone(declined.placement)
-        self.assertIn("KV cache dtype", declined.declined)
-        for algorithm in ("EAGLE", "DFLASH"):
-            placed = self._decide(
-                algorithm=algorithm,
-                draft_kv_dtype="fp8_e4m3",
-                host_kv_dtype=torch.float8_e4m3fn,
-                kv_cache_dtype_flag="fp8_e4m3",
-            )
-            self.assertIsNotNone(placed.placement, algorithm)
-
-    def test_a_draft_off_the_translated_rails_keeps_the_private_pool(self):
-        """A fused draft reads its rows through the KV-index translator, which
-        triton, flashinfer, fa3, fa4 and trtllm_mha carry on draft paths.
-        The draft's backend is the published one, a model hook's declaration
-        included; otherwise it is what the draft runner inherits from the
-        target."""
-        declined = self._decide(algorithm="EAGLE", draft_backend="flashmla")
-        self.assertIsNone(declined.placement)
-        self.assertIn("flashmla", declined.declined)
-        # A DFLASH-family draft runs the target's prefill backend, or the
-        # platform default when that is not a draft backend.
-        for target_backends, fuses in (
-            (("fa4", "fa4"), True),
-            (("fa3", "flashmla"), True),
-            (("flashmla", "flashmla"), True),
+    def test_a_draft_window_is_placed_by_the_drafts_own_rule(self):
+        # The target states 128 and attends over 127. A draft window shares the
+        # target's sub-pool only when its own rule resolves it to 127.
+        for draft_cls, stated, host, band in (
+            (_MinusOneWindowDraft, 128, "window_127", None),
+            (_RawWindowDraft, 128, None, "window_128"),
+            (_RawWindowDraft, 127, "window_127", None),
+            (_MinusOneWindowDraft, 65, None, "window_64"),
+            (_RawWindowDraft, 64, None, "window_64"),
+            (_MinusOneWindowDraft, 257, None, "window_256"),
+            (_RawWindowDraft, 256, None, "window_256"),
         ):
-            decision = self._decide(algorithm="DSPARK", target_backends=target_backends)
-            self.assertEqual(decision.placement is not None, fuses, target_backends)
-        # An EAGLE draft with no backend of its own runs the target's pair.
-        self.assertIsNone(self._decide(target_backends=("fa3", "flashmla")).placement)
+            with self.subTest(draft=draft_cls.__name__, stated=stated):
+                decision = self._decide(
+                    resolved_window=127, draft_window=stated, draft_cls=draft_cls
+                )
+                placement = decision.placement
+                self.assertIsNotNone(placement, decision.declined)
+                if host is not None:
+                    self.assertEqual(placement.hosts(), (host,))
+                    self.assertEqual(placement.new_bands, {})
+                else:
+                    self.assertEqual(set(placement.new_bands), {band})
+                    self.assertEqual(
+                        placement.new_bands[band].window, int(band.split("_")[1])
+                    )
+
+    def test_a_draft_window_known_only_once_built_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "sliding_layer_window_size"):
+            self._decide(
+                resolved_window=127, draft_window=128, draft_cls=_InstanceOnlyDraft
+            )
+
+    def test_fused_placement_uses_resolved_width_for_every_protocol(self):
+        from sglang.srt.configs.draft_parallel import DraftParallelLayout
+
+        layout = DraftParallelLayout(tp_group=None, attn_tp_size=2)
+        for algorithm in ("EAGLE", "DFLASH", "DSPARK"):
+            with self.subTest(algorithm=algorithm):
+                decision = self._decide(
+                    algorithm=algorithm, tp_size=4, draft_parallel_layout=layout
+                )
+                self.assertIsNotNone(decision.placement, decision.declined)
+                self.assertEqual(decision.placement.region("full").head_num, 2)
+
+    def test_cp_draft_placement_keeps_dp_isolated(self):
+        for algorithm, cp, dp, heads in (
+            ("DFLASH", 1, 1, 1),
+            ("DFLASH", 4, 1, 1),
+            ("DFLASH", 2, 2, 4),
+            ("EAGLE", 4, 1, 4),
+            ("DSPARK", 4, 1, 4),
+        ):
+            with self.subTest(algorithm=algorithm, cp=cp, dp=dp):
+                decision = self._decide(
+                    algorithm=algorithm,
+                    tp_size=4,
+                    attn_cp_size=cp,
+                    attn_dp_size=dp,
+                )
+                self.assertIsNotNone(decision.placement, decision.declined)
+                self.assertEqual(decision.placement.region("full").head_num, heads)
+
+    def test_a_draft_kv_dtype_unlike_the_host_fuses_in_its_own_dtype(self):
+        """A fused region has typed views of its own, so an explicit draft
+        dtype other than the host's fuses, with the region priced and viewed
+        in the draft's dtype; one that matches the host's fuses as before."""
+        placed = self._decide(draft_kv_dtype="auto")
+        self.assertEqual(placed.placement.region("full").resolved_kv_dtype(), _DTYPE)
+        for algorithm in ("EAGLE", "DFLASH"):
+            with self.subTest(algorithm=algorithm):
+                other = self._decide(algorithm=algorithm, draft_kv_dtype="fp8_e4m3")
+                self.assertIsNotNone(other.placement, other.declined)
+                self.assertEqual(
+                    other.placement.region("full").resolved_kv_dtype(),
+                    torch.float8_e4m3fn,
+                )
+                same = self._decide(
+                    algorithm=algorithm,
+                    draft_kv_dtype="fp8_e4m3",
+                    host_kv_dtype=torch.float8_e4m3fn,
+                    kv_cache_dtype_flag="fp8_e4m3",
+                )
+                self.assertEqual(
+                    same.placement.region("full").resolved_kv_dtype(),
+                    torch.float8_e4m3fn,
+                )
+
+    def test_the_region_takes_the_dtype_the_draft_resolves(self):
+        """The region's dtype is the one the draft runner resolves for itself
+        by the KV dtype rules; the fused decision never asks the backend. A
+        DFLASH draft on fa4 resolves its compute dtype over an fp8 host (fa4
+        reads K in Q's dtype), on triton the host's fp8; over a bf16 host both
+        keep bf16. The same holds when the host's fp8 came from `auto`."""
+        for host_kv_dtype, flag in (
+            (torch.float8_e4m3fn, "fp8_e4m3"),
+            (torch.float8_e4m3fn, "auto"),
+            (torch.bfloat16, "auto"),
+        ):
+            for draft_backend, fp8_region in (
+                ("fa4", torch.bfloat16),
+                ("triton", None),
+            ):
+                with self.subTest(host=host_kv_dtype, flag=flag, backend=draft_backend):
+                    decision = self._decide(
+                        algorithm="DFLASH",
+                        draft_backend=draft_backend,
+                        host_kv_dtype=host_kv_dtype,
+                        kv_cache_dtype_flag=flag,
+                    )
+                    self.assertIsNotNone(decision.placement, decision.declined)
+                    expected = (
+                        host_kv_dtype
+                        if host_kv_dtype == torch.bfloat16 or fp8_region is None
+                        else fp8_region
+                    )
+                    self.assertEqual(
+                        decision.placement.region("full").resolved_kv_dtype(),
+                        expected,
+                    )
+
+    def test_an_auto_draft_dtype_sizes_the_region_as_the_loaded_draft_resolves(self):
+        """BUG REGRESSION. An explicit draft KV dtype of `auto` sized the region
+        without the draft's quant config, in its compute dtype, while the
+        loaded draft, whose quant config declares an FP8 KV cache, resolved
+        FP8 and failed to bind. Until the draft loads, its `auto` takes the
+        host's dtype, as no flag does; an explicit dtype is its own."""
+        from sglang.srt.layers.quantization.fp8 import Fp8Config
+        from sglang.srt.mem_cache.kv_cache_dtype import configure_kv_cache_dtype
+
+        loaded_draft = SimpleNamespace(
+            quant_config=Fp8Config(
+                is_checkpoint_fp8_serialized=True, kv_cache_quant_algo="FP8"
+            )
+        )
+        for draft_kv_dtype in (None, "auto", "fp8_e4m3"):
+            with self.subTest(draft_kv_dtype=draft_kv_dtype):
+                decision = self._decide(
+                    draft_kv_dtype=draft_kv_dtype,
+                    host_kv_dtype=torch.float8_e4m3fn,
+                    kv_cache_dtype_flag="fp8_e4m3",
+                )
+                self.assertIsNotNone(decision.placement, decision.declined)
+                # What the draft worker resolves once its model has loaded.
+                _, resolved = configure_kv_cache_dtype(
+                    server_args_kv_cache_dtype="fp8_e4m3",
+                    model=loaded_draft,
+                    model_dtype=_DTYPE,
+                    is_draft_worker=True,
+                    is_dflash=False,
+                    speculative_draft_attention_backend=None,
+                    speculative_draft_kv_cache_dtype=draft_kv_dtype,
+                )
+                self.assertEqual(resolved, torch.float8_e4m3fn)
+                self.assertEqual(
+                    decision.placement.region("full").resolved_kv_dtype(), resolved
+                )
+
+    def test_no_draft_backend_keeps_the_private_pool(self):
+        """A fused draft reads its rows through the target's views and id
+        spaces, so the draft's backend, named or inherited, never decides
+        whether it fuses."""
+        self.assertIsNotNone(
+            self._decide(algorithm="EAGLE", draft_backend="flashmla").placement
+        )
+        for target_backends in (("fa4", "fa4"), ("fa3", "flashmla")):
+            for algorithm in ("EAGLE", "DSPARK"):
+                decision = self._decide(
+                    algorithm=algorithm, target_backends=target_backends
+                )
+                self.assertIsNotNone(decision.placement, (algorithm, target_backends))
 
     def test_a_fa4_dspark_draft_fuses(self):
         decision = self._decide(algorithm="DSPARK", draft_backend="fa4")
@@ -778,31 +1044,114 @@ class TestFusedDraftDecision(CustomTestCase):
         decision = self._decide(target_backends=("trtllm_mha", "trtllm_mha"))
         self.assertIsNotNone(decision.placement)
 
-    def test_dcp_keeps_the_private_pool(self):
-        """Under --dcp-size > 1 each rank's host rows hold only its share of
-        the widened id space, while the draft, outside the DCP group, reads
-        every token."""
-        for algorithm in ("DSPARK", "EAGLE"):
-            declined = self._decide(algorithm=algorithm, dcp_size=2)
-            self.assertIsNone(declined.placement, algorithm)
-            self.assertIn("--dcp-size 2", declined.declined)
+    def test_mla_draft_storage_matches_its_dcp_execution(self):
+        """An MLA draft reader shards KV; its storage must not expand those pages."""
+        for width in (2, 4):
+            with self.subTest(dcp=width):
+                decision = self._decide(
+                    dcp_size=width, draft_mla=True, draft_backend="cutedsl_mla"
+                )
+                self.assertIsNotNone(decision.placement, decision.declined)
+                self.assertEqual(decision.placement.region("full").token_replicas, 1)
 
-    def test_hierarchical_cache_keeps_the_private_pool(self):
-        """HiCache builds the draft's host pool off its own device pool, which
-        a fused draft does not have; DSPARK + HiCache keeps working on the
-        private pool."""
-        declined = self._decide(algorithm="DSPARK", hicache=True)
-        self.assertIsNone(declined.placement)
-        self.assertIn("--enable-hierarchical-cache", declined.declined)
+    def test_dsa_draft_placement_preserves_platform_execution_policy(self):
+        """DSA NextN stays replicated on CUDA and sharded on ROCm."""
+        from transformers import PretrainedConfig
 
-    def test_host_pool_retraction_keeps_the_private_pool(self):
-        """Host-pool decode retraction builds the draft's host pool off its
-        own device pool too; DSPARK with it keeps the private pool."""
-        declined = self._decide(algorithm="DSPARK", retraction_backup="host_pool")
-        self.assertIsNone(declined.placement)
-        self.assertIn(
-            "--disaggregation-decode-retraction-backup=host_pool", declined.declined
+        config = PretrainedConfig(
+            architectures=["DeepseekV3ForCausalLMNextN"], index_topk=256
         )
+        for hip, replicas in ((False, 4), (True, 1)):
+            with (
+                self.subTest(hip=hip),
+                patch("sglang.srt.configs.model_config.is_hip", return_value=hip),
+            ):
+                decision = self._decide(
+                    dcp_size=4,
+                    draft_mla=True,
+                    draft_hf_config=config,
+                    draft_backend="cutedsl_mla",
+                )
+                self.assertEqual(
+                    decision.placement.region("full").token_replicas, replicas
+                )
+
+    def test_npu_mla_draft_preserves_global_slot_layout(self):
+        """Ascend draft attention does not consume the target's DCP metadata."""
+        with patch("sglang.srt.configs.model_config.is_npu", return_value=True):
+            decision = self._decide(
+                dcp_size=4, draft_mla=True, draft_backend="cutedsl_mla"
+            )
+        self.assertEqual(decision.placement.region("full").token_replicas, 4)
+
+    def test_private_mla_pool_pages_match_its_execution(self):
+        """A sharded MLA draft must not multiply its physical page size by DCP."""
+        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+        from sglang.srt.runtime_context import publish
+        from sglang.srt.server_args import ServerArgs
+
+        args = ServerArgs(model_path="dummy", device="cpu", page_size=64)
+        args._mamba_cache_chunk_size = 64
+        publish(args, role="tokenizer")
+        cfg = KVCacheConfigurator.__new__(KVCacheConfigurator)
+        cfg.is_draft_worker = True
+        cfg.use_mla_backend = True
+        cfg.model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=["BailingMoeForCausalLMNextN"])
+        )
+        for width in (2, 4):
+            with self.subTest(dcp=width), get_parallel().override(attn_dcp_size=width):
+                self.assertEqual(cfg.loc_space_scale, 1)
+                self.assertEqual(cfg.pool_page_size, 64)
+
+    def test_dcp_prices_a_replicated_draft_region(self):
+        for algorithm in ("DSPARK", "EAGLE"):
+            decision = self._decide(
+                algorithm=algorithm, dcp_size=2, draft_backend="flashinfer"
+            )
+            self.assertIsNotNone(decision.placement, decision.declined)
+            self.assertEqual(decision.placement.region("full").token_replicas, 2)
+
+    def test_sharded_triton_draft_is_rejected_before_pool_build(self):
+        """A translated draft cannot use Triton's raw sharded KV read/write indices."""
+        for algorithm, backend, inherited in (
+            ("EAGLE", "triton", ("cutedsl_mla", "cutedsl_mla")),
+            ("EAGLE", None, ("triton", "triton")),
+            ("EAGLE", None, ("flashinfer", "triton")),
+            ("DFLASH", "triton", ("cutedsl_mla", "cutedsl_mla")),
+            ("DSPARK", "triton", ("cutedsl_mla", "cutedsl_mla")),
+        ):
+            with self.subTest(
+                algorithm=algorithm, backend=backend, inherited=inherited
+            ):
+                decision = self._decide(
+                    algorithm=algorithm,
+                    draft_backend=backend,
+                    target_backends=inherited,
+                    dcp_size=2,
+                )
+                with self.assertRaisesRegex(
+                    ValueError, "Triton draft attention with DCP"
+                ):
+                    kcc.KVCacheConfigurator._fused_draft_for_pool_factory(
+                        None, decision
+                    )
+
+    def test_replicated_triton_draft_keeps_unified_storage(self):
+        """HIP DSPARK consumes full token rows even when the target executes DCP."""
+        decision = self._decide(
+            algorithm="DSPARK", draft_backend="triton", dcp_size=2, is_hip=True
+        )
+        self.assertIsNotNone(decision.placement, decision.declined)
+        self.assertEqual(decision.placement.region("full").token_replicas, 2)
+        decision = self._decide(draft_backend="triton", dcp_size=1)
+        self.assertIsNotNone(decision.placement, decision.declined)
+
+    def test_host_transfers_keep_the_declared_placement(self):
+        for flags in (dict(hicache=True), dict(retraction_backup="host_pool")):
+            decision = self._decide(algorithm="DSPARK", **flags)
+            self.assertIsNotNone(decision.placement, decision.declined)
+            self.assertEqual(decision.placement.hosts(), ("full",))
 
 
 if __name__ == "__main__":
