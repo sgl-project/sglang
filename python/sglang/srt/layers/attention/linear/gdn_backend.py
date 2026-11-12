@@ -55,8 +55,15 @@ from sglang.srt.runtime_context import (
     get_schedule,
     mamba_cache_chunk_size,
 )
-from sglang.srt.utils import is_cpu, is_cuda, is_gfx95_supported, is_hip, is_npu, is_xpu
 from sglang.srt.speculative.ragged_verify import ragged_verify_compact_enabled
+from sglang.srt.utils import (
+    is_cpu,
+    is_cuda,
+    is_gfx95_supported,
+    is_hip,
+    is_npu,
+    is_xpu,
+)
 from sglang.srt.utils.device import is_pin_memory_available
 from sglang.srt.utils.log_utils import rank0_log
 
@@ -399,6 +406,8 @@ def _prefill_causal_conv1d(*args, **kwargs):
         except ValueError as exc:
             logger.debug("aiter FlyDSL prefill conv declined this batch: %s", exc)
     return causal_conv1d_fn(*args, **kwargs)
+
+
 def _validate_gdn_target_verify_layout(model_runner: ModelRunner) -> None:
     """Compact verify packs per-request verify lengths into one token list,
     but GDN target verify views a dense [batch, draft tokens] window from the
