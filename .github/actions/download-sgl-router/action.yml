@@ -37,8 +37,6 @@ runs:
         path: sgl-router-bin/sgl-router
         key: sgl-router-${{ runner.arch == 'ARM64' && 'aarch64' || 'x86_64' }}-${{ hashFiles('sgl-router/**', 'rust/**', '.github/workflows/_pr-test-sgl-router-build.yml', 'scripts/ci/utils/build_sgl_router.sh') }}
 
-    # Nightly, weekly and rerun-test have no build job; a key no main run has
-    # cached lands here.
     - name: Build sgl-router from source
       if: steps.artifact.outcome != 'success' && steps.cache.outputs.cache-hit != 'true'
       shell: bash

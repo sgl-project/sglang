@@ -41,7 +41,6 @@ jobs:
         with:
           ref: ${{ inputs.git_ref || github.sha }}
           # What the cache key hashes, plus the actions and scripts this job runs.
-          # The consumer action hashes the same globs on a full checkout.
           sparse-checkout: |
             sgl-router
             rust
@@ -94,8 +93,7 @@ jobs:
       - name: Build sgl-router
         run: bash scripts/ci/utils/build_sgl_router.sh sgl-router-bin
 
-      # Newer glibc than the oldest test image (jammy, 2.35) fails at exec:
-      # "GLIBC_2.xx not found".
+      # The oldest test image (jammy) has glibc 2.35; a newer requirement fails at exec.
       - name: Check the binary's glibc requirement
         env:
           MAX_GLIBC: '2.35'

@@ -240,7 +240,6 @@ jobs:
   # interpreter, so it can use nothing the job above builds.
   rust-ext-build-aarch64:
     needs: [check-changes, call-gate]
-    # A docs-only PR still installs sglang on gb300.
     if: *build-gate
     uses: ./.github/workflows/_pr-test-rust-ext-build.yml
     with:
@@ -251,7 +250,6 @@ jobs:
       git_ref: ${{ inputs.git_ref || '' }}
     secrets: inherit
 
-  # The router the PD disaggregation tests launch.
   sgl-router-build:
     needs: [check-changes, call-gate]
     if: *build-gate
