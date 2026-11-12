@@ -351,6 +351,58 @@ def test_cross_request_image_batching_by_backend(monkeypatch, backend):
     encoder.assert_not_called()
 
 
+def _multi_span_encoder(items):
+    return torch.cat(
+        [
+            torch.randn(
+                sum(end - start + 1 for start, end in item.offsets),
+                HIDDEN,
+                generator=torch.Generator().manual_seed(item.hash),
+            )
+            for item in items
+        ]
+    )
+
+
+@pytest.mark.parametrize("case", ["cuda", "duplicate", "hip", "evs"])
+def test_cross_request_multi_span_batching(monkeypatch, case):
+    """Multi-span items (e.g. timestamped videos) of all requests share one encoder
+    call and a repeated item is encoded once; HIP and EVS keep per-request calls."""
+    monkeypatch.setattr(mm_schedule, "_is_hip", case == "hip")
+    mm_schedule.init_mm_embedding_cache(1 << 30)
+    items = [
+        MultimodalDataItem(
+            modality=Modality.VIDEO,
+            hash=2000 + (0 if case == "duplicate" else i),
+            feature=torch.zeros(1),
+            offsets=ITEM_OFFSETS[:2],
+        )
+        for i in range(2)
+    ]
+    calls = []
+
+    class Model:
+        evs_enabled = case == "evs"
+
+        def get_video_feature(self, batch):
+            calls.append(batch)
+            return _multi_span_encoder(batch)
+
+    embedding, _ = mm_schedule._get_chunked_prefill_embedding(
+        Model().get_video_feature,
+        items,
+        [0, 1, 2],
+        [0, 0],
+        [TOTAL_LEN, TOTAL_LEN],
+        [item.offsets for item in items],
+        torch.zeros(2 * TOTAL_LEN, dtype=torch.long),
+    )
+
+    torch.testing.assert_close(embedding, _multi_span_encoder(items), rtol=0, atol=0)
+    expected = {"cuda": [items], "duplicate": [items[:1]]}
+    assert calls == expected.get(case, [[item] for item in items])
+
+
 def test_full_mismatched_cache_entry_is_reencoded(caplog):
     mm_schedule.init_mm_embedding_cache(1 << 30)
     items = _make_items()
