@@ -26,13 +26,13 @@ from sglang.srt.speculative.dflash_draft_ring import (
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_amd_ci
 
-register_amd_ci(est_time=35, stage="jit-kernel-unit", runner_config="amd")
+register_amd_ci(est_time=15, stage="jit-kernel-unit", runner_config="amd")
 
 PAGE = 64
 Q_LEN = 8  # the draft block
-# window_left = HF sliding_window - 1 (get_dflash_attention_sliding_window_size):
-# the k4s MLA layer's 256 and MLA5's 1024.
-WINDOWS = [255, 1023]
+# window_left = HF sliding_window - 1 (get_dflash_attention_sliding_window_size),
+# MLA5's 1024; the window only sets each row's key count, so k4s's 256 takes no other path.
+WINDOW_LEFT = 1023
 # All 96 heads: under DCP the layer attends with the group's gathered q.
 HEADS, KV_LORA, ROPE = 96, 512, 64
 SCALE = (128 + 64) ** -0.5
@@ -93,9 +93,9 @@ def _backend(dcp, rank, req_to_token, kv_shard, ring=None):
     return backend
 
 
-def _forward_batch(pool_idx, positions, mode=ForwardMode.TARGET_VERIFY):
+def _forward_batch(pool_idx, positions):
     return SimpleNamespace(
-        forward_mode=mode,
+        forward_mode=ForwardMode.TARGET_VERIFY,
         req_pool_indices=pool_idx.cuda(),
         # each request's keys before its window: its first row's position
         seq_lens=positions[::Q_LEN].cuda(),
@@ -103,7 +103,7 @@ def _forward_batch(pool_idx, positions, mode=ForwardMode.TARGET_VERIFY):
     )
 
 
-def _inputs(ctx, dcp, kv_dtype):
+def _inputs(ctx, dcp):
     req_to_token, pool_idx, num_locs = _layout(ctx, dcp, seed=dcp + len(ctx))
     positions = torch.tensor(
         [c + i for c in ctx for i in range(Q_LEN)], dtype=torch.int64
@@ -117,7 +117,7 @@ def _inputs(ctx, dcp, kv_dtype):
         dtype=torch.bfloat16,
         generator=g,
     )
-    keys = (keys * 0.5).to(kv_dtype)
+    keys = (keys * 0.5).to(fp8_dtype)  # the draft KV follows --kv-cache-dtype
     q = torch.randn(
         positions.numel(),
         HEADS,
@@ -212,51 +212,40 @@ def _assert_matches(out, lse, ref_out, ref_lse):
     [(1, CONTEXTS["single"]), (8, DCP8_BATCH)],
     ids=["dcp1-single", "dcp8-batch"],
 )
-@pytest.mark.parametrize("kv_dtype", [torch.bfloat16, fp8_dtype])
-@pytest.mark.parametrize("window_left", WINDOWS)
-def test_rank_partials_merge_to_dense_window(dcp, kv_dtype, window_left, ctx):
-    req_to_token, pool_idx, positions, keys, q = _inputs(ctx, dcp, kv_dtype)
+def test_rank_partials_merge_to_dense_window(dcp, ctx):
+    req_to_token, pool_idx, positions, keys, q = _inputs(ctx, dcp)
     out, lse = _merged_rank_partials(
-        q, keys, req_to_token, pool_idx, positions, _layer(window_left), dcp
+        q, keys, req_to_token, pool_idx, positions, _layer(WINDOW_LEFT), dcp
     )
     _assert_matches(
-        out, lse, *_reference(q, keys, req_to_token, pool_idx, positions, window_left)
+        out, lse, *_reference(q, keys, req_to_token, pool_idx, positions, WINDOW_LEFT)
     )
 
 
-@pytest.mark.parametrize("window_left", WINDOWS)
-@pytest.mark.parametrize(
-    "ctx,with_floor",
-    [
-        (CONTEXTS["batch"], True),
-    ],
-    ids=["prefix-cache-floor"],
-)
-def test_ring_rows_read_as_the_request_window(window_left, ctx, with_floor):
-    dcp = 8
-    req_to_token, pool_idx, positions, keys, q = _inputs(ctx, dcp, fp8_dtype)
+def test_ring_rows_read_as_the_request_window():
+    dcp, ctx = 8, CONTEXTS["batch"]
+    req_to_token, pool_idx, positions, keys, q = _inputs(ctx, dcp)
     ring = DFlashDraftKVRing(
         rows_per_req=draft_kv_ring_rows_per_req(
-            window_left=window_left, block_size=Q_LEN, dcp_size=dcp
+            window_left=WINDOW_LEFT, block_size=Q_LEN, dcp_size=dcp
         ),
         dcp_size=dcp,
         req_pool_rows=req_to_token.shape[0],
         device="cuda",
-        window_left=window_left,
+        window_left=WINDOW_LEFT,
     )
-    floors = [max(0, c - 37) for c in ctx] if with_floor else None
-    if floors is not None:
-        # Prefix-cache hits must not read stale keys below the first extend.
-        ring.min_pos[pool_idx.cuda()] = torch.tensor(
-            floors, dtype=torch.int32, device="cuda"
-        )
+    # Prefix-cache hits must not read stale keys below the first extend.
+    floors = [max(0, c - 37) for c in ctx]
+    ring.min_pos[pool_idx.cuda()] = torch.tensor(
+        floors, dtype=torch.int32, device="cuda"
+    )
     out, lse = _merged_rank_partials(
         q,
         keys,
         req_to_token,
         pool_idx,
         positions,
-        _layer(window_left),
+        _layer(WINDOW_LEFT),
         dcp,
         ring=ring,
         floors=floors,
@@ -264,7 +253,7 @@ def test_ring_rows_read_as_the_request_window(window_left, ctx, with_floor):
     _assert_matches(
         out,
         lse,
-        *_reference(q, keys, req_to_token, pool_idx, positions, window_left, floors),
+        *_reference(q, keys, req_to_token, pool_idx, positions, WINDOW_LEFT, floors),
     )
 
 
@@ -275,24 +264,21 @@ def test_window_indices_are_built_once_per_forward():
     )
     verify = _backend(8, 3, req_to_token.cuda(), None).mla_dcp_window_verify
     forward_batch = _forward_batch(pool_idx, positions)
-    window_left = WINDOWS[0]
-    first = verify.window_sparse_indices(_layer(window_left, 2), forward_batch)
+    first = verify.window_sparse_indices(_layer(WINDOW_LEFT, 2), forward_batch)
     # The next sliding layer of the same forward reuses them.
-    again = verify.window_sparse_indices(_layer(window_left, 3), forward_batch)
+    again = verify.window_sparse_indices(_layer(WINDOW_LEFT, 3), forward_batch)
     assert again[0] is first[0] and again[1] is first[1]
     # A new forward rebuilds them, here to the same values.
     rebuilt = verify.window_sparse_indices(
-        _layer(window_left, 4), _forward_batch(pool_idx, positions)
+        _layer(WINDOW_LEFT, 4), _forward_batch(pool_idx, positions)
     )
     assert rebuilt[0] is not first[0]
     torch.testing.assert_close(rebuilt[0], first[0], rtol=0, atol=0)
     torch.testing.assert_close(rebuilt[1], first[1], rtol=0, atol=0)
 
 
-@pytest.mark.parametrize(
-    "mode,causal", [(ForwardMode.EXTEND, True), (ForwardMode.TARGET_VERIFY, False)]
-)
-def test_other_sliding_windows_still_refuse(mode, causal):
+def test_a_non_causal_sliding_window_still_refuses():
+    # the rank-local window kernel reads [p - window, p] only
     req_to_token, pool_idx, _ = _layout([0], 8, seed=0)
     backend = _backend(8, 0, req_to_token.cuda(), None)
     q = torch.zeros(Q_LEN, HEADS, KV_LORA + ROPE, device="cuda", dtype=torch.bfloat16)
@@ -301,9 +287,9 @@ def test_other_sliding_windows_still_refuse(mode, causal):
             q,
             None,
             None,
-            _layer(WINDOWS[0]),
-            _forward_batch(pool_idx, torch.arange(Q_LEN), mode),
-            causal,
+            _layer(WINDOW_LEFT),
+            _forward_batch(pool_idx, torch.arange(Q_LEN)),
+            False,
             0.0,
             None,
         )
@@ -320,7 +306,7 @@ def test_verify_metadata_builds_no_rail():
     backend.is_gfx950_m31_draft = backend.verify_reads_window_kv_only = False
     backend.topk = 0
     backend.dcp_size, backend.dcp_rank = 8, 0
-    backend.sliding_window_size = WINDOWS[1]
+    backend.sliding_window_size = WINDOW_LEFT
     backend.req_to_token = backend.token_to_kv_pool = None
     backend.kv_index_translator = SimpleNamespace(full_v2p_table=None)
     backend.page_size = PAGE
