@@ -125,7 +125,7 @@ class TestKimiK3EvalMI35x(CustomTestCase):
         )
 
         try:
-            requests.get(self.base_url + "/flush_cache")
+            requests.post(self.base_url + "/flush_cache")
 
             args = SimpleNamespace(
                 num_shots=8,

@@ -96,7 +96,7 @@ def _run_gsm8k(
 
     ``metrics["score"]`` is the accuracy in [0, 1].
     """
-    requests.get(base_url + "/flush_cache")
+    requests.post(base_url + "/flush_cache")
     args = SimpleNamespace(
         base_url=base_url,
         model=model,

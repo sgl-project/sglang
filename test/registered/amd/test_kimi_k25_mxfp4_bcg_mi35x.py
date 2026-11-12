@@ -136,7 +136,7 @@ class TestKimiK25MXFP4BcgMI35x(CustomTestCase):
             env=env,
         )
         try:
-            requests.get(self.base_url + "/flush_cache")
+            requests.post(self.base_url + "/flush_cache")
             args = SimpleNamespace(
                 num_shots=8,
                 data_path=None,

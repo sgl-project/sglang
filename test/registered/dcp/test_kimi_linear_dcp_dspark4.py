@@ -186,7 +186,7 @@ class TestKimiLinearDCPDSpark4(CustomTestCase):
                 ],
                 max_new_tokens=8,
             )
-            requests.get(self.base_url + "/flush_cache", timeout=30).raise_for_status()
+            requests.post(self.base_url + "/flush_cache", timeout=30).raise_for_status()
             metrics = run_eval(
                 SimpleNamespace(
                     base_url=self.base_url,

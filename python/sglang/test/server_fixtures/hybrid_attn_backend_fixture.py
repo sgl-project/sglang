@@ -76,7 +76,7 @@ class TestHybridAttnBackendBase(CustomTestCase):
         terminate_and_kill_process_tree(cls.process, wait_timeout=60)
 
     def test_gsm8k(self):
-        requests.get(self.base_url + "/flush_cache")
+        requests.post(self.base_url + "/flush_cache")
 
         model = DEFAULT_TARGET_MODEL_EAGLE if self.speculative_decode else self.model
         args = SimpleNamespace(

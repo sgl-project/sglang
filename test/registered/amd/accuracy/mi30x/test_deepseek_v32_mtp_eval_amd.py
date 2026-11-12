@@ -93,7 +93,7 @@ class TestDeepseekV32TPMTP(CustomTestCase):
 
         Named with 'a' prefix to run first (alphabetically) to warm up the server.
         """
-        requests.get(self.base_url + "/flush_cache")
+        requests.post(self.base_url + "/flush_cache")
 
         args = SimpleNamespace(
             num_shots=20,

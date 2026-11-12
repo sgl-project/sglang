@@ -232,7 +232,7 @@ class TestDeepseekV4DSparkUnifiedKVGSM8K(CustomTestCase):
             kill_process_tree(cls.process.pid)
 
     def test_full_gsm8k_unified_kv_dspark_static(self):
-        requests.get(self.base_url + "/flush_cache")
+        requests.post(self.base_url + "/flush_cache")
         args = SimpleNamespace(
             num_shots=5,
             data_path=None,

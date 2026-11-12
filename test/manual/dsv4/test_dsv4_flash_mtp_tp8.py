@@ -77,7 +77,7 @@ class TestDSV4FlashMTPSimulatedAcc(CustomTestCase):
             kill_process_tree(cls.process.pid)
 
     def _run_one_batch(self, input_len):
-        requests.get(self.base_url + "/flush_cache")
+        requests.post(self.base_url + "/flush_cache")
         server_args = ServerArgs(model_path=DSV4_FLASH_MODEL_PATH)
         bench_args = OneBatchBenchArgs(
             run_name=f"dsv4_flash_simacc_isl{input_len}",

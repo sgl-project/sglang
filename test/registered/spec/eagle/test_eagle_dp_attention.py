@@ -70,7 +70,7 @@ class TestEAGLE3EngineDPAttention(CustomTestCase):
 
     def test_a_gsm8k(self):
         """Test GSM8K evaluation - append 'a' to run first alphabetically"""
-        requests.get(self.base_url + "/flush_cache")
+        requests.post(self.base_url + "/flush_cache")
 
         args = SimpleNamespace(
             base_url=self.base_url,

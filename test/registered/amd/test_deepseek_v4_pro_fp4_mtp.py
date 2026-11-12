@@ -109,7 +109,7 @@ class TestDeepseekV4ProFp4MTP(CustomTestCase):
 
     def test_a_gsm8k(self):
         # `a` prefix to run first (alphabetically) and warm up the server.
-        requests.get(self.base_url + "/flush_cache")
+        requests.post(self.base_url + "/flush_cache")
 
         args = SimpleNamespace(
             num_shots=8,

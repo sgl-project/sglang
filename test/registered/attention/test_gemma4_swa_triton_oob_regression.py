@@ -95,7 +95,7 @@ class TestGemma4SwaTritonOobRegression(CustomTestCase):
 
     def test_no_ima_under_concurrent_load(self):
         try:
-            requests.get(self.base_url + "/flush_cache", timeout=30)
+            requests.post(self.base_url + "/flush_cache", timeout=30)
         except Exception:
             pass
 

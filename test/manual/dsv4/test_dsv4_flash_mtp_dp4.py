@@ -125,7 +125,7 @@ class DSV4FlashMTPServerBase(CustomTestCase):
 class TestDSV4FlashMTPBasic(DSV4FlashMTPServerBase):
     def test_gsm8k(self):
         """Accuracy + spec path full forward."""
-        requests.get(self.base_url + "/flush_cache")
+        requests.post(self.base_url + "/flush_cache")
         args = SimpleNamespace(
             eval_name="gsm8k",
             num_examples=200,
@@ -140,7 +140,7 @@ class TestDSV4FlashMTPBasic(DSV4FlashMTPServerBase):
 
     def test_max_token_one(self):
         """Degenerate spec step (still cuda-graph captured)."""
-        requests.get(self.base_url + "/flush_cache")
+        requests.post(self.base_url + "/flush_cache")
         args = SimpleNamespace(
             eval_name="gsm8k",
             num_examples=100,

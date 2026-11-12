@@ -319,7 +319,7 @@ class TestTraceServer(CustomTestCase):
     ):
         """Helper to send a request and wait for spans."""
         if trace_level is not None:
-            response = requests.get(
+            response = requests.post(
                 f"{DEFAULT_URL_FOR_TEST}/set_trace_level?level={trace_level}"
             )
             self.assertEqual(response.status_code, 200)
@@ -401,7 +401,7 @@ class TestTraceServer(CustomTestCase):
 
     def test_batch_request(self):
         """Test tracing with batch requests (multiple prompts in one request)."""
-        response = requests.get(f"{DEFAULT_URL_FOR_TEST}/set_trace_level?level=1")
+        response = requests.post(f"{DEFAULT_URL_FOR_TEST}/set_trace_level?level=1")
         self.assertEqual(response.status_code, 200)
         self.collector.clear()
 
@@ -440,7 +440,7 @@ class TestTraceServer(CustomTestCase):
 
     def test_parallel_sample(self):
         """Test tracing with parallel sampling (n > 1 in sampling_params)."""
-        response = requests.get(f"{DEFAULT_URL_FOR_TEST}/set_trace_level?level=1")
+        response = requests.post(f"{DEFAULT_URL_FOR_TEST}/set_trace_level?level=1")
         self.assertEqual(response.status_code, 200)
         self.collector.clear()
 

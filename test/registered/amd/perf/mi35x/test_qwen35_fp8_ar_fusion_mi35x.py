@@ -177,7 +177,7 @@ class TestQwen35Fp8ArFusionMI35x(CustomTestCase):
             env=env,
         )
         try:
-            requests.get(base_url + "/flush_cache", timeout=10)
+            requests.post(base_url + "/flush_cache", timeout=10)
             metrics = self._run_gsm8k(base_url)
             print(f"[{variant.variant}] {metrics=}")
             return metrics

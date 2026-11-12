@@ -1057,7 +1057,7 @@ def _refuse_decision_layout(obj: EmbeddingReqInput) -> None:
         raise ValueError("decision_layout is set only by /v1/systemone")
 
 
-@app.api_route("/flush_cache", methods=["GET", "POST"])
+@app.post("/flush_cache")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def flush_cache(timeout: float = Query(0.0, ge=0.0)):
     """Flush the radix cache."""
@@ -1253,7 +1253,7 @@ async def get_hicache_l3_cache_layout():
     return merged or disabled_l3_layout("No scheduler layout replies")
 
 
-@app.api_route("/start_profile", methods=["GET", "POST"])
+@app.post("/start_profile")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def start_profile_async(obj: Annotated[Optional[ProfileReq], Body()] = None):
     """Start profiling."""
@@ -1264,7 +1264,7 @@ async def start_profile_async(obj: Annotated[Optional[ProfileReq], Body()] = Non
     )
 
 
-@app.api_route("/stop_profile", methods=["GET", "POST"])
+@app.post("/stop_profile")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def stop_profile_async():
     """Stop profiling."""
@@ -1275,7 +1275,7 @@ async def stop_profile_async():
     )
 
 
-@app.api_route("/set_trace_level", methods=["GET", "POST"])
+@app.post("/set_trace_level")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 def set_trace_level(level: int = Query(..., ge=0)):
     set_global_trace_level(level)
@@ -1286,7 +1286,7 @@ def set_trace_level(level: int = Query(..., ge=0)):
     )
 
 
-@app.api_route("/freeze_gc", methods=["GET", "POST"])
+@app.post("/freeze_gc")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def freeze_gc_async():
     """
@@ -1299,7 +1299,7 @@ async def freeze_gc_async():
     )
 
 
-@app.api_route("/start_expert_distribution_record", methods=["GET", "POST"])
+@app.post("/start_expert_distribution_record")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def start_expert_distribution_record_async():
     """Start recording the expert distribution. Clear the previous record if any."""
@@ -1310,7 +1310,7 @@ async def start_expert_distribution_record_async():
     )
 
 
-@app.api_route("/stop_expert_distribution_record", methods=["GET", "POST"])
+@app.post("/stop_expert_distribution_record")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def stop_expert_distribution_record_async():
     """Stop recording the expert distribution."""
@@ -1321,7 +1321,7 @@ async def stop_expert_distribution_record_async():
     )
 
 
-@app.api_route("/dump_expert_distribution_record", methods=["GET", "POST"])
+@app.post("/dump_expert_distribution_record")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def dump_expert_distribution_record_async():
     """Dump expert distribution record."""
@@ -1625,7 +1625,7 @@ async def get_weights_by_name(
         return _create_error_response(e)
 
 
-@app.api_route("/release_memory_occupation", methods=["GET", "POST"])
+@app.post("/release_memory_occupation")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def release_memory_occupation(
     obj: Annotated[ReleaseMemoryOccupationReqInput, Body()], request: Request
@@ -1637,7 +1637,7 @@ async def release_memory_occupation(
         return _create_error_response(e)
 
 
-@app.api_route("/resume_memory_occupation", methods=["GET", "POST"])
+@app.post("/resume_memory_occupation")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def resume_memory_occupation(
     obj: Annotated[ResumeMemoryOccupationReqInput, Body()], request: Request
@@ -1671,7 +1671,7 @@ async def check_weights(
     return ORJSONResponse(body, status_code=200 if success else HTTPStatus.BAD_REQUEST)
 
 
-@app.api_route("/slow_down", methods=["GET", "POST"])
+@app.post("/slow_down")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def slow_down(obj: Annotated[SlowDownReqInput, Body()], request: Request):
     """Slow down the system deliberately. Only for testing. Example scenario:
@@ -1737,7 +1737,7 @@ async def unload_lora_adapter(
     return ORJSONResponse(msgspec_to_builtins(result), status_code=status_code)
 
 
-@app.api_route("/open_session", methods=["GET", "POST"])
+@app.post("/open_session")
 async def open_session(obj: Annotated[OpenSessionReqInput, Body()], request: Request):
     """Open a session, and return its unique session id."""
     try:
@@ -1751,7 +1751,7 @@ async def open_session(obj: Annotated[OpenSessionReqInput, Body()], request: Req
         return _create_error_response(e)
 
 
-@app.api_route("/close_session", methods=["GET", "POST"])
+@app.post("/close_session")
 async def close_session(obj: Annotated[CloseSessionReqInput, Body()], request: Request):
     """Close the session."""
     try:
@@ -1761,7 +1761,7 @@ async def close_session(obj: Annotated[CloseSessionReqInput, Body()], request: R
         return _create_error_response(e)
 
 
-@app.api_route("/configure_logging", methods=["GET", "POST"])
+@app.post("/configure_logging")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def configure_logging(
     obj: Annotated[ConfigureLoggingReq, Body()], request: Request

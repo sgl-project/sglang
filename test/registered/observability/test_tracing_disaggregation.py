@@ -189,7 +189,7 @@ class TestTraceDisaggregation(CustomTestCase):
     def test_disaggregation_transfer_spans(self):
         """Test that disaggregation produces PREFILL_TRANSFER_KV_CACHE and DECODE_TRANSFERRED spans."""
         # Set trace level
-        response = requests.get(f"{self.prefill_url}/set_trace_level?level=2")
+        response = requests.post(f"{self.prefill_url}/set_trace_level?level=2")
         self.assertEqual(response.status_code, 200)
         self.collector.clear()
 

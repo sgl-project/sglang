@@ -184,7 +184,7 @@ class GSM8KMixin:
     gsm8k_top_p: Optional[float] = None
 
     def test_gsm8k(self):
-        requests.get(self.base_url + "/flush_cache")
+        requests.post(self.base_url + "/flush_cache")
         threshold = self.gsm8k_score_threshold
         if threshold != threshold:  # canonical unset (NaN) -> legacy alias
             threshold = self.gsm8k_accuracy_thres
