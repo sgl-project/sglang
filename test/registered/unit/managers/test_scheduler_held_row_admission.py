@@ -114,7 +114,9 @@ class TestHeldRowAdmission(CustomTestCase):
         s.req_to_token_pool = SimpleNamespace(
             available_size=lambda: NUM_ROWS - len(running) - 1
         )
-        s.beam_coordinator = SimpleNamespace(pending_member_rows=lambda batch: 0)
+        s.beam_coordinator = SimpleNamespace(
+            pending_member_rows=lambda batch: 0, pending_member_rows_of=lambda reqs: 0
+        )
         s.running_reqs = KeyedReqList(ListKind.DECODING)
         s.prefill_launched_reqs = KeyedReqList(ListKind.PREFILL_LAUNCHED)
         return s
