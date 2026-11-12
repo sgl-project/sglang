@@ -132,6 +132,7 @@ if TYPE_CHECKING:
     SGLANG_USE_ROCM_VAE_CONV2D: bool = False
     SGLANG_USE_ROCM_VAE_CONV2D_BF16: bool = False
     SGLANG_USE_ROCM_AITER_TGEMM: bool = False
+    SGLANG_USE_ROCM_SPLITK_GEMM: int = 0
 
 
 def get_default_cache_root() -> str:
@@ -534,6 +535,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ROCm: route unquantized bf16/fp16 linears through aiter tgemm, which picks
     # the backend per (M, N, K) from aiter's bf16_tuned_gemm CSVs
     "SGLANG_USE_ROCM_AITER_TGEMM": _lazy_bool("SGLANG_USE_ROCM_AITER_TGEMM"),
+    # ROCm gfx1151: split the K dimension of a large-K bf16 linear into N
+    # chunks and accumulate them, which avoids the slow rocBLAS kernel this
+    # arch picks above K ~ 8192. 0 disables, N > 1 enables N chunks.
+    "SGLANG_USE_ROCM_SPLITK_GEMM": _lazy_int("SGLANG_USE_ROCM_SPLITK_GEMM", 0),
 }
 
 # Add cache-dit Secondary Transformer Env Vars via programmatic generation to reduce duplication
