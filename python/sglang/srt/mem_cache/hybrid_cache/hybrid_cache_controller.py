@@ -354,6 +354,7 @@ class HybridCacheController(BaseHiCacheController):
         enable_storage_metrics: bool = False,
         host_memory_mode: str = "cache",
         kv_storage: Optional[KVStorage] = None,
+        mirror_topk_rows: bool = True,
     ):
         startup_storage_backend = storage_backend
         self.is_kv_sharded = isinstance(
@@ -387,6 +388,7 @@ class HybridCacheController(BaseHiCacheController):
             enable_storage_metrics=enable_storage_metrics,
             host_memory_mode=host_memory_mode,
             kv_storage=kv_storage,
+            mirror_topk_rows=mirror_topk_rows,
         )
         # Hybrid transfer IDs span every component pool, including holes for
         # uncached layers that the anchor pool alone cannot describe.

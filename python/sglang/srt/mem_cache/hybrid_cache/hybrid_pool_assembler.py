@@ -277,6 +277,7 @@ def _build_cache_controller(
     storage_backend_extra_config: Optional[dict],
     enable_storage_metrics: bool,
     kv_storage=None,
+    mirror_topk_rows: bool = True,
 ) -> HybridCacheController:
     memory = get_memory()
     return HybridCacheController(
@@ -298,6 +299,7 @@ def _build_cache_controller(
         enable_storage_metrics=enable_storage_metrics,
         host_memory_mode=memory.hicache_host_memory_mode,
         kv_storage=kv_storage,
+        mirror_topk_rows=mirror_topk_rows,
     )
 
 
@@ -1552,6 +1554,8 @@ def build_unified_host_stack(
         storage_backend_extra_config=storage_backend_extra_config,
         enable_storage_metrics=enable_storage_metrics,
         kv_storage=storage,
+        # A decode offload stack (no cache) never loads host slots back.
+        mirror_topk_rows=cache is not None,
     )
     return StackBuildResult(
         host_pool_group=host_pool_group,

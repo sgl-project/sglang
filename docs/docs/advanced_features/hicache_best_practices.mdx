@@ -90,6 +90,10 @@ Guidelines:
 --hicache-storage-prefetch-policy timeout
 ```
 
+### Returning Routed Experts
+
+With `--enable-return-routed-experts`, the routed-experts rows of a cached prefix follow its KV cache through the host tier. They are not written to storage backends: rows of prefix pages loaded from the storage tier are stale, and the server logs a warning when a storage backend is attached.
+
 ### Integration with PD Disaggregation
 
 HiCache works seamlessly with PD Disaggregation. You can choose between two configurations:
