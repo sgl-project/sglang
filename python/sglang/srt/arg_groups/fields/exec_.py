@@ -170,7 +170,10 @@ class ExecFeatures(msgspec.Struct):
         "EAGLE3 defaults to the model's EAGLE3 layers.",
     ] = None
     enable_return_routed_experts: A[
-        bool, "Enable returning routed experts of each layer with responses."
+        bool,
+        "Enable returning routed experts of each layer with responses. With "
+        "pipeline parallelism each hop also carries the routed experts of the "
+        "layers run so far, up to num_layers * top-k int32 ids per token.",
     ] = False
     enable_return_indexer_topk: A[
         bool,
@@ -317,7 +320,8 @@ class ExecKernel(msgspec.Struct):
     dsa_prefill_backend: A[
         Optional[str],
         Arg(
-            help="DSA (DeepSeek Sparse Attention) prefill backend. If not specified, auto-detects based on hardware and kv_cache_dtype.",
+            help="DSA (DeepSeek Sparse Attention) prefill backend. If not specified, auto-detects based on hardware and kv_cache_dtype. "
+            "'prims_ts': FlashInfer Prims-TS sparse MLA (SM100/SM103/SM107, fp8_e4m3 KV).",
             choices=[
                 "flashmla_sparse",
                 "flashmla_sparse_q8",
@@ -330,6 +334,7 @@ class ExecKernel(msgspec.Struct):
                 "triton",
                 "aiter",
                 "trtllm",
+                "prims_ts",
                 "intel_xpu",
             ],
             resolvable=True,
@@ -367,7 +372,8 @@ class ExecKernel(msgspec.Struct):
     dsa_decode_backend: A[
         Optional[str],
         Arg(
-            help="DSA (DeepSeek Sparse Attention) decode backend. If not specified, auto-detects based on hardware and kv_cache_dtype.",
+            help="DSA (DeepSeek Sparse Attention) decode backend. If not specified, auto-detects based on hardware and kv_cache_dtype. "
+            "'prims_ts': FlashInfer Prims-TS sparse MLA (SM100/SM103/SM107, fp8_e4m3 KV).",
             choices=[
                 "flashmla_sparse",
                 "flashmla_sparse_q8",
@@ -379,6 +385,7 @@ class ExecKernel(msgspec.Struct):
                 "triton",
                 "aiter",
                 "trtllm",
+                "prims_ts",
                 "intel_xpu",
             ],
             resolvable=True,
@@ -1062,8 +1069,19 @@ class ExecMoe(msgspec.Struct):
         bool,
         "Let Paged Experts write to disk under $SGLANG_CACHE_DIR/paged_experts: each MoE "
         "layer's experts are kept there (about the size of the experts), so that later starts "
-        "read them instead of loading and repacking them. Requires --enable-paged-experts.",
+        "read them instead of loading and repacking them, and experts that do not fit the "
+        "host budget (--paged-experts-host-memory-gb) are served from there. Requires "
+        "--enable-paged-experts.",
     ] = False
+    paged_experts_host_memory_gb: A[
+        Optional[float],
+        "Pinned host memory (GiB) for the experts of all MoE layers with --enable-paged-experts. "
+        "When not every expert fits, each layer keeps only some experts in pinned memory and "
+        "reads the others from its file under $SGLANG_CACHE_DIR/paged_experts, which needs "
+        "--paged-experts-enable-disk. Unset: every expert is pinned; with "
+        "--paged-experts-enable-disk, the experts that do not fit what is available at "
+        "startup within the container's memory limit go to disk, keeping 10 GiB free.",
+    ] = None
 
     # -------------------------------------------------------------------------
     # Ktransformers/AMX expert parallelism

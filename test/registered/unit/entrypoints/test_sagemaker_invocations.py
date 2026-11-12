@@ -7,6 +7,8 @@ from fastapi.responses import StreamingResponse
 from fastapi.testclient import TestClient
 
 from sglang.srt.entrypoints import http_server
+from sglang.srt.runtime_context import publish, reset_context
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -35,6 +37,8 @@ class _RecordingHandler:
 
 class TestSageMakerInvocations(CustomTestCase):
     def setUp(self):
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+        self.addCleanup(reset_context)
         state = http_server.app.state
         self._saved = {name: getattr(state, name, None) for name in _HANDLERS}
         self.handlers = {name: _RecordingHandler(name) for name in _HANDLERS}

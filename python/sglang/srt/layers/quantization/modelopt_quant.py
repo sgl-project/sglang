@@ -827,6 +827,7 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
         self.fp8_block_config = fp8_block_config
         self.nvfp4_config = nvfp4_config
         self.nvfp4a16_config = nvfp4a16_config
+        self.block_fp8_moe_online_config: Optional[QuantizationConfig] = None
 
     @classmethod
     def override_quantization_method(cls, hf_quant_config, user_quant):
@@ -1043,6 +1044,25 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
     def resolve_quant_algo(self, prefix: str) -> Optional[str]:
         return self._resolve_quant_algo(prefix)
 
+    def convert_block_fp8_experts_to_nvfp4(self) -> None:
+        """Quantize block-FP8 MoE experts to NVFP4 while they load.
+
+        An explicit `modelopt_fp4` draft does this for the BF16 MTP experts of
+        NVFP4 checkpoints; MIXED_PRECISION exports that ship block-FP8 MTP
+        experts get the same NVFP4 draft experts.
+        """
+        from sglang.srt.layers.quantization.nvfp4_online import (
+            make_modelopt_fp4_online_config_from_fp8,
+        )
+
+        self.block_fp8_moe_online_config = make_modelopt_fp4_online_config_from_fp8(
+            {
+                "quant_method": "fp8",
+                "weight_block_size": self.fp8_block_config.weight_block_size,
+                "packed_modules_mapping": self.packed_modules_mapping,
+            }
+        )
+
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional[QuantizeMethodBase]:
@@ -1094,6 +1114,10 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
             if quant_algo == "MXFP8":
                 return Fp8MoEMethod(self.mxfp8_config)
             if quant_algo in _BLOCK_FP8_ALGOS:
+                if self.block_fp8_moe_online_config is not None:
+                    return self.block_fp8_moe_online_config.get_quant_method(
+                        layer, prefix
+                    )
                 return Fp8MoEMethod(self.fp8_block_config)
             if quant_algo == "NVFP4":
                 return ModelOptNvFp4FusedMoEMethod(self.nvfp4_config)

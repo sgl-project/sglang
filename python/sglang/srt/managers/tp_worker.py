@@ -64,6 +64,10 @@ from sglang.srt.runtime_context import (
     get_spec,
 )
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.state_capturer.routed_experts import (
+    PP_ROUTED_EXPERTS_KEY,
+    merge_relayed_routed_experts,
+)
 from sglang.srt.utils import MultiprocessingSerializer, broadcast_pyobj, set_random_seed
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
@@ -676,6 +680,14 @@ class TpModelWorker(BaseTpWorker):
         if self.is_dllm():
             return self._forward_batch_generation_dllm(forward_batch, batch)
 
+        # Taken out before the forward: the model and its CUDA graphs only
+        # handle the proxy keys they allocate buffers for.
+        relayed_routed_experts = (
+            None
+            if pp_proxy_tensors is None
+            else pp_proxy_tensors.tensors.pop(PP_ROUTED_EXPERTS_KEY, None)
+        )
+
         if self.pp_group.is_last_rank:
             out = self.model_runner.forward(
                 forward_batch,
@@ -701,7 +713,9 @@ class TpModelWorker(BaseTpWorker):
                 logits_output=logits_output,
                 can_run_cuda_graph=can_run_cuda_graph,
                 expert_distribution_metrics=out.expert_distribution_metrics,
-                routed_experts_output=out.routed_experts_output,
+                routed_experts_output=merge_relayed_routed_experts(
+                    output=out.routed_experts_output, relayed=relayed_routed_experts
+                ),
                 indexer_topk_output=out.indexer_topk_output,
                 iteration_ids=(
                     None
@@ -785,8 +799,14 @@ class TpModelWorker(BaseTpWorker):
                 pp_proxy_tensors=pp_proxy_tensors,
             )
             pp_proxy_tensors, can_run_cuda_graph = out.logits_output, out.can_run_graph
+            routed_experts_output = merge_relayed_routed_experts(
+                output=out.routed_experts_output, relayed=relayed_routed_experts
+            )
+            if routed_experts_output is not None:
+                pp_proxy_tensors[PP_ROUTED_EXPERTS_KEY] = routed_experts_output.topk
             return GenerationBatchResult(
                 pp_hidden_states_proxy_tensors=pp_proxy_tensors,
                 can_run_cuda_graph=can_run_cuda_graph,
                 expert_distribution_metrics=out.expert_distribution_metrics,
+                routed_experts_output=routed_experts_output,
             )

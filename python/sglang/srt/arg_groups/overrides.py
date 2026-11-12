@@ -535,13 +535,26 @@ def _dsa_kv_cache_dtype_default(view: Any) -> dict:
         checkpoint_allows_fp8 = getattr(
             get_dsa_config(hf_config), "dsa_fp8_kv_cache", True
         )
+        # gfx950 reports capability 9.x, but its triton/tilelang DSA kernels
+        # take fp8 KV and the gfx950-tuned sparse-MLA path requires it. The raw
+        # fp8 MLA layout is only read back on the aiter path (forward_mha.py).
+        hip_gfx95_fp8 = (
+            get_platform().is_hip
+            and is_gfx95_supported()
+            and envs.SGLANG_USE_AITER.get()
+            and view.dsa_prefill_backend in (None, "triton", "tilelang")
+            and view.dsa_decode_backend in (None, "triton", "tilelang")
+        )
         kv_cache_dtype = (
             "fp8_e4m3"
-            if major >= 10 and not has_attention_sinks and checkpoint_allows_fp8
+            if (major >= 10 or hip_gfx95_fp8)
+            and not has_attention_sinks
+            and checkpoint_allows_fp8
             else "bfloat16"
         )
         logger.warning(
-            f"Setting KV cache dtype to {kv_cache_dtype} for DeepSeek DSA on SM{major} device."
+            f"Setting KV cache dtype to {kv_cache_dtype} for DeepSeek DSA "
+            f"(device capability major {major})."
         )
     if kv_cache_dtype == "bf16":
         kv_cache_dtype = "bfloat16"
@@ -566,19 +579,27 @@ def _check_dsa_backend_constraints(
     """Validate DSA backend / platform / kv-cache-dtype constraints."""
     chosen = {prefill_backend, decode_backend}
 
-    # A TRTLLM consumer makes the shared pool store raw FP8 rows, which the
+    # A TRTLLM or Prims-TS consumer makes the shared pool store raw FP8 rows, which the
     # other backend's scaled-FP8 / BF16 kernels cannot read.
     if (
         not hip
         and kv_cache_dtype == "fp8_e4m3"
         and disaggregation_mode == "null"
-        and (prefill_backend == "trtllm") != (decode_backend == "trtllm")
+        and (prefill_backend in ("trtllm", "prims_ts"))
+        != (decode_backend in ("trtllm", "prims_ts"))
     ):
         raise ValueError(
             f"FP8 KV with --dsa-prefill-backend {prefill_backend!r} and "
-            f"--dsa-decode-backend {decode_backend!r} is unsupported: trtllm "
-            "stores raw FP8 rows that the other backend cannot read. Use trtllm "
-            "for both, or --kv-cache-dtype bfloat16."
+            f"--dsa-decode-backend {decode_backend!r} is unsupported: trtllm and "
+            "prims_ts store raw FP8 rows that the other backend cannot read. "
+            "Use raw FP8 backends for both phases, or choose BF16-compatible "
+            "backends with --kv-cache-dtype bfloat16."
+        )
+
+    # The SM100/SM103/SM107 check is check_prims_ts_sparse_mla_support, at backend init.
+    if "prims_ts" in chosen and (hip or kv_cache_dtype != "fp8_e4m3"):
+        raise ValueError(
+            "The prims_ts DSA backend needs CUDA and --kv-cache-dtype fp8_e4m3."
         )
 
     rocm_only = {"triton"} & chosen
@@ -791,7 +812,7 @@ def _pin_dsa_backends(
 
 # Matches the reference fp8_ds_mla cache; trtllm's 576 B layout does not.
 _KIMI_K31_DSA_BACKEND = "flashmla_kv"
-_KIMI_K31_DSA_BACKENDS = ("flashmla_kv", "trtllm")
+_KIMI_K31_DSA_BACKENDS = ("flashmla_kv", "trtllm", "prims_ts")
 # ROCm: the Triton kernels dequantize the same fp8_ds_mla rows and run BF16 dots.
 _KIMI_K31_DSA_BACKEND_HIP = "triton"
 
@@ -809,9 +830,11 @@ def _kimi_k31_kv_cache_dtype(view: Any) -> dict:
 
 
 def _kimi_k31_dsa_backends(view: Any) -> dict:
-    if view.enable_hisparse:
-        raise ValueError("Kimi-K3.1 does not support --enable-hisparse yet.")
     if get_platform().is_hip:
+        if view.enable_hisparse:
+            raise ValueError(
+                "Kimi-K3.1 does not support --enable-hisparse on ROCm yet."
+            )
         backend = _KIMI_K31_DSA_BACKEND_HIP
         return _pin_dsa_backends(
             view,
@@ -835,16 +858,23 @@ def _kimi_k31_dsa_backends(view: Any) -> dict:
     if len(chosen) > 1:
         raise ValueError(
             "Kimi-K3.1 needs the same --dsa-prefill-backend and "
-            "--dsa-decode-backend (flashmla_kv and trtllm use different KV "
-            f"layouts); got {view.dsa_prefill_backend!r} and "
+            "--dsa-decode-backend (flashmla_kv and trtllm / prims_ts use "
+            f"different KV layouts); got {view.dsa_prefill_backend!r} and "
             f"{view.dsa_decode_backend!r}."
         )
     backend = chosen.pop() if chosen else _KIMI_K31_DSA_BACKEND
-    if backend == "trtllm":
+    if backend in ("trtllm", "prims_ts"):
         logger.warning(
-            "Kimi-K3.1 trtllm DSA uses FP8 q and an unscaled FP8 KV cache, not "
-            "the reference fp8_ds_mla numerics. PD prefill and decode must both "
-            "use trtllm."
+            f"Kimi-K3.1 {backend} DSA uses FP8 q and an unscaled FP8 KV cache, not "
+            "the reference fp8_ds_mla numerics. PD prefill and decode servers must "
+            "both use a raw-FP8-KV backend (trtllm or prims_ts)."
+        )
+    if view.enable_hisparse and backend != _KIMI_K31_DSA_BACKEND:
+        # The HiSparse FP8 backend allow-list (hisparse_hook) admits only
+        # flashmla_kv among the K3.1 backends.
+        raise ValueError(
+            f"Kimi-K3.1 HiSparse requires DSA backend {_KIMI_K31_DSA_BACKEND!r}; "
+            f"got {backend!r}."
         )
     declared = {f: backend for f in fields if getattr(view, f) is None}
     logger.warning(
