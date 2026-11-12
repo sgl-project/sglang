@@ -38,7 +38,6 @@ from transformers import PretrainedConfig
 
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
-from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layer_boundary import (
@@ -73,6 +72,8 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.layers.utils.layer_list import make_pp_layers
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -85,7 +86,6 @@ from sglang.srt.model_executor.cuda_graph_config import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_exec, get_parallel
-from sglang.srt.utils import add_prefix, make_pp_layers
 
 _XLLM_SOURCE_ROUTER_PARTITIONS_CONFIG_KEY = "xllm_source_router_gemm_partitions"
 _XLLM_SOURCE_ROUTER_PARTITIONS_MISSING = object()
@@ -942,6 +942,10 @@ class XllmSparseMoeBlock(nn.Module):
             prefix=add_prefix("experts", prefix),
             routing_method_type=RoutingMethodType.RenormalizeNaive,
         )
+        self.topk.bind_runner_backend(
+            self.experts.runner_backend,
+            routing_method_type=self.experts.routing_method_type,
+        )
 
         # Shared expert (no gating — output added directly)
         num_shared_experts = getattr(config, "num_shared_experts", 0)
@@ -996,10 +1000,6 @@ class XllmSparseMoeBlock(nn.Module):
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
-                num_token_non_padded=forward_batch.moe_num_token_non_padded(),
-                expert_location_dispatch_info=(
-                    ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
-                ),
             )
             # Apply router scaling factor after renormalization
             if self.router_scaling_factor != 1.0:
@@ -1010,7 +1010,7 @@ class XllmSparseMoeBlock(nn.Module):
                     topk_output.topk_weights = scaled_weights
         else:
             topk_output = self.topk.empty_topk_output(
-                hidden_states.device, layer_id=self.layer_id
+                hidden_states.device,
             )
         final_hidden_states = self.experts(
             hidden_states=hidden_states,
@@ -1047,7 +1047,7 @@ class XllmSparseMoeBlock(nn.Module):
         if hidden_states.shape[0] == 0:
             shared_output = None
             topk_output = self.topk.empty_topk_output(
-                hidden_states.device, layer_id=self.layer_id
+                hidden_states.device,
             )
             final_hidden_states = self.experts(hidden_states, topk_output)
         else:

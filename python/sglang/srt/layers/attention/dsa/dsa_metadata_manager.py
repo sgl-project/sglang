@@ -6,12 +6,11 @@ import logging
 from functools import partial
 from typing import TYPE_CHECKING
 
-from sglang.kernels.ops.attention.dsa_metadata import (
+from sglang.kernels.ops.attention.dsa.metadata import (
     fused_dsa_decode_metadata,
     fused_dsa_draft_extend_metadata,
     fused_dsa_target_verify_metadata,
 )
-from sglang.srt.environ import envs
 from sglang.srt.utils import is_cuda, is_hip
 
 if TYPE_CHECKING:
@@ -22,7 +21,7 @@ if TYPE_CHECKING:
         DeepseekSparseAttnBackend,
         DSAMetadata,
     )
-    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+    from sglang.srt.model_executor.forward_mode import ForwardMode
 
 _is_hip = is_hip()
 
@@ -39,25 +38,24 @@ class DSAMetadataManagementMixin:
     experimental_kpool_metadata_fusion = False
 
     def _init_kpool_metadata_fusion(self):
-        requested = envs.SGLANG_EXPERIMENTAL_DSA_KPOOL_METADATA_FUSION.get()
         supported = kpool_metadata_fusion_supported(
             self.dsa_index_kpool, self.physical_page_size, self.dsa_index_topk
         )
         self.experimental_kpool_metadata_fusion = (
-            requested and supported and is_cuda() and not is_hip()
+            supported and is_cuda() and not is_hip()
         )
         self._fused_decode_metadata = fused_dsa_decode_metadata
         self._fused_verify_metadata = fused_dsa_target_verify_metadata
         self._fused_draft_extend_metadata = fused_dsa_draft_extend_metadata
         if self.experimental_kpool_metadata_fusion:
-            from sglang.kernels.ops.attention.dsa_kpool_metadata.decode import (
-                fused_dsa_decode_metadata as decode,
+            from sglang.kernels.ops.attention.dsa.kpool_metadata.decode import (
+                fused_dsa_decode_metadata_kpool as decode,
             )
-            from sglang.kernels.ops.attention.dsa_kpool_metadata.draft_extend import (
-                fused_dsa_draft_extend_metadata as draft_extend,
+            from sglang.kernels.ops.attention.dsa.kpool_metadata.draft_extend import (
+                fused_dsa_draft_extend_metadata_kpool as draft_extend,
             )
-            from sglang.kernels.ops.attention.dsa_kpool_metadata.verify import (
-                fused_dsa_target_verify_metadata as verify,
+            from sglang.kernels.ops.attention.dsa.kpool_metadata.verify import (
+                fused_dsa_target_verify_metadata_kpool as verify,
             )
 
             self._fused_decode_metadata = partial(
@@ -72,7 +70,7 @@ class DSAMetadataManagementMixin:
             logger.info(
                 "DSA KPool metadata fusion enabled (pool=%d)", self.dsa_index_kpool
             )
-        elif requested and self.dsa_index_kpool > 1:
+        elif self.dsa_index_kpool > 1:
             logger.warning(
                 "DSA KPool metadata fusion unsupported for this platform/geometry; retaining ordinary metadata"
             )
@@ -84,7 +82,7 @@ class DSAMetadataManagementMixin:
         # Use fused CUDA kernel for all copy operations
         if not _is_hip:
             try:
-                from sglang.kernels.ops.attention.fused_metadata_copy import (
+                from sglang.kernels.ops.attention.dsa.fused_metadata_copy import (
                     fused_metadata_copy_cuda,
                 )
 

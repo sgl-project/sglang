@@ -12,8 +12,8 @@ from sglang.srt.configs.model_config import (
 from sglang.srt.constants import MIS_DELIMITER_TOKEN_ID
 from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
+from sglang.srt.multimodal.media_io import ImageData
 from sglang.srt.runtime_context import get_exec, get_memory, get_schedule, get_serving
-from sglang.srt.utils import ImageData
 
 logger = logging.getLogger(__name__)
 

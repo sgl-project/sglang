@@ -8,7 +8,6 @@ from sglang.kernels.registry import register_kernel
 from sglang.kernels.selector import get_kernel
 from sglang.kernels.spec import (
     CUDA_ONLY,
-    CapabilityRequirement,
     KernelBackend,
     KernelSpec,
 )
@@ -106,12 +105,13 @@ _TRITON_KERNELS = [
     ("fp8_kernel", "dequant_group_fp8_to_bf16"),
     ("fp8_kernel", "per_tensor_quant_mla_fp8"),
     ("fp8_kernel", "per_token_group_quant_mla_deep_gemm_masked_fp8"),
+    ("fp8_kernel", "block_quant_fp8"),
     ("int8_kernel", "per_token_quant_int8"),
     ("int8_kernel", "per_token_group_quant_int8"),
     ("awq_triton", "awq_dequantize_triton"),
+    ("rocm_upscale", "upscale"),
+    ("rocm_upscale", "upscale_mxfp4"),
     ("mxfp8_amd_gfx95", "mxfp8_e4m3_quantize"),
-    ("mxfp8_swizzled_triton", "swiglu_oai_mxfp8"),
-    ("mxfp8_swizzled_triton", "swiglu_oai_mxfp8_deepgemm"),
 ]
 for _mod, _fn in _TRITON_KERNELS:
     register_kernel(
@@ -125,23 +125,38 @@ del _mod, _fn
 
 register_kernel(
     KernelSpec(
-        op="quantization.nvfp4_gemm_swiglu_nvfp4_quant",
-        backend=KernelBackend.CUTE_DSL,
-        target=(
-            "sglang.kernels.ops.quantization.nvfp4_gemm_swiglu_nvfp4_quant"
-            ":nvfp4_gemm_swiglu_nvfp4_quant"
-        ),
-        capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(10, 0))}),
+        op="quantization.mxfp8_quantize_swizzled",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.quantization.mxfp8_swizzled_triton:mxfp8_quantize_swizzled",
+        capabilities=CUDA_ONLY,
     )
 )
 
-
-# Public entry points inventoried by logical operator group (RFC #29630).
 register_kernel(
     KernelSpec(
-        op="quantization.cvt_fp8_e4m3",
-        backend=KernelBackend.JIT,
-        target="sglang.kernels.ops.quantization.fp8_cvt:cvt_fp8_e4m3",
+        op="quantization.quantize_fp4_indexer_tensor",
+        backend=KernelBackend.TRITON,
+        target=(
+            "sglang.kernels.ops.quantization.fp4_indexer_quant"
+            ":quantize_fp4_indexer_tensor"
+        ),
+    )
+)
+
+# act_quant also has a TileLang implementation (act_quant_tilelang, used on HIP);
+# KernelBackend has no TileLang provenance, so only the Triton one is inventoried.
+register_kernel(
+    KernelSpec(
+        op="quantization.act_quant",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.quantization.act_quant_triton:act_quant",
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="quantization.split_fp32_to_bf16x3",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.quantization.bf16x3_split:split_fp32_to_bf16x3",
         capabilities=CUDA_ONLY,
     )
 )

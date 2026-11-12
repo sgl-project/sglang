@@ -429,7 +429,8 @@ class _VMOBAAttentionBackendResolver(_CudaAttentionBackendResolver):
     @classmethod
     def resolve(cls, platform) -> str:
         try:
-            from kernel.attn.vmoba_attn.vmoba import moba_attn_varlen  # noqa: F401
+            # the in-tree VMoBA runs on FlashAttention 2's varlen kernels
+            import flash_attn.flash_attn_interface  # noqa: F401
 
             from sglang.multimodal_gen.runtime.layers.attention.backends.vmoba import (  # noqa: F401
                 VMOBAAttentionBackend,
@@ -438,7 +439,9 @@ class _VMOBAAttentionBackendResolver(_CudaAttentionBackendResolver):
             return "sglang.multimodal_gen.runtime.layers.attention.backends.vmoba.VMOBAAttentionBackend"
         except ImportError as e:
             logger.error("Failed to import Video MoBA Attention backend: %s", str(e))
-            raise ImportError("Video MoBA Attention backend is not installed. ") from e
+            raise ImportError(
+                "Video MoBA Attention backend requires flash-attn >= 2.7.1."
+            ) from e
 
 
 class _SubBlockSparseAttentionBackendResolver(_CudaAttentionBackendResolver):
@@ -779,7 +782,11 @@ class CudaPlatformBase(Platform):
                 )
 
                 supported_sizes = FlashAttentionBackend.get_supported_head_sizes()
-                if head_size not in supported_sizes:
+                # FA4 on sm100 serves every multiple of 8 up to 128, e.g. Qwen-VL vision heads (72, 80)
+                fa4_head_size = (
+                    cls.is_blackwell() and head_size <= 128 and head_size % 8 == 0
+                )
+                if head_size not in supported_sizes and not fa4_head_size:
                     logger.info(
                         "Cannot use FlashAttention backend for head size %d.",
                         head_size,
@@ -848,11 +855,12 @@ class CudaPlatformBase(Platform):
     @classmethod
     def optimize_vae(cls, vae: torch.nn.Module) -> torch.nn.Module:
         """Install the quality-gated FLUX.2 / AutoencoderKL / Wan / Qwen-Image /
-        MiniMax-H3 VAE decoder fast paths.
+        MiniMax-H3 VAE fast paths.
 
         Requests with quality="lossless" or "high" run the fast paths; the
         "exact" default runs the original module path bit-for-bit. See
-        flux2_vae_cuda_opt and wan_vae_cuda_opt for details.
+        flux2_vae_cuda_opt, wan_vae_cuda_opt and minimax_h3_vae_cuda_opt for
+        details.
         """
         try:
             from sglang.multimodal_gen.runtime.models.vaes.flux2_vae_cuda_opt import (

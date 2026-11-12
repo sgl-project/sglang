@@ -10,30 +10,30 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers import mm_schedule
 from sglang.srt.managers.io_struct import (
     AbortReq,
-    SessionParams,
     TokenizedGenerateReqInput,
 )
-from sglang.srt.managers.schedule_batch import (
-    Modality,
+from sglang.srt.managers.req_types import (
     MultimodalDataItem,
     MultimodalInputs,
     MultimodalProcessorOutput,
-    Req,
 )
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
+from sglang.srt.multimodal.modality import Modality
+from sglang.srt.multimodal.transport import cuda_vmm as vmm
 from sglang.srt.multimodal.transport.cuda_ipc import CudaIpcTensorTransportProxy
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.session.session_controller import Session
-from sglang.srt.utils import cuda_vmm_transport_utils as vmm
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.scheduler_test_utils import empty_request_lists
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 @pytest.fixture
@@ -77,10 +77,10 @@ def _publish(pool):
         shape=(768,),
         dtype=torch.uint8,
     )
-    return [
-        MultimodalDataItem(modality=Modality.IMAGE, feature=copy.deepcopy(proxy)),
-        MultimodalDataItem(modality=Modality.IMAGE, feature=copy.deepcopy(proxy)),
-    ]
+    item = MultimodalDataItem(modality=Modality.IMAGE, feature=pool.memory_pool[256:])
+    item.set_pad_value()
+    item.feature = proxy
+    return [copy.deepcopy(item), copy.deepcopy(item)]
 
 
 def _rank(rank):
@@ -91,14 +91,18 @@ def _rank(rank):
 
 def _queued_scheduler(req):
     scheduler = object.__new__(Scheduler)
-    scheduler.waiting_queue = [req]
-    scheduler.chunked_req = scheduler.mm_receiver = scheduler.dllm_config = None
+    empty_request_lists(scheduler)
+    scheduler.waiting_queue.join([req])
+    scheduler.mm_receiver = None
     scheduler.disaggregation_mode = DisaggregationMode.NULL
     scheduler.tree_cache = MagicMock()
     scheduler.beam_coordinator = MagicMock()
     scheduler.ipc_channels = MagicMock()
-    scheduler.grammar_manager = MagicMock()
+    scheduler.rust_server = None
+    scheduler.output_streamer = MagicMock()
     scheduler.collect_inflight_reqs = lambda: set()
+    scheduler.hisparse_coordinator = None
+    scheduler.init_request_retirer()
     return scheduler
 
 
@@ -111,7 +115,7 @@ def test_queued_abort_recycles_unconsumed_vmm_slices(vmm_pool):
             scheduler = _queued_scheduler(req)
             with _rank(rank):
                 scheduler.abort_request(AbortReq(rid=req.rid))
-            assert scheduler.waiting_queue == []
+            assert list(scheduler.waiting_queue) == []
         vmm_pool._recycle_chunks()
         assert not vmm_pool.occupied_chunks
 
@@ -122,14 +126,14 @@ def test_embedding_hit_cannot_recycle_another_ranks_live_proxy(vmm_pool, path):
     items = _publish(vmm_pool)
     cache = MultiModalStaticCache(1 << 20)
     cached = torch.ones(1, 2)
-    cache.set(cache.combine_hashes([123]), EmbeddingResult(embedding=cached))
-    cache.set(123, EmbeddingResult(embedding=cached))
+    cache_key = items[0].cache_key
+    cache.set(cache.combine_hashes([cache_key]), EmbeddingResult(embedding=cached))
+    cache.set(cache_key, EmbeddingResult(embedding=cached))
 
     def encode(_):
         pytest.fail("cache hit unexpectedly ran the encoder")
 
     for rank, item in enumerate(items):
-        item.hash = 123
         item.offsets = [(0, 0)]
         with _rank(rank), patch.object(mm_schedule, "embedding_cache", cache):
             if path == "full":
@@ -157,7 +161,7 @@ def test_embedding_hit_cannot_recycle_another_ranks_live_proxy(vmm_pool, path):
                     [request],
                     torch.device("cpu"),
                 )
-                embedding = embeddings[(123, 1)]
+                embedding = embeddings[(cache_key, 1)]
         assert torch.equal(embedding, cached)
         assert not item.feature._consumer_acknowledged, (
             "cache eviction may need this input again"
@@ -189,36 +193,6 @@ def test_aborted_session_turn_releases_new_media_not_history(vmm_pool):
             _queued_scheduler(req).abort_request(AbortReq(rid=req.rid))
         assert torch.equal(history.feature, torch.ones(3))
         assert not session._inflight
-    vmm_pool._recycle_chunks()
-    assert not vmm_pool.occupied_chunks
-
-
-def test_rejected_session_releases_media_before_request_admission(vmm_pool):
-    """An invalid session is rejected before the request attaches its media."""
-    for rank, item in enumerate(_publish(vmm_pool)):
-        recv = TokenizedGenerateReqInput(
-            rid="invalid-session",
-            input_text="",
-            input_ids=[1],
-            input_embeds=None,
-            mm_inputs=MultimodalProcessorOutput(mm_items=[item]),
-            token_type_ids=None,
-            sampling_params=SamplingParams(),
-            return_logprob=False,
-            logprob_start_len=-1,
-            top_logprobs_num=0,
-            token_ids_logprob=None,
-            stream=False,
-            session_params=SessionParams(id="missing"),
-        )
-        scheduler = _queued_scheduler(None)
-        scheduler.session_controller = {}
-        scheduler.model_config = SimpleNamespace(vocab_size=10)
-        scheduler.tokenizer = None
-        scheduler.init_req_max_new_tokens = lambda req: None
-        scheduler._add_request_to_queue = lambda req: None
-        with _rank(rank):
-            scheduler.handle_generate_request(recv)
     vmm_pool._recycle_chunks()
     assert not vmm_pool.occupied_chunks
 

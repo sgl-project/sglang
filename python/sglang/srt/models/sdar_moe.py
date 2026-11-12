@@ -13,7 +13,6 @@ from transformers import PretrainedConfig
 
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
-from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
@@ -44,6 +43,8 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.layers.utils.layer_list import make_pp_layers
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -59,7 +60,7 @@ from sglang.srt.models.utils import (
     enable_fused_set_kv_buffer,
 )
 from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
-from sglang.srt.utils import LazyValue, add_prefix, is_cuda, make_pp_layers
+from sglang.srt.utils import LazyValue, is_cuda
 
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
@@ -105,6 +106,10 @@ class SDARMoeSparseMoeBlock(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("experts", prefix),
             routing_method_type=RoutingMethodType.Renormalize,
+        )
+        self.topk.bind_runner_backend(
+            self.experts.runner_backend,
+            routing_method_type=self.experts.routing_method_type,
         )
 
         self.gate = ReplicatedLinear(
@@ -155,10 +160,6 @@ class SDARMoeSparseMoeBlock(nn.Module):
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
-                num_token_non_padded=forward_batch.moe_num_token_non_padded(),
-                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                    layer_id=self.layer_id
-                ),
             )
         else:
             topk_output = self.topk.empty_topk_output(hidden_states.device)
