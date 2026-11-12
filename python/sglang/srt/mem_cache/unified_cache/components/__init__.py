@@ -1,28 +1,37 @@
-from sglang.srt.mem_cache.unified_cache.components.full_component import FullComponent
-from sglang.srt.mem_cache.unified_cache.components.mamba_component import MambaComponent
-from sglang.srt.mem_cache.unified_cache.components.swa_component import SWAComponent
-from sglang.srt.mem_cache.unified_cache.components.tree_component import (
-    _NUM_COMPONENT_TYPES,
+from sglang.srt.mem_cache.unified_cache.component_type import (
     BASE_COMPONENT_TYPE,
+    ComponentType,
+)
+from sglang.srt.mem_cache.unified_cache.components.base import (
+    ABSENT_COMPONENT_DATA,
     CacheTransferPhase,
     ComponentData,
-    ComponentType,
     EvictLayer,
     ExternalLinkerLoadPhase,
+    InternalStateBackup,
     LinkerTransferPhase,
     LRURefreshPhase,
     PrepareLoadBackResult,
     PreparePrefetchResult,
     TreeComponent,
     get_and_increase_time_counter,
+    lru_pointer_slot,
     next_component_uuid,
+    node_component_records,
+    slot_width,
+    windows_stand_alone,
 )
+from sglang.srt.mem_cache.unified_cache.components.full import FullComponent
+from sglang.srt.mem_cache.unified_cache.components.mamba import MambaComponent
+from sglang.srt.mem_cache.unified_cache.components.swa import SWAComponent
 
 __all__ = [
+    "ABSENT_COMPONENT_DATA",
     "BASE_COMPONENT_TYPE",
     "ComponentData",
     "ComponentType",
     "ExternalLinkerLoadPhase",
+    "InternalStateBackup",
     "LinkerTransferPhase",
     "EvictLayer",
     "FullComponent",
@@ -33,7 +42,10 @@ __all__ = [
     "PreparePrefetchResult",
     "SWAComponent",
     "TreeComponent",
-    "_NUM_COMPONENT_TYPES",
+    "lru_pointer_slot",
     "next_component_uuid",
+    "node_component_records",
+    "slot_width",
+    "windows_stand_alone",
     "get_and_increase_time_counter",
 ]

@@ -14,10 +14,13 @@ the cap is read directly from whichever cgroup version is mounted.
 """
 
 import os
+import weakref
 
 import psutil
+import torch
 
 from sglang.multimodal_gen import envs
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -103,13 +106,42 @@ def _cgroup_dirs(mount: str) -> list[str]:
     return dirs
 
 
-def cgroup_memory_limit_bytes() -> tuple[int, int] | None:
+# memory.stat keys for the reclaimable page cache: v1's subtree totals, then v2's
+# (hierarchical already). Both are the file LRUs, which leave out shmem.
+_CGROUP_FILE_CACHE_KEYS = (
+    ("total_active_file", "total_inactive_file"),
+    ("active_file", "inactive_file"),
+)
+
+
+def _cgroup_file_cache_bytes(directory: str) -> int:
+    stat = {}
+    try:
+        with open(os.path.join(directory, "memory.stat")) as handle:
+            for line in handle:
+                key, _, value = line.partition(" ")
+                stat[key] = int(value)
+    except (OSError, ValueError):
+        return 0
+    for keys in _CGROUP_FILE_CACHE_KEYS:
+        if all(key in stat for key in keys):
+            return sum(stat[key] for key in keys)
+    return 0
+
+
+def cgroup_memory_limit_bytes(
+    *, exclude_file_cache: bool = False
+) -> tuple[int, int] | None:
     """This process's (cap, usage) under its cgroup, or None when uncapped.
 
     The tightest cap in the chain wins. A nested cgroup -- a systemd scope with
     MemoryMax, a container started with --cgroup-parent -- holds this process
     below whatever the mount root allows, and planning against the root would
     commit memory the process cannot have.
+
+    A cgroup is charged for the page cache it touches, so its usage grows by
+    the whole checkpoint the process maps. ``exclude_file_cache`` leaves out
+    the cache on the file LRUs, which the kernel reclaims under the cap.
     """
     for mount, limit_name, usage_name in _CGROUP_MOUNTS:
         tightest = None
@@ -119,10 +151,33 @@ def cgroup_memory_limit_bytes() -> tuple[int, int] | None:
                 continue
             if tightest is not None and limit >= tightest[0]:
                 continue
-            tightest = (limit, _read_int(os.path.join(directory, usage_name)) or 0)
+            usage = _read_int(os.path.join(directory, usage_name)) or 0
+            if exclude_file_cache:
+                usage = max(0, usage - _cgroup_file_cache_bytes(directory))
+            tightest = (limit, usage)
         if tightest is not None:
             return tightest
     return None
+
+
+def physical_host_memory_available_bytes() -> int:
+    """What the machine itself can still give: kernel available under any cgroup cap.
+
+    Page cache charged to the cgroup counts as available, as MemAvailable counts
+    it outside one: the kernel reclaims it under the cap. That includes a
+    mapping's own cached pages, which are the room it needs to stay cached, and
+    a layer pinned out of the mapping stops needing them.
+
+    Both file LRUs count, not only the inactive one the kubelet subtracts:
+    which list a page sits on follows its access history and the LRU
+    implementation, so the active list holds cold cache too.
+    """
+    available = int(psutil.virtual_memory().available)
+    capped = cgroup_memory_limit_bytes(exclude_file_cache=True)
+    if capped is None:
+        return available
+    limit, usage = capped
+    return min(available, max(0, limit - usage))
 
 
 def host_memory_available_bytes() -> int:
@@ -146,13 +201,31 @@ def host_memory_available_bytes() -> int:
         except OSError:
             pass
         return max(0, int(forced_gib * GIB_BYTES) - own_anonymous)
+    return physical_host_memory_available_bytes()
 
-    available = int(psutil.virtual_memory().available)
-    capped = cgroup_memory_limit_bytes()
-    if capped is None:
-        return available
-    limit, usage = capped
-    return min(available, max(0, limit - usage))
+
+def host_copies_are_redundant() -> bool:
+    """Whether a host copy of a mapped weight buys nothing.
+
+    When host and device share one physical pool the device reads page-cache
+    pages directly, so a pinned or pageable copy holds the same bytes twice and
+    adds only pressure. The mapping is then the right home for every weight
+    that has one, whatever the free-memory reading says.
+    """
+    return current_platform.device_shares_host_memory()
+
+
+def page_cache_cannot_hold(mapped_bytes: int) -> bool:
+    """Whether the kernel's page cache cannot keep a mapping of this size.
+
+    Read against the machine, not the test-only forced view: a mapping the
+    cache holds is re-read from memory however small the pretend host is.
+    """
+    if mapped_bytes <= 0:
+        return False
+    return (
+        mapped_bytes >= physical_host_memory_available_bytes() - HOST_COPY_RESERVE_BYTES
+    )
 
 
 def host_copies_would_not_fit(weight_bytes: int) -> bool:
@@ -186,7 +259,13 @@ class HostPinBudget:
 
     def __init__(self, available_bytes: int | None = None) -> None:
         if available_bytes is None:
-            available_bytes = host_memory_available_bytes()
+            if host_copies_are_redundant():
+                # Nothing to pin for: on one pool the copy duplicates
+                # page-cache bytes the device can already read, and the mapped
+                # courier overlaps its transfers anyway.
+                available_bytes = 0
+            else:
+                available_bytes = host_memory_available_bytes()
         self.available_bytes = available_bytes
         self.reserve_bytes = max(
             int(available_bytes * HOST_RESERVE_FRACTION), MIN_HOST_RESERVE_BYTES
@@ -222,6 +301,14 @@ class HostPinBudget:
             self.available_bytes / GIB_BYTES,
         )
         return False
+
+    def release(self, weight_bytes: int) -> None:
+        """Return an allowance when its pinned storage is no longer owned."""
+        self.committed_bytes -= weight_bytes
+
+    def track_storage(self, storage: torch.UntypedStorage) -> None:
+        """Tie an already booked allowance to the storage's last owner."""
+        weakref.finalize(storage, self.release, storage.nbytes())
 
 
 def pin_benefit_bytes(*, weight_bytes: int, uses_per_request: int) -> int:
@@ -259,7 +346,9 @@ def describe_host_memory() -> str:
     if capped is None:
         return f"{available / GIB_BYTES:.1f} GiB available (no cgroup cap)"
     limit, usage = capped
+    _, unreclaimable = cgroup_memory_limit_bytes(exclude_file_cache=True)
     return (
         f"{available / GIB_BYTES:.1f} GiB available "
-        f"(cgroup cap {limit / GIB_BYTES:.1f} GiB, in use {usage / GIB_BYTES:.1f} GiB)"
+        f"(cgroup cap {limit / GIB_BYTES:.1f} GiB, in use {usage / GIB_BYTES:.1f} GiB "
+        f"of which {(usage - unreclaimable) / GIB_BYTES:.1f} GiB reclaimable cache)"
     )

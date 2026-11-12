@@ -53,12 +53,18 @@ jobs:
           fi
 
       - name: Start disaggregation container
-        run: bash scripts/ci/amd/amd_ci_start_container_disagg.sh --rocm-version rocm724
+        run: bash scripts/ci/amd/amd_ci_start_container_disagg.sh --rocm-version rocm10
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Install dependencies
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh
+
+      - name: Run Mori unit tests
+        run: |
+          bash scripts/ci/amd/amd_ci_exec.sh \
+            -w /sglang-checkout/test \
+            python3 -m pytest -q registered/amd/disaggregation/test_mori_backend_basic.py
 
       - name: Run Mori PD tests
         run: |
@@ -84,7 +90,7 @@ jobs:
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Start CI container
-        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm724
+        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version rocm10
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
           ENABLE_CACHE_HOST: "1"

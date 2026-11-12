@@ -10,7 +10,7 @@ from sglang.multimodal_gen.apps.webui.minimax_h3 import (
     build_minimax_h3_sampling_params_kwargs,
     minimax_h3_tasks_for_server,
 )
-from sglang.multimodal_gen.configs.sample.sampling_params import DataType
+from sglang.multimodal_gen.configs.task_type import DataType
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.request_validation import (
     minimax_h3_validate_canonical_request,
 )
@@ -44,6 +44,9 @@ def test_h3_webui_tasks_follow_loaded_partition():
     assert minimax_h3_tasks_for_server(
         SimpleNamespace(model_variant="ref2va", model_subfolder=None)
     ) == ("ref2va",)
+    assert minimax_h3_tasks_for_server(
+        SimpleNamespace(model_variant="hybrid", model_subfolder=None)
+    ) == ("t2va", "fl2va", "ref2va")
 
 
 def test_h3_t2va_uses_native_contract_without_generic_cfg_fields():
@@ -132,6 +135,7 @@ def _video_request():
         fps=24,
         save_output=True,
         output_compression=50,
+        x264_preset="ultrafast",
         output_file_path=Mock(return_value="/tmp/generated.mp4"),
     )
 
@@ -176,6 +180,7 @@ def test_h3_generation_runs_video_lifecycle_and_preserves_audio():
     sampling_params.cleanup_video_request.assert_called_once_with(request)
     assert save_outputs.call_args.kwargs["audio"] is result.audio
     assert save_outputs.call_args.kwargs["audio_sample_rate"] == 24000
+    assert save_outputs.call_args.kwargs["x264_preset"] == "ultrafast"
 
 
 def test_h3_generation_cleans_up_after_scheduler_error():

@@ -17,16 +17,20 @@
 
 
 import collections
+import logging
 import math
 import os
-from dataclasses import field
+from array import array
+from dataclasses import dataclass, field
 from enum import Enum
 from functools import partial
 from itertools import repeat
 from typing import (
     Callable,
+    Dict,
     Final,
     Iterable,
+    List,
     Literal,
     Optional,
     Sequence,
@@ -43,19 +47,18 @@ from torch import Tensor, _assert, nn
 from torch.nn.init import trunc_normal_
 from transformers import AutoModel, PreTrainedModel
 
-from sglang.srt.configs.janus_pro import *
+from sglang.srt.configs.janus_pro import MultiModalityConfig, SigLIPVisionCfg
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternTokenPairs,
     general_mm_embed_routine,
+    pad_mm_token_pairs,
 )
-from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaForCausalLM
-from sglang.utils import logger
 
 #################################################################################
 #                              VQ Model Configs                                 #
@@ -113,6 +116,8 @@ def VQ_16(**kwargs):
 VQ_models = {"VQ-16": VQ_16}
 
 import collections.abc
+
+logger = logging.getLogger(__name__)
 
 
 # From PyTorch internals
@@ -1995,14 +2000,14 @@ class MultiModalityCausalLM(MultiModalityPreTrainedModel):
     def prepare_gen_img_embeds(self, image_ids: torch.LongTensor):
         return self.gen_aligner(self.gen_embed(image_ids))
 
-    def pad_input_ids(self, input_ids: List[int], image_inputs: MultimodalInputs):
+    def pad_input_ids(self, input_ids: array, image_inputs: MultimodalInputs) -> array:
         im_start_id = image_inputs.im_start_id
         im_end_id = image_inputs.im_end_id
         media_token_pairs = [(im_start_id, im_end_id)]
 
-        helper = MultiModalityDataPaddingPatternTokenPairs(media_token_pairs)
-
-        return helper.pad_input_tokens(input_ids, image_inputs)
+        return pad_mm_token_pairs(
+            input_ids, image_inputs, data_token_pairs=media_token_pairs
+        )
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [

@@ -144,6 +144,10 @@ class GuidanceGrammar(BaseGrammarObject):
         if self.ll_matcher.is_stopped() and token in self.eos_tokens:
             self.finished = True
             return
+        # consume_token leaves the matcher in a sticky error state on reject;
+        # validate first so a rejected token raises with the state untouched.
+        if self.ll_matcher.validate_tokens([token]) == 0:
+            raise ValueError(f"Tokens not accepted: {token}")
         self.ll_matcher.consume_token(token)
         self._check_err()
 
@@ -193,7 +197,12 @@ class GuidanceGrammar(BaseGrammarObject):
 
     @staticmethod
     def apply_vocab_mask(logits: torch.Tensor, vocab_mask: torch.Tensor) -> None:
-        apply_token_bitmask_inplace(logits, vocab_mask)
+        if logits.device.type == "npu":
+            import sgl_kernel_npu  # noqa: F401
+
+            torch.ops.npu.apply_token_bitmask(logits, vocab_mask)
+        else:
+            apply_token_bitmask_inplace(logits, vocab_mask)
 
     def copy(self):
         # Cache templates are pristine, so cloning their matcher creates a fresh

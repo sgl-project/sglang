@@ -102,7 +102,7 @@ class InternViTCudaGraphRunner:
 
         if backend == "triton_attn":
             cu_ws = [cu, cu_kk, max_len]
-        elif backend == "fa3":
+        elif backend in ("fa3", "fa4"):
             cu_ws = [cu, max_len]
         else:
             raise RuntimeError(
@@ -125,7 +125,7 @@ class InternViTCudaGraphRunner:
 
         if backend == "triton_attn":
             cu_ws = [cu, cu_kk, max_len]
-        elif backend == "fa3":
+        elif backend in ("fa3", "fa4"):
             cu_ws = [cu, max_len]
         else:
             raise RuntimeError(

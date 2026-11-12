@@ -13,10 +13,10 @@ from sglang.multimodal_gen.configs.models.encoders import TextEncoderConfig
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     _get_encoder_data_parallel_group_ranks,
 )
+from sglang.multimodal_gen.runtime.distributed.utils import RankGenerator
 from sglang.multimodal_gen.runtime.models.encoders.base import TextEncoder
 from sglang.multimodal_gen.runtime.pipelines_core.stages import text_encoding as _te_mod
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
-from sglang.multimodal_gen.runtime.utils.distributed import RankGenerator
 
 
 def _enc(hidden=4096, heads=64, inter=10240, folding_mode=None):

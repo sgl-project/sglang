@@ -20,7 +20,7 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     RowParallelLinear,
 )
 from sglang.multimodal_gen.runtime.layers.quantization import QuantizationConfig
-from sglang.srt.utils import add_prefix
+from sglang.srt.layers.utils.common import add_prefix
 
 
 class MLP(nn.Module):
@@ -77,7 +77,7 @@ class MLP(nn.Module):
                 and x.is_cuda
                 and x.dtype in (torch.float16, torch.bfloat16)
             ):
-                from sglang.kernels.ops.elementwise.bias_gelu import bias_gelu_tanh
+                from sglang.kernels.ops.activation.bias_gelu import bias_gelu_tanh
 
                 return bias_gelu_tanh(x, bias)
             return self.act(x + bias)

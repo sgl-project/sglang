@@ -6,6 +6,7 @@ import unittest
 import torch
 
 from sglang.test.ci.ci_register import register_amd_ci
+from sglang.test.mem_cache_utils import routed
 
 register_amd_ci(est_time=30, suite="stage-b-test-1-gpu-small-amd")
 
@@ -31,9 +32,7 @@ def _fp32_divide_write(k, v, k_cache, v_cache, loc, k_scale, v_scale, fp8_dtype)
 @unittest.skipUnless(_HAS_CUDA, "Triton kernels require a GPU")
 class TestFusedFp8KvWrite(unittest.TestCase):
     def _run(self, num_tokens, num_heads, head_dim, total_slots=None, seed=0xC0FFEE):
-        from sglang.kernels.ops.attention.utils import (
-            launch_reshape_and_cache_flash,
-        )
+        from sglang.kernels.ops.kvcache.cache_ops import launch_reshape_and_cache_flash
         from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
 
         torch.manual_seed(seed)
@@ -225,7 +224,7 @@ class TestAiterFp8KvDispatch(unittest.TestCase):
                 on_set(args, kwargs)
                 raise _StopForward
 
-        return _Pool()
+        return routed(_Pool())
 
     def test_decode_uses_fused_and_v_scale_falls_back_to_self(self):
         """Standard FP8 decode takes the fused path; with layer.v_scale=None,
@@ -251,6 +250,7 @@ class TestAiterFp8KvDispatch(unittest.TestCase):
 
         class _FB:
             out_cache_loc = torch.arange(n, device=dev, dtype=torch.int64)
+            out_cache_loc_is_physical = False
 
         captured = {}
 
@@ -304,6 +304,7 @@ class TestAiterFp8KvDispatch(unittest.TestCase):
 
         class _FB:
             out_cache_loc = torch.arange(n, device=dev, dtype=torch.int64)
+            out_cache_loc_is_physical = False
 
         launch_calls = {"n": 0}
 
@@ -359,6 +360,7 @@ class TestAiterFp8KvDispatch(unittest.TestCase):
 
         class _FB:
             out_cache_loc = torch.arange(n, device=dev, dtype=torch.int64)
+            out_cache_loc_is_physical = False
 
         launch_calls = {"n": 0}
 

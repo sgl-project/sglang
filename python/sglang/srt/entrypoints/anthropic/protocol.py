@@ -19,6 +19,8 @@ from pydantic import (
     model_validator,
 )
 
+from sglang.srt.entrypoints.openai.protocol import PDRoutingFields
+
 
 class AnthropicError(BaseModel):
     """Error structure for Anthropic API."""
@@ -138,6 +140,7 @@ class AnthropicCustomTool(BaseModel):
     name: str
     description: Optional[str] = None
     input_schema: dict[str, Any]
+    strict: bool = False
     defer_loading: Optional[bool] = None
 
     @field_validator("input_schema")
@@ -250,33 +253,20 @@ class AnthropicToolChoice(BaseModel):
 
     type: Literal["auto", "any", "tool", "none"]
     name: Optional[str] = None
+    disable_parallel_tool_use: bool = False
 
 
 class AnthropicThinkingParam(BaseModel):
     """Anthropic extended-thinking control on the request.
 
-    Mirrors the Anthropic SDK's ``ThinkingConfigParam`` discriminated
-    union of three variants — see ``anthropic-sdk-python``'s
-    ``thinking_config_{enabled,disabled,adaptive}_param.py``:
-
-    * ``enabled`` requires ``budget_tokens`` (≥1024) and accepts
-      ``display``.
-    * ``disabled`` accepts no other fields.
-    * ``adaptive`` (Claude 4.7) accepts ``display`` but not
-      ``budget_tokens``.
-
-    The serving layer treats ``adaptive`` identically to ``enabled``
-    because the local OpenAI-compatible backend has no auto-throttle
-    equivalent. ``budget_tokens`` is accepted on ``enabled`` for SDK
-    compatibility but the backend has no hard-cap knob to honor it; the
-    serving layer logs a WARNING so operators see that the requested
-    budget is not enforced. ``display="omitted"`` is accepted but
-    similarly cannot suppress reasoning mid-stream and is logged.
+    Mirrors the SDK's ``thinking_config_{enabled,disabled,adaptive}_param.py``
+    variants. ``budget_tokens`` and ``display="omitted"``/``"updates"`` are
+    accepted for SDK compatibility but not enforced; the serving layer logs them.
     """
 
     type: Literal["enabled", "disabled", "adaptive"]
     budget_tokens: Optional[int] = None
-    display: Optional[Literal["summarized", "omitted"]] = None
+    display: Optional[Literal["summarized", "omitted", "updates"]] = None
 
     @model_validator(mode="after")
     def _validate_thinking_shape(self):
@@ -325,6 +315,11 @@ class AnthropicTaskBudget(BaseModel):
     remaining: Optional[int] = Field(default=None, ge=0)
 
 
+class AnthropicJSONOutputFormat(BaseModel):
+    type: Literal["json_schema"]
+    schema_: dict[str, Any] = Field(alias="schema")
+
+
 class AnthropicOutputConfig(BaseModel):
     """Claude 4.7 ``output_config`` block.
 
@@ -335,6 +330,7 @@ class AnthropicOutputConfig(BaseModel):
 
     effort: Optional[Literal["minimal", "low", "medium", "high", "xhigh", "max"]] = None
     task_budget: Optional[AnthropicTaskBudget] = None
+    format: Optional[AnthropicJSONOutputFormat] = None
 
 
 class AnthropicCountTokensRequest(BaseModel):
@@ -346,7 +342,7 @@ class AnthropicCountTokensRequest(BaseModel):
     thinking: Optional[AnthropicThinkingParam] = None
     tool_choice: Optional[AnthropicToolChoice] = None
     tools: Optional[list[AnthropicTool]] = None
-    # Claude 4.7 / SDK-compatibility fields. Accepted but no-op on count.
+    # Claude 4.7 / SDK-compatibility fields; betas is accepted but ignored.
     output_config: Optional[AnthropicOutputConfig] = None
     betas: Optional[list[str]] = None
 
@@ -357,7 +353,7 @@ class AnthropicCountTokensResponse(BaseModel):
     input_tokens: int
 
 
-class AnthropicMessagesRequest(BaseModel):
+class AnthropicMessagesRequest(PDRoutingFields):
     """Anthropic Messages API request."""
 
     model: str
@@ -373,6 +369,7 @@ class AnthropicMessagesRequest(BaseModel):
     tools: Optional[list[AnthropicTool]] = None
     top_k: Optional[int] = None
     top_p: Optional[float] = None
+    cache_salt: Optional[str] = None
     # Claude 4.7 fields. The Anthropic SDK / Claude Code attach these even
     # when targeting non-Anthropic backends, so the schema must accept them.
     output_config: Optional[AnthropicOutputConfig] = None

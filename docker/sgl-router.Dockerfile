@@ -12,11 +12,9 @@
 # manifests → cargo fetch → copy src" approach caches only the fetched
 # registry; every source change still recompiles every dep.
 #
-# `Cargo.lock` is gitignored repo-wide (root .gitignore "# Rust lib"
-# block), so we generate it inside the chef stage with `cargo
-# generate-lockfile` and propagate that lockfile to the builder via
-# `COPY --from=chef`. Both stages thus build against the same lockfile,
-# preserving --locked semantics within a single Docker build.
+# `sgl-router/Cargo.lock` is committed, and every cargo step
+# below runs with `--locked`, so the image ships exactly the dependency
+# graph CI checked, tested, and license-audited.
 #
 # Build (from the repo root):
 #   docker build -f docker/sgl-router.Dockerfile -t sgl-router:dev .
@@ -27,32 +25,51 @@
 #
 # Image budget: < 100 MB stripped (M6 acceptance). Verify with
 #   `docker image inspect sgl-router:dev --format '{{.Size}}'`.
+#
+# FIPS 140-3 build (aws-lc-rs FIPS module as the TLS provider; see the `fips`
+# feature in sgl-router/Cargo.toml). The module is statically linked, so the
+# runtime image needs nothing extra; RUNTIME_BASE_IMAGE may point at a FIPS
+# base for the OS packages:
+#   docker build -f docker/sgl-router.Dockerfile --build-arg CARGO_FEATURES=fips \
+#       -t sgl-router:fips .
 
-ARG RUST_VERSION=1.90
+ARG RUST_VERSION=1.92
 ARG DEBIAN_VERSION=bookworm
+ARG RUNTIME_BASE_IMAGE=gcr.io/distroless/cc-debian12:nonroot
 
 ######################## STAGE 1 — chef recipe ##########################
 FROM rust:${RUST_VERSION}-${DEBIAN_VERSION} AS chef
 RUN cargo install cargo-chef --locked --version ^0.1
 WORKDIR /work/sgl-router
-COPY experimental/sgl-router/Cargo.toml ./
-COPY experimental/sgl-router/sgl-kv-indexer/Cargo.toml sgl-kv-indexer/Cargo.toml
-# Stub a minimal src tree so cargo can resolve the workspace, generate
-# the lockfile (gitignored upstream), then prepare the chef recipe.
-RUN mkdir -p src sgl-kv-indexer/src/bin \
+COPY sgl-router/Cargo.toml sgl-router/Cargo.lock ./
+COPY sgl-router/sgl-kv-indexer/Cargo.toml sgl-kv-indexer/Cargo.toml
+# sglang-processor is a path dependency that inherits from the rust/ workspace manifest.
+COPY rust/Cargo.toml /work/rust/Cargo.toml
+COPY rust/sglang-api-types /work/rust/sglang-api-types
+COPY rust/sglang-runtime-v1-types /work/rust/sglang-runtime-v1-types
+COPY rust/sglang-processor/Cargo.toml /work/rust/sglang-processor/Cargo.toml
+# Stub a minimal src tree so cargo can see the workspace targets, then
+# prepare the chef recipe.
+RUN mkdir -p src sgl-kv-indexer/src/bin /work/rust/sglang-processor/src \
+    && touch /work/rust/sglang-processor/src/lib.rs \
     && echo "fn main() {}" > src/main.rs \
     && echo "" > src/lib.rs \
     && echo "" > sgl-kv-indexer/src/lib.rs \
     && echo "fn main() {}" > sgl-kv-indexer/src/bin/kv-indexer-server.rs \
     && echo "fn main() {}" > sgl-kv-indexer/src/bin/kv-indexer-bridge.rs \
-    && cargo generate-lockfile \
     && cargo chef prepare --recipe-path recipe.json \
     && rm -rf src sgl-kv-indexer/src
 
 ######################## STAGE 2 — builder ##############################
 FROM rust:${RUST_VERSION}-${DEBIAN_VERSION} AS builder
+# Comma-separated cargo features; empty for the default build. `fips` also
+# needs the aws-lc-fips-sys toolchain (cmake, Go for the delocator, clang).
+ARG CARGO_FEATURES=""
 RUN apt-get update \
     && apt-get install -y --no-install-recommends protobuf-compiler \
+    && case ",${CARGO_FEATURES}," in \
+         *,fips,*) apt-get install -y --no-install-recommends cmake golang-go clang libclang-dev ;; \
+       esac \
     && rm -rf /var/lib/apt/lists/* \
     && cargo install cargo-chef --locked --version ^0.1
 WORKDIR /work/sgl-router
@@ -66,30 +83,37 @@ WORKDIR /work/sgl-router
 ENV PCRE2_SYS_STATIC=1
 
 COPY --from=chef /work/sgl-router/recipe.json ./recipe.json
-COPY --from=chef /work/sgl-router/Cargo.lock ./Cargo.lock
-COPY experimental/sgl-router/sgl-kv-indexer/Cargo.toml sgl-kv-indexer/Cargo.toml
+COPY sgl-router/sgl-kv-indexer/Cargo.toml sgl-kv-indexer/Cargo.toml
+# The recipe omits path dependencies outside this workspace, so cook against a
+# stub of sglang-processor; its real sources arrive with the router's below.
+COPY rust/Cargo.toml /work/rust/Cargo.toml
+COPY rust/sglang-api-types /work/rust/sglang-api-types
+COPY rust/sglang-runtime-v1-types /work/rust/sglang-runtime-v1-types
+COPY rust/sglang-processor/Cargo.toml /work/rust/sglang-processor/Cargo.toml
+RUN mkdir -p /work/rust/sglang-processor/src && touch /work/rust/sglang-processor/src/lib.rs
 
 # Cook (compile + cache) the dep graph from the recipe. The recipe carries every
-# workspace member's manifest, so chef recreates the Indexer's source stubs itself.
-RUN cargo chef cook --release --recipe-path recipe.json
+# workspace member's manifest and the lockfile, so chef recreates the Indexer's
+# source stubs itself.
+RUN cargo chef cook --locked --release --recipe-path recipe.json \
+    ${CARGO_FEATURES:+--features "$CARGO_FEATURES"}
 
-# Now bring in the real sources and the manifest they need.
-COPY experimental/sgl-router/Cargo.toml ./
-COPY experimental/sgl-router/src ./src
-COPY experimental/sgl-router/sgl-kv-indexer/Cargo.toml sgl-kv-indexer/Cargo.toml
-COPY experimental/sgl-router/sgl-kv-indexer/build.rs sgl-kv-indexer/build.rs
-COPY experimental/sgl-router/sgl-kv-indexer/proto sgl-kv-indexer/proto
-COPY experimental/sgl-router/sgl-kv-indexer/src sgl-kv-indexer/src
+# Now bring in the real sources and the manifests they need.
+COPY sgl-router/Cargo.toml sgl-router/Cargo.lock ./
+COPY sgl-router/src ./src
+COPY sgl-router/sgl-kv-indexer/Cargo.toml sgl-kv-indexer/Cargo.toml
+COPY sgl-router/sgl-kv-indexer/build.rs sgl-kv-indexer/build.rs
+COPY sgl-router/sgl-kv-indexer/proto sgl-kv-indexer/proto
+COPY sgl-router/sgl-kv-indexer/src sgl-kv-indexer/src
+COPY rust/sglang-processor/src /work/rust/sglang-processor/src
 
-# --locked is intentionally omitted: the lockfile is generated in-container
-# (gitignored upstream) and `cargo chef cook` may have mutated it during the
-# dep-cook step, so a strict --locked check would spuriously fail.
-RUN touch sgl-kv-indexer/build.rs \
-    && cargo build --release --bin sgl-router \
+RUN touch sgl-kv-indexer/build.rs /work/rust/sglang-processor/src/lib.rs \
+    && cargo build --locked --release --bin sgl-router \
+       ${CARGO_FEATURES:+--features "$CARGO_FEATURES"} \
     && strip target/release/sgl-router
 
 ######################## STAGE 3 — runtime ##############################
-FROM gcr.io/distroless/cc-debian12:nonroot AS runtime
+FROM ${RUNTIME_BASE_IMAGE} AS runtime
 
 COPY --from=builder /work/sgl-router/target/release/sgl-router /usr/local/bin/sgl-router
 
@@ -98,6 +122,7 @@ ENV SGL_ROUTER_CONFIG=/etc/sgl-router/sgl-router.yaml
 EXPOSE 8090
 
 # distroless `nonroot` runs as uid 65532. The router doesn't need root.
-USER nonroot:nonroot
+# Numeric so a RUNTIME_BASE_IMAGE without a `nonroot` passwd entry still works.
+USER 65532:65532
 
 ENTRYPOINT ["/usr/local/bin/sgl-router"]

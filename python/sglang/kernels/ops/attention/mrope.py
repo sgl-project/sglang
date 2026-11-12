@@ -7,11 +7,14 @@ import triton
 import triton.language as tl
 
 
-@triton.jit
+# Sequence length varies across requests. Specializing S would create one
+# compiled kernel variant per observed length, while the existing mask handles
+# the final partial block.
+@triton.jit(do_not_specialize=["S"])
 def apply_interleaved_rope_kernel(
     x_ptr,
     out_ptr,
-    S: tl.constexpr,
+    S,
     D: tl.constexpr,
     stride_x_m,
     stride_x_s,

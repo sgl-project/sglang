@@ -25,31 +25,50 @@ from transformers import (
 )
 
 from sglang.kernels.ops.layernorm.gemma4_fused_ops import (
-    gemma4_fused_routing,
     gemma_dual_rmsnorm_residual_scalar,
     gemma_qkv_rmsnorm,
     gemma_rmsnorm_residual_scalar,
+)
+from sglang.kernels.ops.moe.gemma4_routing import (
+    gemma4_fused_routing,
     gemma_routing_post_topk,
 )
-from sglang.srt.distributed import (
-    get_pp_group,
+from sglang.srt.distributed.utils import get_group_rank_size
+from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
+from sglang.srt.layers.communication import gemma4_ar_fusion
+from sglang.srt.layers.layer_boundary import (
+    SumGroup,
+    append_stages,
+    declare_attn,
+    declare_ffn,
 )
+from sglang.srt.layers.layer_boundary.output import OutputTransform
+from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
+from sglang.srt.layers.layer_boundary.residual.add_norm import REPLACE_AT_EXIT
 from sglang.srt.layers.layernorm import Gemma4RMSNorm, RMSNorm
 from sglang.srt.layers.linear import (
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
+    _resolve_linear_group,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
+from sglang.srt.layers.moe.expert_executor import MoeExpertExecutorContext
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
-from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.layers.utils.layer_list import make_pp_layers
+from sglang.srt.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
@@ -58,8 +77,13 @@ from sglang.srt.models.gemma3_causal import Gemma3MLP, Gemma3TextScaledWordEmbed
 from sglang.srt.models.utils import (
     create_fused_set_kv_buffer_arg,
 )
-from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args
-from sglang.srt.utils import add_prefix, make_layers
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_forward,
+    get_lora,
+    get_parallel,
+    get_server_args,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -219,12 +243,14 @@ class Gemma4MoE(nn.Module):
         config: Gemma4TextConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        activation: str = "gelu",
+        reduce_results: bool = True,
     ) -> None:
         super().__init__()
         self.layer_id = layer_id
         self.hidden_size = hidden_size
         self.num_experts = config.num_experts
-        self.tp_size = get_parallel().tp_size
+        parallel = get_parallel()
 
         # Per-expert output scale folded into routing weights so that
         # MoE's fused kernel computes: Σ_e (expert_e * w_e * scale_e)
@@ -267,19 +293,40 @@ class Gemma4MoE(nn.Module):
             custom_routing_function=routing_function,
         )
 
-        experts_type = get_moe_impl_class(quant_config)
+        num_redundant_experts = get_exec().moe.ep_num_redundant_experts
+        experts_prefix = add_prefix("experts", prefix)
+        experts_type = get_moe_impl_class(
+            quant_config,
+            context=MoeExpertExecutorContext(
+                model_family="gemma4",
+                layer_id=layer_id,
+                num_experts=config.num_experts,
+                num_redundant_experts=num_redundant_experts,
+                hidden_size=config.hidden_size,
+                intermediate_size=config.moe_intermediate_size,
+                top_k=config.top_k_experts,
+                activation=activation,
+                reduce_results=reduce_results,
+                quant_config=quant_config,
+                prefix=experts_prefix,
+                tp_size=parallel.tp_size,
+                moe_tp_size=parallel.moe_tp_size,
+                moe_ep_size=parallel.moe_ep_size,
+            ),
+        )
 
         self.experts = experts_type(
-            num_experts=config.num_experts + get_exec().moe.ep_num_redundant_experts,
+            num_experts=config.num_experts + num_redundant_experts,
             hidden_size=config.hidden_size,
             intermediate_size=config.moe_intermediate_size,
             layer_id=layer_id,
             top_k=config.top_k_experts,
             quant_config=quant_config,
-            prefix=add_prefix("experts", prefix),
-            activation="gelu",
-            reduce_results=True,
+            prefix=experts_prefix,
+            activation=activation,
+            reduce_results=reduce_results,
         )
+        self.topk.bind_runner_backend(self.experts.runner_backend)
 
     def forward(
         self, hidden_states: torch.Tensor, router_logits: torch.Tensor
@@ -353,6 +400,7 @@ class Gemma4Attention(nn.Module):
             hidden_size,
             bias=config.attention_bias,
             quant_config=quant_config,
+            reduce_results=False,
             prefix=add_prefix("o_proj", prefix),
         )
 
@@ -415,6 +463,7 @@ class Gemma4Attention(nn.Module):
             layer_id=(
                 self.kv_shared_layer_index if self.is_kv_shared_layer else self.layer_id
             ),
+            graph_layer_id=self.layer_id,
             logit_cap=0.0,
             sliding_window_size=self.sliding_window,
             quant_config=quant_config,
@@ -579,6 +628,7 @@ class Gemma4DecoderLayer(nn.Module):
             hidden_activation=config.hidden_activation,
             quant_config=quant_config,
             prefix=add_prefix("mlp", prefix),
+            reduce_results=False,
         )
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -619,7 +669,7 @@ class Gemma4DecoderLayer(nn.Module):
             self.post_per_layer_input_norm = None
 
         # Parallel MoE
-        self.enable_moe_block = getattr(config, "enable_moe_block", False)
+        self.enable_moe_block = self._enable_moe_block(config)
         if self.enable_moe_block:
             self.router = Gemma4Router(
                 config,
@@ -632,6 +682,7 @@ class Gemma4DecoderLayer(nn.Module):
                 config=config,
                 quant_config=quant_config,
                 prefix=add_prefix("moe", prefix),
+                reduce_results=False,
             )
 
             self.post_feedforward_layernorm_1 = RMSNorm(
@@ -653,6 +704,39 @@ class Gemma4DecoderLayer(nn.Module):
         self.register_buffer("layer_scalar", torch.ones(1), persistent=True)
         self.has_ple = self.hidden_size_per_layer_input > 0
         self.prefix = prefix
+        attn, ffn = self.stage_facts(
+            config, layer_id, post_attention_layernorm=self.post_attention_layernorm
+        )
+        self.attn_boundary, self.ffn_boundary = append_stages(
+            (attn, self.input_layernorm),
+            (ffn, self.pre_feedforward_layernorm),
+        )
+
+    @staticmethod
+    def _enable_moe_block(config: PretrainedConfig) -> bool:
+        return getattr(config, "enable_moe_block", False)
+
+    @classmethod
+    def stage_facts(
+        cls,
+        config: PretrainedConfig,
+        layer_id: int,
+        *,
+        post_attention_layernorm=None,
+    ):
+        """The stages a Gemma 4 layer declares, from the config alone: the
+        model's shared declaration function, which the layer declares with
+        too (see make_layers). The attention's output norm is its output
+        transform."""
+        enable_moe_block = cls._enable_moe_block(config)
+        return (
+            declare_attn(output_transform=OutputTransform(post_attention_layernorm)),
+            declare_ffn(
+                sparse=enable_moe_block,
+                next_layer_sparse=enable_moe_block,
+                update=REPLACE_AT_EXIT,
+            ),
+        )
 
     def forward(
         self,
@@ -660,47 +744,62 @@ class Gemma4DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         per_layer_input: torch.Tensor,
         forward_batch: ForwardBatch,
+        capture_output=None,
         **kwargs,
-    ) -> tuple[
-        torch.FloatTensor, Optional[tuple[torch.FloatTensor, torch.FloatTensor]]
-    ]:
+    ) -> torch.Tensor:
         # Gemma4 residual pattern following JAX implementation:
         # 1. input_norm(x) -> attn -> post_attn_norm -> ADD residual
         # 2. pre_ff_norm -> mlp -> post_ff_norm -> ADD residual
         #
-        # Optimization: fuse "post_attn_norm(h) + residual; pre_ff_norm(...)"
-        # into "post_attn_norm(h); pre_ff_norm(h, residual)" using
-        # gemma_fused_add_rmsnorm which computes:
+        # The FFN input runs post_attn_norm(h), then pre_ff_norm(h, residual)
+        # with gemma_fused_add_rmsnorm, which computes:
         #   residual = h + residual (in-place)
         #   h = gemma_norm(residual)
-        residual = hidden_states
-
-        # Apply input layernorm
-        hidden_states = self.input_layernorm(hidden_states)
+        hidden_states = self.attn_boundary.prepare(
+            hidden_states, forward_batch, capture=capture_output
+        )
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
             forward_batch=forward_batch,
         )
-        hidden_states = self.post_attention_layernorm(hidden_states)
+        hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+        hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
+        residual = residual_batch.written_residual(forward_batch)
+        hidden_states = self._next_stream(
+            hidden_states, residual, per_layer_input, forward_batch
+        )
+        return self.ffn_boundary.finish(hidden_states, forward_batch)
+
+    def _next_stream(
+        self,
+        hidden_states: torch.Tensor,
+        residual: torch.Tensor,
+        per_layer_input: Optional[torch.Tensor],
+        forward_batch: ForwardBatch,
+    ) -> torch.Tensor:
+        """The next stream from the FFN input and the residual the FFN input
+        wrote. Each part's TP sum is completed by the FFN boundary before its
+        post-FFN norm."""
 
         if self.enable_moe_block:
-            # Fuse: hidden_states + residual -> residual; pre_ff_norm(residual) -> hidden_states
-            # Also need raw (unfused) residual for router and pre_ff_norm_2
-            hidden_states, residual = self.pre_feedforward_layernorm(
-                hidden_states, residual
-            )
             # For MoE: router and pre_ff_norm_2 need the unfused residual
             # (which is now updated to post_attn_out + old_residual)
             moe_input = residual
 
             # Dense MLP branch
-            hidden_states_1 = self.mlp(hidden_states)
+            hidden_states_1 = self.ffn_boundary.sum_part(
+                self.mlp(hidden_states), forward_batch, SumGroup.TP
+            )
 
             # MoE branch: router sees residual (= post_attn_out + old_residual)
             router_logits = self.router(moe_input)
             hidden_states_2 = self.pre_feedforward_layernorm_2(moe_input)
-            hidden_states_2 = self.moe(hidden_states_2, router_logits)
+            hidden_states_2 = self.ffn_boundary.sum_part(
+                self.moe(hidden_states_2, router_logits),
+                forward_batch,
+                SumGroup.MOE_OUTPUT,
+            )
 
             # Fused: (rmsnorm(rmsnorm(h1,w1) + rmsnorm(h2,w2), w3) + residual) * scalar
             if (
@@ -723,7 +822,7 @@ class Gemma4DecoderLayer(nn.Module):
                     norm2.variance_epsilon,
                     norm3.variance_epsilon,
                 )
-                return hidden_states, None
+                return hidden_states
 
             hidden_states_1 = self.post_feedforward_layernorm_1(hidden_states_1)
             hidden_states_2 = self.post_feedforward_layernorm_2(hidden_states_2)
@@ -731,11 +830,9 @@ class Gemma4DecoderLayer(nn.Module):
             # Combine branches
             hidden_states = hidden_states_1 + hidden_states_2
         else:
-            # Fuse: hidden_states + residual -> residual; pre_ff_norm(residual) -> hidden_states
-            hidden_states, residual = self.pre_feedforward_layernorm(
-                hidden_states, residual
+            hidden_states = self.ffn_boundary.sum_part(
+                self.mlp(hidden_states), forward_batch, SumGroup.TP
             )
-            hidden_states = self.mlp(hidden_states)
 
         if (
             not self.has_ple
@@ -767,7 +864,7 @@ class Gemma4DecoderLayer(nn.Module):
                 hidden_states = hidden_states + per_layer_contribution
 
             hidden_states = hidden_states * self.layer_scalar
-        return hidden_states, None
+        return hidden_states
 
 
 class Gemma4TextModel(PreTrainedModel):
@@ -782,7 +879,7 @@ class Gemma4TextModel(PreTrainedModel):
         self.quant_config = quant_config
         self.vocab_size = config.vocab_size
         self.padding_idx = getattr(config, "pad_token_id", None)
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
 
         # Token / per-layer embedding tables and the per-layer projection only
         # produce activations consumed at the model entry, so they live on the
@@ -863,7 +960,7 @@ class Gemma4TextModel(PreTrainedModel):
             self.per_layer_input_scale = None
             self.per_layer_projection_scale = None
 
-        self.layers, self.start_layer, self.end_layer = make_layers(
+        self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
             lambda idx, prefix: Gemma4DecoderLayer(
                 layer_id=idx,
@@ -871,9 +968,8 @@ class Gemma4TextModel(PreTrainedModel):
                 quant_config=quant_config,
                 prefix=prefix,
             ),
-            pp_rank=self.pp_group.rank_in_group,
-            pp_size=self.pp_group.world_size,
             prefix=add_prefix("layers", prefix),
+            stage_facts=lambda idx: Gemma4DecoderLayer.stage_facts(config, idx),
         )
 
         if self.pp_group.is_last_rank:
@@ -881,7 +977,132 @@ class Gemma4TextModel(PreTrainedModel):
         else:
             self.norm = PPMissingLayer()
         self.layers_to_capture = []
+        self._ar_fusion = self._maybe_init_ar_fusion(config)
         self.post_init()
+
+    # Block-FP8 linears that take the fused site's pre-quantized (fp8, scales)
+    # input (see compressed_tensors_w8a8_fp8.apply_weights).
+    _AR_FUSION_LINEARS = (
+        "deepgemm_w8a8_block_fp8_linear_with_fallback",
+        "triton_w8a8_block_fp8_linear",
+    )
+
+    @classmethod
+    def _ar_fusion_linear_reason(cls, layers) -> Optional[str]:
+        """Why a layer's qkv_proj or gate_up_proj cannot take the fused site's
+        output, or None when every consumer in ``layers`` can."""
+        for i, layer in enumerate(layers):
+            for name, proj in (
+                ("qkv_proj", layer.self_attn.qkv_proj),
+                ("gate_up_proj", layer.mlp.gate_up_proj),
+            ):
+                linear = getattr(
+                    getattr(proj, "scheme", None), "w8a8_block_fp8_linear", None
+                )
+                linear_name = getattr(getattr(linear, "func", linear), "__name__", "")
+                if linear_name not in cls._AR_FUSION_LINEARS:
+                    return (
+                        f"layer {i} {name}: block-FP8 linear "
+                        f"{linear_name or 'missing'} takes no pre-quantized input"
+                    )
+        return None
+
+    def _maybe_init_ar_fusion(
+        self, config
+    ) -> Optional["gemma4_ar_fusion.Gemma4ArFusion"]:
+        """The fused all-reduce sites (layers/communication/gemma4_ar_fusion.py)
+        when requested and this model fits them."""
+        if not gemma4_ar_fusion.requested():
+            return None
+        layers = self.layers[self.start_layer : self.end_layer]
+        dtype = layers[0].input_layernorm.weight.dtype
+        linear_reason = self._ar_fusion_linear_reason(layers)
+        reasons = [
+            why
+            for bad, why in (
+                (self.pp_group.world_size != 1, "pipeline parallel"),
+                (self.hidden_size_per_layer_input > 0, "per-layer embeddings"),
+                (Gemma4DecoderLayer._enable_moe_block(config), "MoE block"),
+                # the kernel reads bf16 residual rows and norm weights
+                (dtype != torch.bfloat16, f"dtype {dtype} (needs bfloat16)"),
+                # the adapter GEMMs take a bf16 tensor, not (fp8, scales)
+                (get_lora().enable_lora, "LoRA"),
+                (linear_reason is not None, linear_reason),
+            )
+            if bad
+        ]
+        if reasons:
+            logger.warning("SGLANG_GEMMA4_AR_FUSION=1 ignored: %s", ", ".join(reasons))
+            return None
+        return gemma4_ar_fusion.Gemma4ArFusion.create(
+            config.hidden_size, config.rms_norm_eps
+        )
+
+    def _ar_fusion_applies(
+        self, forward_batch, num_tokens, per_layer_inputs, pp_proxy_tensors
+    ) -> bool:
+        mode = forward_batch.forward_mode
+        return (
+            (mode == ForwardMode.EXTEND or mode.is_mixed())
+            and self._ar_fusion.applies(num_tokens)
+            and per_layer_inputs is None
+            and pp_proxy_tensors is None
+            and not self.layers_to_capture
+            and not get_forward().sp_active
+        )
+
+    def _forward_ar_fusion(
+        self, positions, forward_batch, input_embeds
+    ) -> torch.Tensor:
+        """The layer stack with every TP all-reduce + epilogue as one fused site.
+
+        This rank keeps only its own rows of the residual stream; each site
+        returns the next GEMM's FP8 input for all rows. Same math as
+        Gemma4DecoderLayer.forward: the attention site rounds the
+        post-attention norm to bf16 before the add, the MLP site adds in fp32
+        and scales.
+        """
+        fusion = self._ar_fusion
+        if not fusion.used:
+            fusion.used = True
+            logger.info(
+                "gemma4 all-reduce fusion: first fused forward (%d tokens)",
+                input_embeds.shape[0],
+            )
+        row0, rows = fusion.rows(input_embeds.shape[0])
+        residual = input_embeds[row0 : row0 + rows].clone()
+        x = self.layers[self.start_layer].input_layernorm(input_embeds)
+        for idx in range(self.start_layer, self.end_layer):
+            layer = self.layers[idx]
+            h = layer.self_attn(
+                positions=positions, hidden_states=x, forward_batch=forward_batch
+            )
+            x = fusion.site(
+                h,
+                residual,
+                layer.post_attention_layernorm.weight,
+                layer.pre_feedforward_layernorm.weight,
+                None,
+                round_a=True,
+            )
+            h = layer.mlp(x)
+            if idx + 1 < self.end_layer:
+                x = fusion.site(
+                    h,
+                    residual,
+                    layer.post_feedforward_layernorm.weight,
+                    self.layers[idx + 1].input_layernorm.weight,
+                    layer.layer_scalar,
+                    round_a=False,
+                )
+            else:
+                x = fusion.final(
+                    h,
+                    residual,
+                    layer.post_feedforward_layernorm.weight,
+                    layer.layer_scalar,
+                )
+        return self.norm(x)
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.embed_tokens
@@ -968,61 +1189,60 @@ class Gemma4TextModel(PreTrainedModel):
         **kwargs,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, List[torch.Tensor]], PPProxyTensors]:
         if self.pp_group.is_first_rank:
-            if (input_ids is None) ^ (input_embeds is not None):
-                raise ValueError(
-                    "You must specify exactly one of input_ids or inputs_embeds"
-                )
-
-            if input_ids is not None:
+            if input_embeds is None:
+                if input_ids is None:
+                    raise ValueError("input_ids or input_embeds is required")
                 input_embeds = self.embed_tokens(input_ids)
+            # Prefill graphs supply embeddings and IDs for the per-layer table.
+            if per_layer_inputs is None and input_ids is not None:
                 per_layer_inputs = self.get_per_layer_inputs(input_ids)
             per_layer_inputs = self.project_per_layer_inputs(
                 input_embeds, per_layer_inputs
             )
+            if self._ar_fusion is not None and self._ar_fusion_applies(
+                forward_batch, input_embeds.shape[0], per_layer_inputs, pp_proxy_tensors
+            ):
+                return self._forward_ar_fusion(positions, forward_batch, input_embeds)
             hidden_states = input_embeds
+            residual_batch.start(forward_batch)
         else:
             assert pp_proxy_tensors is not None, (
                 "pp_proxy_tensors is required on non-first PP ranks"
             )
-            hidden_states = pp_proxy_tensors["hidden_states"]
+            hidden_states = self.layers[self.start_layer].attn_boundary.from_pp(
+                pp_proxy_tensors, forward_batch
+            )
             # PLE inputs were computed on rank 0 and forwarded along the
             # pipeline; non-PLE models simply omit the key.
             per_layer_inputs = pp_proxy_tensors.tensors.get("per_layer_inputs", None)
 
-        aux_hidden_states = []
+        aux_hidden_states = AuxHiddenStateList()
         num_layers = self.config.num_hidden_layers
 
         for layer_idx in range(self.start_layer, self.end_layer):
-            if layer_idx in self.layers_to_capture:
-                aux_hidden_states.append(hidden_states)
-
             if per_layer_inputs is not None:
                 per_layer_input = per_layer_inputs[:, layer_idx, :]
             else:
                 per_layer_input = None
-            layer = self.layers[layer_idx]
-            layer_outputs = layer(
+            hidden_states = self.layers[layer_idx](
                 positions=positions,
                 hidden_states=hidden_states,
                 per_layer_input=per_layer_input,
                 forward_batch=forward_batch,
+                capture_output=aux_hidden_states.capture
+                if layer_idx in self.layers_to_capture
+                else None,
                 **kwargs,
             )
-            hidden_states = layer_outputs[0]
-            # Gemma4DecoderLayer.forward always returns (hidden_states, None);
-            # the residual is fused inside the layer, so nothing to thread.
 
         if not self.pp_group.is_last_rank:
-            # cuda_graph_runner allocates a fixed PP-proxy schema of
-            # {hidden_states, residual} and KeyErrors if a model omits a key.
-            # Gemma4 fuses the residual inside each layer so we don't have a
-            # standalone tensor to forward; emit a zero placeholder instead so
-            # graph replay can still copy it.  The receiving stage never reads
-            # this key.
-            proxy = {
-                "hidden_states": hidden_states,
-                "residual": torch.zeros_like(hidden_states),
-            }
+            # Each layer writes the whole stream at its FFN exit, so it goes as
+            # hidden_states alone. cuda_graph_runner allocates a fixed PP-proxy
+            # schema of {hidden_states, residual} and KeyErrors if a model
+            # omits a key, so a zero placeholder fills the residual; the
+            # receiving stage never reads it.
+            proxy = residual_batch.to_pp(hidden_states, forward_batch).tensors
+            proxy["residual"] = torch.zeros_like(hidden_states)
             if per_layer_inputs is not None:
                 proxy["per_layer_inputs"] = per_layer_inputs
             return PPProxyTensors(proxy)
@@ -1033,7 +1253,9 @@ class Gemma4TextModel(PreTrainedModel):
         if num_layers in self.layers_to_capture:
             aux_hidden_states.append(hidden_states)
 
-        hidden_states = self.norm(hidden_states)
+        hidden_states = residual_batch.final_norm(
+            hidden_states, forward_batch, self.norm
+        )
 
         if len(aux_hidden_states) == 0:
             return hidden_states
@@ -1090,9 +1312,10 @@ class Gemma4ForCausalLM(PreTrainedModel):
         prefix: str = "",
     ) -> None:
         super().__init__(config=config)
-        self.pp_group = get_pp_group()
+        self.pp_group = get_parallel().pp_group
         self.config = config
         self.quant_config = quant_config
+        self._shared_vocab_tp_group = _resolve_linear_group("tp")
 
         self.model = Gemma4TextModel(
             config=config, quant_config=quant_config, prefix=add_prefix("model", prefix)
@@ -1387,24 +1610,26 @@ class Gemma4ForCausalLM(PreTrainedModel):
                     logger.log(level, "%s: %s", msg, names)
         return loaded_params
 
-    def _shard_weight(self, weight: torch.Tensor) -> torch.Tensor:
-        """Shard a full embedding/lm_head weight along vocab dim for the current TP rank.
-
-        Gemma4 uses nn.Embedding (unsharded) but the Eagle3 draft model uses
-        VocabParallelEmbedding (sharded). This method extracts the correct
-        shard so the weights can be shared.
-        """
-        tp_size = get_parallel().tp_size
+    def _shard_weight(
+        self, weight: torch.Tensor, *, draft_embedding=None
+    ) -> torch.Tensor:
+        group = self._shared_vocab_tp_group
+        if draft_embedding is not None:
+            group = (
+                draft_embedding.tp_group
+                if isinstance(draft_embedding, VocabParallelEmbedding)
+                else None
+            )
+        tp_rank, tp_size = get_group_rank_size(group)
         if tp_size <= 1:
             return weight
-        tp_rank = get_parallel().tp_rank
         shard_size = (weight.shape[0] + tp_size - 1) // tp_size
         return weight[tp_rank * shard_size : (tp_rank + 1) * shard_size]
 
     def get_embed(self):
         return self._shard_weight(self.model.embed_tokens.weight)
 
-    def get_embed_and_head(self):
+    def get_embed_and_head(self, *, draft_embedding=None):
         if self.pp_group.world_size > 1:
             # Under PP, embed_tokens lives on the first rank and lm_head on
             # the last; neither rank holds both tensors, so we can't return
@@ -1418,9 +1643,14 @@ class Gemma4ForCausalLM(PreTrainedModel):
                 "PP rank and lm_head on the last; use --pp-size 1 if you "
                 "need this API."
             )
-        embed = self._shard_weight(self.model.embed_tokens.weight)
-        head = self._shard_weight(self.lm_head.weight)
+        embed = self._shard_weight(
+            self.model.embed_tokens.weight, draft_embedding=draft_embedding
+        )
+        head = self._shard_weight(self.lm_head.weight, draft_embedding=draft_embedding)
         return embed, head
+
+    def get_embed_and_head_for_draft(self, draft_embedding):
+        return self.get_embed_and_head(draft_embedding=draft_embedding)
 
     def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
         if layer_ids is None:

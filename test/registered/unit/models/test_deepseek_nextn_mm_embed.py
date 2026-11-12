@@ -11,11 +11,11 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.srt.managers.schedule_batch import MM_PAD_SHIFT_VALUE
+from sglang.srt.managers.req_types import MM_PAD_SHIFT_VALUE
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=30, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 VOCAB_SIZE = 154880
 HIDDEN_SIZE = 64  # tiny for CPU test
@@ -93,14 +93,6 @@ class TestDeepseekNextNMmEmbed(CustomTestCase):
 
         with (
             patch(
-                "sglang.srt.models.deepseek_nextn.dsa_use_prefill_cp",
-                return_value=False,
-            ),
-            patch(
-                "sglang.srt.models.deepseek_nextn.mla_use_prefill_cp",
-                return_value=False,
-            ),
-            patch(
                 "sglang.srt.models.deepseek_nextn.fused_eh_norm",
                 side_effect=lambda h, p, ew, hw, eps: torch.cat(
                     [model.enorm(h), model.hnorm(p)], dim=-1
@@ -157,14 +149,6 @@ class TestDeepseekNextNMmEmbed(CustomTestCase):
         embed_calls = mock_embed.call_args_list
 
         with (
-            patch(
-                "sglang.srt.models.deepseek_nextn.dsa_use_prefill_cp",
-                return_value=False,
-            ),
-            patch(
-                "sglang.srt.models.deepseek_nextn.mla_use_prefill_cp",
-                return_value=False,
-            ),
             patch(
                 "sglang.srt.models.deepseek_nextn.fused_eh_norm",
                 side_effect=lambda h, p, ew, hw, eps: torch.cat(

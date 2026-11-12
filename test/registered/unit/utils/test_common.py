@@ -1,17 +1,33 @@
+import gc
+import io
+import sys
 import unittest
 from array import array
+from unittest import mock
 
 import torch
+from PIL import Image
 
-from sglang.srt.utils.common import (
-    flatten_arrays_to_int64_tensor,
-    get_device_sm_nvidia_smi,
+from sglang.srt.multimodal.media_io import _load_image
+from sglang.srt.utils.common import flatten_arrays_to_int64_tensor
+from sglang.srt.utils.device import (
+    _get_device_sm_via_nvml,
     get_nvidia_driver_version_str,
+    is_gfx95_supported,
+    is_gfx942_supported,
+    is_gfx1250_supported,
+    is_hip,
 )
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.srt.utils.log_utils import freeze_gc
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cpu_ci,
+    register_cuda_ci,
+)
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=5, stage="stage-b", runner_config="1-gpu-small-amd")
 
 
@@ -121,27 +137,142 @@ class TestNvidiaDriverVersionStr(CustomTestCase):
             subprocess.run = original
 
 
-class TestGetDeviceSmNvidiaSmi(CustomTestCase):
-    """`get_device_sm_nvidia_smi` parses nvidia-smi output into a (major,
-    minor) tuple and falls back to (0, 0) -- logging via `logger.error` --
-    when nvidia-smi fails. The success path needs a GPU; the fallback path is
-    covered here by forcing a failure and asserting the (0, 0) return. The
-    fallback path needs no GPU, so this test runs on CPU.
-    """
+class TestLoadImage(CustomTestCase):
+    def test_corrupt_image_bytes_raise_value_error(self):
+        buf = io.BytesIO()
+        Image.new("RGB", (16, 16), (10, 120, 200)).save(buf, format="PNG")
+        valid_png = buf.getvalue()
 
-    def test_fallback_on_failure_returns_zero_zero(self):
-        import subprocess
+        broken_chunk_png = bytearray(valid_png)
+        idat_pos = broken_chunk_png.index(b"IDAT")
+        broken_chunk_png[idat_pos - 1] -= 6
 
-        original = subprocess.run
+        img = _load_image(image_bytes=valid_png, gpu_image_decode=False)
+        self.assertEqual(img.size, (16, 16))
 
-        def boom(*a, **k):
-            raise subprocess.CalledProcessError(1, "nvidia-smi")
+        cases = [
+            b"not an image",
+            b"",
+            valid_png[: len(valid_png) // 2],
+            bytes(broken_chunk_png),
+        ]
+        for image_bytes in cases:
+            with self.subTest(length=len(image_bytes)):
+                with self.assertRaisesRegex(ValueError, "Could not decode image"):
+                    _load_image(
+                        image_bytes=image_bytes,
+                        gpu_image_decode=False,
+                    )
 
-        subprocess.run = boom
+
+class _FakePynvml:
+    """Records the NVML index it was asked for, so a test can tell which
+    physical GPU the helper would have reported."""
+
+    def __init__(self, capability=(9, 0)):
+        self.capability = capability
+        self.requested_index = None
+        self.initialized = False
+
+    def nvmlInit(self):
+        self.initialized = True
+
+    def nvmlShutdown(self):
+        pass
+
+    def nvmlDeviceGetHandleByIndex(self, index):
+        self.requested_index = index
+        return f"handle-{index}"
+
+    def nvmlDeviceGetCudaComputeCapability(self, handle):
+        return self.capability
+
+
+class TestGetDeviceSmViaNvml(CustomTestCase):
+    """The torch ordinal and the NVML index differ under CUDA_VISIBLE_DEVICES
+    and MIG; without that mapping the helper must return None, not GPU 0."""
+
+    def test_torch_exposes_the_mapping_api(self):
+        # The cases below install the private attribute themselves, so they stay
+        # green on a torch that dropped it while the helper silently falls back.
+        self.assertTrue(hasattr(torch.cuda, "_get_nvml_device_index"))
+
+    def test_maps_the_torch_ordinal_to_the_nvml_index(self):
+        fake = _FakePynvml(capability=(9, 0))
+        with (
+            mock.patch.dict(sys.modules, {"pynvml": fake}),
+            mock.patch.object(
+                torch.cuda, "_get_nvml_device_index", lambda index: 3, create=True
+            ),
+        ):
+            self.assertEqual(_get_device_sm_via_nvml(), 90)
+        self.assertEqual(fake.requested_index, 3)
+
+    def test_returns_none_when_the_mapping_api_is_absent(self):
+        fake = _FakePynvml()
+        saved = torch.cuda.__dict__.pop("_get_nvml_device_index", None)
         try:
-            self.assertEqual(get_device_sm_nvidia_smi(), (0, 0))
+            with mock.patch.dict(sys.modules, {"pynvml": fake}):
+                self.assertIsNone(_get_device_sm_via_nvml())
         finally:
-            subprocess.run = original
+            if saved is not None:
+                torch.cuda._get_nvml_device_index = saved
+        self.assertFalse(fake.initialized, "must not query NVML without the mapping")
+
+    def test_returns_none_when_the_mapping_api_raises(self):
+        fake = _FakePynvml()
+
+        def boom(index):
+            raise RuntimeError("no such device")
+
+        with (
+            mock.patch.dict(sys.modules, {"pynvml": fake}),
+            mock.patch.object(torch.cuda, "_get_nvml_device_index", boom, create=True),
+        ):
+            self.assertIsNone(_get_device_sm_via_nvml())
+        self.assertFalse(fake.initialized, "must not query NVML without the mapping")
+
+
+class TestHipProbes(CustomTestCase):
+    """These probes run at import time; a ROCm build with no visible GPU
+    (CPU-only workers, routers) must get False instead of a CUDA init error."""
+
+    PROBES = (is_hip, is_gfx95_supported, is_gfx942_supported, is_gfx1250_supported)
+
+    def setUp(self):
+        for probe in self.PROBES:
+            probe.cache_clear()
+            self.addCleanup(probe.cache_clear)
+
+    def test_returns_false_without_querying_the_device(self):
+        def boom(device):
+            raise RuntimeError("No CUDA GPUs are available")
+
+        with (
+            mock.patch.object(torch.version, "hip", "7.2.0"),
+            mock.patch.object(torch.cuda, "is_available", lambda: False),
+            mock.patch.object(torch.cuda, "get_device_properties", boom),
+        ):
+            for probe in self.PROBES:
+                with self.subTest(probe=probe.__name__):
+                    self.assertFalse(probe())
+
+    def test_is_hip_with_a_visible_device(self):
+        with (
+            mock.patch.object(torch.version, "hip", "7.2.0"),
+            mock.patch.object(torch.cuda, "is_available", lambda: True),
+        ):
+            self.assertTrue(is_hip())
+
+
+class TestFreezeGc(CustomTestCase):
+    def setUp(self):
+        self.addCleanup(gc.set_threshold, *gc.get_threshold())
+        self.addCleanup(gc.unfreeze)
+
+    def test_applies_configured_threshold(self):
+        freeze_gc("test", [700, 10, 1000])
+        self.assertEqual(gc.get_threshold(), (700, 10, 1000))
 
 
 if __name__ == "__main__":

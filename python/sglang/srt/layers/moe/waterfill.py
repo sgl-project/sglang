@@ -77,16 +77,14 @@ class WaterfillBalancer:
         world_size: int,
         rank: int,
         layer_id: int,
-        routed_scaling_factor: float = 1.0,
+        shared_weight: float,
     ):
         self.num_routed_experts = num_routed_experts
         self.world_size = world_size
         self.rank = rank
         self.layer_id = layer_id
         self.old_experts_per_rank = num_routed_experts // world_size
-        self.shared_weight = (
-            1.0 / routed_scaling_factor if routed_scaling_factor != 0 else 1.0
-        )
+        self.shared_weight = shared_weight
         self._counts_buf: Optional[Tensor] = None
         self.use_static_waterfill = not envs.SGLANG_DISABLE_STATIC_WATERFILL.get()
 
@@ -167,12 +165,12 @@ class WaterfillBalancer:
         local_routed_counts: Tensor, num_tokens: int
     ) -> Tuple[Tensor, Tensor]:
         """Aggregate dynamic load with SGLang EP communication."""
-        from sglang.srt.distributed import get_moe_ep_group
         from sglang.srt.distributed.communication_op import (
             moe_expert_parallel_all_reduce,
         )
+        from sglang.srt.runtime_context import get_parallel
 
-        group = get_moe_ep_group()
+        group = get_parallel().moe_ep_group
         world = group.world_size
         buf = torch.zeros(
             world * 2, dtype=torch.int64, device=local_routed_counts.device

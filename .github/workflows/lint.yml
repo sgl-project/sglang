@@ -57,6 +57,12 @@ jobs:
           workspaces: rust
           shared-key: "rust-workspace-lint"
 
+      # The export-cookbook-commands pre-commit hook runs node.
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
       - name: Run pre-commit checks
         run: SKIP=no-commit-to-branch pre-commit run --all-files --show-diff-on-failure
 
@@ -65,17 +71,20 @@ jobs:
         with:
           args: --config .github/linters/lychee.toml README.md
 
+      - name: Check cookbook authoring contracts
+        run: |
+          node docs/scripts/check_cookbook_configs.mjs
+          node --test docs/scripts/tests/*.test.mjs
+
+      - name: Test PR title check
+        run: node --test .github/scripts/pr-title.test.cjs
+
+      - name: Test PR health action
+        run: node --test .github/actions/check-pr-test-health/action.test.cjs
+
       # docs/ (Mintlify) internal-link check. Runs only in CI — contributors
       # are NOT required to install `mint` for local pre-commit. External links
       # are covered separately by the nightly lychee job (no --check-external here).
-      - name: Set up Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-
-      - name: Check cookbook authoring contracts
-        run: node docs/scripts/check_cookbook_configs.mjs
-
       - name: Cache mint
         uses: actions/cache@v4
         with:
