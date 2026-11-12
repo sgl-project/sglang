@@ -1,0 +1,1 @@
+import sglang_simulator.bootstrap; sglang_simulator.bootstrap.activate_from_env()

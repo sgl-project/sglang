@@ -25,14 +25,16 @@ The simulator supports:
 Use the simulator and SGLang source from the same monorepo checkout:
 
 ```bash
-python3 -m pip install -e tools/sglang-simulator
+python3 -m pip install tools/sglang-simulator
 export PYTHONPATH="$PWD/tools/sglang-simulator/src:$PWD/python"
 ```
+
+Use a standard installation rather than an editable install so Python installs the simulator's early-startup bridge.
 
 Install the AISimulate extra for the simulator runtime. The current shared import and memory-estimation paths also load the SDK when using ML or replay predictors:
 
 ```bash
-python3 -m pip install -e "tools/sglang-simulator[aisimulate]"
+python3 -m pip install "tools/sglang-simulator[aisimulate]"
 ```
 
 The SDK requires Python 3.11–3.13 and NumPy `>=2.1,<3`. Prepare a compatible SGLang runtime and its dependencies before installing the estimator extra. For existing AIConfigurator environments, see [Migrating from AIConfigurator](https://github.com/sgl-project/sglang/tree/main/tools/sglang-simulator#migrating-from-aiconfigurator) for the uninstall/install steps and renamed configuration and Python interfaces.
@@ -55,6 +57,29 @@ python3 -m sglang_simulator.simulation.sglang.launch_server \
 ```
 
 `OFFLINE` advances the simulator's logical clock without sleeping. `BLOCKING` also sleeps for predicted forward and cache-load latency, which is useful when a client must observe simulated wall-clock pacing.
+
+### Use an external harness
+
+An external harness can keep its normal process entry point and opt into the existing simulator hooks. Set the activation marker before Python starts:
+
+```bash
+export SGLANG_SIMULATOR_BOOTSTRAP=1
+export SGLANG_SIMULATOR_CONFIG_PATH=tools/sglang-simulator/examples/sim_configs/replay.json
+export SGLANG_USE_CPU_ENGINE=1
+
+python3 -m dynamo.sglang \
+  --model-path tools/sglang-simulator/test/assets/qwen3-8b \
+  --load-format dummy \
+  --device cpu \
+  --attention-backend torch_native \
+  --prefill-attention-backend torch_native \
+  --decode-attention-backend torch_native \
+  --sampling-backend pytorch \
+  --disable-overlap-schedule \
+  --disable-cuda-graph
+```
+
+The marker installs simulator hooks before the harness imports SGLang and propagates activation to spawned scheduler and detokenizer workers. Startup stops if the hooks cannot be installed. The marker does not apply the standalone launcher's defaults, so the harness must still provide the simulator-compatible SGLang arguments shown above.
 
 ## Send a workload
 
