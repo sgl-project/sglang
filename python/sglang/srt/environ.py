@@ -798,6 +798,11 @@ class Envs:
     SGLANG_HISPARSE_RESIDENT = EnvBool(False)
     # HiSparse: resident requests back up to host when demoted, not every step.
     SGLANG_HISPARSE_LAZY_BACKUP = EnvBool(False)
+    # HiSparse: residency under speculative decoding (needs LAZY_BACKUP).
+    SGLANG_HISPARSE_SPEC_RESIDENT = EnvBool(False)
+    # HiSparse: lend the unused index-K reservation to the device KV pool; logical pages kept mapped above use.
+    SGLANG_HISPARSE_ELASTIC = EnvBool(False)
+    SGLANG_HISPARSE_ELASTIC_HEADROOM = EnvInt(4096)
     SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS = EnvBool(True)
     # Decode batches between SWA out-of-window evictions.
     SGLANG_SWA_EVICTION_INTERVAL = EnvInt(128)

@@ -42,6 +42,15 @@ struct SpecCacheState {
   int64_t ref_epoch_stride;
 };
 
+// HS_SPECRES: optional resident-request translation (resident == nullptr: disabled). A resident request's KV is in the
+// device pool at full_to_device[req_to_token[rid, position]].
+struct HsSpecResident {
+  const int8_t* __restrict__ resident;
+  const int32_t* __restrict__ req_to_token;
+  int64_t req_to_token_stride;
+  const int64_t* __restrict__ full_to_device;
+};
+
 struct SpecMissWorkspace {
   int32_t* __restrict__ locs;
   int32_t* __restrict__ metadata;
@@ -377,6 +386,126 @@ __device__ __forceinline__ int first_set_lane(BallotMask mask) {
 #endif
 }
 
+// HS_SPECFIX: the batched copies below need 16-byte rows of the private host pool; other row sizes, a late-bound
+// (HiCache) host pool and ROCm keep the stock per-warp copies.
+template <int ITEM_SIZE_BYTES, bool LateBoundHostBase>
+struct HsSpecBatchedCopy {
+#ifdef USE_ROCM
+  static constexpr bool value = false;
+#else
+  static constexpr bool value = ITEM_SIZE_BYTES % 16 == 0 && !LateBoundHostBase;
+#endif
+};
+
+#ifndef USE_ROCM
+// HS_SPECFIX: copy n_items rows of item_size_bytes (a multiple of 16) from host to device, src_loc(m) / dst_loc(m)
+// giving the row slots of item m. T threads take part (thread index g); each keeps kBatch 16-byte loads in flight
+// before any store (the single-step swap-in kernel's copy routine).
+template <int kBatch, typename SrcLoc, typename DstLoc>
+__device__ __forceinline__ void hs_copy_rows_flat(
+    int g,
+    int T,
+    int n_items,
+    int64_t item_size_bytes,
+    const char* __restrict__ host_base,
+    char* __restrict__ dev_base,
+    SrcLoc src_loc,
+    DstLoc dst_loc) {
+  const int pairs = static_cast<int>(item_size_bytes >> 4);
+  const int64_t total = static_cast<int64_t>(n_items) * pairs;
+  for (int64_t base = g; base < total; base += static_cast<int64_t>(T) * kBatch) {
+    uint64_t lo[kBatch], hi[kBatch];
+#pragma unroll
+    for (int u = 0; u < kBatch; ++u) {
+      const int64_t f = base + static_cast<int64_t>(u) * T;
+      if (f < total) {
+        const int m = static_cast<int>(f / pairs);
+        const int p = static_cast<int>(f - static_cast<int64_t>(m) * pairs);
+        const uint64_t* sp = reinterpret_cast<const uint64_t*>(host_base + src_loc(m) * item_size_bytes + p * 16);
+        asm volatile("ld.global.nc.v2.b64 {%0,%1},[%2];" : "=l"(lo[u]), "=l"(hi[u]) : "l"(sp) : "memory");
+      }
+    }
+#pragma unroll
+    for (int u = 0; u < kBatch; ++u) {
+      const int64_t f = base + static_cast<int64_t>(u) * T;
+      if (f < total) {
+        const int m = static_cast<int>(f / pairs);
+        const int p = static_cast<int>(f - static_cast<int64_t>(m) * pairs);
+        uint64_t* dp = reinterpret_cast<uint64_t*>(dev_base + dst_loc(m) * item_size_bytes + p * 16);
+        asm volatile("st.global.cg.v2.b64 [%0],{%1,%2};" ::"l"(dp), "l"(lo[u]), "l"(hi[u]) : "memory");
+      }
+    }
+  }
+}
+
+// HS_SPECFIX: copy the unique misses the gather kernel claimed for each request (scratch rows 0 .. min(work count,
+// scratch capacity)) from the host cache into their scratch slots: the rows the stock gather kernel copied itself.
+// Grid (batch, HS_SPEC_COPY_BLOCKS); the blocks of a request split its rows.
+constexpr int HS_SPEC_COPY_THREADS = 256;
+constexpr int HS_SPEC_COPY_BLOCKS = 4;
+template <int ITEM_SIZE_BYTES, int WORKSPACE_CAPACITY>
+__global__ __launch_bounds__(HS_SPEC_COPY_THREADS) void load_cache_to_device_buffer_spec_copy_kernel(
+    const int64_t* __restrict__ host_cache_locs,
+    const void* __restrict__ host_cache_k,
+    void* __restrict__ device_buffer_k,
+    const int64_t* __restrict__ req_pool_indices,
+    SpecMissWorkspace miss_workspace,
+    const int32_t* __restrict__ num_real_reqs,
+    int64_t host_stride,
+    HsSpecResident res) {
+  static_assert(ITEM_SIZE_BYTES % 16 == 0, "instantiated only for 16-byte rows (HsSpecBatchedCopy)");
+  constexpr int kChunk = 512;
+  __shared__ int64_t s_src[kChunk];
+  __shared__ int32_t s_dst[kChunk];
+  __shared__ int32_t s_n;
+  const int bid = blockIdx.x;
+  if (bid >= num_real_reqs[0]) return;
+  const int64_t rid = req_pool_indices[bid];
+  if (res.resident != nullptr && res.resident[rid] != 0) return;  // HS_SPECRES: nothing claimed
+  const int32_t* req_scratch_locs = miss_workspace.locs + rid * miss_workspace.loc_stride;
+  const int32_t* req_scratch_tokens = miss_workspace.metadata + rid * miss_workspace.metadata_stride;
+  const auto* req_scratch_table = reinterpret_cast<const unsigned long long*>(req_scratch_tokens);
+  const int32_t* req_compact_hash_positions = req_scratch_tokens + 4 * WORKSPACE_CAPACITY;
+  const int64_t* req_host_cache_locs = host_cache_locs + rid * host_stride;
+  const int32_t work_count = *(miss_workspace.counters + miss_workspace.counter_capacity + rid);
+  const int32_t n = min(work_count, static_cast<int32_t>(miss_workspace.loc_stride));
+  const int32_t per = (n + static_cast<int32_t>(gridDim.y) - 1) / static_cast<int32_t>(gridDim.y);
+  const int32_t m0 = static_cast<int32_t>(blockIdx.y) * per;
+  const int32_t m1 = min(n, m0 + per);
+  const auto host_base = static_cast<const char*>(host_cache_k);
+  auto dev_base = static_cast<char*>(device_buffer_k);
+  for (int32_t c0 = m0; c0 < m1; c0 += kChunk) {
+    const int32_t cnt = min(kChunk, m1 - c0);
+    __syncthreads();  // the previous chunk's copy has finished reading s_src / s_dst
+    if (threadIdx.x == 0) s_n = 0;
+    __syncthreads();
+    for (int i = threadIdx.x; i < cnt; i += HS_SPEC_COPY_THREADS) {
+      const int32_t m = c0 + i;
+      const int32_t hash_pos = req_compact_hash_positions[m] & CompactHashPosition<WORKSPACE_CAPACITY>::MASK;
+      const int32_t token = static_cast<int32_t>(static_cast<uint32_t>(req_scratch_table[hash_pos]));
+      const int32_t dst = req_scratch_locs[m];
+      int64_t src = -1;
+      if (token >= 0 && token < host_stride) src = req_host_cache_locs[token];
+      if (src >= 0 && dst >= 0) {
+        const int slot = atomicAdd(&s_n, 1);
+        s_src[slot] = src;
+        s_dst[slot] = dst;
+      }
+    }
+    __syncthreads();
+    hs_copy_rows_flat<8>(
+        threadIdx.x,
+        HS_SPEC_COPY_THREADS,
+        s_n,
+        ITEM_SIZE_BYTES,
+        host_base,
+        dev_base,
+        [&](int m) { return s_src[m]; },
+        [&](int m) { return static_cast<int64_t>(s_dst[m]); });
+  }
+}
+#endif
+
 template <int HOT_BUFFER_SIZE>
 __device__ __forceinline__ bool try_get_extra_page_device_loc(
     int32_t token_idx,
@@ -455,7 +584,8 @@ __global__ void load_cache_to_device_buffer_spec_gather_kernel(
     int64_t top_k_tokens_stride,
     int64_t top_k_device_locs_stride,
     int64_t plan_stride,
-    int64_t page_size) {
+    int64_t page_size,
+    HsSpecResident res) {
   const int bid = blockIdx.x;
   const int tid = threadIdx.x;
   constexpr int64_t total_occurrences = NUM_STEPS * NUM_TOP_K;
@@ -478,6 +608,20 @@ __global__ void load_cache_to_device_buffer_spec_gather_kernel(
   const int64_t global_warp = static_cast<int64_t>(blockIdx.y) * NUM_WARPS + warp_id;
   const int64_t occ = static_cast<int64_t>(lane_id) * total_warps + global_warp;
   const int64_t rid = req_pool_indices[bid];
+  // HS_SPECRES: a resident request's whole KV is in the device pool. Translate each occurrence through req_to_token and
+  // the logical-to-device map; no lookup, no claim, no copy (the block is uniform in rid, so returning early is safe).
+  if (res.resident != nullptr && res.resident[rid] != 0) {
+    if (occ < total_occurrences) {
+      const int64_t step = occ / NUM_TOP_K;
+      const int32_t token = top_k_tokens[bid * top_k_tokens_stride + occ];
+      const int64_t seq_len = static_cast<int64_t>(seq_lens[bid * NUM_STEPS + step]);
+      req_top_k_device_locs[occ] =
+          (token >= 0 && token < seq_len)
+              ? static_cast<int32_t>(res.full_to_device[res.req_to_token[rid * res.req_to_token_stride + token]])
+              : -1;
+    }
+    return;
+  }
   const int64_t buffer_offset = rid * buffer_stride_0;
 
   int32_t* req_device_buffer_tokens = device_buffer_tokens + buffer_offset;
@@ -633,9 +777,12 @@ __global__ void load_cache_to_device_buffer_spec_gather_kernel(
           miss_dst_out[bid * plan_stride + copy_miss_idx] = copy_loc;
         }
       }
-      const auto src_k = host_base + copy_src_loc * host_row_bytes;
-      auto dst_k = static_cast<char*>(device_buffer_k) + static_cast<int64_t>(copy_loc) * ITEM_SIZE_BYTES;
-      transfer_item_warp<ITEM_SIZE_BYTES>(lane_id, src_k, dst_k);
+      if constexpr (!HsSpecBatchedCopy<ITEM_SIZE_BYTES, LateBoundHostBase>::value) {  // HS_SPECFIX: else the copy
+                                                                                      // kernel copies it
+        const auto src_k = host_base + copy_src_loc * host_row_bytes;
+        auto dst_k = static_cast<char*>(device_buffer_k) + static_cast<int64_t>(copy_loc) * ITEM_SIZE_BYTES;
+        transfer_item_warp<ITEM_SIZE_BYTES>(lane_id, src_k, dst_k);
+      }
     }
     copy_mask &= ~(static_cast<BallotMask>(1) << owner_lane);
   }
@@ -671,13 +818,20 @@ __global__ void load_cache_to_device_buffer_spec_commit_kernel(
     int64_t top_k_device_locs_stride,
     int64_t buffer_stride_0,
     int64_t host_stride,
-    int64_t plan_stride) {
+    int64_t plan_stride,
+    HsSpecResident res) {
   device::PDLWaitPrimary<USE_PDL>();
   const int bid = blockIdx.x;
   if (bid >= num_real_reqs[0]) return;
 
   const int lane_id = threadIdx.x % WARP_SIZE;
   const int64_t rid = req_pool_indices[bid];
+  if (res.resident != nullptr && res.resident[rid] != 0) {  // HS_SPECRES: nothing to admit; an empty plan
+    if constexpr (RecordMissPlan) {
+      if (threadIdx.x == 0) miss_count_out[bid] = 0;
+    }
+    return;
+  }
   constexpr int64_t total_occurrences = NUM_STEPS * NUM_TOP_K;
   using RingState = PackedRingState<HOT_BUFFER_SIZE>;
   const int32_t packed_ring_state = cache_state.ring_state[rid];
@@ -716,6 +870,12 @@ __global__ void load_cache_to_device_buffer_spec_commit_kernel(
   const bool scratch_overflow = miss_count > miss_workspace.loc_stride;
   const int64_t compact_iterations = (miss_count + blockDim.x - 1) / blockDim.x;
   const bool lock_free_single_pass = compact_iterations == 1;
+#ifndef USE_ROCM
+  // HS_SPECFIX: overflow misses (beyond the scratch capacity) are collected per iteration and copied block-wide.
+  __shared__ int64_t s_ov_src[512];
+  __shared__ int32_t s_ov_dst[512];
+  __shared__ int32_t s_ov_n;
+#endif
 
   // The union fast path can preserve every token needed by this speculative group.
   // Its victim selection below partitions the ring by miss ordinal, avoiding
@@ -906,6 +1066,36 @@ __global__ void load_cache_to_device_buffer_spec_commit_kernel(
       }
     }
 
+#ifndef USE_ROCM
+    if constexpr (HsSpecBatchedCopy<ITEM_SIZE_BYTES, LateBoundHostBase>::value) {  // HS_SPECFIX: block-wide batched
+                                                                                   // overflow copies
+      __syncthreads();
+      if (threadIdx.x == 0) s_ov_n = 0;
+      __syncthreads();
+      if (copy_owner && copy_src_loc >= 0 && copy_dst_loc >= 0) {
+        if constexpr (RecordMissPlan) {
+          miss_src_out[bid * plan_stride + unique_idx] = copy_src_loc;
+          miss_dst_out[bid * plan_stride + unique_idx] = copy_dst_loc;
+        }
+        const int slot = atomicAdd(&s_ov_n, 1);
+        s_ov_src[slot] = copy_src_loc;
+        s_ov_dst[slot] = copy_dst_loc;
+      }
+      __syncthreads();
+      if (s_ov_n > 0) {
+        hs_copy_rows_flat<8>(
+            threadIdx.x,
+            blockDim.x,
+            s_ov_n,
+            ITEM_SIZE_BYTES,
+            static_cast<const char*>(host_cache_k),
+            static_cast<char*>(device_buffer_k),
+            [&](int m) { return s_ov_src[m]; },
+            [&](int m) { return static_cast<int64_t>(s_ov_dst[m]); });
+      }
+      continue;
+    }
+#endif
     BallotMask copy_mask = __ballot_sync(FULL_WARP_MASK, copy_owner);
     while (copy_mask != 0) {
       const int owner_lane = first_set_lane(copy_mask);
@@ -960,6 +1150,28 @@ __global__ void load_cache_to_device_buffer_spec_commit_kernel(
   }
 
   __syncthreads();
+#ifndef USE_ROCM
+  // HS_SPECFIX: one failed cuckoo insert set the request's degraded flag for good (the flag is shared by all layers),
+  // and from then on every ring lookup miss in every layer scanned all HOT_BUFFER_SIZE slots. Rebuild this layer's two
+  // banks from the buffer's token table and clear the flag unless the rebuild itself fails.
+  if (s_hash_degraded != 0) {
+    for (int64_t i = threadIdx.x; i < cache_state.hash_size; i += blockDim.x) {
+      req_ring_hash_keys[i] = -1;
+      req_ring_hash_vals[i] = -1;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) s_hash_degraded = 0;
+    __syncthreads();
+    for (int32_t slot = threadIdx.x; slot < HOT_BUFFER_SIZE; slot += blockDim.x) {
+      const int32_t tok = req_device_buffer_tokens[slot];
+      if (tok >= 0 && ring_hash_insert_atomic<HOT_BUFFER_SIZE>(
+                          req_ring_hash_keys, req_ring_hash_vals, cache_state.hash_size, tok, slot) < 0) {
+        atomicExch(&s_hash_degraded, 1);
+      }
+    }
+    __syncthreads();
+  }
+#endif
   if (threadIdx.x == 0) {
     miss_workspace.counters[rid] = miss_count;
     if constexpr (RecordMissPlan) {
@@ -1006,10 +1218,28 @@ void load_cache_to_device_buffer_spec(
     tvm::ffi::TensorView miss_dst_out,
     tvm::ffi::TensorView miss_count_out,
     tvm::ffi::TensorView device_locs,
-    tvm::ffi::TensorView host_binding) {
+    tvm::ffi::TensorView host_binding,
+    tvm::ffi::TensorView resident,
+    tvm::ffi::TensorView req_to_token,
+    tvm::ffi::TensorView full_to_device) {
   using namespace host;
 
   static_assert(NUM_STEPS >= 1 && NUM_STEPS <= 8, "HiSparse speculative swap requires 1-8 steps.");
+  // HS_SPECRES: optional resident-request translation (empty tensors = disabled)
+  HsSpecResident res{nullptr, nullptr, 0, nullptr};
+  if (!(resident.ndim() == 0 || resident.shape()[0] == 0)) {
+    const auto rd = resident.dtype();
+    const auto td = req_to_token.dtype();
+    const auto fd = full_to_device.dtype();
+    RuntimeCheck(
+        rd.code == kDLInt && rd.bits == 8 && td.code == kDLInt && td.bits == 32 && fd.code == kDLInt && fd.bits == 64 &&
+            req_to_token.ndim() == 2 && req_to_token.strides()[1] == 1,
+        "speculative resident must be int8, req_to_token row-contiguous int32 [slots, len], full_to_device int64.");
+    res.resident = static_cast<const int8_t*>(resident.data_ptr());
+    res.req_to_token = static_cast<const int32_t*>(req_to_token.data_ptr());
+    res.req_to_token_stride = req_to_token.strides()[0];
+    res.full_to_device = static_cast<const int64_t*>(full_to_device.data_ptr());
+  }
   static_assert(NUM_TOP_K >= 1024, "HiSparse speculative swap requires top_k >= 1024.");
   static_assert(NUM_STEPS * NUM_TOP_K <= 16384, "HiSparse speculative swap supports at most 16384 occurrences.");
   static_assert(
@@ -1107,7 +1337,19 @@ void load_cache_to_device_buffer_spec(
   TensorMatcher({bs * NUM_STEPS}).with_dtype<int32_t>().with_device(cuda_device).verify(seq_lens);
   const auto device = cuda_device.unwrap();
 
-  const uint32_t tiles = static_cast<uint32_t>((total_occurrences + BLOCK_SIZE - 1) / BLOCK_SIZE);
+  uint32_t tiles = static_cast<uint32_t>((total_occurrences + BLOCK_SIZE - 1) / BLOCK_SIZE);
+#ifndef USE_ROCM
+  // HS_SPECFIX: the gather kernel shares one ring lookup between the draft steps of a top-k position only when the warp
+  // count divides NUM_TOP_K (3 draft tokens, 64-thread blocks: 192 warps, which does not divide 2048). Round it up to a
+  // power of two when that makes the sharing apply.
+  {
+    constexpr uint32_t kWarps = BLOCK_SIZE / WARP_SIZE;
+    uint32_t p = 1;
+    while (p < tiles * kWarps)
+      p <<= 1;
+    if (NUM_TOP_K % p == 0 && NUM_STEPS * (NUM_TOP_K / p) <= WARP_SIZE) tiles = (p + kWarps - 1) / kWarps;
+  }
+#endif
   LaunchKernel(dim3(static_cast<uint32_t>(bs), tiles), BLOCK_SIZE, device)(
       load_cache_to_device_buffer_spec_gather_kernel<
           BLOCK_SIZE,
@@ -1142,7 +1384,24 @@ void load_cache_to_device_buffer_spec(
       top_k_tokens_stride,
       top_k_device_locs_stride,
       plan_stride,
-      page_size);
+      page_size,
+      res);
+
+#ifndef USE_ROCM
+  if constexpr (HsSpecBatchedCopy<ITEM_SIZE_BYTES, LateBoundHostBase>::value) {
+    // HS_SPECFIX: batched copy of the claimed misses; the commit kernel's PDL wait covers it (no early trigger).
+    LaunchKernel(dim3(static_cast<uint32_t>(bs), HS_SPEC_COPY_BLOCKS), HS_SPEC_COPY_THREADS, device)(
+        load_cache_to_device_buffer_spec_copy_kernel<ITEM_SIZE_BYTES, WORKSPACE_CAPACITY>,
+        static_cast<const int64_t*>(host_cache_locs.data_ptr()),
+        host_cache_k.data_ptr(),
+        device_buffer_k.data_ptr(),
+        static_cast<const int64_t*>(req_pool_indices.data_ptr()),
+        miss_workspace,
+        static_cast<const int32_t*>(num_real_reqs.data_ptr()),
+        host_stride,
+        res);
+  }
+#endif
 
   LaunchKernel(dim3(static_cast<uint32_t>(bs)), 512, device)
       .enable_pdl(USE_PDL)(
@@ -1175,7 +1434,8 @@ void load_cache_to_device_buffer_spec(
           top_k_device_locs_stride,
           buffer_stride_0,
           host_stride,
-          plan_stride);
+          plan_stride,
+          res);
 }
 
 }  // namespace sglang

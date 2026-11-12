@@ -97,6 +97,9 @@ def load_cache_to_device_buffer_spec_mla(
     miss_count: torch.Tensor | None = None,
     device_locs: torch.Tensor | None = None,
     host_binding: torch.Tensor | None = None,
+    resident: torch.Tensor | None = None,
+    req_to_token: torch.Tensor | None = None,
+    full_to_device: torch.Tensor | None = None,
 ) -> None:
     """Resolve all speculative steps and swap unique misses in one launch pair.
 
@@ -219,6 +222,9 @@ def load_cache_to_device_buffer_spec_mla(
         miss_count,
         device_locs if device_locs is not None else empty_device,
         host_binding if host_binding is not None else empty_device,
+        resident if resident is not None else empty_device,  # HS_SPECRES
+        req_to_token if req_to_token is not None else empty_device,
+        full_to_device if full_to_device is not None else empty_device,
     )
 
 

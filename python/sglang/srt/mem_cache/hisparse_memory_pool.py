@@ -61,6 +61,28 @@ class HiSparseDSATokenToKVPool(HiSparseDevicePoolMappingMixin, DSATokenToKVPool)
         kv_scale_ue8m0: bool = False,
         use_fp4_indexer: bool = False,
     ):
+        # HS_ELASTIC: sizes the VMM-backed buffers need before the parent constructors create them
+        from sglang.srt.environ import envs as _hs_envs
+
+        self._hs_el = None
+        if _hs_envs.SGLANG_HISPARSE_ELASTIC.get():
+            ibs = int(size * host_to_device_ratio) // page_size * page_size
+            skips = (
+                list(skip_topk_layers)
+                if skip_topk_layers is not None
+                else [False] * layer_num
+            )
+            self._hs_el = dict(
+                size=size,
+                ik_pages=(ibs + page_size + 1) // page_size,  # IndexKeyCache's rule
+                n_ik=sum(1 for x in skips if not x),
+                ik_page_bytes=page_size
+                // index_kpool
+                * DSATokenToKVPool.index_bytes_per_token_for(
+                    index_head_dim, use_fp4_indexer
+                ),  # IndexKeyCache's row
+                headroom=_hs_envs.SGLANG_HISPARSE_ELASTIC_HEADROOM.get(),
+            )
         super().__init__(
             size=size,
             page_size=page_size,
@@ -86,6 +108,84 @@ class HiSparseDSATokenToKVPool(HiSparseDevicePoolMappingMixin, DSATokenToKVPool)
         )
         self.bytes_per_token = self.kv_cache_dim * self.dtype.itemsize
         self.data_strides = torch.full_like(self.data_ptrs, self.bytes_per_token)
+
+    # ---- HS_ELASTIC ------------------------------------------------------------------------------------------------
+    def _create_buffers(self):
+        el = getattr(self, "_hs_el", None)
+        if el is None:
+            return super()._create_buffers()
+        from sglang.srt.mem_cache.hisparse_elastic import ElasticFamily
+
+        row = self.kv_cache_dim * torch._utils._element_size(self.store_dtype)
+        E = el["n_ik"] * el["ik_pages"] * el["ik_page_bytes"]
+        band_max = E // (self.layer_num * row) // self.page_size * self.page_size
+        rows_max = self.size + band_max + self.page_size
+        fam = ElasticFamily(
+            self.device,
+            self.layer_num,
+            rows_max * row,
+            (self.size + self.page_size) * row,
+            "kv",
+        )
+        el.update(
+            row=row,
+            E=E,
+            band_max=band_max,
+            k_min=self.size,
+            k_max=self.size + band_max,
+            kv=fam,
+        )
+        self.kv_buffer = [
+            fam.view(l, rows_max * row)
+            .view(self.store_dtype)
+            .view(rows_max, 1, self.kv_cache_dim)
+            for l in range(self.layer_num)
+        ]
+        for b in self.kv_buffer:  # the static pool's torch.zeros
+            b[: self.size + self.page_size].zero_()
+        logger.info(
+            "HiSparse elastic: device pool %d slots static + band up to %d slots (%.1f GiB of index-K reservation "
+            "to lend), %d layers x %d B rows",
+            self.size,
+            band_max,
+            E / 2**30,
+            self.layer_num,
+            row,
+        )
+
+    def _create_index_key_cache(self):
+        el = getattr(self, "_hs_el", None)
+        if el is None:
+            return super()._create_index_key_cache()
+        from sglang.srt.mem_cache.hisparse_elastic import ElasticFamily
+        from sglang.srt.mem_cache.index_key_cache import IndexKeyCache
+
+        pages, pb = el["ik_pages"], el["ik_page_bytes"]
+        ik_layers = [i for i in range(self.layer_num) if not self.skip_topk_layers[i]]
+        fam = ElasticFamily(self.device, len(ik_layers), pages * pb, 0, "ik")
+        fam.grow_to(
+            (el["headroom"] + 2) * pb
+        )  # graph capture writes dummy keys into page 0 / the first pages
+        el.update(ik=fam, ik_layers=ik_layers)
+        cache = IndexKeyCache.__new__(IndexKeyCache)
+        cache.pool = self
+        bufs, k = [], 0
+        for i in range(self.layer_num):
+            if self.skip_topk_layers[i]:
+                bufs.append(
+                    torch.zeros(
+                        (0, pb),
+                        dtype=self.index_k_with_scale_buffer_dtype,
+                        device=self.device,
+                    )
+                )
+            else:
+                v = fam.view(k, pages * pb).view(pages, pb)
+                v[: fam.mapped // pb].zero_()
+                bufs.append(v)
+                k += 1
+        cache.buffer = bufs
+        return cache
 
     def translate_loc_to_hisparse_device(
         self, compressed_indices: torch.Tensor

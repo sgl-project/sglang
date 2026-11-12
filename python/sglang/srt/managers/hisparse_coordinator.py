@@ -290,7 +290,22 @@ class HiSparseSpecSwapManager:
         if not self.enabled or req_pool_idx in self._scratch_reqs:
             return
         allocator = self._coordinator.token_to_kv_pool_allocator
-        scratch_locs = allocator.hisparse_attn_allocator.alloc(self.scratch_capacity)
+        if (  # HS_SPECRES v2: admission counted resident requests' extra pages as free; demote to free them
+            getattr(self._coordinator, "hs_spec_res", False)
+            is True  # a bool; SGLang's unit tests pass MagicMocks
+            and allocator.hisparse_attn_allocator.available_size()
+            < self.scratch_capacity
+        ):
+            self._coordinator.hs_spec_reclaims[0] += 1
+            self._coordinator.reclaim_device(self.scratch_capacity)
+        if isinstance(
+            getattr(self._coordinator, "hs_el", None), dict
+        ):  # HS_ELASTIC: scratch below the band (a dict; tests pass MagicMocks)
+            scratch_locs = allocator._hs_el_alloc_below_or_demote(self.scratch_capacity)
+        else:
+            scratch_locs = allocator.hisparse_attn_allocator.alloc(
+                self.scratch_capacity
+            )
         if scratch_locs is None:
             raise RuntimeError(
                 "HiSparse spec failed to allocate "
@@ -345,9 +360,25 @@ class HiSparseSpecSwapManager:
                 f"HiSparse verify slot mismatch: expected {expected_slots}, "
                 f"got {verify_cache_locs.numel()}."
             )
+        reqs = batch.reqs
+        if coordinator.hs_spec_res:  # HS_SPECRES: resident rows write their verify KV to their own mirrored slots
+            res_rows = coordinator._hs_spec_res_prepare(batch)
+            if len(res_rows) == len(reqs):
+                return
+            if res_rows:
+                rs = set(res_rows)
+                buf_rows = [i for i in range(len(reqs)) if i not in rs]
+                idx = coordinator._gpu_rows(buf_rows)
+                reqs = [reqs[i] for i in buf_rows]
+                req_pool_indices = req_pool_indices[idx]
+                start_positions = start_positions[idx]
+                verify_cache_locs = verify_cache_locs.reshape(
+                    -1, self.num_draft_tokens
+                )[idx].reshape(-1)
+                expected_slots = len(buf_rows) * self.num_draft_tokens
 
         # CPU-side logical reservations cover verify even when overlap lags seq_lens.
-        for req in batch.reqs:
+        for req in reqs:
             req_pool_idx = req.kv.req_pool_idx
             allocated_len = int(
                 coordinator.req_to_host_pool_allocated_len[req_pool_idx]
@@ -432,21 +463,45 @@ class HiSparseSpecSwapManager:
         if batch_size == 0 or verify_cache_locs.numel() % batch_size != 0:
             raise ValueError("HiSparse verify cache locations are not request-aligned.")
 
+        reqs = batch.reqs
+        seq_lens = batch.seq_lens
+        row_ids = None  # HS_SPECRES: batch rows taking the stock commit (None = all)
+        all_verify_locs = verify_cache_locs
+        if coordinator.hs_spec_res:
+            res = coordinator._resident
+            res_rows = [i for i, r in enumerate(reqs) if r.kv.req_pool_idx in res]
+            coordinator._hs_spec_commit_hook(batch, accept_indices, res_rows)
+            if len(res_rows) == len(reqs):
+                return  # resident rows: accepted KV is already in its own slot; host copy at demotion
+            if res_rows:
+                rs = set(res_rows)
+                buf_rows = [i for i in range(len(reqs)) if i not in rs]
+                row_ids = coordinator._gpu_rows(buf_rows)
+                reqs = [reqs[i] for i in buf_rows]
+                req_pool_indices = req_pool_indices[row_ids]
+                seq_lens = seq_lens[row_ids]
+                accept_indices = accept_indices[row_ids]
+                verify_cache_locs = all_verify_locs.reshape(batch_size, -1)[
+                    row_ids
+                ].reshape(-1)
+
         valid = accept_indices >= 0
         counts = valid.sum(dim=1)
         steps = torch.arange(accept_indices.shape[1], device=accept_indices.device)
-        positions = batch.seq_lens[:, None].to(torch.int64) + steps
+        positions = seq_lens[:, None].to(torch.int64) + steps
         mapping = (
             coordinator.token_to_kv_pool_allocator.full_to_hisparse_device_index_mapping
         )
         # Keep a fixed width: boolean indexing and GPU-sized repeat_interleave sync.
-        verify_width = verify_cache_locs.numel() // batch_size
-        row_offsets = (
-            torch.arange(batch_size, device=accept_indices.device)[:, None]
-            * verify_width
+        verify_width = all_verify_locs.numel() // batch_size
+        rows_full = (  # HS_SPECRES: accept indices index the whole batch's verify tokens
+            torch.arange(batch_size, device=accept_indices.device)
+            if row_ids is None
+            else row_ids
         )
+        row_offsets = rows_full[:, None] * verify_width
         source_offsets = torch.where(valid, accept_indices, row_offsets + steps)
-        source_device_locs = mapping[verify_cache_locs[source_offsets]].clone()
+        source_device_locs = mapping[all_verify_locs[source_offsets]].clone()
         canonical_locs = coordinator.req_to_token_pool.req_to_token[
             req_pool_indices, positions
         ]
@@ -495,7 +550,7 @@ class HiSparseSpecSwapManager:
                 :, req_pool_indices, cache_positions
             ],
         )
-        for req in batch.reqs:
+        for req in reqs:
             coordinator._skip_first_backup[req.kv.req_pool_idx] = True
 
     def swap_in(
@@ -518,6 +573,15 @@ class HiSparseSpecSwapManager:
         assert self.top_k_device_locs is not None
         top_k_indices = self.top_k_device_locs[:num_reqs, :num_steps, :num_top_k]
         coordinator = self._coordinator
+        res_kw = {}
+        if (
+            coordinator.enable_resident
+        ):  # HS_SPECRES: resident rows are translated, not swapped
+            res_kw = dict(
+                resident=coordinator.req_resident,
+                req_to_token=coordinator.req_to_token_pool.req_to_token,
+                full_to_device=coordinator.token_to_kv_pool_allocator.full_to_hisparse_device_index_mapping,
+            )
         load_cache_to_device_buffer_spec_mla(
             top_k_tokens=top_k_result,
             device_buffer_tokens=coordinator.req_device_buffer_tokens[layer_id],
@@ -531,6 +595,7 @@ class HiSparseSpecSwapManager:
             state=self.states[layer_id],
             num_real_reqs=coordinator.num_real_reqs,
             **plan,
+            **res_kw,
         )
         return top_k_indices
 
@@ -548,6 +613,10 @@ _HS_I64_MAX = (
 
 
 class HiSparseCoordinator:
+    hs_spec_res = (
+        False  # HS_SPECRES (class default for coordinators built without __init__)
+    )
+    hs_el = None  # HS_ELASTIC (class default)
     _hs_anchor_copy_blocks = 0
     _hs_stats_every = 0
     _hs_step = 0
@@ -759,13 +828,73 @@ class HiSparseCoordinator:
 
         # HS_RESIDENT: a long request keeps its whole KV in the device pool after staging while there is room, and is
         # demoted to the normal LRU buffer on demand (a new prefill or a resident request's growth needs the space).
+        # HS_SPECRES: under speculative decoding only with SGLANG_HISPARSE_SPEC_RESIDENT (and the lazy host backup)
+        self.hs_spec_res = bool(
+            num_draft_tokens > 0
+            and envs.SGLANG_HISPARSE_SPEC_RESIDENT.get()
+            and envs.SGLANG_HISPARSE_LAZY_BACKUP.get()
+        )
         self.enable_resident = bool(
             envs.SGLANG_HISPARSE_RESIDENT.get()
             and not self.is_dsv4_hisparse
             and not self.is_m3_hisparse
-            and num_draft_tokens == 0
+            and (num_draft_tokens == 0 or self.hs_spec_res)
             and not envs.SGLANG_HISPARSE_HOST_MAP.get()
         )
+        self.hs_spec_res = bool(self.hs_spec_res and self.enable_resident)
+        self._hs_dev_len = {}  # HS_SPECRES: req_pool_idx -> positions with device slots (mirrored logical pages)
+        self._hs_spec_steps = [0, 0, 0]  # verify steps; resident rows; buffered rows
+        self.hs_spec_reclaims = [
+            0,
+            0,
+        ]  # HS_SPECRES v2: reclaims before a scratch / a buffer allocation
+        # HS_ELASTIC: the pool's VMM families and limits (None: static pool)
+        self.hs_el = getattr(self.token_to_kv_pool_allocator, "_hs_el", None)
+        self.hs_el_stats = [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+        ]  # band grows, band shrinks, pages relocated, buffer pages moved, demotions, rounds
+        if self.hs_el is not None:
+            self.hs_el_grow_band(log=True)
+            # v3: physical chunks for the whole reservation now, pooled: no cuMemCreate runs after start-up, when
+            # PyTorch's caching allocator may hold the rest of HBM (v2 created the last ~0.1 GiB at the end of a full
+            # fill and could fail there: cuMemCreate out of memory, c16 descending ladder)
+            el = self.hs_el
+            kv, ik = el["kv"], el["ik"]
+            # the most ever mapped at once: band + keys <= E, except that keys mapped for the whole logical pool round
+            # up to whole 2 MiB chunks per layer (up to one chunk per layer above E, with the band at zero)
+            total = max(-(-el["E"] // kv.g), ik.stride // ik.g * ik.layers)
+            have = kv.handles() + ik.mapped // ik.g * ik.layers + kv.x.pooled(kv.g)
+            if total > have:
+                kv.x.reserve_pool(kv.dev, kv.g, total - have)
+            el["creates0"] = int(kv.x.creates())
+            logger.info(
+                "HiSparse elastic: %d physical chunks of %d MiB for the %.1f GiB reservation created up front "
+                "(%d pooled); cuMemCreate calls %d",
+                total,
+                kv.g >> 20,
+                el["E"] / 2**30,
+                kv.x.pooled(kv.g),
+                el["creates0"],
+            )
+        self._hs_arange_page = torch.arange(
+            self.page_size, dtype=torch.int64, device=device
+        )
+        # v4: every variant of the device-to-device copy kernel now, while HBM has room (num_locs_upper is a constexpr:
+        # one variant per power of two up to 256; a variant first needed at a larger batch was loaded with HBM full and
+        # failed, c13 b240). Identity copies of the padding slot 0, which no request owns.
+        if (
+            (self.enable_resident or self.hs_el is not None)
+            and not self.is_dsv4_hisparse
+            and not self.is_m3_hisparse
+        ):
+            for n in (1, 2, 3, 5, 9, 16, 17, 32, 33, 48, 65, 80, 129, 144):
+                z = torch.zeros(n, dtype=torch.int64, device=device)
+                self.mem_pool_device.transfer_values_on_device(z, z)
         if envs.SGLANG_HISPARSE_RESIDENT.get() and not self.enable_resident:
             logger.warning(
                 "HiSparse: SGLANG_HISPARSE_RESIDENT ignored (DSv4, MiniMax, speculative decoding or host map)"
@@ -795,6 +924,10 @@ class HiSparseCoordinator:
             0,
             0,
         ]  # decode steps prepared by the lean all-resident path, by the general path
+        if self.hs_spec_res:
+            logger.info(
+                "HiSparse: resident requests under speculative decoding (mirrored device pages, lazy backup)"
+            )
         if self.enable_resident:
             self.token_to_kv_pool_allocator.set_reclaimer(self)
             logger.info(
@@ -1180,11 +1313,20 @@ class HiSparseCoordinator:
             if total_grow > 0:
                 if self._resident:  # HS_RESIDENT: demote resident requests to make room
                     self.reclaim_device(total_grow)
-                all_new_indices = (
-                    self.token_to_kv_pool_allocator.hisparse_attn_allocator.alloc(
-                        total_grow
+                if (
+                    self.hs_el is not None
+                ):  # HS_ELASTIC v4: buffers live below the band, their growth too
+                    all_new_indices = (
+                        self.token_to_kv_pool_allocator._hs_el_alloc_below_or_demote(
+                            total_grow
+                        )
                     )
-                )
+                else:
+                    all_new_indices = (
+                        self.token_to_kv_pool_allocator.hisparse_attn_allocator.alloc(
+                            total_grow
+                        )
+                    )
                 if all_new_indices is None:
                     logger.error(
                         "HiSparse: _grow_device_buffers bulk alloc failed "
@@ -1231,10 +1373,17 @@ class HiSparseCoordinator:
         self.req_device_buffer_size[rid] = 0
         if self.hs_lazy:  # HS_LEAN: decode tokens stay on the device only, until a demotion backs them up
             self.hs_lazy_from[rid] = self._hs_staged_len[rid]
+        if (
+            self.hs_spec_res
+        ):  # HS_SPECRES: positions [0, staged) have their prefill device slots
+            self._hs_dev_len[rid] = self._hs_staged_len[rid]
 
     def _owned_device_slots(self, req: Req) -> int:
         page = self.mem_pool_device.page_size
-        return -(-req.kv.kv_allocated_len // page) * page
+        n = req.kv.kv_allocated_len
+        if self.hs_spec_res:  # HS_SPECRES v2: only mirrored positions hold device slots; the rest are reserved ahead
+            n = self._hs_dev_len.get(req.kv.req_pool_idx, n)
+        return -(-n // page) * page
 
     def reclaimable_slots(self) -> int:
         """Device slots that demoting every resident request would free (the allocator's admission budget)."""
@@ -1255,6 +1404,182 @@ class HiSparseCoordinator:
             self._demote(rid)
         return True
 
+    # ---- HS_ELASTIC ------------------------------------------------------------------------------------------------
+    def _hs_el_budget(self):
+        el = self.hs_el
+        kv, ik = el["kv"], el["ik"]
+        band = (kv.mapped - kv.perm) * kv.layers
+        return el["E"] - band - ik.mapped * ik.layers
+
+    def _hs_el_sync(self) -> None:
+        # nothing may touch memory being unmapped or moved: the in-flight batch, the staging and backup copies
+        if self.decode_producer_stream is not None:
+            device_module.current_stream().wait_stream(self.decode_producer_stream)
+        self.wait_for_pending_backup()
+        torch.cuda.synchronize()
+
+    def hs_el_demote_one(self) -> bool:
+        if not self._resident:
+            return False
+        rid = max(self._resident, key=lambda r: self._resident[r].kv.kv_allocated_len)
+        self._demote(rid)
+        self.hs_el_stats[4] += 1
+        return True
+
+    def _hs_el_log_high(self) -> int:
+        """Highest allocated logical page (0 when none): the logical allocator's free list is sorted below its limit."""
+        el = self.hs_el
+        alloc = self.token_to_kv_pool_allocator.logical_attn_allocator
+        alloc.merge_and_sort_free()
+        lim = el["log_max_page"]
+        fp = alloc.free_pages
+        n = int(fp.numel())
+        if n == 0:
+            return lim
+        # free pages form [1..lim] minus used; the top run of free pages ends at lim
+        tail = fp[-min(n, lim) :]
+        expect = torch.arange(lim - tail.numel() + 1, lim + 1, device=fp.device)
+        same = (tail == expect).flip(0).to(torch.int64).cumprod(0).sum()
+        return lim - int(same)
+
+    def hs_el_grow_band(self, log: bool = False, keep_extra: int = 0) -> None:
+        """Lend index-K mapped above the logical high-water + headroom (+ keep_extra pages a pending logical
+        allocation will take) to the band."""
+        el = self.hs_el
+        alloc = self.token_to_kv_pool_allocator
+        kv, ik, pb, row, P = (
+            el["kv"],
+            el["ik"],
+            el["ik_page_bytes"],
+            el["row"],
+            self.page_size,
+        )
+        keep_pages = self._hs_el_log_high() + el["headroom"] + 2 + keep_extra
+        keep = max(0, min(ik.stride, (keep_pages + 1) * pb))
+        g = ik.g
+        if -(-keep // g) * g < ik.mapped:
+            self._hs_el_sync()
+            new_max = min(
+                alloc.logical_attn_allocator.num_pages, -(-keep // g) * g // pb - 1
+            )
+            alloc.hs_el_set_limit("log", new_max)
+            ik.shrink_to(keep)
+        # map band chunks while the budget allows
+        added = 0
+        while (
+            self._hs_el_budget() >= kv.chunk_bytes() and kv.mapped + kv.g <= kv.stride
+        ):
+            kv.grow_to(kv.mapped + kv.g)
+            added += 1
+        if added:
+            alloc.hs_el_set_limit("dev", kv.mapped // row // P - 1)
+            self.hs_el_stats[0] += 1
+        if added or log:
+            logger.info(
+                "HiSparse elastic: band %d slots (%.1f GiB), index-K mapped for %d logical pages; budget left %.2f "
+                "GiB; stats %s; runtime cuMemCreate %d",
+                kv.mapped // row - el["k_min"] - P,
+                (kv.mapped - kv.perm) * kv.layers / 2**30,
+                ik.mapped // pb,
+                self._hs_el_budget() / 2**30,
+                self.hs_el_stats,
+                int(kv.x.creates()) - el.get("creates0", 0),
+            )
+
+    def hs_el_ensure_logical(self, n_pages: int) -> None:
+        """Index-K for n_pages more logical pages (+ headroom); takes the band back when the budget is short."""
+        el = self.hs_el
+        alloc = self.token_to_kv_pool_allocator
+        la = alloc.logical_attn_allocator
+        if la.available_size() // self.page_size >= n_pages + 1:
+            return
+        kv, ik, pb, row, P = (
+            el["kv"],
+            el["ik"],
+            el["ik_page_bytes"],
+            el["row"],
+            self.page_size,
+        )
+        if el["log_max_page"] >= la.num_pages:
+            return  # all logical pages mapped already
+        want = min(ik.stride, (el["log_max_page"] + 2 + n_pages + el["headroom"]) * pb)
+        need = (-(-want // ik.g) * ik.g - ik.mapped) * ik.layers
+        if need > self._hs_el_budget():
+            short = need - self._hs_el_budget()
+            chunks = -(-short // kv.chunk_bytes())
+            self._hs_el_shrink_band(max(kv.perm, kv.mapped - chunks * kv.g))
+        ik.grow_to(want)
+        alloc.hs_el_set_limit("log", min(la.num_pages, ik.mapped // pb - 1))
+
+    def _hs_el_shrink_band(self, new_bytes: int) -> None:
+        """Take band rows at and above new_bytes back: mapped pages there move below (fresh pages), demoting resident
+        requests when there is no room; then the chunks are unmapped."""
+        el = self.hs_el
+        alloc = self.token_to_kv_pool_allocator
+        dev = alloc.hisparse_attn_allocator
+        kv, row, P = el["kv"], el["row"], self.page_size
+        new_rows = new_bytes // row
+        new_max_page = new_rows // P - 1
+        self._hs_el_sync()
+        alloc.hs_el_set_limit("dev", new_max_page)  # free pages above are dropped
+        lo = (new_max_page + 1) * P
+        mapping = alloc.full_to_hisparse_device_index_mapping
+        while True:
+            sel = torch.nonzero(mapping[:-1] >= lo).squeeze(1)
+            if sel.numel() == 0:
+                break
+            slots = mapping[sel]
+            pages = torch.unique(slots // P)
+            new = dev.alloc(len(pages) * P)
+            if new is None:
+                if not self.hs_el_demote_one():
+                    raise RuntimeError(
+                        "HiSparse elastic: no room to take the band back"
+                    )
+                self._hs_el_sync()
+                continue
+            new_pages = new.view(-1, P)[:, 0] // P
+            src = (pages[:, None] * P + torch.arange(P, device=self.device)).reshape(-1)
+            dst = (
+                new_pages[:, None] * P + torch.arange(P, device=self.device)
+            ).reshape(-1)
+            alloc.hs_copy_rows(src, dst)
+            idx = torch.searchsorted(pages, slots // P)
+            mapping[sel] = new_pages[idx] * P + slots % P
+            self.hs_el_stats[2] += len(pages)
+            break
+        # nothing else may hold pages above the limit: buffers and scratch live below the band. v4: rows of buffered
+        # requests only (plain decode writes a resident row's newest-token slot, its own and just moved, into the
+        # reserved column of req_device_buffer_token_locs; nothing reads it there)
+        sw = self.spec_swap
+        buf_rows = (
+            torch.nonzero(self.req_device_buffer_size > 0).squeeze(1).to(self.device)
+        )
+        held = int((self.req_to_device_buffer[buf_rows] >= lo).sum()) + int(
+            (self.req_device_buffer_token_locs[:, buf_rows] >= lo).sum()
+        )
+        if getattr(sw, "enabled", False):
+            held += int((sw.req_to_scratch >= lo).sum())
+        if held:
+            raise RuntimeError(
+                f"HiSparse elastic: {held} buffer/scratch slots above the band limit {lo}"
+            )
+        # v2: no free page above the limit either (demotions above may have freed some; _release_page_ids drops them)
+        fp = torch.cat((dev.free_pages, *getattr(dev, "staged_pages", [])))
+        if fp.numel() and int(fp.max()) > new_max_page:
+            raise RuntimeError(
+                f"HiSparse elastic: free device page {int(fp.max())} above the band limit {new_max_page}"
+            )
+        torch.cuda.synchronize()
+        kv.shrink_to(new_bytes)
+        self.hs_el_stats[1] += 1
+        logger.info(
+            "HiSparse elastic: band taken back to %d slots; stats %s; runtime cuMemCreate %d",
+            new_rows - el["k_min"] - P,
+            self.hs_el_stats,
+            int(kv.x.creates()) - el.get("creates0", 0),
+        )
+
     def _demote(self, rid: int) -> None:
         """Turn resident request `rid` into a buffered one: its host copy is complete up to the newest token with KV,
         which moves to the reserved slot (where the next step backs it up from, as for any buffered request)."""
@@ -1271,13 +1596,26 @@ class HiSparseCoordinator:
         device_locs = mapping[logical]
         if self.hs_lazy:  # HS_LEAN: back up the tokens after the staged prefix first
             self._hs_lazy_backup(rid, device_locs)
-        newest_src = device_locs[device_locs > 0][-1:].clone()
+        # HS_SPECRES: under speculative decoding the mapped positions run past the committed length (logical pages
+        # reserved ahead), so there is no newest token to place: the reserved slot stays empty (read from host on demand)
+        newest_src = (
+            None if self.hs_spec_res else device_locs[device_locs > 0][-1:].clone()
+        )
+        if newest_src is not None and self.hs_el is not None:
+            # HS_ELASTIC v4: into the reserved position's slot before anything is freed or moved (alloc_device_buffer
+            # may move band buffer pages into freed pages, the newest token's included; a page move carries this row)
+            self.mem_pool_device.transfer_values_on_device(
+                device_locs[self.device_buffer_size : self.device_buffer_size + 1],
+                newest_src,
+            )
+            newest_src = None
         # Keeps the first padded slots (tokens 0..padded-1 hold their own KV), frees the rest, unmaps every token.
         buffer_locs = self.token_to_kv_pool_allocator.alloc_device_buffer(
             logical, self.padded_buffer_size
         )
         reserved = buffer_locs[self.device_buffer_size : self.device_buffer_size + 1]
-        self.mem_pool_device.transfer_values_on_device(reserved, newest_src)
+        if newest_src is not None:
+            self.mem_pool_device.transfer_values_on_device(reserved, newest_src)
         buf32 = buffer_locs.to(torch.int32)
         self.req_to_device_buffer[rid, : self.padded_buffer_size] = buf32
         self.req_device_buffer_size[rid] = self.padded_buffer_size
@@ -1287,6 +1625,10 @@ class HiSparseCoordinator:
         self.req_device_buffer_tokens[:, rid, self.device_buffer_size :] = -1
         self.req_device_buffer_token_locs[:, rid, : self.padded_buffer_size] = buf32
         self.lru_slots[:, rid, :].copy_(self._lru_init)
+        if self.hs_spec_res:  # HS_SPECRES: the speculative swap state of a freshly staged buffered request
+            self.spec_swap.allocate_scratch(rid)
+            self.spec_swap.reset(rid)
+            self._hs_dev_len.pop(rid, None)
         self.req_resident[rid] = 0
         self.resident_demotions += 1
         logger.info(
@@ -1328,6 +1670,91 @@ class HiSparseCoordinator:
         self.hs_lazy_from[rid] = _HS_I64_MAX
         self.hs_lazy_backups += 1
         self.hs_lazy_tokens += n
+
+    def _hs_spec_res_prepare(self, batch) -> List[int]:
+        """HS_SPECRES: give every resident request of this verify batch the device pages of the logical pages it holds
+        (kv_allocated_len, reserved ahead by spec decode), mirrored page for page: first the rest of the device page that
+        holds position L - 1 (L = positions already mapped), then whole new pages. Demotes resident requests (largest
+        first) when the free pages do not cover it. Returns the batch rows that are resident afterwards."""
+        P = self.page_size
+        if (
+            self.hs_el is not None
+        ):  # HS_ELASTIC: lend index-K slack to the band now and then
+            self.hs_el_stats[5] += 1
+            if self.hs_el_stats[5] % 200 == 0:
+                self.hs_el_grow_band()
+        res = self._resident
+        dev = self.token_to_kv_pool_allocator.hisparse_attn_allocator
+
+        def plan(rows):
+            out = []
+            for i in rows:
+                req = batch.reqs[i]
+                rid = req.kv.req_pool_idx
+                L, E = self._hs_dev_len[rid], int(req.kv.kv_allocated_len)
+                if E > L:
+                    out.append((rid, L, min(E, -(-L // P) * P), E))
+            return out
+
+        rows = [i for i, req in enumerate(batch.reqs) if req.kv.req_pool_idx in res]
+        todo = plan(rows)
+        need = sum(E - pe for _, _, pe, E in todo)
+        if need > dev.available_size():
+            self.reclaim_device(
+                need
+            )  # may demote rows of this batch: they take the buffered path below
+            rows = [i for i in rows if batch.reqs[i].kv.req_pool_idx in res]
+            todo = plan(rows)
+            need = sum(E - pe for _, _, pe, E in todo)
+            if need > dev.available_size():
+                raise RuntimeError(
+                    f"HiSparse spec residency: {need} device slots needed after reclaim"
+                )
+        if todo:
+            full = dev.alloc(need) if need else None
+            if need and full is None:
+                raise RuntimeError(
+                    f"HiSparse spec residency: device allocation of {need} slots failed"
+                )
+            r2t = self.req_to_token_pool.req_to_token
+            mapping = (
+                self.token_to_kv_pool_allocator.full_to_hisparse_device_index_mapping
+            )
+            log_parts, dev_parts, off = [], [], 0
+            for rid, L, pe, E in todo:
+                if pe > L:  # the rest of the device page that holds position L - 1
+                    base = mapping[r2t[rid, L - 1].to(torch.int64)]
+                    log_parts.append(r2t[rid, L:pe])
+                    dev_parts.append(base + 1 + self._hs_arange_page[: pe - L])
+                if E > pe:
+                    log_parts.append(r2t[rid, pe:E])
+                    dev_parts.append(full[off : off + E - pe].to(torch.int64))
+                    off += E - pe
+                self._hs_dev_len[rid] = E
+            mapping[torch.cat(log_parts).to(torch.int64)] = torch.cat(dev_parts)
+        st = self._hs_spec_steps
+        st[0] += 1
+        st[1] += len(rows)
+        st[2] += len(batch.reqs) - len(rows)
+        if st[0] % 1000 == 0:
+            logger.info(
+                "HiSparse spec resident: %d verify steps, %.1f resident / %.1f buffered rows per step; %d resident now, "
+                "%d demotions so far; lazy backups %d (%d tokens); reclaims before scratch %d, before buffer %d",
+                st[0],
+                st[1] / st[0],
+                st[2] / st[0],
+                len(res),
+                self.resident_demotions,
+                self.hs_lazy_backups,
+                self.hs_lazy_tokens,
+                self.hs_spec_reclaims[0],
+                self.hs_spec_reclaims[1],
+            )
+        return rows
+
+    def _hs_spec_commit_hook(self, batch, accept_indices, res_rows) -> None:
+        """HS_SPECRES: validation anchor (the in-situ hooks shadow the per-step backup the resident rows skip)."""
+        return
 
     def _hs_lazy_done(self, rid, staged, m, host_locs, device_locs) -> None:
         """HS_LEAN: validation anchor (the in-situ hooks compare the lazy copy with the per-step backup)."""
@@ -1843,6 +2270,7 @@ class HiSparseCoordinator:
             self.req_resident[req.kv.req_pool_idx] = 0
             if self.hs_lazy:  # HS_LEAN
                 self.hs_lazy_from[req.kv.req_pool_idx] = _HS_I64_MAX
+            self._hs_dev_len.pop(req.kv.req_pool_idx, None)  # HS_SPECRES
 
         # Use kv_allocated_len (not seqlen): under speculative decoding the
         # allocator can over-allocate beyond the committed seqlen, and those
