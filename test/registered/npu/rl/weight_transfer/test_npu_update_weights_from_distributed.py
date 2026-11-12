@@ -1,12 +1,8 @@
-"""P0 NPU tests: online weight refit over HCCL (disaggregated RL).
+"""P0 NPU tests: weight refit over HCCL (disaggregated RL).
 
-NPU 0 hosts the inference engine, NPU 1 hosts the trainer. The trainer creates
-an HCCL group through ``/init_weights_update_group`` and broadcasts the
-checkpoint shards in the order requested by ``/update_weights_from_distributed``.
-
-GLM-5.2 is served as a 6-layer, 8-expert model generated from config only (the
-published checkpoint is ~1.4 TB). The weight bytes travel over the HCCL process
-group; the HTTP request only carries names, dtypes and shapes.
+The trainer broadcasts the checkpoint shards over an HCCL group; each round is
+compared (text + token logprobs) against the startup-loaded reference. The HTTP
+request only carries metadata.
 """
 
 import os
@@ -46,13 +42,10 @@ PROMPTS = weights.SIGNATURE_PROMPTS
 MASTER_ADDR = os.environ.get("SGLANG_TEST_HCCL_MASTER_ADDR", "127.0.0.1")
 UPDATE_ROUNDS = 2
 FLATTENED_BUCKET_SKIP_REASON = (
-    "blocked: flattened_bucket updates (load_format='flattened_bucket') corrupt "
-    "routed-expert weights; the experts are loaded from views of one shared "
-    "buffer and come out wrong on both the IPC and HCCL paths. Per-tensor "
-    "refits reproduce startup loading."
+    "blocked: flattened_bucket updates corrupt routed-expert weights on both "
+    "the IPC and HCCL paths; per-tensor updates reproduce startup loading."
 )
-# The default HCCL socket port (16666) is machine-wide; on shared hosts another
-# tenant already owns it. Give this test's engine + trainer their own range.
+# The default HCCL port is machine-wide; use a private range on shared hosts.
 HCCL_PORT_RANGE = os.environ.setdefault(
     "HCCL_NPU_SOCKET_PORT_RANGE",
     f"{30000 + (os.getpid() * 7) % 20000}-{30000 + (os.getpid() * 7) % 20000 + 99}",
@@ -88,9 +81,7 @@ class TestNpuUpdateWeightsFromDistributed(CustomTestCase):
         env = {**npu_rl_env(), "HCCL_NPU_SOCKET_PORT_RANGE": HCCL_PORT_RANGE}
         with npu_server(cls.checkpoint, extra_args=REFERENCE_ARGS, env=env) as base_url:
             cls.reference = logprob_signature(base_url, PROMPTS)
-        # Keep one lane server for the class: the trainer creates NPU tensors
-        # in this process, and launching another server afterwards resets the
-        # device on some CANN/driver combinations.
+        # One lane server per class: creating NPU tensors resets the device.
         cls._lane_ctx = npu_server(MODEL, extra_args=LANE_ARGS, env=env)
         cls.lane_url = cls._lane_ctx.__enter__()
 

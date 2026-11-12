@@ -1,22 +1,7 @@
-"""P0 NPU tests: online weight refit from tensors with TP=2 (per-rank IPC).
+"""P0 NPU tests: tensor weight refit with TP=2 (per-rank NPU IPC).
 
-The tensor-update request carries one serialized payload per TP rank; each
-rank's payload holds full (unsharded) tensors created on that rank's device, so
-every worker rebuilds its own NPU IPC handles and shards the weights inside
-``load_weights``. This is the multi-rank IPC path the vLLM-Ascend weight
-transfer tests exercise; the single-rank payload branch is a strict subset.
-
-The oracle is a TP=2 server that loads the same generated checkpoint at
-startup; every update round must reproduce its signature (text + token
-logprobs). Updates run inside a begin/end session and are repeated twice.
-
-GLM-5.2 is served as a 6-layer, 8-expert model generated from config only (the
-published checkpoint is ~1.4 TB), with the real vocabulary and tokenizer.
-
-The ``flattened_bucket`` (``load_format="flattened_bucket"``) full refit is
-currently blocked: routed-expert tensors loaded from views of one flattened
-buffer come out wrong (reproduced on both this IPC path and the HCCL path).
-See ``test_02_flattened_bucket_refit``.
+One payload is sent per TP rank and compared (text + token logprobs) against a
+server that loaded the same generated checkpoint at startup.
 """
 
 import os
@@ -58,13 +43,10 @@ SUBSET_WEIGHT = "model.layers.1.mlp.down_proj.weight"
 MOE_LAYER = 3
 MOE_EXPERTS = CASE.hf_overrides["n_routed_experts"]
 FLATTENED_BUCKET_SKIP_REASON = (
-    "blocked: flattened_bucket updates (load_format='flattened_bucket') corrupt "
-    "routed-expert weights; the experts are loaded from views of one shared "
-    "buffer and come out wrong on both the IPC and HCCL paths. Per-tensor "
-    "refits reproduce startup loading."
+    "blocked: flattened_bucket updates corrupt routed-expert weights on both "
+    "the IPC and HCCL paths; per-tensor updates reproduce startup loading."
 )
-# The default HCCL socket port is machine-wide; TP collectives need their own
-# range on shared hosts.
+# TP collectives need their own socket range on shared hosts.
 HCCL_PORT_RANGE = os.environ.setdefault(
     "HCCL_NPU_SOCKET_PORT_RANGE",
     f"{30000 + (os.getpid() * 7) % 20000}-{30000 + (os.getpid() * 7) % 20000 + 99}",
@@ -258,8 +240,7 @@ class TestNpuUpdateWeightsFromTensor(CustomTestCase):
             except Exception:
                 pass
 
-        # An in-place load can fail after mutating part of the weights, so the
-        # engine must not keep serving: no rollback is possible here.
+        # A failed in-place load cannot be rolled back.
         deadline = time.time() + 30
         while health(self.lane_url) and time.time() < deadline:
             time.sleep(0.5)
