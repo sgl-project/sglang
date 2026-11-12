@@ -1,8 +1,10 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
+import atexit
 import multiprocessing as mp
 import os
 import sys
+import threading
 import time
 from contextlib import ExitStack
 from multiprocessing.connection import wait
@@ -43,6 +45,44 @@ _SCHEDULER_SHUTDOWN_TIMEOUT_MS = 5000
 _WORKER_JOIN_TIMEOUT_S = 10
 _WORKER_TERMINATE_TIMEOUT_S = 1
 _WORKER_KILL_TIMEOUT_S = 1
+
+
+def _watch_causal_workers(processes, stopped):
+    """A failed pipeline rank invalidates the replica, including its HTTP health."""
+    while not stopped.wait(0.5):
+        failed = [process for process in processes if process.exitcode is not None]
+        if failed and not stopped.is_set():
+            logger.error(
+                "Causal pipeline worker exited unexpectedly: %s; terminating replica",
+                _process_names(failed),
+            )
+            kill_process_tree(os.getpid(), include_parent=True)
+            return
+
+
+class _WorkerProcesses(list):
+    """Keep the replica watchdog alive across a WebUI launch return."""
+
+    def __init__(self, processes=()):
+        super().__init__(processes)
+        self._watch_stop = threading.Event()
+        self._watch_thread = None
+
+    def start_watch(self):
+        self._watch_thread = threading.Thread(
+            target=_watch_causal_workers,
+            args=(self, self._watch_stop),
+            name="causal-worker-watch",
+            daemon=True,
+        )
+        atexit.register(self.stop_watch)
+        self._watch_thread.start()
+
+    def stop_watch(self):
+        self._watch_stop.set()
+        if self._watch_thread is not None:
+            self._watch_thread.join(timeout=2)
+        atexit.unregister(self.stop_watch)
 
 
 def _find_available_port(
@@ -123,6 +163,8 @@ def shutdown_scheduler_processes(
     *,
     request_shutdown: bool = True,
 ) -> None:
+    if isinstance(processes, _WorkerProcesses):
+        processes.stop_watch()
     if not processes:
         return
 
@@ -218,10 +260,12 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
     local_num_gpus = num_gpus // nnodes
     rank_offset = node_rank * local_num_gpus
     server_args_payload = ServerArgsPayload.capture(server_args)
-    processes = _start_scheduler_processes(
-        server_args_payload,
-        [(i, rank_offset + i) for i in range(local_num_gpus)],
-        "sglang-diffusionWorker-",
+    processes = _WorkerProcesses(
+        _start_scheduler_processes(
+            server_args_payload,
+            [(i, rank_offset + i) for i in range(local_num_gpus)],
+            "sglang-diffusionWorker-",
+        )
     )
 
     logger.debug("All workers are ready")
@@ -244,6 +288,8 @@ def launch_server(server_args: ServerArgs, launch_http_server: bool = True):
         return processes
 
     if launch_http_server:
+        if server_args.causal_pipeline_mode != "off":
+            processes.start_watch()
         if server_args.pipeline_config.supports_action_endpoint():
             logger.info(
                 "Action generation endpoint ready: model=%s; per-request details are "
