@@ -91,6 +91,9 @@ _NETWORK_ROWS = "network-rows"
 # units of 1/_GROWTH_SCALE page.
 _GROWTH_DECAY = 16
 _GROWTH_SCALE = 64
+# Distinct (prompt, decode) questions `max_new_tokens_for_memory` keeps
+# answers for; past it the answers are dropped and asked afresh.
+_MAX_NEW_TOKENS_MEMO_SIZE = 4096
 
 logger = logging.getLogger(__name__)
 
@@ -405,6 +408,9 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         self._growth: Dict[str, int] = {b.sub_pool_name: 0 for b in self.bands}
         self._snapshot_key: Optional[int] = None
         self._snapshot_memo: Optional[ChainSnapshot] = None
+        # `max_new_tokens_for_memory`'s answers by question: an empty pool's,
+        # so they change only with the pool's geometry (`_reset_geometry_memo`).
+        self._max_new_tokens_memo: Dict[tuple, Optional[int]] = {}
         self._window_capacity_from_sizing = full_max_total_num_tokens is not None
         self._set_token_shares(full_max_total_num_tokens, swa_max_total_num_tokens)
 
@@ -629,6 +635,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             self._size_swa = min(geometry.window_tokens for geometry in geometries)
         self.stage_capacity = StageCapacity(stage, geometries, checks=checks)
         self._stage_memo = (None, ())
+        self._reset_geometry_memo()
 
     def _logical_counts(self) -> Tuple[Dict[str, int], Dict[str, int]]:
         """Live pages per band, and virtual pages in use per id owner: what
@@ -1177,14 +1184,35 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         slots and request row, window retirement (`demand.window_retirement`),
         and the smallest chunk admission may cut its prompt to
         (`smallest_admissible_chunk`)."""
+        windows = self._ceiling_windows(sliding_window_size)
+        state_slots = (
+            0 if self.mamba_allocator is None else self.fresh_request_state_slots
+        )
+        # Every request of one prompt and decode length asks the same question
+        # of the same empty pool: answer it once.
+        key = (
+            input_tokens,
+            max_new_tokens,
+            token_capacity,
+            tuple(windows.items()),
+            state_slots,
+            bool(self.request_allocators),
+            chunk_size,
+            chunk_align,
+            prefill_retire_lag,
+            eviction_interval,
+            checkpoint_interval,
+            decode_retire_lag,
+        )
+        memo = self._max_new_tokens_memo
+        if key in memo:
+            return memo[key]
+        if len(memo) >= _MAX_NEW_TOKENS_MEMO_SIZE:
+            memo.clear()
         page = self.page_size
         paged_input = -(-input_tokens // page) * page
         max_new_tokens = min(
             max_new_tokens, max(0, token_capacity - paged_input - page - 1)
-        )
-        windows = self._ceiling_windows(sliding_window_size)
-        state_slots = (
-            0 if self.mamba_allocator is None else self.fresh_request_state_slots
         )
         # Below the grid no shorter chunk is admissible: admission runs the
         # request at the configured chunk or not at all.
@@ -1209,18 +1237,27 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
                 empty_pool=True,
             )
 
-        if not fits(0):
-            return None
+        # A request that fits with all of its decode fits with less of it.
         if fits(max_new_tokens):
-            return max_new_tokens
-        low, high = 0, max_new_tokens
-        while low < high:
-            mid = (low + high + 1) // 2
-            if fits(mid):
-                low = mid
-            else:
-                high = mid - 1
-        return low
+            answer = max_new_tokens
+        elif max_new_tokens == 0 or not fits(0):
+            answer = None
+        else:
+            low, high = 0, max_new_tokens
+            while low < high:
+                mid = (low + high + 1) // 2
+                if fits(mid):
+                    low = mid
+                else:
+                    high = mid - 1
+            answer = low
+        memo[key] = answer
+        return answer
+
+    def _reset_geometry_memo(self) -> None:
+        """Forget the answers that depend on the pool's geometry: its size,
+        the FULL cap, and the pipeline stages every question is asked of."""
+        self._max_new_tokens_memo.clear()
 
     def get_extend_allocation_demand(
         self,
@@ -1256,6 +1293,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
     reclaim_for_load_back = _asks_the_cache
 
     def resize(self, config) -> None:
+        self._reset_geometry_memo()
         if (
             not self.arena.backed_after_capture
             or config.unified_memory_pool_bytes != self.arena.total_bytes
