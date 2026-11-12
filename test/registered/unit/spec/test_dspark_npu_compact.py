@@ -102,7 +102,7 @@ def _backend_method(name="init_forward_metadata", **extra):
 
 def _bind_metadata_methods(backend):
     for name in (
-        "_glm_compact_layout",
+        "_get_ragged_verify_layout",
         "_gather_block_tables",
         "_allocate_padded_verify_metadata",
         "_update_ragged_verify_metadata",
@@ -150,7 +150,7 @@ class TestNpuCompactMetadata(CustomTestCase):
 
     def test_compact_metadata_dispatch_is_glm_verify_only(self):
         layout = layout_for([1, 3])
-        select = _backend_method("_glm_compact_layout")
+        select = _backend_method("_get_ragged_verify_layout")
         for enabled, mode, request_layout in (
             (False, ForwardMode.TARGET_VERIFY, layout),
             (True, ForwardMode.EXTEND, layout),

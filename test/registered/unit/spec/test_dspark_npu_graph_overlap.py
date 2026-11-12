@@ -2,6 +2,7 @@
 
 import ast
 import copy
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -16,9 +17,6 @@ from sglang.srt.managers.overlap_utils import (
     ConfidenceRelay,
 )
 from sglang.srt.speculative.dspark_components import dspark_planner
-from sglang.srt.speculative.dspark_components.dspark_execution import (
-    DSparkExecutionPolicy,
-)
 from sglang.srt.speculative.dspark_components.dspark_planner import DSparkScheduleConfig
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout, RaggedVerifyMode
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -122,10 +120,14 @@ def test_tp_broadcast_budget_precedes_tier_choice(
     planner.model_runner = SimpleNamespace(
         attn_backend=SimpleNamespace(_dspark_dsa_ragged_verify=is_npu)
     )
-    planner._execution_policy = (
-        dspark_dp.NpuDSparkExecutionPolicy(planner.model_runner)
+    planner._verify_hooks = (
+        dspark_planner.DSparkVerifyHooks(
+            sync_budget=partial(
+                dspark_dp.sync_verify_budget, model_runner=planner.model_runner
+            )
+        )
         if is_npu
-        else DSparkExecutionPolicy()
+        else None
     )
     planner._budget_from_resolved = Mock(return_value=local_budget)
     planner._maybe_gather_dp_verify_tier = Mock()
@@ -163,10 +165,14 @@ def test_sync_budget_uses_runtime_tp_group(is_npu, is_glm):
         req_to_token_pool=SimpleNamespace(req_generation=torch.tensor([10, 20, 30])),
         attn_backend=SimpleNamespace(_dspark_dsa_ragged_verify=is_glm),
     )
-    planner._execution_policy = (
-        dspark_dp.NpuDSparkExecutionPolicy(planner.model_runner)
+    planner._verify_hooks = (
+        dspark_planner.DSparkVerifyHooks(
+            sync_budget=partial(
+                dspark_dp.sync_verify_budget, model_runner=planner.model_runner
+            )
+        )
         if is_npu
-        else DSparkExecutionPolicy()
+        else None
     )
     group = SimpleNamespace(broadcast_object=Mock(return_value=6))
     draft_input = SimpleNamespace()
@@ -235,10 +241,12 @@ def test_planner_constructed_before_backend_detects_glm_after_initialization(mod
             tp_rank=1,
             verify_num_draft_tokens=4,
             tp_sync=Mock(),
-            execution_policy=dspark_dp.NpuDSparkExecutionPolicy(runner),
+            verify_hooks=dspark_planner.DSparkVerifyHooks(
+                sync_budget=partial(dspark_dp.sync_verify_budget, model_runner=runner)
+            ),
         )
         assert not hasattr(runner, "attn_backend")
-        assert planner._execution_policy.sync_verify_budget(1) == 1
+        assert planner.sync_verify_budget(1) == 1
         runner.req_to_token_pool = SimpleNamespace(req_generation=torch.tensor([0, 0]))
         runner.attn_backend = SimpleNamespace(_dspark_dsa_ragged_verify=True)
         if mode is RaggedVerifyMode.COMPACT:
@@ -257,7 +265,7 @@ def test_planner_constructed_before_backend_detects_glm_after_initialization(mod
             assert budget == 3
             group.broadcast_object.assert_called_once_with(1, src=0)
         runner.attn_backend = SimpleNamespace(_dspark_dsa_ragged_verify=False)
-        assert planner._execution_policy.sync_verify_budget(1) == 1
+        assert planner.sync_verify_budget(1) == 1
 
 
 def test_confidence_relay_not_ready_generation_and_source_fence():
@@ -388,7 +396,7 @@ def test_future_map_accepts_scheduler_string_device():
 
 
 @pytest.mark.parametrize("idle_seq_len", [0, 1])
-def test_idle_executor_uses_backend_prefix_contract_and_execution_policy(idle_seq_len):
+def test_idle_executor_uses_backend_prefix_contract_and_prepare_hook(idle_seq_len):
     from sglang.srt.speculative.dspark_components import dspark_verify
 
     backend = SimpleNamespace(ragged_verify_idle_seq_len=idle_seq_len)
@@ -399,7 +407,7 @@ def test_idle_executor_uses_backend_prefix_contract_and_execution_policy(idle_se
     executor.model_runner = runner
     executor.verify_epilogue = None
     executor.verify_num_draft_tokens = 9
-    executor._execution_policy = Mock()
+    executor._prepare_verify_forward_batch = Mock()
     executor.target_worker = Mock()
     layout = RaggedVerifyLayout.from_verify_lens_device(
         verify_lens=torch.tensor([0]), graph_num_tokens=8
@@ -417,9 +425,7 @@ def test_idle_executor_uses_backend_prefix_contract_and_execution_policy(idle_se
         return forward_batch, False
 
     def forward(**kwargs):
-        executor._execution_policy.prepare_verify_forward_batch.assert_called_once_with(
-            forward_batch
-        )
+        executor._prepare_verify_forward_batch.assert_called_once_with(forward_batch)
         assert kwargs["forward_batch"] is forward_batch
 
     executor.target_worker.forward_batch_generation.side_effect = forward

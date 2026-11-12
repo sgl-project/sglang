@@ -1,153 +1,64 @@
-"""GLM DSpark compact coordination across attention-DP groups.
+"""NPU hooks for GLM DSpark budget synchronization and packed DP inputs.
 
-Dense drafts run independently on attention TP. Only target verification
-joins the full TP/EP group, including ranks without local requests. Exchange
-host sizes once at that boundary; never broadcast one DP group's budget to
-another. No NPU runtime import is needed by these contracts.
+The shared DSpark planner owns cross-DP tier gathering and layout selection.
 """
 
 import logging
+from functools import partial
 
-import msgspec
 import torch
 
-from sglang.srt.distributed.utils import all_gather_single
-from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_dp_tp_group
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.speculative.dspark_components.dspark_execution import (
-    DSparkExecutionPolicy,
-)
+from sglang.srt.speculative.dspark_components.dspark_planner import DSparkVerifyHooks
 from sglang.srt.speculative.ragged_verify import (
-    RaggedVerifyLayout,
     RaggedVerifyMode,
     read_ragged_verify_mode,
-    round_up_grid,
 )
 
 logger = logging.getLogger(__name__)
 
 
-def make_dspark_execution_policy(model_runner) -> DSparkExecutionPolicy:
-    # The worker is built before attention backends; model identity is available
-    # here, while backend capabilities must be resolved when the budget is used.
+def make_dspark_verify_hooks(model_runner) -> DSparkVerifyHooks | None:
+    # Worker construction precedes attention-backend initialization.
     from sglang.srt.configs.model_config import is_glm_moe_dsa
 
     config = getattr(model_runner, "model_config", None)
     if config is None or not is_glm_moe_dsa(config.hf_config):
-        return DSparkExecutionPolicy()
-    coordinates_dp_verify = (
+        return None
+    coordinate_dp_verify = (
         get_parallel().attn_dp_enabled
         and read_ragged_verify_mode() is RaggedVerifyMode.COMPACT
     )
-    if coordinates_dp_verify and get_parallel().tp_rank == 0:
+    if coordinate_dp_verify and get_parallel().tp_rank == 0:
         logger.info(
             "GLM DSpark compact attention DP enabled (attn_dp=%d, attn_tp=%d, "
             "budget_sync=attention-tp, target_tier_sync=tp-cpu).",
             get_parallel().attn_dp_size,
             get_parallel().attn_tp_size,
         )
-    return NpuDSparkExecutionPolicy(
-        model_runner, coordinates_dp_verify=coordinates_dp_verify
+    return DSparkVerifyHooks(
+        sync_budget=partial(sync_verify_budget, model_runner=model_runner),
+        prepare_forward_batch=(
+            partial(prepare_compact_dp_forward_batch, model_runner=model_runner)
+            if coordinate_dp_verify
+            else None
+        ),
+        dynamic_tiers_with_dp=True,
+        coordinate_dp_verify=coordinate_dp_verify,
     )
 
 
-class NpuDSparkExecutionPolicy(DSparkExecutionPolicy):
-    dynamic_verify_tiers_with_dp = True
-
-    def __init__(self, model_runner, *, coordinates_dp_verify: bool = False):
-        self.model_runner = model_runner
-        self.coordinates_dp_verify = coordinates_dp_verify
-
-    def sync_verify_budget(self, budget):
-        # Ring readiness may differ across ranks. Synchronize before choosing
-        # token tiers, only within the attention-TP group owning these requests.
-        # Do not cache the capability before backend initialization.
-        if getattr(
-            getattr(self.model_runner, "attn_backend", None),
-            "_dspark_dsa_ragged_verify",
-            False,
-        ):
-            return get_dp_tp_group().broadcast_object(budget, src=0)
-        return budget
-
-    def coordinate_verify_layout(self, *, batch, layout):
-        if not self.coordinates_dp_verify:
-            return layout
-        # The default scheduler may supply a synthetic idle layout. It is not
-        # local work and must not inflate the collective's packed token tier.
-        return coordinate_compact_dp_layout(
-            batch=batch,
-            layout=layout if batch.batch_size() else None,
-            model_runner=self.model_runner,
-        )
-
-    def prepare_verify_forward_batch(self, forward_batch):
-        if self.coordinates_dp_verify:
-            prepare_compact_dp_forward_batch(forward_batch, self.model_runner)
-
-
-def compact_dp_graph_tokens(contributions, *, attn_tp_size, runner):
-    """Return a common token width, or None for a collective eager fallback.
-
-    Contributions are (local requests, local padded tokens), repeated on each
-    attention-TP peer. Maxima deliberately do not double count those peers.
-    A busy rank without a compact layout contributes -1; all ranks must then
-    use the existing uniform eager verify path.
-    """
-    max_reqs = max((row[0] for row in contributions), default=0)
-    if max_reqs == 0 or any(row[1] < 0 for row in contributions):
-        return None
-    tokens = max(max_reqs, max(row[1] for row in contributions))
-    tokens = (tokens + attn_tp_size - 1) // attn_tp_size * attn_tp_size
-    if runner is not None and runner.ragged_verify_mode:
-        if max_reqs > runner.max_bs or tokens > runner.capture_num_tokens[-1]:
-            return None
-        tokens = round_up_grid(tokens, runner.capture_num_tokens)
-        if max_reqs > runner._ragged_capture_slots(tokens):
-            return None
-    return tokens
-
-
-def coordinate_compact_dp_layout(*, batch, layout, model_runner):
-    """Called exactly once by busy AND idle ranks, after local dense draft."""
-    parallel = get_parallel()
-    bs = batch.batch_size()
-    contribution = [
-        bs,
-        layout.graph_num_tokens if layout is not None else (-1 if bs else 0),
-    ]
-    cpu_group = parallel.tp_group.cpu_group
-    local = torch.tensor(contribution, dtype=torch.int64)
-    gathered = torch.empty(
-        (torch.distributed.get_world_size(group=cpu_group) * 2,), dtype=torch.int64
-    )
-    all_gather_single(gathered, local, group=cpu_group)
-    contributions = gathered.view(-1, 2).tolist()
-    tokens = compact_dp_graph_tokens(
-        contributions,
-        attn_tp_size=parallel.attn_tp_size,
-        runner=model_runner.decode_cuda_graph_runner,
-    )
-    if envs.SGLANG_DSPARK_DEBUG_CONFIDENCE_PREFIX_SCHEDULER.get():
-        if parallel.attn_tp_rank == 0:
-            logger.info(
-                "[DSPARK-DP] dp_rank=%d local_reqs=%d local_tokens=%d target_tokens=%s",
-                parallel.attn_dp_rank,
-                bs,
-                contribution[1],
-                tokens,
-            )
-    if tokens is None:
-        return None
-    if bs:
-        return msgspec.structs.replace(layout, graph_num_tokens=tokens)
-    # Empty device-only rows describe no real request. All padded queries go
-    # to the GLM metadata's separate sink slot, never request-pool row zero.
-    return RaggedVerifyLayout.from_verify_lens_device(
-        verify_lens=torch.zeros(1, dtype=torch.int32, device=model_runner.device),
-        graph_num_tokens=tokens,
-    )
+def sync_verify_budget(budget, *, model_runner):
+    # Resolve the capability late. A missing confidence-ring snapshot is also
+    # a decision: broadcast None within the group owning the same requests.
+    if getattr(
+        getattr(model_runner, "attn_backend", None),
+        "_dspark_dsa_ragged_verify",
+        False,
+    ):
+        return get_dp_tp_group().broadcast_object(budget, src=0)
+    return budget
 
 
 def is_glm_compact_dp_batch(forward_batch, model_runner):

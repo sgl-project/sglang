@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 import msgspec
 import torch
@@ -54,9 +54,6 @@ from sglang.srt.speculative.dspark_components.dspark_deferred_draft_kv import (
     DeferredDraftKVStore,
 )
 from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockResult
-from sglang.srt.speculative.dspark_components.dspark_execution import (
-    DSparkExecutionPolicy,
-)
 from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
     TargetHiddenKvInjector,
 )
@@ -73,6 +70,9 @@ from sglang.srt.speculative.spec_utils import (
 )
 from sglang.srt.utils import is_npu
 from sglang.srt.utils.invariants import Bucket, Invariant, NotNaN, expect
+
+if TYPE_CHECKING:
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 logger = logging.getLogger(__name__)
 
@@ -147,7 +147,7 @@ class TargetVerifyExecutor:
         model_runner,
         kv_injector: TargetHiddenKvInjector,
         tp_sync: SpecTpSync,
-        execution_policy: Optional[DSparkExecutionPolicy] = None,
+        prepare_verify_forward_batch: Optional[Callable[[ForwardBatch], None]] = None,
         verify_epilogue=None,
         simulate_acc_len: float = 0.0,
         simulated_correct_len: Optional[torch.Tensor] = None,
@@ -162,7 +162,7 @@ class TargetVerifyExecutor:
         self.model_runner = model_runner
         self.kv_injector = kv_injector
         self._tp_sync = tp_sync
-        self._execution_policy = execution_policy or DSparkExecutionPolicy()
+        self._prepare_verify_forward_batch = prepare_verify_forward_batch
         self.verify_epilogue = verify_epilogue
         self._verify_backend_self_adds_seq_lens_cache: Optional[bool] = None
         self._simulate_acc_len = float(simulate_acc_len)
@@ -306,7 +306,8 @@ class TargetVerifyExecutor:
         verify_forward_batch, _ = verify_input.prepare_for_verify(
             batch, self.target_worker
         )
-        self._execution_policy.prepare_verify_forward_batch(verify_forward_batch)
+        if self._prepare_verify_forward_batch is not None:
+            self._prepare_verify_forward_batch(verify_forward_batch)
         self.target_worker.forward_batch_generation(
             batch=None,
             forward_batch=verify_forward_batch,
@@ -386,7 +387,8 @@ class TargetVerifyExecutor:
         batch.seq_lens_cpu = seq_lens_cpu_backup
         batch.seq_lens_sum = seq_lens_sum_backup
 
-        self._execution_policy.prepare_verify_forward_batch(verify_forward_batch)
+        if self._prepare_verify_forward_batch is not None:
+            self._prepare_verify_forward_batch(verify_forward_batch)
         target_out = self.target_worker.forward_batch_generation(
             batch=None,
             forward_batch=verify_forward_batch,

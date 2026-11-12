@@ -59,9 +59,6 @@ from sglang.srt.speculative.dspark_components.dspark_draft import (
 from sglang.srt.speculative.dspark_components.dspark_draft_sampler import (
     maybe_build_draft_sampler,
 )
-from sglang.srt.speculative.dspark_components.dspark_execution import (
-    DSparkExecutionPolicy,
-)
 from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
     TargetHiddenKvInjector,
 )
@@ -356,13 +353,13 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
         self._target_hidden_projection_enabled = False
 
-        self._execution_policy = DSparkExecutionPolicy()
+        verify_hooks = None
         if _is_npu:
             from sglang.srt.hardware_backend.npu.dspark_dp import (
-                make_dspark_execution_policy,
+                make_dspark_verify_hooks,
             )
 
-            self._execution_policy = make_dspark_execution_policy(self.model_runner)
+            verify_hooks = make_dspark_verify_hooks(self.model_runner)
         self._verify_planner = DSparkVerifyPlanner(
             draft_model=self.draft_model,
             gamma=self.gamma,
@@ -371,14 +368,14 @@ class DSparkWorkerV2(BaseSpecWorker):
             tp_rank=get_parallel().tp_rank,
             verify_num_draft_tokens=self.verify_num_draft_tokens,
             tp_sync=self._tp_sync,
-            execution_policy=self._execution_policy,
+            verify_hooks=verify_hooks,
         )
         if (
             get_parallel().attn_dp_enabled
             and not self._draft_is_moe
             and self._verify_planner.is_compact_mode
             and self._decode_graph_allowed
-            and not self._execution_policy.coordinates_dp_verify
+            and not self._verify_planner.coordinates_dp_verify
         ):
             raise ValueError(
                 "DSpark dense-draft compact verify under attention DP does not "
@@ -552,7 +549,9 @@ class DSparkWorkerV2(BaseSpecWorker):
             model_runner=self.model_runner,
             kv_injector=self._kv_injector,
             tp_sync=self._tp_sync,
-            execution_policy=self._execution_policy,
+            prepare_verify_forward_batch=(
+                verify_hooks.prepare_forward_batch if verify_hooks is not None else None
+            ),
             verify_epilogue=self._verify_epilogue,
             simulate_acc_len=self._simulate_acc_len,
             simulated_correct_len=self._simulated_correct_len,
@@ -982,7 +981,7 @@ class DSparkWorkerV2(BaseSpecWorker):
                         batch, "target", rank, local_only=target_local_only
                     )
                 idle_layout = self._idle_verify_ragged_layout(batch)
-                idle_layout = self._execution_policy.coordinate_verify_layout(
+                idle_layout = self._verify_planner.coordinate_verify_layout(
                     batch=batch, layout=idle_layout
                 )
                 self._verify_executor.run_idle_participation(
@@ -1090,7 +1089,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             global_num_reqs=global_num_reqs,
             dp_tier_num_tokens=self._dp_verify_tier_num_tokens(batch),
         )
-        layout = self._execution_policy.coordinate_verify_layout(
+        layout = self._verify_planner.coordinate_verify_layout(
             batch=batch, layout=layout
         )
         run_compact = self._verify_planner.should_run_compact(layout=layout)

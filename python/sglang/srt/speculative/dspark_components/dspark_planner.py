@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Optional, Union
+from typing import TYPE_CHECKING, Callable, Optional, Union
 
 import msgspec
 import torch
@@ -26,9 +26,6 @@ from sglang.srt.mem_cache.kv.alloc.iteration_ids import IterationIds
 from sglang.srt.runtime_context import get_disagg, get_parallel, get_schedule, get_spec
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import apply_dflash_verify_logits_adjustments
-from sglang.srt.speculative.dspark_components.dspark_execution import (
-    DSparkExecutionPolicy,
-)
 from sglang.srt.speculative.dspark_components.dspark_sps import (
     SpsAdditiveCostTable,
     SpsCostTable,
@@ -55,6 +52,9 @@ from sglang.srt.utils.invariants import (
     resolve_level,
 )
 
+if TYPE_CHECKING:
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
 logger = logging.getLogger(__name__)
 
 # Scheduled verify lengths must not exceed the per-step token budget.
@@ -80,6 +80,15 @@ class VerifyTierResolution(msgspec.Struct, frozen=True):
     graph_num_tokens: Optional[int]
 
 
+class DSparkVerifyHooks(msgspec.Struct, frozen=True):
+    """Optional platform hooks; tier gathering and layout selection stay in the planner."""
+
+    sync_budget: Callable[[Optional[int]], Optional[int]]
+    prepare_forward_batch: Optional[Callable[[ForwardBatch], None]] = None
+    dynamic_tiers_with_dp: bool = False
+    coordinate_dp_verify: bool = False
+
+
 class DSparkVerifyPlanner:
     def __init__(
         self,
@@ -91,7 +100,7 @@ class DSparkVerifyPlanner:
         tp_rank: int,
         verify_num_draft_tokens: int,
         tp_sync: SpecTpSync,
-        execution_policy: Optional[DSparkExecutionPolicy] = None,
+        verify_hooks: Optional[DSparkVerifyHooks] = None,
     ) -> None:
         self.draft_model = draft_model
         self.gamma = gamma
@@ -99,7 +108,7 @@ class DSparkVerifyPlanner:
         self.device = device
         self.verify_num_draft_tokens = verify_num_draft_tokens
         self._tp_sync = tp_sync
-        self._execution_policy = execution_policy or DSparkExecutionPolicy()
+        self._verify_hooks = verify_hooks
         self._align_verify_tokens_to_graph_tier = (
             get_spec().speculative_dspark_align_verify_tokens_to_graph_tier
         )
@@ -180,15 +189,14 @@ class DSparkVerifyPlanner:
                 model_runner=self.model_runner,
                 relay_lag_steps=relay_lag_steps,
             )
-            self._dynamic_graph_tier = (
-                not is_dp_attention_enabled()
-                or self._execution_policy.dynamic_verify_tiers_with_dp
+            self._dynamic_graph_tier = not is_dp_attention_enabled() or (
+                verify_hooks is not None and verify_hooks.dynamic_tiers_with_dp
             )
             self._dp_tier_gather_enabled = (
                 self._ragged_verify_mode is RaggedVerifyMode.COMPACT
                 and is_dp_attention_enabled()
                 # A target-boundary coordinator owns the packed graph tier.
-                and not self._execution_policy.coordinates_dp_verify
+                and not self.coordinates_dp_verify
                 and get_parallel().attn_tp_size == 1
                 and get_parallel().attn_cp_size == 1
                 and require_mlp_tp_gather()
@@ -224,6 +232,83 @@ class DSparkVerifyPlanner:
                         "budget degenerates to verify-all (zero scheduling gain). "
                         "Pass a profiled --speculative-dspark-sps-table-path."
                     )
+
+    @property
+    def coordinates_dp_verify(self) -> bool:
+        return (
+            self._verify_hooks is not None and self._verify_hooks.coordinate_dp_verify
+        )
+
+    def sync_verify_budget(self, budget: Optional[int]) -> Optional[int]:
+        if self._verify_hooks is None:
+            return budget
+        return self._verify_hooks.sync_budget(budget)
+
+    def coordinate_verify_layout(
+        self, *, batch: ScheduleBatch, layout: Optional[RaggedVerifyLayout]
+    ) -> Optional[RaggedVerifyLayout]:
+        """Agree on packed target capacity after independent local drafting.
+
+        Busy and idle ranks enter once. Unlike scheduler-time hints, these are
+        actual padded layout sizes, so never clamp them to requests * window.
+        """
+        if not self.coordinates_dp_verify:
+            return layout
+        bs = batch.batch_size()
+        local_tokens = (
+            layout.graph_num_tokens if bs and layout is not None else (-1 if bs else 0)
+        )
+        contributions = gather_dp_verify_tiers(
+            local_tier_num_tokens=local_tokens, local_num_reqs=bs
+        )
+        tokens = self._resolve_dp_verify_tokens(contributions)
+        if envs.SGLANG_DSPARK_DEBUG_CONFIDENCE_PREFIX_SCHEDULER.get():
+            parallel = get_parallel()
+            if parallel.attn_tp_rank == 0:
+                logger.info(
+                    "[DSPARK-DP] dp_rank=%d local_reqs=%d local_tokens=%d target_tokens=%s",
+                    parallel.attn_dp_rank,
+                    bs,
+                    local_tokens,
+                    tokens,
+                )
+        if tokens is None:
+            return None
+        if bs:
+            return msgspec.structs.replace(layout, graph_num_tokens=tokens)
+        # Idle ranks have no real query rows. The backend routes execution
+        # padding to its sink row, rather than request-pool row zero.
+        return RaggedVerifyLayout.from_verify_lens_device(
+            verify_lens=torch.zeros(1, dtype=torch.int32, device=self.device),
+            graph_num_tokens=tokens,
+        )
+
+    def _resolve_dp_verify_tokens(
+        self, contributions: list[list[int]]
+    ) -> Optional[int]:
+        tokens = dp_global_verify_tier_num_tokens(
+            global_tier_num_tokens=[row[0] for row in contributions]
+        )
+        max_reqs = max((row[1] for row in contributions), default=0)
+        if tokens is None or max_reqs == 0:
+            return None
+        alignment = get_parallel().attn_tp_size
+        tokens = max(tokens, max_reqs)
+        tokens = (tokens + alignment - 1) // alignment * alignment
+        if ragged_layout_exceeds_captured_grid(
+            num_reqs=max_reqs,
+            verify_num_draft_tokens=self.verify_num_draft_tokens,
+            model_runner=self.model_runner,
+            tier_tokens_hint=tokens,
+        ):
+            return None
+        grid = ragged_capture_num_tokens(model_runner=self.model_runner)
+        if grid is not None:
+            tokens = round_up_grid(tokens, grid)
+            runner = self.model_runner.decode_cuda_graph_runner
+            if max_reqs > runner._ragged_capture_slots(tokens):
+                return None
+        return tokens
 
     @property
     def carries_confidence(self) -> bool:
@@ -281,7 +366,7 @@ class DSparkVerifyPlanner:
         draft_input.verify_token_budget = self._budget_from_resolved(
             resolved=resolved, req_pool_indices_cpu=batch.req_pool_indices_cpu
         )
-        draft_input.verify_token_budget = self._execution_policy.sync_verify_budget(
+        draft_input.verify_token_budget = self.sync_verify_budget(
             draft_input.verify_token_budget
         )
         batch.spec_verify_tier_num_tokens = local_verify_tier_num_tokens(
@@ -302,13 +387,9 @@ class DSparkVerifyPlanner:
         if batch.is_extend_in_batch:
             batch.global_spec_verify_tier_num_tokens = None
             return
-        cpu_group = get_parallel().tp_group.cpu_group
-        local_tensor = torch.tensor([local_tier_num_tokens], dtype=torch.int64)
-        gathered = torch.empty(
-            (torch.distributed.get_world_size(group=cpu_group),), dtype=torch.int64
+        batch.global_spec_verify_tier_num_tokens = gather_dp_verify_tiers(
+            local_tier_num_tokens=local_tier_num_tokens
         )
-        all_gather_single(gathered, local_tensor, group=cpu_group)
-        batch.global_spec_verify_tier_num_tokens = gathered.tolist()
 
     def note_non_decode_step(self) -> None:
         if self._budget_planner is not None:
@@ -339,7 +420,7 @@ class DSparkVerifyPlanner:
         budget = self._budget_from_resolved(
             resolved=resolved, req_pool_indices_cpu=req_pool_indices_cpu
         )
-        return self._execution_policy.sync_verify_budget(budget)
+        return self.sync_verify_budget(budget)
 
     def resolve_verify_token_budget(
         self,
@@ -660,6 +741,30 @@ def graph_tier_fill_budget(
     fill_total = min(graph_num_tokens, bs * verify_num_draft_tokens)
     floor_tokens = bs * max(min_verify_len, 1)
     return max(0, fill_total - floor_tokens)
+
+
+def gather_dp_verify_tiers(
+    *, local_tier_num_tokens: int, local_num_reqs: Optional[int] = None
+) -> list[int] | list[list[int]]:
+    """Share verify capacity on the target TP group.
+
+    Scheduler hints keep their original one-column wire format. Target-boundary
+    coordination also sends request slots; packed token counts cannot recover
+    them by division by the fixed verify width. Both paths use the same gather.
+    """
+    values = [local_tier_num_tokens]
+    if local_num_reqs is not None:
+        values.append(local_num_reqs)
+    cpu_group = get_parallel().tp_group.cpu_group
+    local = torch.tensor(values, dtype=torch.int64)
+    gathered = torch.empty(
+        torch.distributed.get_world_size(group=cpu_group) * len(values),
+        dtype=torch.int64,
+    )
+    all_gather_single(gathered, local, group=cpu_group)
+    if local_num_reqs is not None:
+        gathered = gathered.view(-1, len(values))
+    return gathered.tolist()
 
 
 def dp_global_verify_tier_num_tokens(

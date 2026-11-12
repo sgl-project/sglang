@@ -623,7 +623,7 @@ class AscendAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         in_capture: bool = False,
     ):
-        layout = self._glm_compact_layout(forward_batch)
+        layout = self._get_ragged_verify_layout(forward_batch)
         bs = forward_batch.batch_size
         if in_capture:
             self._init_cuda_graph_metadata(
@@ -654,7 +654,9 @@ class AscendAttnBackend(AttentionBackend):
             ragged_layout=layout,
         )
 
-    def _glm_compact_layout(self, forward_batch):
+    def _get_ragged_verify_layout(
+        self, forward_batch: ForwardBatch
+    ) -> Optional[RaggedVerifyLayout]:
         if (
             forward_batch.forward_mode.is_target_verify()
             and self._dspark_dsa_ragged_verify
@@ -723,7 +725,7 @@ class AscendAttnBackend(AttentionBackend):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
         self.forward_metadata = ForwardMetadata()
-        layout = self._glm_compact_layout(forward_batch)
+        layout = self._get_ragged_verify_layout(forward_batch)
         if layout is not None:
             # A selected graph tier survives a later graph-admission failure.
             # Use the same sink-row contract in eager, with or without DP.
