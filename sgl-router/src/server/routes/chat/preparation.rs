@@ -346,11 +346,9 @@ impl PreparedRequest {
     ) -> Result<Self, ApiError> {
         let value = Value::Object(serde_json::from_slice(&body).map_err(|_| invalid_request())?);
         let return_logprob = value["return_logprob"] == true;
-        let request = Self::generate_value(ctx, model, value, Some(body))?;
-        Ok(Self {
-            merges_input_logprobs: return_logprob && !request.streaming && !request.fans_out,
-            ..request
-        })
+        let mut request = Self::generate_value(ctx, model, value, Some(body))?;
+        request.merges_input_logprobs = return_logprob && !request.streaming && !request.fans_out;
+        Ok(request)
     }
 
     /// [`Self::generate`] over a parsed body: the client's `body` gets the

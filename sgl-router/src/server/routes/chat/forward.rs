@@ -22,7 +22,7 @@ use crate::state::load_monitor::router_inflight_load::RouterInflightLoadGuard;
 use crate::workers::{DecodeSlot, DpRankGuard, LoadGuard, Worker};
 use axum::body::Body;
 use axum::http::header::CONTENT_TYPE;
-use axum::http::{HeaderMap, HeaderName, HeaderValue, Response};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, Response, StatusCode};
 use axum::response::IntoResponse;
 use bytes::Bytes;
 use futures::StreamExt;
@@ -443,7 +443,7 @@ trait Transport: Clone + Send + Sync + 'static {
     type Response: Send + 'static;
 
     fn status(response: &Self::Response) -> u16;
-    /// The client's response; `prefill_body` is a PD prefill's, when it was awaited.
+    /// The client's response; `prefill_body` is a PD prefill's, when it completed first.
     fn respond(
         request: &mut PreparedRequest,
         response: Self::Response,
@@ -584,15 +584,18 @@ impl Transport for Http {
 }
 
 /// Decode's response with prefill's `meta_info.input_token_logprobs` before
-/// its own. A failure status, or a body without both lists, passes through.
+/// its own. A failure status, or a body without both lists, passes through;
+/// an unreadable decode body is a 502.
 async fn merge_input_logprobs(prefill_body: &[u8], response: Response<Body>) -> Response<Body> {
     if !response.status().is_success() {
         return response;
     }
     let (parts, body) = response.into_parts();
-    let decode_body = axum::body::to_bytes(body, usize::MAX)
-        .await
-        .expect("`forward_json_to` buffers a non-streaming body");
+    let Ok(decode_body) = axum::body::to_bytes(body, usize::MAX).await else {
+        let mut response = Response::new(Body::empty());
+        *response.status_mut() = StatusCode::BAD_GATEWAY;
+        return response;
+    };
     let body =
         prepend_prefill_logprobs(prefill_body, &decode_body).map_or(decode_body, Bytes::from);
     Response::from_parts(parts, Body::from(body))
@@ -899,7 +902,7 @@ struct Blame {
 /// Returns decode's response as soon as decode answers, or with
 /// `wait_for_prefill` once prefill also completes, unless prefill fails
 /// first; then prefill's failure is returned along with the blamed prefill.
-/// Prefill's body comes along only with `wait_for_prefill`.
+/// Prefill's body comes along when prefill completed before the return.
 async fn forward_pd<R>(
     mut task: tokio::task::JoinHandle<PrefillOutcome<R>>,
     prefill: Arc<Worker>,
@@ -926,13 +929,10 @@ async fn forward_pd<R>(
         tokio::select! {
             biased;
             outcome = &mut task => return match outcome {
-                Ok(PrefillOutcome::Completed(body)) => {
-                    let body = body.filter(|_| wait_for_prefill);
-                    match held {
-                        Some(response) => (response, None, body),
-                        None => (decode.await, None, body),
-                    }
-                }
+                Ok(PrefillOutcome::Completed(body)) => match held {
+                    Some(response) => (response, None, body),
+                    None => (decode.await, None, body),
+                },
                 Ok(PrefillOutcome::Failed(failure)) => (failure, blame(prefill), None),
                 Err(_) => (Err(ApiError::PrefillFailed { status: None }), blame(prefill), None),
             },
