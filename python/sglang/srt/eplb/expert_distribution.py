@@ -248,6 +248,11 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
 
     @contextmanager
     def with_forward_pass(self, forward_pass_id: int, forward_batch: ForwardBatch):
+        # A disabled pass must not reset, collect, or publish target statistics.
+        if self._disable_all:
+            yield {}
+            return
+
         outputs = {}
         with self._current_forward_pass_id.with_value(forward_pass_id):
             self._on_forward_pass_start(forward_batch)

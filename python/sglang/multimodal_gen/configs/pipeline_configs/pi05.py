@@ -37,8 +37,6 @@ class Pi05PipelineConfig(PipelineConfig):
     )
     empty_cameras: int = 0
     image_size: tuple[int, int] = (224, 224)
-    image_normalization_mean: tuple[float, float, float] = (0.5, 0.5, 0.5)
-    image_normalization_std: tuple[float, float, float] = (0.5, 0.5, 0.5)
 
     # Experimental eager completion-boundary execution; scheduler opt-in.
     enable_segmented_actions: bool = False
