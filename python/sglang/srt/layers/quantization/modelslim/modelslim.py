@@ -217,12 +217,6 @@ class ModelSlimConfig(QuantizationConfig):
         if ".mlp." in prefix:
             candidates.append(prefix.replace(".mlp.", ".block_sparse_moe."))
 
-        # GLM-Next checkpoints may keep forget_gate around these projections.
-        proj_name = prefix.rsplit(".", 1)[-1]
-        if proj_name in {"f_a_proj", "f_b_proj"} and ".forget_gate." not in prefix:
-            parent, proj_name = prefix.rsplit(".", 1)
-            candidates.append(f"{parent}.forget_gate.{proj_name}")
-
         for candidate in list(candidates):
             if candidate.startswith("model.language_model."):
                 candidates.append(
