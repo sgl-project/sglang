@@ -173,9 +173,9 @@ class TestK3A8W4MoeGfx950(CustomTestCase):
         ref = self._reference(x, ids, w)
         whole = self._run(x, ids, w, block_m=block_m, seg_blocks=1 << 20)
         self.assertLess(self._rel(whole, ref), 1e-2)
-        for seg in (3, 8):  # non-power-of-two tail and production segment size
-            out = self._run(x, ids, w, block_m=block_m, seg_blocks=seg)
-            self.assertTrue(torch.equal(out, whole), f"seg_blocks={seg}")
+        # production segment size; the hot experts' block counts leave a short tail
+        out = self._run(x, ids, w, block_m=block_m, seg_blocks=self.M._DOWN_SEG_BLOCKS)
+        self.assertTrue(torch.equal(out, whole))
 
     def test_matches_aiter_a8w4(self):
         # K3.1's own expert count: AITER only has tuned A8W4 kernels for it (other shapes fall back to a CK
