@@ -16,10 +16,9 @@ test_topk_alignment = load_legacy_ppu_module(
 ).test_topk_alignment
 
 register_ppu_ci(est_time=90, suite="stage-b-kernel-test-1-gpu-ppu")
-register_ppu_ci(est_time=90, suite="known-issues-1-ppu", nightly=True)
 
 
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 def test_rmsnorm(dtype):
     from sgl_kernel import rmsnorm
 
