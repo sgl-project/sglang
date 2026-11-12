@@ -12,7 +12,6 @@ import time
 from functools import wraps
 from types import SimpleNamespace
 from typing import Iterable, Optional, Union
-from urllib.parse import urlparse
 
 import requests
 
@@ -451,92 +450,6 @@ def _get_pod_ip_by_keyword(configmap_data, keyword):
     return None
 
 
-def resolve_prefill_instance_master_ip(
-    pod_index, prefill_args, timeout=LOCAL_TIMEOUT, poll_interval=15
-):
-    """Resolve the master pod IP of this prefill instance from the ConfigMap.
-
-    The master index follows the same rule as ``launch_pd_separation_node``
-    (``(pod_index // nnodes) * nnodes``), so all pods of a multi-pod prefill
-    instance can share one npu_memcache MetaService hosted on the master.
-
-    Returns None when not running in k8s (no NAMESPACE / KUBE_CONFIG_MAP), so
-    callers keep the local POD_IP fallback.
-    """
-    if not (NAMESPACE and CONFIGMAP_NAME):
-        return None
-
-    nnodes = _get_nnodes_from_args(prefill_args) or 1
-    master_index = (pod_index // nnodes) * nnodes
-    # ConfigMap data is {pod_name: pod_ip}; match the exact index so that
-    # e.g. "prefill-1" does not match "prefill-10".
-    suffix = f"prefill-{master_index}"
-
-    start_time = time.time()
-    while time.time() - start_time < timeout:
-        configmap = query_configmap(CONFIGMAP_NAME, NAMESPACE)
-        if configmap and configmap.data:
-            for pod_name, pod_ip in configmap.data.items():
-                if pod_name.endswith(suffix):
-                    logger.info(
-                        f"Resolved prefill master {suffix} from ConfigMap: {pod_ip}"
-                    )
-                    return pod_ip
-        logger.info(f"Waiting for ConfigMap entry ending with {suffix} ...")
-        time.sleep(poll_interval)
-
-    raise RuntimeError(
-        f"Timeout: failed to find {suffix} in ConfigMap {CONFIGMAP_NAME} "
-        f"after {timeout} seconds"
-    )
-
-
-def resolve_meta_service_config(meta_service_config, prefill_args, role):
-    """Point every pod of a multi-pod prefill instance at its instance master.
-
-    The MetaService is hosted by the first pod of the instance, so the other
-    pods must talk to the master's IP instead of their own POD_IP. The L3
-    backend extra config baked into ``prefill_args`` is rewritten as well, so
-    the model server and the test agree on the same endpoints.
-
-    Returns the effective config for this pod: the input config for decode
-    pods, single-pod prefill instances or runs outside k8s.
-    """
-    if (
-        not meta_service_config
-        or role != "prefill"
-        or not (NAMESPACE and CONFIGMAP_NAME)
-    ):
-        return meta_service_config
-
-    last_part = os.getenv("HOSTNAME", "").rsplit("-", 1)[-1]
-    if not last_part.isdigit():
-        return meta_service_config
-
-    nnodes = _get_nnodes_from_args(prefill_args or []) or 1
-    if nnodes <= 1:
-        return meta_service_config
-
-    master_ip = resolve_prefill_instance_master_ip(int(last_part), prefill_args)
-    resolved = build_meta_service_config(master_ip)
-    _rewrite_storage_extra_config(prefill_args, resolved)
-    return resolved
-
-
-def _rewrite_storage_extra_config(prefill_args, meta_service_config):
-    """Replace the MetaService endpoints in the L3 backend extra config."""
-    flag = "--hicache-storage-backend-extra-config"
-    if flag not in prefill_args:
-        return
-
-    value_index = prefill_args.index(flag) + 1
-    extra_config = json.loads(prefill_args[value_index])
-    for key in ("meta_service_url", "config_store_url", "metrics_url"):
-        if key in extra_config and key in meta_service_config:
-            extra_config[key] = meta_service_config[key]
-    prefill_args[value_index] = json.dumps(extra_config)
-
-
 def check_role(allowed_roles: Union[str, Iterable[str]]):
     if isinstance(allowed_roles, str):
         allowed_roles = {allowed_roles}
@@ -814,14 +727,11 @@ def launch_pd_separation_node(model_config):
 
     # The npu_memcache L3 backend connects to the Ascend MemCache MetaService
     # as soon as the model server starts, so the service must already be
-    # listening. The L3 backend is enabled through the storage backend extra
-    # config flag, which only the prefill side carries; on a multi-pod prefill
-    # instance only the instance master pod hosts the service.
+    # listening on this pod's IP. It is enabled through the storage backend
+    # extra config flag, which only the prefill side carries.
     meta_service_process = None
     if "--hicache-storage-backend-extra-config" in service_args:
-        meta_service_process = start_meta_service(
-            build_meta_service_config(), role, service_args
-        )
+        meta_service_process = start_meta_service(host_ip)
 
     other_args.extend(service_args)
 
@@ -988,34 +898,17 @@ def launch_router(model_config):
         raise RuntimeError(f"Failed to start router process: {e}")
 
 
-def start_meta_service(meta_service_config, role, prefill_args=None):
-    """Start the npu_memcache MetaService before the model server.
+def start_meta_service(host_ip):
+    """Start the npu_memcache MetaService on this pod before the model server.
 
     The L3 npu_memcache backend connects to the Ascend MemCache MetaService
-    at startup, so it must already be listening. In PD separation only the
-    prefill node enables the L3 backend. On a multi-pod prefill instance the
-    endpoints are retargeted at the instance master (see
-    ``resolve_meta_service_config``), which is also the only pod hosting it.
+    at startup, so it must already be listening. The service is hosted on the
+    current pod's IP, which is also what the L3 backend extra config targets.
 
-    Returns the MetaService process, or None when this pod does not host it.
+    Returns the MetaService process.
     """
-    meta_service_config = resolve_meta_service_config(
-        meta_service_config, prefill_args or [], role
-    )
-    if not meta_service_config or role != "prefill":
-        return None
-
-    # In a multi-pod prefill instance every pod is configured with the
-    # instance master's endpoint, but only the master pod hosts the
-    # MetaService itself.
-    parsed_url = urlparse(meta_service_config["meta_service_url"])
-    host, port = parsed_url.hostname, parsed_url.port
-    if host not in (os.getenv("POD_IP"), "127.0.0.1"):
-        logger.info(
-            f"npu_memcache MetaService is hosted on {host}, "
-            f"skip starting it on this pod"
-        )
-        return None
+    meta_service_config = build_meta_service_config(host_ip)
+    port = META_SERVICE_PORT
 
     # Materialize the config on the pod-local temp dir so runtime ports
     # (chosen by the test case) are not baked into a checked-in file.
@@ -1042,14 +935,14 @@ def start_meta_service(meta_service_config, role, prefill_args=None):
                 f"npu_memcache MetaService exited with code "
                 f"{process.returncode} before it was ready"
             )
-        if check_port_availability(host, port):
-            logger.info(f"npu_memcache MetaService is ready at {host}:{port}")
+        if check_port_availability(host_ip, port):
+            logger.info(f"npu_memcache MetaService is ready at {host_ip}:{port}")
             return process
         time.sleep(META_SERVICE_READY_POLL_INTERVAL)
 
     raise RuntimeError(
         f"Timed out after {META_SERVICE_READY_TIMEOUT}s waiting for "
-        f"npu_memcache MetaService at {host}:{port}"
+        f"npu_memcache MetaService at {host_ip}:{port}"
     )
 
 
