@@ -4,7 +4,6 @@ from typing import List, Optional, Sequence, Union
 
 import torch
 
-from sglang.kernels.ops.memory.adler32 import adler32_strided_checksum
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
@@ -175,7 +174,10 @@ class KvChecksumComputer:
     ) -> int:
         """``state_indices_gpu`` is one tensor for every state buffer, or one
         per state entry (`state_indices_for_request`)."""
-        assert kv_page_indices_gpu.is_cuda and kv_page_indices_gpu.is_contiguous()
+        expected_device = kv_page_indices_gpu.device.type
+        assert (
+            expected_device in ("cuda", "npu") and kv_page_indices_gpu.is_contiguous()
+        )
         all_ptrs = list(self._kv_data_ptrs)
         all_lens = list(self._kv_item_lens)
         all_indices: List[torch.Tensor] = [kv_page_indices_gpu] * len(
@@ -189,8 +191,15 @@ class KvChecksumComputer:
                 per_entry = list(state_indices_gpu)
                 assert len(per_entry) == len(self._state_entry_sizes)
             for indices, size in zip(per_entry, self._state_entry_sizes):
-                assert indices.is_cuda and indices.is_contiguous()
+                assert (
+                    indices.device.type == expected_device and indices.is_contiguous()
+                )
                 all_indices += [indices] * size
             all_ptrs += self._state_data_ptrs
             all_lens += self._state_item_lens
+        if expected_device == "npu":
+            from sgl_kernel_npu.operators.mem_cache import adler32_strided_checksum
+        else:
+            from sglang.kernels.ops.memory.adler32 import adler32_strided_checksum
+
         return adler32_strided_checksum(all_ptrs, all_lens, all_indices)
