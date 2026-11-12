@@ -254,15 +254,6 @@ async fn router_side_rejections_use_the_anthropic_envelope() {
         assert_eq!(status, StatusCode::BAD_REQUEST, "{req}");
         assert_anthropic_error(&body, "invalid_request_error");
     }
-    let (status, _, body) = post(
-        build_ctx(mock.url.clone()),
-        "/v1/messages",
-        json!({"model": "no-such-model", "max_tokens": 16,
-               "messages": [{"role": "user", "content": "x"}]}),
-    )
-    .await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
-    assert_anthropic_error(&body, "not_found_error");
     assert!(
         captured(&mock).is_none(),
         "rejected requests must not reach the engine"
@@ -285,15 +276,16 @@ async fn count_tokens() {
     cfg.model.tokenizer_path = Some(tokenizer.to_str().unwrap().into());
     let req = json!({"model": MODEL, "messages": [{"role": "user", "content": "hello world"}]});
 
-    let (status, _, body) = post(
-        build_ctx_with(mock.url.clone(), cfg),
-        "/v1/messages/count_tokens",
-        req.clone(),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
-    let v: Value = serde_json::from_slice(&body).unwrap();
-    assert!(v["input_tokens"].as_u64().unwrap() > 0, "{v}");
+    // Any `model` name counts with the served model's tokenizer.
+    let ctx = build_ctx_with(mock.url.clone(), cfg);
+    for model in [MODEL, "no-such-model"] {
+        let mut req = req.clone();
+        req["model"] = json!(model);
+        let (status, _, body) = post(ctx.clone(), "/v1/messages/count_tokens", req).await;
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert!(v["input_tokens"].as_u64().unwrap() > 0, "{model}: {v}");
+    }
 
     // Without a chat template there is no exact count, and no raw-text guess.
     let (status, _, body) = post(

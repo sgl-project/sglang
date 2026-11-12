@@ -981,23 +981,8 @@ async fn no_healthy_workers_returns_503() {
     );
 }
 
-#[tokio::test]
-async fn unknown_model_without_workers_returns_404() {
-    let ctx = build_ctx_with_worker("http://127.0.0.1:1");
-    ctx.registry.remove(&WorkerId("w1".into()));
-    let request = Request::builder()
-        .method("POST")
-        .uri("/v1/chat/completions")
-        .header("content-type", "application/json")
-        .body(Body::from(r#"{"model":"unknown","messages":[]}"#))
-        .unwrap();
-    let response = build_router(ctx).oneshot(request).await.unwrap();
-    assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    assert_eq!(response.headers()["x-router-error-code"], "model_not_found");
-}
-
-/// A `--model-alias` is served as `--model-id`; a name that is neither stays
-/// `model_not_found`. The case: a gateway forwarding the engine's snapshot path.
+/// A `--model-alias` is served as `--model-id`; any other name is served too
+/// and forwarded as sent. The case: a gateway forwarding the engine's snapshot path.
 #[tokio::test]
 async fn model_alias_routes_as_the_configured_model() {
     const ALIAS: &str = "/weights-repo/snapshots/d89b007b";
@@ -1021,26 +1006,22 @@ async fn model_alias_routes_as_the_configured_model() {
     let policies = Arc::new(build_policy_registry(&cfg).unwrap());
     let proxy = Arc::new(Proxy::new(TEST_TIMEOUT).unwrap());
     let ctx = Arc::new(AppContext::new(cfg, tokenizers, proxy, registry, policies));
-    for (model, forwarded_model, status) in [
-        (ALIAS, "tiny", StatusCode::OK),
+    for (model, forwarded_model) in [
+        (ALIAS, "tiny"),
         // SGLang's `base:adapter` LoRA syntax on an alias.
+        ("/weights-repo/snapshots/d89b007b:my-lora", "tiny:my-lora"),
+        ("s3://bucket/model", "tiny"),
+        ("s3://bucket/model:my-lora", "tiny:my-lora"),
+        ("s3://bucket/model:version", "tiny"),
+        ("s3://bucket/model:version:my-lora", "tiny:my-lora"),
+        ("tiny", "tiny"),
+        ("tiny:my-lora", "tiny:my-lora"),
+        ("dummy", "dummy"),
         (
-            "/weights-repo/snapshots/d89b007b:my-lora",
-            "tiny:my-lora",
-            StatusCode::OK,
+            "/weights-repo/snapshots/other",
+            "/weights-repo/snapshots/other",
         ),
-        ("s3://bucket/model", "tiny", StatusCode::OK),
-        ("s3://bucket/model:my-lora", "tiny:my-lora", StatusCode::OK),
-        ("s3://bucket/model:version", "tiny", StatusCode::OK),
-        (
-            "s3://bucket/model:version:my-lora",
-            "tiny:my-lora",
-            StatusCode::OK,
-        ),
-        ("tiny", "tiny", StatusCode::OK),
-        ("tiny:my-lora", "tiny:my-lora", StatusCode::OK),
-        ("/weights-repo/snapshots/other", "", StatusCode::NOT_FOUND),
-        ("s3://bucket/other:my-lora", "", StatusCode::NOT_FOUND),
+        ("s3://bucket/other:my-lora", "s3://bucket/other:my-lora"),
     ] {
         for (path, mut body) in [
             (
@@ -1059,22 +1040,19 @@ async fn model_alias_routes_as_the_configured_model() {
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap();
             let res = build_router(Arc::clone(&ctx)).oneshot(req).await.unwrap();
-            assert_eq!(res.status(), status, "{path}: model {model}");
-            if status == StatusCode::OK {
-                let sent = worker.captured_json().await;
-                assert_eq!(sent["model"], forwarded_model, "{path}: model {model}");
-                assert_eq!(sent["lora_path"], serde_json::Value::Null);
-            }
+            assert_eq!(res.status(), StatusCode::OK, "{path}: model {model}");
+            let sent = worker.captured_json().await;
+            assert_eq!(sent["model"], forwarded_model, "{path}: model {model}");
+            assert_eq!(sent["lora_path"], serde_json::Value::Null);
         }
     }
 }
 
-/// A worker is registered for a model that is NOT the configured `cfg.model` (so the
-/// policy registry has no entry for it).  The handler returns 404
-/// `model_not_found` rather than 500 — clients can recover by sending a
-/// different model name; an internal_error would mask the misconfiguration.
+/// A worker is registered for a model that is NOT the configured `cfg.model`.
+/// A request naming that model is served as `cfg.model`, which has no
+/// workers, so it is a 503 rather than traffic to the other model's worker.
 #[tokio::test]
-async fn unknown_model_with_no_policy_returns_404_model_not_found() {
+async fn worker_of_another_model_gets_no_traffic() {
     let worker = crate::common::mock_worker::MockWorker::start(vec![]).await;
     let cfg = config_for(&worker.url);
     let tokenizers = Arc::new(TokenizerRegistry::load_from_config(&cfg).unwrap());
@@ -1106,11 +1084,12 @@ async fn unknown_model_with_no_policy_returns_404_model_not_found() {
         ))
         .unwrap();
     let res = app.oneshot(req).await.unwrap();
-    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(
         res.headers().get("x-router-error-code").unwrap(),
-        "model_not_found",
+        "no_healthy_workers",
     );
+    assert!(worker.captured.lock().unwrap().last_body.is_none());
 }
 
 #[tokio::test]
