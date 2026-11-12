@@ -7,13 +7,14 @@ from unittest.mock import patch
 
 from sglang.srt.kernel_plugins.nvidia import binding as mb
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=2, stage="base-a", runner_config="cpu")
 ARCH = ["KimiK3ForConditionalGeneration"]
 DEFAULT = tuple(range(6, 65, 6))
 
 
-class TestNativeCapturePreparation(unittest.TestCase):
+class TestNativeCapturePreparation(CustomTestCase):
     def test_request_pool_clamps_oversized_capture_bucket(self):
         from sglang.srt.arg_groups.cuda_graph_hook import parse_cuda_graph_config
         from sglang.srt.arg_groups.memory_hook import handle_gpu_memory_settings
