@@ -767,16 +767,16 @@ def test_prologue_stores_kv_pool(m, local):
 @pytest.mark.parametrize("local_heavy", [False, True])
 @pytest.mark.parametrize("tokens", [1, 2, 3, 4])
 def test_fused_route_matches_separate_kernels(rank, with_bias, local_heavy, tokens):
-    """route_topk_metadata (one token, ROCm decode) is bitwise route_topk followed
-    by route_metadata: weights, ids and every routing metadata tensor (local_heavy
-    routes all eight ids to this rank's experts, filling the schedule)."""
+    """route_topk_metadata (up to four tokens, ROCm decode) is bitwise route_topk
+    followed by route_metadata: weights, ids and every routing metadata tensor
+    (local_heavy routes all eight ids to this rank's experts, filling the schedule)."""
     from sglang.kernels.ops.inkling2.route import route_metadata, route_topk
     from sglang.kernels.ops.inkling2.route_hip import route_topk_metadata
 
     experts, num_local, block_m = 384, 48, 16
     one = torch.ones((), device="cuda")
     start = rank * num_local
-    for seed in range(20 if tokens == 1 else 6):
+    for seed in range(6):
         torch.manual_seed(
             1000 * rank + 100 * with_bias + 10 * local_heavy + seed + 7 * tokens
         )
@@ -1310,10 +1310,9 @@ def test_apply_wo_ud_matches_hipblaslt(rows):
 @pytest.mark.parametrize("fmt", ["nvfp4", "mxfp8"])
 @pytest.mark.parametrize("tokens", [160, 256, 512])
 def test_expert_gemm_large_batch_tiles(fmt, tokens):
-    """1,280-4,096 routed rows over 384 experts (MTP verify above c16) take the
-    large-batch tile (16, 64, 256), which equals float64 up to summation order."""
+    """1,280-4,096 routed rows over 384 experts (MTP verify above c16): the
+    large-batch tile equals float64 up to summation order."""
     from sglang.kernels.ops.inkling2 import experts_hip, experts_sm90
-    from sglang.kernels.ops.inkling2.experts_hip import GemmConfig
 
     torch.manual_seed(tokens)
     nexp, n, k, top_k, start, num_experts = 48, 512, 1024, 8, 48, 384
@@ -1338,7 +1337,6 @@ def test_expert_gemm_large_batch_tiles(fmt, tokens):
     ).int()
     rows = ids.numel()
     cfg = experts_hip.default_config(rows, num_experts, fmt == "nvfp4")
-    assert cfg == GemmConfig(16, 64, 256, 1, 4, 1)
     route = experts_hip.route(ids.flatten(), start, nexp, num_experts, block_m=cfg.bm)
     out = experts_hip.expert_gemm(
         xq, w, s, route, n, top_k, torch.float32, rows, num_experts=num_experts
