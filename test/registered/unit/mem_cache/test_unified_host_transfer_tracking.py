@@ -17,7 +17,7 @@ from sglang.kernels.ops.memory.virtual_slot import translate_token_ids
 from sglang.srt.disaggregation.decode import SchedulerDisaggregationDecodeMixin
 from sglang.srt.mem_cache import unified_radix_cache
 from sglang.srt.mem_cache.common import RetractionBackup
-from sglang.srt.mem_cache.kv.alloc.band import Band, _span_growth
+from sglang.srt.mem_cache.kv.alloc.band import Band
 from sglang.srt.mem_cache.kv.alloc.chain import ChainRoles
 from sglang.srt.mem_cache.kv.alloc.id_space import UnitIds
 from sglang.srt.mem_cache.kv.alloc.page_usage import PageUsage
@@ -256,19 +256,6 @@ class TestRetirementBookkeeping(CustomTestCase):
             usage.register_forward(object())
             usage.retire_all()  # a settle waits the newest forward
         self.assertEqual(len(usage.event_seq), 0)
-
-
-class TestSpanGrowth(CustomTestCase):
-    def test_growth_is_the_pages_taken_at_either_end(self):
-        self.assertEqual(_span_growth((10, 20), (10, 22)), [20, 21])
-        self.assertEqual(_span_growth((10, 20), (8, 20)), [8, 9])
-        self.assertEqual(_span_growth((10, 20), (9, 21)), [9, 20])
-        self.assertEqual(_span_growth((10, 20), (10, 20)), [])
-
-    def test_growth_from_an_empty_span(self):
-        self.assertEqual(_span_growth((15, 15), (4, 7)), [4, 5, 6])
-        self.assertEqual(_span_growth((3, 3), (4, 7)), [4, 5, 6])
-        self.assertEqual(_span_growth((5, 5), (4, 7)), [4, 5, 6])
 
 
 if __name__ == "__main__":

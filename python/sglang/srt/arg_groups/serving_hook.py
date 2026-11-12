@@ -206,6 +206,8 @@ def handle_media_url_security(server_args: Any):
         allowed_media_domains=configure_media_url_security(
             cfg.allowed_media_domains,
             cfg.media_url_max_file_size_mb,
+            cfg.media_url_timeout,
+            cfg.allow_local_media_files,
         ),
     )
 
@@ -329,6 +331,22 @@ def handle_deprecated_args(server_args: Any):
             and cfg.speculative_attention_mode == "prefill"
         ):
             renamed["speculative_attention_mode"] = "decode"
+    if renamed:
+        declare_resolution(server_args, "_handle_deprecated_args", **renamed)
+
+    # Deprecated MoE A2A backend alias.
+    renamed = {}
+    for attr, value in (
+        ("moe_a2a_backend", cfg.moe_a2a_backend),
+        ("speculative_moe_a2a_backend", cfg.speculative_moe_a2a_backend),
+    ):
+        if value == "flashinfer":
+            logger.warning(
+                "--%s=flashinfer is deprecated; use 'flashinfer_nvlink_one_sided' "
+                "instead.",
+                attr.replace("_", "-"),
+            )
+            renamed[attr] = "flashinfer_nvlink_one_sided"
     if renamed:
         declare_resolution(server_args, "_handle_deprecated_args", **renamed)
 
