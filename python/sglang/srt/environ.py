@@ -42,6 +42,29 @@ def _default_on_in_ci() -> bool:
     return envs.SGLANG_IS_IN_CI.get()
 
 
+# Parsed values by name once `freeze_env_reads` ran; None reads os.environ every time.
+_frozen_reads: Optional[Dict[str, Any]] = None
+
+
+def freeze_env_reads() -> None:
+    """Serve every later ``EnvField.get`` from a per-process memo.
+
+    Gated by SGLANG_OPT_FREEZE_ENV_READS, for a process whose hot loop reads the
+    same variables every step, once its startup is over. Writes through ``set`` /
+    ``override`` / ``clear`` drop the memo; a raw ``os.environ`` write after this
+    call is not seen.
+    """
+    global _frozen_reads
+    if _frozen_reads is None and envs.SGLANG_OPT_FREEZE_ENV_READS.get():
+        _frozen_reads = {}
+
+
+def _drop_frozen_reads() -> None:
+    # Callable defaults read other fields, so one write can change several values.
+    if _frozen_reads is not None:
+        _frozen_reads.clear()
+
+
 class EnvField:
     _allow_set_name = True
 
@@ -65,6 +88,16 @@ class EnvField:
         return self.default() if callable(self.default) else self.default
 
     def get(self) -> Any:
+        frozen = _frozen_reads
+        if frozen is None:
+            return self._read()
+        try:
+            return frozen[self.name]
+        except KeyError:
+            value = frozen[self.name] = self._read()
+            return value
+
+    def _read(self) -> Any:
         value = os.getenv(self.name)
 
         # Explicitly set to None
@@ -91,6 +124,7 @@ class EnvField:
     def set(self, value: Any):
         self._set_to_none = value is None
         os.environ[self.name] = str(value)
+        _drop_frozen_reads()
 
     @contextmanager
     def override(self, value: Any):
@@ -106,10 +140,12 @@ class EnvField:
             else:
                 os.environ.pop(self.name, None)
             self._set_to_none = backup_set_to_none
+            _drop_frozen_reads()
 
     def clear(self):
         os.environ.pop(self.name, None)
         self._set_to_none = False
+        _drop_frozen_reads()
 
     def __bool__(self):
         raise RuntimeError(
@@ -172,7 +208,7 @@ class _DeprecatedEnvFallback:
         super().__init__(default, secret=secret)
         self.deprecated_name = deprecated_name
 
-    def get(self) -> Any:
+    def _read(self) -> Any:
         if os.getenv(self.name) is None:
             fallback = os.getenv(self.deprecated_name)
             if fallback is not None:
@@ -186,7 +222,7 @@ class _DeprecatedEnvFallback:
                     stacklevel=2,
                 )
                 os.environ[self.name] = fallback
-        return super().get()
+        return super()._read()
 
 
 class EnvBoolWithAlias(_DeprecatedEnvFallback, EnvBool):
@@ -1721,6 +1757,13 @@ class Envs:
     # Let an unchanged top-k-1 EAGLE round read the previous round's top-1 and hidden
     # rows where the draft-extend graph left them instead of relaying copies.
     SGLANG_OPT_SPEC_RELAY_IN_PLACE = EnvBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
+    )
+    # Once the scheduler's event loop starts, serve EnvField reads from a memo
+    # (freeze_env_reads). Opt-in: torch.compile traces EnvField.get, so a function
+    # compiled before the freeze and called outside graph replay recompiles once at
+    # the freeze and again whenever a new variable enters the memo.
+    SGLANG_OPT_FREEZE_ENV_READS = EnvBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
     # Runtime optimizations that follow SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION. Each
