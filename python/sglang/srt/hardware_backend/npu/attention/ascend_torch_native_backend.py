@@ -7,6 +7,16 @@ import torch
 from torch.nn.functional import scaled_dot_product_attention
 
 
+def reference_swa_decode_mask(seq_lens, reference_lens, positions, window_size):
+    """FIA mask (True excludes a key) for full references plus the live suffix."""
+    lengths = seq_lens[:, None]
+    references = reference_lens[:, None]
+    keys = positions[None, :]
+    return (
+        (keys >= lengths) | ((keys >= references) & (keys < lengths - window_size))
+    ).unsqueeze(1)
+
+
 class AscendTorchNativeAttnBackend:
     def __init__(self):
         pass
@@ -74,6 +84,7 @@ class AscendTorchNativeAttnBackend:
         full_to_swa_mapping: Optional[torch.Tensor] = None,
         logit_cap: float = 0.0,
         logit_capping_method: str = "tanh",
+        reference_lens: Optional[torch.Tensor] = None,
     ):
         """Run the extend forward by using torch native sdpa op.
 
@@ -130,6 +141,7 @@ class AscendTorchNativeAttnBackend:
                 sliding_window_size is not None
                 and sliding_window_size > -1
                 and encoder_lens is None
+                and reference_lens is None
             )
             if is_swa_self_attn:
                 # For extend, the sliding window must be anchored at the first
@@ -177,6 +189,41 @@ class AscendTorchNativeAttnBackend:
                 # scaled_dot_product_attention() expects query, key, and value to have the same dtype
                 per_req_key = per_req_key.to(per_req_query.dtype)
                 per_req_value = per_req_value.to(per_req_query.dtype)
+
+            if reference_lens is not None:
+                # Re-prefill after retraction can include generated tokens.
+                # They keep their original R-SWA mask, rather than becoming
+                # part of a new globally visible prompt.
+                key_pos = torch.arange(seq_len_kv, device=query.device)
+                query_pos = torch.arange(
+                    prefill_seq_len_q, seq_len_kv, device=query.device
+                )[:, None]
+                mask = (key_pos <= query_pos) & (
+                    (key_pos < int(reference_lens[seq_idx]))
+                    | (key_pos > query_pos - sliding_window_size)
+                )
+                sdpa = (
+                    self.scaled_dot_product_attention_with_softcapping
+                    if logit_cap > 0
+                    else scaled_dot_product_attention
+                )
+                kwargs = (
+                    dict(logit_cap=logit_cap, logit_capping_method=logit_capping_method)
+                    if logit_cap > 0
+                    else {}
+                )
+                result = sdpa(
+                    per_req_query.unsqueeze(0),
+                    per_req_key.unsqueeze(0),
+                    per_req_value.unsqueeze(0),
+                    attn_mask=mask,
+                    scale=scaling,
+                    enable_gqa=enable_gqa,
+                    **kwargs,
+                )
+                output[start_q:end_q] = result.squeeze(0).movedim(1, 0)
+                start_q, start_kv = end_q, end_kv
+                continue
 
             if logit_cap > 0:
                 per_req_out_redundant = (
@@ -230,6 +277,7 @@ class AscendTorchNativeAttnBackend:
         full_to_swa_mapping: Optional[torch.Tensor] = None,
         logit_cap: float = 0.0,
         logit_capping_method: str = "tanh",
+        reference_lens: Optional[torch.Tensor] = None,
     ):
         """Run the decode forward by using torch native sdpa op.
 
@@ -287,6 +335,18 @@ class AscendTorchNativeAttnBackend:
             # index for each token in the sequence.
             req_pool_idx = req_pool_indices[seq_idx]
             per_req_tokens = req_to_token[req_pool_idx, atten_start_kv:atten_end_kv]
+            if reference_lens is not None:
+                # R-SWA keeps the entire prompt, then the latest W generated
+                # tokens (including the current query). Do not duplicate the
+                # prompt when the generated suffix is shorter than W.
+                reference_len = int(reference_lens[seq_idx].item())
+                window_start = max(reference_len, seq_len_kv - sliding_window_size)
+                per_req_tokens = torch.cat(
+                    (
+                        req_to_token[req_pool_idx, :reference_len],
+                        req_to_token[req_pool_idx, window_start:seq_len_kv],
+                    )
+                )
             # For SWA layers, k_cache/v_cache are from the SWA pool but
             # req_to_token stores full pool indices. Translate before indexing.
             if full_to_swa_mapping is not None:
