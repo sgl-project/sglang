@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from sglang.srt.layers.attention import triton_backend
 from sglang.srt.layers.attention.triton_backend import (
     ForwardMetadata,
     TritonAttnBackend,
@@ -131,8 +132,11 @@ def test_eager_target_verify_uses_bonus_token_width():
 )
 @pytest.mark.parametrize("unset_width", (None, -1, 0))
 def test_graph_capture_and_padded_replay_use_bonus_token_width(
-    batch_size, raw_batch_size, unset_width
+    batch_size, raw_batch_size, unset_width, monkeypatch
 ):
+    # CPU tensors take the shared fill; ROCm's fused fill is a GPU kernel
+    # (test_verify_indptrs_matches_torch).
+    monkeypatch.setattr(triton_backend, "_is_hip", False)
     backend = _make_backend(batch_size)
     capture_spec = None
     if unset_width is not None:
