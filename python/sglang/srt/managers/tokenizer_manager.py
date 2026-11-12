@@ -57,6 +57,7 @@ import uvloop
 import zmq
 import zmq.asyncio
 from fastapi import BackgroundTasks
+from transformers import PreTrainedTokenizerFast
 
 from sglang.srt.beam_search.output import (
     build_beam_search_out,
@@ -1151,7 +1152,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if (
                 not is_cross_encoder
                 and not return_special_tokens_mask
-                and not getattr(self.tokenizer, "is_fast", False)
+                and not isinstance(self.tokenizer, PreTrainedTokenizerFast)
             ):
                 input_ids = [
                     self.tokenizer.encode(t, **tokenizer_kwargs)

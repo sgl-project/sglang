@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from fastapi import FastAPI, HTTPException
+from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
 from tokenizers import Tokenizer, models, pre_tokenizers, processors
 from transformers import PretrainedConfig, PreTrainedTokenizerFast
@@ -138,8 +139,8 @@ class TestCohereEmbeddingHTTP(unittest.TestCase):
         self.app.router.routes.extend(
             route
             for route in http_server.app.routes
-            if getattr(route, "path", None)
-            in ("/v2/embed", "/v1/embeddings", "/v1/messages")
+            if isinstance(route, APIRoute)
+            and route.path in ("/v2/embed", "/v1/embeddings", "/v1/messages")
         )
         self.app.exception_handlers.update(http_server.app.exception_handlers)
         self.app.state.cohere_serving_embedding = self.serving
@@ -403,7 +404,9 @@ class TestCohereEmbeddingHTTP(unittest.TestCase):
 
     def test_direct_route_uses_shared_orjson_parser(self):
         route = next(
-            r for r in http_server.app.routes if getattr(r, "path", None) == "/v2/embed"
+            route
+            for route in http_server.app.routes
+            if isinstance(route, APIRoute) and route.path == "/v2/embed"
         )
         self.assertIs(type(route), http_server.ORJSONRoute)
         payload = b'{"texts":["hello"]}'

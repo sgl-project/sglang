@@ -143,15 +143,19 @@ Let `B` be the server's available input-token limit and `N` a positive `max_toke
 | --- | --- | --- |
 | Omitted or `null` | Use `B`; truncate a longer input. | Reject an input longer than `B`. |
 | `-1` | Use `B`; truncate a longer input. | Compare against literal `-1`; reject every nonempty input. |
-| `0` | Text input becomes empty and is rejected. Image input cannot be removed to meet a zero-token budget. | Reject every nonempty input. |
+| `0` | Reject the request: no valid nonempty token sequence fits a zero-token budget. | Reject every nonempty input. |
 | `N` at most `B` | Keep at most `N` tokens. | Reject an input longer than `N`. |
 | `N` greater than `B` | Reject the request, even if the input is short. | Accept an input that fits within `B`; reject a longer input. |
 
-For a text token sequence `[A, B, C, D, E]` with `max_tokens: 3`:
+For `texts` not rendered through a chat template, tokens added by the tokenizer (such as BOS or EOS) are kept and count toward the budget; only text tokens are removed. If the budget cannot fit the required special tokens, the request returns HTTP 400. A budget equal to their count can leave only special tokens.
 
-- `END` removes tokens from the end and retains `[A, B, C]`.
-- `START` removes tokens from the start and retains `[C, D, E]`.
+For example, if the tokenizer produces `[A, B, C, D, <|endoftext|>]`, with the final EOS token added by the tokenizer and `max_tokens: 3`:
+
+- `END` removes text tokens from the end and retains `[A, B, <|endoftext|>]`.
+- `START` removes text tokens from the start and retains `[C, D, <|endoftext|>]`.
 - `NONE` returns HTTP 400 instead of truncating.
+
+This preservation rule does not apply to tokens already present in a rendered chat template. For template-rendered `texts` and text-only `inputs`, `END` keeps the beginning of the token sequence and `START` keeps the end, up to the effective budget; template tokens outside that slice can be removed.
 
 A final empty token sequence returns HTTP 400. An empty string is not rejected solely for being empty: the result depends on the tokens added during preprocessing.
 
@@ -247,7 +251,7 @@ Server authentication and scheduling also apply their existing checks.
 
 ## Current scope
 
-- Text requests have GPU integration coverage with `Alibaba-NLP/gte-Qwen2-1.5B-instruct` and `Qwen/Qwen3-Embedding-0.6B`. These tests compare results with `/v1/embeddings`.
+- GPU integration tests cover text requests with `Alibaba-NLP/gte-Qwen2-1.5B-instruct`, `Qwen/Qwen3-Embedding-0.6B`, and `nvidia/Nemotron-3-Embed-1B-BF16`. These tests compare results with `/v1/embeddings`. The Nemotron test also checks the model-defined `query` and `document` task prefixes.
 - The endpoint adapts requests to installed model implementations. It does not add Nemotron model implementations.
 - Encoder/language disaggregation is not supported for these embedding requests. Use a server that runs the model and its encoder together for image requests.
 - The endpoint returns embeddings only. It does not implement Cohere chat, text generation, reranking, audio/video inputs, or streaming.

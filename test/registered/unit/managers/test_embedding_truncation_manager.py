@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, Mock
 
 import torch
 from tokenizers import Tokenizer, models, pre_tokenizers, processors
-from transformers import PreTrainedTokenizerFast
+from transformers import PreTrainedTokenizer, PreTrainedTokenizerFast
 
 from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchTokenizer
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
@@ -43,7 +43,7 @@ class TestEmbeddingTruncationManager(unittest.IsolatedAsyncioTestCase):
             is_embedding_gemma=False,
         )
         self.manager.mm_processor = None
-        self.manager.tokenizer = Mock(is_fast=True)
+        self.manager.tokenizer = Mock(spec=PreTrainedTokenizerFast)
         self.manager.async_dynamic_batch_tokenizer = None
         self.manager._create_tokenized_object = Mock(
             side_effect=lambda obj, text, ids, embeds, mm, types: SimpleNamespace(
@@ -246,7 +246,14 @@ class TestEmbeddingTruncationManager(unittest.IsolatedAsyncioTestCase):
     ):
         for mode in ("fast", "slow", "async"):
             with self.subTest(mode=mode):
-                tokenizer = Mock(is_fast=mode != "slow", eos_token_id=99)
+                tokenizer = Mock(
+                    spec=(
+                        PreTrainedTokenizer
+                        if mode == "slow"
+                        else PreTrainedTokenizerFast
+                    ),
+                    eos_token_id=99,
+                )
                 tokenizer.return_value = {"input_ids": [[1, 2]]}
                 tokenizer.encode.return_value = [1, 2]
                 self.manager.tokenizer = tokenizer
@@ -401,7 +408,13 @@ class TestEmbeddingTruncationManager(unittest.IsolatedAsyncioTestCase):
     async def test_fast_slow_and_async_tokenization_propagate_special_masks(self):
         for mode in ("fast", "slow", "async"):
             with self.subTest(mode=mode):
-                tokenizer = Mock(is_fast=mode != "slow")
+                tokenizer = Mock(
+                    spec=(
+                        PreTrainedTokenizer
+                        if mode == "slow"
+                        else PreTrainedTokenizerFast
+                    )
+                )
                 tokenizer.return_value = {
                     "input_ids": [[1, 2, 99]],
                     "special_tokens_mask": [[0, 0, 1]],

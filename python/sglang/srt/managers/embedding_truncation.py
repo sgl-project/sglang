@@ -164,7 +164,8 @@ def truncate_embedding_input(
     END retains the beginning and START retains the end. NONE enforces the
     budget even when the server's legacy auto-truncation option is enabled.
     -1 means the server limit only for END/START; NONE checks the literal value.
-    A zero END/START budget produces no tokens, which the caller must reject.
+    A zero END/START budget is rejected if required special tokens cannot fit;
+    otherwise it produces no tokens, which the caller must reject.
     For single-sequence text, a tokenizer-provided mask preserves tokens added
     by its template, while truncating only content tokens. Explicit token IDs
     and processor-expanded multimodal inputs retain their existing semantics.
