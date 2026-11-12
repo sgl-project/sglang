@@ -6177,6 +6177,8 @@ class Scheduler(
     def _hicache_l3_layout(self) -> dict:
         from sglang.srt.mem_cache.hicache_storage import disabled_l3_layout
 
+        if self.enable_unified_cache_external_linker:
+            return self._linker_l3_layout()
         if not self.enable_hierarchical_cache:
             return disabled_l3_layout(
                 "Hierarchical cache is disabled", page_size=self.page_size
@@ -6212,6 +6214,68 @@ class Scheduler(
                 )
             }
         return storage_backend.describe_l3_object_layout(
+            sidecar_pool_specs=sidecar_pool_specs,
+            window_trailing_pages=window_trailing_pages,
+            page_size=self.page_size,
+        )
+
+    def _linker_l3_layout(self) -> dict:
+        """The direct external linker's Mooncake objects, described like HiCache's:
+        the linker writes through its own MooncakeStore with the same key builders."""
+        from sglang.srt.mem_cache.hicache_storage import (
+            PoolHitPolicy,
+            PoolName,
+            SidecarPoolSpec,
+            disabled_l3_layout,
+        )
+        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
+            MooncakeDirectLinker,
+        )
+
+        tree_cache = self.tree_cache
+        wrapper = tree_cache.linker
+        cache_linker = wrapper.cache_linker if wrapper is not None else None
+        if not isinstance(cache_linker, MooncakeDirectLinker):
+            return disabled_l3_layout(
+                (
+                    "External linker storage is not Mooncake"
+                    if wrapper is not None
+                    else "Mooncake external linker is not attached"
+                ),
+                backend=get_memory().unified_cache_external_linker_backend,
+                page_size=self.page_size,
+            )
+        # Linker keys embed the attention-CP rank, so each CP shard is its own object.
+        if get_parallel().attn_cp_size > 1:
+            return disabled_l3_layout(
+                "External L3 layout does not support attention context parallelism",
+                backend="mooncake",
+                page_size=self.page_size,
+            )
+        storage = cache_linker.storage
+        window_trailing_pages = {
+            str(window.pool_name): window.full_window_pages
+            for window in (
+                tree_cache.components[ct] for ct in tree_cache.window_slots()
+            )
+        }
+        # The linker never fills tree_cache.sidecar_pool_specs; resolve_transfers
+        # gives each entry its index source's hit policy, so mirror that here.
+        trailing_sources = {str(PoolName.MAMBA), *window_trailing_pages}
+        sidecar_pool_specs = [
+            SidecarPoolSpec(
+                pool_name=entry.name,
+                indices_from_pool=entry.indices_from_pool,
+                hit_policy=(
+                    PoolHitPolicy.TRAILING_PAGES
+                    if str(entry.indices_from_pool) in trailing_sources
+                    else PoolHitPolicy.ALL_PAGES
+                ),
+            )
+            for entry in storage.mem_pool_host.entries
+            if entry.indices_from_pool != entry.name
+        ]
+        return storage.describe_l3_object_layout(
             sidecar_pool_specs=sidecar_pool_specs,
             window_trailing_pages=window_trailing_pages,
             page_size=self.page_size,

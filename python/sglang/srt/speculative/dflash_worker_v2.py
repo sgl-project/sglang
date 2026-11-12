@@ -61,8 +61,12 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
+from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, HiCacheDraftPlan
 from sglang.srt.speculative.dflash_dp import gather_draft_embedding
+from sglang.srt.speculative.dflash_draft_ring import (
+    DFlashDraftKVRing,
+    draft_kv_ring_rows_per_req_from_config,
+)
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import (
@@ -419,6 +423,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         self.draft_window_size: Optional[int] = get_spec().speculative_draft_window_size
         self.use_compact_draft_cache = self.draft_window_size is not None
         self.device = target_worker.device
+        self.draft_kv_ring: Optional[DFlashDraftKVRing] = None
 
         self._warned_sampling_fallback = False
         self._warned_lilicorr_eager = False
@@ -720,6 +725,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
         if self._draft_kv_on_swa:
             self._check_draft_pool_on_swa(token_to_kv_pool_allocator)
+        if get_spec().speculative_dflash_draft_kv_ring:
+            self._init_draft_kv_ring()
 
     def _check_draft_kv_on_swa(self, *, resolved_attention_backend: str) -> None:
         parallel = get_parallel()
@@ -806,12 +813,42 @@ class DFlashWorkerV2(BaseSpecWorker):
         assert ids is not None, "the target plan has no SWA write ids"
         return ids
 
+    def _init_draft_kv_ring(self) -> None:
+        dcp_size = get_parallel().attn_dcp_size
+        pool = self.draft_model_runner.token_to_kv_pool
+        req_to_token_rows = self.model_runner.req_to_token_pool.req_to_token.shape[0]
+        self.draft_kv_ring = DFlashDraftKVRing(
+            rows_per_req=draft_kv_ring_rows_per_req_from_config(
+                self.draft_model_runner.model_config.hf_config
+            ),
+            dcp_size=dcp_size,
+            req_to_token_rows=req_to_token_rows,
+            device=self.device,
+        )
+        if get_parallel().tp_rank == 0:
+            logger.info(
+                "DFLASH draft KV ring: %d rows per request per rank (%d positions), "
+                "%d req_to_token rows, draft pool %d rows.",
+                self.draft_kv_ring.rows_per_req,
+                self.draft_kv_ring.span,
+                req_to_token_rows,
+                pool.size,
+            )
+
+    def _build_hicache_draft_plan(self) -> HiCacheDraftPlan:
+        # A ring holds no prefix: a cached prefix brings no draft KV back.
+        if self.draft_kv_ring is not None:
+            return HiCacheDraftPlan()
+        return super()._build_hicache_draft_plan()
+
     def init_attention_backends(self):
         with (
             draft_pp_context(),
             draft_tp_context(self.draft_parallel_layout),
         ):
             self._draft_worker.init_attention_backends()
+        if self.draft_kv_ring is not None:
+            self.draft_model_runner.attn_backend.set_draft_kv_ring(self.draft_kv_ring)
         self._need_mamba_verify_commit = mambaish_config(
             self.model_runner.model_config
         ) is not None and hasattr(
@@ -2626,13 +2663,29 @@ class DFlashWorkerV2(BaseSpecWorker):
                 ctx_lens,
                 int(sum(batch.extend_lens)),
             )
-            # The draft KV goes to the slots the target prefill just wrote.
+            if self.draft_kv_ring is not None:
+                self.draft_kv_ring.record_floors(
+                    batch.reqs,
+                    batch.prefix_lens,
+                    self.model_runner.req_to_token_pool.req_generation,
+                )
+                draft_cache_loc = self.draft_kv_ring.extend_locs(
+                    req_pool_indices=batch.req_pool_indices,
+                    positions=positions,
+                    extend_lens=ctx_lens,
+                    seq_ends=draft_seq_lens + ctx_lens,
+                )
+            else:
+                # The draft KV goes to the slots the target prefill just wrote.
+                draft_cache_loc = self._draft_write_ids(iteration_ids)
             self._append_target_hidden_to_draft_kv_by_loc(
                 target_hidden=logits_output.hidden_states,
-                cache_loc=self._draft_write_ids(iteration_ids),
+                cache_loc=draft_cache_loc,
                 swa_cache_loc=(
                     swa_write_ids
                     if self._draft_kv_on_swa
+                    else None
+                    if self.draft_kv_ring is not None
                     else self._draft_write_ids(
                         iteration_ids, IdSpaceKind.SLIDING_WINDOW
                     )
@@ -2902,6 +2955,13 @@ class DFlashWorkerV2(BaseSpecWorker):
             else iteration_ids
         )
         draft_plan.bind(forward_batch, draft_translator)
+        ring_block_locs = None
+        if self.draft_kv_ring is not None:
+            ring_block_locs = self.draft_kv_ring.block_locs(
+                batch.req_pool_indices, positions, block_size
+            )
+            forward_batch.out_cache_loc = ring_block_locs
+            forward_batch.out_cache_loc_virtual = None
 
         if self.selector is not None or self.lilicorr is not None:
             self._selector_sample = None
@@ -3212,7 +3272,11 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         # Consume in this step: every decode graph size shares one aux output,
         # which the next target forward overwrites (resolve_aux_hidden_states_width).
-        cache_loc = self._draft_write_ids(iteration_ids)
+        cache_loc = (
+            ring_block_locs
+            if ring_block_locs is not None
+            else self._draft_write_ids(iteration_ids)
+        )
         self._append_target_hidden_to_draft_kv_by_loc(
             target_hidden=hidden.reshape(-1, hidden.shape[-1]),
             cache_loc=cache_loc,
@@ -3220,6 +3284,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             swa_cache_loc=(
                 verify_swa_write_ids
                 if self._draft_kv_on_swa
+                else None
+                if ring_block_locs is not None
                 else self._draft_write_ids(iteration_ids, IdSpaceKind.SLIDING_WINDOW)
             ),
             positions=positions,
