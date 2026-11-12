@@ -586,6 +586,12 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset], ...] = (
         _CUDA_SM100_PLUS,
     ),
     (
+        "diffusion.h3_vae_assemble_tiles",
+        KernelBackend.TRITON,
+        "layout.h3_vae_tile_assemble_triton:h3_vae_assemble_tiles",
+        frozenset({CapabilityRequirement.CUDA, CapabilityRequirement.HIP}),
+    ),
+    (
         "diffusion.pack_qkv_destination_major",
         KernelBackend.TRITON,
         "layout.ulysses_qkv_triton:pack_qkv_destination_major",
@@ -885,6 +891,7 @@ _EXPORTS: dict[str, str] = {
     "can_use_minimax_h3_vae_temporal_blend_write": "layout.minimax_h3_vae_output_jit",
     "minimax_h3_vae_denorm_clamp": "layout.minimax_h3_vae_output_jit",
     "minimax_h3_vae_temporal_blend_write": "layout.minimax_h3_vae_output_jit",
+    "h3_vae_assemble_tiles": "layout.h3_vae_tile_assemble_triton",
     "build_inv_indices": "layout.varlen_pack_pad_triton",
     "fused_pack_qkv": "layout.varlen_pack_pad_triton",
     "fused_pack_segmented_qkv": "layout.varlen_pack_pad_triton",
