@@ -23,7 +23,7 @@ def test_pack_pool_and_output_are_exact(used, nq, nk):
         route_prequantized,
         write_cake_output,
     )
-    from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse.sage_ulysses import (
+    from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse.prepared_sage_attention import (
         _dequantize_for_routing,
     )
 

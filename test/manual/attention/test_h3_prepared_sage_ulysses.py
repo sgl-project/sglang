@@ -19,9 +19,9 @@ import torch.distributed as dist
 def main():
     import os
 
-    from sglang.multimodal_gen.runtime.distributed import parallel_state
+    from sglang.multimodal_gen.runtime.distributed import parallel_state, sage_ulysses
     from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse import (
-        sage_ulysses as adapter,
+        prepared_sage_attention as adapter,
     )
     from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse import (
         sage_ulysses_route as route,
@@ -87,19 +87,23 @@ def main():
                 with patch.dict(
                     os.environ, {"SGLANG_DIFFUSION_H3_SAGE_FUSED_PREPOST": "0"}
                 ):
-                    reference = adapter.prepared_sage_ulysses_forward(
+                    reference = adapter.prepared_subblock_sage_attention_forward(
                         q, k, v, **kwargs
                     ).clone()
-                transport = adapter._get_transport(dist.group.WORLD, q, used)
+                transport = sage_ulysses._get_transport(dist.group.WORLD, q, used)
                 received = transport.encoded
                 assert received.used_sequence == used
                 with patch.dict(
                     os.environ, {"SGLANG_DIFFUSION_H3_SAGE_FUSED_PREPOST": "1"}
                 ):
-                    actual = adapter.prepared_sage_ulysses_forward(q, k, v, **kwargs)
-                assert adapter._get_transport(dist.group.WORLD, q, used) is transport
+                    actual = adapter.prepared_subblock_sage_attention_forward(
+                        q, k, v, **kwargs
+                    )
+                assert (
+                    sage_ulysses._get_transport(dist.group.WORLD, q, used) is transport
+                )
                 assert transport.encoded is received
-                assert len(adapter._TRANSPORTS) == 1
+                assert len(sage_ulysses._TRANSPORTS) == 1
                 assert actual is not None and actual.shape == q.shape
                 torch.testing.assert_close(actual, reference, rtol=0, atol=0)
                 assert torch.isfinite(actual).all()
@@ -110,12 +114,12 @@ def main():
                     # Exercise FlashInfer's collective preparation failure,
                     # then let the next geometry prove the group can retry.
                     try:
-                        adapter._get_transport(dist.group.WORLD, q, total + 1)
+                        sage_ulysses._get_transport(dist.group.WORLD, q, total + 1)
                     except (ValueError, RuntimeError) as error:
                         assert "used_sequence" in str(error), str(error)
                     else:
                         raise AssertionError("invalid live prefix was accepted")
-                    assert not adapter._TRANSPORTS and transport.comm is None
+                    assert not sage_ulysses._TRANSPORTS and transport.comm is None
                 del received, transport
             dist.barrier()
             if rank == 0:
@@ -130,7 +134,7 @@ def main():
         if rank == 0:
             print("PASS geometry turnover and retained output lifetimes", flush=True)
     finally:
-        adapter.shutdown_prepared_sage_ulysses()
+        sage_ulysses.shutdown_prepared_sage_ulysses()
         dist.destroy_process_group()
 
 

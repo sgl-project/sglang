@@ -947,7 +947,7 @@ def destroy_model_parallel() -> None:
     import sys
 
     prepared_sage = sys.modules.get(
-        "sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse.sage_ulysses"
+        "sglang.multimodal_gen.runtime.distributed.sage_ulysses"
     )
     if prepared_sage is not None:
         prepared_sage.shutdown_prepared_sage_ulysses()

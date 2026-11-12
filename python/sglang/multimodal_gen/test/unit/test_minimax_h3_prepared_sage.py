@@ -1,13 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
-"""CPU contract tests for the CAKE adapter, without compiling a CUDA kernel."""
+"""CPU contracts for prepared Sage communication and its SubBlock consumer."""
 
 from types import SimpleNamespace
 
 import pytest
 import torch
 
+from sglang.multimodal_gen.runtime.distributed import sage_ulysses as adapter
 from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse import (
-    sage_ulysses as adapter,
+    prepared_sage_attention as attention_backend,
 )
 
 
@@ -23,7 +24,7 @@ def test_cake_receives_exact_tail_and_noncontiguous_routing(
     topk = index.numel()
     index = index.view(1, 1, 1, topk).expand(1, 2, blocks, topk).contiguous()
     monkeypatch.setattr(
-        adapter,
+        attention_backend,
         "SubBlockRouter",
         lambda **kwargs: SimpleNamespace(
             route=lambda *args, **kwargs: SimpleNamespace(index=index, topk=topk)
@@ -63,25 +64,28 @@ def test_cake_receives_exact_tail_and_noncontiguous_routing(
         out.fill_(3)
         return out
 
-    monkeypatch.setattr(adapter, "load_bsa_attn_sm120_blk64_sage_fwd", lambda: kernel)
+    monkeypatch.setattr(
+        attention_backend, "load_bsa_attn_sm120_blk64_sage_fwd", lambda: kernel
+    )
     schedule = SimpleNamespace(
         sparsity=0.75, n_k=1, n_q=1, min_seq_len=0, skip_first_steps=10
     )
     q = torch.zeros((1, global_sequence, 2, 128), dtype=torch.int8)
     v = torch.zeros((1, 128, 2, global_sequence), dtype=torch.float8_e4m3fn)
-    out = torch.full(q.shape, 99, dtype=torch.bfloat16)
-    adapter._SparseSageA2ACompute(schedule, mask)(
-        q_int8=q,
-        k_int8=q,
-        v_fp8=v,
+    operands = SimpleNamespace(
+        q=q,
+        k=q,
+        v=v,
         q_scale=torch.ones((1, 2, 8)),
         k_scale=torch.ones((1, 2, 4)),
         v_scale=torch.ones((1, 2, 128)),
-        out=out,
         used_sequence=used,
-        global_sequence=global_sequence,
-        softmax_scale=128**-0.5,
-        output_dtype=torch.bfloat16,
+        logical_sequence=global_sequence,
+        input_dtype=torch.bfloat16,
+        layout="sage2_sm89_sm120",
+    )
+    out = attention_backend.PreparedSubBlockSageAttention(schedule, mask)(
+        operands, softmax_scale=128**-0.5
     )
     assert torch.all(out[:, :used] == 3)
     assert torch.count_nonzero(out[:, used:]) == 0
@@ -90,6 +94,14 @@ def test_cake_receives_exact_tail_and_noncontiguous_routing(
         assert count == blocks
     else:
         assert count == topk and indices is index
+
+
+def test_subblock_consumer_rejects_an_incompatible_quantized_layout():
+    consumer = attention_backend.PreparedSubBlockSageAttention(
+        SimpleNamespace(n_k=4, n_q=4)
+    )
+    with pytest.raises(ValueError, match="requires sage2_sm89_sm120"):
+        consumer(SimpleNamespace(layout="sage2_sm90"), softmax_scale=128**-0.5)
 
 
 @pytest.mark.parametrize("eligible", [True, False])
@@ -113,6 +125,7 @@ def test_prepared_forward_reuses_operands_and_gathers_once(monkeypatch, eligible
         v_scale=torch.ones((1, 2, 128)),
         used_sequence=130,
         logical_sequence=256,
+        input_dtype=torch.bfloat16,
     )
     calls = []
 
@@ -121,32 +134,26 @@ def test_prepared_forward_reuses_operands_and_gathers_once(monkeypatch, eligible
         calls.append("quantize+exchange")
         return encoded
 
-    def compute(**kw):
-        for name, value in [
-            ("q_int8", encoded.q),
-            ("k_int8", encoded.k),
-            ("v_fp8", encoded.v),
-            ("q_scale", encoded.q_scale),
-            ("k_scale", encoded.k_scale),
-            ("v_scale", encoded.v_scale),
-        ]:
-            assert kw[name] is value
-        assert kw["used_sequence"] == 130 and kw["global_sequence"] == 256
+    def compute(operands, *, softmax_scale):
+        assert operands is encoded
+        assert softmax_scale == 128**-0.5
         calls.append("compute")
-        kw["out"].fill_(5)
+        return torch.full_like(operands.q, 5, dtype=operands.input_dtype)
 
     def gather(output):
         calls.append("gather")
         return output.reshape(1, 64, 8, 128)
 
-    monkeypatch.setattr(adapter, "_SparseSageA2ACompute", lambda *args: compute)
+    monkeypatch.setattr(
+        attention_backend, "PreparedSubBlockSageAttention", lambda *args: compute
+    )
     impl = SimpleNamespace(
         schedule=SimpleNamespace(quantize_before_a2a=True, min_seq_len=0),
         layer_enabled=True,
         _step_enabled=lambda: True,
         softmax_scale=128**-0.5,
     )
-    result = adapter.prepared_sage_ulysses_forward(
+    result = attention_backend.prepared_subblock_sage_attention_forward(
         q,
         q,
         q,
@@ -182,7 +189,7 @@ def test_declines_before_transport_when_schedule_does_not_admit(monkeypatch, gat
     monkeypatch.setattr(adapter, "_get_transport", unexpected)
     q = torch.zeros((64, 8, 128), dtype=torch.bfloat16)
     assert (
-        adapter.prepared_sage_ulysses_forward(
+        attention_backend.prepared_subblock_sage_attention_forward(
             q,
             q,
             q,
@@ -194,6 +201,54 @@ def test_declines_before_transport_when_schedule_does_not_admit(monkeypatch, gat
         )
         is None
     )
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_ulysses_accepts_an_independent_attention_consumer(monkeypatch, fail):
+    calls = []
+    q = torch.zeros((64, 8, 128), dtype=torch.bfloat16)
+    # The communication wrapper must pass the received record through without
+    # inspecting attention-specific fields or creating a SubBlock consumer.
+    operands = object()
+    computed = torch.full((1, 256, 2, 128), 7, dtype=q.dtype)
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("A supplied attention consumer must not invoke SubBlock")
+
+    monkeypatch.setattr(attention_backend, "PreparedSubBlockSageAttention", unexpected)
+
+    def exchange(query, key, value):
+        assert query is key is value is q
+        calls.append("exchange")
+        return operands
+
+    def attention(received):
+        assert received is operands
+        calls.append("attention")
+        if fail:
+            raise RuntimeError("attention failed")
+        return computed
+
+    def gather(output):
+        assert output is computed
+        calls.append("gather")
+        return output.reshape(1, *q.shape)
+
+    def get_transport(group, query, used):
+        assert group == "group" and query is q and used == 130
+        calls.append("prepare")
+        return SimpleNamespace(exchange=exchange, gather=gather)
+
+    monkeypatch.setattr(adapter, "_get_transport", get_transport)
+    kwargs = dict(group="group", used_sequence=130, attention=attention)
+    if fail:
+        with pytest.raises(RuntimeError, match="attention failed"):
+            adapter.prepared_sage_ulysses_forward(q, q, q, **kwargs)
+        assert calls == ["prepare", "exchange", "attention"]
+    else:
+        result = adapter.prepared_sage_ulysses_forward(q, q, q, **kwargs)
+        assert result.shape == q.shape and torch.all(result == 7)
+        assert calls == ["prepare", "exchange", "attention", "gather"]
 
 
 def test_workspace_and_received_storage_are_reused(monkeypatch):

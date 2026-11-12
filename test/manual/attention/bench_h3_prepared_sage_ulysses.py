@@ -18,8 +18,9 @@ import torch.distributed as dist
 
 @torch.inference_mode()
 def main():
+    from sglang.multimodal_gen.runtime.distributed import sage_ulysses
     from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse import (
-        sage_ulysses as adapter,
+        prepared_sage_attention as adapter,
     )
     from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse import (
         sage_ulysses_route as route,
@@ -58,7 +59,7 @@ def main():
         _step_enabled=lambda: True,
         softmax_scale=dim**-0.5,
     )
-    transport = adapter._PreparedSageTransport(dist.group.WORLD, q, used)
+    transport = sage_ulysses._PreparedSageTransport(dist.group.WORLD, q, used)
     try:
         with (
             patch.object(
@@ -71,7 +72,7 @@ def main():
 
             def run(fused):
                 os.environ["SGLANG_DIFFUSION_H3_SAGE_FUSED_PREPOST"] = str(fused)
-                return adapter.prepared_sage_ulysses_forward(
+                return adapter.prepared_subblock_sage_attention_forward(
                     q,
                     k,
                     v,

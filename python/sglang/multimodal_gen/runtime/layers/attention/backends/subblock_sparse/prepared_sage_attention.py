@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Opt-in SM120 SubBlock attention with quantization before NCCL Ulysses.
+"""SM120 SubBlock/CAKE consumer of prepared Sage2 QKV operands.
 
 FlashInfer's prepared Sage2 exchange supplies INT8 Q/K, FP8 V and scales.
 Routing uses reconstructed quantized operands, so its selected blocks can
@@ -10,6 +10,8 @@ approximate path, including when layout/pooling fusion is disabled.
 from __future__ import annotations
 
 import os
+from functools import partial
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -22,6 +24,9 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse_att
     _load_sm120_sage_ops,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+if TYPE_CHECKING:
+    from flashinfer.comm.ulysses import UlyssesQKV
 
 logger = init_logger(__name__)
 BLOCK = 64
@@ -52,7 +57,7 @@ def _dequantize_for_routing(
     return (q_bf16, k_bf16)
 
 
-class _SparseSageA2ACompute:
+class PreparedSubBlockSageAttention:
     """Route and consume prepared INT8/FP8 operands without requantization.
 
     The caller admits only sparse steps; dense warmup retains the native path.
@@ -63,21 +68,19 @@ class _SparseSageA2ACompute:
         self.query_block_mask = query_block_mask
         self.router = SubBlockRouter(n_k=schedule.n_k, n_q=schedule.n_q)
 
-    def __call__(
-        self,
-        *,
-        q_int8,
-        k_int8,
-        v_fp8,
-        q_scale,
-        k_scale,
-        v_scale,
-        out,
-        used_sequence,
-        global_sequence,
-        softmax_scale,
-        output_dtype,
-    ):
+    def __call__(self, operands: UlyssesQKV, *, softmax_scale: float) -> torch.Tensor:
+        if operands.layout != "sage2_sm89_sm120":
+            raise ValueError("SM120 SubBlock CAKE requires sage2_sm89_sm120 operands")
+        q_int8, k_int8, v_fp8 = operands.q, operands.k, operands.v
+        q_scale, k_scale, v_scale = (
+            operands.q_scale,
+            operands.k_scale,
+            operands.v_scale,
+        )
+        used_sequence = operands.used_sequence
+        global_sequence = operands.logical_sequence
+        output_dtype = operands.input_dtype
+        out = torch.empty_like(q_int8, dtype=output_dtype)
         fused = (
             q_int8.is_cuda
             and os.environ.get("SGLANG_DIFFUSION_H3_SAGE_FUSED_PREPOST", "1") != "0"
@@ -178,128 +181,10 @@ class _SparseSageA2ACompute:
             if used_sequence != global_sequence:
                 out.zero_()
             out[:, :used_sequence] = attn.transpose(1, 2).to(output_dtype)
+        return out
 
 
-class _PreparedSageTransport:
-    def __init__(self, group, query, used):
-        import torch.distributed as dist
-        from flashinfer.comm import UlyssesCommunicator
-
-        if not hasattr(UlyssesCommunicator, "prepare_qkv"):
-            raise ImportError(
-                "quantize_before_a2a requires FlashInfer with the prepared Sage2 "
-                "QKV API (flashinfer-ai/flashinfer#4924); the pinned 0.7.3 "
-                "release does not provide it"
-            )
-        self._local_used = max(
-            0, min(query.shape[0], used - dist.get_rank(group) * query.shape[0])
-        )
-        # 3 * Q bytes conservatively covers the complete combined lowp operand,
-        # including the received payload and scales, not just one source shard.
-        # Keep both QKV exchange and output gather on the validated NCCL path.
-        self.comm = UlyssesCommunicator(
-            group,
-            max_bytes=3 * query.numel() * query.element_size(),
-            dtype=query.dtype,
-            device=query.device,
-            backend="nccl",
-        )
-        self.workspace = None
-        self.encoded = None
-        self.gathered = None
-        try:
-            self.workspace = self.comm.prepare_qkv(
-                (1, *query.shape), quantization="sage2", used_sequence=used
-            )
-            self.gathered = torch.empty(
-                (1, *query.shape), dtype=query.dtype, device=query.device
-            )
-        except BaseException:
-            self.close()
-            raise
-
-    def exchange(self, q, k, v):
-        # prepare_qkv requires zero input rows beyond the global live prefix.
-        # These are disposable projection rows; clear only padding in place.
-        if self._local_used < q.shape[0]:
-            for operand in (q, k, v):
-                operand[self._local_used :].zero_()
-        self.encoded = self.comm.scatter_qkv(
-            q.unsqueeze(0),
-            k.unsqueeze(0),
-            v.unsqueeze(0),
-            workspace=self.workspace,
-            out=self.encoded,
-        )
-        return self.encoded
-
-    def gather(self, output):
-        return self.comm.gather_heads(output, out=self.gathered)
-
-    def close(self):
-        comm, self.comm = self.comm, None
-        try:
-            if comm is not None:
-                comm.close()
-        finally:
-            # Pure NCCL close is local and owns no prepared buffers. Drop our
-            # references before allocating a replacement geometry. Returned
-            # output views retain their own storage through PyTorch.
-            self.workspace = None
-            self.encoded = None
-            self.gathered = None
-
-
-_TRANSPORTS: dict[tuple, tuple[tuple, _PreparedSageTransport]] = {}
-_HARDWARE_SUPPORT: dict[tuple, bool] = {}
-
-
-def _hardware_supported_by_all_ranks(group, device):
-    # Negotiate once: a rank-local architecture rejection could leave peers
-    # entering prepared collectives on a mixed-GPU group.
-    import torch.distributed as dist
-
-    key = (group, device)
-    if key not in _HARDWARE_SUPPORT:
-        supported = torch.version.hip is None and torch.cuda.get_device_capability(
-            device
-        ) == (12, 0)
-        vote = torch.tensor([int(supported)], dtype=torch.int32, device=device)
-        dist.all_reduce(vote, op=dist.ReduceOp.MIN, group=group)
-        _HARDWARE_SUPPORT[key] = bool(vote.item())
-    return _HARDWARE_SUPPORT[key]
-
-
-def _get_transport(group, query, used):
-    # Serialized H3 inference reuses a geometry across layers and steps. Keep
-    # only the current geometry for each group/device, releasing its buffers
-    # before preparing a different shape, dtype or live prefix. Request order
-    # and geometry must agree on all ranks, as for ordinary Ulysses.
-    key = (group, query.device)
-    geometry = (tuple(query.shape), query.dtype, used)
-    cached = _TRANSPORTS.get(key)
-    if cached is not None:
-        cached_geometry, transport = cached
-        if cached_geometry == geometry:
-            return transport
-        del _TRANSPORTS[key]
-        transport.close()
-    # Publish only a fully initialized transport. A preparation failure leaves
-    # no stale entry, so a later call can retry the collective consistently.
-    transport = _PreparedSageTransport(group, query, used)
-    _TRANSPORTS[key] = (geometry, transport)
-    return transport
-
-
-def shutdown_prepared_sage_ulysses():
-    transports = list(_TRANSPORTS.values())
-    _TRANSPORTS.clear()
-    _HARDWARE_SUPPORT.clear()
-    for _, transport in transports:
-        transport.close()
-
-
-def prepared_sage_ulysses_forward(
+def prepared_subblock_sage_attention_forward(
     query,
     key,
     value,
@@ -324,6 +209,8 @@ def prepared_sage_ulysses_forward(
         or max_seqlen < impl.schedule.min_seq_len
     ):
         return None
+    from sglang.multimodal_gen.runtime.distributed import sage_ulysses
+
     group = None
     if transport is None:
         # Execution mode and packed metadata agree across the SGLang ranks.
@@ -338,7 +225,9 @@ def prepared_sage_ulysses_forward(
         )
 
         group = get_sp_group().ulysses_group
-        if group is None or not _hardware_supported_by_all_ranks(group, query.device):
+        if group is None or not sage_ulysses._hardware_supported_by_all_ranks(
+            group, query.device
+        ):
             return None
     from .sage_ulysses_route import check_prepared_sage_route
 
@@ -364,23 +253,18 @@ def prepared_sage_ulysses_forward(
         raise ValueError(
             "H3 prepared Sage QKV requires the live sparse query-block mask"
         )
-    if transport is None:
-        transport = _get_transport(group, query, used)
-    encoded = transport.exchange(query, key, value)
-    output = torch.empty_like(encoded.q, dtype=query.dtype)
-    _SparseSageA2ACompute(impl.schedule, query_block_mask)(
-        q_int8=encoded.q,
-        k_int8=encoded.k,
-        v_fp8=encoded.v,
-        q_scale=encoded.q_scale,
-        k_scale=encoded.k_scale,
-        v_scale=encoded.v_scale,
-        out=output,
-        used_sequence=encoded.used_sequence,
-        global_sequence=encoded.logical_sequence,
+    attention = partial(
+        PreparedSubBlockSageAttention(impl.schedule, query_block_mask),
         softmax_scale=impl.softmax_scale,
-        output_dtype=query.dtype,
     )
-    result = transport.gather(output)
+    result = sage_ulysses.prepared_sage_ulysses_forward(
+        query,
+        key,
+        value,
+        group=group,
+        used_sequence=used,
+        attention=attention,
+        transport=transport,
+    )
     logger.info_once("MiniMax H3 prepared Sage QKV + CAKE SSA active: input a2a=nccl")
-    return result[0]
+    return result

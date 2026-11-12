@@ -1084,11 +1084,11 @@ def _minimax_h3_attention_core_impl(
         is AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN
         and attention._attention_impl.schedule.quantize_before_a2a
     ):
-        from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse.sage_ulysses import (
-            prepared_sage_ulysses_forward,
+        from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse.prepared_sage_attention import (
+            prepared_subblock_sage_attention_forward,
         )
 
-        out = prepared_sage_ulysses_forward(
+        out = prepared_subblock_sage_attention_forward(
             q,
             k,
             v,

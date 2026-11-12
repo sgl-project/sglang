@@ -243,10 +243,29 @@ is selected separately by `prepare_qkv(..., quantization="sage2")` and executed
 by `scatter_qkv()`: local statistics, FP32 statistics AllGather, quantize/pack,
 then the low-precision QKV AllToAll. Ordinary `scatter_heads()` is unchanged.
 
+Communication and attention are separate components:
+
+- `runtime/distributed/sage_ulysses.py` owns prepared exchange, cached transport
+  buffers and output gather. Its `prepared_sage_ulysses_forward` accepts an
+  `attention` callable and passes FlashInfer's `UlyssesQKV` record directly to
+  it, including the operand layouts, scales and live/logical sequence lengths.
+- `prepared_sage_attention.py` implements `PreparedSubBlockSageAttention`,
+  which consumes that record, performs SubBlock routing and CAKE compute, and
+  returns floating output in the global BSHD/head-sharded layout for gather.
+  Its H3 wrapper owns schedule, geometry and query-mask admission.
+
+The communication wrapper has no dependency on SubBlock or CAKE. Another
+consumer, such as dense SageAttention, can use the same exchange when it
+accepts the record's quantization layout and scales. An ordinary BF16 Sage
+entry point that quantizes its inputs again is not a direct consumer.
+Consumer output must match the record's global shape and `input_dtype`, with
+padding rows cleared. This PR wires the SubBlock/CAKE consumer only; it does
+not add or claim validation of a dense Sage consumer.
+
 Supported calls are inference on SM120, head dimension 128, Ulysses degree 4
 or 8, and one live packed H3 document followed by padding. Ring, training,
 graph capture, unsupported geometry and oversized routing metadata decline
-before communication. Dense warmup steps and skipped layers keep the original
+before prepared QKV exchange. Dense warmup steps and skipped layers keep the original
 BF16 path. Once collective preparation starts, failures propagate. The option
 does not change the existing `quality=high` admission rules.
 
