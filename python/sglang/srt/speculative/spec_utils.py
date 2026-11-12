@@ -70,6 +70,8 @@ if TYPE_CHECKING:
 
 
 if _is_cuda:
+    from sglang.kernels.ops.sampling.argmax_jit import can_argmax
+    from sglang.kernels.ops.speculative.row_argmax import div_argmax
     from sglang.kernels.ops.speculative.simulated_accept import simulated_accept
 
 
@@ -184,6 +186,22 @@ def fast_sample(
             sample_index = torch.multinomial(probs, num_samples=num_samples)
             return probs.gather(1, sample_index), sample_index
         q = torch.empty_like(probs, dtype=torch.float32).exponential_(1.0)
+        if (
+            num_samples == 1
+            and _is_cuda
+            and probs.dtype == torch.float32
+            # Unit column stride is enough: the multi-layer EAGLE single-graph
+            # draft passes a [bs, step] view of a [max_bs, steps, vocab] buffer.
+            and probs.stride(-1) == 1
+            # Size gate measured on RTX PRO 6000, H100 and GB300; re-tune for others.
+            and probs.numel() >= 1 << 23
+            and can_argmax(q)
+        ):
+            # Same index as the clamp_min_ / division / sampling_argmax below.
+            sample_index = div_argmax(
+                probs, q, divisor_min=torch.finfo(torch.float32).tiny, ignore_nan=True
+            ).unsqueeze(-1)
+            return probs.gather(1, sample_index), sample_index
         q.clamp_min_(torch.finfo(torch.float32).tiny)
         scores = probs.float() / q
 
