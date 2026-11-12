@@ -27,7 +27,7 @@ use crate::{
         grpc::common::responses::{
             ensure_mcp_connection, persist_response_if_needed, ResponsesContext,
         },
-        mcp_utils::{extract_server_label, DEFAULT_MAX_ITERATIONS},
+        mcp_utils::{extract_server_label, RequestMcpTools, DEFAULT_MAX_ITERATIONS},
     },
 };
 
@@ -48,22 +48,16 @@ pub(super) async fn route_responses_internal(
     // 1. Load conversation history and build modified request
     let modified_request = load_conversation_history(ctx, &request).await?;
 
-    // 2. Check MCP connection and get whether MCP tools are present
-    let (has_mcp_tools, server_keys) =
-        ensure_mcp_connection(&ctx.mcp_manager, request.tools.as_deref()).await?;
+    // 2. Check MCP connection and get the MCP tools this request may use
+    let request_mcp = ensure_mcp_connection(&ctx.mcp_manager, request.tools.as_deref()).await?;
 
-    // Set the server keys in the context
-    {
-        let mut servers = ctx.requested_servers.write().unwrap();
-        *servers = server_keys;
-    }
-
-    let responses_response = if has_mcp_tools {
+    let responses_response = if let Some(request_mcp) = request_mcp {
         debug!("MCP tools detected, using tool loop");
 
         // Execute with MCP tool loop
         execute_tool_loop(
             ctx,
+            &request_mcp,
             modified_request,
             &request,
             headers,
@@ -153,6 +147,7 @@ pub(super) async fn execute_without_mcp(
 /// 4. Repeats until no more tool calls or limit reached
 pub(super) async fn execute_tool_loop(
     ctx: &ResponsesContext,
+    request_mcp: &RequestMcpTools,
     mut current_request: ResponsesRequest,
     original_request: &ResponsesRequest,
     headers: Option<http::HeaderMap>,
@@ -175,10 +170,7 @@ pub(super) async fn execute_tool_loop(
     );
 
     // Get MCP tools and convert to chat format (do this once before loop)
-    let mcp_tools = {
-        let servers = ctx.requested_servers.read().unwrap();
-        ctx.mcp_manager.list_tools_for_servers(&servers)
-    };
+    let mcp_tools = request_mcp.list_tools();
     let mcp_chat_tools = convert_mcp_tools_to_chat_tools(&mcp_tools);
     trace!(
         "Converted {} MCP tools to chat format",
@@ -322,8 +314,7 @@ pub(super) async fn execute_tool_loop(
                 );
 
                 let tool_start = Instant::now();
-                let (output_str, success, error) = match ctx
-                    .mcp_manager
+                let (output_str, success, error) = match request_mcp
                     .call_tool(tool_call.name.as_str(), tool_call.arguments.as_str())
                     .await
                 {
@@ -411,9 +402,7 @@ pub(super) async fn execute_tool_loop(
             // Inject MCP metadata into output
             if state.total_calls > 0 {
                 // Prepend mcp_list_tools item
-                let servers = ctx.requested_servers.read().unwrap();
-                let mcp_list_tools =
-                    build_mcp_list_tools_item(&ctx.mcp_manager, &server_label, &servers);
+                let mcp_list_tools = build_mcp_list_tools_item(request_mcp, &server_label);
                 responses_response.output.insert(0, mcp_list_tools);
 
                 // Append all mcp_call items at the end

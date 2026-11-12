@@ -15,7 +15,9 @@ use crate::{
         responses::{ResponseTool, ResponseToolType, ResponsesRequest, ResponsesResponse},
     },
     routers::{
-        error, mcp_utils::ensure_request_mcp_client, persistence_utils::persist_conversation_items,
+        error,
+        mcp_utils::{ensure_request_mcp_client, RequestMcpTools},
+        persistence_utils::persist_conversation_items,
     },
 };
 
@@ -23,11 +25,12 @@ use crate::{
 ///
 /// Checks if request declares MCP tools, and if so, validates that
 /// the MCP clients can be created and connected.
-/// Returns Ok((has_mcp_tools, server_keys)) on success.
+/// Returns Ok(Some(tools)) with the MCP tools this request may use when it
+/// declares MCP tools, Ok(None) when it declares none.
 pub(crate) async fn ensure_mcp_connection(
     mcp_manager: &Arc<McpManager>,
     tools: Option<&[ResponseTool]>,
-) -> Result<(bool, Vec<String>), Response> {
+) -> Result<Option<Arc<RequestMcpTools>>, Response> {
     let has_mcp_tools = tools
         .map(|t| {
             t.iter()
@@ -38,8 +41,8 @@ pub(crate) async fn ensure_mcp_connection(
     if has_mcp_tools {
         if let Some(tools) = tools {
             match ensure_request_mcp_client(mcp_manager, tools).await {
-                Some((_manager, server_keys)) => {
-                    return Ok((true, server_keys));
+                Some(request_mcp) => {
+                    return Ok(Some(request_mcp));
                 }
                 None => {
                     error!(
@@ -55,7 +58,7 @@ pub(crate) async fn ensure_mcp_connection(
         }
     }
 
-    Ok((false, Vec::new()))
+    Ok(None)
 }
 
 /// Validate that workers are available for the requested model

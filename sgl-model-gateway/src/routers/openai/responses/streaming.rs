@@ -41,7 +41,7 @@ use crate::{
     },
     routers::{
         header_utils::{apply_request_headers, preserve_response_headers},
-        mcp_utils::{ensure_request_mcp_client, McpLoopConfig},
+        mcp_utils::{ensure_request_mcp_client, McpLoopConfig, RequestMcpTools},
         openai::context::{RequestContext, StreamingEventContext, StreamingRequest},
         persistence_utils::persist_conversation_items,
         streaming_utils::BreakerTrackedStream,
@@ -437,7 +437,7 @@ pub(super) fn send_final_response_event(
     tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
     sequence_number: &mut u64,
     state: &ToolLoopState,
-    active_mcp: Option<&Arc<smg_mcp::McpManager>>,
+    active_mcp: Option<&RequestMcpTools>,
     ctx: &StreamingEventContext<'_>,
 ) -> bool {
     let mut final_response = match handler.snapshot_final_response() {
@@ -455,13 +455,7 @@ pub(super) fn send_final_response_event(
     }
 
     if let Some(mcp) = active_mcp {
-        inject_mcp_metadata_streaming(
-            &mut final_response,
-            state,
-            mcp,
-            ctx.server_label,
-            ctx.server_keys,
-        );
+        inject_mcp_metadata_streaming(&mut final_response, state, mcp, ctx.server_label);
     }
 
     mask_tools_as_mcp(&mut final_response, ctx.original_request);
@@ -753,12 +747,11 @@ pub(super) async fn handle_streaming_with_tool_interception(
     worker: Arc<dyn crate::core::Worker>,
     headers: Option<&HeaderMap>,
     req: StreamingRequest,
-    active_mcp: &Arc<smg_mcp::McpManager>,
-    server_keys: Vec<String>,
+    active_mcp: Arc<RequestMcpTools>,
 ) -> Response {
     // Transform MCP tools to function tools in payload
     let mut payload = req.payload;
-    prepare_mcp_tools_as_functions(&mut payload, active_mcp, &server_keys);
+    prepare_mcp_tools_as_functions(&mut payload, &active_mcp);
 
     let (tx, rx) = mpsc::unbounded_channel::<Result<Bytes, io::Error>>();
     let should_store = req.original_body.store.unwrap_or(false);
@@ -772,17 +765,12 @@ pub(super) async fn handle_streaming_with_tool_interception(
     let url_clone = url.clone();
     let headers_opt = headers.cloned();
     let payload_clone = payload.clone();
-    let active_mcp_clone = Arc::clone(active_mcp);
-    let server_keys_clone = server_keys.clone();
     let worker_for_breaker = worker;
 
     // Spawn the streaming loop task
     tokio::spawn(async move {
         let mut state = ToolLoopState::new(original_request.input.clone());
-        let loop_config = McpLoopConfig {
-            server_keys: server_keys_clone.clone(),
-            ..McpLoopConfig::default()
-        };
+        let loop_config = McpLoopConfig::default();
         let max_tool_calls = original_request.max_tool_calls.map(|n| n as usize);
         let tools_json = payload_clone.get("tools").cloned().unwrap_or(json!([]));
         let base_payload = payload_clone.clone();
@@ -808,7 +796,6 @@ pub(super) async fn handle_streaming_with_tool_interception(
             server_label,
             original_request: &original_request,
             previous_response_id: previous_response_id.as_deref(),
-            server_keys: &server_keys_clone,
         };
 
         loop {
@@ -979,11 +966,10 @@ pub(super) async fn handle_streaming_with_tool_interception(
                                                         handler.allocate_synthetic_output_index();
                                                     if !send_mcp_list_tools_events(
                                                         &tx,
-                                                        &active_mcp_clone,
+                                                        &active_mcp,
                                                         server_label,
                                                         list_tools_index,
                                                         &mut sequence_number,
-                                                        &server_keys_clone,
                                                     ) {
                                                         // Client disconnected
                                                         return;
@@ -1054,7 +1040,7 @@ pub(super) async fn handle_streaming_with_tool_interception(
                     &tx,
                     &mut sequence_number,
                     &state,
-                    Some(&active_mcp_clone),
+                    Some(&active_mcp),
                     &streaming_ctx,
                 ) {
                     return;
@@ -1075,9 +1061,8 @@ pub(super) async fn handle_streaming_with_tool_interception(
                     inject_mcp_metadata_streaming(
                         &mut response_json,
                         &state,
-                        &active_mcp_clone,
+                        &active_mcp,
                         server_label,
-                        &server_keys_clone,
                     );
 
                     mask_tools_as_mcp(&mut response_json, &original_request);
@@ -1155,7 +1140,7 @@ pub(super) async fn handle_streaming_with_tool_interception(
             // Execute all pending tool calls
             if !execute_streaming_tool_calls(
                 pending_calls,
-                &active_mcp_clone,
+                &active_mcp,
                 &tx,
                 &mut state,
                 server_label,
@@ -1219,18 +1204,16 @@ pub async fn handle_streaming_response(ctx: RequestContext) -> Response {
     let original_body = ctx.responses_request();
     let mcp_manager = ctx.components.mcp_manager().expect("MCP manager required");
 
-    let server_keys = match original_body.tools.as_ref() {
-        Some(tools) => match ensure_request_mcp_client(mcp_manager, tools.as_slice()).await {
-            Some((_manager, keys)) => keys,
-            None => Vec::new(),
-        },
-        None => Vec::new(),
-    };
+    let request_mcp = match original_body.tools.as_ref() {
+        Some(tools) => ensure_request_mcp_client(mcp_manager, tools.as_slice()).await,
+        None => None,
+    }
+    .unwrap_or_else(|| Arc::new(RequestMcpTools::static_only(Arc::clone(mcp_manager))));
 
-    let active_mcp = if mcp_manager.list_tools_for_servers(&server_keys).is_empty() {
+    let active_mcp = if request_mcp.list_tools().is_empty() {
         None
     } else {
-        Some(mcp_manager.clone())
+        Some(request_mcp)
     };
 
     let client = ctx.components.client().clone();
@@ -1254,8 +1237,7 @@ pub async fn handle_streaming_response(ctx: RequestContext) -> Response {
         Arc::clone(&worker),
         headers.as_ref(),
         req,
-        &active_mcp,
-        server_keys,
+        active_mcp,
     )
     .await
 }

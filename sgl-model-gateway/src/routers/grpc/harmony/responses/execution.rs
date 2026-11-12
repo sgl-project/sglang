@@ -1,10 +1,10 @@
 //! MCP tool execution logic for Harmony Responses
 
-use std::{sync::Arc, time::Instant};
+use std::time::Instant;
 
 use axum::response::Response;
 use serde_json::{from_str, json, to_string, to_value, Value};
-use smg_mcp::{self as mcp, McpManager};
+use smg_mcp as mcp;
 use tracing::{debug, error, warn};
 
 use super::common::McpCallTracking;
@@ -14,7 +14,7 @@ use crate::{
         common::{Function, ToolCall},
         responses::{ResponseTool, ResponseToolType},
     },
-    routers::error,
+    routers::{error, mcp_utils::RequestMcpTools},
 };
 
 /// Tool execution result
@@ -43,7 +43,7 @@ pub(crate) struct ToolResult {
 ///
 /// Vector of tool results (one per tool call)
 pub(super) async fn execute_mcp_tools(
-    mcp_manager: &Arc<McpManager>,
+    request_mcp: &RequestMcpTools,
     tool_calls: &[ToolCall],
     tracking: &mut McpCallTracking,
     model_id: &str,
@@ -84,7 +84,7 @@ pub(super) async fn execute_mcp_tools(
         };
 
         let tool_start = Instant::now();
-        let tool_result = mcp_manager
+        let tool_result = request_mcp
             .call_tool(&tool_call.function.name, args_map)
             .await;
         let tool_duration = tool_start.elapsed();

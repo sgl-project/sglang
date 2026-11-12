@@ -2,6 +2,8 @@
 //!
 //! This module handles non-streaming Responses API requests with MCP tool support.
 
+use std::sync::Arc;
+
 use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
@@ -16,7 +18,7 @@ use super::{
 };
 use crate::routers::{
     header_utils::{apply_provider_headers, extract_auth_header},
-    mcp_utils::{ensure_request_mcp_client, McpLoopConfig},
+    mcp_utils::{ensure_request_mcp_client, McpLoopConfig, RequestMcpTools},
     openai::context::{PayloadState, RequestContext},
     persistence_utils::persist_conversation_items,
 };
@@ -50,28 +52,23 @@ pub async fn handle_non_streaming_response(mut ctx: RequestContext) -> Response 
         }
     };
 
-    let server_keys = match original_body.tools.as_ref() {
-        Some(tools) => match ensure_request_mcp_client(mcp_manager, tools.as_slice()).await {
-            Some((_manager, keys)) => keys,
-            None => Vec::new(),
-        },
-        None => Vec::new(),
-    };
+    let request_mcp = match original_body.tools.as_ref() {
+        Some(tools) => ensure_request_mcp_client(mcp_manager, tools.as_slice()).await,
+        None => None,
+    }
+    .unwrap_or_else(|| Arc::new(RequestMcpTools::static_only(Arc::clone(mcp_manager))));
 
-    let active_mcp = if mcp_manager.list_tools_for_servers(&server_keys).is_empty() {
+    let active_mcp = if request_mcp.list_tools().is_empty() {
         None
     } else {
-        Some(mcp_manager)
+        Some(request_mcp)
     };
 
     let mut response_json: Value;
 
-    if let Some(mcp) = active_mcp {
-        let config = McpLoopConfig {
-            server_keys: server_keys.clone(),
-            ..McpLoopConfig::default()
-        };
-        prepare_mcp_tools_as_functions(&mut payload, mcp, &server_keys);
+    if let Some(mcp) = active_mcp.as_ref() {
+        let config = McpLoopConfig::default();
+        prepare_mcp_tools_as_functions(&mut payload, mcp);
 
         match execute_tool_loop(
             ctx.components.client(),
