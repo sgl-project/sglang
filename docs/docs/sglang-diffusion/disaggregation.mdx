@@ -329,7 +329,7 @@ sglang serve \
   --cuda-graph-max-bs-decode 28 \
   --device npu \
   --attention-backend ascend \
-  --disable-fast-image-processor \
+  --image-processor-backend pil \
   --tp-size 2 \
   --host 0.0.0.0 \
   --port 30020 \
@@ -370,7 +370,7 @@ python fetch_images.py \
 
 ## Port Convention
 
-Result endpoints are derived deterministically from the head node's `--scheduler-port` (default: 5555):
+Result endpoints are derived deterministically from the head node's `--scheduler-port` (pass an explicit port other than 5555: unless `--strict-ports` is set, the value 5555, whether default or passed, is randomized within 5555-5655, and an occupied port is moved to another free port):
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
@@ -412,6 +412,8 @@ Result endpoints are derived deterministically from the head node's `--scheduler
 </table>
 
 Role instances derive their result endpoint automatically from `--disagg-server-addr`. No manual endpoint configuration needed.
+
+Pass `--strict-ports` to the head and to every worker so that a busy port fails at startup instead of silently diverging from the addresses in `--*-urls`/`--disagg-server-addr`.
 
 ## Transfer Mechanism
 
@@ -572,7 +574,7 @@ if __name__ == "__main__":
     launch_pool_disagg_server(
         server_args,
         encoder_gpus=[[0]],
-        denoiser_gpus=[[1, 2, 3, 4], [5, 6, 7, 8]],
+        denoiser_gpus=[[1, 2, 3, 4]],
         decoder_gpus=[[0]],
     )
 ```
@@ -606,4 +608,6 @@ PENDING → ENCODER_WAITING → ENCODER_RUNNING → ENCODER_DONE
                                     DECODER_WAITING → DECODER_RUNNING → DONE
 ```
 
-Any state can transition to `FAILED` or `TIMED_OUT`.
+With split encoding (a separate image encoder pool), `ENCODER_DONE` → `IMAGE_ENCODER_WAITING` → `IMAGE_ENCODER_RUNNING` → `IMAGE_ENCODER_DONE` → `DENOISING_WAITING`. In GLM-Image distributed mode the request finishes at `DENOISING_DONE` → `DONE`.
+
+Any non-terminal state can transition to `FAILED` or `TIMED_OUT`.
