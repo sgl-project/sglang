@@ -343,8 +343,6 @@ class FlashAttentionBackend(AttentionBackend):
         if kernels is None:
             self._init_flash_attention_functions(device_capability)
         else:
-            if self.fa_impl_ver not in (3, 4):
-                raise ValueError(f"Invalid version: {self.fa_impl_ver=}")
             # The FA3 scheduler metadata and FA4 runtime policy are the FA builds'.
             self._get_scheduler_metadata = None
             self._get_fa_runtime_policy = None
