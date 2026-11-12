@@ -286,6 +286,12 @@ full_arguments = "".join(arguments)
 print_highlight(f"streamed function call arguments: {full_arguments}")
 ```
 
+#### Argument completeness on a truncated stream
+
+A tool call's final `arguments` delta can be produced by re-serialising the partially decoded argument object instead of streaming raw model text. That flush is optional: the serving layer sends it only when the already-streamed text is a prefix of the re-serialisation and the parser has not marked the call incomplete, so a stream can also end with no final delta at all.
+
+A response that ends with `finish_reason="length"` can therefore deliver `arguments` that parse as valid JSON even though generation stopped mid-value - it is the decoded values, not the string, that are truncated. Accumulate `function.arguments` per `index`, and treat a call as complete only once its arguments were flushed and `finish_reason` reports `tool_calls`; an aborted or interrupted stream, and a call that never carried arguments, can be truncated as well. Deltas are emitted per call as the parser recognises it, so a later `index` appearing does not imply that every earlier call has finished.
+
 ### Define a Tool Function
 
 
