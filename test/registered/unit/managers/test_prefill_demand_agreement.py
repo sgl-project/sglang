@@ -2,6 +2,7 @@
 check, commitment, load-back, decode ceiling) builds its demand the same way."""
 
 import itertools
+import random
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -490,6 +491,53 @@ class TestMemoryClip(_AdderCase):
                             self.assertTrue(self._runs_alone(allocator, prompt, limit))
             self.assertGreater(accepted, 0)
             self.assertGreater(refused, 0)
+
+    def test_clip_prices_each_question_once(self):
+        """Every request of one prompt and decode length asks the clip the
+        same question of an empty pool. Over randomized questions, repeated
+        and with memory taken between them, each answer equals a fresh pool's,
+        a repeated question is not priced again, and one that fits with all
+        of its decode is priced once."""
+        rng = random.Random(0)
+        allocator = _window_pool(4096)
+        questions = [
+            dict(
+                input_tokens=rng.choice((8, 40, 96, 200, 400)),
+                max_new_tokens=rng.choice((0, 4, 64, 600)),
+                token_capacity=rng.choice((10**6, 120)),
+                sliding_window_size=8,
+                chunk_size=rng.choice((None, 16)),
+                chunk_align=rng.choice((None, 8)),
+                prefill_retire_lag=rng.choice((0, 16)),
+                eviction_interval=rng.choice((1, 8)),
+                checkpoint_interval=rng.choice((0, 4)),
+                decode_retire_lag=rng.choice((0, 1)),
+            )
+            for _ in range(24)
+        ]
+        asked, held, whole = set(), [], 0
+        with patch.object(allocator, "admits", wraps=allocator.admits) as priced:
+            for question in rng.choices(questions, k=96):
+                before = priced.call_count
+                answer = allocator.max_new_tokens_for_memory(**question)
+                fresh = _window_pool(4096).max_new_tokens_for_memory(**question)
+                self.assertEqual(answer, fresh, question)
+                key = tuple(sorted(question.items()))
+                if key in asked:
+                    self.assertEqual(priced.call_count, before)
+                else:
+                    paged = -(-question["input_tokens"] // 4) * 4
+                    room = question["token_capacity"] - paged - 4 - 1
+                    if answer == min(question["max_new_tokens"], max(0, room)):
+                        whole += 1
+                        self.assertEqual(priced.call_count, before + 1)
+                asked.add(key)
+                if (tokens := allocator.alloc(4)) is not None:
+                    held.append(tokens)
+        self.assertGreater(whole, 0)
+        self.assertLess(whole, len(asked))
+        for tokens in held:
+            allocator.free(tokens)
 
     def test_clip_applies_the_scheduler_token_capacity(self):
         """BUG REGRESSION. The clip must not grant decode beyond the token
