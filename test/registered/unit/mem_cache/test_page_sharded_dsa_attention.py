@@ -729,8 +729,14 @@ def _attention_backend(pool, req_to_token, device, prefill_impl="flashmla_sparse
         if torch.device(device).type == "cuda"
         else 0
     )
-    # Mirrors DeepseekSparseAttnBackend.__init__ so forward_extend sees the
-    # same small-heads FlashMLA prefill choice as a real backend.
+    # Mirror the real backend's cached FlashMLA layout choices.
+    backend.flashmla_sparse_head_padding = (
+        DeepseekSparseAttnBackend._flashmla_sparse_head_padding(
+            device_sm_major=backend.device_sm_major,
+            head_dim=backend.kv_lora_rank + backend.qk_rope_head_dim,
+            num_heads=backend.num_q_heads,
+        )
+    )
     backend.sparse_prefill_small_heads = _small_heads_prefill_enabled(
         backend.device_sm_major,
         backend.kv_cache_dtype,

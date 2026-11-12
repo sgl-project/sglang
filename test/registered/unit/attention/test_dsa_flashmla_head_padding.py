@@ -44,13 +44,18 @@ class TestFlashMLASparseHeadPadding(CustomTestCase):
         def native(**kwargs):
             calls.append("native")
             padded = kwargs["q"].shape[1]
-            self.assertEqual(padded, 128)
+            self.assertEqual(padded, 64 if dim == 576 and heads <= 64 else 128)
             torch.testing.assert_close(kwargs["q"][:, :heads], q)
             self.assertIs(kwargs["topk_length"], lengths)
             return torch.ones(3, padded, 512), None, None
 
         backend = SimpleNamespace(
             device_sm_major=10,
+            flashmla_sparse_head_padding=(
+                DeepseekSparseAttnBackend._flashmla_sparse_head_padding(
+                    device_sm_major=10, head_dim=dim, num_heads=heads
+                )
+            ),
             sparse_prefill_small_heads=enabled,
             _sink_pad_cache={},
             _call_flash_mla_sparse_fwd_small_heads=small,
