@@ -14,7 +14,9 @@ register_cpu_ci(1.0, "base-a-test-cpu")
 
 class TestCudaHomeResolution(CustomTestCase):
     def _env(self, **overrides):
-        env = {k: v for k, v in os.environ.items() if k not in ("CUDA_HOME", "CUDA_PATH")}
+        env = {
+            k: v for k, v in os.environ.items() if k not in ("CUDA_HOME", "CUDA_PATH")
+        }
         env.update(overrides)
         return mock.patch.dict(os.environ, env, clear=True)
 
@@ -32,13 +34,17 @@ class TestCudaHomeResolution(CustomTestCase):
             os.makedirs(os.path.dirname(nvcc))
             with open(nvcc, "w") as f:
                 f.write("")
-            with self._env(), mock.patch.object(
-                toolchain.shutil, "which", return_value=nvcc
+            with (
+                self._env(),
+                mock.patch.object(toolchain.shutil, "which", return_value=nvcc),
             ):
                 self.assertEqual(toolchain.cuda_home(), root)
 
     def test_falls_back_to_default(self):
-        with self._env(), mock.patch.object(toolchain.shutil, "which", return_value=None):
+        with (
+            self._env(),
+            mock.patch.object(toolchain.shutil, "which", return_value=None),
+        ):
             self.assertEqual(toolchain.cuda_home(), "/usr/local/cuda")
 
 
