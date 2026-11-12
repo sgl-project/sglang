@@ -10,13 +10,13 @@ import torch
 from PIL import Image
 
 from sglang.srt.hardware_backend.npu import jpeg
+from sglang.srt.multimodal import media_io
 from sglang.srt.multimodal.cache import MediaSnapshot
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
 from sglang.srt.multimodal.processors.llava import LlavaImageProcessor
 from sglang.srt.multimodal.processors.pixtral import PixtralProcessor
 from sglang.srt.multimodal.processors.qwen_vl import QwenVLImageProcessor
-from sglang.srt.utils import common
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -48,8 +48,8 @@ class TestPILImageDecodePolicy(unittest.TestCase):
     def setUp(self):
         # Exercise the actual common loader on CPU CI. Only platform detection
         # and device decoding are replaced; a missed opt-out returns a Tensor.
-        self.enterContext(patch.object(common, "is_cuda", return_value=False))
-        self.enterContext(patch.object(common, "is_npu", return_value=True))
+        self.enterContext(patch.object(media_io, "is_cuda", return_value=False))
+        self.enterContext(patch.object(media_io, "is_npu", return_value=True))
         self.decoded = torch.zeros((3, 48, 64), dtype=torch.uint8)
         self.decode = self.enterContext(
             patch.object(jpeg, "decode_jpeg", return_value=self.decoded)
@@ -64,7 +64,7 @@ class TestPILImageDecodePolicy(unittest.TestCase):
                     data, 123, aspect, [[64, 64]], processor
                 )
                 # A CPU-only environment is the existing reference behavior.
-                with patch.object(common, "is_npu", return_value=False):
+                with patch.object(media_io, "is_npu", return_value=False):
                     expected, _, expected_size = (
                         LlavaImageProcessor._preprocess_image_task(
                             data, 123, aspect, [[64, 64]], processor

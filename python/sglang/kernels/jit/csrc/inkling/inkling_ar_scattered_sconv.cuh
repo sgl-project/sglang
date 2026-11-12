@@ -41,6 +41,7 @@
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
+#include <sgl_kernel/activation.cuh>
 #include <sgl_kernel/runtime.cuh>
 #include <sgl_kernel/utils.cuh>
 
@@ -337,7 +338,7 @@ __launch_bounds__(1024, 1) void inkling_ar_scattered_sconv_kernel(const __grid_c
               const float tap = __bfloat162float(reinterpret_cast<const __nv_bfloat16*>(&taps[k])[j]);
               acc += tap * wt(j, k);
             }
-            if constexpr (USE_SILU) acc = __fdividef(acc, 1.0f + __expf(-acc));
+            if constexpr (USE_SILU) acc = device::activation::silu(acc);
             if constexpr (USE_RESIDUAL) acc += xj;
             yj[h] = acc;
           }
@@ -620,7 +621,7 @@ __launch_bounds__(1024, 1) void inkling_ar_stream_sconv_kernel(const __grid_cons
             const float tap = __bfloat162float(reinterpret_cast<const __nv_bfloat16*>(&tp[k])[j]);
             acc += tap * wt(j, k);
           }
-          if constexpr (USE_SILU) acc = __fdividef(acc, 1.0f + __expf(-acc));
+          if constexpr (USE_SILU) acc = device::activation::silu(acc);
           if constexpr (USE_RESIDUAL) acc += xj;
           yj[hh] = acc;
         }
@@ -1064,7 +1065,7 @@ __global__ __launch_bounds__(1024, 1) void inkling_ar_col_decode_kernel(const __
           const float tap = __bfloat162float(reinterpret_cast<const __nv_bfloat16*>(&hist[k])[j]);
           acc += tap * cm * wt(k);
         }
-        if constexpr (USE_SILU) acc = __fdividef(acc, 1.0f + __expf(-acc));
+        if constexpr (USE_SILU) acc = device::activation::silu(acc);
         if constexpr (USE_RESIDUAL) acc += xj;
         yj[hh] = acc;
       }
@@ -1449,7 +1450,7 @@ __launch_bounds__(1024, 1) void inkling_ar_banded_sconv_kernel(const __grid_cons
             const float tap = __bfloat162float(reinterpret_cast<const __nv_bfloat16*>(&taps[k])[j]);
             acc += tap * wt[j][k];
           }
-          if constexpr (USE_SILU) acc = __fdividef(acc, 1.0f + __expf(-acc));
+          if constexpr (USE_SILU) acc = device::activation::silu(acc);
           if constexpr (USE_RESIDUAL) acc += xj;
           yj[h] = acc;
         }
@@ -1845,7 +1846,7 @@ __launch_bounds__(1024, 1) void inkling_ar_ssconv_norm_decode_kernel(const __gri
         acc += h * cm * __bfloat162float(wtaps[i][j][w]);
       }
       acc += xj * __bfloat162float(wtaps[i][j][W1]);
-      if constexpr (USE_SILU) acc = __fdividef(acc, 1.0f + __expf(-acc));
+      if constexpr (USE_SILU) acc = device::activation::silu(acc);
       if constexpr (USE_RESIDUAL) acc += xj;
       y[j] = acc;
     }

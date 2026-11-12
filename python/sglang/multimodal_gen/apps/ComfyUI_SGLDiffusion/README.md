@@ -25,6 +25,7 @@ The plugin supports two modes of operation: **Server Mode** (via HTTP API) and *
 - **FLUX**: State-of-the-art text-to-image models (e.g., `FLUX.1-dev`)
 - **Qwen-Image**: Multi-modal image generation models (e.g., `Qwen-Image`,`Qwen-Image-2512`). *Note: Image editing support is currently experimental and may have some issues.*
 - **Qwen-Image-2.1**: Integrated mode (`model_type=qwen_image21`, auto-detected) for Comfy-Org's `qwen_image_2.1_bf16.safetensors` or INT8 `qwen_image_2.1_int8_convrot.safetensors`. Text-to-image and reference-image edit work with the official templates after swapping `UNETLoader` for `SGLDUNETLoader`. The worker manages the prefix K/V cache itself, so the `Qwen Image 2.1 Cache` node's options are ignored. Multi-GPU: Ulysses / Ring or TP through the manual layout in `SGLDiffusion Options`. DiT patches (Fun-Control, attention hooks) are not supported. LoRA: use `SGLDiffusion LoRA Loader` instead of `LoraLoaderModelOnly`. Tested with `Viggle/Qwen-Image-2.1-viggle-turbo` (`...-v0.3-6step-lora-r128.safetensors`): euler, `BasicGuider`, `ManualSigmas` `1.0, 0.967754, 0.933358, 0.857192, 0.666756, 0.400096, 0` at 1024x1024.
+- **LTX-2.5 / LTX-2.3**: Lightricks audio-video DiTs (ComfyUI `ltxav`). Integrated mode loads the ComfyUI single-file DiT (LTX-2.5 INT8 ConvRot / BF16, or the LTX-2.3 all-in-one FP8 checkpoint). The DiT and its text connectors run on the worker with SGLang's native LTX numerics; Gemma, the VAEs, the latent upsampler and the samplers / guiders stay in ComfyUI. Text-to-video and image-to-video (`LTXVImgToVideoInplace`) are supported; keyframe guides (`LTXVAddGuide`), reference-audio conditioning, STG and modality guidance raise an error. Use the official LTX templates with `SGLDUNETLoader` in place of the model loader. LoRA (`SGLDiffusion LoRA Loader`) on the LTX-2.3 FP8 checkpoint runs as a dynamic low-rank delta on every DiT layer: SGLang cannot merge into static FP8 weights, and the default `auto` merge mode decides per module.
 - **MiniMax-H3**: Joint video-and-audio DiT (`model_type=minimax_h3`). Integrated mode: T2V / I2VA / FL2VA use an `fl2va` checkpoint; R2V needs `ref2va`. CLIP and VAE stay in ComfyUI. Server mode uses `SGLDiffusion Generate MiniMax-H3`.
 
 ### Mode 1: Server Mode (HTTP API)
@@ -48,6 +49,27 @@ decode on the worker).
 2. **Configure Options** (optional): connect `SGLDiffusion Options` to the loader. Without it the worker uses auto-detection and defaults.
 3. **Sample**: Connect the loaded model to standard ComfyUI samplers. Each step is packed by a model adapter and sent to the SGLang scheduler.
 4. **LoRA Support**: Use the `SGLDiffusion LoRA Loader` for native LoRA integration.
+
+The LoRA loader's `merge_mode` defaults to `auto`, including workflows saved
+before this option existed. Chain loader nodes to combine adapters; each keeps
+its own strength and training alpha/rank. All loaders chained on one MODEL must
+use the same mode. Separate MODEL branches can use different modes: immediately
+before sampling, the shared worker switches to that branch's adapters and mode.
+Sampling the original model disables the previous branch's LoRAs.
+
+- `auto`: a single LoRA is merged into the base weights, unless the weights
+  cannot be merged or a BF16 merge would round away most of its update (common
+  for distilled Turbo LoRAs), in which case it stays dynamic. A chain of LoRAs
+  runs dynamically: re-merging the whole combination whenever it changes costs
+  more than the per-step adapter work it saves.
+- `dynamic`: leaves base weights unchanged and computes each adapter's update
+  during every forward. This avoids BF16 weight-merge rounding and suits
+  workflows that switch adapters, at the cost of per-step adapter work.
+- `merge`: folds the combination into base weights before sampling, saving the
+  per-step adapter computation. Switching restores the original weights first.
+  Merging into BF16 can round away small updates, so it need not produce the
+  same output as dynamic. Quantized weights that cannot be merged require dynamic.
+
 
 ### Options
 

@@ -15,10 +15,12 @@
 
 from __future__ import annotations
 
+import ctypes
 import logging
 import os
 import platform
 import subprocess
+import sys
 import time
 from errno import ENXIO
 from pathlib import Path
@@ -27,6 +29,24 @@ from typing import List
 import psutil
 
 logger = logging.getLogger(__name__)
+
+# Yama's prctl option and "any process" value, from <linux/prctl.h>.
+_PR_SET_PTRACER = 0x59616D61
+_PR_SET_PTRACER_ANY = ctypes.c_ulong(-1)
+
+
+def allow_pyspy_attach() -> None:
+    """Let any same-user process ptrace this one under Yama ptrace_scope=1."""
+    if sys.platform != "linux":
+        return
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        if libc.prctl(_PR_SET_PTRACER, _PR_SET_PTRACER_ANY, 0, 0, 0) != 0:
+            logger.debug(
+                "prctl(PR_SET_PTRACER_ANY) failed: %s", os.strerror(ctypes.get_errno())
+            )
+    except (OSError, AttributeError) as e:
+        logger.debug("prctl(PR_SET_PTRACER_ANY) unavailable: %s", e)
 
 
 def _resolve_cuda_coredump_pipe_path(proc: psutil.Process) -> Path:

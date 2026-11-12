@@ -13,6 +13,7 @@ import torch
 from PIL import Image
 
 from sglang.srt.hardware_backend.npu import jpeg
+from sglang.srt.multimodal import media_io
 from sglang.srt.multimodal.cache import MediaSnapshot
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
@@ -21,7 +22,6 @@ from sglang.srt.multimodal.processors.embedding_gemma2 import (
 )
 from sglang.srt.multimodal.processors.kimi_common import unwrap_kimi_images
 from sglang.srt.multimodal.processors.kimi_k3 import KimiK3ImageProcessor
-from sglang.srt.utils import common
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -36,8 +36,8 @@ def encoded_image(fmt="JPEG"):
 
 class TestNPUImageDecodeModes(unittest.TestCase):
     def setUp(self):
-        self.enterContext(patch.object(common, "is_cuda", return_value=False))
-        self.enterContext(patch.object(common, "is_npu", return_value=True))
+        self.enterContext(patch.object(media_io, "is_cuda", return_value=False))
+        self.enterContext(patch.object(media_io, "is_npu", return_value=True))
         self.decode = self.enterContext(
             patch.object(jpeg, "decode_jpeg", side_effect=AssertionError("DVPP called"))
         )
@@ -63,7 +63,7 @@ class TestNPUImageDecodeModes(unittest.TestCase):
                 sources.append(str(path))
             for source in sources:
                 with self.subTest(source_type=type(source).__name__):
-                    image, _ = common.load_image(
+                    image, _ = media_io.load_image(
                         source, gpu_image_decode="nvjpeg_fancy"
                     )
                     self.assert_pil_pixels(image, data)
@@ -74,7 +74,7 @@ class TestNPUImageDecodeModes(unittest.TestCase):
         expected = torch.zeros((3, 48, 64), dtype=torch.uint8)
         self.decode.side_effect = None
         self.decode.return_value = expected
-        image, _ = common.load_image(data, True)
+        image, _ = media_io.load_image(data, True)
         self.assertIs(image, expected)
         args, kwargs = self.decode.call_args
         self.assertEqual(bytes(args[0].numpy()), data)
@@ -83,7 +83,7 @@ class TestNPUImageDecodeModes(unittest.TestCase):
 
     def test_false_uses_pil_without_dvpp(self):
         data = encoded_image()
-        image, _ = common.load_image(data, False)
+        image, _ = media_io.load_image(data, False)
         self.assert_pil_pixels(image, data)
         self.decode.assert_not_called()
 
@@ -91,34 +91,57 @@ class TestNPUImageDecodeModes(unittest.TestCase):
         data = encoded_image()
         self.decode.side_effect = None
         self.decode.return_value = None
-        image, _ = common.load_image(data, True)
+        image, _ = media_io.load_image(data, True)
         self.assert_pil_pixels(image, data)
         self.decode.assert_called_once()
 
     def test_png_and_cpu_do_not_select_npu_fancy(self):
-        with patch.object(common.logger, "warning") as warning:
+        with patch.object(media_io.logger, "warning") as warning:
             data = encoded_image("PNG")
-            image, _ = common.load_image(data, gpu_image_decode="nvjpeg_fancy")
+            image, _ = media_io.load_image(data, gpu_image_decode="nvjpeg_fancy")
             self.assert_pil_pixels(image, data)
-            with patch.object(common, "is_npu", return_value=False):
+            with patch.object(media_io, "is_npu", return_value=False):
                 data = encoded_image()
-                image, _ = common.load_image(data, gpu_image_decode="nvjpeg_fancy")
+                image, _ = media_io.load_image(data, gpu_image_decode="nvjpeg_fancy")
                 self.assert_pil_pixels(image, data)
         warning.assert_not_called()
         self.decode.assert_not_called()
+
+    def test_npu_fallback_fully_loads_pil_pixels(self):
+        self.decode.side_effect = None
+        self.decode.return_value = None
+        image, _ = media_io.load_image(encoded_image(), True)
+        self.assertIsInstance(image, Image.Image)
+        self.assertIsNone(image.fp)
+        self.assertIsNotNone(image.im)
+
+    def test_invalid_npu_fallback_is_a_client_error(self):
+        self.decode.side_effect = None
+        self.decode.return_value = None
+        with self.assertRaisesRegex(ValueError, "Could not decode image"):
+            media_io.load_image(b"\xff\xd8invalid jpeg\xff\xd9", True)
+        self.decode.assert_called_once()
+
+    def test_npu_execution_error_is_not_a_pil_fallback(self):
+        error = RuntimeError("NPU execution failed")
+        self.decode.side_effect = error
+        with self.assertRaises(RuntimeError) as raised:
+            media_io.load_image(encoded_image(), True)
+        self.assertIs(raised.exception, error)
+        self.decode.assert_called_once()
 
     def test_gpu_fancy_keeps_its_existing_decoder(self):
         data = encoded_image()
         expected = torch.zeros((3, 48, 64), dtype=torch.uint8)
         with (
-            patch.object(common, "is_cuda", return_value=True),
-            patch.object(common, "is_npu", return_value=False),
+            patch.object(media_io, "is_cuda", return_value=True),
+            patch.object(media_io, "is_npu", return_value=False),
             patch(
                 "sglang.srt.utils.nvjpeg_decoder.decode_jpeg_with_fancy_upsampling",
                 return_value=expected,
             ) as cuda_decode,
         ):
-            image, _ = common.load_image(data, gpu_image_decode="nvjpeg_fancy")
+            image, _ = media_io.load_image(data, gpu_image_decode="nvjpeg_fancy")
             self.assertIs(image, expected)
             cuda_decode.assert_called_once_with(data)
         self.decode.assert_not_called()
@@ -127,16 +150,16 @@ class TestNPUImageDecodeModes(unittest.TestCase):
         data = encoded_image()
         expected = torch.zeros((3, 48, 64), dtype=torch.uint8)
         with (
-            patch.object(common, "is_cuda", return_value=True),
-            patch.object(common, "is_npu", return_value=False),
+            patch.object(media_io, "is_cuda", return_value=True),
+            patch.object(media_io, "is_npu", return_value=False),
             patch("torchvision.io.decode_jpeg", return_value=expected) as cuda_decode,
         ):
-            image, _ = common.load_image(data, True)
+            image, _ = media_io.load_image(data, True)
             self.assertIs(image, expected)
             args, kwargs = cuda_decode.call_args
             self.assertEqual(bytes(args[0].numpy()), data)
             self.assertEqual(kwargs, {"device": "cuda"})
-            image, _ = common.load_image(data, False)
+            image, _ = media_io.load_image(data, False)
             self.assert_pil_pixels(image, data)
             cuda_decode.assert_called_once()
         self.decode.assert_not_called()
@@ -144,15 +167,15 @@ class TestNPUImageDecodeModes(unittest.TestCase):
     def test_cuda_fancy_failure_returns_pil_not_plain_decode(self):
         data = encoded_image()
         with (
-            patch.object(common, "is_cuda", return_value=True),
-            patch.object(common, "is_npu", return_value=False),
+            patch.object(media_io, "is_cuda", return_value=True),
+            patch.object(media_io, "is_npu", return_value=False),
             patch(
                 "sglang.srt.utils.nvjpeg_decoder.decode_jpeg_with_fancy_upsampling",
                 side_effect=RuntimeError("test decoder unavailable"),
             ),
             patch("torchvision.io.decode_jpeg") as plain_decode,
         ):
-            image, _ = common.load_image(data, "nvjpeg_fancy")
+            image, _ = media_io.load_image(data, "nvjpeg_fancy")
             self.assert_pil_pixels(image, data)
             plain_decode.assert_not_called()
         self.decode.assert_not_called()
