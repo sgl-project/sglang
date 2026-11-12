@@ -411,6 +411,8 @@ class DraftBlockProposer:
             if enable_num_token_non_padded()
             else None
         )
+        # The count last written into _num_token_non_padded (written only here).
+        self._num_token_non_padded_value: Optional[int] = None
 
     @property
     def noise(self) -> DraftNoise:
@@ -728,7 +730,9 @@ class DraftBlockProposer:
         device = self.draft_model_runner.device
         num_tokens = forward_batch.input_ids.numel()
         if self._num_token_non_padded is not None:
-            self._num_token_non_padded.fill_(num_tokens)
+            if self._num_token_non_padded_value != num_tokens:
+                self._num_token_non_padded.fill_(num_tokens)
+                self._num_token_non_padded_value = num_tokens
             forward_batch.num_token_non_padded = self._num_token_non_padded
         forward_batch.num_token_non_padded_cpu = num_tokens
         if not self._dp_moe_sync or batch.global_num_tokens is None:

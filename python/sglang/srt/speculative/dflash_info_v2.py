@@ -190,8 +190,11 @@ class DFlashDraftInputV2(SpecInput):
 
             cur_kv_lens = self._prepare_cur_kv_lens_gpu_buf[:bs]
             nxt_kv_lens = self._prepare_nxt_kv_lens_gpu_buf[:bs]
-            cur_kv_lens.copy_(cur_kv_lens_cpu_t, non_blocking=True)
-            nxt_kv_lens.copy_(nxt_kv_lens_cpu_t, non_blocking=True)
+            # Only the allocation below reads the device copies, and only when
+            # it allocates (most steps stay inside the reserved pages).
+            if num_needed_tokens > 0:
+                cur_kv_lens.copy_(cur_kv_lens_cpu_t, non_blocking=True)
+                nxt_kv_lens.copy_(nxt_kv_lens_cpu_t, non_blocking=True)
 
             alloc_for_spec_decode(
                 batch.tree_cache,
