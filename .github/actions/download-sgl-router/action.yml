@@ -1,0 +1,63 @@
+name: 'Download prebuilt sgl-router'
+description: >
+  Put the sgl-router binary at sgl-router-bin/sgl-router in the checkout and set
+  SGLANG_TEST_PD_ROUTER_BINARY to it for the job; the PD disaggregation test
+  fixture launches it. Takes sgl-router-build's artifact, then the cache, and
+  builds from source when both miss. The checkout keeps it visible to CI
+  containers that mount the workspace.
+
+inputs:
+  artifact_name:
+    description: "sgl-router-build's artifact in this run; empty uses only the cache."
+    required: false
+    default: ''
+  cache_key_prefix:
+    description: 'Must match what _pr-test-sgl-router-build.yml saves under. ARM64 runners always restore sgl-router-aarch64.'
+    required: false
+    default: sgl-router-x86_64
+
+runs:
+  using: composite
+  steps:
+    # continue-on-error: the artifact expires in a day, so a re-run falls through
+    # to the cache below.
+    - name: Download prebuilt sgl-router
+      id: artifact
+      if: inputs.artifact_name != ''
+      continue-on-error: true
+      uses: actions/download-artifact@v4
+      with:
+        name: ${{ inputs.artifact_name }}
+        path: sgl-router-bin
+
+    - name: Ensure zstd so the cache entry is readable
+      if: steps.artifact.outcome != 'success'
+      shell: bash
+      run: bash scripts/ci/utils/ensure_zstd.sh
+
+    - name: Restore prebuilt sgl-router from cache
+      id: cache
+      if: steps.artifact.outcome != 'success'
+      uses: actions/cache/restore@v4
+      with:
+        path: sgl-router-bin/sgl-router
+        key: ${{ runner.arch == 'ARM64' && 'sgl-router-aarch64' || inputs.cache_key_prefix }}-${{ hashFiles('sgl-router/**', 'rust/**', '.github/workflows/_pr-test-sgl-router-build.yml', 'scripts/ci/utils/build_sgl_router.sh') }}
+
+    # Nightly, weekly and rerun-test have no build job of their own, so a source
+    # change that no main-ref run has cached yet lands here.
+    - name: Build sgl-router from source
+      if: steps.artifact.outcome != 'success' && steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        bash scripts/ci/utils/install_rustup.sh
+        bash scripts/ci/utils/build_sgl_router.sh sgl-router-bin
+
+    # An artifact download drops the executable bit.
+    - name: Export the binary path
+      shell: bash
+      run: |
+        set -euo pipefail
+        binary="${GITHUB_WORKSPACE}/sgl-router-bin/sgl-router"
+        chmod +x "${binary}"
+        "${binary}" --help >/dev/null
+        echo "SGLANG_TEST_PD_ROUTER_BINARY=${binary}" >> "$GITHUB_ENV"

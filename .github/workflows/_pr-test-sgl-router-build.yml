@@ -1,0 +1,157 @@
+name: PR Test - Build sgl-router
+
+# Builds the sgl-router binary once so the test stages that launch it (the PD
+# disaggregation fixture) download it instead of each compiling it.
+#
+# Same two layers as _pr-test-rust-ext-build.yml:
+# - The cache, keyed by a source hash, carries a build across runs.
+# - The artifact hands it to the stages of this run; the cache is evictable.
+#
+# The binary has no interpreter or torch ABI, so one compile job covers the arch.
+
+on:
+  workflow_call:
+    inputs:
+      runs_on:
+        description: 'Runner label for the compile job. Its glibc has to satisfy max_glibc.'
+        type: string
+        required: true
+      restore_runs_on:
+        description: 'Runner label for the cache-hit path. Only republishes bytes, so any arch works.'
+        type: string
+        default: ubuntu-latest
+      artifact_name:
+        description: 'Artifact name. Suffix it per caller: artifacts are immutable per name per run, so two callers sharing a run would collide.'
+        type: string
+        default: sgl-router-x86_64
+      cache_key_prefix:
+        description: 'Cache key prefix. Encodes the arch; callers share it to reuse each other''s build.'
+        type: string
+        default: sgl-router-x86_64
+      max_glibc:
+        description: 'Highest GLIBC symbol version the binary may require: the oldest image that runs it is jammy at 2.35.'
+        type: string
+        default: '2.35'
+      git_ref:
+        type: string
+        default: ''
+      skip_pr_test_health_check:
+        description: 'Forwarded from the caller for the check-maintenance action.'
+        type: boolean
+        default: false
+    outputs:
+      artifact_name:
+        description: 'Artifact holding the binary. Empty when neither job published one; consumers then fall back to the cache, then to a local build.'
+        value: ${{ jobs.restore.outputs.artifact_name || jobs.compile.outputs.artifact_name }}
+
+# Reusable workflows do not inherit the caller's env; mirror what
+# check-maintenance reads.
+env:
+  SGLANG_IS_IN_CI: true
+  SKIP_PR_TEST_HEALTH_CHECK: ${{ inputs.skip_pr_test_health_check && 'true' || 'false' }}
+  PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
+
+jobs:
+  restore:
+    runs-on: ${{ inputs.restore_runs_on }}
+    timeout-minutes: 15
+    name: Restore sgl-router
+    outputs:
+      hit: ${{ steps.cache.outputs.cache-hit }}
+      artifact_name: ${{ steps.publish.outputs.name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.git_ref || github.sha }}
+          # What the cache key hashes, plus the actions and scripts this job runs.
+          # The consumer action hashes the same globs on a full checkout.
+          sparse-checkout: |
+            sgl-router
+            rust
+            .github
+            scripts/ci/utils
+          sparse-checkout-cone-mode: false
+
+      - uses: ./.github/actions/check-maintenance
+
+      - name: Ensure zstd so the saved entry is readable
+        run: bash scripts/ci/utils/ensure_zstd.sh
+
+      - name: Restore built binary
+        id: cache
+        uses: actions/cache/restore@v4
+        with:
+          path: sgl-router-bin/sgl-router
+          key: ${{ inputs.cache_key_prefix }}-${{ hashFiles('sgl-router/**', 'rust/**', '.github/workflows/_pr-test-sgl-router-build.yml', 'scripts/ci/utils/build_sgl_router.sh') }}
+
+      - name: Upload binary
+        if: steps.cache.outputs.cache-hit == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact_name }}
+          path: sgl-router-bin/sgl-router
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Publish artifact name
+        id: publish
+        if: steps.cache.outputs.cache-hit == 'true'
+        run: echo "name=${{ inputs.artifact_name }}" >> "$GITHUB_OUTPUT"
+
+  compile:
+    needs: restore
+    if: needs.restore.outputs.hit != 'true'
+    runs-on: ${{ inputs.runs_on }}
+    timeout-minutes: 60
+    name: Build sgl-router
+    outputs:
+      artifact_name: ${{ steps.publish.outputs.name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.git_ref || github.sha }}
+
+      - uses: ./.github/actions/check-maintenance
+
+      - name: Install Rust toolchain
+        run: bash scripts/ci/utils/install_rustup.sh
+
+      - name: Build sgl-router
+        run: bash scripts/ci/utils/build_sgl_router.sh sgl-router-bin
+
+      # Newer glibc than the test images fails at exec: "GLIBC_2.xx not found".
+      - name: Check the binary's glibc requirement
+        env:
+          MAX_GLIBC: ${{ inputs.max_glibc }}
+        run: |
+          set -euo pipefail
+          symbols=$(objdump -T sgl-router-bin/sgl-router)
+          needed=$(printf '%s\n' "${symbols}" | grep -oE 'GLIBC_2\.[0-9]+' | sed 's/GLIBC_//' | sort -V | tail -1 || true)
+          echo "sgl-router requires glibc ${needed:-none}"
+          if [ -n "${needed}" ] \
+             && [ "$(printf '%s\n%s\n' "${MAX_GLIBC}" "${needed}" | sort -V | tail -1)" != "${MAX_GLIBC}" ]; then
+              echo "::error::sgl-router requires glibc ${needed} > ${MAX_GLIBC}; build on an older image"
+              exit 1
+          fi
+
+      - name: Ensure zstd so the restore job can read what this job saves
+        run: bash scripts/ci/utils/ensure_zstd.sh
+
+      # After the glibc check, so a rejected build cannot poison this key.
+      - name: Save built binary
+        uses: actions/cache/save@v4
+        with:
+          path: sgl-router-bin/sgl-router
+          key: ${{ inputs.cache_key_prefix }}-${{ hashFiles('sgl-router/**', 'rust/**', '.github/workflows/_pr-test-sgl-router-build.yml', 'scripts/ci/utils/build_sgl_router.sh') }}
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact_name }}
+          path: sgl-router-bin/sgl-router
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Publish artifact name
+        id: publish
+        run: echo "name=${{ inputs.artifact_name }}" >> "$GITHUB_OUTPUT"

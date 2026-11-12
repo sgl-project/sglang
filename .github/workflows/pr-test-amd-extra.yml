@@ -219,6 +219,10 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.sha }}
 
+      # For the PD tests in this suite. Cache-only, as in pr-test-amd.yml;
+      # amd_ci_exec.sh forwards the path.
+      - uses: ./.github/actions/download-sgl-router
+
       - name: Ensure VRAM is clear
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 

@@ -160,6 +160,10 @@ jobs:
       # No artifact_name: a workflow_dispatch has no rust-ext-build job of its own.
       - uses: ./.github/actions/download-rust-ext
 
+      # Cache-only for the same reason. The PD fixture needs two GPUs.
+      - uses: ./.github/actions/download-sgl-router
+        if: ${{ !startsWith(inputs.runs_on, '1-gpu') }}
+
       - name: Install dependencies
         timeout-minutes: ${{ fromJson(inputs.install_timeout) }}
         run: |

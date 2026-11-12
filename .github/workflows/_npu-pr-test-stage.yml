@@ -54,6 +54,10 @@ on:
         description: 'Coverage-recommended test files for this suite (one repo-relative path per line, from recommend-tests-from-coverage). Empty = run the full suite.'
         type: string
         default: ''
+      sgl_router_artifact:
+        description: "Artifact name from _pr-test-sgl-router-build.yml in this run; empty restores the aarch64 cache."
+        type: string
+        default: ''
       github-token:
         description: 'GitHub token for API calls'
         type: string
@@ -197,6 +201,13 @@ jobs:
             } else {
               core.notice('[health-check] PASS: no root cause failures detected');
             }
+
+      # The router the PD disaggregation fixture launches. Before the install,
+      # whose build output under rust/ would change the cache key it hashes.
+      - name: Download prebuilt sgl-router
+        uses: ./.github/actions/download-sgl-router
+        with:
+          artifact_name: ${{ inputs.sgl_router_artifact }}
 
       - name: Install dependencies
         env:
