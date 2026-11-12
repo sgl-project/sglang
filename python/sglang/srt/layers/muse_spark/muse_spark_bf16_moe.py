@@ -25,6 +25,7 @@ from sglang.kernels.ops.moe.muse_spark_post_expert_finalize_triton import (
 from sglang.srt.layers.moe import MoeRunnerBackend
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.muse_spark.muse_spark_fp4_moe import (
+    finalize_expert_tp,
     finalize_with_post_expert_norm,
 )
 from sglang.srt.layers.utils.common import set_weight_attrs
@@ -101,8 +102,12 @@ class MuseSpark1xBf16Experts(nn.Module):
         expert_hidden_size: int,
         intermediate_size: int,
         top_k: int,
+        expert_tp_size: int = 1,
+        expert_tp_rank: int = 0,
     ):
         super().__init__()
+        self.expert_tp_size = expert_tp_size
+        self.expert_tp_rank = expert_tp_rank
         self.num_experts = num_experts
         self.num_local_experts = num_local_experts
         self.local_expert_offset = local_expert_offset
@@ -167,6 +172,13 @@ class MuseSpark1xBf16Experts(nn.Module):
         if not 0 <= local_id < self.num_local_experts:
             return
         target = param.data[local_id]
+        if self.expert_tp_size > 1:
+            dim = 0 if shard_id in ("w1", "w3") else -1
+            loaded_weight = loaded_weight.narrow(
+                dim,
+                self.expert_tp_rank * self.intermediate_size,
+                self.intermediate_size,
+            )
         if shard_id in ("w1", "w3"):
             offset = 0 if shard_id == "w1" else self.intermediate_size
             target = target.narrow(0, offset, self.intermediate_size)
@@ -396,6 +408,8 @@ class MuseSpark1xBf16Experts(nn.Module):
                 packed_topk_ids,
                 ar_workspace=ar_workspace,
             )
+        if self.expert_tp_size > 1:
+            raise RuntimeError("Muse BF16 expert TP needs the TRT-LLM MoE backend")
         if self.use_triton:
             return self._forward_triton(
                 hidden_states, topk_scores, topk_ids, post_expert_norm
@@ -472,6 +486,20 @@ class MuseSpark1xBf16Experts(nn.Module):
                 activation_type=_SWIGLU,
             )[:3]
         )
+
+        if self.expert_tp_size > 1:
+            weight, eps, weight_first = self._finalize_norm_params(post_expert_norm)
+            return finalize_expert_tp(
+                gemm2_out,
+                expanded_idx_to_permuted_idx,
+                topk_scores,
+                topk_ids,
+                hidden_size=self.expert_hidden_size,
+                norm_weight=weight,
+                eps=eps,
+                weight_first=weight_first,
+                apply_norm=post_expert_norm is not None,
+            ).to(hidden_states.dtype)
 
         if self._finalize_op is None:
             output = finalize_with_post_expert_norm(

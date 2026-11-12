@@ -26,9 +26,11 @@ from sglang.kernels.ops.layernorm.muse_spark_rmsnorm_nvfp4_quant import (
     fused_norm_fp4_quant,
     fused_norm_fp4_quant_static,
 )
+from sglang.kernels.ops.moe.moe_finalize_fuse_shared import moe_finalize_fuse_shared
 from sglang.kernels.ops.moe.muse_spark_post_expert_finalize_triton import (
     fused_post_expert_norm_weighted_sum,
 )
+from sglang.srt.distributed import moe_tensor_model_parallel_all_reduce
 from sglang.srt.layers.moe import MoeRunnerBackend, get_moe_runner_backend
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.muse_spark.muse_spark_nvfp4_moe import (
@@ -96,6 +98,7 @@ class MuseSpark1xFp4Experts(nn.Module):
         top_k: int,
         quant_config: QuantizationConfig,
         params_dtype: Optional[torch.dtype] = None,
+        expert_tp_size: int = 1,
     ) -> None:
         super().__init__()
         # create_weights sizes the activation scales from ``num_experts``, so it
@@ -107,6 +110,7 @@ class MuseSpark1xFp4Experts(nn.Module):
         self.hidden_size = hidden_size
         self.intermediate_size_per_partition = intermediate_size
         self.top_k = top_k
+        self.expert_tp_size = expert_tp_size
         self.params_dtype = params_dtype or torch.get_default_dtype()
         self.quant_config = quant_config
         self.moe_runner_backend = _resolve_moe_runner_backend()
@@ -541,6 +545,8 @@ class MuseSpark1xFp4Experts(nn.Module):
         expert_outputs, local_topk_ids = self._marlin_expert_outputs(
             hidden_states, topk_scores, topk_ids
         )
+        if self.expert_tp_size > 1:
+            expert_outputs = moe_tensor_model_parallel_all_reduce(expert_outputs)
         if self._post_expert_norm is not post_expert_norm:
             self.set_post_expert_norm(post_expert_norm)
         if self._post_expert_norm_weight is not None:
@@ -710,6 +716,21 @@ class MuseSpark1xFp4Experts(nn.Module):
             )[:3]
         )
 
+        if self.expert_tp_size > 1:
+            if self._post_expert_norm is not post_expert_norm:
+                self.set_post_expert_norm(post_expert_norm)
+            return finalize_expert_tp(
+                gemm2_out,
+                expanded_idx_to_permuted_idx,
+                topk_scores,
+                topk_ids,
+                hidden_size=self.hidden_size,
+                norm_weight=self._post_expert_norm_weight,
+                eps=self._post_expert_norm_eps,
+                weight_first=self._post_expert_norm_weight_first,
+                apply_norm=post_expert_norm is not None,
+            ).to(hidden_states.dtype)
+
         from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
             FlashInferTrtllmDeferredFinalizeOutput,
         )
@@ -726,6 +747,67 @@ class MuseSpark1xFp4Experts(nn.Module):
             out_dtype=hidden_states.dtype,
             ar_workspace=ar_workspace,
         )
+
+
+def finalize_expert_tp(
+    gemm2_out: torch.Tensor,
+    expanded_idx_to_permuted_idx: torch.Tensor,
+    topk_scores: torch.Tensor,
+    topk_ids: torch.Tensor,
+    *,
+    hidden_size: int,
+    norm_weight: Optional[torch.Tensor],
+    eps: float,
+    weight_first: bool,
+    apply_norm: bool,
+) -> torch.Tensor:
+    from flashinfer.comm import (
+        supports_tp_moe_finalize_rmsnorm,
+        tp_moe_finalize_rmsnorm,
+    )
+
+    num_tokens, top_k = topk_ids.shape
+    weights = topk_scores.float().contiguous()
+    idx = expanded_idx_to_permuted_idx.view(num_tokens, top_k)
+    output = torch.empty(
+        num_tokens, hidden_size, dtype=torch.bfloat16, device=gemm2_out.device
+    )
+    if (
+        apply_norm
+        and norm_weight is not None
+        and supports_tp_moe_finalize_rmsnorm(
+            gemm2_out, weights, idx, norm_weight, output
+        )
+    ):
+        tp_moe_finalize_rmsnorm(
+            gemm2_out,
+            weights,
+            idx,
+            norm_weight,
+            output,
+            eps=eps,
+            gain_center=0.0,
+            weight_before_norm=weight_first,
+        )
+        return output
+    # Reduced in token order: the kernel's permutation may differ across ranks.
+    rows = moe_finalize_fuse_shared(
+        gemm2_out,
+        expanded_idx_to_permuted_idx,
+        torch.ones(num_tokens * top_k, 1, dtype=torch.float32, device=weights.device),
+        None,
+        top_k=1,
+    )
+    rows = moe_tensor_model_parallel_all_reduce(rows)
+    return fused_post_expert_norm_weighted_sum(
+        rows.view(num_tokens, top_k, rows.shape[1])[..., :hidden_size],
+        topk_scores,
+        norm_weight=norm_weight,
+        eps=eps,
+        weight_first=weight_first,
+        apply_norm=apply_norm,
+        slot_expert_ids=topk_ids,
+    )
 
 
 def finalize_with_post_expert_norm(
