@@ -14,6 +14,7 @@ use axum::middleware::Next;
 use axum::response::IntoResponse;
 use bytes::Bytes;
 
+use crate::off_worker;
 use crate::protocol::anthropic::{
     self, response::chat_to_message, stream::MessagesStream, EchoContext,
 };
@@ -33,11 +34,15 @@ pub(crate) async fn messages(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response<Body> {
-    let converted = match parse(&body, false) {
+    let prepared = off_worker::run_for_body(body.len(), || {
+        let converted = parse(&body, false)?;
+        let chat_body = Bytes::from(serde_json::to_vec(&converted.chat).expect("serialize chat"));
+        Ok::<_, ApiError>((converted, chat_body))
+    });
+    let (converted, chat_body) = match prepared {
         Ok(c) => c,
         Err(e) => return adapt(e.into_response(), None).await,
     };
-    let chat_body = Bytes::from(serde_json::to_vec(&converted.chat).expect("serialize chat"));
     let resp = match chat_completions(State(ctx), headers, chat_body).await {
         Ok(r) => r,
         Err(e) => e.into_response(),
@@ -50,7 +55,7 @@ pub(crate) async fn count_tokens(
     State(ctx): State<Arc<AppContext>>,
     body: Bytes,
 ) -> Response<Body> {
-    let mut converted = match parse(&body, true) {
+    let mut converted = match off_worker::run_for_body(body.len(), || parse(&body, true)) {
         Ok(c) => c,
         Err(e) => return adapt(e.into_response(), None).await,
     };
@@ -121,20 +126,23 @@ async fn adapt(resp: Response<Body>, echo: Option<(EchoContext, bool)>) -> Respo
     let Some((echo, _)) = echo else {
         return Response::from_parts(parts, Body::from(bytes));
     };
-    match serde_json::from_slice::<serde_json::Value>(&bytes) {
-        Ok(chat) => {
-            let body = serde_json::to_vec(&chat_to_message(&chat, &echo)).expect("serialize");
-            rebuild(parts, body)
+    // A non-streaming reply can be as large as a request body.
+    off_worker::run_for_body(bytes.len(), || {
+        match serde_json::from_slice::<serde_json::Value>(&bytes) {
+            Ok(chat) => {
+                let body = serde_json::to_vec(&chat_to_message(&chat, &echo)).expect("serialize");
+                rebuild(parts, body)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "messages: upstream reply is not JSON");
+                parts.status = StatusCode::BAD_GATEWAY;
+                rebuild(
+                    parts,
+                    anthropic::error_body(502, "upstream reply is not a valid chat completion"),
+                )
+            }
         }
-        Err(e) => {
-            tracing::warn!(error = %e, "messages: upstream reply is not JSON");
-            parts.status = StatusCode::BAD_GATEWAY;
-            rebuild(
-                parts,
-                anthropic::error_body(502, "upstream reply is not a valid chat completion"),
-            )
-        }
-    }
+    })
 }
 
 /// The body limit rejects oversized requests before the handler runs; give
