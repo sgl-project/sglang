@@ -39,14 +39,14 @@ logger = logging.getLogger(__name__)
 
 
 def get_eplb_group() -> torch.distributed.ProcessGroup | None:
-    """Reuse NPU TP for non-pipelined, non-elastic EPLB; otherwise use WORLD."""
-    if (
-        get_device().device != "npu"
-        or get_exec().moe.elastic_ep_backend is not None
-        or get_parallel().pp_size != 1
-    ):
+    """Reuse NPU TP for non-elastic, PP=1 EPLB when TP spans WORLD."""
+    if get_device().device != "npu" or get_exec().moe.elastic_ep_backend is not None:
         return None
-    return get_parallel().tp_group.device_group
+    parallel = get_parallel()
+    # Statistics use global ranks and root 0, so TP must cover the whole WORLD.
+    if parallel.pp_size != 1 or parallel.tp_size != torch.distributed.get_world_size():
+        return None
+    return parallel.tp_group.device_group
 
 
 def _prefer_same_node_experts() -> bool:
