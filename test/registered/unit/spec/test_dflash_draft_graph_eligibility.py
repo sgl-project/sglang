@@ -51,6 +51,9 @@ class TestDFlashDraftGraphEligibility(unittest.TestCase):
         worker._block_pos_offsets = torch.arange(2)
         worker._use_triton_prepare_block = False
         worker._mask_token_id = 2
+        worker._megakernel_embed = None
+        worker.draft_kv_ring = None
+        worker._aux_pending = False
         worker._full_embed_gpu = None
         worker._noise_embed_scale = 1.0
         worker.use_compact_draft_cache = False

@@ -23,6 +23,7 @@ def _stage(first_rank: bool, succeeded, failed, prev=None):
         disagg_prefill_transfer_queue=[],
         get_rids=lambda queue, is_send, *groups: (list(succeeded), list(failed)),
         _pp_recv_pyobj_from_prev_stage=lambda: prev,
+        scheduler_stage_metrics=None,
     )
 
 

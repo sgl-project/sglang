@@ -182,7 +182,9 @@ def test_direct_backend_dispatch(sparse):
     batch = make_batch()
     q = torch.zeros(4, 2, 3)
     result = object()
-    backend = SimpleNamespace(forward=lambda *args, **kwargs: result)
+    backend = SimpleNamespace(
+        forward=lambda *args, **kwargs: result, plans_padded_extend_rows=False
+    )
     with (
         attention_scope(batch, backend),
         patch(
@@ -329,7 +331,9 @@ def test_decode_bcg_without_prefill_scope_uses_backend(mode_name, sparse):
     batch.forward_mode = ForwardMode[mode_name]
     q = torch.zeros(4, 1, 2)
     result = object()
-    backend = SimpleNamespace(forward=lambda *args, **kwargs: result)
+    backend = SimpleNamespace(
+        forward=lambda *args, **kwargs: result, plans_padded_extend_rows=False
+    )
     with (
         forward_context(ForwardContext(backend)),
         patch(

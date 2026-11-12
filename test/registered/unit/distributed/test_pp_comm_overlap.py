@@ -28,6 +28,7 @@ class FakeEvent:
 
 def _make_scheduler(**attrs):
     scheduler = object.__new__(SchedulerPPMixin)
+    scheduler.scheduler_stage_metrics = None
     scheduler.__dict__.update(attrs)
     return scheduler
 

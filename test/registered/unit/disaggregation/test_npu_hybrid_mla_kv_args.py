@@ -12,6 +12,7 @@ from sglang.srt.hardware_backend.npu import memory_pool_npu
 from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 from sglang.srt.mem_cache.static_kv_storage import StaticKVStorage
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -70,12 +71,13 @@ def _register(target, draft):
         num_hidden_layers=_TARGET_LAYERS,
     )
     kv_args = KVArgs()
-    setup_state_kv_args(
-        kv_args,
-        storage,
-        draft_token_to_kv_pool=draft,
-        total_kv_layers=_TARGET_LAYERS,
-    )
+    with get_context().override_server_args():
+        setup_state_kv_args(
+            kv_args,
+            storage,
+            draft_token_to_kv_pool=draft,
+            total_kv_layers=_TARGET_LAYERS,
+        )
     return kv_args
 
 

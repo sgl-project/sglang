@@ -44,6 +44,7 @@ class _ReadStream:
         kv_start_idx=None,
         kind=IdSpaceKind.FULL,
         token_mapping=None,
+        num_token_blocks=1,
     ):
         for i, (req, length) in enumerate(zip(req_pool_indices, seq_lens)):
             start = 0 if kv_start_idx is None else int(kv_start_idx[i])

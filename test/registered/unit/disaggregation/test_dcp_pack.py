@@ -66,6 +66,7 @@ class TestDcpCachedPrefixSend(CustomTestCase):
             dsa_index_k_token_bytes=None,
             state_sub_pools=[None, None],
         )
+        mgr.state_item_lens_sums = [0, 0]
         mgr._dcp_pack_buffers = None
         mgr._dcp_pack_max_tokens = None
         mgr.transfer_queues = [None]

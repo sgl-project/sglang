@@ -390,6 +390,7 @@ class TestFinishedMambaSpecCheckpoint(CustomTestCase):
             batch.mamba_track_mask_cpu = None
             tree = MagicMock()
             tree.supports_mamba.return_value = True
+            tree.request_mamba_only = False
             tree.claim_kv_row.return_value = False
             tree.token_to_kv_pool_allocator.page_size = 1
             tree.logical_page_size = 1

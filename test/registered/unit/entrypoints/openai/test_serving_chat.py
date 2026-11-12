@@ -3027,29 +3027,36 @@ class ServingChatTestCase(CustomTestCase):
 
         untyped = {"function": {"name": "lookup"}}
         cases = {
-            "user message": (declare("user", [tool()], "Hi"), True),
-            "assistant message": (declare("assistant", [tool()]), True),
-            "root message": (declare("root", [tool()], "You are A."), True),
-            "system message with content": (declare("system", [tool()], "A"), True),
-            "missing type": (declare("system", [untyped]), True),
-            "non-function type": (declare("system", [tool(type="bogus")]), True),
-            "name starts with a digit": (declare("system", [tool("1x")]), True),
-            "name with a symbol": (declare("system", [tool("a@b")]), True),
-            "empty name": (declare("system", [tool("")]), True),
-            "name over 256 chars": (declare("system", [tool("a" * 257)]), True),
-            "system message": (declare("system", [tool("_a-1" + "b" * 252)]), False),
-            "developer message": (declare("developer", [tool()], None), False),
+            "user message": (declare("user", [tool()], "Hi"), "request"),
+            "assistant message": (declare("assistant", [tool()]), "request"),
+            "root message": (declare("root", [tool()], "You are A."), "kimi_k3"),
+            "system message with content": (
+                declare("system", [tool()], "A"),
+                "request",
+            ),
+            "missing type": (declare("system", [untyped]), "request"),
+            "non-function type": (declare("system", [tool(type="bogus")]), "request"),
+            "name starts with a digit": (declare("system", [tool("1x")]), "request"),
+            "name with a symbol": (declare("system", [tool("a@b")]), "request"),
+            "empty name": (declare("system", [tool("")]), "request"),
+            "name over 256 chars": (declare("system", [tool("a" * 257)]), "request"),
+            "system message": (declare("system", [tool("_a-1" + "b" * 252)]), None),
+            "developer message": (declare("developer", [tool()], None), None),
         }
         for chat_encoding_spec in (None, "kimi_k3"):
             _use_chat_encoding(self.chat, chat_encoding_spec)
-            for name, (messages, rejected_by_k3) in cases.items():
+            for name, (messages, rejected_by) in cases.items():
                 with self.subTest(chat_encoding_spec=chat_encoding_spec, case=name):
+                    if rejected_by == "request":
+                        with self.assertRaisesRegex(ValueError, r"messages\[0\]"):
+                            ChatCompletionRequest(model="x", messages=messages)
+                        continue
                     error = self.chat._validate_request(
                         ChatCompletionRequest(model="x", messages=messages)
                     )
                     self.assertEqual(
                         error is not None,
-                        rejected_by_k3 and chat_encoding_spec == "kimi_k3",
+                        rejected_by == "kimi_k3" and chat_encoding_spec == "kimi_k3",
                         error,
                     )
 
@@ -3067,7 +3074,7 @@ class ServingChatTestCase(CustomTestCase):
             ("kimi_k3", "required", json_object, None, True),
             ("kimi_k3", named, json_schema, None, True),
             ("kimi_k3", "required", json_object, "a+", False),
-            (None, "required", json_object, None, False),
+            (None, "required", json_object, None, True),
         )
         for spec, tool_choice, response_format, regex, accepted in cases:
             _use_chat_encoding(self.chat, spec)
@@ -3093,6 +3100,9 @@ class ServingChatTestCase(CustomTestCase):
                 self.assertNotIn("json_schema", adapted.sampling_params)
                 self.assertIn("structural_tag", adapted.sampling_params)
                 kwargs = self.tm.tokenizer.apply_chat_template.call_args.kwargs
+                if spec is None:
+                    self.assertNotIn("response_format", kwargs)
+                    continue
                 self.assertEqual(
                     kwargs["response_format"]["type"], response_format["type"]
                 )

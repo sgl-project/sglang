@@ -744,6 +744,7 @@ class TestForwardPassMetrics(unittest.TestCase):
                 # No unified pool: nothing keeps freed pages on the forward.
                 receiver._on_step_forward_recorded = lambda forward_done: False
                 receiver._pp_spec_relay = speculative
+                receiver.scheduler_stage_metrics = None
                 receiver.forward_stream_ctx = nullcontext()
                 receiver.forward_stream = Mock()
                 receiver.schedule_stream = object()

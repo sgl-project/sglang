@@ -28,6 +28,9 @@ from sglang.srt.managers.scheduler_components.request_list import (
 )
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_mode import ForwardMode
+from sglang.srt.observability.scheduler_stage_metrics import (
+    SchedulerStageMetricsRecorder,
+)
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -578,7 +581,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         scheduler.dllm_config = None
         scheduler.disaggregation_mode = DisaggregationMode.PREFILL
         scheduler._poll_timeout_aborts = Mock(return_value=[])
-        scheduler.scheduler_stage_metrics = None
+        scheduler.scheduler_stage_metrics = SchedulerStageMetricsRecorder(enabled=False)
         scheduler.metrics_reporter = SimpleNamespace(record_scheduler_active=Mock())
         scheduler.invariant_checker = Mock()
         scheduler.scripted_scheduler_hook = SimpleNamespace(

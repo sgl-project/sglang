@@ -1527,6 +1527,12 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>0</code>, <code>2</code>, <code>4</code></td>
     </tr>
         <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--enable-flashmla-prefill-token-packing`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Pack adjacent Kimi-K3.1 prefill tokens into one FlashMLA query tile. Requires SM100/SM103, FP8 V32 KV cache and at most 32 heads per TP rank. Supports DCP prefill after KV gathering, without separate prefill CP. Disabled during deterministic inference. On by default for Kimi-K3.1 (it only reorders the sparse-key sum); use `--no-enable-flashmla-prefill-token-packing` to disable.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: bool</td>
+    </tr>
+        <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--dsa-decode-backend`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>DSA backend for the decode stage when running DeepSeek DSA-style attention. Overrides `--attention-backend` for decoding.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Auto (hardware-dependent)</td>
@@ -1553,6 +1559,12 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--enable-fp4-indexer`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Use FP4 queries and index-K cache in the DSA lightning indexer of DeepSeek-V3.2-style sparse attention, ERNIE 5.5 Flash's MLA layers included; requires SM100. DeepSeek V4's C4 indexer has its own switch, `--enable-deepseek-v4-fp4-indexer`. Default keeps the FP8 indexer.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
+    </tr>
+        <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--enable-dsa-fp4-indexer`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Store the DSA indexer keys in MXFP4 and score them with AITER's FP4 MQA-logits kernels (Kimi-K3.1 on gfx950 with DCP): the row-group kernel in decode and target verify, the prefill kernel over the DCP-gathered keys in prefill.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
     </tr>

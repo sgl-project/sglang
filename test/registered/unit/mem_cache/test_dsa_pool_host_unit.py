@@ -8,7 +8,7 @@ from sglang.srt.mem_cache.pool_host.dsa import (
     DSAIndexerPoolHost,
 )
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
@@ -58,6 +58,7 @@ class TestDSAHiCacheTransfer(unittest.TestCase):
             self.skipTest("DSA host transfer tests only support CUDA/ROCm.")
         if not (is_cuda() or is_hip()):
             self.skipTest("CUDA/ROCm not available.")
+        self.enterContext(get_context().override_server_args())
         cm = get_parallel().override(attn_dcp_size=1)
         cm.__enter__()
         self.addCleanup(cm.__exit__, None, None, None)
