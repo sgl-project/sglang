@@ -2,10 +2,19 @@
 
 Sparse attention reads FP8 latent rows and indexer keys that the unified pool
 lays out per page of its full sub-pool, beside the KDA state. Kimi-K3.1 cut to
-its first eight layers (real weights) runs the same requests on both pools: a
-chunked prefill, decoding, and a second request that reuses the first one's
-prefix, so the indexer scores cached keys. Prompt and output logprobs must
-agree.
+its first eight layers (real weights) runs the same requests on both pools, in
+two cases, each a chunked prefill with decoding and then a second request that
+reuses the first one's prefix:
+
+  * short: the contexts stay within the indexer's top-k, so every token is
+    attended and the indexer's scores pick nothing; this covers the latent
+    rows and the prefix reuse;
+  * long: the prompt is over twice the top-k, so prefill chunks past it, every
+    decode step and the second request's extend over the cached prefix score
+    the indexer keys and attend only the top-k they select. Wrong keys change
+    which tokens attention reads.
+
+Prompt and output logprobs must agree, with CUDA graphs and in eager mode.
 """
 
 import json
@@ -21,7 +30,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=1800, stage="nightly", runner_config="8-gpu-b300")
+register_cuda_ci(est_time=2000, stage="nightly", runner_config="8-gpu-b300")
 
 MODEL_PATH = "moonshotai/Kimi-K3.1-Pro"
 # The checkpoint's first eight layers, numbered from 1 as its config numbers
@@ -44,14 +53,24 @@ BASE_ARGS = [
     "--mem-fraction-static",
     "0.6",
 ]
-PREFIX = [1] + [100 + (i * 37) % 5000 for i in range(700)]
+# New tokens the second request of each case appends to the cached prefix.
+CONTINUATION = [200 + i for i in range(64)]
 
 
-def _model_override(model_path):
-    """The checkpoint's config with only the kept layers."""
+def _prompt(length, offset):
+    """A BOS then synthetic tokens; cases take disjoint ranges so neither
+    reuses the other's prefix."""
+    return [1] + [offset + (i * 37) % 5000 for i in range(length - 1)]
+
+
+def _text_config(model_path):
     from sglang.srt.hf_transformers.config import get_config
 
-    text = get_config(model_path, trust_remote_code=True).text_config
+    return get_config(model_path, trust_remote_code=True).text_config
+
+
+def _model_override(text):
+    """The checkpoint's config with only the kept layers."""
     linear = dict(text.linear_attn_config)
     linear.update(full_attn_layers=FULL_LAYERS, kda_layers=KDA_LAYERS)
     dsa = dict(text.dsa_config)
@@ -70,9 +89,17 @@ class TestKimiK31UnifiedMemoryParity(CustomTestCase):
     def setUpClass(cls):
         cls.model = MODEL_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
+        text = _text_config(MODEL_PATH)
+        cls.index_topk = text.dsa_config["index_topk"]
+        cls.prompts = {
+            "short": _prompt(701, offset=100),
+            # 4,097 tokens for a top-k of 2,048.
+            "long": _prompt(2 * cls.index_topk + 1, offset=5100),
+        }
+        assert len(cls.prompts["short"]) + len(CONTINUATION) <= cls.index_topk
         cls.base_args = BASE_ARGS + [
             "--json-model-override-args",
-            json.dumps(_model_override(MODEL_PATH)),
+            json.dumps(_model_override(text)),
         ]
 
     def _generate(self, input_ids, logprob_start_len=0):
@@ -106,15 +133,18 @@ class TestKimiK31UnifiedMemoryParity(CustomTestCase):
             other_args=self.base_args + extra_args,
         )
         try:
-            first = self._generate(PREFIX)
-            # The same prefix again, then new tokens: a cache hit whose new
-            # tokens score the cached indexer keys.
-            # Prompt logprobs only past the prefix: asking for them from the
-            # start would recompute the prefix instead of reusing it.
-            second = self._generate(
-                PREFIX + [200 + i for i in range(64)], logprob_start_len=len(PREFIX)
-            )
-            return first, second
+            results = {}
+            for case, prefix in self.prompts.items():
+                first = self._generate(prefix)
+                # The same prefix again, then new tokens: a cache hit whose
+                # new tokens read the cached latent rows and indexer keys.
+                # Prompt logprobs only past the prefix: asking for them from
+                # the start would recompute the prefix instead of reusing it.
+                second = self._generate(
+                    prefix + CONTINUATION, logprob_start_len=len(prefix)
+                )
+                results[case] = first, second
+            return results
         finally:
             kill_process_tree(process.pid, wait_timeout=60)
 
@@ -140,9 +170,20 @@ class TestKimiK31UnifiedMemoryParity(CustomTestCase):
         ):
             with self.subTest(mode=name):
                 unified = self._run(["--enable-unified-memory", *extra])
-                self.assertGreater(unified[1][2], 0, "the second request hit no prefix")
-                self._assert_close(unified[0], static[0], f"{name}, first request")
-                self._assert_close(unified[1], static[1], f"{name}, prefix hit")
+                for case in self.prompts:
+                    with self.subTest(case=case):
+                        self._check_case(unified[case], static[case], name, case)
+
+    def _check_case(self, unified, static, mode, case):
+        cached = unified[1][2]
+        self.assertGreater(cached, 0, "the second request hit no prefix")
+        if case == "long":
+            # The extend's context, cached keys included, exceeds the top-k,
+            # so the indexer's selection decides what attention reads.
+            self.assertGreater(cached, self.index_topk)
+        what = f"{mode}, {case}"
+        self._assert_close(unified[0], static[0], f"{what}, first request")
+        self._assert_close(unified[1], static[1], f"{what}, prefix hit")
 
 
 if __name__ == "__main__":
