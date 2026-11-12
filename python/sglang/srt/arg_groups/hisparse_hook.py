@@ -23,6 +23,8 @@ HISPARSE_ROCM_DSA_BACKENDS = {"tilelang", "triton", "aiter"}
 HISPARSE_XPU_DSA_BACKENDS_BY_DTYPE = {"bfloat16": {"intel_xpu"}}
 HISPARSE_KV_CACHE_DTYPES = ("bfloat16", "fp8_e4m3")
 
+HISPARSE_VALIDATED_SPEC_ALGORITHMS = ("EAGLE", "EAGLE3", "UNO")
+
 
 def _hisparse_default_backend(kv_cache_dtype: str) -> str:
     if get_platform().is_hip:
@@ -136,20 +138,28 @@ def validate_hisparse(server_args: ServerArgs) -> None:
     )
     validate_hisparse_feature_combos(server_args)
 
-    enable_spec = (
-        cfg.speculative_algorithm is not None
-        and cfg.speculative_algorithm.upper() != "NONE"
-    )
-    if enable_spec and (cfg.speculative_eagle_topk or 1) != 1:
-        raise ValueError(
-            "The minimal HiSparse spec integration supports linear speculation "
-            "only; use --speculative-eagle-topk 1."
-        )
-    if enable_spec and cfg.speculative_adaptive:
-        raise ValueError(
-            "HiSparse speculative decoding uses statically sized swap state; "
-            "--speculative-adaptive is not supported."
-        )
+    algorithm = cfg.speculative_algorithm
+    if algorithm is not None and algorithm.upper() != "NONE":
+        if algorithm.upper() not in HISPARSE_VALIDATED_SPEC_ALGORITHMS:
+            raise ValueError(
+                f"--enable-hisparse has not validated speculative algorithm "
+                f"{algorithm!r}. Algorithms whose workers never bind HiSparse "
+                "verify slots would write target-verify KV through unmapped "
+                "device locations (silent corruption); only validated "
+                "combinations are accepted: "
+                f"{', '.join(HISPARSE_VALIDATED_SPEC_ALGORITHMS)} (linear "
+                "speculation only, --speculative-eagle-topk 1)."
+            )
+        if (cfg.speculative_eagle_topk or 1) != 1:
+            raise ValueError(
+                "The minimal HiSparse spec integration supports linear "
+                "speculation only; use --speculative-eagle-topk 1."
+            )
+        if cfg.speculative_adaptive:
+            raise ValueError(
+                "HiSparse speculative decoding uses statically sized swap "
+                "state; --speculative-adaptive is not supported."
+            )
 
     # DSv4 hisparse handles its own dtype/backend pairing elsewhere; the dtype-
     # aware checks below only apply to the DSA hisparse path.

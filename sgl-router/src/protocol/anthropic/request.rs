@@ -197,9 +197,7 @@ fn thinking_enabled(thinking: &Value) -> Result<bool, String> {
     };
     match thinking.get("type").and_then(Value::as_str) {
         Some("enabled") => match budget.map(Value::as_i64) {
-            None => {
-                Err("thinking.budget_tokens is required when thinking.type is 'enabled'".into())
-            }
+            None => Ok(true),
             Some(Some(n)) if n >= 1024 => Ok(true),
             Some(Some(n)) => Err(format!("thinking.budget_tokens must be >= 1024 (got {n})")),
             Some(None) => Err("thinking.budget_tokens: must be an integer".into()),
@@ -944,9 +942,9 @@ mod tests {
             with(json!({"type": "adaptive", "display": "omitted"})),
             Ok(json!(true))
         );
+        assert_eq!(with(json!({"type": "enabled"})), Ok(json!(true)));
         assert_eq!(with(json!({"type": "disabled"})), Ok(json!(false)));
         for (thinking, needle) in [
-            (json!({"type": "enabled"}), "required"),
             (json!({"type": "enabled", "budget_tokens": 1023}), ">= 1024"),
             (
                 json!({"type": "disabled", "budget_tokens": 2048}),

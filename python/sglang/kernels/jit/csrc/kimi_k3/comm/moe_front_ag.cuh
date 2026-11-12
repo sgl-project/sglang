@@ -18,7 +18,7 @@ namespace sglang {
 
 namespace k3_front_ag {
 
-using device::distributed::Counter;
+using device::distributed::EpochCounter;
 using Lamport = device::distributed::LamportTrait<float, 4>;
 
 constexpr uint32_t kVec = 16 / sizeof(float);  // 4 fp32 (16B) per thread
@@ -26,8 +26,7 @@ constexpr uint32_t kVec = 16 / sizeof(float);  // 4 fp32 (16B) per thread
 struct Params {
   uint8_t* ws_local;      // LOCAL VA of the push workspace base (poll + reset)
   uint8_t* ws_mc;         // multicast VA of the push workspace base (push)
-  Counter* counter;       // per-block phase counters
-  uint32_t num_counters;  // PushPlane::num_blocks
+  EpochCounter* counter;  // the push plane's phase word
   uint32_t half_bytes;    // world_size * slot_bytes
   uint32_t rank;
   const float* local;     // [M, N / world], rows local_stride floats apart
@@ -46,22 +45,11 @@ __global__ __launch_bounds__(kBlock) void front_all_gather_kernel(const __grid_c
   const auto tx = threadIdx.x;
   const uint32_t tid = bx * kBlock + tx;
   PDLWaitPrimary<kUsePDL>();
-  const uint32_t phase = params.counter[bx].get() & 1;
+  const uint32_t phase = params.counter->load();
   const uint32_t half_off = phase * params.half_bytes;
 
-  // the last block flips its own counter and every one past the grid
-  if (const auto num_blocks = gridDim.x; bx == num_blocks - 1) {
-    [[unlikely]];
-    PDLTriggerSecondary<kUsePDL>();
-    __syncthreads();
-    for (uint32_t i = num_blocks - 1 + tx; i < params.num_counters; i += kBlock) {
-      params.counter[i].set(phase ^ 1);
-    }
-    return void();
-  }
-
-  // Bound the grid to the existing AR counters; larger batches use a stride.
-  const uint32_t stride = (gridDim.x - 1) * kBlock * kVec;
+  // The grid is capped at the push plane's launch width; larger batches stride.
+  const uint32_t stride = gridDim.x * kBlock * kVec;
   const uint32_t local_numel = params.num_rows * kNLocal;
   for (uint32_t local_elem = tid * kVec; local_elem < local_numel; local_elem += stride) {
     const auto local_row = local_elem / kNLocal;
@@ -87,8 +75,8 @@ __global__ __launch_bounds__(kBlock) void front_all_gather_kernel(const __grid_c
     *reinterpret_cast<uint4*>(params.out + elem) = raw;
     *reinterpret_cast<uint4*>(src) = make_uint4(0, 0, 0, 0);
   }
-  __syncthreads();
-  if (tx == 0) params.counter[bx].set(phase ^ 1);
+  __syncthreads();  // every thread has read the phase before this block commits
+  if (tx == 0) params.counter->commit();
 }
 
 }  // namespace k3_front_ag
@@ -123,13 +111,11 @@ struct K3FrontAllGather {
     CHECK_HOST(int64_t(num_tokens) * kNLocal * 4 <= push.slot_bytes)
         << "this rank's block exceeds the push slot size " << push.slot_bytes;
     CHECK_HOST(push.mc_workspace != nullptr) << "requires a multicast-capable push plane";
-    CHECK_HOST(push.num_blocks >= 2) << "gather needs a work block and a counter-update block";
 
     const auto params = k3_front_ag::Params{
         .ws_local = push.workspaces[push.rank],
         .ws_mc = push.mc_workspace,
         .counter = push.counter,
-        .num_counters = push.num_blocks,
         .half_bytes = static_cast<uint32_t>(push.slot_bytes * push.world_size),
         .rank = push.rank,
         .local = static_cast<const float*>(local.data_ptr()),
@@ -138,8 +124,8 @@ struct K3FrontAllGather {
         .num_rows = num_tokens,
     };
     const auto num_vecs = num_tokens * N / k3_front_ag::kVec;
-    const auto num_work_blocks = std::min(host::div_ceil(num_vecs, kBlock), push.num_blocks - 1);
-    host::LaunchKernel(num_work_blocks + 1, kBlock, device.unwrap()).enable_pdl(kUsePDL)(kernel, params);
+    const auto num_blocks = std::min(host::div_ceil(num_vecs, kBlock), push.default_blocks);
+    host::LaunchKernel(num_blocks, kBlock, device.unwrap()).enable_pdl(kUsePDL)(kernel, params);
   }
 };
 
