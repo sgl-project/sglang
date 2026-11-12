@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Callable, Optional
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.req_types import FINISH_ABORT
 from sglang.srt.managers.scheduler_components.exit_ledger import record_exit
 from sglang.srt.managers.utils import make_abort_req
@@ -12,6 +14,8 @@ from sglang.srt.mem_cache.common import (
     release_kv_cache,
 )
 from sglang.srt.runtime_context import get_disagg
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.beam_search.coordinator import BeamCoordinator
@@ -28,9 +32,8 @@ class RequestRetirer:
     """Ends requests and releases what they hold: `abort` for one no launched
     step reports (sends the abort output), `retire_unadmitted` for one rejected
     before it was queued (streams its output), `release` for one its caller
-    ended and sends. `abort`, `retire_unadmitted` and `abort_retracted` take
-    the request out of the list it is still in: a request ended on its way
-    between lists leaves for none."""
+    ended and sends. Each takes the request out of the list it is still in: a
+    request ended on its way between lists leaves for none."""
 
     def __init__(
         self,
@@ -61,7 +64,6 @@ class RequestRetirer:
         the chunked slot, or refused at the waiting-queue door. ``reason`` is the
         request's own finish reason and ``finished_reason`` what the tokenizer
         receives."""
-        _leave_owner_list(req)
         # Finished in place, so a later abort in the same intake skips it.
         if req.finished_reason is None:
             req.finish_outside_step(reason or FINISH_ABORT())
@@ -74,7 +76,6 @@ class RequestRetirer:
         """Finish a request rejected before it was queued. It holds no device KV,
         but the release still frees its streaming session, its cache prefetch
         retry and a retracted request's host KV backup."""
-        _leave_owner_list(req)
         # An already set `finished_reason` is what the client receives.
         reason = req.finished_reason or req.to_finish
         req.time_stats.trace_ctx.abort(abort_info={"reason": reason.message})
@@ -87,6 +88,7 @@ class RequestRetirer:
 
     def release(self, req: Req, *, checkpoint: bool) -> None:
         """Give back what an ended request holds; the caller finishes and streams it."""
+        _leave_owner_list(req)
         record_exit(req, "release")
         if isinstance(req.finished_reason, FINISH_ABORT):
             self._detach(req)
@@ -141,6 +143,26 @@ class RequestRetirer:
             make_abort_req(req, finished_reason=reason.to_json()), req
         )
 
+    def abandon(self, req: Req, error: Exception) -> None:
+        """Take out a request whose release raised `error`, freeing nothing.
+        A failed release is a bug: CI raises it."""
+        if envs.SGLANG_IS_IN_CI.get():
+            raise error
+        logger.error(
+            f"Release of request {req.rid} (bootstrap room {req.bootstrap_room}) "
+            "failed; abandoning what it holds",
+            exc_info=error,
+        )
+        if req.owner_list is None:
+            return
+        _leave_owner_list(req)
+        record_exit(req, "abandon")
+
+    def settle_output(self, req: Req) -> None:
+        """Take a released request out of the list holding its final output;
+        its release already recorded the exit."""
+        _leave_owner_list(req)
+
     def _detach(self, req: Req) -> None:
         """Drop an aborted request from the components tracking it and free its
         media, but no KV or rows. `release` runs it before the KV goes: uOCR's
@@ -156,4 +178,4 @@ class RequestRetirer:
 
 def _leave_owner_list(req: Req) -> None:
     if req.owner_list is not None:
-        req.owner_list.leave([req])
+        req.owner_list._leave([req])
