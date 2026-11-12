@@ -214,50 +214,43 @@ fn prepare_now<'a>(
     body: Bytes,
     grpc: bool,
 ) -> Result<(PreparedRequest, ModelRouting<'a>), ApiError> {
-    let served_model = || ModelId(ctx.config.model.id.clone());
-    let (routing, request) = match endpoint {
+    // One model is served, so any `model` name routes to it; the engine still
+    // reads the name the body carries, with any `:adapter` suffix.
+    let model = ModelId(ctx.config.model.id.clone());
+    let routing = ModelRouting::lookup(ctx, &model)?;
+    let request = match endpoint {
         Endpoint::Chat | Endpoint::Completions => {
             let mut fields = parse_routing_fields(&body)?;
-            let model = fields.model.take();
-            let model =
-                ModelId(model.ok_or_else(|| ApiError::BadRequest("missing `model` field".into()))?);
-            let (model, body) = canonicalize_model_alias(ctx, model, body)?;
-            let (model, routing) = ModelRouting::lookup_openai(ctx, model)?;
+            let sent = fields.model.take();
+            let sent =
+                ModelId(sent.ok_or_else(|| ApiError::BadRequest("missing `model` field".into()))?);
+            let (_, body) = canonicalize_model_alias(ctx, sent, body)?;
             let needs_tokens = routing.needs_request_tokens(ctx);
             let path = if matches!(endpoint, Endpoint::Chat) {
                 CHAT_PATH
             } else {
                 COMPLETIONS_PATH
             };
-            let request = if grpc && matches!(endpoint, Endpoint::Completions) {
+            if grpc && matches!(endpoint, Endpoint::Completions) {
                 PreparedRequest::completion(ctx, model, fields, body, needs_tokens)?
             } else if grpc {
                 PreparedRequest::openai_grpc(ctx, path, model, fields, headers, body, needs_tokens)?
             } else {
                 PreparedRequest::openai(ctx, path, model, fields, headers, body, needs_tokens)?
-            };
-            (routing, request)
+            }
         }
-        Endpoint::Generate => {
-            let model = served_model();
-            let routing = ModelRouting::lookup(ctx, &model)?;
-            (routing, PreparedRequest::generate(ctx, model, body)?)
-        }
+        Endpoint::Generate => PreparedRequest::generate(ctx, model, body)?,
         Endpoint::Embeddings | Endpoint::Classify => {
             let path = endpoint.path();
-            let (model, mut value) = parse_embedding_request(&body)?;
-            let (model, body) = canonicalize_model_alias(ctx, model, body)?;
-            value["model"] = model.0.clone().into();
-            let (model, routing) = ModelRouting::lookup_openai(ctx, model)?;
+            let (sent, mut value) = parse_embedding_request(&body)?;
+            let (sent, body) = canonicalize_model_alias(ctx, sent, body)?;
+            value["model"] = sent.0.into();
             require_plain_workers(ctx, &model, path)?;
-            let request = PreparedRequest::embeddings(ctx, path, model, body, value)?;
-            (routing, request)
+            PreparedRequest::embeddings(ctx, path, model, body, value)?
         }
         Endpoint::Rerank => {
-            let model = served_model();
-            let routing = ModelRouting::lookup(ctx, &model)?;
             require_plain_workers(ctx, &model, RERANK_PATH)?;
-            (routing, PreparedRequest::rerank(model, body)?)
+            PreparedRequest::rerank(model, body)?
         }
     };
     Ok((request, routing))
@@ -310,26 +303,6 @@ impl<'a> ModelRouting<'a> {
             ChatRouting::Reorg(resolvers) => resolvers.get(model).map(Self::Reorg),
         };
         routing.ok_or_else(|| ApiError::ModelNotFound(model.0.clone()))
-    }
-
-    /// Like `lookup`, but `base:adapter` (SGLang's LoRA syntax) resolves to
-    /// `base`; the body still names the adapter for the engine. Aliases have
-    /// already been canonicalized in both the routing model and the body.
-    fn lookup_openai(ctx: &'a AppContext, model: ModelId) -> Result<(ModelId, Self), ApiError> {
-        let split = model
-            .0
-            .strip_prefix(&ctx.config.model.id)
-            .and_then(|suffix| suffix.strip_prefix(':'))
-            .map(|adapter| (ctx.config.model.id.as_str(), adapter))
-            .or_else(|| model.0.split_once(':'));
-        match (Self::lookup(ctx, &model), split) {
-            (Err(error), Some((base, _))) => {
-                let base = ModelId(base.trim().to_owned());
-                let routing = Self::lookup(ctx, &base).map_err(|_| error)?;
-                Ok((base, routing))
-            }
-            (routing, _) => Ok((model, routing?)),
-        }
     }
 
     fn needs_request_tokens(&self, ctx: &AppContext) -> bool {
@@ -810,12 +783,6 @@ mod tests {
                 "{input}"
             );
         }
-        ctx.policies =
-            Arc::new(crate::policies::factory::build_registry_with_defaults(&ctx.config).unwrap());
-        let (base, _) =
-            ModelRouting::lookup_openai(&ctx, ModelId("s3://bucket/served:adapter".into()))
-                .unwrap_or_else(|_| panic!("the full served URI must resolve before its adapter"));
-        assert_eq!(base.0, ctx.config.model.id);
     }
 
     #[test]

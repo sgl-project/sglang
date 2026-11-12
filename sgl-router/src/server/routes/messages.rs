@@ -24,7 +24,7 @@ use crate::server::error::ApiError;
 use crate::server::routes::chat::{
     chat_completions, enforce_minimax_m31_thinking, MAX_CHAT_BODY_BYTES,
 };
-use crate::server::routes::tokenize::tokenizer_for;
+use crate::server::routes::tokenize::served_tokenizer;
 
 /// Upstream replies are buffered up to the same cap as requests.
 const MAX_REPLY_BYTES: usize = MAX_CHAT_BODY_BYTES;
@@ -59,8 +59,8 @@ pub(crate) async fn count_tokens(
         Ok(c) => c,
         Err(e) => return adapt(e.into_response(), None).await,
     };
-    let model = ctx.config.model.served_name(&converted.echo.model);
-    if let Err(e) = tokenizer_for(&ctx, model) {
+    let model = ctx.config.model.id.as_str();
+    if let Err(e) = served_tokenizer(&ctx) {
         return adapt(e.into_response(), None).await;
     }
     if ctx.tokenizers.is_minimax_m31(model) {
