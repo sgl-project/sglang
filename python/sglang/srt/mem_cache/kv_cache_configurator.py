@@ -805,6 +805,19 @@ class KVCacheConfigurator:
                             draft_virtual_id_space
                         )
                 sizes = msgspec.structs.replace(sizes, **size_overrides)
+            elif get_spec().speculative_dflash_draft_kv_ring:
+                from sglang.srt.speculative.dflash_draft_ring import (
+                    draft_kv_ring_pool_rows_from_config,
+                )
+
+                sizes = msgspec.structs.replace(
+                    sizes,
+                    max_total_num_tokens=draft_kv_ring_pool_rows_from_config(
+                        self.model_config.hf_config,
+                        req_to_token_rows=req_to_token_pool.req_to_token.shape[0],
+                        page_size=max(int(self.pool_page_size or 1), 1),
+                    ),
+                )
             elif isinstance(token_to_kv_pool_allocator, HiSparseTokenToKVPoolAllocator):
                 # HiSparse's target allocator hands out logical IDs from its
                 # host-expanded address space. Draft KV is direct-indexed by
@@ -2712,6 +2725,31 @@ class KVCacheConfigurator:
         )
         return token_to_kv_pool
 
+    def _dflash_draft_kv_ring_bytes(self) -> int:
+        if self.is_draft_worker or not get_spec().speculative_dflash_draft_kv_ring:
+            return 0
+        from sglang.srt.speculative.dflash_draft_ring import (
+            draft_kv_ring_pool_rows_from_config,
+        )
+
+        max_num_reqs = max(1, get_schedule().max_running_requests // self.attn_dp_size)
+        page_size = get_schedule().page_size * self.dflash_draft_loc_space_scale
+        rows = draft_kv_ring_pool_rows_from_config(
+            self.spec_aux_config.draft_model_config.hf_config,
+            # Request rows plus the padding row: the ring is off under PD, so no
+            # pre-alloc rows.
+            req_to_token_rows=self._req_pool_rows(max_num_reqs) + 1,
+            page_size=page_size,
+        )
+        # The pool adds one padding page.
+        ring_bytes = (rows + page_size) * int(self.dflash_draft_cell_size_per_token)
+        logger.info(
+            "DFLASH draft KV ring: %d rows, %.2f GB charged to the KV budget.",
+            rows,
+            ring_bytes / (1 << 30),
+        )
+        return ring_bytes
+
     def _hybrid_full_attention_pool_class(
         self, *, mha_pool_class: type, mla_pool_class: type, dsa_pool_class: type
     ) -> type:
@@ -3036,6 +3074,7 @@ class KVCacheConfigurator:
         rest_memory = available_gpu_memory - slack_gb - mm_reservation_gb
         if self.mambaish_config is not None and not get_memory().enable_unified_memory:
             rest_memory = self._handle_max_mamba_cache(rest_memory)
+        rest_memory -= self._dflash_draft_kv_ring_bytes() / (1 << 30)
 
         # Loaded weights (target + draft) can exceed the static budget
         if rest_memory <= 0:
