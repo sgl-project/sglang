@@ -1822,10 +1822,6 @@ class Envs:
     SGLANG_OPT_DFLASH_AUX_OVERLAP = EnvBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_K31_GB_OPTIMIZATION.get
     )
-    # Skip the SWA draft's LSE and zero-KV fixup when DCP is off.
-    SGLANG_OPT_DFLASH_SWA_SKIP_LSE = EnvBool(
-        SGLANG_ENABLE_NV_MEGA_RUNTIME_K31_GB_OPTIMIZATION.get
-    )
     # Defer the TP gather of an unsoftcapped target-verify vocab shard; off by default.
     SGLANG_DFLASH_DEFER_PLAIN_GATHER = EnvBool(False)
     # Capture the megakernel post-verify tail as CUDA graphs; off by default.
@@ -2289,9 +2285,6 @@ class Envs:
     SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = EnvInt(2048)
     SGLANG_DSA_HIP_DISABLE_PRESHUFFLE = EnvBool(False)
     SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION = EnvFloat(0.2)
-    # Requires a DeepGEMM paged-MQA scheduler supporting batches > SM count
-    # (0.2.3 does); set to 0 for an older DeepGEMM.
-    SGLANG_DSA_FULL_BATCH_MQA = EnvBool(True)
     # Prefill indexer: bf16 instead of fp32 MQA logits, read by a bf16 top-k.
     SGLANG_DSA_INDEXER_BF16_LOGITS = EnvBool(False)
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
