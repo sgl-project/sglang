@@ -62,6 +62,13 @@ WeightsMapping = Mapping[str, Optional[str]]
 """If a key maps to a value of `None`, the corresponding weight is ignored."""
 
 
+def keeps_no_quant_config(hf_config, quant_config) -> None:
+    """``own_quant_config`` of a model class that keeps no ``quant_config``:
+    its layers may still take the loader's config, but its runner reads none
+    off the model, so an ``auto`` KV cache dtype resolves to the model dtype."""
+    return None
+
+
 @dataclass
 class WeightsMapper:
     """Maps the name of each weight if they match the following patterns."""

@@ -311,15 +311,20 @@ def built_quant_config(
     load_config: LoadConfig,
 ) -> Optional[QuantizationConfig]:
     """The quantization config the model of ``model_config`` keeps as its
-    ``quant_config`` once built, known before it is built: the loader's, as
-    the model class narrows it for itself (``own_quant_config``), say an MTP
-    head that ships unquantized inside a quantized checkpoint."""
+    ``quant_config`` once built, known before it is built.
+
+    A model class keeps the loader's config unless it declares
+    ``own_quant_config(hf_config, quant_config)``, which its constructor
+    applies too: say an MTP head that ships unquantized inside a quantized
+    checkpoint, or a draft that keeps no ``quant_config`` at all
+    (``keeps_no_quant_config``) while its layers still take the loader's.
+    """
     quant_config = _get_quantization_config(model_config, load_config)
     model_class, _ = get_model_architecture(model_config)
     own_quant_config = getattr(model_class, "own_quant_config", None)
     if own_quant_config is None:
         return quant_config
-    return own_quant_config(quant_config)
+    return own_quant_config(model_config.hf_config, quant_config)
 
 
 def _initialize_model(

@@ -324,7 +324,7 @@ class Eagle3DeepseekV2ForCausalLM(nn.Module):
     draft_parallel_spec = DraftParallelSpec(tp_execution=DraftTPExecution.SINGLE_GROUP)
 
     @staticmethod
-    def own_quant_config(quant_config):
+    def own_quant_config(hf_config, quant_config):
         """The quant config this class keeps, read before it is built to size
         the draft's KV cache. Match deepseek_nextn behavior: modelopt_fp4 is
         target-only and the bf16 draft must not inherit the FP4 quant method."""
@@ -340,12 +340,13 @@ class Eagle3DeepseekV2ForCausalLM(nn.Module):
     ) -> None:
         super().__init__()
         self.config = config
-        if quant_config is not None and self.own_quant_config(quant_config) is None:
+        loader_quant_config = quant_config
+        quant_config = self.own_quant_config(config, quant_config)
+        if loader_quant_config is not None and quant_config is None:
             logger.warning(
                 "Overriding Eagle3DeepseekV2ForCausalLM quant config for "
                 "modelopt_fp4 target; draft weights are bf16."
             )
-            quant_config = None
         self.quant_config = quant_config
         self.pp_group = get_parallel().pp_group
 

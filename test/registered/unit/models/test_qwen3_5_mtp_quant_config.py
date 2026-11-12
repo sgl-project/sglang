@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from sglang.srt.layers.quantization.quark.utils import should_ignore_layer
@@ -98,7 +99,9 @@ class TestQwen3_5MTPQuantConfig(CustomTestCase):
                     return_value=(model_class, model_class.__name__),
                 ),
             ):
-                built = loader.built_quant_config(object(), object())
+                built = loader.built_quant_config(
+                    SimpleNamespace(hf_config=None), object()
+                )
                 self.assertIs(built, kept)
                 _, resolved = configure_kv_cache_dtype(
                     server_args_kv_cache_dtype="auto",
