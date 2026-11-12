@@ -33,8 +33,15 @@ if TYPE_CHECKING:
 # ACL format IDs, kept here so importing this module does not load torch_npu.
 _FORMAT_NCHW = 0
 _FORMAT_ND = 2
-_FORMAT_FRACTAL_NZ = 29
 _BASE_FORMATS = (_FORMAT_NCHW, _FORMAT_ND)
+_SUPPORTED_NZ_FORMATS = (
+    29,  # FRACTAL_NZ
+    50,  # FRACTAL_NZ_C0_16 (also used for packed FP4 storage)
+    51,  # FRACTAL_NZ_C0_32
+    52,  # FRACTAL_NZ_C0_2
+    53,  # FRACTAL_NZ_C0_4
+    54,  # FRACTAL_NZ_C0_8
+)
 
 
 def migrate_expert_weights(
@@ -247,9 +254,9 @@ def _expert_storage_layout(weight: torch.Tensor) -> _ExpertStorageLayout:
     full_storage_tensor = _validated_full_storage_tensor(weight)
     storage_elements = torch_npu.get_storage_size(full_storage_tensor)
     npu_format = torch_npu.get_npu_format(full_storage_tensor)
-    # Inspect the tensor's actual format, independently of the model name.
-    # This implementation accepts base formats and 3D batched FRACTAL_NZ.
-    if npu_format not in _BASE_FORMATS + (_FORMAT_FRACTAL_NZ,):
+    # Check the actual storage format: requesting NZ (29) can produce a C0
+    # variant, such as 50 for packed FP4. Expert-block checks below still apply.
+    if npu_format not in _BASE_FORMATS and npu_format not in _SUPPORTED_NZ_FORMATS:
         raise ValueError(f"NPU EPLB does not support storage format {npu_format}.")
     # The byte view must stay within the original allocation, including NZ padding.
     storage_bytes = storage_elements * full_storage_tensor.element_size()
