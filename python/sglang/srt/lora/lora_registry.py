@@ -164,9 +164,9 @@ class LoRARegistry:
             "Please file an issue if you see this error."
         )
 
-        # A read-write lock to ensure adapters loading / unloading operations are exclusive.
-        # Please note that the counter increment/decrement operations are not synchronized through this
-        # lock, as they are designed to be non-blocking and can be performed concurrently.
+        # Exclusive lock for load / unload / acquire. The usage counter is bumped
+        # before this lock is released, so a queued unload can't sneak in and
+        # drop the adapter. release() only takes the reader lock.
         self._registry_lock = RWLock()
         # An ordered dictionary to hold LoRARef objects, mapping from LoRA name to LoRARef.
         # The LoRARefs are stored in LRU order, such that LoRA adapters that have been
@@ -228,26 +228,42 @@ class LoRARegistry:
             return lora_ref.lora_id
 
         if isinstance(lora_name, str):
-            async with self._registry_lock.writer_lock:
-                lora_id = _lookup(lora_name)
-
-            await self._counters[lora_id].increment(notify_all=False)
-            return lora_id
+            names = [lora_name]
         elif isinstance(lora_name, list):
-            async with self._registry_lock.writer_lock:
-                lora_ids = [_lookup(name) for name in lora_name]
-
-            # Increment the counters only after all IDs are looked up.
-            await asyncio.gather(
-                *[
-                    self._counters[id].increment(notify_all=False)
-                    for id in lora_ids
-                    if id is not None
-                ]
-            )
-            return lora_ids
+            names = lora_name
         else:
             raise TypeError("lora_name must be either a string or a list of strings.")
+
+        bumped = []
+        try:
+            async with self._registry_lock.writer_lock:
+                lora_ids = [_lookup(name) for name in names]
+                for lora_id in lora_ids:
+                    if lora_id is None:
+                        continue
+                    counter = self._counters[lora_id]
+                    await counter.increment(notify_all=False)
+                    bumped.append(counter)
+            if isinstance(lora_name, str):
+                return lora_ids[0]
+            return lora_ids
+        except BaseException:
+            # CancelledError is a BaseException. Don't leave a bumped counter
+            # behind, or a later unload waits forever.
+            if bumped:
+
+                async def _undo():
+                    for counter in bumped:
+                        await counter.decrement()
+
+                cleanup = asyncio.create_task(_undo())
+                while not cleanup.done():
+                    try:
+                        await asyncio.shield(cleanup)
+                    except asyncio.CancelledError:
+                        continue
+                cleanup.result()
+            raise
 
     async def release(self, lora_id: Union[str, List[str]]):
         """
@@ -256,13 +272,15 @@ class LoRARegistry:
 
         async with self._registry_lock.reader_lock:
             if isinstance(lora_id, str):
-                await self._counters[lora_id].decrement()
+                counter = self._counters.get(lora_id)
+                if counter is not None:
+                    await counter.decrement()
             elif isinstance(lora_id, list):
                 await asyncio.gather(
                     *[
                         self._counters[id].decrement()
                         for id in lora_id
-                        if id is not None
+                        if id is not None and id in self._counters
                     ]
                 )
             else:
