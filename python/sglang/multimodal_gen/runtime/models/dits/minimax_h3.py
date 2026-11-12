@@ -1860,12 +1860,9 @@ class MiniMaxH3TokenRefinerBlock(nn.Module):
             cu_seqlens_host=cu_seqlens_host,
             max_seqlen=max_seqlen,
         )
-        if current_platform.is_npu():
-            h, x = self.norm2(h, x)
-        else:
-            x = x + h
-            h = self.norm2(x)
-        return x + self.mlp(h)
+        # Round the residual sum before normalization, as in the reference.
+        x = x + h
+        return x + self.mlp(self.norm2(x))
 
 
 class MiniMaxH3TokenRefiner(nn.Module):
