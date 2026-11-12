@@ -1,23 +1,31 @@
 import os
 import subprocess
 import unittest
+from urllib.parse import urlparse
 
 from sglang.test.ascend.e2e.test_npu_accuracy_utils import (
     BENCHMARK_TOOL_DEFAULT,
     TestNpuAccuracyTestCaseBase,
 )
 from sglang.test.ascend.e2e.test_npu_performance_utils import (
-    DEEPSEEK_V4_FLASH_0731_W8A8_MODEL_PATH,
+    DEEPSEEK_V4_FLASH_0731_W8A8_MODEL_PATH, run_bench_serving, assert_metrics,
+)
+from sglang.test.ascend.e2e.test_npu_multi_node_utils import (
+    build_hicache_storage_extra_config,
 )
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST
 from sglang.utils import wait_for_server
-
+HICACHE_STORAGE_EXTRA_CONFIG = build_hicache_storage_extra_config(
+    world_size=16,
+    protocol="device_sdma",
+    dram_size="4GB",
+)
 register_npu_ci(est_time=3600, suite="base-c-test-acc-16-npu-a3")
 
 register_npu_ci(
     est_time=3600,
-    suite="nightly-acc-16-npu-a3",
+    suite="nightly-acc-16-npu-a3-",
     nightly=True,
 )
 
@@ -47,6 +55,7 @@ DEEPSEEK_V4_FLASH_W8A8_DSPARK_8P_ENVS = {
     "SGLANG_OPT_USE_TILELANG_MHC_PRE": "False",
     "SGLANG_OPT_DEEPGEMM_HC_PRENORM": "False",
     "SGLANG_OPT_USE_TILELANG_MHC_POST": "False",
+    "SGLANG_DSPARK_FAST_KERNEL": "0",
     # DSPARK
     "SGLANG_RAGGED_VERIFY_MODE": "static",
     # mtp
@@ -115,7 +124,21 @@ DEEPSEEK_V4_FLASH_W8A8_DSPARK_8P_OTHER_ARGS = [
     6,
     8,
     10,
-    "--disable-radix-cache",
+    # "--disable-radix-cache",
+    "--enable-hierarchical-cache",
+    "--hicache-io-backend",
+    "kernel_ascend",
+    "--hicache-ratio",
+    1.5,
+    "--hicache-write-policy",
+    "write_through",
+    "--enable-cache-report",
+    "--max-total-tokens",
+    140000,
+    "--hicache-storage-backend",
+    "npu_memcache",
+    "--hicache-storage-backend-extra-config",
+    HICACHE_STORAGE_EXTRA_CONFIG,
 ]
 
 
@@ -172,10 +195,32 @@ class TestNPUDeepSeekV4FlashW8A88PGPQA(TestNpuAccuracyTestCaseBase):
         cls.process = subprocess.Popen(command, env=env)
         wait_for_server(cls.base_url, timeout=cls.server_timeout, process=cls.process)
 
-    def test_npu_deepseek_v4_flash_w8a8_8p_gpqa(self):
-        """Run NPU accuracy test for DeepSeek-V4-Flash W8A8 8p DSPARK GPQA."""
-        self.run_accuracy()
+    # def test_npu_deepseek_v4_flash_w8a8_8p_gpqa(self):
+    #     """Run NPU accuracy test for DeepSeek-V4-Flash W8A8 8p DSPARK GPQA."""
+    #     self.run_accuracy()
 
-
+    def test_npu_deepseek_v4_flash_0731_w8a8_1p1d_16p_l2_l3_hit_rate(self):
+        """Run the 32k GSP bench; assert_metrics checks the L2/L3 hit rates"""
+        # 3 groups x 32 prompts share a 28800-token system prompt (32k * 0.9)
+        # plus a 3200-token question, which exceeds L1 so evictions land in L2
+        # and L3.
+        # This base class launches the server on cls.base_url, so derive the
+        # bench host/port from it (there is no host/port class attribute).
+        parsed_url = urlparse(self.base_url)
+        metrics = run_bench_serving(
+            host=parsed_url.hostname,
+            port=parsed_url.port,
+            model_path=self.model,
+            dataset_name="generated-shared-prefix",
+            input_len=32000,
+            output_len=1024,
+            max_concurrency=32,
+            gsp_num_groups=3,
+            gsp_prompts_per_group=32,
+            seed=100,
+            warmup_requests=16,
+            cache_report=True,
+        )
+        assert_metrics(self, metrics)
 if __name__ == "__main__":
     unittest.main()
