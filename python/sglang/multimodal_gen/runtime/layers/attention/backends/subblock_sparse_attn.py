@@ -534,7 +534,27 @@ class SubBlockSparseAttentionImpl(AttentionImpl):
             )
 
     def _build_dense_impl(self, *, causal: bool) -> AttentionImpl:
-        """Flash attention, used wherever the schedule excludes sparsity."""
+        """Use dense Sage for SM120 Sage DiT steps excluded from sparsity."""
+        if (
+            self.schedule.compute_mode == "sage_fp8"
+            and self.layer_idx is not None
+            and torch.cuda.is_available()
+            and torch.cuda.get_device_capability() == (12, 0)
+        ):
+            from sglang.multimodal_gen.runtime.layers.attention.backends.sage_attn import (
+                SageAttentionImpl,
+            )
+
+            return SageAttentionImpl(
+                num_heads=self.num_heads,
+                head_size=self.head_size,
+                causal=causal,
+                softmax_scale=self.softmax_scale,
+                num_kv_heads=self.num_kv_heads,
+                prefix=f"{self.prefix}.dense",
+                packed_trailing_padding=True,
+                quantize_before_a2a=self.schedule.quantize_before_a2a,
+            )
         from sglang.multimodal_gen.runtime.layers.attention.selector import (
             get_attn_backend,
         )

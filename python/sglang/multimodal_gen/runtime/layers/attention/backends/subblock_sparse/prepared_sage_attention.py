@@ -199,16 +199,35 @@ def prepared_subblock_sage_attention_forward(
 ):
     """Return rank-local output, or decline before prepared QKV exchange.
 
-    Dense warmup steps and disabled layers retain the existing BF16 path.
+    SM120 Sage DiT warmup/skipped steps use dense Sage; admitted sparse
+    steps use the SubBlock/CAKE consumer with the same prepared transport.
     Once prepare/scatter starts, errors propagate on this path.
     """
+    if not impl.schedule.quantize_before_a2a:
+        return None
     if (
-        not impl.schedule.quantize_before_a2a
-        or not impl.layer_enabled
+        not impl.layer_enabled
         or not impl._step_enabled()
         or max_seqlen < impl.schedule.min_seq_len
     ):
-        return None
+        dense_impl = getattr(impl, "dense_impl", None)
+        if not getattr(dense_impl, "quantize_before_a2a", False):
+            return None
+        from sglang.multimodal_gen.runtime.layers.attention.backends.prepared_sage_attn import (
+            prepared_dense_sage_attention_forward,
+        )
+
+        return prepared_dense_sage_attention_forward(
+            query,
+            key,
+            value,
+            impl=dense_impl,
+            cu_seqlens_host=cu_seqlens_host,
+            max_seqlen=max_seqlen,
+            ulysses_active=ulysses_active,
+            ring_active=ring_active,
+            transport=transport,
+        )
     from sglang.multimodal_gen.runtime.distributed import sage_ulysses
     from sglang.multimodal_gen.runtime.distributed.sage_ulysses_route import (
         resolve_prepared_sage_route,

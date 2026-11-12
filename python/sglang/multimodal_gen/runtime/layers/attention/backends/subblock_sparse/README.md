@@ -290,8 +290,13 @@ point below has not been run for this revision.
 Supported calls are inference on SM120, head dimension 128, Ulysses degree 4
 or 8, and one live packed H3 document followed by padding. Ring, training,
 graph capture, unsupported geometry and oversized routing metadata decline
-before prepared QKV exchange. Dense warmup steps and skipped layers keep the original
-BF16 path. Once collective preparation starts, failures propagate. The option
+before prepared QKV exchange. On SM120, `compute_mode="sage_fp8"` uses dense
+SageAttention2 for DiT warmup steps, skipped DiT layers and short dense DiT
+calls. With `quantize_before_a2a=true`, these calls use the dense prepared
+consumer and subsequent sparse steps use SubBlock/CAKE over the same
+transport. Without prepared exchange they use the dense Sage backend after
+the ordinary BF16 QKV exchange. Non-DiT token-refiner calls keep their dense
+backend. Once collective preparation starts, failures propagate. The option
 does not change the existing `quality=high` admission rules.
 
 Before exchange, the transport clears disposable padded Q/K/V projection rows

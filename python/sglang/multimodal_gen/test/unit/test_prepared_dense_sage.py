@@ -15,6 +15,89 @@ from sglang.multimodal_gen.runtime.layers.attention.backends import (
 from sglang.multimodal_gen.runtime.layers.attention.backends import (
     sage_attn,
 )
+from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse import (
+    prepared_sage_attention as subblock,
+)
+from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse_attn import (
+    SubBlockSparseAttentionImpl,
+)
+
+
+@pytest.mark.parametrize(
+    "mode,layer", [("sage_fp8", 0), ("bf16", 0), ("sage_fp8", None)]
+)
+def test_sage_ssa_uses_dense_sage_for_dit_warmup(monkeypatch, mode, layer):
+    from sglang.multimodal_gen.runtime.layers.attention import selector
+
+    selected = []
+    fallback = object()
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (12, 0))
+    monkeypatch.setattr(
+        sage_attn.envs.SGLANG_USE_SAGE_ATTENTION_IMPL, "get", lambda: "auto"
+    )
+    monkeypatch.setattr(
+        selector,
+        "get_attn_backend",
+        lambda *args, **kwargs: (
+            selected.append(kwargs)
+            or SimpleNamespace(get_impl_cls=lambda: lambda **kwargs: fallback)
+        ),
+    )
+    impl = SimpleNamespace(
+        schedule=SimpleNamespace(compute_mode=mode, quantize_before_a2a=True),
+        layer_idx=layer,
+        num_heads=8,
+        head_size=128,
+        num_kv_heads=8,
+        prefix="blocks.0.attn" if layer is not None else "token_refiner.blocks.0.attn",
+        softmax_scale=0.125,
+    )
+    result = SubBlockSparseAttentionImpl._build_dense_impl(impl, causal=False)
+    if mode == "sage_fp8" and layer is not None:
+        assert isinstance(result, sage_attn.SageAttentionImpl)
+        assert result.quantize_before_a2a and result.packed_trailing_padding
+        assert not selected
+    else:
+        assert result is fallback and len(selected) == 1
+
+
+@pytest.mark.parametrize("gate", ["step", "layer", "length"])
+def test_prepared_sage_ssa_selects_dense_before_sparse_admission(monkeypatch, gate):
+    q = torch.zeros((64, 8, 128), dtype=torch.bfloat16)
+    output = torch.ones_like(q)
+    dense_impl = SimpleNamespace(quantize_before_a2a=True)
+    impl = SimpleNamespace(
+        schedule=SimpleNamespace(
+            quantize_before_a2a=True, min_seq_len=131 if gate == "length" else 0
+        ),
+        layer_enabled=gate != "layer",
+        _step_enabled=lambda: gate != "step",
+        dense_impl=dense_impl,
+    )
+    calls = []
+    transport = object()
+
+    def forward(*args, **kwargs):
+        assert args == (q, q, q)
+        assert kwargs["impl"] is dense_impl and kwargs["transport"] is transport
+        assert kwargs["cu_seqlens_host"] == (0, 130, 256)
+        calls.append("dense")
+        return output
+
+    monkeypatch.setattr(dense, "prepared_dense_sage_attention_forward", forward)
+    result = subblock.prepared_subblock_sage_attention_forward(
+        q,
+        q,
+        q,
+        impl=impl,
+        cu_seqlens_host=(0, 130, 256),
+        max_seqlen=130,
+        ulysses_active=True,
+        ring_active=False,
+        transport=transport,
+    )
+    assert result is output and calls == ["dense"]
 
 
 @pytest.mark.parametrize("same_stream", [False, True])
