@@ -107,7 +107,7 @@ print_highlight(response.text)
 
 ## Health Check
 - `/health`: Check the health of the server.
-- `/health_generate`: Check the health of the server by generating one token.
+- `/health_generate`: Check the health of the server by completing inference: 200 only after the scheduler finishes a real forward (running traffic when busy, the probe's own one-token generation when idle).
 - `/ready`: Returns 200 when the server accepts new requests; 503 while starting, paused, unhealthy, or shutting down.
 - `/ping`: SageMaker health check. Returns 200 once the server is up; 503 while starting, unhealthy, or shutting down. Stays 200 while generation is paused. A failed `/health` or `/health_generate` probe marks the server unhealthy until a later probe succeeds.
 

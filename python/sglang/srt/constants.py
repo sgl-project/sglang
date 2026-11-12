@@ -1,3 +1,5 @@
+import os
+
 # GPU Memory Types
 GPU_MEMORY_TYPE_KV_CACHE = "kv_cache"
 GPU_MEMORY_TYPE_WEIGHTS = "weights"
@@ -10,6 +12,8 @@ GPU_MEMORY_ALL_TYPES = [
 ]
 
 HEALTH_CHECK_RID_PREFIX = "HEALTH_CHECK"
+# Seconds /health_generate waits for a completed-inference acknowledgement.
+HEALTH_CHECK_TIMEOUT = int(os.getenv("SGLANG_HEALTH_CHECK_TIMEOUT", 20))
 
 # Placeholder token inserted between items in Multi-Item Scoring sequences:
 # query<delim>item1<delim>item2<delim>... Positions are pre-computed from item
