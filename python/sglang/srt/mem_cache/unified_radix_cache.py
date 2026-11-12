@@ -61,6 +61,7 @@ from sglang.srt.mem_cache.buffer_mode.storage_existence_cache import (
     StorageExistenceCache,
     default_belief_policy,
 )
+from sglang.srt.mem_cache.capacity import owner_rows_ready
 from sglang.srt.mem_cache.common import RetractionBackup
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
@@ -514,6 +515,10 @@ class UnifiedRadixCache(BasePrefixCache):
         ] = {}
         self.storage_prefetch_retries = StoragePrefetchRetries()
         self.ongoing_backup: dict[int, tuple[NodeId, DecLockRefParams]] = {}
+        # Requested KV tokens of each cache-mode storage write in
+        # ongoing_backup: the ack drain settles every write at a rank-agreed
+        # written prefix of this span (buffer mode reads it from its entry).
+        self._backup_requested_tokens: dict[int, int] = {}
         if self.buffer_pipeline is not None:
             self.buffer_pipeline.reset()
             # The dropped writes' content no longer reaches a storage ack.
@@ -2375,12 +2380,15 @@ class UnifiedRadixCache(BasePrefixCache):
                 return False
 
         token_slot = self.slot_id(TREE_TOKEN)
-        if self._pool_available(token_slot) < kv_tokens:
-            self.evict_for_alloc(KVDemand(full_tokens=kv_tokens))
-            if self._pool_available(token_slot) < kv_tokens:
-                self.dec_lock_ref(node_id, ancestor_lock_params)
-                self.dec_host_lock_ref(node_id, host_anchor_params)
-                return False
+        if not owner_rows_ready(
+            self,
+            self.token_to_kv_pool_allocator,
+            kv_tokens,
+            lambda: self._pool_available(token_slot),
+        ):
+            self.dec_lock_ref(node_id, ancestor_lock_params)
+            self.dec_host_lock_ref(node_id, host_anchor_params)
+            return False
 
         # Load H→D
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
@@ -2517,6 +2525,9 @@ class UnifiedRadixCache(BasePrefixCache):
         self.ongoing_backup[operation_id] = (
             node_id,
             self.inc_host_lock_ref(node_id).to_dec_params(),
+        )
+        self._backup_requested_tokens[operation_id] = (
+            len(spec.hash_value) * self.page_size
         )
 
     def is_backuped(self, node_id: NodeId) -> bool:
@@ -3798,26 +3809,50 @@ class UnifiedRadixCache(BasePrefixCache):
                         )
 
         def _drain_backup():
-            drained = 0
-            for operation in _drain_queue(cc.ack_backup_queue, n_backup):
-                drained += 1
-                if buffer_mode:
-                    # Storage write acked: free the staging.
-                    self.buffer_pipeline.finish_storage_write_ack(operation.id)
-                else:
-                    entry = self.ongoing_backup.pop(operation.id, None)
-                    if entry is not None:
-                        node_id, lock_params = entry
-                        self.dec_host_lock_ref(node_id, lock_params)
-                if (
-                    log_metrics
-                    and self.enable_storage_metrics
-                    and self.storage_metrics_collector is not None
-                ):
-                    self.storage_metrics_collector.log_backuped_tokens(
-                        operation.completed_tokens
+            acked = list(_drain_queue(cc.ack_backup_queue, n_backup))
+            if not acked:
+                return 0
+            page_size = self.page_size
+            # The requested KV span comes from the scheduler-side record, not
+            # the operation: a native controller's operation exposes only its
+            # id and completed_tokens. None is a write no longer tracked
+            # (dropped by reset or detach) or a buffer-mode write of another
+            # pool, which carries no KV pages and settles whole.
+            requested = [self._backup_requested_tokens_of(op.id) for op in acked]
+            if cc.backup_skip:
+                # Not the KV writer (replicated MLA KV): this rank's
+                # completed_tokens carries no KV evidence, so it vouches for
+                # the whole span; its own rank-sharded sidecars are written
+                # whole or logged by the controller.
+                written = [req or 0 for req in requested]
+            else:
+                written = [
+                    min(op.completed_tokens, req or 0)
+                    for op, req in zip(acked, requested)
+                ]
+            if n_backup is not None:
+                # n_backup is the rank-agreed count, so this tensor has the
+                # same shape on every rank. One MIN gives every rank the same
+                # written prefix per operation: backup submission and acks
+                # have no other collective and the acks pair by position, so
+                # beliefs settled from a rank-local count would diverge. The
+                # local detach drain passes None and enters no collective.
+                votes = torch.tensor(written, dtype=torch.int64)
+                self._all_reduce_storage_drain(votes)
+                written = votes.tolist()
+            for operation, req, done in zip(acked, requested, written):
+                if req is not None and not (0 <= done <= req and done % page_size == 0):
+                    raise RuntimeError(
+                        f"HiCache storage backup operation {operation.id} reported "
+                        f"{done} written tokens of {req} (page size {page_size})"
                     )
-            return drained
+                self._finish_backup_ack(
+                    operation,
+                    requested_tokens=req,
+                    agreed_tokens=done,
+                    log_metrics=log_metrics,
+                )
+            return len(acked)
 
         def _drain_release():
             host_indices_list = []
@@ -3854,6 +3889,82 @@ class UnifiedRadixCache(BasePrefixCache):
         _drain_backup()
         _drain_release()
         _drain_extra_release()
+
+    def _all_reduce_storage_drain(self, data: torch.Tensor) -> None:
+        """MIN-reduce a per-drain tensor over the ranks whose storage drain
+        runs in lockstep, as _sync_hicache_ready_counts reduces the counts:
+        every TP rank of each PP stage in buffer_only mode (each stage drains
+        its own completions), else PP0's TP verdict propagated along PP."""
+        if self.host_memory_mode == "buffer_only" and self.pp_size > 1:
+            self._all_reduce_attn_groups(data, torch.distributed.ReduceOp.MIN)
+        else:
+            self._all_reduce(data, torch.distributed.ReduceOp.MIN)
+
+    def _backup_requested_tokens_of(self, operation_id: int) -> Optional[int]:
+        """Requested KV tokens of an acked storage write; None for a write no
+        longer tracked (dropped by reset or detach) and for a buffer-mode
+        write of another pool, which carries no KV pages and settles whole."""
+        if self.buffer_pipeline is None:
+            return self._backup_requested_tokens.get(operation_id)
+        entry = self.buffer_pipeline.ongoing_backup.get(operation_id)
+        if entry is None or entry.intent.pool != PoolName.KV:
+            return None
+        return len(entry.keys_by_pool[PoolName.KV]) * self.page_size
+
+    def _finish_backup_ack(
+        self,
+        operation,
+        *,
+        requested_tokens: Optional[int],
+        agreed_tokens: int,
+        log_metrics: bool,
+    ) -> None:
+        """Settle one acked storage write at its agreed written prefix.
+
+        Buffer mode believes only the written keys; the unwritten tail is
+        neither believed nor in flight, so the next write-through piece that
+        covers it writes it. Cache mode releases the host lock as before:
+        the span is sent again when the node's host copy is evicted and the
+        node is hit again, the existing write-through cycle. Nothing is
+        retried here; a shortfall is logged and counted.
+        """
+        page_size = self.page_size
+        short = requested_tokens is not None and agreed_tokens < requested_tokens
+        if self.buffer_pipeline is not None:
+            self.buffer_pipeline.finish_storage_write_ack(
+                operation.id,
+                written_pages=(
+                    None if requested_tokens is None else agreed_tokens // page_size
+                ),
+            )
+        else:
+            self._backup_requested_tokens.pop(operation.id, None)
+            entry = self.ongoing_backup.pop(operation.id, None)
+            if entry is not None:
+                node_id, lock_params = entry
+                self.dec_host_lock_ref(node_id, lock_params)
+        if short:
+            logger.warning(
+                "HiCache storage backup operation %d wrote %d of %d tokens; the "
+                "tail stays un-backed until a later write-through covers it.",
+                operation.id,
+                agreed_tokens,
+                requested_tokens,
+            )
+        if (
+            log_metrics
+            and self.enable_storage_metrics
+            and self.storage_metrics_collector is not None
+        ):
+            collector = self.storage_metrics_collector
+            # What this rank wrote of the agreed prefix.
+            collector.log_backuped_tokens(
+                min(operation.completed_tokens, agreed_tokens)
+            )
+            if short:
+                collector.log_storage_backup_failed_tokens(
+                    requested_tokens - agreed_tokens
+                )
 
     def drain_storage_control_queues(self) -> None:
         cc = self.cache_controller
@@ -4267,6 +4378,20 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
         return failed
 
+    def _raise_if_storage_workers_died(self) -> None:
+        """A storage worker that raised out of its loop no longer drains or
+        acks, and the counts the tick reduces below would wait on it forever.
+        The rank that lost one exits loudly in its own tick; the peers follow
+        through the engine teardown (the parent's SIGQUIT on this host, the
+        NCCL watchdog elsewhere), so the check stays rank-local: no agreed
+        word, no row change, no PP caveat."""
+        dead = self.cache_controller.dead_storage_workers()
+        if dead:
+            raise RuntimeError(
+                "HiCache storage worker thread(s) exited on this rank: "
+                + ", ".join(dead)
+            )
+
     def check_hicache_events(self) -> None:
         """Called per scheduler step to poll async HiCache events."""
         if self.linker is not None:
@@ -4287,6 +4412,8 @@ class UnifiedRadixCache(BasePrefixCache):
             self.linker.check_prefetch_events()
             return
 
+        if self.enable_storage:
+            self._raise_if_storage_workers_died()
         # Reap the previous round's PP-sync sends before issuing new ones.
         self._drain_async_work()
         # Backups queued outside process_batch_result: the chunked-prefill stash
