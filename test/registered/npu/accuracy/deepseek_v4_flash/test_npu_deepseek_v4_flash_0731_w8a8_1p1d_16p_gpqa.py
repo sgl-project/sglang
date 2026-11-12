@@ -50,39 +50,20 @@ def _get_first_visible_device():
 #     "metrics_url": f"http://127.0.0.1:{META_METRICS_PORT}",
 # }
 
-# Endpoints default to the local pod's real IP (POD_IP) so a multi-pod
-# prefill instance can reach the MetaService across nodes. When the prefill
-# instance spans multiple pods, setUpClass replaces this with the instance
-# master's IP resolved from the ConfigMap.
+
 METASERVICE_CONFIG = build_meta_service_config()
 
 
-# Local service config for the npu_memcache L3 backend; it must point at the
-# same MetaService/config-store endpoints as METASERVICE_CONFIG.
-# Protocol depends on the A3 interconnect: device_sdma needs an HCCS/LingQu
-# supernode (LingQu L1 >= 1.5.0 and firmware >= 7.8.0.6.201), while an A3
-# cluster built on NPU RDMA/RoCE uses device_rdma (A5 uses device_urma). This
-# CI cluster runs pods on A3 RoCE nodes whose driver exposes neither vmm nor
-# DCMI v2, so device_sdma fails with "dram segment does not support sdma in
-# current environment" and every rank aborts the MemCache store init.
-# world_size is the prefill instance's tp_size*pp_size, and dram_size is the
-# per-rank DRAM contribution. All 16 ranks live on the prefill node, so the
-# node must donate world_size * dram_size of host DRAM (16 x 4GB = 64GB here);
-# 10GB per rank exhausted the node during MemCache init.
-def _build_hicache_storage_extra_config(meta_cfg):
-    return json.dumps(
-        {
-            "meta_service_url": meta_cfg["meta_service_url"],
-            "config_store_url": meta_cfg["config_store_url"],
-            "log_level": "info",
-            "world_size": 16,
-            "protocol": "device_sdma",
-            "dram_size": "4GB",
-        }
-    )
-
-
-HICACHE_STORAGE_EXTRA_CONFIG = _build_hicache_storage_extra_config(METASERVICE_CONFIG)
+HICACHE_STORAGE_EXTRA_CONFIG = json.dumps(
+    {
+        "meta_service_url": METASERVICE_CONFIG["meta_service_url"],
+        "config_store_url": METASERVICE_CONFIG["config_store_url"],
+        "log_level": "info",
+        "world_size": 16,
+        "protocol": "device_sdma",
+        "dram_size": "4GB",
+    }
+)
 
 DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_COMMON_ENVS = {
     "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
@@ -352,10 +333,6 @@ class TestNPUDeepSeekV4Flash0731W8A8PDSEPGPQAHigh(
         super().setUpClass()
 
     model_config = DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_MODEL_CONFIG
-    # The base class starts the npu_memcache MetaService before the model
-    # server (L3 backend requirement) and, for a multi-pod prefill instance,
-    # retargets it at the instance master resolved from the ConfigMap.
-    meta_service_config = METASERVICE_CONFIG
     # (reference: Flash W8A8 GPQA Diamond baseline is 0.874).
     accuracy = 0.874
     datasets = ["gpqa_diamond"]

@@ -789,6 +789,17 @@ def launch_pd_separation_node(model_config):
     # if "--model-type" not in service_args:
     #     other_args.extend(["--model-type", "llm"])
 
+    # The npu_memcache L3 backend connects to the Ascend MemCache MetaService
+    # as soon as the model server starts, so the service must already be
+    # listening. The L3 backend is enabled through the storage backend extra
+    # config flag, which only the prefill side carries; on a multi-pod prefill
+    # instance only the instance master pod hosts the service.
+    meta_service_process = None
+    if "--hicache-storage-backend-extra-config" in service_args:
+        meta_service_process = start_meta_service(
+            build_meta_service_config(), role, service_args
+        )
+
     other_args.extend(service_args)
 
     try:
@@ -801,6 +812,9 @@ def launch_pd_separation_node(model_config):
     except Exception as e:
         raise RuntimeError(f"Failed to start {role} node on {host_ip}: {e}")
 
+    # Expose the MetaService process (None when this pod does not host it) so
+    # callers can stop it during tearDown.
+    process.meta_service_process = meta_service_process
     return process
 
 

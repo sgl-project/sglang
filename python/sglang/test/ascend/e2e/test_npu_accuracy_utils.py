@@ -20,7 +20,6 @@ from sglang.test.ascend.e2e.test_npu_multi_node_utils import (
     launch_pd_mix_node,
     launch_pd_separation_node,
     launch_router,
-    start_meta_service,
     wait_server_ready,
 )
 from sglang.test.test_utils import (
@@ -677,17 +676,11 @@ class TestNpuAccuracyMultiNodePdSepTestCaseBase(CustomTestCase):
     # Per-case evalscope accuracy retry count. None uses the dataset default
     # (get_max_retries); set to 1 to fail fast on first measurement.
     max_retries = None
-    # npu_memcache metaservice_config content (meta_service_url /
-    # config_store_url / metrics_url). When set, the prefill node starts the
-    # Ascend MemCache MetaService before launching the model server, since
-    # the L3 cache backend needs it to be running first.
-    meta_service_config = None
 
     @classmethod
     def setUpClass(cls):
         apply_accuracy_dataset_override(cls)
         cls.process = None
-        cls.meta_service_process = None
         cls.local_ip = "127.0.0.1"
         cls.host = os.getenv("POD_IP")
         cls.port = SERVICE_PORT
@@ -702,15 +695,6 @@ class TestNpuAccuracyMultiNodePdSepTestCaseBase(CustomTestCase):
         )
         logger.info(f"Init {cls.host} {cls.role=}!")
 
-        # The L3 storage backend must be reachable before the model server
-        # starts, so bring up the MetaService first (prefill node only). A
-        # multi-pod prefill instance hosts it on its master pod, which every
-        # pod of the instance has to target.
-        cls.meta_service_process = start_meta_service(
-            cls.meta_service_config,
-            cls.role,
-            (cls.model_config or {}).get("prefill_args"),
-        )
         cls.start_pd_server()
         cls.start_router_server()
 
@@ -721,11 +705,15 @@ class TestNpuAccuracyMultiNodePdSepTestCaseBase(CustomTestCase):
                 kill_process_tree(cls.process.pid)
             except Exception as e:
                 logger.error(f"Error during tearDown: {e}")
-        if cls.meta_service_process:
-            try:
-                kill_process_group(cls.meta_service_process)
-            except Exception as e:
-                logger.error(f"Error stopping MetaService during tearDown: {e}")
+            # launch_pd_separation_node starts the npu_memcache MetaService
+            # when the L3 backend is enabled and attaches it to the server
+            # process; it lives outside the server's process tree.
+            meta_service_process = getattr(cls.process, "meta_service_process", None)
+            if meta_service_process:
+                try:
+                    kill_process_group(meta_service_process)
+                except Exception as e:
+                    logger.error(f"Error stopping MetaService during tearDown: {e}")
 
     @classmethod
     @check_role(allowed_roles=["router"])
