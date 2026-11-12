@@ -10,6 +10,7 @@ from sglang.srt.managers.io_struct import (
     EndWeightUpdateReqInput,
     PluginWeightUpdateReqInput,
     PluginWeightUpdateReqOutput,
+    ReleaseMemoryOccupationReqInput,
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
@@ -710,6 +711,25 @@ class TestPluginWeightUpdate(_WeightUpdaterManagerTestBase):
         self.assertFalse(unknown.success)
         self.assertIn("nccl", unknown.message)
         self.assertEqual(called, [])
+
+
+class TestReleaseMemoryRefusal(_WeightUpdaterManagerTestBase):
+    def test_an_idle_rank_refuses_when_a_tp_peer_is_busy(self):
+        """A rank that released alone would wait forever in the group barrier."""
+        manager = self._manager(Mock(), session=False)
+        manager.scheduler = None
+        manager.memory_saver_adapter = Mock()
+
+        def a_peer_is_busy(busy, **kwargs):
+            busy.fill_(1)
+
+        with patch("torch.distributed.all_reduce", side_effect=a_peer_is_busy):
+            output = manager.release_memory_occupation(
+                ReleaseMemoryOccupationReqInput(tags=["cuda_graph"])
+            )
+
+        self.assertFalse(output.success)
+        manager.memory_saver_adapter.pause.assert_not_called()
 
 
 class TestPluginWeightUpdateReply(CustomTestCase):
