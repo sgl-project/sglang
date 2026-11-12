@@ -1691,19 +1691,47 @@ audit, a minimum-GPU claim, or an extrapolation to GB200/NVL72 scaling.
 
 ### Ascend NPU topology comparison
 
-Both topologies used Laser Attention and the explicit Cache-DiT configuration
-from the Ascend launch commands, with `--dit-cpu-offload false` keeping the DiT
-resident. The measured workload was one 5-second T2VA request at 1344×768,
-124 frames, 24 fps, and 50 inference steps.
+The November 12, 2026 Ascend A3 measurements compare main with the NPU
+RMSNorm/SwiGLU changes in [#49353](https://github.com/sgl-project/sglang/pull/49353).
+Both use the Ascend launch commands above: Laser Attention, Cache-DiT,
+`--dit-cpu-offload false`, and text-encoder layerwise offload. Compile and
+breakable graphs are disabled. The workload is one 5-second T2VA request at
+1344×768, 124 frames, 24 fps, 50 inference steps, and seed 1101.
 
-| NPU count | Topology | End-to-end latency |
-| ---: | --- | ---: |
-| 8 | TP2 + SP4 | **55.07 s** |
-| 4 | TP2 + SP2 | **103.57 s** |
+| NPUs | Topology | Main generation | This PR generation | Reduction | Main denoising | This PR denoising |
+| ---: | --- | ---: | ---: | ---: | ---: | ---: |
+| 4 | TP2 + SP2 | 105.54 s | 96.48 s | 8.6% | 96.42 s | 87.37 s |
+| 8 | TP2 + SP4 | 59.69 s | 55.21 s | 7.5% | 52.47 s | 48.28 s |
 
-These are individual end-to-end measurements for each topology, not averages.
-The eight-NPU topology had 46.8% lower end-to-end latency than the four-NPU
-topology.
+Generation time is the server's `Pixel data generated successfully` measurement,
+excluding model loading. These are individual requests, not averages or an
+isolated kernel benchmark.
+The resolved eight-NPU configuration uses Ulysses4 and KV-gather1; the four-NPU
+configuration uses Ulysses2 and KV-gather2.
+
+Use this request with either topology:
+
+```bash Request
+curl -sS -X POST http://127.0.0.1:30088/v1/videos \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "MiniMaxAI/MiniMax-H3",
+    "prompt": "At night, while their owner sleeps in a bedroom, three cats march in loudly playing tiny brass instruments, then abruptly file out.",
+    "seconds": 5,
+    "task": "t2va",
+    "conditions": [],
+    "target": {
+      "short_edge": 768,
+      "aspect_ratio": "16:9",
+      "duration_seconds": 5.0
+    },
+    "num_outputs_per_prompt": 1,
+    "num_inference_steps": 50,
+    "flow_shift": 12.0,
+    "audio_flow_shift": 3.0,
+    "seed": 1101
+  }'
+```
 
 ### B300 precision and encoder placement
 
