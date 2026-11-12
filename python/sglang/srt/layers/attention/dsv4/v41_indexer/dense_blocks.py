@@ -308,14 +308,10 @@ class DenseBlocksBackend:
     def _xpu_publish_prefill(self, inputs: PrefillInputs):
         return self._xpu_prefill_impl(inputs, None)
 
-    def _xpu_consume_prefill(
-        self, inputs: PrefillInputs, published: BlockIds
-    ) -> None:
+    def _xpu_consume_prefill(self, inputs: PrefillInputs, published: BlockIds) -> None:
         self._xpu_prefill_impl(inputs, published)
 
-    def _xpu_prefill_impl(
-        self, inputs: PrefillInputs, published: Optional[BlockIds]
-    ):
+    def _xpu_prefill_impl(self, inputs: PrefillInputs, published: Optional[BlockIds]):
         inputs.reset_outputs()
         assert inputs.seq_lens_cpu is not None and inputs.rows_per_request is not None
         rows = inputs.positions.numel()
