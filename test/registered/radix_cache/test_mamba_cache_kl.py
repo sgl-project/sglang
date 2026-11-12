@@ -65,6 +65,9 @@ class TestMambaLazyFullPoolKL(MambaCacheKLMixin, DefaultServerBase):
         "SGLANG_TEST_MAMBA_LAZY_POOL_FULL": "0",
     }
     other_args = [
+        # This regression requires the intermediate 192-token checkpoint.
+        "--hybrid-cache-checkpoints-level",
+        "3",
         "--skip-tokenizer-init",
         "--mamba-radix-cache-strategy",
         "extra_buffer_lazy",
