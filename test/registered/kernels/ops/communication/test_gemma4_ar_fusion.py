@@ -162,9 +162,10 @@ def test_site(hidden: int, rows: int, round_a: bool):
     # gather before any assert: a rank that fails alone would hang its peers
     all_out, all_scales = _gather(out), _gather(scales)
     # this rank's residual rows, then every rank's view of the quantized rows
-    # atol: one bf16 ulp of the first norm (1/32 for |a| < 8) times the 0.75 scalar
+    # multimem.ld_reduce does not round to nearest, so x can sit one bf16 ulp off the
+    # fp32 sum; that moves a = bf16(norm(x)) by up to two ulps (2/32 for |a| < 8), times 0.75
     torch.testing.assert_close(
-        residual.float(), ref_res[row0 : row0 + mine].float(), rtol=2e-2, atol=3e-2
+        residual.float(), ref_res[row0 : row0 + mine].float(), rtol=2e-2, atol=5e-2
     )
     deq = out.float() * scales.repeat_interleave(GROUP, dim=1)
     torch.testing.assert_close(
