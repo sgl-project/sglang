@@ -10,7 +10,13 @@ from sgl_kernel_npu.attention.sinks_attention import (
     attention_sinks_triton,
 )
 
-from sglang.srt.configs.model_config import AttentionArch, is_deepseek_dsa
+from sglang.srt.configs.model_config import (
+    AttentionArch,
+    get_dsa_index_head_dim,
+    get_dsa_index_n_heads,
+    get_dsa_index_topk,
+    is_deepseek_dsa,
+)
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.ascend_torch_native_backend import (
@@ -21,6 +27,11 @@ from sglang.srt.hardware_backend.npu.attention.dcp_metadata import (
 )
 from sglang.srt.hardware_backend.npu.attention.dsa_dcp import (
     forward_dcp_sparse_attention,
+)
+from sglang.srt.hardware_backend.npu.attention.dsa_indexer_v2 import (
+    DsaIndexerV2Metadata,
+    load_dsa_indexer_v2_ops,
+    prepare_dsa_indexer_v2_metadata,
 )
 from sglang.srt.hardware_backend.npu.attention.mla_cache import (
     build_mla_prefix_token_indices,
@@ -119,6 +130,7 @@ class ForwardMetadata:
     actual_seq_lengths_q_pa_cpu: Optional[torch.Tensor] = None
     actual_seq_lengths_kv: Optional[torch.Tensor] = None
     seqused_q: Optional[torch.Tensor] = None  # Valid query counts; padding is 0.
+    dsa_indexer_v2: Optional[DsaIndexerV2Metadata] = None
     flash_mla_metadata: Optional[torch.Tensor] = None
     dcp_mtp_attn_mask: Optional[torch.Tensor] = None
 
@@ -422,6 +434,29 @@ class AscendAttnBackend(AttentionBackend):
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
+        self.dcp_indexer_v2_shape = None
+        if (
+            self.use_dsa
+            and getattr(self.token_to_kv_pool, "index_k_scale_buffer", None) is not None
+        ):
+            if self.dsa_dcp_target or is_dsa_enable_prefill_cp():
+                load_dsa_indexer_v2_ops()
+            if self.dsa_dcp_target:
+                hf_config = model_runner.model_config.hf_config
+                self.dcp_indexer_v2_shape = (
+                    get_dsa_index_n_heads(hf_config),
+                    get_dsa_index_head_dim(hf_config),
+                    get_dsa_index_topk(hf_config),
+                )
+        self.dcp_fp8_sparse_attention = None
+        if self.dsa_dcp_target and self.kv_cache_dtype == torch.float8_e4m3fn:
+            if not self.token_to_kv_pool.dsa_kv_cache_store_fp8:
+                raise ValueError(
+                    "Ascend DSA DCP with FP8 KV requires the A5 packed KV pool."
+                )
+            self.dcp_fp8_sparse_attention = (
+                torch.ops.npu.sgl_kv_quant_sparse_flash_attention
+            )
         self.graph_mode = False
         self.use_fa = get_bool_env_var("ASCEND_USE_FA", "False")
         self.enable_sparsity_driven_kv_offload = is_sparsity_driven_kv_offload_enabled(
@@ -1457,6 +1492,26 @@ class AscendAttnBackend(AttentionBackend):
         if not self.dense_mla_dcp_target:
             metadata.seq_lens[:bs].copy_(device_kv_lens[:bs])
 
+        if self.dcp_indexer_v2_shape is not None and (
+            forward_mode.is_decode_or_idle() or forward_mode.is_target_verify()
+        ):
+            # Indexer K is replicated. Plan from the global lengths, outside the
+            # graph, once per batch for all layers that compute top-k.
+            num_heads, head_dim, topk = self.dcp_indexer_v2_shape
+            metadata.dsa_indexer_v2 = prepare_dsa_indexer_v2_metadata(
+                metadata.actual_seq_lengths_q,
+                metadata.seq_lens[:bs],
+                num_heads=num_heads,
+                head_dim=head_dim,
+                topk=topk,
+                max_seqlen_q=(
+                    self.speculative_num_draft_tokens
+                    if forward_mode.is_target_verify()
+                    else 1
+                ),
+                existing=metadata.dsa_indexer_v2,
+            )
+
         self.forward_metadata = metadata
 
         self.graph_mode = True
@@ -1871,6 +1926,16 @@ class AscendAttnBackend(AttentionBackend):
         # V2: Q is already sharded to local by the strategy; single sparse-attn
         # call against the full (gathered) KV, no prev/next balance split.
         topk_indices = _expand_dsa_sparse_indices(topk_indices)
+        if self.token_to_kv_pool.dsa_kv_cache_store_fp8:
+            return self._forward_fp8_sparse(
+                q_nope,
+                q_pe,
+                k_nope,
+                topk_indices,
+                layer,
+                actual_seq_qlen,
+                actual_seq_lengths_kv,
+            )
         attn_out, _, _ = torch_npu.npu_sparse_flash_attention(
             query=q_nope,
             key=k_nope,
@@ -1894,6 +1959,45 @@ class AscendAttnBackend(AttentionBackend):
             return_softmax_lse=False,
         )
         return attn_out
+
+    def _forward_fp8_sparse(
+        self,
+        q_nope,
+        q_pe,
+        packed_kv,
+        topk_indices,
+        layer,
+        actual_seq_qlen,
+        actual_seq_lengths_kv,
+    ):
+        assert q_nope.dtype == q_pe.dtype == torch.bfloat16
+        packed = packed_kv.view(torch.float8_e4m3fn)
+        return torch_npu.npu_kv_quant_sparse_flash_attention(
+            query=torch.cat((q_nope, q_pe), dim=-1).contiguous(),
+            key=packed,
+            value=packed,
+            sparse_indices=topk_indices,
+            scale_value=layer.scaling,
+            key_quant_mode=2,
+            value_quant_mode=2,
+            key_dequant_scale=None,
+            value_dequant_scale=None,
+            actual_seq_lengths_query=actual_seq_qlen.to(
+                device=q_nope.device, dtype=torch.int32
+            ),
+            actual_seq_lengths_kv=actual_seq_lengths_kv.to(
+                device=q_nope.device, dtype=torch.int32
+            ),
+            block_table=self.forward_metadata.block_tables,
+            sparse_block_size=1,
+            layout_query="TND",
+            layout_kv="PA_BSND",
+            sparse_mode=3,
+            attention_mode=2,
+            quant_scale_repo_mode=1,
+            tile_size=128,
+            rope_head_dim=self.qk_rope_head_dim,
+        )
 
     def do_cp_attn_fia(
         self,
@@ -2051,35 +2155,17 @@ class AscendAttnBackend(AttentionBackend):
                     forward_batch=forward_batch,
                     speculative_num_draft_tokens=self.speculative_num_draft_tokens,
                     scaling=layer.scaling,
+                    fp8_attention=self.dcp_fp8_sparse_attention,
                 )
             if self.kv_cache_dtype == torch.float8_e4m3fn:
-                assert q_nope.dtype == q_pe.dtype == torch.bfloat16
-                packed = k_nope.view(torch.float8_e4m3fn)
-                attn_out = torch_npu.npu_kv_quant_sparse_flash_attention(
-                    query=torch.cat((q_nope, q_pe), dim=-1).contiguous(),
-                    key=packed,
-                    value=packed,
-                    sparse_indices=topk_indices,
-                    scale_value=layer.scaling,
-                    key_quant_mode=2,
-                    value_quant_mode=2,
-                    key_dequant_scale=None,
-                    value_dequant_scale=None,
-                    actual_seq_lengths_query=actual_seq_qlen.to(
-                        device=q_nope.device, dtype=torch.int32
-                    ),
-                    actual_seq_lengths_kv=actual_seq_lengths_kv.to(
-                        device=q_nope.device, dtype=torch.int32
-                    ),
-                    block_table=self.forward_metadata.block_tables,
-                    sparse_block_size=1,
-                    layout_query="TND",
-                    layout_kv="PA_BSND",
-                    sparse_mode=3,
-                    attention_mode=2,
-                    quant_scale_repo_mode=1,
-                    tile_size=128,
-                    rope_head_dim=self.qk_rope_head_dim,
+                attn_out = self._forward_fp8_sparse(
+                    q_nope,
+                    q_pe,
+                    k_nope,
+                    topk_indices,
+                    layer,
+                    actual_seq_qlen,
+                    actual_seq_lengths_kv,
                 )
             else:
                 attn_out, _, _ = torch_npu.npu_sparse_flash_attention(

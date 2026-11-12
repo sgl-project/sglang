@@ -25,6 +25,10 @@ from sglang.srt.utils import is_npu, print_info_once
 if is_npu():
     import torch_npu
 
+    from sglang.srt.hardware_backend.npu.attention.dsa_indexer_v2 import (
+        prepare_dsa_indexer_v2_metadata,
+        run_dsa_indexer_v2,
+    )
     from sglang.srt.hardware_backend.npu.utils import get_indexer_weight_stream
 
 _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
@@ -414,14 +418,13 @@ class DSANPUIndexerMixin:
 
         indexer_cache_loc = forward_batch.out_cache_loc
         parallel = get_parallel()
-        if (
+        use_dcp_indexer = (
             parallel.dcp_enabled
             and parallel.attn_dcp_size > 1
-            and not get_attn_backend().is_draft_worker
-        ):
-            indexer_cache_loc = (
-                get_attn_backend().forward_metadata.dcp_origin_out_cache_loc
-            )
+            and not attn_backend.is_draft_worker
+        )
+        if use_dcp_indexer:
+            indexer_cache_loc = attn_backend.forward_metadata.dcp_origin_out_cache_loc
             assert indexer_cache_loc is not None, (
                 "NPU DSA+DCP requires allocator-global origin_out_cache_loc metadata"
             )
@@ -447,7 +450,7 @@ class DSANPUIndexerMixin:
                 self.dsa_enable_prefill_cp
                 and forward_batch.attn_cp_metadata is not None
             ):
-                # V2: local metadata already prepared by prepare_dsa_cp_metadata.
+                # Local metadata already prepared by prepare_dsa_cp_metadata.
                 actual_seq_lengths_q = (
                     get_attn_backend().forward_metadata.actual_seq_lengths_q
                 )
@@ -506,6 +509,7 @@ class DSANPUIndexerMixin:
             is_prefill
             and self.dsa_enable_prefill_cp
             and forward_batch.attn_cp_metadata is not None
+            and not use_quant_indexer
         ):
             topk_indices = self.do_npu_cp_balance_indexer(
                 q.view(-1, self.n_heads, self.head_dim),
@@ -517,11 +521,11 @@ class DSANPUIndexerMixin:
             )
             return topk_indices
         else:
-            block_table = (
-                block_table[: actual_seq_lengths_q.size()[0]]
-                if is_prefill
-                else block_table
-            )
+            if is_prefill and uses_prefill_cp:
+                weights = weights.contiguous().view(-1, weights.shape[-1])
+                actual_seq_lengths_q = actual_seq_lengths_q.to(q.device)
+            elif is_prefill:
+                block_table = block_table[: actual_seq_lengths_q.size(0)]
             query = q.view(-1, self.n_heads, self.head_dim)
             # The full width for the gather, NOT query.shape[0] (already cut).
             num_query_tokens = bs
@@ -540,12 +544,56 @@ class DSANPUIndexerMixin:
                     pool.indexer_hadamard_128,
                     pool.dtype,
                 )
-                topk_indices = torch_npu.npu_quant_lightning_indexer(
+                key_scale = pool.get_index_k_scale_buffer(layer_id)
+                forward_mode = forward_batch.forward_mode
+                if (is_prefill and uses_prefill_cp) or (
+                    use_dcp_indexer
+                    and (
+                        forward_mode.is_decode_or_idle()
+                        or forward_mode.is_target_verify()
+                    )
+                ):
+                    if actual_seq_lengths_q.numel() == 0:
+                        return query.new_full(
+                            (query.shape[0], self.index_topk), -1, dtype=torch.int32
+                        )
+                    fm = attn_backend.forward_metadata
+                    if fm.dsa_indexer_v2 is None:
+                        max_seqlen_q = (
+                            int(forward_batch.spec_info.draft_token_num)
+                            if forward_mode.is_target_verify()
+                            else 1
+                        )
+                        fm.dsa_indexer_v2 = prepare_dsa_indexer_v2_metadata(
+                            actual_seq_lengths_q.to(
+                                device=query.device, dtype=torch.int32
+                            ),
+                            actual_seq_lengths_kv.to(
+                                device=query.device, dtype=torch.int32
+                            ),
+                            num_heads=self.n_heads,
+                            head_dim=self.head_dim,
+                            topk=self.index_topk,
+                            max_seqlen_q=max_seqlen_q,
+                        )
+                    return run_dsa_indexer_v2(
+                        query,
+                        past_key_states,
+                        weights,
+                        query_scale,
+                        key_scale,
+                        block_table,
+                        self.index_topk,
+                        fm.dsa_indexer_v2,
+                    )
+
+                # custom_ops can replace the torch_npu alias with a different schema.
+                topk_indices = torch.ops.npu.npu_quant_lightning_indexer(
                     query=query,
                     key=past_key_states,
                     weights=weights,
                     query_dequant_scale=query_scale,
-                    key_dequant_scale=pool.get_index_k_scale_buffer(layer_id),
+                    key_dequant_scale=key_scale,
                     actual_seq_lengths_query=actual_seq_lengths_q.to(torch.int32),
                     actual_seq_lengths_key=actual_seq_lengths_kv.to(
                         device=k.device, dtype=torch.int32
