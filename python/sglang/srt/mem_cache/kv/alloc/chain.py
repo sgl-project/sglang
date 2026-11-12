@@ -753,8 +753,10 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
                 id_room = owner_snap.num_virtual_pages - owner_snap.min_page
             elif b.name in self.request_allocators:
                 # A request band mints no ids: each live unit binds one
-                # request table row, its id.
-                id_room = b.num_virtual_pages - b.min_page - b.live
+                # request table row, its id. Row 0 is the table's padding
+                # row; the band's own padding (`min_page`) is physical and
+                # bounds the units below.
+                id_room = b.num_virtual_pages - 1 - b.live
             else:
                 id_room = b.free_virtual_pages
             pages = min(pages, b.num_pages - b.min_page - b.live, id_room)
