@@ -20,32 +20,18 @@ BM, BN, BK = 16, 64, 256
 
 
 @gluon.jit
-def _cvt_fp4(p, scale, PAD: gl.constexpr = False):
+def _cvt_fp4(p, scale):
     """v_cvt_scalef32_pk_f16_fp4 on each lane: two e2m1 values -> (low, high) FP16.
     It applies only the exponent of its FP32 scale, so the e4m3 scale is applied
-    after, in FP16 (exact: the NVFP4 values lie in [2^-10, 2688]).
-    PAD puts a wait state on each side. LLVM's hazard recognizer cannot see into
-    inline asm, and on gfx950 an instruction right after a v_cvt_scalef32_pk_* that
-    overwrites one of its inputs gives run-to-run nondeterministic results; the unrolled
-    NVFP4 loop has such a pair, the rolled loops do not."""
-    if PAD:
-        packed = gl.inline_asm_elementwise(
-            "s_nop 0\n v_cvt_scalef32_pk_f16_fp4 $0, $1, $2\n s_nop 0",
-            "=v,v,v",
-            [p, scale],
-            dtype=gl.int32,
-            is_pure=True,
-            pack=1,
-        )
-    else:
-        packed = gl.inline_asm_elementwise(
-            "v_cvt_scalef32_pk_f16_fp4 $0, $1, $2",
-            "=v,v,v",
-            [p, scale],
-            dtype=gl.int32,
-            is_pure=True,
-            pack=1,
-        )
+    after, in FP16 (exact: the NVFP4 values lie in [2^-10, 2688])."""
+    packed = gl.inline_asm_elementwise(
+        "v_cvt_scalef32_pk_f16_fp4 $0, $1, $2",
+        "=v,v,v",
+        [p, scale],
+        dtype=gl.int32,
+        is_pure=True,
+        pack=1,
+    )
     low = (packed & 0xFFFF).to(gl.int16).to(gl.float16, bitcast=True)
     high = (packed >> 16).to(gl.int16).to(gl.float16, bitcast=True)
     return low, high
@@ -59,7 +45,6 @@ def _dequant(
     LB: gl.constexpr,
     BN: gl.constexpr,
     BK: gl.constexpr,
-    PAD: gl.constexpr = False,
 ):
     """(BK // 2, BN) packed bytes in LP and [column group, 16-K half, row, 32-K block]
     scales -> the (BK, BN) FP16 B operand in LB, without moving data between lanes."""
@@ -69,7 +54,7 @@ def _dequant(
     s = gl.reshape(gl.permute(s, (3, 1, 4, 5, 0, 2)), [BK // 2, BN])
     s = gl.convert_layout(s, LP)
     one = gl.full(p.shape, 1.0, gl.float32, layout=LP)
-    low, high = _cvt_fp4(p.to(gl.int32), one, PAD)
+    low, high = _cvt_fp4(p.to(gl.int32), one)
     w = gl.reshape(gl.permute(gl.join(low * s, high * s), (0, 2, 1)), [BK, BN])
     return gl.convert_layout(w, LB, assert_trivial=True)
 
@@ -249,52 +234,29 @@ def _grouped_gemm(
         gl.amd.cdna4.buffer_load(Dst2Src, x_pos, mask=x_mask, other=0) // GATHER_DIV
     )
     acc = gl.zeros([BM, BN], gl.float32, layout=mfma)
-    if NVFP4 and K_SPLIT // BK <= 4:
-        # a split K's few tiles unroll so their loads issue together; each stages x
-        # in its own LDS buffer, so none overwrites x another tile is still reading
-        xt = gl.allocate_shared_memory(
-            X.dtype.element_ty, [K_SPLIT // BK, BM, BK], layout=SX
+    xs = gl.allocate_shared_memory(X.dtype.element_ty, [BM, BK], layout=SX)
+    for k0 in range(split * K_SPLIT, (split + 1) * K_SPLIT, BK):
+        t = gl.amd.cdna4.buffer_load(W, w_off + (k0 // 128) * 1024)
+        s = gl.amd.cdna4.buffer_load(WS, s_off + (k0 if NVFP4 else k0 // 32))
+        x = gl.amd.cdna4.buffer_load(
+            X,
+            x_rows[:, None] * K + (k0 + xk)[None, :],
+            mask=x_mask[:, None],
+            other=0.0,
         )
-        for kk in gl.static_range(0, K_SPLIT, BK):
-            k0 = split * K_SPLIT + kk
-            t = gl.amd.cdna4.buffer_load(W, w_off + (k0 // 128) * 1024)
-            s = gl.amd.cdna4.buffer_load(WS, s_off + k0)
-            x = gl.amd.cdna4.buffer_load(
-                X,
-                x_rows[:, None] * K + (k0 + xk)[None, :],
-                mask=x_mask[:, None],
-                other=0.0,
-            )
-            p = _units_tile(t, LP, BN, BK)
-            xb = xt.index(kk // BK)
-            xb.store(x)
-            gl.barrier()
-            b = _dequant(p, s, LP, LB, BN, BK, True)
-            acc = gl.amd.cdna4.mfma(xb.load(LA), b, acc)
-    else:
-        xs = gl.allocate_shared_memory(X.dtype.element_ty, [BM, BK], layout=SX)
-        for k0 in range(split * K_SPLIT, (split + 1) * K_SPLIT, BK):
-            t = gl.amd.cdna4.buffer_load(W, w_off + (k0 // 128) * 1024)
-            s = gl.amd.cdna4.buffer_load(WS, s_off + (k0 if NVFP4 else k0 // 32))
-            x = gl.amd.cdna4.buffer_load(
-                X,
-                x_rows[:, None] * K + (k0 + xk)[None, :],
-                mask=x_mask[:, None],
-                other=0.0,
-            )
-            p = _units_tile(t, LP, BN, BK)
-            gl.barrier()
-            xs.store(x)
-            gl.barrier()
-            # long K loops read x from LDS before the dequant, whose ALU work hides
-            # the latency; a split K's few tiles read it after
-            if K_SPLIT // BK > 4:
-                a = xs.load(LA)
-                b = _b_operand(p, s, LP, LB, BN, BK, NVFP4)
-            else:
-                b = _b_operand(p, s, LP, LB, BN, BK, NVFP4)
-                a = xs.load(LA)
-            acc = gl.amd.cdna4.mfma(a, b, acc)
+        p = _units_tile(t, LP, BN, BK)
+        gl.barrier()
+        xs.store(x)
+        gl.barrier()
+        # long K loops read x from LDS before the dequant, whose ALU work hides
+        # the latency; a split K's few tiles read it after
+        if K_SPLIT // BK > 4:
+            a = xs.load(LA)
+            b = _b_operand(p, s, LP, LB, BN, BK, NVFP4)
+        else:
+            b = _b_operand(p, s, LP, LB, BN, BK, NVFP4)
+            a = xs.load(LA)
+        acc = gl.amd.cdna4.mfma(a, b, acc)
     cm = gl.arange(0, BM, layout=gl.SliceLayout(1, mfma))
     cn = gl.arange(0, BN, layout=gl.SliceLayout(0, mfma))
     c_pos = lo + block * BM + cm
