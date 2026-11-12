@@ -351,8 +351,6 @@ def default_config(rows, num_experts, nvfp4=False, mfma_order=False):
     MFMA-order weights run experts_gluon, whose width is fixed. mfma_order: weights in
     experts_gluon's MFMA order, which take other prefill tiles with the same K split
     (bitwise)."""
-    if rows <= 32:
-        return GemmConfig(16, 64, 256, 8, 4, 1)
     # MTP verify at c1 is 64 rows (8 draft tokens x top-8); above 64 rows the
     # consumers' reads of the FP32 partials cost more than splitting K saves
     if rows <= 64:
