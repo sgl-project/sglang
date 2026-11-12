@@ -18,9 +18,10 @@ from sglang.srt.runtime_context import (
     get_mm,
     get_parallel,
     get_schedule,
+    get_spec,
     pre_capture_activation_reserve_mb,
 )
-from sglang.srt.utils.common import get_available_gpu_memory, get_device_memory_capacity
+from sglang.srt.utils.device import get_available_gpu_memory, get_device_memory_capacity
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -40,9 +41,11 @@ def is_post_capture_kv_active(
 ) -> bool:
     if is_draft_worker:
         # A dflash-family draft pool is indexed by the target's token ids, so it
-        # follows the target pool's post-capture backing.
+        # follows the target pool's post-capture backing. A draft KV ring is a
+        # fixed pool indexed by request slot instead.
         return (
             spec_algorithm.is_dflash_family()
+            and not get_spec().speculative_dflash_draft_kv_ring
             and token_to_kv_pool_allocator.get_kvcache().post_capture_active
         )
     return post_capture_kv_sizing_planned(server_args) and current_platform.is_cuda()
@@ -133,12 +136,16 @@ def compute_post_capture_kv_resize(
     )
     # Drafts take the target's token count; the target cell already charges their
     # bytes. A draft that aliases the target pool is finalized once, as the target.
-    draft_pools = tuple(
-        runner.token_to_kv_pool
-        for runner in draft_runners
-        if runner.token_to_kv_pool is not pool
-        and runner.token_to_kv_pool.post_capture_active
-    )
+    owners = {id(pool.backing_owner)}
+    draft_pools = []
+    for runner in draft_runners:
+        draft_pool = runner.token_to_kv_pool
+        if not draft_pool.post_capture_active:
+            continue
+        owner_id = id(draft_pool.backing_owner)
+        if owner_id not in owners:
+            owners.add(owner_id)
+            draft_pools.append(draft_pool)
     budget_bytes = (
         int(max(0.0, free_gb - headroom_gb - mm_reservation_gb) * (1 << 30))
         + pool.post_capture_backed_bytes
