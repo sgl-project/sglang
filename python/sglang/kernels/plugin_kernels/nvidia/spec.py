@@ -103,6 +103,8 @@ class Step(msgspec.Struct, frozen=True):
     mode is one of:
       "decode"        – autoregressive single-token decode; runs in a CUDA graph.
       "target_verify" – speculative-decoding target verify; runs in a CUDA graph.
+      "draft_extend"  – a draft model's extend over the verified rows; runs in a
+                        CUDA graph and gets the same view as "target_verify".
       "prefill"       – context prefill; runs eagerly (never captured in a graph).
     """
 

@@ -523,6 +523,35 @@ class TestMegakernelRuntime(CustomTestCase):
         MegakernelBinding.forward_view.assert_not_called()
         MegakernelBinding.seal_capture_view.assert_not_called()
 
+    def test_a_draft_extend_step_gets_the_captured_forward_view(self):
+        from sglang.kernels.plugin_kernels.nvidia.spec import Step
+
+        built = SimpleNamespace(
+            widths=(4,),
+            draft_sampler=None,
+            draft_loop=None,
+            draft_extend=None,
+            begin_draft_round=None,
+            graph_variants=None,
+            summary=lambda: "draft-extend-fake",
+            plan=lambda ids, fb, *a, **kw: Step(mode="draft_extend", rows=4),
+            forward=lambda step, orig, *a, **kw: step,
+        )
+        lm = self._install_spec(
+            replace(SPEC, build=lambda m, hf, ctx: built), tokens=1, is_draft=True
+        )
+        forward_batch = batch(4)
+        with (
+            patch.object(MegakernelBinding, "prefill_view") as prefill_view,
+            patch.object(torch.cuda, "is_current_stream_capturing", return_value=True),
+        ):
+            ran = lm(forward_batch.input_ids, None, forward_batch)
+        self.assertEqual((ran.mode, ran.view), ("draft_extend", "view"))
+        prefill_view.assert_not_called()
+        MegakernelBinding.seal_capture_view.assert_called_once_with(
+            forward_batch, "view"
+        )
+
     def test_decode_step_does_not_call_prefill_view(self):
         """A decode step must call forward_view(forward_batch) and not prefill_view."""
         with patch.object(MegakernelBinding, "prefill_view", return_value="pview"):
