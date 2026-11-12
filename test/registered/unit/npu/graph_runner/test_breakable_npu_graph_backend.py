@@ -71,6 +71,48 @@ class TestBreakableNPUGraphBackend(CustomTestCase):
             with self.assertRaisesRegex(AssertionError, "torch.compile"):
                 mod.BreakableNPUGraphBackend(runner)
 
+    # Guards the default ascend_ops config: alltoallv sizes its buffers from
+    # live expert counts read on the host, which capture cannot do.  Reject it
+    # when the graph backend is built, before any capture starts.
+    def test_ascend_ops_alltoallv_capture_is_rejected(self):
+        runner = _make_runner()
+        with (
+            get_parallel().override(tp_group=SimpleNamespace(barrier=mock.Mock())),
+            mock.patch.object(mod, "get_flags", return_value=_flags()),
+            mock.patch.object(
+                mod,
+                "get_moe_a2a_backend",
+                return_value=SimpleNamespace(is_ascend_ops=lambda: True),
+            ),
+            mock.patch.object(
+                mod,
+                "get_moe_ascend_ops_config",
+                return_value=SimpleNamespace(prefill="alltoallv"),
+            ),
+        ):
+            with self.assertRaisesRegex(ValueError, "prefill=allgather"):
+                mod.BreakableNPUGraphBackend(runner)
+
+    def test_ascend_ops_allgather_capture_is_allowed(self):
+        runner = _make_runner()
+        with (
+            get_parallel().override(tp_group=SimpleNamespace(barrier=mock.Mock())),
+            mock.patch.object(mod, "get_flags", return_value=_flags()),
+            mock.patch.object(
+                mod,
+                "get_moe_a2a_backend",
+                return_value=SimpleNamespace(is_ascend_ops=lambda: True),
+            ),
+            mock.patch.object(
+                mod,
+                "get_moe_ascend_ops_config",
+                return_value=SimpleNamespace(prefill="allgather"),
+            ),
+        ):
+            backend = mod.BreakableNPUGraphBackend(runner)
+
+        self.assertIsInstance(backend, BreakableCudaGraphBackend)
+
     def test_capture_publishes_allgather_row_sizes(self):
         runner = _make_runner()
         tp_group = SimpleNamespace(barrier=mock.Mock(), world_size=4)

@@ -26,6 +26,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
+from sglang.srt.layers.moe import get_moe_a2a_backend, get_moe_ascend_ops_config
 from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend import (
     BreakableCudaGraphBackend,
 )
@@ -59,6 +60,18 @@ class BreakableNPUGraphBackend(BreakableCudaGraphBackend):
             "breakable NPU prefill graph does not support torch.compile; "
             "disable --enable-torch-compile or prefill graph"
         )
+        # AllToAllV sizes its buffers from live per-expert counts read on the
+        # host, which a captured segment cannot do.  Reject at construction so
+        # the failure lands at startup, before any capture.
+        if (
+            get_moe_a2a_backend().is_ascend_ops()
+            and get_moe_ascend_ops_config().prefill != "allgather"
+        ):
+            raise ValueError(
+                "breakable NPU prefill graph requires ascend_ops prefill=allgather; "
+                "alltoallv reads live expert counts from the host, which capture "
+                "cannot do"
+            )
 
     def capture_one(
         self,
