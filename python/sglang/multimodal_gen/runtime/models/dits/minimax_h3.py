@@ -101,6 +101,9 @@ from sglang.multimodal_gen.runtime.layers.linear import (
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
 )
+from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
+    RotaryEmbedding,
+)
 from sglang.multimodal_gen.runtime.layers.usp import (
     _ring_attention_varlen,
     _usp_all_gather,
@@ -638,16 +641,15 @@ def _apply_rope_qk(
     k: torch.Tensor,
     cos_sin_cache: torch.Tensor,
     positions: torch.Tensor,
+    *,
+    rotary_emb: RotaryEmbedding,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if not q.is_cuda:
         half = cos_sin_cache.shape[-1] // 2
-        cos_half, sin_half = cos_sin_cache.split(half, dim=-1)
-        cos = torch.cat((cos_half, cos_half), dim=-1).unsqueeze(1)
-        sin = torch.cat((sin_half, sin_half), dim=-1).unsqueeze(1)
-        return (
-            _apply_rope_cos_sin(q, cos, sin),
-            _apply_rope_cos_sin(k, cos, sin),
-        )
+        cos, sin = cos_sin_cache.split(half, dim=-1)
+        # forward_npu sends 3D q/k to forward_native; npu_rotary_mul needs BSND.
+        q, k = rotary_emb(query=q.unsqueeze(0), key=k.unsqueeze(0), cos=cos, sin=sin)
+        return q.squeeze(0), k.squeeze(0)
 
     from sgl_kernel import rotary_embedding as apply_sgl_kernel_rotary_embedding
 
@@ -674,10 +676,13 @@ def _apply_qk_norm_rope(
     head_dim: int,
     cos_sin_cache: torch.Tensor,
     positions: torch.Tensor,
+    rotary_emb: RotaryEmbedding,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     def unfused():
         normed_q, normed_k = _apply_qk_norm(q, k, q_norm, k_norm, head_dim)
-        return _apply_rope_qk(normed_q, normed_k, cos_sin_cache, positions)
+        return _apply_rope_qk(
+            normed_q, normed_k, cos_sin_cache, positions, rotary_emb=rotary_emb
+        )
 
     if (
         q_norm.eps is not None
@@ -1313,6 +1318,13 @@ class MiniMaxH3Attention(nn.Module):
             arch, quant_config, prefix=prefix, local_heads=self.num_heads
         )
 
+        self.rotary_emb = RotaryEmbedding(
+            head_size=self.head_dim,
+            rotary_dim=rope_dim,
+            is_neox_style=True,
+            use_precomputed_cache=False,
+        )
+
     def _set_attention_backend(self, backend) -> None:
         if (
             backend.get_enum() is AttentionBackendEnum.CUBE_SPARSE_ATTN
@@ -1648,6 +1660,7 @@ class MiniMaxH3Attention(nn.Module):
                     self.head_dim,
                     cos_sin_cache,
                     positions,
+                    self.rotary_emb,
                 )
 
         gate_compress = None
