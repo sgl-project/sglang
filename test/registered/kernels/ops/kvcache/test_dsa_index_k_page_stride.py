@@ -5,7 +5,9 @@ whose pages are slices of larger per-page entries, so ``stride(0)`` exceeds the
 page blob. Every writer and reader must address page ``p`` at ``p * stride(0)``,
 write in place, and leave the bytes between blobs alone. Each case runs the same
 operation on such a strided view and on a packed buffer and requires identical
-blobs (or outputs), and untouched bytes outside the blobs.
+blobs (or outputs), and untouched bytes outside the blobs. The boundary cases
+put pages past 2 GiB from the buffer start, so page offsets overflow int32 unless
+the kernels widen them, including when the page table or locations are int32.
 """
 
 from __future__ import annotations
@@ -42,6 +44,9 @@ SENTINEL = 0xA5
 # Bytes between two pages of one layer when each page entry holds every layer's
 # MLA rows followed by one index-K blob per layer (61 layers).
 LARGE_PAGE_STRIDE = 1_212_288
+INT32_MAX = 2**31 - 1
+# The first page whose offset at LARGE_PAGE_STRIDE exceeds int32.
+FIRST_PAGE_PAST_INT32 = INT32_MAX // LARGE_PAGE_STRIDE + 1  # 1772
 
 
 def _layouts(page_bytes: int):
@@ -78,9 +83,11 @@ def _pages(num_pages: int, page_bytes: int, stride: int, offset: int, seed: int)
 
 
 def _assert_outside_untouched(entries: torch.Tensor, offset: int, page_bytes: int):
-    outside = torch.ones_like(entries, dtype=torch.bool)
-    outside[:, offset : offset + page_bytes] = False
-    assert (entries[outside] == SENTINEL).all(), "bytes outside the blobs changed"
+    before = entries[:, :offset]
+    after = entries[:, offset + page_bytes :]
+    assert (before == SENTINEL).all() and (after == SENTINEL).all(), (
+        "bytes outside the blobs changed"
+    )
 
 
 def _loc(num_pages: int, num_tokens: int, seed: int) -> torch.Tensor:
@@ -286,6 +293,107 @@ def test_index_key_cache_strided_layer_buffer(use_fp4_indexer):
     assert torch.equal(strided, packed)
     assert torch.equal(k_out, k_ref) and torch.equal(s_out, s_ref)
     _assert_outside_untouched(entries, offset, page_bytes)
+
+
+# A ~2.15 GB buffer whose last pages lie past int32 byte offsets.
+BOUNDARY_NUM_PAGES = FIRST_PAGE_PAST_INT32 + 2
+# A low page; the last page that starts below 2 GiB, whose blob lies above it;
+# and two pages that start above it.
+BOUNDARY_PAGES = (
+    3,
+    FIRST_PAGE_PAST_INT32 - 1,
+    FIRST_PAGE_PAST_INT32,
+    BOUNDARY_NUM_PAGES - 1,
+)
+
+
+def _boundary_pages(page_bytes: int, seed: int):
+    assert FIRST_PAGE_PAST_INT32 * LARGE_PAGE_STRIDE > INT32_MAX
+    offset = LARGE_PAGE_STRIDE - 3 * page_bytes
+    assert (FIRST_PAGE_PAST_INT32 - 1) * LARGE_PAGE_STRIDE + offset > INT32_MAX
+    packed, entries, strided = _pages(
+        BOUNDARY_NUM_PAGES, page_bytes, LARGE_PAGE_STRIDE, offset, seed
+    )
+    return packed, entries, strided, offset
+
+
+def _boundary_loc(dtype: torch.dtype) -> torch.Tensor:
+    # A few slots in each boundary page, the first and last slot included.
+    slots = [
+        page * PAGE_SIZE + slot
+        for page in BOUNDARY_PAGES
+        for slot in (0, 17, PAGE_SIZE - 1)
+    ]
+    return torch.tensor(slots, dtype=dtype, device="cuda")
+
+
+@pytest.mark.parametrize("key_bytes", [HEAD_DIM, HEAD_DIM // 2], ids=["fp8", "fp4"])
+def test_get_k_and_s_past_int32_offsets(key_bytes):
+    _skip_if_unavailable()
+    page_bytes = PAGE_SIZE * (key_bytes + 4)
+    packed, entries, strided, offset = _boundary_pages(page_bytes, 20)
+    p0, p1, p2, p3 = BOUNDARY_PAGES
+    # An int32 page table, as the indexer builds it.
+    page_table = torch.tensor(
+        [[p2, p0, p3], [p1, p3, p2]], dtype=torch.int32, device="cuda"
+    )
+    seq_lens = torch.tensor([150, 3 * PAGE_SIZE], dtype=torch.int64, device="cuda")
+
+    outs = [
+        _get_k_and_s_triton(
+            buf=buf,
+            page_indices=page_table,
+            seq_lens=seq_lens,
+            seq_len_sum=int(seq_lens.sum()),
+            max_seq_len=int(seq_lens.max()),
+            page_size=PAGE_SIZE,
+            index_head_dim=key_bytes,
+        )
+        for buf in (packed, strided)
+    ]
+    torch.cuda.synchronize()
+
+    (k_ref, s_ref), (k_out, s_out) = outs
+    assert torch.equal(k_out, k_ref)
+    assert torch.equal(s_out, s_ref)
+    _assert_outside_untouched(entries, offset, page_bytes)
+
+
+@pytest.mark.parametrize("writer", ["fused_store", "set_k_and_s", "fp4_store"])
+def test_store_past_int32_offsets(writer):
+    _skip_if_unavailable()
+    if writer == "fused_store" and not can_use_dsa_fused_store(
+        torch.bfloat16, torch.int64, PAGE_SIZE
+    ):
+        pytest.skip("fused store JIT unavailable")
+    page_bytes = FP4_PAGE_BYTES if writer == "fp4_store" else FP8_PAGE_BYTES
+    packed, entries, strided, offset = _boundary_pages(page_bytes, 21)
+    # The FP4 writer takes int32 locations; the FP8 writers require int64.
+    loc = _boundary_loc(torch.int32 if writer == "fp4_store" else torch.int64)
+    key = torch.randn(loc.numel(), HEAD_DIM, dtype=torch.bfloat16, device="cuda")
+    index_k = key.to(torch.float8_e4m3fn)
+    index_k_scale = torch.rand(loc.numel(), 1, device="cuda")
+    pages = list(BOUNDARY_PAGES)
+    before = packed[pages].clone()
+
+    for cache in (packed, strided):
+        if writer == "fused_store":
+            fused_store_index_k_cache(key, cache, loc, PAGE_SIZE)
+        elif writer == "set_k_and_s":
+            _set_k_and_s_triton(cache, loc, index_k, index_k_scale, PAGE_SIZE)
+        else:
+            store_fp4_index_k_cache(key, cache, loc, page_size=PAGE_SIZE, rne=True)
+    torch.cuda.synchronize()
+
+    # Every written page changed, and every page, written or not, matches the
+    # packed buffer at the same index.
+    assert all(not torch.equal(a, b) for a, b in zip(packed[pages], before))
+    assert torch.equal(strided, packed)
+    _assert_outside_untouched(entries, offset, page_bytes)
+    if writer == "fp4_store":
+        ref = gather_fp4_index_k(packed, loc, page_size=PAGE_SIZE)
+        out = gather_fp4_index_k(strided, loc, page_size=PAGE_SIZE)
+        assert torch.equal(out[0], ref[0]) and torch.equal(out[1], ref[1])
 
 
 def _deep_gemm_or_skip(min_major: int):
