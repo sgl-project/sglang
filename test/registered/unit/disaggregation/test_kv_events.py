@@ -9,12 +9,12 @@ the router can subscribe per replica (the `dp_size` it reads from
 
 import atexit
 import json
-import socket
 import time
 import unittest
 
 import msgspec
 import zmq
+
 from sglang.srt.disaggregation.kv_events import (
     AllBlocksCleared,
     BlockRemoved,
@@ -48,11 +48,8 @@ class TestLocalKvEventSource(CustomTestCase):
     def test_advertised_source_delivers_events(self):
         for host, bind, topic in (("*", None, "kv"), ("127.0.0.1", True, "")):
             with self.subTest(host=host):
-                # ZMQ close delegates endpoint teardown to its I/O thread;
-                # a synchronous TCP probe releases the port before rebinding.
-                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
-                    probe.bind(("127.0.0.1", 0))
-                    port = probe.getsockname()[1]
+                with zmq.Context.instance().socket(zmq.PUB) as probe:
+                    port = probe.bind_to_random_port("tcp://127.0.0.1")
                 publisher = self._publisher(
                     attn_dp_rank=4,
                     endpoint=f"tcp://{host}:{port - 4}",

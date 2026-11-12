@@ -1,35 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Control replay and local cache ordering, with real cache/DMA/socket fixtures.
-
-The separate file owns publisher/replay teardown and feedback capacity fixtures;
-it reuses the native cache and request lifecycle fixtures without changing them.
-"""
+"""HTTP control replay and local cache ordering using native cache fixtures."""
 
 import threading
-import time
 import unittest
-import uuid
 from unittest.mock import patch
 
 import msgspec
 import test_kv_control_cache as cache_fixtures
 import test_kv_control_service as service_fixtures
 import test_kv_control_transfers as transfer_fixtures
-import zmq
-from sglang.srt.disaggregation.kv_events import (
-    AllBlocksCleared,
-    KVEventBatch,
-    ZmqEventPublisher,
-)
 from sglang.srt.managers.kv_control.contracts import Status
-from sglang.srt.managers.kv_control.feedback import (
-    ControlEventBatch,
-    FeedbackLimits,
-    FeedbackPublisherConfig,
-)
+from sglang.srt.managers.kv_control.feedback import FeedbackLimits
 from sglang.srt.managers.kv_control.service import ServiceConfig, dispatch
 from sglang.srt.managers.schedule_batch import FINISH_LENGTH
-from sglang.srt.utils.network import get_free_port
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
@@ -374,109 +357,6 @@ class TestKVControlFeedback(cache_fixtures.KVCacheTestCase):
             self.assertEqual(
                 restarted["cache_watermark"]["source_epoch"], before.source_epoch
             )
-
-    def test_optional_publisher_uses_own_socket_replay_and_nonblocking_bounded_outbox(
-        self,
-    ):
-        channel = "inproc://control-" + uuid.uuid4().hex
-        replay_endpoint = f"tcp://127.0.0.1:{get_free_port()}"
-        config = ServiceConfig(
-            namespace="ns",
-            engine_id="engine",
-            feedback_limits=FeedbackLimits(max_events=4),
-            feedback_publisher=FeedbackPublisherConfig(
-                endpoint=channel,
-                replay_endpoint=replay_endpoint,
-                buffer_steps=2,
-                max_queue_size=1,
-            ),
-        )
-        old_channel = "inproc://legacy-" + uuid.uuid4().hex
-        legacy = ZmqEventPublisher(attn_dp_rank=0, endpoint=old_channel)
-        context = zmq.Context.instance()
-        sub, old_sub, dealer = (
-            context.socket(zmq.SUB),
-            context.socket(zmq.SUB),
-            context.socket(zmq.DEALER),
-        )
-        for socket in (sub, old_sub):
-            socket.setsockopt(zmq.SUBSCRIBE, b"")
-            socket.setsockopt(zmq.RCVTIMEO, 3000)
-        dealer.setsockopt(zmq.RCVTIMEO, 3000)
-        old_sub.connect(old_channel)
-        publisher = None
-        try:
-            with transfer_fixtures.hicache(self, config=config, storage=True) as owner:
-                _, cache, service, dma = owner
-                publisher = service.feedback.publisher
-                sub.connect(channel)
-                dealer.connect(replay_endpoint)
-                time.sleep(0.05)  # ZMQ subscription handshake, external boundary.
-                node = transfer_fixtures.seed(cache)
-                transfer_fixtures.backup_prefix(cache, dma, node, evict=True)
-                operation = transfer_fixtures.public_transfer(
-                    service, "demote", "host", "storage", "save", caller="A"
-                )
-                with patch.object(publisher, "try_publish", return_value=False):
-                    transfer_fixtures.wait(service, operation)
-                self.assertTrue(service.has_background_work)
-                self.assertGreater(service.next_deadline, self.clock.now)
-                self.clock.now += 0.02
-                service.progress()
-                publisher._event_queue.join()
-                frames = sub.recv_multipart()
-                batch = msgspec.msgpack.decode(frames[2], type=ControlEventBatch)
-                self.assertEqual(frames[0], b"sglang.control.v1")
-                self.assertEqual(
-                    batch.source_epoch,
-                    service.capabilities()["feedback"]["source_epoch"],
-                )
-                self.assertEqual(
-                    service.capabilities()["feedback"]["endpoint"], channel
-                )
-                self.assertEqual(
-                    service.capabilities()["feedback"]["replay_endpoint"],
-                    replay_endpoint,
-                )
-                self.assertEqual(
-                    batch.events[-1].payload["update"]["status"], "completed"
-                )
-                self.assertEqual(
-                    transfer_fixtures.current(service, operation).status,
-                    Status.COMPLETED,
-                )
-                self.assertFalse(old_sub.poll(50))
-                legacy.publish(KVEventBatch(ts=0, events=[AllBlocksCleared()]))
-                self.assertEqual(
-                    msgspec.msgpack.decode(
-                        old_sub.recv_multipart()[2], type=KVEventBatch
-                    ).events,
-                    [AllBlocksCleared()],
-                )
-                for revision in range(3):
-                    service.feedback.append("association", "A", {"revision": revision})
-                    service.progress()
-                    publisher._event_queue.join()
-                dealer.send_multipart([b"", (0).to_bytes(8, "big")])
-                replies = [dealer.recv_multipart() for _ in range(3)]
-                self.assertEqual(
-                    [int.from_bytes(r[2], "big", signed=True) for r in replies],
-                    [2, 3, -1],
-                )
-                replayed = [
-                    msgspec.msgpack.decode(r[3], type=ControlEventBatch)
-                    for r in replies[:2]
-                ]
-                self.assertEqual(
-                    [b.events[-1].payload["revision"] for b in replayed], [1, 2]
-                )
-                self.assertTrue(events(service)["gap"])
-            self.assertFalse(publisher._thread.is_alive())
-        finally:
-            sub.close(linger=0)
-            old_sub.close(linger=0)
-            dealer.close(linger=0)
-            legacy.shutdown()
 
 
 if __name__ == "__main__":

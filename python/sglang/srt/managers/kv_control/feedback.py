@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import hashlib
 import threading
-import time
 import uuid
 from collections import deque
 from typing import Annotated, Literal
@@ -29,30 +28,6 @@ class FeedbackLimits(Value):
     max_bytes: Annotated[int, msgspec.Meta(ge=1024, le=1 << 28)] = 8 << 20
     max_event_bytes: Annotated[int, msgspec.Meta(ge=1024, le=1 << 24)] = 1 << 20
     max_requests: Annotated[int, msgspec.Meta(ge=1, le=65536)] = 4096
-
-
-class FeedbackPublisherConfig(Value):
-    # Always bind: accidentally connecting this channel to a legacy PUB/SUB
-    # endpoint would expose unknown control events to old subscribers.
-    endpoint: Identifier
-    replay_endpoint: Identifier | None = None
-    buffer_steps: Annotated[int, msgspec.Meta(ge=1, le=4096)] = 256
-    max_queue_size: Annotated[int, msgspec.Meta(ge=1, le=1024)] = 32
-    hwm: Annotated[int, msgspec.Meta(ge=1, le=4096)] = 256
-
-
-class ControlEventBatch(msgspec.Struct, kw_only=True):
-    source_id: str
-    source_epoch: str
-    engine_id: str
-    engine_epoch: str
-    namespace: str
-    events: tuple[ControlEvent, ...]
-    earliest_sequence: int
-    latest_sequence: int
-    gap: bool
-    version: Literal["1.0"] = "1.0"
-    attn_dp_rank: int | None = None
 
 
 class FeedbackCursor(Value):
@@ -122,8 +97,6 @@ class FeedbackJournal:
         namespace,
         limits,
         watermark,
-        publisher_config=None,
-        clock=time.monotonic,
     ):
         self.engine_id, self.engine_epoch, self.namespace = (
             engine_id,
@@ -141,108 +114,18 @@ class FeedbackJournal:
         self._requests: dict[
             tuple[str, str], tuple[str, RequestAssociation | None]
         ] = {}
-        self.publisher = None
-        self._published = 0
-        self.publisher_config = publisher_config
-        self._clock = clock
-        self._publish_retry_at = 0.0
-        if publisher_config is not None:
-            from sglang.srt.disaggregation.kv_events import EventPublisherFactory
-
-            if publisher_config.endpoint == publisher_config.replay_endpoint:
-                raise ControlError(
-                    "invalid_payload", "Control PUB and replay endpoints must differ"
-                )
-            config = {
-                "publisher": "zmq",
-                "bind": True,
-                "topic": "sglang.control.v1",
-                **msgspec.to_builtins(publisher_config),
-            }
-            self.publisher = EventPublisherFactory.create(
-                msgspec.json.encode(config).decode()
-            )
-
-    @property
-    def has_outbox(self):
-        return self.publisher is not None and self._published < self._sequence
-
-    @property
-    def next_deadline(self):
-        return max(self._clock(), self._publish_retry_at) if self.has_outbox else None
-
-    def flush(self, *, limit=64):
-        self._owner()
-        if not self.has_outbox or self._clock() < self._publish_retry_at:
-            return
-        earliest = self._events[0][0].sequence if self._events else self._sequence + 1
-        selected, size = [], 0
-        for event, event_size in self._events:
-            if event.sequence <= self._published:
-                continue
-            if selected and (
-                len(selected) >= limit
-                or size + event_size > self.limits.max_event_bytes
-            ):
-                break
-            selected.append(event)
-            size += event_size
-        events = tuple(selected)
-        latest = events[-1].sequence if events else self._sequence
-        batch = ControlEventBatch(
-            source_id=self.source_id,
-            source_epoch=self.source_epoch,
-            engine_id=self.engine_id,
-            engine_epoch=self.engine_epoch,
-            namespace=self.namespace,
-            events=events,
-            earliest_sequence=earliest,
-            latest_sequence=latest,
-            gap=self._published < earliest - 1,
-        )
-        if self.publisher.try_publish(batch):
-            self._published = latest
-            self._publish_retry_at = 0.0
-        else:
-            self._publish_retry_at = self._clock() + 0.01
 
     def describe(self):
-        source = (
-            self.publisher.describe_local_source(0)
-            if self.publisher is not None
-            else None
-        )
         return {
             "query": "events",
             "version": "1.0",
-            "publisher": self.publisher is not None,
             "source_id": self.source_id,
             "source_epoch": self.source_epoch,
-            "endpoint": source["endpoint"]
-            if source is not None
-            else (
-                self.publisher_config.endpoint if self.publisher is not None else None
-            ),
-            "replay_endpoint": source.get("replay_endpoint")
-            if source is not None
-            else (
-                self.publisher_config.replay_endpoint
-                if self.publisher is not None
-                else None
-            ),
-            "topic": "sglang.control.v1" if self.publisher is not None else None,
-            "transport_sequence": "separate_frame_sequence",
             "cursor_sequence": "ControlEvent.sequence",
             "recovery": "query_known_scopes",
             "request_association": "bind_request_optional_provenance",
             "limits": self.limits,
         }
-
-    def close(self):
-        if self.publisher is not None:
-            self.flush()
-            self.publisher.shutdown()
-            self.publisher = None
 
     def append(self, kind, caller_id, payload):
         self._owner()

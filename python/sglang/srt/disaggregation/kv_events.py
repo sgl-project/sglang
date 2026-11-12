@@ -29,11 +29,12 @@ from abc import ABC, abstractmethod
 from collections import deque
 from itertools import count
 from queue import Queue
-from typing import Any, Callable, Literal, Optional, Protocol, Union
+from typing import Any, Callable, Literal, Optional, Union
 
 import msgspec
 import zmq
 from pydantic import BaseModel
+
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.network import NetworkAddress
 
@@ -343,12 +344,6 @@ class KVEventBatch(EventBatch):
     events: list[Union[BlockStored, BlockRemoved, AllBlocksCleared]]
 
 
-class PublisherBatch(Protocol):
-    """Shared transport metadata for location and independent control batches."""
-
-    attn_dp_rank: Optional[int]
-
-
 class EventPublisher(ABC):
     """
     Lightweight publisher for EventBatch batches with
@@ -364,7 +359,7 @@ class EventPublisher(ABC):
     """
 
     @abstractmethod
-    def publish(self, events: PublisherBatch) -> None:
+    def publish(self, events: EventBatch) -> None:
         """Emit events in order.
 
         Implementations should guarantee at-least-once delivery and
@@ -378,10 +373,6 @@ class EventPublisher(ABC):
     def describe_local_source(self, block_size: int) -> Optional[dict[str, Any]]:
         """Describe a source accessible to a separate local process, if any."""
         return None
-
-    def try_publish(self, events: PublisherBatch) -> bool:
-        """Nonblocking admission, for independent bounded control outboxes."""
-        return False
 
 
 class NullEventPublisher(EventPublisher):
@@ -436,7 +427,7 @@ class ZmqEventPublisher(EventPublisher):
         bind: Optional[bool] = None,
     ) -> None:
         # Storage
-        self._event_queue = Queue[Optional[PublisherBatch]](maxsize=max_queue_size)
+        self._event_queue = Queue[Optional[EventBatch]](maxsize=max_queue_size)
         self._buffer = deque[tuple[int, bytes]](maxlen=buffer_steps)
 
         # ZMQ sockets
@@ -469,23 +460,12 @@ class ZmqEventPublisher(EventPublisher):
 
         atexit.register(self.shutdown)
 
-    def publish(self, events: PublisherBatch) -> None:
+    def publish(self, events: EventBatch) -> None:
         if not self._running:
             raise RuntimeError("Publisher is closed")
         if events.attn_dp_rank is None:
             events.attn_dp_rank = self._dp_rank
         self._event_queue.put(events)
-
-    def try_publish(self, events: PublisherBatch) -> bool:
-        if not self._running:
-            return False
-        if events.attn_dp_rank is None:
-            events.attn_dp_rank = self._dp_rank
-        try:
-            self._event_queue.put_nowait(events)
-        except queue.Full:
-            return False
-        return True
 
     def describe_local_source(self, block_size: int) -> Optional[dict[str, Any]]:
         """Report the bound socket, not a port reconstructed from global DP size.
@@ -526,13 +506,8 @@ class ZmqEventPublisher(EventPublisher):
 
     def shutdown(self) -> None:
         """Stop the publisher thread and clean up resources."""
-        if not self._running:
-            return
         self._running = False
-        try:
-            self._event_queue.put_nowait(None)
-        except queue.Full:
-            pass  # The worker drains its bounded queue before exiting.
+        self._event_queue.put_nowait(None)
 
         start = time.time()
         pending_items = True
@@ -559,7 +534,6 @@ class ZmqEventPublisher(EventPublisher):
                 self._replay.close(linger=0)
         finally:
             pass  # Do not terminate context; other sockets may use it
-        atexit.unregister(self.shutdown)
 
     def _socket_setup(self) -> None:
         """Initialize sockets

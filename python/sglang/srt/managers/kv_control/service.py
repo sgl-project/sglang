@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import atexit
 import hashlib
 import threading
 import time
@@ -34,7 +33,6 @@ from sglang.srt.managers.kv_control.feedback import (
     FeedbackCursor,
     FeedbackJournal,
     FeedbackLimits,
-    FeedbackPublisherConfig,
     RequestAssociation,
 )
 from sglang.srt.managers.kv_hints import KvHintsEnvelope
@@ -59,7 +57,6 @@ class ServiceConfig(Value):
     cache_limits: CacheLimits = CacheLimits()
     protection_limits: ProtectionLimits = ProtectionLimits()
     feedback_limits: FeedbackLimits = FeedbackLimits()
-    feedback_publisher: FeedbackPublisherConfig | None = None
 
     def cache_config(self):
         return CacheControlConfig(
@@ -237,23 +234,16 @@ class KVControlService:
                 "KV control cache is unsupported: " + capabilities["reason"]
             )
         cache.kv_control_service = self
-        self.feedback = None
         self._bind_feedback()
-        if config.feedback_publisher is not None:
-            atexit.register(self.close)
 
     def _bind_feedback(self):
         registry = self.control.registry
-        if self.feedback is not None:
-            self.feedback.close()
         self.feedback = FeedbackJournal(
             engine_id=registry.engine_id,
             engine_epoch=registry.engine_epoch,
             namespace=registry.namespace,
             limits=self.config.feedback_limits,
             watermark=self.cache_watermark,
-            publisher_config=self.config.feedback_publisher,
-            clock=self.control._clock,
         )
         registry.on_result = self.feedback.operation
         registry.cache_watermark = self.cache_watermark
@@ -368,22 +358,14 @@ class KVControlService:
     @property
     def has_background_work(self):
         protection = self.control.executor.protection
-        return (
-            self.has_pending
-            or self.feedback.has_outbox
-            or (protection is not None and protection.has_background_work)
+        return self.has_pending or (
+            protection is not None and protection.has_background_work
         )
 
     @property
     def next_deadline(self):
         protection = self.control.executor.protection
-        deadlines = (
-            self.feedback.next_deadline,
-            protection.next_deadline if protection is not None else None,
-        )
-        return min(
-            (deadline for deadline in deadlines if deadline is not None), default=None
-        )
+        return protection.next_deadline if protection is not None else None
 
     def invalidate_protection(self, *, reason):
         protection = self.control.executor.protection
@@ -399,14 +381,7 @@ class KVControlService:
         changes = protection.invalidate(reason=reason) if protection is not None else ()
         for claim in changes:
             self.feedback.append("claim", claim.caller_id, claim)
-        if reason == "host_cache_detached":
-            self.close()
         return changes
-
-    def close(self):
-        if self.feedback is not None:
-            self.feedback.close()
-        atexit.unregister(self.close)
 
     def progress_protection(self, *, limit=64):
         protection = self.control.executor.protection
@@ -443,7 +418,6 @@ class KVControlService:
         if self.has_pending:
             self.control.progress(background=True)
         self.progress_protection()
-        self.feedback.flush()
 
     def reset_after_cache_flush(self):
         self.control.reset(self.config.namespace)
