@@ -4,10 +4,13 @@ import numpy as np
 import torch
 import triton
 
+from sglang.kernels.ops.memory.ptr_table import make_ptr_table
 from sglang.srt.disaggregation.common.staging_buffer import (
     StagingBuffer,
     _fused_gather_to_staging_kernel,
 )
+from sglang.srt.runtime_context import get_device
+from sglang.srt.utils import device_stream_context
 
 
 def packed_page_indices(*, num_tensors, dst_pages, dst_num_slots):
@@ -36,7 +39,9 @@ class PackedKVSender:
         self._src_handles: dict[int, object] = {}
         self._dst_handles: dict[tuple, object] = {}
         self.buffer = StagingBuffer(
-            size_bytes=size_bytes, device=f"cuda:{gpu_id}", gpu_id=gpu_id
+            size_bytes=size_bytes,
+            device=f"{get_device().device}:{gpu_id}",
+            gpu_id=gpu_id,
         )
         register_memory(self.buffer.get_ptr(), self.buffer.get_size())
         self.inflight = None
@@ -54,17 +59,16 @@ class PackedKVSender:
     ):
         num_tokens = len(pages) * page_size
         tensor_bytes = num_tokens * dst_token_bytes
-        torch.cuda.set_device(self.gpu_id)
+        self.buffer.device_module.set_device(self.gpu_id)
         stream = self.buffer.get_gather_stream()
         # The transfer worker already waited for the producer; keep uploads off
         # the default stream, which prefill CUDA graph capture may be using.
-        with torch.cuda.stream(stream):
+        with device_stream_context(stream):
             indices = torch.tensor(pages, dtype=torch.int64, device=self.buffer.device)
             pointers = self._src_pointers.get(tuple(src_ptrs))
             if pointers is None:
-                pointers = torch.tensor(
-                    src_ptrs, dtype=torch.int64, device=self.buffer.device
-                )
+                # XPU addresses set bit 63, which a plain int64 tensor rejects.
+                pointers = make_ptr_table(src_ptrs, device=self.buffer.device)
                 self._src_pointers[tuple(src_ptrs)] = pointers
             _fused_gather_to_staging_kernel[
                 (len(src_ptrs), triton.cdiv(tensor_bytes, 1024))

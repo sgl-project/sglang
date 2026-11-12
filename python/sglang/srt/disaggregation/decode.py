@@ -179,6 +179,9 @@ logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
 
+# Devices whose streams and events back the deferred destination publish.
+_DEFER_PUBLISH_DEVICE_TYPES = ("cuda", "xpu")
+
 if TYPE_CHECKING:
     from sglang.srt.managers.io_struct import AbortReq
     from sglang.srt.managers.schedule_batch import Req
@@ -449,7 +452,7 @@ class DecodeRequest:
 
 
 class _PendingPublish(msgspec.Struct, frozen=True):
-    allocated: torch.cuda.Event
+    allocated: torch.Event
     decode_req: DecodeRequest
     dst_kv_indices: torch.Tensor
     prefix_len: int
@@ -510,6 +513,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         self.host_reserved_tokens = 0
         self.host_window_entries = []
         self.gloo_group = parallel.attn_tp_group.cpu_group
+        self._device_module = torch.get_device_module(get_device().device)
         # Destinations published or deferred, but not yet on the transfer queue.
         self._num_published_destinations = 0
         # A page-index readback on the WAR-fenced schedule stream would wait on the
@@ -521,7 +525,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             and not scheduler.enable_hisparse
             # Staging registers a room only at publish but polls every queued request.
             and not transfer_queue.enable_staging
-            and torch.cuda.is_available()
+            # XPU also needs SGLANG_ENABLE_WAR_BARRIER, which is on by default only on CUDA.
+            and get_device().device in _DEFER_PUBLISH_DEVICE_TYPES
+            and self._device_module.is_available()
             and is_war_barrier_enabled()
         )
         self._pending_publish: List[_PendingPublish] = []
@@ -529,7 +535,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # so this cannot alias a stream that waits on the forward; on ROCm,
         # high-priority NCCL streams share the pool, a slot repeating every 32 draws.
         self._publish_stream = (
-            torch.cuda.Stream(priority=-1) if self._defer_publish else None
+            self._device_module.Stream(priority=-1) if self._defer_publish else None
         )
         self.tp_rank = parallel.tp_rank
         self.gpu_id = gpu_id
@@ -1992,7 +1998,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 # A take of pages a forward may still use (freed while it ran)
                 # queued its wait for that forward on this stream first, so this
                 # event, and the readback the publish gates on it, follow it.
-                allocated = torch.cuda.Event()
+                allocated = self._device_module.Event()
                 allocated.record()
                 storage = self._storage()
                 # The publish reads these rows' ids back later, off the
@@ -2074,8 +2080,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             else:
                 # A page move since the allocation rebinds these ids on the
                 # schedule stream: read them back after it.
-                self._publish_stream.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(self._publish_stream):
+                self._publish_stream.wait_stream(self._device_module.current_stream())
+            with self._device_module.stream(self._publish_stream):
                 self._publish_destination(
                     decode_req=entry.decode_req,
                     dst_kv_indices=entry.dst_kv_indices,
@@ -2090,7 +2096,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self.note_destinations_queued(1)
         # Order the publish stream's writes (e.g. request-state clears) before
         # later schedule-stream work, which the forwards wait on.
-        torch.cuda.current_stream().wait_stream(self._publish_stream)
+        self._device_module.current_stream().wait_stream(self._publish_stream)
 
     def _publish_destination(
         self,

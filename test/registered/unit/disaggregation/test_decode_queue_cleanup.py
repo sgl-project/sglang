@@ -422,6 +422,7 @@ class TestDeferredDestinationPublish(CustomTestCase):
         queue._defer_publish = True
         queue._pending_publish = []
         queue._publish_stream = MagicMock()
+        queue._device_module = MagicMock()
         queue._resolve_pending_reqs = MagicMock()
         queue._update_handshake_waiters = MagicMock()
         queue._uses_swa_tail_prealloc = MagicMock(return_value=False)
