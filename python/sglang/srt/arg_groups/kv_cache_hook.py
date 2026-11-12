@@ -548,6 +548,13 @@ def handle_unified_memory_pool(server_args: Any) -> None:
             "--enable-unified-memory with PD disaggregation does not support "
             "speculative decoding with the Mooncake transfer backend."
         )
+        # This flag also selects decode's non-blocking metadata readback, which
+        # records a receive as in flight before its destination is published.
+        assert not envs.SGLANG_DISAGG_STAGING_BUFFER.get(), (
+            "--enable-unified-memory with PD disaggregation does not support "
+            "SGLANG_DISAGG_STAGING_BUFFER: heterogeneous-TP staging is not "
+            "supported with unified memory; unset SGLANG_DISAGG_STAGING_BUFFER."
+        )
         assert not cfg.enable_hisparse, (
             "--enable-unified-memory with PD disaggregation is not compatible "
             "with --enable-hisparse: the decode-side HiSparse prealloc path "
@@ -640,6 +647,25 @@ def handle_unified_memory_pool(server_args: Any) -> None:
         "--enable-hierarchical-cache: HiCache keeps the draft on a private "
         "pool, and would pack an MTP head's KV into the target's "
         "page-envelope host pool, which refuses per-layer draft loads."
+    )
+    assert not (
+        cfg.pp_size > 1
+        and cfg.enable_hierarchical_cache
+        and cfg.hicache_host_memory_mode == "buffer_only"
+    ), (
+        "--enable-unified-memory with --pp-size > 1 does not support "
+        "--hicache-host-memory-mode buffer_only: each pipeline stage drains its "
+        "own backup completions, so the stages' eviction credit, and with it "
+        "their capacity decisions, can differ."
+    )
+    assert not (
+        cfg.pp_size > 1
+        and (cfg.enable_streaming_session or cfg.enable_session_radix_cache)
+    ), (
+        "--enable-unified-memory with --pp-size > 1 does not support "
+        "--enable-streaming-session or --enable-session-radix-cache: each "
+        "pipeline stage closes timed-out sessions on its own clock, so the "
+        "memory the stages hold, and with it their capacity decisions, can differ."
     )
     if cfg.dcp_size > 1:
         _validate_unified_memory_dcp(server_args)
@@ -762,6 +788,15 @@ def handle_page_major_kv_layout(server_args: Any):
 
     cfg = resolving_view(server_args)
     if cfg.enable_unified_memory:
+        # Unified memory relies on the scheduler's write-after-read barrier, a device
+        # stream wait; on MPS (MLX included) the scheduler has no device streams.
+        if cfg.device == "mps":
+            raise ValueError(
+                "--enable-unified-memory is not supported on MPS: it orders the "
+                "scheduler's writes after the running forward's reads with "
+                "device stream waits, and the scheduler has no device streams "
+                "on MPS or MLX."
+            )
         declare_resolution(
             server_args,
             "_handle_page_major_kv_layout",

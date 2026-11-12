@@ -326,6 +326,26 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
     def get_ksize_per_token(self):
         return self.get_size_per_token()
 
+    def get_mapping_lengths(self) -> list[int]:
+        if self.layout != "page_first_kv_split" or self._native_buffers is None:
+            return super().get_mapping_lengths()
+        native = self._native_buffers
+        k_width = native.k_width if self.dsa_kv_cache_store_fp8 else self.kv_lora_rank
+        per_row_widths = [
+            self.layer_num * k_width * self.dtype.itemsize,
+            self.layer_num * self.qk_rope_head_dim * self.dtype.itemsize,
+        ]
+        index_layers = len(native.index_layer_indices)
+        if native.index_k is not None:
+            per_row_widths.append(
+                index_layers * native.index_width * self.dtype.itemsize
+            )
+        if native.index_scales is not None:
+            # FP32 scale mirror
+            per_row_widths.append(index_layers * 4)
+        rows = self.page_num * self.page_size
+        return [rows * width for width in per_row_widths]
+
     def init_kv_buffer(self):
         if self.layout == "layer_first":
             dims = (
