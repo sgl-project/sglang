@@ -20,9 +20,9 @@ from sglang.srt.model_executor.forward_mode import ForwardMode
 class ForwardMetadata:
     """Per-forward attention state shared across decoder layers.
 
-    Keep one metadata class as the backend grows: extend it with optional or
-    defaulted fields for new execution modes, cache layouts, attention features
-    and kernel scheduling needs, rather than adding feature-specific classes.
+    Keep one metadata class per backend as it grows, with optional or defaulted
+    fields for new execution modes and kernel scheduling needs. Specialized
+    backends can extend this class with cache-layout-specific fields.
     Prepare batch-dependent state once and reuse it across layers.
     """
 

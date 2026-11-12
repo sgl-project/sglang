@@ -94,3 +94,41 @@ def merge_state_triton(
         output_lse is not None,
     )
     return output, output_lse
+
+
+def merge_state_mlu(
+    prefix_output: torch.Tensor,
+    prefix_lse: torch.Tensor,
+    suffix_output: torch.Tensor,
+    suffix_lse: torch.Tensor,
+    output: Optional[torch.Tensor] = None,
+    output_lse: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    import torch_mlu_ops
+
+    # Adapt to update_out_and_lse: add a leading batch dimension to output
+    # [num_tokens, num_heads, value_head_dim], and transpose LSE from
+    # [num_tokens, num_heads] to [1, num_heads, num_tokens].
+    lse = prefix_lse.transpose(0, 1).contiguous().unsqueeze(0)
+    block_lse = suffix_lse.transpose(0, 1).contiguous().unsqueeze(0)
+    if output is None:
+        output = torch.empty_like(prefix_output)
+    if output_lse is None:
+        output_lse = torch.empty_like(lse).squeeze(0).transpose(0, 1)
+
+    result_lse = output_lse.transpose(0, 1).unsqueeze(0)
+    copy_lse = not result_lse.is_contiguous()
+    if copy_lse:
+        result_lse = torch.empty_like(lse)
+
+    _, merged_lse = torch_mlu_ops.update_out_and_lse(
+        prefix_output.unsqueeze(0),
+        lse,
+        suffix_output.unsqueeze(0),
+        block_lse,
+        result=output.unsqueeze(0),
+        result_lse=result_lse,
+    )
+    if copy_lse:
+        output_lse.copy_(merged_lse.squeeze(0).transpose(0, 1))
+    return output, output_lse
