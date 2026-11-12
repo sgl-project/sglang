@@ -25,6 +25,7 @@ class TestNemotronLabsDiffusion(CustomTestCase):
             ("Translate to French: The cat is sleeping.", "chat"),
             ("Explain in one short sentence why ice floats on water.", "less dense"),
         ]
+        ar_output_ids = {}
         for algorithm in (None, "NemotronFastDiffuser", "NemotronLinearSpec"):
             args = [
                 "--context-length",
@@ -85,6 +86,14 @@ class TestNemotronLabsDiffusion(CustomTestCase):
                         data = response.json()
                         self.assertEqual(data["meta_info"]["completion_tokens"], limit)
                         self.assertNotIn(100, data["output_ids"])
+                        if algorithm is None:
+                            ar_output_ids[limit] = data["output_ids"]
+                        elif algorithm == "NemotronLinearSpec":
+                            self.assertEqual(
+                                data["output_ids"],
+                                ar_output_ids[limit],
+                                f"Self-speculation differs from AR at limit {limit}",
+                            )
                     if algorithm is not None:
                         for unsupported in (
                             {"temperature": 1},
