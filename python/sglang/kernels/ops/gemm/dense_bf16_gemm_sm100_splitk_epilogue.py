@@ -43,7 +43,8 @@ _SUPPORTED_MMA_N = (8, 16, 32)
 #: Physical cluster-K sizes; split 1 compiles out the DSMEM path.
 _SUPPORTED_SPLIT_K = (1, 2, 3, 4, 8, 16)
 
-#: Largest public M this low-M policy serves.
+#: Largest public M this low-M policy serves by default; a caller may raise it (``max_m``),
+#: since the grid tiles public M.
 _MAX_M = 32
 
 #: Bytes per FP32 partial exchanged through DSMEM.
@@ -136,6 +137,7 @@ def validate_tactic(
     k: int,
     *,
     smem_capacity: int = _SMEM_CAPACITY_BYTES,
+    max_m: int = _MAX_M,
 ) -> None:
     """Reject a tactic that cannot serve ``(m, n, k)``."""
     if tactic.mma_m not in _SUPPORTED_MMA_M:
@@ -149,8 +151,10 @@ def validate_tactic(
             f"ab_stages must be in [{_MIN_AB_STAGES}, {_MAX_AB_STAGES}], "
             f"got {tactic.ab_stages}"
         )
-    if not 1 <= m <= _MAX_M:
-        raise ValueError(f"this low-M policy requires 1 <= M <= {_MAX_M}, got {m}")
+    if not 1 <= m <= max(max_m, _MAX_M):
+        raise ValueError(
+            f"this low-M policy requires 1 <= M <= {max(max_m, _MAX_M)}, got {m}"
+        )
     if n <= 0:
         raise ValueError(f"N must be positive, got {n}")
     if k <= 0 or k % _CTA_K or (k // _CTA_K) % tactic.split_k:
@@ -1244,9 +1248,11 @@ def run_splitk_dense_silu(
     pdl: bool,
     tactic: SplitKTactic,
     scale: float,
+    *,
+    max_m: int = _MAX_M,
 ):
     """Run ``bf16(silu(scale * (A[M,K] @ B[K,N])))``."""
-    validate_tactic(tactic, *_validate_runtime_tensors(a, b, None, out))
+    validate_tactic(tactic, *_validate_runtime_tensors(a, b, None, out), max_m=max_m)
     cute_tensors = _to_cute_swap(a, b, out, None)
     compiled = _get_compiled_splitk_kernel(
         dtype=a.dtype,

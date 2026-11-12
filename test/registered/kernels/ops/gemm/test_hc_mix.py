@@ -100,5 +100,30 @@ def test_hc_mix_splitk_matches_reference_and_repeats_bitwise(num_tokens):
         assert torch.equal(hc_mix(x, w_down, w_up_p, HC_COUNT, HIDDEN_SIZE), out)
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10,
+    reason="the split-K epilogue GEMM is tcgen05 (sm_100 family) only",
+)
+def test_splitk_dense_silu_serves_a_raised_max_m():
+    """Above the default M bound only with a caller's ``max_m``; the grid tiles M."""
+    from sglang.kernels.ops.gemm.dense_bf16_gemm_sm100_splitk_epilogue import (
+        default_tactic,
+        run_splitk_dense_silu,
+    )
+
+    m, n, k, scale = 64, LOWRANK, HC_COUNT * HIDDEN_SIZE, 1.0 / HC_COUNT
+    x, w_down, _ = _make_inputs(m, torch.bfloat16)
+    out = torch.empty((m, n), dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(ValueError, match="M <= 32"):
+        run_splitk_dense_silu(x, w_down.T, out, True, default_tactic(32, n, k), scale)
+    run_splitk_dense_silu(
+        x, w_down.T, out, True, default_tactic(32, n, k), scale, max_m=m
+    )
+    ref = F.silu(scale * (x.to(torch.float64) @ w_down.T.to(torch.float64)))
+    torch.testing.assert_close(
+        out.to(torch.float64), ref, **_TOLERANCES[torch.bfloat16]
+    )
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
