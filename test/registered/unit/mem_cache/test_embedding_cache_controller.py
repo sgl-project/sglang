@@ -397,6 +397,9 @@ class _FakeDeviceTensor:
     def record_stream(self, stream):
         self.recorded_stream = stream
 
+    def __getitem__(self, key):
+        return self
+
 
 class TestDeviceAgnosticCopyPath(unittest.TestCase):
     """The D2H staging path must dispatch on the tensor device, not on CUDA."""
@@ -447,6 +450,106 @@ class TestDeviceAgnosticCopyPath(unittest.TestCase):
         self.assertIs(tensor.recorded_stream, copy_stream)
         event.record.assert_called_once_with(copy_stream)
         self.assertEqual(handle.device, torch.device("npu:0"))
+
+    def test_load_to_device_async_dispatches_on_npu_device(self):
+        """The H2D cache-hit path (host pool -> NPU) must dispatch on the
+        tensor device and run the copy on the side copy stream."""
+        ctrl = _make_controller(num_pages=4, dim=4, page_size=2)
+        src = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+        _insert_ready_entry(ctrl, "h", src)
+
+        dst = _FakeDeviceTensor("npu:0")
+        copy_stream = MagicMock()
+        event = MagicMock()
+
+        with (
+            mock.patch.object(
+                embedding_cache_controller, "create_device_event", return_value=event
+            ) as create_device_event,
+            mock.patch.object(
+                embedding_cache_controller,
+                "device_stream_context",
+                return_value=MagicMock(),
+            ) as device_stream_context,
+            mock.patch.object(ctrl, "_get_copy_stream", return_value=copy_stream),
+            mock.patch.object(
+                embedding_cache_controller,
+                "_build_host_device_transfer_plan",
+                side_effect=lambda *args, **kwargs: ([0], [0], [2]),
+            ),
+        ):
+            copied = {}
+
+            def fake_copy_(other, non_blocking=False):
+                copied["non_blocking"] = non_blocking
+                copied["src"] = other
+
+            def fake_page_runs_copy(*args, **kwargs):
+                # dst is our fake tensor; emulate _copy_embedding_page_runs'
+                # per-slice copy_ fallback with the single-run plan above.
+                dst = kwargs["dst"]
+                dst[0:2].copy_ = fake_copy_
+
+            with mock.patch.object(
+                ctrl,
+                "_copy_embedding_page_runs",
+                side_effect=fake_page_runs_copy,
+            ):
+                handle = ctrl.load_to_device_async("h", dst, dst_token_offset=0)
+
+        self.assertIsNotNone(handle)
+        create_device_event.assert_called_once_with(torch.device("npu:0"))
+        device_stream_context.assert_called_once_with(copy_stream)
+        event.record.assert_called_once_with(copy_stream)
+        self.assertEqual(handle.device, torch.device("npu:0"))
+        self.assertEqual(handle.entry_hash, "h")
+        # The READY entry stays pinned until wait_load_to_device().
+        self.assertEqual(ctrl.entries["h"].ref_count, 1)
+
+        event.synchronize = MagicMock()
+        ctrl.wait_load_to_device([handle])
+        event.synchronize.assert_called_once_with()
+        self.assertEqual(ctrl.entries["h"].ref_count, 0)
+        self.assertIn("h", ctrl.vision_pool.evictable)
+
+    def test_load_to_device_async_copies_pool_data_on_cpu_equivalent_path(self):
+        """Verify the resulting embedding: on a CPU host pool the same H2D
+        copy path must reproduce the stored pool pages in the destination.
+        The copy-stream cache is pre-seeded and the stream context is
+        stubbed (torch.cpu.Stream lacks .device on some torch versions), so
+        the data path (transfer plan, page-run copies, event, pin/unpin)
+        runs unmocked."""
+        ctrl = _make_controller(num_pages=4, dim=4, page_size=2)
+        src = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+        _insert_ready_entry(ctrl, "h", src)
+
+        class _NullDeviceStreamContext:
+            def __init__(self, stream):
+                pass
+
+            def __enter__(self):
+                pass
+
+            def __exit__(self, *exc):
+                return False
+
+        ctrl._copy_streams["cpu"] = torch.cpu.Stream()
+        dst = torch.zeros((2, 4), dtype=torch.float32)
+        with mock.patch.object(
+            embedding_cache_controller,
+            "device_stream_context",
+            _NullDeviceStreamContext,
+        ):
+            handle = ctrl.load_to_device_async("h", dst, dst_token_offset=0)
+        self.assertIsNotNone(handle)
+
+        ctrl.wait_load_to_device([handle])
+        self.assertTrue(torch.equal(dst, src))
+
+    def test_load_to_device_async_missing_entry_returns_none(self):
+        ctrl = _make_controller(num_pages=4, dim=4, page_size=2)
+
+        self.assertIsNone(ctrl.load_to_device_async("missing", torch.zeros((2, 4)), 0))
 
 
 def _insert_ready_entry(ctrl, mm_hash, tensor, modality=Modality.IMAGE):
