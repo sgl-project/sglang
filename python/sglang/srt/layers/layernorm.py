@@ -707,6 +707,11 @@ class RMSNorm(BaseFusedOp):
         post_residual_addition: Optional[torch.Tensor] = None,
         quant_linear: Optional[nn.Module] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if self.cast_x_before_out_mul:
+            # NPU fused norms do not expose the activation cast before weighting.
+            return self.forward_native(
+                x, residual, post_residual_addition, quant_linear
+            )
         if residual is not None:
             if post_residual_addition is not None:
                 residual = residual + post_residual_addition
