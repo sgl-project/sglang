@@ -25,6 +25,12 @@ NOPE_ROPE_BYTES = DIM_NOPE + DIM_ROPE * 2  # 576
 PADDED_SCALE_PER_TOKEN = NUM_SCALE_TILES + 1  # 8
 
 
+def _check_out(out: torch.Tensor) -> None:
+    # An fp8 ``out`` is a plain e4m3 workspace with an implicit unit scale: the
+    # gathers dequantize in fp32 and cast once at the store.
+    assert out.dtype in (torch.bfloat16, fp8_dtype), out.dtype
+
+
 def dequantize_k_cache_paged_dsv4(
     quant_k_cache: torch.Tensor,
     page_table_1_flattened: torch.Tensor,
@@ -38,13 +44,14 @@ def dequantize_k_cache_paged_dsv4(
         quant_k_cache: (num_pages, bytes_per_page_padded) uint8.
         page_table_1_flattened: (num_tokens,) int — token IDs into the cache.
         page_size: number of tokens per page.
-        out: optional (num_tokens, 1, DIM_NOPE + DIM_ROPE) bf16 destination.
+        out: optional (num_tokens, 1, DIM_NOPE + DIM_ROPE) bf16 or e4m3
+            destination; an e4m3 ``out`` holds the values cast once with unit scale.
             May be a slice of a larger workspace; the kernel uses out.stride(0)
             so contiguous-along-dim-0 slices work.
         layout: the cache's :class:`KVLayout`.
 
     Returns:
-        (num_tokens, 1, DIM_NOPE + DIM_ROPE) bfloat16.
+        (num_tokens, 1, DIM_NOPE + DIM_ROPE) bfloat16 (or ``out``'s dtype).
     """
     layout = KVLayout.parse(layout)
     if layout is not KVLayout.V4:
@@ -74,7 +81,9 @@ def dequantize_k_cache_paged_dsv4(
         )
     else:
         assert out.shape == (num_tokens, 1, DIM_NOPE + DIM_ROPE)
-        assert out.dtype == torch.bfloat16
+    _check_out(out)
+    if num_tokens == 0:
+        return out
 
     tokens_per_prog = 4
     _dequantize_k_cache_paged_kernel[(triton.cdiv(num_tokens, tokens_per_prog),)](
@@ -109,7 +118,8 @@ def dequantize_k_cache_paged_v41(
     """Dequantize a V4.1 paged cache (fp8 ``V41`` / ``V41_NEW`` or fp4 ``V41_FP4`` / ``V41_FP4_NEW``) for a list
     of token IDs into ``(num_tokens, 1, 512)`` bf16.
 
-    Bit-exact with the pure-torch dequantizer of these formats.
+    Bit-exact with the pure-torch dequantizer of these formats. ``out`` may be
+    e4m3, as in :func:`dequantize_k_cache_paged_dsv4`.
     """
     layout = KVLayout.parse(layout)
     assert layout.encoding in (KVLayout.V41, KVLayout.V41_FP4), layout
@@ -141,7 +151,7 @@ def dequantize_k_cache_paged_v41(
         )
     else:
         assert out.shape == (num_tokens, 1, DIM_NOPE + DIM_ROPE)
-        assert out.dtype == torch.bfloat16
+    _check_out(out)
     if num_tokens == 0:
         return out
 
@@ -310,9 +320,10 @@ def _dequantize_k_cache_paged_kernel(
     rope_offs = tl.arange(0, DIM_ROPE)
     bf16_off = (token_data_base[:, None] + DIM_NOPE) // 2 + rope_offs[None, :]
     rope_data = tl.load(buf_bf16_ptr + bf16_off, mask=tmask[:, None], other=0.0)
+    # A bf16 workspace keeps the cache's rope bits unchanged; an fp8 one casts them.
     tl.store(
         output_ptr + out_row_base[:, None] + DIM_NOPE + rope_offs[None, :],
-        rope_data,
+        rope_data.to(output_ptr.dtype.element_ty),
         mask=tmask[:, None],
     )
 
@@ -351,6 +362,17 @@ def _v41_dequant_to_bf16(value, IS_HIP: tl.constexpr):
         bits = result.to(tl.uint16, bitcast=True)
         bits = tl.where((bits & 0x7FFF) > 0x7F80, 0x7FC0, bits).to(tl.uint16)
         result = bits.to(tl.bfloat16, bitcast=True)
+    return result
+
+
+@triton.jit
+def _v41_store_cast(value, out_ty: tl.constexpr, IS_HIP: tl.constexpr):
+    # A bf16 workspace keeps the canonical-NaN conversion; an fp8 one is cast once
+    # from fp32 (going through bf16 first would round twice).
+    if out_ty == tl.bfloat16:
+        result = _v41_dequant_to_bf16(value, IS_HIP)
+    else:
+        result = value.to(out_ty)
     return result
 
 
@@ -399,7 +421,7 @@ def _dequantize_k_cache_paged_v41_fp8_kernel(
     out = vals * _ue8m0_to_fp32(scale_u8)
     tl.store(
         output_ptr + token_id[:, None] * output_stride_0 + offs[None, :],
-        _v41_dequant_to_bf16(out, IS_HIP),
+        _v41_store_cast(out, output_ptr.dtype.element_ty, IS_HIP),
         mask=mask,
     )
 
@@ -447,8 +469,9 @@ def _dequantize_k_cache_paged_v41_fp4_kernel(
         buf_fp8_ptr + token_scale_base[:, None] + ((2 * boffs) // TILE_SIZE)[None, :],
         mask=mask,
     ).to(tl.float32)
-    lo = _v41_dequant_to_bf16(_e2m1_code_to_fp32(packed & 0xF) * scale, IS_HIP)
-    hi = _v41_dequant_to_bf16(_e2m1_code_to_fp32(packed >> 4) * scale, IS_HIP)
+    out_ty = output_ptr.dtype.element_ty
+    lo = _v41_store_cast(_e2m1_code_to_fp32(packed & 0xF) * scale, out_ty, IS_HIP)
+    hi = _v41_store_cast(_e2m1_code_to_fp32(packed >> 4) * scale, out_ty, IS_HIP)
     cols = tl.arange(0, 2 * DATA_BYTES)
     tl.store(
         output_ptr + token_id[:, None] * output_stride_0 + cols[None, :],
