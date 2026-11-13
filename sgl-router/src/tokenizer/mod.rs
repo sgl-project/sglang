@@ -237,7 +237,16 @@ impl TokenizerRegistry {
 
     /// Encode a raw prompt as the engine's `tokenizer(text)` does, special tokens included.
     pub fn encode_prompt(&self, model_id: &str, text: &str) -> Option<Vec<u32>> {
+        if !self.can_encode_prompt(model_id) {
+            return None;
+        }
         crate::off_worker::run(|| self.encode_prompt_now(model_id, text))
+    }
+
+    /// Whether [`Self::encode_prompt`] can tokenize for `model_id`; callers check
+    /// it before handing a batch off the worker for nothing.
+    pub fn can_encode_prompt(&self, model_id: &str) -> bool {
+        self.prompt_affixes.is_some() && self.inner.contains_key(model_id)
     }
 
     fn encode_prompt_now(&self, model_id: &str, text: &str) -> Option<Vec<u32>> {

@@ -241,7 +241,9 @@ class EaglePostVerifyGraphs:
         state_slots = None
         if "state_slots" in staged:
             state_slots = ForwardStateSlots(
-                staged["state_slots"], staged.get("track_state_slots")
+                staged["state_slots"],
+                staged.get("track_state_slots"),
+                staged.get("ring_rows"),
             )
         commit_mamba_states_after_verify(
             self._target_worker,
@@ -512,4 +514,6 @@ def _post_verify_inputs(
         inputs["state_slots"] = state_slots.working
         if state_slots.track is not None:
             inputs["track_state_slots"] = state_slots.track
+        if state_slots.ring is not None:
+            inputs["ring_rows"] = state_slots.ring
     return inputs

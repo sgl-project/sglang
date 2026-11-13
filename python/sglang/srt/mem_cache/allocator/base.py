@@ -16,7 +16,8 @@ limitations under the License.
 from __future__ import annotations
 
 import abc
-from typing import TYPE_CHECKING, Dict, Mapping, Optional, Tuple
+from types import MappingProxyType
+from typing import TYPE_CHECKING, Any, Dict, Mapping, Optional, Tuple
 
 import torch
 
@@ -44,6 +45,12 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     storage: Optional[KVStorage] = None
     # The steps a lazily compacting unified pool's freed pages wait for.
     forward_steps: Optional[ForwardSteps] = None
+    # The request sub-pools' bands by name; only a unified chain has any.
+    request_allocators: Mapping[str, Any] = MappingProxyType({})
+
+    def request_id_spaces(self) -> Dict[str, IdSpace]:
+        """Each request sub-pool's id space; only a unified chain has any."""
+        return {}
 
     @property
     def state_slots(self):

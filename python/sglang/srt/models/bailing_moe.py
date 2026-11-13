@@ -337,7 +337,10 @@ class BailingMoESparseMoeBlock(nn.Module):
                 reduce_results=False,
                 prefix=add_prefix("shared_experts", prefix),
                 parallel_group="replicated"
-                if get_moe_a2a_backend().is_deepep()
+                if (
+                    get_moe_a2a_backend().is_deepep()
+                    or get_moe_a2a_backend().is_ascend_ops()
+                )
                 else "tp",
             )
         # dispatcher
@@ -360,7 +363,10 @@ class BailingMoESparseMoeBlock(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: Optional[ForwardBatch] = None,
     ) -> torch.Tensor:
-        if not get_moe_a2a_backend().is_deepep():
+        if (
+            not get_moe_a2a_backend().is_deepep()
+            and not get_moe_a2a_backend().is_ascend_ops()
+        ):
             return self.forward_normal(hidden_states, forward_batch)
         else:
             return self.forward_deepep(hidden_states, forward_batch)
