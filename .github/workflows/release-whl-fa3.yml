@@ -1,0 +1,197 @@
+name: Release sgl-fa3
+
+# The package (CMake, Python wrapper, tests, build.sh) lives in
+# sgl-project/sgl-flash-attn under sgl_fa3/. The build image
+# (docker/sgl-fa3.Dockerfile), the wheel retag script and the index script
+# (scripts/rename_sgl_fa3_whl.sh, scripts/update_fa3_whl_index.py) live here.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Wheel version (e.g. 0.1.0, 0.1.1rc0)"
+        type: string
+        required: true
+      branch:
+        description: "sgl-flash-attn branch to build from (default: sgl-kernel)"
+        type: string
+        required: false
+        default: 'sgl-kernel'
+      validation_only:
+        description: "Build and test without publishing wheels"
+        type: boolean
+        required: false
+        default: false
+      skip_tests:
+        description: "Skip the GPU test suite (publishes untested wheels)"
+        type: boolean
+        required: false
+        default: false
+
+concurrency:
+  group: release-sgl-fa3-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Must match TORCH_VER in docker/sgl-fa3.Dockerfile and the pin in sgl_fa3/pyproject.toml:
+  # the extension uses the regular torch C++ ABI and only loads against this torch.
+  TORCH_VER: "2.14.1"
+  FA3_REPO: sgl-project/sgl-flash-attn
+
+jobs:
+  build:
+    if: github.repository == 'sgl-project/sglang'
+    # One wheel: x86_64 only (FA3 targets sm_80/sm_86/sm_90a), and abi3
+    # (cp310-abi3), built with the oldest CPython it supports.
+    runs-on: x64-kernel-build-node
+    steps:
+      - name: Clean workspace (remove root-owned files from prior runs)
+        run: |
+          docker run --rm -v "${{ github.workspace }}:/workspace" alpine:3 \
+            sh -c 'rm -rf /workspace/..?* /workspace/.[!.]* /workspace/*' || true
+
+      - uses: actions/checkout@v4
+
+      # The build needs only the FA3 sources; CUTLASS is fetched by CMake.
+      - name: Checkout sgl-flash-attn
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.FA3_REPO }}
+          ref: ${{ inputs.branch || 'sgl-kernel' }}
+          path: sgl-flash-attn
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Set wheel version
+        run: |
+          echo "__version__ = \"${{ inputs.version }}\"" > sgl-flash-attn/sgl_fa3/python/sgl_fa3/_version.py
+          cat sgl-flash-attn/sgl_fa3/python/sgl_fa3/_version.py
+
+      - name: Build wheel
+        run: bash sgl-flash-attn/sgl_fa3/scripts/build.sh 3.10 13.0 "${{ github.workspace }}"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: fa3-wheel-x86_64
+          path: sgl-flash-attn/sgl_fa3/dist/*.whl
+
+      - name: Upload PyPI artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: fa3-pypi-x86_64
+          path: sgl-flash-attn/sgl_fa3/dist-pypi/*.whl
+
+  test:
+    needs: build
+    if: ${{ !inputs.skip_tests }}
+    # The sm_80/sm_86 kernels are compiled but there is no Ampere runner to run them on.
+    runs-on: 8-gpu-h200
+    timeout-minutes: 90
+    steps:
+      - name: Checkout sgl-flash-attn
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.FA3_REPO }}
+          ref: ${{ inputs.branch || 'sgl-kernel' }}
+          path: sgl-flash-attn
+
+      # The tests need only sgl_fa3/tests. The source package would shadow the
+      # installed wheel (it has no built extension), so it is removed.
+      - name: Remove the sgl_fa3 source package
+        run: rm -rf sgl-flash-attn/sgl_fa3/python
+
+      - name: Download wheel
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/
+          merge-multiple: true
+          pattern: fa3-wheel-x86_64
+
+      - name: Install wheel and deps
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install "torch==${TORCH_VER}" --index-url https://download.pytorch.org/whl/cu130 --force-reinstall
+          python3 -m pip install numpy einops pytest
+          # --force-reinstall: a base image may already carry this version, in
+          # which case pip skips the wheel and the job tests a stale extension.
+          python3 -m pip install dist/*.whl --force-reinstall --no-deps
+          # The ops register at import time, so a missing symbol surfaces here
+          # rather than at the first launch.
+          python3 -c "
+          import os
+          import torch
+          import sgl_fa3
+          print('sgl_fa3:', sgl_fa3.__file__, sgl_fa3.__version__)
+          assert not sgl_fa3.__file__.startswith(os.environ['GITHUB_WORKSPACE']), 'not the installed wheel'
+          assert sgl_fa3.__version__ == '${{ inputs.version }}', sgl_fa3.__version__
+          assert torch.ops.sgl_fa3.fwd.default is not None
+          assert torch.ops.sgl_fa3.get_scheduler_metadata.default is not None
+          "
+
+      - name: Run tests
+        run: python3 -m pytest sgl-flash-attn/sgl_fa3/tests -q
+
+  release:
+    if: |
+      !cancelled() && !inputs.validation_only &&
+      needs.build.result == 'success' &&
+      (needs.test.result == 'success' || needs.test.result == 'skipped')
+    needs: [build, test]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/
+          merge-multiple: true
+          pattern: fa3-wheel-*
+
+      - name: Download PyPI artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist-pypi/
+          merge-multiple: true
+          pattern: fa3-pypi-*
+
+      - name: Record that the GPU test suite was skipped
+        if: ${{ inputs.skip_tests }}
+        run: |
+          echo "Releasing v${{ inputs.version }} with the GPU test suite skipped." \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload to PyPI
+        run: |
+          pip install --upgrade twine "packaging>=24.2"
+          python3 -m twine upload --skip-existing dist-pypi/* -u __token__ -p ${{ secrets.SGL_FA3_PYPI_TOKEN }}
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: sgl-fa3-v${{ inputs.version }}
+          repository: sgl-project/whl
+          token: ${{ secrets.GH_PAT_FOR_WHL_RELEASE }}
+          files: |
+            dist/*
+
+      - name: Clone wheel index
+        run: git clone https://oauth2:${WHL_TOKEN}@github.com/sgl-project/whl.git sgl-whl
+        env:
+          WHL_TOKEN: ${{ secrets.GH_PAT_FOR_WHL_RELEASE }}
+
+      - name: Update wheel index
+        run: python3 scripts/update_fa3_whl_index.py --cuda 130
+
+      - name: Push wheel index
+        run: |
+          cd sgl-whl
+          git config --local user.name "sglang-bot"
+          git config --local user.email "sglangbot@gmail.com"
+          git add -A
+          git commit -m "update sgl-fa3 whl index for v${{ inputs.version }}${{ inputs.skip_tests && ' (GPU tests skipped)' || '' }}"
+          git push
