@@ -450,6 +450,80 @@ def _handle_dflash(server_args: ServerArgs) -> None:
         )
 
 
+def _handle_ubtree(server_args: ServerArgs) -> None:
+    from sglang.srt.hf_transformers import get_config
+    from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
+    from sglang.srt.speculative.ubtree_components.config import (
+        parse_ubtree_config,
+        resolve_verify_width,
+        validate_runtime_config,
+    )
+
+    cfg = resolving_view(server_args)
+    # ROCm also uses torch's "cuda" device type. UBTree requires the NVIDIA
+    # implementation of FA3 and its CUDA-specific state/graph kernels.
+    if not current_platform.is_cuda():
+        raise ValueError(
+            "UBTREE currently supports NVIDIA CUDA GPUs only; "
+            f"got platform {current_platform.device_name!r}."
+        )
+    if cfg.speculative_draft_model_path is None:
+        raise ValueError("UBTREE requires --speculative-draft-model-path")
+    if attn_dp_enabled_of(cfg):
+        raise ValueError("UBTREE does not support DP attention")
+    target = model_config_of(server_args)
+    if "BailingMoeV3ForCausalLM" not in target.hf_config.architectures:
+        raise ValueError("UBTREE currently supports Ling3 BailingMoeV3 targets")
+
+    draft = get_config(
+        cfg.speculative_draft_model_path,
+        trust_remote_code=cfg.trust_remote_code,
+        revision=cfg.speculative_draft_model_revision,
+        model_override_args=json.loads(cfg.json_model_override_args),
+    )
+    tree = parse_ubtree_config(draft)
+    if draft.vocab_size != target.vocab_size:
+        raise ValueError(
+            f"UBTREE draft vocab_size {draft.vocab_size} must match the target "
+            f"vocab_size {target.vocab_size}. Use the UBTree draft exported for "
+            "this target checkpoint."
+        )
+    width = resolve_verify_width(tree, cfg.speculative_num_draft_tokens)
+    if cfg.speculative_dflash_block_size not in (None, tree.block_size):
+        raise ValueError("UBTREE draft block size does not match the checkpoint")
+    # The backend uses topk>1 to enable direct-parent tree metadata. UBTree's
+    # actual irregular topology is carried by UBTreeVerifyInput, not topk.
+    declare_resolution(
+        server_args,
+        "_handle_ubtree",
+        speculative_dflash_block_size=tree.block_size,
+        speculative_num_draft_tokens=width,
+        speculative_num_steps=tree.depth_count,
+        speculative_eagle_topk=2,
+        max_running_requests=(
+            1 if cfg.max_running_requests is None else cfg.max_running_requests
+        ),
+        enable_mixed_chunk=False,
+    )
+    graph = cfg.cuda_graph_config
+    if graph.decode.backend != Backend.DISABLED:
+        locked = server_args._cuda_graph_config_locked
+        if (Phase.PREFILL, "backend") not in locked:
+            graph = with_phase(graph, Phase.PREFILL, backend=Backend.DISABLED)
+        if not {(Phase.DECODE, "bs"), (Phase.DECODE, "max_bs")} & locked:
+            graph = with_phase(graph, Phase.DECODE, bs=[1], max_bs=1)
+        declare_resolution(
+            server_args,
+            "_handle_ubtree",
+            cuda_graph_config=graph,
+            disable_cuda_graph_padding=True,
+        )
+    _resolve_dflash_draft_attention_backend(server_args)
+    validate_runtime_config(cfg, tuple(attention_backends_of(cfg)))
+    if cfg.enable_unified_memory:
+        raise ValueError("UBTREE does not yet support unified memory")
+
+
 def _handle_uno(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
 

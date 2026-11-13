@@ -36,6 +36,7 @@ class SpeculativeAlgorithm(Enum):
     """
 
     DFLASH = auto()
+    UBTREE = auto()
     UNO = auto()
     DSPARK = auto()
     EAGLE = auto()
@@ -116,6 +117,9 @@ class SpeculativeAlgorithm(Enum):
     def is_dflash(self) -> bool:
         return self == SpeculativeAlgorithm.DFLASH
 
+    def is_ubtree(self) -> bool:
+        return self == SpeculativeAlgorithm.UBTREE
+
     def is_uno(self) -> bool:
         return self == SpeculativeAlgorithm.UNO
 
@@ -123,7 +127,7 @@ class SpeculativeAlgorithm(Enum):
         return self == SpeculativeAlgorithm.DSPARK
 
     def is_dflash_family(self) -> bool:
-        return self.is_dflash() or self.is_dspark()
+        return self in _DFLASH_FAMILY
 
     def is_standalone(self) -> bool:
         return self == SpeculativeAlgorithm.STANDALONE
@@ -141,7 +145,7 @@ class SpeculativeAlgorithm(Enum):
         """
         # DSPARK's draft KV inject runs after the target prefill, but on write
         # locations it computes before the target forward.
-        return self.is_none() or self.is_dflash_family()
+        return self in _PREFILL_SHARED_READ_DONE
 
     def supports_mixed_chunk(self) -> bool:
         """Whether mixed chunk prefill may stay enabled with this algorithm.
@@ -168,7 +172,16 @@ class SpeculativeAlgorithm(Enum):
         # Needs a GPU draft phase to hide the grammar CPU work under: NGRAM drafts
         # from a host corpus lookup, so it stays synchronous by design.
         # STANDALONE inherits the EAGLE V2 worker's verify path, barrier included.
-        return self.is_eagle() or self.is_standalone() or self.is_dflash_family()
+        return self.is_eagle() or self in _GRAMMAR_OVERLAP
+
+    def create_cuda_graph_verify_input(
+        self, *, custom_mask, num_tokens_per_req: int, is_draft_worker: bool
+    ):
+        if not self.is_ubtree() or is_draft_worker:
+            return None
+        from sglang.srt.speculative.ubtree_info import create_ubtree_verify_input
+
+        return create_ubtree_verify_input(custom_mask, num_tokens_per_req)
 
     def has_draft_kv(self) -> bool:
         """Whether the draft phase writes KV chains. NGRAM does not (its tree
@@ -242,6 +255,7 @@ class SpeculativeAlgorithm(Enum):
             _handle_eagle_family,
             _handle_frozen_kv_mtp,
             _handle_ngram,
+            _handle_ubtree,
             _handle_uno,
         )
 
@@ -251,7 +265,9 @@ class SpeculativeAlgorithm(Enum):
 
         read_ragged_verify_mode()
 
-        if self.is_dflash():
+        if self.is_ubtree():
+            _handle_ubtree(server_args)
+        elif self.is_dflash():
             _handle_dflash(server_args)
         elif self.is_uno():
             _handle_uno(server_args)
@@ -320,6 +336,11 @@ class SpeculativeAlgorithm(Enum):
         if platform_worker_cls is not None:
             return platform_worker_cls
 
+        if self.is_ubtree():
+            from sglang.srt.speculative.ubtree_worker_v2 import UBTreeWorkerV2
+
+            return UBTreeWorkerV2
+
         if self.is_dflash():
             # V2 worker drives both overlap and non-overlap (scheduler runs it
             # synchronously when overlap is disabled), same as EAGLE.
@@ -371,6 +392,23 @@ class SpeculativeAlgorithm(Enum):
             return NGRAMWorker
 
         raise ValueError("Unreachable code path in create_worker.")
+
+
+_DFLASH_FAMILY = (
+    SpeculativeAlgorithm.DFLASH,
+    SpeculativeAlgorithm.DSPARK,
+    SpeculativeAlgorithm.UBTREE,
+)
+_PREFILL_SHARED_READ_DONE = (
+    SpeculativeAlgorithm.NONE,
+    SpeculativeAlgorithm.DFLASH,
+    SpeculativeAlgorithm.DSPARK,
+)
+_GRAMMAR_OVERLAP = (
+    SpeculativeAlgorithm.STANDALONE,
+    SpeculativeAlgorithm.DFLASH,
+    SpeculativeAlgorithm.DSPARK,
+)
 
 
 class SpecInputType(IntEnum):
@@ -483,6 +521,16 @@ def create_dummy_verify_input(
     leaves overridden.
     """
     from sglang.srt.model_executor.forward_mode import CaptureHiddenMode
+
+    custom_builder = getattr(spec_algorithm, "create_cuda_graph_verify_input", None)
+    if custom_builder is not None:
+        spec_info = custom_builder(
+            custom_mask=custom_mask,
+            num_tokens_per_req=num_tokens_per_req,
+            is_draft_worker=is_draft_worker,
+        )
+        if spec_info is not None:
+            return spec_info
 
     spec = get_spec_config()
 

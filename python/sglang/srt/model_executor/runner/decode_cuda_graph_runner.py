@@ -2185,6 +2185,20 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         return output
 
     def get_spec_info(self, num_tokens: int, ragged_verify_layout=None):
+        custom_builder = getattr(
+            self.model_runner.spec_algorithm,
+            "create_cuda_graph_verify_input",
+            None,
+        )
+        if custom_builder is not None:
+            spec_info = custom_builder(
+                custom_mask=self.buffers.custom_mask,
+                num_tokens_per_req=self.captured_req_width,
+                is_draft_worker=self.model_runner.is_draft_worker,
+            )
+            if spec_info is not None:
+                return spec_info
+
         spec_info = None
         if (
             self.model_runner.spec_algorithm.is_eagle()

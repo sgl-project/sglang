@@ -20,6 +20,7 @@ from sglang.kernels.ops.attention.trtllm_mha_page_table import (
     build_trtllm_mha_page_table,
 )
 from sglang.kernels.ops.attention.utils import assert_buffer_fits
+from sglang.kernels.ops.speculative.spec_tree import TreeMaskMode
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.base_attn_backend import (
     AttentionBackend,
@@ -72,6 +73,45 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 from sgl_kernel import merge_state_v2
+
+
+def _extract_target_verify_tree_mask(
+    spec_info: SpecInput,
+    *,
+    bs: int,
+    verify_width: int,
+    seq_lens: torch.Tensor,
+    cols: torch.Tensor,
+    valid_num_tokens: Optional[int] = None,
+) -> torch.Tensor:
+    """Return the [bs * verify_width, verify_width] tree visibility matrix.
+
+    FULL_MASK stores prefix columns before each tree suffix and therefore needs
+    a gather, reusing the columns built for the page-table gather. QLEN_ONLY
+    is already the exact suffix matrix and can be viewed
+    directly, eliminating the per-step index construction and gather kernel.
+    """
+    if (
+        getattr(spec_info, "tree_mask_mode", TreeMaskMode.FULL_MASK)
+        == TreeMaskMode.QLEN_ONLY
+    ):
+        required = int(bs) * int(verify_width) * int(verify_width)
+        if spec_info.custom_mask.numel() < required:
+            raise ValueError(
+                "QLEN_ONLY target verify mask is smaller than the captured batch"
+            )
+        return spec_info.custom_mask[:required].view(-1, verify_width)
+
+    cum_len = torch.nn.functional.pad(
+        torch.cumsum((seq_lens + verify_width).repeat_interleave(verify_width), dim=0),
+        (1, 0),
+    )[:-1]
+    mask_extraction_indices = (
+        cols.repeat_interleave(verify_width, dim=0) + cum_len[:, None]
+    ).view(1, -1)
+    if valid_num_tokens is not None:
+        mask_extraction_indices[:, valid_num_tokens * verify_width :].fill_(0)
+    return spec_info.custom_mask[mask_extraction_indices].view(-1, verify_width)
 
 
 def _load_fa4_kernels(device_capability):
@@ -1218,24 +1258,13 @@ class FlashAttentionBackend(AttentionBackend):
                 cols = offsets.expand(
                     forward_batch.seq_lens.numel(), -1
                 ) + forward_batch.seq_lens.unsqueeze(1)
-                cum_len = torch.nn.functional.pad(
-                    torch.cumsum(
-                        (
-                            forward_batch.seq_lens + self.speculative_num_draft_tokens
-                        ).repeat_interleave(self.speculative_num_draft_tokens),
-                        dim=0,
-                    ),
-                    (1, 0),
-                )[:-1]
-                mask_extraction_indices = (
-                    cols.repeat_interleave(self.speculative_num_draft_tokens, dim=0)
-                    + cum_len[:, None]
-                ).view(1, -1)
-                mask = forward_batch.spec_info.custom_mask[
-                    mask_extraction_indices
-                ].view(
-                    -1, self.speculative_num_draft_tokens
-                )  # (bsz * draft_num, draft_num)
+                mask = _extract_target_verify_tree_mask(
+                    forward_batch.spec_info,
+                    bs=batch_size,
+                    verify_width=self.speculative_num_draft_tokens,
+                    seq_lens=forward_batch.seq_lens,
+                    cols=cols,
+                )
 
                 # shift table indices to avoid padding
                 # non_masked_page_table [[8, 9, 10],   mask (display with int format) [[1, 0, 0],
@@ -3339,27 +3368,14 @@ class FlashAttentionBackend(AttentionBackend):
                 ).unsqueeze(0)  # shape: (1, self.speculative_num_draft_tokens)
 
                 cols = offsets.expand(seq_lens.numel(), -1) + seq_lens.unsqueeze(1)
-                cum_len = torch.nn.functional.pad(
-                    torch.cumsum(
-                        (
-                            seq_lens + self.speculative_num_draft_tokens
-                        ).repeat_interleave(self.speculative_num_draft_tokens),
-                        dim=0,
-                    ),
-                    (1, 0),
-                )[:-1]
-                mask_extraction_indices = (
-                    cols.repeat_interleave(self.speculative_num_draft_tokens, dim=0)
-                    + cum_len[:, None]
-                ).view(1, -1)
-                # avoid extracting padded seq indices which will be out of boundary
-                mask_extraction_indices[
-                    :,
-                    spec_info.positions.numel() * self.speculative_num_draft_tokens :,
-                ].fill_(0)
-                mask = spec_info.custom_mask[mask_extraction_indices].view(
-                    -1, self.speculative_num_draft_tokens
-                )  # (bsz * draft_num, draft_num)
+                mask = _extract_target_verify_tree_mask(
+                    spec_info,
+                    bs=bs,
+                    verify_width=self.speculative_num_draft_tokens,
+                    seq_lens=seq_lens,
+                    cols=cols,
+                    valid_num_tokens=spec_info.positions.numel(),
+                )
 
                 col_indices = offsets.expand(
                     mask.shape[0], self.speculative_num_draft_tokens

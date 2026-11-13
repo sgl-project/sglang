@@ -3476,12 +3476,32 @@ class Scheduler(
             return
 
         if self.spec_algorithm.is_dflash_family():
-            error_msg = validate_dflash_request(req, self.enable_overlap)
-            if error_msg is not None:
-                req.set_finish_with_abort(error_msg)
-                self.init_req_max_new_tokens(req)
-                self._add_request_to_queue(req)
-                return
+            if self.spec_algorithm.is_ubtree():
+                from sglang.srt.speculative.ubtree_components.validation import (
+                    validate_ubtree_request,
+                )
+
+                error_msg = validate_ubtree_request(req)
+                if error_msg is not None:
+                    finished_reason = {
+                        "type": "abort",
+                        "status_code": HTTPStatus.BAD_REQUEST,
+                        "message": error_msg,
+                    }
+                    req.time_stats.trace_ctx.abort(abort_info=finished_reason)
+                    self.request_retirer.abort(
+                        req,
+                        reason=FINISH_ABORT(error_msg, HTTPStatus.BAD_REQUEST),
+                        finished_reason=finished_reason,
+                    )
+                    return
+            else:
+                error_msg = validate_dflash_request(req, self.enable_overlap)
+                if error_msg is not None:
+                    req.set_finish_with_abort(error_msg)
+                    self.init_req_max_new_tokens(req)
+                    self._add_request_to_queue(req)
+                    return
 
         if self.spec_algorithm.is_uno():
             error_msg = validate_uno_request(req)
@@ -3495,6 +3515,7 @@ class Scheduler(
             isinstance(self.spec_algorithm, SpeculativeAlgorithm)
             and self.spec_algorithm.is_some()
             and req.sampling_params.min_p > 0
+            and not self.spec_algorithm.is_ubtree()
         ):
             error_msg = (
                 f"min_p is not supported with {self.spec_algorithm.name} "

@@ -386,6 +386,22 @@ class FusedKVMaterializeHelper:
         self._workspace_capacity = new_capacity
         self._workspace_dtype = dtype
 
+    def get_workspace_tensors(self) -> tuple[torch.Tensor, ...]:
+        """Return the current workspace for owners of captured CUDA Graphs.
+
+        Materialization can replace these tensors when a longer prefill arrives.
+        Graphs must retain the workspace they captured until they are discarded.
+        """
+        return tuple(
+            tensor
+            for tensor in (
+                self._proj_workspace,
+                self._k_workspace,
+                self._v_workspace,
+            )
+            if tensor is not None
+        )
+
     def materialize(
         self,
         ctx_hidden: torch.Tensor,
