@@ -306,6 +306,21 @@ def _get_quantization_config(
     return None
 
 
+def built_quant_config(
+    model_config: ModelConfig,
+    load_config: LoadConfig,
+) -> Optional[QuantizationConfig]:
+    """The quant config the built model keeps: the loader's, unless its class
+    narrows it with ``own_quant_config(hf_config, quant_config)``, which the
+    constructor must apply too."""
+    quant_config = _get_quantization_config(model_config, load_config)
+    model_class, _ = get_model_architecture(model_config)
+    own_quant_config = getattr(model_class, "own_quant_config", None)
+    if own_quant_config is None:
+        return quant_config
+    return own_quant_config(model_config.hf_config, quant_config)
+
+
 def _initialize_model(
     model_config: ModelConfig,
     load_config: LoadConfig,
