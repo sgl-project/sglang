@@ -201,12 +201,14 @@ async fn dispatch<T: Transport>(
         .then(|| prompt_dp_rank(ctx, request, &headers, &prefill, prefill_load))
         .flatten();
 
-    // Track worker occupancy and the prompt's contribution to active load.
+    // Track worker occupancy, the prompt's contribution to active load, and the
+    // estimated tokens.
     let worker_load_guard = if track_dispatch_timestamps {
         prefill.timestamped_load_guard()
     } else {
         prefill.load_guard()
-    };
+    }
+    .with_tokens(prefill_load);
     let active_request_guard = ctx.router_inflight_load.register_aged(
         prefill.id.clone(),
         prefill.url.clone(),
@@ -286,7 +288,11 @@ async fn dispatch<T: Transport>(
                 decode_slot.clone(),
             );
             // Counted from arrival, so decode selection sees requests waiting here.
-            let decode_load = decode.load_guard();
+            let decode_rank_load = RankLoad {
+                input_tokens: 0,
+                ..request_load
+            };
+            let decode_load = decode.load_guard().with_tokens(decode_rank_load);
             if let Some(slot) = &decode_slot {
                 let mut abort = ctx.proxy.abort_on_drop(
                     &prefill.url,
@@ -306,10 +312,6 @@ async fn dispatch<T: Transport>(
                 .await?;
                 abort.disarm();
             }
-            let decode_rank_load = RankLoad {
-                input_tokens: 0,
-                ..request_load
-            };
             let decode_rank = dp_aware
                 .then(|| {
                     select_dp_rank(

@@ -136,6 +136,11 @@ under reorg) or per group in a bucket file:
   plain engines compare estimated prefill queue time, waiting uncached tokens,
   waiting, running, then in-flight requests; decode engines compare waiting and
   running requests, then KV usage. Decode groups always default to it.
+- **`shape_aware`**: prefers the engine whose heavier phase, prefill or decode,
+  stays lightest once the request joins, from the prompt tokens and `max_tokens`
+  (capped at 4096, charged 4096 when unset) of the requests this router has in
+  flight on it. Prefill engines are charged the prompt only. Plain and prefill
+  groups.
 - **`cache_aware`**: prefers the engine holding the longest cached prefix of the
   prompt (at least `--cache-affinity-min-matched-tokens`, default 1024, and
   optionally `--cache-affinity-min-match-ratio` of the prompt). Plain and

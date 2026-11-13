@@ -17,7 +17,7 @@ use sha2::{Digest, Sha256};
 /// `SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION`.
 pub const UNBOUNDED_OUTPUT_TOKENS: u64 = 4096;
 
-/// What `request` adds to a rank, as [`DpRankPolicy::ShapeAware`] scores it.
+/// What a request adds to a rank or worker, as the shape-aware policies score it.
 /// `output_tokens` is `None` when the request sets no cap.
 pub fn request_rank_load(input_tokens: usize, output_tokens: Option<u64>) -> RankLoad {
     RankLoad {

@@ -83,12 +83,12 @@ fn grpc_client(host: &str, port: u16) -> Option<SglangServiceClient<tonic::trans
     )
 }
 
-/// Estimated engine work of one request on a DP rank, in tokens.
+/// Estimated engine work of one request on a DP rank or worker, in tokens.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RankLoad {
-    /// Prompt tokens the rank has yet to prefill.
+    /// Prompt tokens yet to prefill.
     pub input_tokens: u64,
-    /// Tokens the rank has yet to generate, up to its decode budget.
+    /// Tokens yet to generate, up to the decode budget.
     pub output_tokens: u64,
 }
 
@@ -96,6 +96,13 @@ pub struct RankLoad {
 #[derive(Default)]
 struct RankSlot {
     requests: AtomicUsize,
+    input_tokens: AtomicU64,
+    output_tokens: AtomicU64,
+}
+
+/// Estimated tokens this router has in flight on one worker.
+#[derive(Default)]
+struct TokenCounters {
     input_tokens: AtomicU64,
     output_tokens: AtomicU64,
 }
@@ -194,8 +201,9 @@ impl SlotRegistry {
 }
 
 /// RAII guard that increments `active_requests` on construction and decrements
-/// on drop. Obtain via [`Worker::load_guard`]. Policies that need to correct
-/// an engine snapshot use the crate-private timestamped variant.
+/// on drop, along with any tokens added by `with_tokens`. Obtain via
+/// [`Worker::load_guard`]. Policies that need to correct an engine snapshot use
+/// the crate-private timestamped variant.
 ///
 /// `#[must_use]`: a statement-form call like `worker.load_guard();` would
 /// drop the guard on the same line, so the counter would never see the
@@ -204,6 +212,22 @@ impl SlotRegistry {
 pub struct LoadGuard {
     active_requests: Arc<AtomicUsize>,
     tracked_slot: Option<(Arc<SlotRegistry>, u64)>,
+    token_load: Arc<TokenCounters>,
+    charged: RankLoad,
+}
+
+impl LoadGuard {
+    /// Also counts `load` on the worker's in-flight tokens until dropped.
+    pub fn with_tokens(mut self, load: RankLoad) -> Self {
+        self.token_load
+            .input_tokens
+            .fetch_add(load.input_tokens, Ordering::Relaxed);
+        self.token_load
+            .output_tokens
+            .fetch_add(load.output_tokens, Ordering::Relaxed);
+        self.charged = load;
+        self
+    }
 }
 
 impl Drop for LoadGuard {
@@ -212,6 +236,12 @@ impl Drop for LoadGuard {
             registry.release(*id);
         }
         self.active_requests.fetch_sub(1, Ordering::Relaxed);
+        self.token_load
+            .input_tokens
+            .fetch_sub(self.charged.input_tokens, Ordering::Relaxed);
+        self.token_load
+            .output_tokens
+            .fetch_sub(self.charged.output_tokens, Ordering::Relaxed);
     }
 }
 
@@ -253,6 +283,8 @@ pub struct Worker {
     pub model_ids: Vec<ModelId>,
     pub breaker: Arc<CircuitBreaker>,
     pub active_requests: Arc<AtomicUsize>,
+    /// Estimated tokens of the in-flight requests whose guards carry them.
+    token_load: Arc<TokenCounters>,
     /// Timestamped ledger for requests whose policy reads Engine Load;
     /// answers [`Worker::slots_acquired_since`].
     slots: Arc<SlotRegistry>,
@@ -307,6 +339,7 @@ impl Worker {
         let bootstrap_host = parse_bootstrap_host(&spec.url);
         let grpc = grpc_port.and_then(|port| grpc_client(&bootstrap_host, port));
         let active_requests = Arc::new(AtomicUsize::new(0));
+        let token_load = Arc::new(TokenCounters::default());
         let slots = SlotRegistry::new();
         Self {
             id: spec.id,
@@ -317,6 +350,7 @@ impl Worker {
             model_ids: spec.model_ids,
             breaker,
             active_requests,
+            token_load,
             slots,
             bootstrap_host,
             bootstrap_port: spec.bootstrap_port,
@@ -370,6 +404,7 @@ impl Worker {
             self.breaker = Arc::clone(&prev.breaker);
         }
         self.active_requests = Arc::clone(&prev.active_requests);
+        self.token_load = Arc::clone(&prev.token_load);
         self.slots = Arc::clone(&prev.slots);
     }
 
@@ -458,6 +493,14 @@ impl Worker {
         self.active_requests.load(Ordering::Relaxed)
     }
 
+    /// Estimated tokens of this router's in-flight requests on the worker.
+    pub fn router_inflight_tokens(&self) -> RankLoad {
+        RankLoad {
+            input_tokens: self.token_load.input_tokens.load(Ordering::Relaxed),
+            output_tokens: self.token_load.output_tokens.load(Ordering::Relaxed),
+        }
+    }
+
     /// Number of this worker's currently in-flight requests dispatched at or
     /// after `since`. See [`SlotRegistry::count_acquired_since`].
     pub fn slots_acquired_since(&self, since: Instant) -> usize {
@@ -471,6 +514,8 @@ impl Worker {
         LoadGuard {
             active_requests: Arc::clone(&self.active_requests),
             tracked_slot: None,
+            token_load: Arc::clone(&self.token_load),
+            charged: RankLoad::default(),
         }
     }
 
@@ -481,6 +526,8 @@ impl Worker {
         LoadGuard {
             active_requests: Arc::clone(&self.active_requests),
             tracked_slot: Some((Arc::clone(&self.slots), slot_id)),
+            token_load: Arc::clone(&self.token_load),
+            charged: RankLoad::default(),
         }
     }
 }

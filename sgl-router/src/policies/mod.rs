@@ -15,6 +15,7 @@ pub mod round_robin;
 pub mod scoring;
 pub mod selection;
 pub mod session_aware;
+pub mod shape_aware;
 pub mod sticky;
 
 use crate::discovery::ModelId;
@@ -166,6 +167,7 @@ pub struct SelectionContext<'a> {
     session_id: Option<&'a str>,
     candidate_range_id: &'a str,
     input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
     request_tokens: Option<&'a [u32]>,
     cache_namespace: &'a CacheNamespace,
     external_prefix: Option<&'a PrefixLookupResult>,
@@ -184,6 +186,7 @@ impl<'a> SelectionContext<'a> {
             session_id: None,
             candidate_range_id: "global",
             input_tokens: None,
+            output_tokens: None,
             request_tokens: None,
             cache_namespace: CacheNamespace::NONE,
             external_prefix: None,
@@ -206,6 +209,7 @@ impl<'a> SelectionContext<'a> {
             session_id: None,
             candidate_range_id: "global",
             input_tokens: None,
+            output_tokens: None,
             request_tokens: None,
             cache_namespace: CacheNamespace::NONE,
             external_prefix: None,
@@ -243,6 +247,12 @@ impl<'a> SelectionContext<'a> {
     /// Attaches the request input token count.
     pub fn with_input_tokens(mut self, input_tokens: u64) -> Self {
         self.input_tokens = Some(input_tokens);
+        self
+    }
+
+    /// Attaches the request's output budget, `None` when it sets no cap.
+    pub fn with_output_tokens(mut self, output_tokens: Option<u64>) -> Self {
+        self.output_tokens = output_tokens;
         self
     }
 
@@ -302,6 +312,11 @@ impl<'a> SelectionContext<'a> {
     }
     pub fn input_tokens(&self) -> Option<u64> {
         self.input_tokens
+    }
+
+    /// The request's `max_tokens`; `None` when it sets no cap.
+    pub fn output_tokens(&self) -> Option<u64> {
+        self.output_tokens
     }
 
     /// Returns ingress-computed routing tokens.

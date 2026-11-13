@@ -131,6 +131,10 @@ pub enum PolicyKind {
     /// Selects the currently least-loaded worker.
     #[value(name = "load_based")]
     LoadBased,
+    /// Selects the worker whose heavier phase, prefill or decode, stays lightest
+    /// once the request joins, by the tokens this router has in flight on it.
+    #[value(name = "shape_aware")]
+    ShapeAware,
     /// Weighted sum of `--fuse` terms.
     #[value(name = "fused_score")]
     FusedScore,
