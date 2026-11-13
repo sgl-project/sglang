@@ -161,6 +161,9 @@ class _TinyModel(nn.Module):
         self.register_buffer("rotary_emb_cos_cache", torch.full((8,), 1.62))
         self.register_buffer("rotary_emb_sin_cache", torch.full((8,), 0.58))
         self.register_buffer("rotary_emb_freqs_cis", torch.full((8,), 2.71))
+        self.register_buffer(
+            "rotary_emb_axis_map", torch.tensor([0, 1, 2, 0, 1, 2], dtype=torch.int64)
+        )
         self.register_buffer("gate_proj_weight_fp32_cache", torch.full((8,), 1.41))
 
 
@@ -611,6 +614,11 @@ class TestResetTensors(_WeightCheckerTestBase):
         before = self.model.rotary_emb_freqs_cis.clone()
         self.checker._reset_tensors()
         torch.testing.assert_close(self.model.rotary_emb_freqs_cis, before)
+
+    def test_skips_axis_map(self):
+        before = self.model.rotary_emb_axis_map.clone()
+        self.checker._reset_tensors()
+        torch.testing.assert_close(self.model.rotary_emb_axis_map, before)
 
     def test_poisons_weight_fp32_cache(self):
         before = self.model.gate_proj_weight_fp32_cache.clone()

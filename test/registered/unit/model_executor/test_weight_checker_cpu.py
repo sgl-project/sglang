@@ -38,6 +38,9 @@ class TestRawChecksumWithoutCuda(CustomTestCase):
                 scalar = torch.tensor([1.5])
                 model.register_buffer("layer_scalar", scalar)
                 model.register_buffer("cos_sin_cache", torch.ones(2), persistent=False)
+                model.register_buffer(
+                    "axis_map", torch.tensor([0, 1, 2]), persistent=False
+                )
                 with published_topology():
                     checker = WeightChecker(get_model=lambda: model)
                     result = checker.handle(
@@ -67,6 +70,22 @@ class TestRawChecksumWithoutCuda(CustomTestCase):
                     names=["weight", "missing_b", "missing_a"],
                     role="draft",
                 )
+
+
+class TestResetTensorsWithoutCuda(CustomTestCase):
+    def test_reset_tensors_skips_non_persistent_buffers(self) -> None:
+        """Non-persistent buffers like axis_map and cos_sin_cache must be preserved during weight reset."""
+        model = nn.Linear(2, 2)
+        model.requires_grad_(False)
+        axis_map = torch.tensor([0, 1, 2, 0, 1, 2], dtype=torch.int64)
+        cos_sin_cache = torch.tensor([3.14, 1.59])
+        model.register_buffer("axis_map", axis_map.clone(), persistent=False)
+        model.register_buffer("cos_sin_cache", cos_sin_cache.clone(), persistent=False)
+        with published_topology():
+            checker = WeightChecker(get_model=lambda: model)
+            checker._reset_tensors()
+        torch.testing.assert_close(model.axis_map, axis_map)
+        torch.testing.assert_close(model.cos_sin_cache, cos_sin_cache)
 
 
 if __name__ == "__main__":
