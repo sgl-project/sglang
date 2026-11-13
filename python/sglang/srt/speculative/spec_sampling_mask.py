@@ -24,16 +24,22 @@ def validate_spec_sampling_mask_request(
     """Reject configurations whose committed tokens are not exact samples from
     the captured target distribution."""
     if not spec_algorithm.is_dflash_family():
-        return "return_sampling_mask is not supported with speculative decoding."
+        return (
+            "return_sampling_mask or sampling_logprobs_mode is not supported with "
+            "speculative decoding."
+        )
 
     # build_speculative_verify_target_probs applies top-k/top-p only.
     if req.sampling_params.min_p > 0:
-        return "return_sampling_mask with speculative decoding does not support min_p."
+        return (
+            "return_sampling_mask or sampling_logprobs_mode with speculative "
+            "decoding does not support min_p."
+        )
 
     if envs.SGLANG_SIMULATE_ACC_LEN.get() > 0:
         return (
-            "return_sampling_mask is not supported with simulated speculative "
-            "acceptance."
+            "return_sampling_mask or sampling_logprobs_mode is not supported with "
+            "simulated speculative acceptance."
         )
 
     if spec_algorithm.is_dflash():
@@ -42,14 +48,14 @@ def validate_spec_sampling_mask_request(
             or get_spec().speculative_accept_threshold_acc != 1.0
         ):
             return (
-                "return_sampling_mask with DFlash requires acceptance thresholds "
-                "of 1.0."
+                "return_sampling_mask or sampling_logprobs_mode with DFlash requires "
+                "acceptance thresholds of 1.0."
             )
         # Without the kernel DFlash verifies non-greedy rows by greedy argmax.
         if req.sampling_params.top_k > 1 and not is_dflash_sampling_verify_available():
             return (
-                "return_sampling_mask with non-greedy DFlash decoding requires "
-                "sampling verification support."
+                "return_sampling_mask or sampling_logprobs_mode with non-greedy DFlash "
+                "decoding requires sampling verification support."
             )
 
     return None

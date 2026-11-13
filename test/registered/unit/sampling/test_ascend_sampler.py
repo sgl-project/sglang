@@ -158,7 +158,9 @@ class TestAscendSamplingMaskCapture(unittest.TestCase):
                 SchedulerBatchResultProcessor.materialize_sampling_mask_output(
                     [
                         SimpleNamespace(
-                            return_sampling_mask=True, sampling_logprobs_mode=mode
+                            return_sampling_mask=True,
+                            return_sampling_logprobs=True,
+                            sampling_logprobs_mode=mode,
                         )
                     ],
                     output,

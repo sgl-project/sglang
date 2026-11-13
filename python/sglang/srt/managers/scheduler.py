@@ -3506,18 +3506,20 @@ class Scheduler(
             self._add_request_to_queue(req)
             return
 
+        if (
+            req.return_sampling_logprobs
+            and self.disaggregation_mode != DisaggregationMode.NULL
+            and not self.disagg_metadata_buffers.enable_sampling_mask
+        ):
+            self._reject_sampling_mask_request(
+                req,
+                "return_sampling_mask or sampling_logprobs_mode requires "
+                "SGLANG_ENABLE_DISAGG_SAMPLING_MASK=1 on both prefill and "
+                "decode servers when using disaggregated serving.",
+            )
+            return
+
         if req.return_sampling_mask:
-            if (
-                self.disaggregation_mode != DisaggregationMode.NULL
-                and not self.disagg_metadata_buffers.enable_sampling_mask
-            ):
-                self._reject_sampling_mask_request(
-                    req,
-                    "return_sampling_mask requires "
-                    "SGLANG_ENABLE_DISAGG_SAMPLING_MASK=1 on both prefill and "
-                    "decode servers when using disaggregated serving.",
-                )
-                return
             top_k = req.sampling_params.top_k
             sampling_mask_cap = self.server_args.sampling_mask_max_tokens
             if top_k != 1 and not (1 < top_k <= sampling_mask_cap):
@@ -3530,7 +3532,7 @@ class Scheduler(
                 self._reject_sampling_mask_request(req, error_msg)
                 return
 
-        if req.return_sampling_mask and not self.spec_algorithm.is_none():
+        if req.return_sampling_logprobs and not self.spec_algorithm.is_none():
             error_msg = validate_spec_sampling_mask_request(req, self.spec_algorithm)
             if error_msg is not None:
                 self._reject_sampling_mask_request(req, error_msg)

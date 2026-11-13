@@ -157,7 +157,11 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
             return "Beam search does not support return_logprob."
         if recv_req.return_hidden_states:
             return "Beam search does not support return_hidden_states."
-        if recv_req.return_sampling_mask or recv_req.return_routed_experts:
+        if (
+            recv_req.return_sampling_mask
+            or recv_req.sampling_logprobs_mode is not None
+            or recv_req.return_routed_experts
+        ):
             return "Beam search does not support sampling-mask/routed-experts returns."
         if any(
             x is not None
