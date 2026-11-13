@@ -3,7 +3,7 @@
 import threading
 import time
 import unittest
-from concurrent.futures import ThreadPoolExecutor, TimeoutError
+from concurrent.futures import ThreadPoolExecutor, TimeoutError, wait
 from unittest.mock import patch
 
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
@@ -158,6 +158,78 @@ class TestGroupedLoad(CustomTestCase):
         index = load(linker, [[transfer(PoolName.KV, ["k0"])]])
         self.assertTrue(linker.layer_done_counter.finish(index))
         self.assertEqual(linker.layer_done_counter.order, [0, 1, 2, 3])
+
+    def test_landed_groups_complete_before_later_groups_are_submitted(self):
+        submitted = []
+        last_submit = threading.Event()
+        release = threading.Event()
+
+        class SlowMetadataPool(FakePool):
+            def get_prepared_layer_range_meta(self, locations, layer):
+                if layer == 1:
+                    # Group 0's reads land while group 1 is being submitted.
+                    wait(list(submitted), timeout=5)
+                elif layer == 2:
+                    last_submit.set()
+                    if not release.wait(5):
+                        raise TimeoutError("Last group was not released")
+                return super().get_prepared_layer_range_meta(locations, layer)
+
+        linker = make_linker(
+            FakeStore(),
+            num_layers=3,
+            layer_group=1,
+            threads=2,
+            pools={PoolName.KV: SlowMetadataPool()},
+        )
+        self.addCleanup(linker.load_io_executor.shutdown)
+        submit = linker.load_io_executor.submit
+
+        def recording_submit(*args):
+            future = submit(*args)
+            submitted.append(future)
+            return future
+
+        counter = linker.layer_done_counter
+        index = counter.update_producer()
+        with patch.object(linker.load_io_executor, "submit", recording_submit):
+            with ThreadPoolExecutor(1) as loader:
+                loading = loader.submit(
+                    linker.load_layer_wise, index, [[transfer(PoolName.KV, ["k0"])]]
+                )
+                try:
+                    self.assertTrue(last_submit.wait(5))
+                    # Layer 0 completes while the load thread still submits layer 2.
+                    counter.futures[index][0].result(timeout=5)
+                    self.assertFalse(counter.futures[index][2].done())
+                finally:
+                    release.set()
+                loading.result(timeout=5)
+        self.assertTrue(counter.finish(index))
+        self.assertEqual(counter.order, [0, 1, 2])
+
+    def test_failed_group_keeps_later_groups_unpublished(self):
+        store = FakeStore(
+            delay=lambda keys: 0.05 if keys == ["k0"] else 0, fail_key="k0"
+        )
+        linker = make_linker(
+            store,
+            num_layers=3,
+            layer_group=1,
+            threads=3,
+            pools={
+                PoolName.KV: FakePool(skip_layers={1, 2}),
+                PoolName.INDEXER: FakePool({0}),
+            },
+        )
+        self.addCleanup(linker.load_io_executor.shutdown)
+        index = load(
+            linker,
+            [[transfer(PoolName.KV, ["k0"]), transfer(PoolName.INDEXER, ["i0"])]],
+        )
+        # Layers 1-2 land before layer 0 fails, but never complete ahead of it.
+        self.assertFalse(linker.layer_done_counter.finish(index))
+        self.assertEqual(linker.layer_done_counter.order, [])
 
     def test_failure_waits_for_inflight_reads_before_releasing_consumers(self):
         """Failed loads must stop writing before consumers can recycle their rows."""
