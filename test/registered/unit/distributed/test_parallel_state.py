@@ -1,5 +1,6 @@
 """
 Test file to verify the correctness of parallel group calculations.
+Also tests variable-size collectives with two CPU/Gloo ranks.
 
 This test validates that the parallel group initialization creates the correct
 groups for different parallelism configurations including:
@@ -38,15 +39,18 @@ from __future__ import annotations
 
 import sys
 from contextlib import nullcontext
+from datetime import timedelta
 from unittest.mock import Mock, patch
 
 import pytest
 import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import publish_build_topology
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=35, suite="base-a-test-cpu")
 
 # Import the actual parallel_state module
 parallel_state = pytest.importorskip("sglang.srt.distributed.parallel_state")
@@ -578,6 +582,60 @@ def test_group_desc_none_normalized_to_anonymous():
     """group_name=None keeps the existing "anonymous" normalization, so the
     emitted descs must be anonymous:device / anonymous:cpu (not None:device)."""
     assert _read_group_descs(None) == ("anonymous:device", "anonymous:cpu")
+
+
+def _run_variable_collectives_gloo(rank, init_method):
+    world_size = 2
+    dist.init_process_group(
+        backend="gloo",
+        init_method=init_method,
+        rank=rank,
+        world_size=world_size,
+        timeout=timedelta(seconds=60),
+    )
+    comm = None
+    try:
+        comm = parallel_state.init_model_parallel_group(
+            group_ranks=[list(range(world_size))],
+            local_rank=rank,
+            backend="gloo",
+            use_pynccl=False,
+            use_custom_allreduce=False,
+            use_mscclpp=False,
+            use_torch_symm_mem_allreduce=False,
+        )
+        with (
+            patch.object(parallel_state, "_is_cpu", True),
+            parallel_state.envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.override(False),
+        ):
+            for sizes in (None, [2, 2], [1, 3], [0, 2], [2, 0], [0, 0]):
+                counts = sizes if sizes is not None else [2, 2]
+                base = torch.arange(sum(counts) * 3, dtype=torch.float32).reshape(-1, 3)
+                source = base + rank
+                expected = 2 * base + 1
+                reduced = comm.reduce_scatterv(source, sizes=sizes)
+                gathered = torch.empty_like(base)
+                outputs = comm.all_gatherv(reduced, sizes=sizes, output=gathered)
+                assert len(outputs) == 1 and outputs[0] is gathered
+                torch.testing.assert_close(
+                    reduced, expected.split(counts)[rank], rtol=0, atol=0
+                )
+                torch.testing.assert_close(gathered, expected, rtol=0, atol=0)
+                torch.testing.assert_close(source, base + rank, rtol=0, atol=0)
+    finally:
+        if comm is not None:
+            comm.destroy()
+        dist.destroy_process_group()
+
+
+def test_variable_collectives_on_gloo(tmp_path):
+    """Uneven and empty shards must work without a PyNccl communicator."""
+    mp.spawn(
+        _run_variable_collectives_gloo,
+        args=((tmp_path / "rendezvous").as_uri(),),
+        nprocs=2,
+        join=True,
+    )
 
 
 if __name__ == "__main__":
