@@ -1032,6 +1032,11 @@ class Gemma4TextModel(PreTrainedModel):
         **kwargs,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, List[torch.Tensor]], PPProxyTensors]:
         if self.pp_group.is_first_rank:
+            if input_ids is None and input_embeds is None:
+                raise ValueError(
+                    "You must specify at least one of input_ids or inputs_embeds"
+                )
+
             if input_embeds is None:
                 input_embeds = self.embed_tokens(input_ids)
             if per_layer_inputs is None and input_ids is not None:

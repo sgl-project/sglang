@@ -45,7 +45,12 @@ from sglang.srt.model_executor.cuda_graph_config import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
-from sglang.srt.runtime_context import get_exec, get_memory, get_spec
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_memory,
+    get_schedule,
+    get_spec,
+)
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import is_pin_memory_available
@@ -418,9 +423,8 @@ class MambaAttnBackendBase(AttentionBackend):
                 0 if in_capture else getattr(forward_batch, "num_padding", None)
             ),
             in_capture=in_capture,
-            mamba_track_indices=getattr(forward_batch, "mamba_track_indices", None),
+            mamba_track_indices=forward_batch.mamba_track_indices,
             ragged_verify_layout=forward_batch.ragged_verify_layout,
-            extend_start_loc=forward_batch.extend_start_loc,
             extend_seq_lens=forward_batch.extend_seq_lens,
         )
 
@@ -672,32 +676,53 @@ class MambaAttnBackendBase(AttentionBackend):
             mask = torch.cat([mask, pad])
         return mask.cpu()
 
-    def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
-        assert max_num_tokens % max_bs == 0, (
-            f"max_num_tokens={max_num_tokens} must be divisible by max_bs={max_bs}"
-        )
-        draft_token_num = max_num_tokens // max_bs
-        prev_max_bs = len(self.state_indices_list)
-        if prev_max_bs >= max_bs:
+    def _get_global_max_bs(self, current_bs: int) -> int:
+        max_bs = current_bs
+        try:
+            graph_cfg = get_exec().graph.cuda_graph_config
+            if graph_cfg.decode.bs:
+                max_bs = max(max_bs, max(graph_cfg.decode.bs))
+            elif graph_cfg.decode.max_bs:
+                max_bs = max(max_bs, graph_cfg.decode.max_bs)
+            if graph_cfg.prefill.backend == Backend.FULL:
+                req = graph_cfg.prefill.full_prefill_max_req
+                if req is None:
+                    req = max(get_schedule().chunked_prefill_size // 512, 1)
+                if (
+                    hasattr(self._model_runner, "req_to_token_pool")
+                    and self._model_runner.req_to_token_pool is not None
+                ):
+                    req = min(req, self._model_runner.req_to_token_pool.size)
+                max_bs = max(max_bs, req)
+        except Exception:
+            pass
+        return max_bs
+
+    def _ensure_mamba_buffers(self, min_bs: int):
+        global_max_bs = self._get_global_max_bs(min_bs)
+        if self.mamba_track_indices_buf is None:
+            self.mamba_track_indices_buf = torch.zeros(
+                (global_max_bs,), dtype=torch.int64, device=self.device
+            )
+        else:
+            assert self.mamba_track_indices_buf.shape[0] >= min_bs, (
+                f"mamba_track_indices_buf size {self.mamba_track_indices_buf.shape[0]} "
+                f"< requested {min_bs}; buffer must not be reallocated after capture"
+            )
+
+    def _grow_state_indices(self, target_bs: int):
+        prev_bs = len(self.state_indices_list)
+        if prev_bs >= target_bs:
             return
 
-        # Per-bs static write-cursor / force-flush buffers, captured by pointer +
-        # refreshed in-place each replay; sized like state_indices_list. None when off.
-        if prev_max_bs == 0:
+        if prev_bs == 0:
             self.replayssm_write_pos_list = [] if self._replayssm_enabled() else None
             self.replayssm_force_flush_list = [] if self._replayssm_enabled() else None
             self.replayssm_ring_indices_list = (
                 [] if self._replayssm_request_ring() else None
             )
-            self.mamba_track_indices_buf = torch.zeros(
-                (max_bs,), dtype=torch.int64, device=self.device
-            )
-        else:
-            self.mamba_track_indices_buf = torch.zeros(
-                (max_bs,), dtype=torch.int64, device=self.device
-            )
 
-        for i in range(prev_max_bs, max_bs):
+        for i in range(prev_bs, target_bs):
             self.state_indices_list.append(
                 torch.full(
                     (i + 1,), self.pad_slot_id, dtype=torch.int32, device=self.device
@@ -718,6 +743,12 @@ class MambaAttnBackendBase(AttentionBackend):
             self.query_start_loc_list.append(
                 torch.zeros((i + 2,), dtype=torch.int32, device=self.device)
             )
+
+    def _grow_spec_buffers(self, target_bs: int, draft_token_num: int):
+        prev_bs = len(self.retrieve_next_token_list)
+        if prev_bs >= target_bs:
+            return
+        for i in range(prev_bs, target_bs):
             self.retrieve_next_token_list.append(
                 torch.zeros(
                     (i + 1, draft_token_num), dtype=torch.int32, device=self.device
@@ -733,24 +764,41 @@ class MambaAttnBackendBase(AttentionBackend):
                     (i + 1, draft_token_num), dtype=torch.int32, device=self.device
                 )
             )
-        self.cached_cuda_graph_decode_query_start_loc = torch.arange(
-            0, max_bs + 1, dtype=torch.int32, device=self.device
+
+    def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
+        assert max_num_tokens % max_bs == 0, (
+            f"max_num_tokens={max_num_tokens} must be divisible by max_bs={max_bs}"
         )
-        self.cached_cuda_graph_verify_query_start_loc = torch.arange(
-            0,
-            max_bs * draft_token_num + 1,
-            step=draft_token_num,
-            dtype=torch.int32,
-            device=self.device,
-        )
+        draft_token_num = max_num_tokens // max_bs
+        self._ensure_mamba_buffers(max_bs)
+        self._grow_state_indices(max_bs)
+        self._grow_spec_buffers(max_bs, draft_token_num)
+
+        if (
+            self.cached_cuda_graph_decode_query_start_loc is None
+            or self.cached_cuda_graph_decode_query_start_loc.shape[0] < max_bs + 1
+        ):
+            self.cached_cuda_graph_decode_query_start_loc = torch.arange(
+                0, max_bs + 1, dtype=torch.int32, device=self.device
+            )
+        if (
+            self.cached_cuda_graph_verify_query_start_loc is None
+            or self.cached_cuda_graph_verify_query_start_loc.shape[0]
+            < max_bs * draft_token_num + 1
+        ):
+            self.cached_cuda_graph_verify_query_start_loc = torch.arange(
+                0,
+                max_bs * draft_token_num + 1,
+                step=draft_token_num,
+                dtype=torch.int32,
+                device=self.device,
+            )
 
     def init_prefill_cuda_graph_state(
         self, *, max_num_tokens: int, max_req_slots: int
     ) -> None:
-        self.init_cuda_graph_state(
-            max_bs=max_req_slots,
-            max_num_tokens=max_req_slots,
-        )
+        self._ensure_mamba_buffers(max_req_slots)
+        self._grow_state_indices(max_req_slots)
 
     def init_cpu_graph_state(self, max_bs: int, max_num_tokens: int):
         assert max_num_tokens % max_bs == 0, (
@@ -852,7 +900,6 @@ class MambaAttnBackendBase(AttentionBackend):
         in_capture: bool = False,
         mamba_track_indices: Optional[torch.Tensor] = None,
         ragged_verify_layout: Optional[RaggedVerifyLayout] = None,
-        extend_start_loc: Optional[torch.Tensor] = None,
         extend_seq_lens: Optional[torch.Tensor] = None,
     ):
         if num_padding is None:
@@ -1011,12 +1058,12 @@ class MambaAttnBackendBase(AttentionBackend):
             # _forward_metadata EXTEND branch, but write into the static
             # per-bs buffer (captured graphs read query_start_loc_list by
             # pointer) instead of allocating a fresh tensor.
-            assert extend_start_loc is not None and extend_seq_lens is not None, (
-                "EXTEND cuda-graph replay requires extend_start_loc/extend_seq_lens"
+            assert extend_seq_lens is not None, (
+                "EXTEND cuda-graph replay requires extend_seq_lens"
             )
             qsl = self.query_start_loc_list[bs - 1]
-            qsl[:bs].copy_(extend_start_loc)
-            qsl[bs].copy_(extend_start_loc[-1] + extend_seq_lens[-1])
+            qsl[0].zero_()
+            torch.cumsum(extend_seq_lens[:bs], dim=0, out=qsl[1 : bs + 1])
         else:
             raise ValueError(f"Invalid forward mode: {forward_mode=}")
         qsl_buf = self.query_start_loc_list[bs - 1]
@@ -1489,10 +1536,11 @@ class HybridLinearAttnBackend(AttentionBackend):
         self, *, max_num_tokens: int, max_req_slots: int
     ) -> None:
         for attn_backend in self.attn_backend_list:
-            attn_backend.init_prefill_cuda_graph_state(
-                max_num_tokens=max_num_tokens,
-                max_req_slots=max_req_slots,
-            )
+            if hasattr(attn_backend, "init_prefill_cuda_graph_state"):
+                attn_backend.init_prefill_cuda_graph_state(
+                    max_num_tokens=max_num_tokens,
+                    max_req_slots=max_req_slots,
+                )
 
     def init_cpu_graph_state(self, max_bs: int, max_num_tokens: int):
         for attn_backend in self.attn_backend_list:

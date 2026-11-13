@@ -115,16 +115,18 @@ class ShortConvAttnBackend(MambaAttnBackendBase):
 
     def _alloc_cache_indices_buf(self, max_bs: int):
         # Refilled in place per step so a captured graph reads a stable address.
-        # Grow-only, never reallocated at the same size: the cuda- and cpu-graph
-        # hooks can both run, in either order, after another phase captured.
-        # This backend may have init_cuda_graph_state called more than once (prefill
-        # and decode graph runners share the same backend instance), so only grow
-        # the buffer.
+        # Sized once using global_max_bs to cover both decode and prefill graph runners,
+        # and never reallocated after graph capture.
         buf = self._cache_indices_buf
         if buf is not None and buf.shape[0] >= max_bs:
             return
+        assert buf is None, (
+            f"cache-indices buffer must be sized before any graph capture: have "
+            f"{buf.shape[0]}, need {max_bs}"
+        )
+        global_max_bs = self._get_global_max_bs(max_bs)
         self._cache_indices_buf = torch.empty(
-            max_bs, dtype=self.cache_indices_dtype, device=self.device
+            global_max_bs, dtype=self.cache_indices_dtype, device=self.device
         )
 
     def _refresh_cache_indices(self):
@@ -146,6 +148,15 @@ class ShortConvAttnBackend(MambaAttnBackendBase):
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         super().init_cuda_graph_state(max_bs, max_num_tokens)
         self._alloc_cache_indices_buf(max_bs)
+
+    def init_prefill_cuda_graph_state(
+        self, *, max_num_tokens: int, max_req_slots: int
+    ) -> None:
+        super().init_prefill_cuda_graph_state(
+            max_num_tokens=max_num_tokens,
+            max_req_slots=max_req_slots,
+        )
+        self._alloc_cache_indices_buf(max_req_slots)
 
     def init_cpu_graph_state(self, max_bs: int, max_num_tokens: int):
         super().init_cpu_graph_state(max_bs, max_num_tokens)

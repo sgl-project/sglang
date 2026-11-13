@@ -116,6 +116,11 @@ class Gemma3nMultimodalEmbedder(nn.Module):
         Returns:
             A torch.Tensor of embeddings with  shape `[batch_size, seq_len, self.config.text_config.hidden_size]`.
         """
+        if input_ids is None and inputs_embeds is None:
+            raise ValueError(
+                "You must specify at least one of input_ids or inputs_embeds"
+            )
+
         if inputs_embeds is not None:
             emb_norm = self.soft_embedding_norm(inputs_embeds)
         else:
@@ -400,7 +405,13 @@ class Gemma3nForConditionalGeneration(PreTrainedModel):
     ) -> LogitsProcessor:
         """Forward pass for multimodal Gemma3n."""
         positions += 1
-        if input_embeds is None:
+        if input_ids is None and input_embeds is None:
+            raise ValueError(
+                "You must specify at least one of input_ids or inputs_embeds"
+            )
+
+        per_layer_inputs = kwargs.get("per_layer_inputs", None)
+        if per_layer_inputs is None and input_ids is not None:
             # Prepare per-layer inputs from inputs_ids
             per_layer_inputs_mask = torch.logical_and(
                 input_ids >= 0, input_ids < self.vocab_size_per_layer_input

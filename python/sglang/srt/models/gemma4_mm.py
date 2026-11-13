@@ -677,16 +677,21 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         is_first_rank = self.pp_group.is_first_rank
         is_last_rank = self.pp_group.is_last_rank
 
+        if is_first_rank and input_ids is None and input_embeds is None:
+            raise ValueError(
+                "You must specify at least one of input_ids or inputs_embeds"
+            )
+
         if envs.SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION.get():
             positions = positions + 1
         else:
             positions += 1
 
-        per_layer_inputs = None
+        per_layer_inputs = kwargs.get("per_layer_inputs", None)
         # PLE table and the per-layer projection live on the first rank only,
         # so non-first ranks must skip this and pull per_layer_inputs from the
         # PP proxy (forwarded by Gemma4TextModel).
-        if is_first_rank and input_ids is not None:
+        if per_layer_inputs is None and is_first_rank and input_ids is not None:
             ple_ids = input_ids.clone()
             pad_id = self.config.text_config.pad_token_id
             # Use torch.where instead of boolean indexing for NPU graph compatibility
