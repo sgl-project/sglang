@@ -5,6 +5,12 @@ import sgl_kernel  # noqa: F401
 import torch
 import torch.nn as nn
 
+from sglang.srt.hardware_backend.cpu.quantization.awq_kernels import (
+    AWQIntelAMXLinearKernel,
+)
+from sglang.srt.hardware_backend.cpu.quantization.gptq_kernels import (
+    GPTQIntelAMXLinearKernel,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.cpu_test_utils import (
     MXFP4QuantizeUtil,
@@ -282,6 +288,87 @@ class TestGemm(CustomTestCase):
 
         atol = rtol = precision[ref_res.dtype]
         torch.testing.assert_close(ref_res, target_res, atol=atol, rtol=rtol)
+
+    @parametrize(
+        quant_method=["gptq", "awq"],
+        output_channels=[24, 32, 40, 64],
+        batch_shape=[(1,), (2, 3), (129,)],
+        dtype=[torch.bfloat16, torch.float16],
+        bias_mode=[None, "layer", "external"],
+    )
+    def test_int4_linear_output_padding(
+        self, quant_method, output_channels, batch_shape, dtype, bias_mode
+    ):
+        """TP-local widths smaller than or between AMX tiles must retain all outputs."""
+        torch.manual_seed(127)
+        input_channels = 2048
+        group_size = 128
+        num_groups = input_channels // group_size
+        int32_range = (-(2**31), 2**31 - 1)
+        scales = (torch.rand(num_groups, output_channels) * 0.02 + 0.01).to(dtype)
+        qzeros = torch.randint(
+            *int32_range, (num_groups, output_channels // 8), dtype=torch.int32
+        )
+        if quant_method == "gptq":
+            qweight = torch.randint(
+                *int32_range,
+                (input_channels // 8, output_channels),
+                dtype=torch.int32,
+            )
+            reference_weight = unpack_and_dequant_gptq(qweight, qzeros, scales.float())
+            kernel = GPTQIntelAMXLinearKernel(None)
+        else:
+            qweight = torch.randint(
+                *int32_range,
+                (input_channels, output_channels // 8),
+                dtype=torch.int32,
+            )
+            awq_shifts = torch.tensor([0, 4, 1, 5, 2, 6, 3, 7], dtype=torch.int32) * 4
+
+            def unpack_awq(packed):
+                return ((packed.unsqueeze(-1) >> awq_shifts) & 0xF).flatten(-2)
+
+            reference_weight = (
+                (
+                    unpack_awq(qweight)
+                    - unpack_awq(qzeros).repeat_interleave(group_size, dim=0)
+                )
+                * scales.float().repeat_interleave(group_size, dim=0)
+            ).T
+            kernel = AWQIntelAMXLinearKernel(None)
+
+        layer = nn.Module()
+        for name, value in (
+            ("qweight", qweight),
+            ("qzeros", qzeros),
+            ("scales", scales),
+        ):
+            layer.register_parameter(name, nn.Parameter(value, requires_grad=False))
+        bias = torch.randn(output_channels, dtype=dtype) if bias_mode else None
+        layer.register_parameter(
+            "bias", nn.Parameter(bias, requires_grad=False) if bias_mode else None
+        )
+        inputs = torch.randint(-127, 128, (*batch_shape, input_channels)).to(dtype) / 32
+        inputs[..., 0] = 127 / 32
+        reference = torch.nn.functional.linear(
+            inputs.float(), reference_weight, bias.float() if bias_mode else None
+        ).to(dtype)
+
+        kernel.process_weights_after_loading(layer)
+        apply_bias = {
+            None: None,
+            "layer": layer.bias,
+            "external": bias.float() if bias_mode else None,
+        }[bias_mode]
+        output = kernel.apply(layer, inputs, apply_bias)
+
+        self.assertEqual(output.shape, (*batch_shape, output_channels))
+        self.assertEqual(output.dtype, dtype)
+        self.assertTrue(output.is_contiguous())
+        if bias_mode:
+            self.assertEqual(layer.bias.shape, (output_channels,))
+        atol = rtol = precision[dtype]
+        torch.testing.assert_close(output, reference, atol=atol, rtol=rtol)
 
     @parametrize(
         M=[1, 32], N=[4096], K=[4096], group_size=[128], has_bias=[False, True]
