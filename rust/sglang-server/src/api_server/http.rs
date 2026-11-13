@@ -15,5 +15,6 @@ mod parsers;
 pub(crate) mod pre_generate;
 mod request_decompression;
 mod request_headers;
+mod responses;
 pub(crate) mod weights;
 mod wrappers;

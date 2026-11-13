@@ -19364,6 +19364,1447 @@ impl<'de> ::serde::Deserialize<'de> for OpenAiDetokenizeResponse {
     }
 }
 
+impl OpenAiResponseReasoning {
+    /// The schema default when unset (protobuf arrival).
+    pub fn effort_or_default(&self) -> ::prost::alloc::string::String {
+        self.effort.clone().unwrap_or_else(|| "medium".to_string())
+    }
+    /// Protobuf arrival: unset defaulted fields become their schema
+    /// defaults (JSON arrival already baked them at deserialization).
+    pub fn apply_absent_defaults(&mut self) {
+        if self.effort.is_none() {
+            self.effort = Some("medium".to_string());
+        }
+    }
+}
+
+impl ::serde::Serialize for OpenAiResponseReasoning {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        if let Some(v) = &self.effort {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "effort", v)?;
+        }
+        if let Some(v) = &self.summary {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "summary", v)?;
+        }
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for OpenAiResponseReasoning {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = OpenAiResponseReasoning;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct OpenAiResponseReasoning")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_effort = None;
+                let mut f_summary = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "effort" => {
+                            if f_effort.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("effort"));
+                            }
+                            f_effort = Some(Some(
+                                map.next_value::<Option<::prost::alloc::string::String>>()?
+                                    .unwrap_or_else(|| "medium".to_string()),
+                            ));
+                        }
+                        "summary" => {
+                            if f_summary.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("summary"));
+                            }
+                            f_summary =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(OpenAiResponseReasoning {
+                    effort: f_effort.unwrap_or_else(|| Some("medium".to_string())),
+                    summary: f_summary.flatten(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for OpenAiResponseTool {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "type", &self.r#type)?;
+        if let Some(v) = &self.name {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "name", v)?;
+        }
+        if let Some(v) = &self.description {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "description", v)?;
+        }
+        if let Some(v) = &self.parameters {
+            ::serde::ser::SerializeMap::serialize_entry(
+                &mut map,
+                "parameters",
+                &::serde_json::from_str::<::serde_json::Value>(v)
+                    .unwrap_or(::serde_json::Value::Null),
+            )?;
+        }
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "strict", &self.strict)?;
+        if !self.tools.is_empty() {
+            let rows: Vec<::serde_json::Value> = self
+                .tools
+                .iter()
+                .map(|s| ::serde_json::from_str(s).unwrap_or(::serde_json::Value::Null))
+                .collect();
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "tools", &rows)?;
+        }
+        if let Some(v) = &self.defer_loading {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "defer_loading", v)?;
+        }
+        if let Some(v) = &self.format {
+            ::serde::ser::SerializeMap::serialize_entry(
+                &mut map,
+                "format",
+                &::serde_json::from_str::<::serde_json::Value>(v)
+                    .unwrap_or(::serde_json::Value::Null),
+            )?;
+        }
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for OpenAiResponseTool {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = OpenAiResponseTool;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct OpenAiResponseTool")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_type = None;
+                let mut f_name = None;
+                let mut f_description = None;
+                let mut f_parameters = None;
+                let mut f_strict = None;
+                let mut f_tools = None;
+                let mut f_defer_loading = None;
+                let mut f_format = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "type" => {
+                            if f_type.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("type"));
+                            }
+                            f_type = Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        "name" => {
+                            if f_name.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("name"));
+                            }
+                            f_name =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        "description" => {
+                            if f_description.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("description"));
+                            }
+                            f_description =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        "parameters" => {
+                            if f_parameters.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("parameters"));
+                            }
+                            f_parameters = Some(
+                                map.next_value::<Option<::serde_json::Value>>()?
+                                    .map(|v| v.to_string()),
+                            );
+                        }
+                        "strict" => {
+                            if f_strict.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("strict"));
+                            }
+                            f_strict = Some(map.next_value::<bool>()?);
+                        }
+                        "tools" => {
+                            if f_tools.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("tools"));
+                            }
+                            f_tools = Some(
+                                map.next_value::<Option<Vec<::serde_json::Value>>>()?
+                                    .unwrap_or_default()
+                                    .into_iter()
+                                    .map(|v| v.to_string())
+                                    .collect(),
+                            );
+                        }
+                        "defer_loading" => {
+                            if f_defer_loading.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("defer_loading"));
+                            }
+                            f_defer_loading = Some(map.next_value::<Option<bool>>()?);
+                        }
+                        "format" => {
+                            if f_format.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("format"));
+                            }
+                            f_format = Some(
+                                map.next_value::<Option<::serde_json::Value>>()?
+                                    .map(|v| v.to_string()),
+                            );
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(OpenAiResponseTool {
+                    r#type: f_type.unwrap_or_default(),
+                    name: f_name.flatten(),
+                    description: f_description.flatten(),
+                    parameters: f_parameters.flatten(),
+                    strict: f_strict.unwrap_or_default(),
+                    tools: f_tools.unwrap_or_default(),
+                    defer_loading: f_defer_loading.flatten(),
+                    format: f_format.flatten(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl OpenAiResponsesRequest {
+    /// The schema default when unset (protobuf arrival).
+    pub fn background_or_default(&self) -> bool {
+        self.background.clone().unwrap_or_else(|| false)
+    }
+    /// The schema default when unset (protobuf arrival).
+    pub fn parallel_tool_calls_or_default(&self) -> bool {
+        self.parallel_tool_calls.clone().unwrap_or_else(|| true)
+    }
+    /// The schema default when unset (protobuf arrival).
+    pub fn service_tier_or_default(&self) -> ::prost::alloc::string::String {
+        self.service_tier
+            .clone()
+            .unwrap_or_else(|| "auto".to_string())
+    }
+    /// The schema default when unset (protobuf arrival).
+    pub fn store_or_default(&self) -> bool {
+        self.store.clone().unwrap_or_else(|| true)
+    }
+    /// The schema default when unset (protobuf arrival).
+    pub fn stream_or_default(&self) -> bool {
+        self.stream.clone().unwrap_or_else(|| false)
+    }
+    /// The schema default when unset (protobuf arrival).
+    pub fn top_logprobs_or_default(&self) -> i64 {
+        self.top_logprobs.clone().unwrap_or_else(|| 0i64)
+    }
+    /// The schema default when unset (protobuf arrival).
+    pub fn truncation_or_default(&self) -> ::prost::alloc::string::String {
+        self.truncation
+            .clone()
+            .unwrap_or_else(|| "disabled".to_string())
+    }
+    /// Protobuf arrival: unset defaulted fields become their schema
+    /// defaults (JSON arrival already baked them at deserialization).
+    pub fn apply_absent_defaults(&mut self) {
+        if self.background.is_none() {
+            self.background = Some(false);
+        }
+        if self.parallel_tool_calls.is_none() {
+            self.parallel_tool_calls = Some(true);
+        }
+        if self.service_tier.is_none() {
+            self.service_tier = Some("auto".to_string());
+        }
+        if self.store.is_none() {
+            self.store = Some(true);
+        }
+        if self.stream.is_none() {
+            self.stream = Some(false);
+        }
+        if self.top_logprobs.is_none() {
+            self.top_logprobs = Some(0i64);
+        }
+        if self.truncation.is_none() {
+            self.truncation = Some("disabled".to_string());
+        }
+    }
+}
+
+impl ::serde::Serialize for OpenAiResponsesRequest {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        if let Some(v) = &self.background {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "background", v)?;
+        }
+        if !self.include.is_empty() {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "include", &self.include)?;
+        }
+        if let Some(v) = &self.input {
+            ::serde::ser::SerializeMap::serialize_entry(
+                &mut map,
+                "input",
+                &::serde_json::from_str::<::serde_json::Value>(v)
+                    .unwrap_or(::serde_json::Value::Null),
+            )?;
+        }
+        if let Some(v) = &self.instructions {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "instructions", v)?;
+        }
+        if let Some(v) = &self.max_output_tokens {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "max_output_tokens", v)?;
+        }
+        if let Some(v) = &self.max_tool_calls {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "max_tool_calls", v)?;
+        }
+        if let Some(v) = &self.metadata {
+            ::serde::ser::SerializeMap::serialize_entry(
+                &mut map,
+                "metadata",
+                &::serde_json::from_str::<::serde_json::Value>(v)
+                    .unwrap_or(::serde_json::Value::Null),
+            )?;
+        }
+        if let Some(v) = &self.model {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "model", v)?;
+        }
+        if let Some(v) = &self.parallel_tool_calls {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "parallel_tool_calls", v)?;
+        }
+        if let Some(v) = &self.previous_response_id {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "previous_response_id", v)?;
+        }
+        if let Some(v) = &self.reasoning {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "reasoning", v)?;
+        }
+        if let Some(v) = &self.service_tier {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "service_tier", v)?;
+        }
+        if let Some(v) = &self.store {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "store", v)?;
+        }
+        if let Some(v) = &self.stream {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "stream", v)?;
+        }
+        if let Some(v) = &self.temperature {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "temperature", v)?;
+        }
+        if let Some(v) = &self.text {
+            ::serde::ser::SerializeMap::serialize_entry(
+                &mut map,
+                "text",
+                &::serde_json::from_str::<::serde_json::Value>(v)
+                    .unwrap_or(::serde_json::Value::Null),
+            )?;
+        }
+        if let Some(v) = &self.tool_choice {
+            ::serde::ser::SerializeMap::serialize_entry(
+                &mut map,
+                "tool_choice",
+                &::serde_json::from_str::<::serde_json::Value>(v)
+                    .unwrap_or(::serde_json::Value::Null),
+            )?;
+        }
+        if !self.tools.is_empty() {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "tools", &self.tools)?;
+        }
+        if let Some(v) = &self.top_logprobs {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "top_logprobs", v)?;
+        }
+        if let Some(v) = &self.top_p {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "top_p", v)?;
+        }
+        if let Some(v) = &self.truncation {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "truncation", v)?;
+        }
+        if let Some(v) = &self.user {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "user", v)?;
+        }
+        if let Some(v) = &self.chat_template_kwargs {
+            ::serde::ser::SerializeMap::serialize_entry(
+                &mut map,
+                "chat_template_kwargs",
+                &::serde_json::from_str::<::serde_json::Value>(v)
+                    .unwrap_or(::serde_json::Value::Null),
+            )?;
+        }
+        if let Some(v) = &self.request_id {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "request_id", v)?;
+        }
+        if let Some(v) = &self.session_id {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "session_id", v)?;
+        }
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "priority", &self.priority)?;
+        if let Some(v) = &self.extra_key {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "extra_key", v)?;
+        }
+        if let Some(v) = &self.cache_salt {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "cache_salt", v)?;
+        }
+        if let Some(v) = &self.data_parallel_rank {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "data_parallel_rank", v)?;
+        }
+        ::serde::ser::SerializeMap::serialize_entry(
+            &mut map,
+            "frequency_penalty",
+            &self.frequency_penalty,
+        )?;
+        ::serde::ser::SerializeMap::serialize_entry(
+            &mut map,
+            "presence_penalty",
+            &self.presence_penalty,
+        )?;
+        if let Some(v) = &self.stop {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "stop", v)?;
+        }
+        if let Some(v) = &self.top_k {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "top_k", v)?;
+        }
+        if let Some(v) = &self.min_p {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "min_p", v)?;
+        }
+        if let Some(v) = &self.repetition_penalty {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "repetition_penalty", v)?;
+        }
+        if let Some(v) = &self.bootstrap_host {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "bootstrap_host", v)?;
+        }
+        if let Some(v) = &self.bootstrap_port {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "bootstrap_port", v)?;
+        }
+        if let Some(v) = &self.bootstrap_room {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "bootstrap_room", v)?;
+        }
+        if let Some(v) = &self.routed_dp_rank {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "routed_dp_rank", v)?;
+        }
+        if let Some(v) = &self.disagg_prefill_dp_rank {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "disagg_prefill_dp_rank", v)?;
+        }
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for OpenAiResponsesRequest {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = OpenAiResponsesRequest;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct OpenAiResponsesRequest")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_background = None;
+                let mut f_include = None;
+                let mut f_input = None;
+                let mut f_instructions = None;
+                let mut f_max_output_tokens = None;
+                let mut f_max_tool_calls = None;
+                let mut f_metadata = None;
+                let mut f_model = None;
+                let mut f_parallel_tool_calls = None;
+                let mut f_previous_response_id = None;
+                let mut f_reasoning = None;
+                let mut f_service_tier = None;
+                let mut f_store = None;
+                let mut f_stream = None;
+                let mut f_temperature = None;
+                let mut f_text = None;
+                let mut f_tool_choice = None;
+                let mut f_tools = None;
+                let mut f_top_logprobs = None;
+                let mut f_top_p = None;
+                let mut f_truncation = None;
+                let mut f_user = None;
+                let mut f_chat_template_kwargs = None;
+                let mut f_request_id = None;
+                let mut f_session_id = None;
+                let mut f_priority = None;
+                let mut f_extra_key = None;
+                let mut f_cache_salt = None;
+                let mut f_data_parallel_rank = None;
+                let mut f_frequency_penalty = None;
+                let mut f_presence_penalty = None;
+                let mut f_stop = None;
+                let mut f_top_k = None;
+                let mut f_min_p = None;
+                let mut f_repetition_penalty = None;
+                let mut f_bootstrap_host = None;
+                let mut f_bootstrap_port = None;
+                let mut f_bootstrap_room = None;
+                let mut f_routed_dp_rank = None;
+                let mut f_disagg_prefill_dp_rank = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "background" => {
+                            if f_background.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("background"));
+                            }
+                            f_background = Some(Some(
+                                map.next_value::<Option<bool>>()?.unwrap_or_else(|| false),
+                            ));
+                        }
+                        "include" => {
+                            if f_include.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("include"));
+                            }
+                            f_include = Some(
+                                map.next_value::<Option<Vec<::prost::alloc::string::String>>>()?
+                                    .unwrap_or_default(),
+                            );
+                        }
+                        "input" => {
+                            if f_input.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("input"));
+                            }
+                            f_input = Some(
+                                map.next_value::<Option<::serde_json::Value>>()?
+                                    .map(|v| v.to_string()),
+                            );
+                        }
+                        "instructions" => {
+                            if f_instructions.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("instructions"));
+                            }
+                            f_instructions =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        "max_output_tokens" => {
+                            if f_max_output_tokens.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "max_output_tokens",
+                                ));
+                            }
+                            f_max_output_tokens = Some(map.next_value::<Option<i64>>()?);
+                        }
+                        "max_tool_calls" => {
+                            if f_max_tool_calls.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("max_tool_calls"));
+                            }
+                            f_max_tool_calls = Some(map.next_value::<Option<i64>>()?);
+                        }
+                        "metadata" => {
+                            if f_metadata.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("metadata"));
+                            }
+                            f_metadata = Some(
+                                map.next_value::<Option<::serde_json::Value>>()?
+                                    .map(|v| v.to_string()),
+                            );
+                        }
+                        "model" => {
+                            if f_model.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("model"));
+                            }
+                            f_model =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        "parallel_tool_calls" => {
+                            if f_parallel_tool_calls.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "parallel_tool_calls",
+                                ));
+                            }
+                            f_parallel_tool_calls = Some(Some(
+                                map.next_value::<Option<bool>>()?.unwrap_or_else(|| true),
+                            ));
+                        }
+                        "previous_response_id" => {
+                            if f_previous_response_id.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "previous_response_id",
+                                ));
+                            }
+                            f_previous_response_id =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        "reasoning" => {
+                            if f_reasoning.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("reasoning"));
+                            }
+                            f_reasoning =
+                                Some(map.next_value::<Option<OpenAiResponseReasoning>>()?);
+                        }
+                        "service_tier" => {
+                            if f_service_tier.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("service_tier"));
+                            }
+                            f_service_tier = Some(Some(
+                                map.next_value::<Option<::prost::alloc::string::String>>()?
+                                    .unwrap_or_else(|| "auto".to_string()),
+                            ));
+                        }
+                        "store" => {
+                            if f_store.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("store"));
+                            }
+                            f_store = Some(Some(
+                                map.next_value::<Option<bool>>()?.unwrap_or_else(|| true),
+                            ));
+                        }
+                        "stream" => {
+                            if f_stream.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("stream"));
+                            }
+                            f_stream = Some(Some(
+                                map.next_value::<Option<bool>>()?.unwrap_or_else(|| false),
+                            ));
+                        }
+                        "temperature" => {
+                            if f_temperature.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("temperature"));
+                            }
+                            f_temperature = Some(map.next_value::<Option<f64>>()?);
+                        }
+                        "text" => {
+                            if f_text.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("text"));
+                            }
+                            f_text = Some(
+                                map.next_value::<Option<::serde_json::Value>>()?
+                                    .map(|v| v.to_string()),
+                            );
+                        }
+                        "tool_choice" => {
+                            if f_tool_choice.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("tool_choice"));
+                            }
+                            f_tool_choice = Some(
+                                map.next_value::<Option<::serde_json::Value>>()?
+                                    .map(|v| v.to_string()),
+                            );
+                        }
+                        "tools" => {
+                            if f_tools.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("tools"));
+                            }
+                            f_tools = Some(
+                                map.next_value::<Option<Vec<OpenAiResponseTool>>>()?
+                                    .unwrap_or_default(),
+                            );
+                        }
+                        "top_logprobs" => {
+                            if f_top_logprobs.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("top_logprobs"));
+                            }
+                            f_top_logprobs = Some(Some(
+                                map.next_value::<Option<i64>>()?.unwrap_or_else(|| 0i64),
+                            ));
+                        }
+                        "top_p" => {
+                            if f_top_p.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("top_p"));
+                            }
+                            f_top_p = Some(map.next_value::<Option<f64>>()?);
+                        }
+                        "truncation" => {
+                            if f_truncation.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("truncation"));
+                            }
+                            f_truncation = Some(Some(
+                                map.next_value::<Option<::prost::alloc::string::String>>()?
+                                    .unwrap_or_else(|| "disabled".to_string()),
+                            ));
+                        }
+                        "user" => {
+                            if f_user.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("user"));
+                            }
+                            f_user =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        "chat_template_kwargs" => {
+                            if f_chat_template_kwargs.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "chat_template_kwargs",
+                                ));
+                            }
+                            f_chat_template_kwargs = Some(
+                                map.next_value::<Option<::serde_json::Value>>()?
+                                    .map(|v| v.to_string()),
+                            );
+                        }
+                        "request_id" => {
+                            if f_request_id.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("request_id"));
+                            }
+                            f_request_id =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        "session_id" => {
+                            if f_session_id.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("session_id"));
+                            }
+                            f_session_id =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        "priority" => {
+                            if f_priority.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("priority"));
+                            }
+                            f_priority = Some(map.next_value::<i64>()?);
+                        }
+                        "extra_key" => {
+                            if f_extra_key.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("extra_key"));
+                            }
+                            f_extra_key =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        "cache_salt" => {
+                            if f_cache_salt.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("cache_salt"));
+                            }
+                            f_cache_salt =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        "data_parallel_rank" => {
+                            if f_data_parallel_rank.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "data_parallel_rank",
+                                ));
+                            }
+                            f_data_parallel_rank = Some(map.next_value::<Option<i64>>()?);
+                        }
+                        "frequency_penalty" => {
+                            if f_frequency_penalty.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "frequency_penalty",
+                                ));
+                            }
+                            f_frequency_penalty = Some(map.next_value::<f64>()?);
+                        }
+                        "presence_penalty" => {
+                            if f_presence_penalty.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "presence_penalty",
+                                ));
+                            }
+                            f_presence_penalty = Some(map.next_value::<f64>()?);
+                        }
+                        "stop" => {
+                            if f_stop.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("stop"));
+                            }
+                            f_stop = Some(map.next_value::<Option<StringOrList>>()?);
+                        }
+                        "top_k" => {
+                            if f_top_k.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("top_k"));
+                            }
+                            f_top_k = Some(map.next_value::<Option<i64>>()?);
+                        }
+                        "min_p" => {
+                            if f_min_p.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("min_p"));
+                            }
+                            f_min_p = Some(map.next_value::<Option<f64>>()?);
+                        }
+                        "repetition_penalty" => {
+                            if f_repetition_penalty.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "repetition_penalty",
+                                ));
+                            }
+                            f_repetition_penalty = Some(map.next_value::<Option<f64>>()?);
+                        }
+                        "bootstrap_host" => {
+                            if f_bootstrap_host.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("bootstrap_host"));
+                            }
+                            f_bootstrap_host = Some(map.next_value::<Option<StringOrList>>()?);
+                        }
+                        "bootstrap_port" => {
+                            if f_bootstrap_port.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("bootstrap_port"));
+                            }
+                            f_bootstrap_port =
+                                Some(map.next_value::<Option<OptionalInt64OrList>>()?);
+                        }
+                        "bootstrap_room" => {
+                            if f_bootstrap_room.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("bootstrap_room"));
+                            }
+                            f_bootstrap_room = Some(map.next_value::<Option<Int64OrList>>()?);
+                        }
+                        "routed_dp_rank" => {
+                            if f_routed_dp_rank.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("routed_dp_rank"));
+                            }
+                            f_routed_dp_rank = Some(map.next_value::<Option<i64>>()?);
+                        }
+                        "disagg_prefill_dp_rank" => {
+                            if f_disagg_prefill_dp_rank.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "disagg_prefill_dp_rank",
+                                ));
+                            }
+                            f_disagg_prefill_dp_rank = Some(map.next_value::<Option<i64>>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(OpenAiResponsesRequest {
+                    background: f_background.unwrap_or_else(|| Some(false)),
+                    include: f_include.unwrap_or_default(),
+                    input: f_input.flatten(),
+                    instructions: f_instructions.flatten(),
+                    max_output_tokens: f_max_output_tokens.flatten(),
+                    max_tool_calls: f_max_tool_calls.flatten(),
+                    metadata: f_metadata.flatten(),
+                    model: f_model.flatten(),
+                    parallel_tool_calls: f_parallel_tool_calls.unwrap_or_else(|| Some(true)),
+                    previous_response_id: f_previous_response_id.flatten(),
+                    reasoning: f_reasoning.flatten(),
+                    service_tier: f_service_tier.unwrap_or_else(|| Some("auto".to_string())),
+                    store: f_store.unwrap_or_else(|| Some(true)),
+                    stream: f_stream.unwrap_or_else(|| Some(false)),
+                    temperature: f_temperature.flatten(),
+                    text: f_text.flatten(),
+                    tool_choice: f_tool_choice.flatten(),
+                    tools: f_tools.unwrap_or_default(),
+                    top_logprobs: f_top_logprobs.unwrap_or_else(|| Some(0i64)),
+                    top_p: f_top_p.flatten(),
+                    truncation: f_truncation.unwrap_or_else(|| Some("disabled".to_string())),
+                    user: f_user.flatten(),
+                    chat_template_kwargs: f_chat_template_kwargs.flatten(),
+                    request_id: f_request_id.flatten(),
+                    session_id: f_session_id.flatten(),
+                    priority: f_priority.unwrap_or_default(),
+                    extra_key: f_extra_key.flatten(),
+                    cache_salt: f_cache_salt.flatten(),
+                    data_parallel_rank: f_data_parallel_rank.flatten(),
+                    frequency_penalty: f_frequency_penalty.unwrap_or_default(),
+                    presence_penalty: f_presence_penalty.unwrap_or_default(),
+                    stop: f_stop.flatten(),
+                    top_k: f_top_k.flatten(),
+                    min_p: f_min_p.flatten(),
+                    repetition_penalty: f_repetition_penalty.flatten(),
+                    bootstrap_host: f_bootstrap_host.flatten(),
+                    bootstrap_port: f_bootstrap_port.flatten(),
+                    bootstrap_room: f_bootstrap_room.flatten(),
+                    routed_dp_rank: f_routed_dp_rank.flatten(),
+                    disagg_prefill_dp_rank: f_disagg_prefill_dp_rank.flatten(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for OpenAiResponsesInputTokensDetails {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::serialize_entry(
+            &mut map,
+            "cached_tokens",
+            &self.cached_tokens,
+        )?;
+        ::serde::ser::SerializeMap::serialize_entry(
+            &mut map,
+            "cache_write_tokens",
+            &self.cache_write_tokens,
+        )?;
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for OpenAiResponsesInputTokensDetails {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = OpenAiResponsesInputTokensDetails;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct OpenAiResponsesInputTokensDetails")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_cached_tokens = None;
+                let mut f_cache_write_tokens = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "cached_tokens" => {
+                            if f_cached_tokens.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("cached_tokens"));
+                            }
+                            f_cached_tokens = Some(map.next_value::<i64>()?);
+                        }
+                        "cache_write_tokens" => {
+                            if f_cache_write_tokens.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "cache_write_tokens",
+                                ));
+                            }
+                            f_cache_write_tokens = Some(map.next_value::<i64>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(OpenAiResponsesInputTokensDetails {
+                    cached_tokens: f_cached_tokens.unwrap_or_default(),
+                    cache_write_tokens: f_cache_write_tokens.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for OpenAiResponsesOutputTokensDetails {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::serialize_entry(
+            &mut map,
+            "reasoning_tokens",
+            &self.reasoning_tokens,
+        )?;
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for OpenAiResponsesOutputTokensDetails {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = OpenAiResponsesOutputTokensDetails;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct OpenAiResponsesOutputTokensDetails")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_reasoning_tokens = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "reasoning_tokens" => {
+                            if f_reasoning_tokens.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "reasoning_tokens",
+                                ));
+                            }
+                            f_reasoning_tokens = Some(map.next_value::<i64>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(OpenAiResponsesOutputTokensDetails {
+                    reasoning_tokens: f_reasoning_tokens.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for OpenAiResponsesUsage {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "input_tokens", &self.input_tokens)?;
+        if let Some(v) = &self.input_tokens_details {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "input_tokens_details", v)?;
+        }
+        ::serde::ser::SerializeMap::serialize_entry(
+            &mut map,
+            "output_tokens",
+            &self.output_tokens,
+        )?;
+        if let Some(v) = &self.output_tokens_details {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "output_tokens_details", v)?;
+        }
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "total_tokens", &self.total_tokens)?;
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for OpenAiResponsesUsage {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = OpenAiResponsesUsage;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct OpenAiResponsesUsage")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_input_tokens = None;
+                let mut f_input_tokens_details = None;
+                let mut f_output_tokens = None;
+                let mut f_output_tokens_details = None;
+                let mut f_total_tokens = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "input_tokens" => {
+                            if f_input_tokens.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("input_tokens"));
+                            }
+                            f_input_tokens = Some(map.next_value::<i64>()?);
+                        }
+                        "input_tokens_details" => {
+                            if f_input_tokens_details.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "input_tokens_details",
+                                ));
+                            }
+                            f_input_tokens_details = Some(
+                                map.next_value::<Option<OpenAiResponsesInputTokensDetails>>()?,
+                            );
+                        }
+                        "output_tokens" => {
+                            if f_output_tokens.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("output_tokens"));
+                            }
+                            f_output_tokens = Some(map.next_value::<i64>()?);
+                        }
+                        "output_tokens_details" => {
+                            if f_output_tokens_details.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "output_tokens_details",
+                                ));
+                            }
+                            f_output_tokens_details = Some(
+                                map.next_value::<Option<OpenAiResponsesOutputTokensDetails>>()?,
+                            );
+                        }
+                        "total_tokens" => {
+                            if f_total_tokens.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("total_tokens"));
+                            }
+                            f_total_tokens = Some(map.next_value::<i64>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(OpenAiResponsesUsage {
+                    input_tokens: f_input_tokens.unwrap_or_default(),
+                    input_tokens_details: f_input_tokens_details.flatten(),
+                    output_tokens: f_output_tokens.unwrap_or_default(),
+                    output_tokens_details: f_output_tokens_details.flatten(),
+                    total_tokens: f_total_tokens.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for OpenAiResponsesResponse {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "id", &self.id)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "object", &self.object)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "created_at", &self.created_at)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "model", &self.model)?;
+        if !self.output.is_empty() {
+            let rows: Vec<::serde_json::Value> = self
+                .output
+                .iter()
+                .map(|s| ::serde_json::from_str(s).unwrap_or(::serde_json::Value::Null))
+                .collect();
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "output", &rows)?;
+        }
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "status", &self.status)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "usage", &self.usage)?;
+        ::serde::ser::SerializeMap::serialize_entry(
+            &mut map,
+            "parallel_tool_calls",
+            &self.parallel_tool_calls,
+        )?;
+        if let Some(v) = &self.tool_choice {
+            ::serde::ser::SerializeMap::serialize_entry(
+                &mut map,
+                "tool_choice",
+                &::serde_json::from_str::<::serde_json::Value>(v)
+                    .unwrap_or(::serde_json::Value::Null),
+            )?;
+        }
+        if !self.tools.is_empty() {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "tools", &self.tools)?;
+        }
+        match &self.error {
+            Some(v) => {
+                ::serde::ser::SerializeMap::serialize_entry(
+                    &mut map,
+                    "error",
+                    &::serde_json::from_str::<::serde_json::Value>(v)
+                        .unwrap_or(::serde_json::Value::Null),
+                )?;
+            }
+            None => {
+                ::serde::ser::SerializeMap::serialize_entry(
+                    &mut map,
+                    "error",
+                    &::serde_json::Value::Null,
+                )?;
+            }
+        }
+        match &self.incomplete_details {
+            Some(v) => {
+                ::serde::ser::SerializeMap::serialize_entry(
+                    &mut map,
+                    "incomplete_details",
+                    &::serde_json::from_str::<::serde_json::Value>(v)
+                        .unwrap_or(::serde_json::Value::Null),
+                )?;
+            }
+            None => {
+                ::serde::ser::SerializeMap::serialize_entry(
+                    &mut map,
+                    "incomplete_details",
+                    &::serde_json::Value::Null,
+                )?;
+            }
+        }
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "instructions", &self.instructions)?;
+        ::serde::ser::SerializeMap::serialize_entry(
+            &mut map,
+            "max_output_tokens",
+            &self.max_output_tokens,
+        )?;
+        ::serde::ser::SerializeMap::serialize_entry(
+            &mut map,
+            "previous_response_id",
+            &self.previous_response_id,
+        )?;
+        match &self.reasoning {
+            Some(v) => {
+                ::serde::ser::SerializeMap::serialize_entry(
+                    &mut map,
+                    "reasoning",
+                    &::serde_json::from_str::<::serde_json::Value>(v)
+                        .unwrap_or(::serde_json::Value::Null),
+                )?;
+            }
+            None => {
+                ::serde::ser::SerializeMap::serialize_entry(
+                    &mut map,
+                    "reasoning",
+                    &::serde_json::Value::Null,
+                )?;
+            }
+        }
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "store", &self.store)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "temperature", &self.temperature)?;
+        match &self.text {
+            Some(v) => {
+                ::serde::ser::SerializeMap::serialize_entry(
+                    &mut map,
+                    "text",
+                    &::serde_json::from_str::<::serde_json::Value>(v)
+                        .unwrap_or(::serde_json::Value::Null),
+                )?;
+            }
+            None => {
+                ::serde::ser::SerializeMap::serialize_entry(
+                    &mut map,
+                    "text",
+                    &::serde_json::Value::Null,
+                )?;
+            }
+        }
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "top_p", &self.top_p)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "truncation", &self.truncation)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "user", &self.user)?;
+        match &self.metadata {
+            Some(v) => {
+                ::serde::ser::SerializeMap::serialize_entry(
+                    &mut map,
+                    "metadata",
+                    &::serde_json::from_str::<::serde_json::Value>(v)
+                        .unwrap_or(::serde_json::Value::Null),
+                )?;
+            }
+            None => {
+                ::serde::ser::SerializeMap::serialize_entry(
+                    &mut map,
+                    "metadata",
+                    &::serde_json::Value::Null,
+                )?;
+            }
+        }
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for OpenAiResponsesResponse {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = OpenAiResponsesResponse;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct OpenAiResponsesResponse")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_id = None;
+                let mut f_object = None;
+                let mut f_created_at = None;
+                let mut f_model = None;
+                let mut f_output = None;
+                let mut f_status = None;
+                let mut f_usage = None;
+                let mut f_parallel_tool_calls = None;
+                let mut f_tool_choice = None;
+                let mut f_tools = None;
+                let mut f_error = None;
+                let mut f_incomplete_details = None;
+                let mut f_instructions = None;
+                let mut f_max_output_tokens = None;
+                let mut f_previous_response_id = None;
+                let mut f_reasoning = None;
+                let mut f_store = None;
+                let mut f_temperature = None;
+                let mut f_text = None;
+                let mut f_top_p = None;
+                let mut f_truncation = None;
+                let mut f_user = None;
+                let mut f_metadata = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "id" => {
+                            if f_id.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("id"));
+                            }
+                            f_id = Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        "object" => {
+                            if f_object.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("object"));
+                            }
+                            f_object = Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        "created_at" => {
+                            if f_created_at.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("created_at"));
+                            }
+                            f_created_at = Some(map.next_value::<i64>()?);
+                        }
+                        "model" => {
+                            if f_model.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("model"));
+                            }
+                            f_model = Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        "output" => {
+                            if f_output.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("output"));
+                            }
+                            f_output = Some(
+                                map.next_value::<Option<Vec<::serde_json::Value>>>()?
+                                    .unwrap_or_default()
+                                    .into_iter()
+                                    .map(|v| v.to_string())
+                                    .collect(),
+                            );
+                        }
+                        "status" => {
+                            if f_status.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("status"));
+                            }
+                            f_status = Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        "usage" => {
+                            if f_usage.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("usage"));
+                            }
+                            f_usage = Some(map.next_value::<Option<OpenAiResponsesUsage>>()?);
+                        }
+                        "parallel_tool_calls" => {
+                            if f_parallel_tool_calls.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "parallel_tool_calls",
+                                ));
+                            }
+                            f_parallel_tool_calls = Some(map.next_value::<bool>()?);
+                        }
+                        "tool_choice" => {
+                            if f_tool_choice.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("tool_choice"));
+                            }
+                            f_tool_choice = Some(
+                                map.next_value::<Option<::serde_json::Value>>()?
+                                    .map(|v| v.to_string()),
+                            );
+                        }
+                        "tools" => {
+                            if f_tools.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("tools"));
+                            }
+                            f_tools = Some(
+                                map.next_value::<Option<Vec<OpenAiResponseTool>>>()?
+                                    .unwrap_or_default(),
+                            );
+                        }
+                        "error" => {
+                            if f_error.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("error"));
+                            }
+                            f_error = Some(
+                                map.next_value::<Option<::serde_json::Value>>()?
+                                    .map(|v| v.to_string()),
+                            );
+                        }
+                        "incomplete_details" => {
+                            if f_incomplete_details.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "incomplete_details",
+                                ));
+                            }
+                            f_incomplete_details = Some(
+                                map.next_value::<Option<::serde_json::Value>>()?
+                                    .map(|v| v.to_string()),
+                            );
+                        }
+                        "instructions" => {
+                            if f_instructions.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("instructions"));
+                            }
+                            f_instructions =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        "max_output_tokens" => {
+                            if f_max_output_tokens.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "max_output_tokens",
+                                ));
+                            }
+                            f_max_output_tokens = Some(map.next_value::<Option<i64>>()?);
+                        }
+                        "previous_response_id" => {
+                            if f_previous_response_id.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "previous_response_id",
+                                ));
+                            }
+                            f_previous_response_id =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        "reasoning" => {
+                            if f_reasoning.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("reasoning"));
+                            }
+                            f_reasoning = Some(
+                                map.next_value::<Option<::serde_json::Value>>()?
+                                    .map(|v| v.to_string()),
+                            );
+                        }
+                        "store" => {
+                            if f_store.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("store"));
+                            }
+                            f_store = Some(map.next_value::<Option<bool>>()?);
+                        }
+                        "temperature" => {
+                            if f_temperature.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("temperature"));
+                            }
+                            f_temperature = Some(map.next_value::<Option<f64>>()?);
+                        }
+                        "text" => {
+                            if f_text.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("text"));
+                            }
+                            f_text = Some(
+                                map.next_value::<Option<::serde_json::Value>>()?
+                                    .map(|v| v.to_string()),
+                            );
+                        }
+                        "top_p" => {
+                            if f_top_p.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("top_p"));
+                            }
+                            f_top_p = Some(map.next_value::<Option<f64>>()?);
+                        }
+                        "truncation" => {
+                            if f_truncation.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("truncation"));
+                            }
+                            f_truncation =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        "user" => {
+                            if f_user.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("user"));
+                            }
+                            f_user =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        "metadata" => {
+                            if f_metadata.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("metadata"));
+                            }
+                            f_metadata = Some(
+                                map.next_value::<Option<::serde_json::Value>>()?
+                                    .map(|v| v.to_string()),
+                            );
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(OpenAiResponsesResponse {
+                    id: f_id.unwrap_or_default(),
+                    object: f_object.unwrap_or_default(),
+                    created_at: f_created_at.unwrap_or_default(),
+                    model: f_model.unwrap_or_default(),
+                    output: f_output.unwrap_or_default(),
+                    status: f_status.unwrap_or_default(),
+                    usage: f_usage.flatten(),
+                    parallel_tool_calls: f_parallel_tool_calls.unwrap_or_default(),
+                    tool_choice: f_tool_choice.flatten(),
+                    tools: f_tools.unwrap_or_default(),
+                    error: f_error.flatten(),
+                    incomplete_details: f_incomplete_details.flatten(),
+                    instructions: f_instructions.flatten(),
+                    max_output_tokens: f_max_output_tokens.flatten(),
+                    previous_response_id: f_previous_response_id.flatten(),
+                    reasoning: f_reasoning.flatten(),
+                    store: f_store.flatten(),
+                    temperature: f_temperature.flatten(),
+                    text: f_text.flatten(),
+                    top_p: f_top_p.flatten(),
+                    truncation: f_truncation.flatten(),
+                    user: f_user.flatten(),
+                    metadata: f_metadata.flatten(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
 impl ::serde::Serialize for OpenAiModelCard {
     fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut map = serializer.serialize_map(None)?;

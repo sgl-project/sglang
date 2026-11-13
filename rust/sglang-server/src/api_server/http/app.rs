@@ -10,7 +10,7 @@ use axum::Router;
 use super::generate_hook::GenerateHook;
 use super::{
     anthropic, auth, corpus, dp_relay, hicache, info, loads, metrics, native_api, ollama, openai,
-    parsers, pre_generate, request_decompression, weights, wrappers,
+    parsers, pre_generate, request_decompression, responses, weights, wrappers,
 };
 use crate::HttpLayer;
 use crate::api_server::core::{DrainEnd, FLUSH_INTERVAL};
@@ -160,7 +160,8 @@ pub async fn serve(
         .merge(native_api::routes())
         .merge(openai::routes())
         .merge(ollama::routes())
-        .merge(anthropic::routes());
+        .merge(anthropic::routes())
+        .merge(responses::routes());
     if server_args.metrics.is_some() && metrics_listener {
         router = router.merge(metrics::routes());
     }
@@ -180,6 +181,7 @@ pub async fn serve(
 
     // No body limit, matching the Python server.
     let core = state.core.clone();
+    let responses_state = state.clone();
     let mut app = router
         .with_state(state)
         .merge(hicache::routes(hicache_manager))
@@ -209,6 +211,9 @@ pub async fn serve(
     // rewrite the request and send it back through everything above, so a
     // wrapped generate is relayed and parsed like a direct one.
     app = wrappers::apply(app);
+    // `POST /v1/responses` plans a chat request and sends it back through
+    // the chat route, so the served model's own chat path answers it.
+    app = responses::mount(app, responses_state);
     // Outside the extension layer, so its routes are keyed too. The bootstrap
     // registry below stays open, as Python serves it on its own server. Auth
     // runs before decompression, so an unauthenticated body is never inflated.

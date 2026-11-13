@@ -89,8 +89,8 @@ RUST_SERVER_IGNORED_BY_DESIGN: Dict[str, str] = {
     "http2_max_concurrent_streams": "Only with --enable-http2, which is refused.",
     # Routes the Rust server does not serve: their clients get a 404.
     "asr_max_concurrent_sessions": "/v1/realtime is not served.",
-    "enable_response_store": "/v1/responses is not served.",
-    "tool_server": "/v1/responses is not served.",
+    "enable_response_store": "The Rust frontend serves /v1/responses without a store; stateful requests get Python's store-disabled refusal.",
+    "tool_server": "The Rust /v1/responses skips built-in tools, which only a tool server would run.",
     "enable_mis": "/v1/decisions is not served.",
     "dllm_algorithm": "/v1/decisions is not served.",
     "chunked_prefill_size": "Only read by /v1/score's score_extraction_token path, which the Rust frontend refuses.",
