@@ -18,6 +18,7 @@ Usage::
 
 import math
 import os
+from pathlib import Path
 
 import requests
 
@@ -31,6 +32,64 @@ _NPU_MAX_ACCURACY_ATTEMPTS = 3
 _is_pr_pipeline = os.environ.get("GITHUB_EVENT_NAME") == "pull_request" and (
     "nightly-test-npu.yml" not in os.environ.get("GITHUB_WORKFLOW_REF", "")
 )
+
+# sgl_eval downloads benchmarks (MMLU data.tar included) with its own httpx
+# client: it ignores HF_ENDPOINT, prints nothing and never retries, so a blocked
+# mirror looks like a hang. CI prefetches the archive instead; the shim below
+# re-checks the pinned digest and feeds prepare the local file.
+_SGL_EVAL_ARCHIVE_DIR_ENV = "SGLANG_EVAL_ARCHIVE_DIR"
+_SGL_EVAL_ARCHIVE_DIR_DEFAULT = Path.home() / ".cache" / "sgl_eval" / "archives"
+
+
+def honor_local_sgl_eval_archive():
+    """Point sgl_eval's archive-backed prepare at a prefetched local copy."""
+    archive_dir = Path(
+        os.environ.get(_SGL_EVAL_ARCHIVE_DIR_ENV) or _SGL_EVAL_ARCHIVE_DIR_DEFAULT
+    )
+    if not archive_dir.is_dir():
+        return
+    try:
+        from sgl_eval.evals import _loader
+    except ImportError:
+        return
+    original = getattr(_loader, "_save_data_from_verified_archive", None)
+    file_sha256 = getattr(_loader, "_file_sha256", None)
+    if (
+        original is None
+        or file_sha256 is None
+        or getattr(original, "_sglang_local_archive_shim", False)
+    ):
+        return
+
+    def _save_data_from_verified_archive(
+        mod, save_args, save_kwargs, archive_url, archive_sha256, work_dir
+    ):
+        local = archive_dir / archive_url.rsplit("/", 1)[-1]
+        expected = (archive_sha256 or "").lower()
+        if not (
+            expected
+            and hasattr(mod, "URL")
+            and local.is_file()
+            and file_sha256(local) == expected
+        ):
+            return original(
+                mod, save_args, save_kwargs, archive_url, archive_sha256, work_dir
+            )
+        # save_data() writes <work_dir>/<archive name>; the prefetched copy
+        # lives elsewhere, so urlretrieve() cannot truncate its own source.
+        original_url = mod.URL
+        try:
+            mod.URL = local.as_uri()
+            mod.save_data(*save_args, **save_kwargs)
+        finally:
+            mod.URL = original_url
+
+    _save_data_from_verified_archive._sglang_local_archive_shim = True
+    _loader._save_data_from_verified_archive = _save_data_from_verified_archive
+
+
+# Applied on import, so no per-case wiring is needed; a no-op without the dir.
+honor_local_sgl_eval_archive()
 
 
 def run_npu_pr_smoke(base_url):
