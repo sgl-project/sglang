@@ -5,7 +5,7 @@ python3 -m unittest test_cpu_graph.TestCPUGraph.test_mmlu_torch_compile_cpu
 
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -1245,6 +1245,76 @@ class TestCPUGraph(CustomTestCase):
         runner._reset_mamba_cache_if_needed()
         self.assertTrue(torch.all(conv_tensor == 0))
         self.assertTrue(torch.all(temporal_tensor == 0))
+
+    def test_attention_backend_registry_handles_intel_amx(self):
+        from sglang.srt.models.deepseek_common.attention_backend_handler import (
+            AttentionBackendRegistry,
+            handle_attention_intel_amx,
+        )
+        from sglang.srt.models.deepseek_common.attention_forward_methods.forward_methods import (
+            AttnForwardMethod,
+        )
+
+        handler = AttentionBackendRegistry.get_handler("intel_amx")
+        self.assertIs(handler, handle_attention_intel_amx)
+
+        # Extend/prefill returns MHA
+        extend_fb = SimpleNamespace(
+            forward_mode=SimpleNamespace(
+                is_decode_or_idle=lambda: False,
+            )
+        )
+        self.assertEqual(
+            handle_attention_intel_amx(object(), extend_fb),
+            AttnForwardMethod.MHA,
+        )
+
+        # Decode returns subtype
+        decode_fb = SimpleNamespace(
+            forward_mode=SimpleNamespace(
+                is_decode_or_idle=lambda: True,
+            )
+        )
+        attn = SimpleNamespace()
+        self.assertEqual(
+            handle_attention_intel_amx(attn, decode_fb),
+            AttnForwardMethod.MLA,
+        )
+
+    def test_warmup_prefill_eager_calls_model_forward(self):
+        runner = CPUGraphRunner.__new__(CPUGraphRunner)
+        runner.capture_num_tokens = [128]
+        runner.device = "cpu"
+        runner.is_generation = True
+        runner.model_is_mrope = False
+        runner.capture_hidden_mode = CaptureHiddenMode.NULL
+
+        model_runner = SimpleNamespace(
+            device="cpu",
+            is_draft_worker=False,
+            spec_algorithm=SimpleNamespace(),
+            attn_backend=SimpleNamespace(init_forward_metadata=lambda fb: None),
+            model=SimpleNamespace(forward=MagicMock()),
+        )
+        runner.model_runner = model_runner
+
+        with (
+            patch(
+                "sglang.srt.model_executor.cpu_graph_runner.enable_num_token_non_padded",
+                return_value=False,
+            ),
+            patch.object(
+                cpu_graph_runner_module,
+                "get_parallel",
+                return_value=SimpleNamespace(
+                    tp_group=SimpleNamespace(barrier=MagicMock()),
+                    moe_ep_size=1,
+                ),
+            ),
+        ):
+            runner._warmup_prefill_eager()
+
+        model_runner.model.forward.assert_called_once()
 
     @intel_amx_benchmark(
         extra_args=[

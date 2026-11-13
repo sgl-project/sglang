@@ -2320,7 +2320,38 @@ class CPUGraphRunner:
             self._rewarm_decode_dynamic_graphs()
         self._reset_mamba_cache_if_needed()
 
+    def _warmup_prefill_eager(self) -> None:
+        if not (
+            hasattr(self, "model_runner")
+            and self.model_runner is not None
+            and hasattr(self, "device")
+            and self.capture_num_tokens
+        ):
+            return
+
+        warmup_num_tokens = self.capture_num_tokens[0]
+        warmup_fb = self._build_prefill_dummy_forward_batch(warmup_num_tokens, 1)
+        warmup_kwargs = {} if self.is_generation else {"get_embedding": True}
+        with forward_context(
+            ForwardContext(attn_backend=self.model_runner.attn_backend),
+            forward_batch=warmup_fb,
+        ):
+            self.model_runner.attn_backend.init_forward_metadata(warmup_fb)
+            with _disable_cpu_graph_custom_op_aliasing_check(), torch.no_grad():
+                get_parallel().tp_group.barrier()
+                self.model_runner.model.forward(
+                    warmup_fb.input_ids,
+                    warmup_fb.positions,
+                    warmup_fb,
+                    **warmup_kwargs,
+                )
+
     def capture_prefill(self) -> None:
+        # Warm up eager model once for prefill (EXTEND) mode before compiling,
+        # so any lazy-initialized modules (e.g. BaseFusedOp._forward_method)
+        # are resolved in eager mode rather than during Dynamo tracing.
+        self._warmup_prefill_eager()
+
         capture_range = (
             tqdm.tqdm(list(reversed(self.capture_num_tokens)))
             if get_parallel().tp_rank == 0
