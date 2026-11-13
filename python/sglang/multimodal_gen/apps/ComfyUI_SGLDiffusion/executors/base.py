@@ -113,6 +113,17 @@ def _slice_transformer_options(options, index: int, batch: int):
     return sliced
 
 
+def _unsupported_model_patch_error(details: str) -> ValueError:
+    return ValueError(
+        "SGLD integrated mode runs the diffusion model in its worker and cannot "
+        f"apply ComfyUI model patches ({details}). Remove "
+        "speed-only patch nodes (attention backends, caches, compile) and set "
+        "the equivalent in SGLDOptions (the workflow converter lists them: "
+        f"{CONVERT_COMMAND}); for ControlNet or block patches, use the native "
+        "ComfyUI loader"
+    )
+
+
 def _reject_model_patches(transformer_options) -> None:
     # The DiT runs in the SGLD worker, so ComfyUI block/attention patches would
     # be dropped silently (e.g. MiniMax H3 Fun ControlNet, ModelAttentionBackend).
@@ -130,14 +141,7 @@ def _reject_model_patches(transformer_options) -> None:
     if opts.get("optimized_attention_override") is not None:
         found.append("optimized_attention_override")
     if found:
-        raise ValueError(
-            "SGLD integrated mode runs the diffusion model in its worker and cannot "
-            f"apply ComfyUI model patches ({', '.join(sorted(found))}). Remove "
-            "speed-only patch nodes (attention backends, caches, compile) and set "
-            "the equivalent in SGLDOptions (the workflow converter lists them: "
-            f"{CONVERT_COMMAND}); for ControlNet or block patches, use the native "
-            "ComfyUI loader"
-        )
+        raise _unsupported_model_patch_error(", ".join(sorted(found)))
 
 
 # apply_model kwargs that carry image content (ControlNet residuals, reference latents).
@@ -408,3 +412,9 @@ class SGLDiffusionExecutor(torch.nn.Module):
             None if cond_uuid is None else (cond_uuid, _cond_row)
         )
         return self._execute_packed(packed, x, timestep)
+
+    @property
+    def transformer_blocks(self):
+        # ComfyUI block-patch nodes (e.g. Fun ControlNet) read
+        # diffusion_model.transformer_blocks before registering patches.
+        raise _unsupported_model_patch_error("diffusion_model.transformer_blocks")

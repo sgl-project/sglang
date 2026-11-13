@@ -7,6 +7,7 @@ import copy
 from comfy.model_patcher import ModelPatcher
 
 from ..convert import CONVERT_COMMAND
+from ..executors.base import _unsupported_model_patch_error
 
 
 class SGLDModelPatcher(ModelPatcher):
@@ -75,6 +76,16 @@ class SGLDModelPatcher(ModelPatcher):
                 f"workflow: {CONVERT_COMMAND}"
             )
         return []
+
+    def set_model_patch(self, patch, name):
+        """Reject ComfyUI transformer/attention patches eagerly at patch time."""
+        raise _unsupported_model_patch_error(f"patches.{name}")
+
+    def set_model_patch_replace(
+        self, patch, name, block_name, number, transformer_index=None
+    ):
+        """Reject ComfyUI block-replace patches eagerly at patch time."""
+        raise _unsupported_model_patch_error(f"patches_replace.{name}")
 
     def model_size(self):
         """Get the model size in bytes."""
