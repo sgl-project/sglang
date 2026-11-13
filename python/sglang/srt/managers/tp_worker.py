@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
+from functools import cached_property
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
@@ -326,29 +327,6 @@ class TpModelWorker(BaseTpWorker):
 
         self._init_dllm_algorithm()
 
-        if get_serving().skip_tokenizer_init or self.is_draft_worker:
-            # A draft worker's tokenizer would only duplicate the target's:
-            # tokenizer_path always points at the target model.
-            self.tokenizer = self.processor = None
-        else:
-            if self.model_config.is_multimodal:
-                self.processor = get_processor(
-                    get_serving().tokenizer_path,
-                    tokenizer_mode=get_serving().tokenizer_mode,
-                    trust_remote_code=get_model().trust_remote_code,
-                    revision=get_model().revision,
-                    tokenizer_backend=get_serving().tokenizer_backend,
-                    model_name=get_model().model_path,
-                )
-                self.tokenizer = get_tokenizer_from_processor(self.processor)
-            else:
-                self.tokenizer = get_tokenizer(
-                    get_serving().tokenizer_path,
-                    tokenizer_mode=get_serving().tokenizer_mode,
-                    trust_remote_code=get_model().trust_remote_code,
-                    revision=get_model().revision,
-                    tokenizer_backend=get_serving().tokenizer_backend,
-                )
         self.device = self.model_runner.device
 
         # Init nccl groups
@@ -393,6 +371,41 @@ class TpModelWorker(BaseTpWorker):
         self.enable_overlap = not get_schedule().disable_overlap_schedule
         self.enable_spec = get_spec().speculative_algorithm is not None
         self.hicache_layer_transfer_counter = None
+
+    # Only a few speculative workers read these, so build them on first use
+    # instead of putting a multi-second processor load on every startup.
+    @cached_property
+    def processor(self):
+        if (
+            get_serving().skip_tokenizer_init
+            or self.is_draft_worker
+            or not self.model_config.is_multimodal
+        ):
+            return None
+        return get_processor(
+            get_serving().tokenizer_path,
+            tokenizer_mode=get_serving().tokenizer_mode,
+            trust_remote_code=get_model().trust_remote_code,
+            revision=get_model().revision,
+            tokenizer_backend=get_serving().tokenizer_backend,
+            model_name=get_model().model_path,
+        )
+
+    @cached_property
+    def tokenizer(self):
+        # A draft worker's tokenizer would only duplicate the target's:
+        # tokenizer_path always points at the target model.
+        if get_serving().skip_tokenizer_init or self.is_draft_worker:
+            return None
+        if self.processor is not None:
+            return get_tokenizer_from_processor(self.processor)
+        return get_tokenizer(
+            get_serving().tokenizer_path,
+            tokenizer_mode=get_serving().tokenizer_mode,
+            trust_remote_code=get_model().trust_remote_code,
+            revision=get_model().revision,
+            tokenizer_backend=get_serving().tokenizer_backend,
+        )
 
     def alloc_memory_pool(
         self,
