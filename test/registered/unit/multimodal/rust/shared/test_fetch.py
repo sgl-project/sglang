@@ -40,14 +40,9 @@ class TestRustMediaSourceLoading(CustomTestCase):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "image.png"
             path.write_bytes(self.DATA)
-            self.assertEqual(bytes(FETCH(str(path))), get_image_bytes(str(path)))
-            # `file://` is asserted against the payload, not the Python helper,
-            # on purpose: `get_image_bytes` passes the un-stripped URL straight
-            # to `open()`, so the reference raises here. The native path strips
-            # the scheme and succeeds — a deliberate divergence, not an omission.
-            with self.assertRaises(OSError):
-                get_image_bytes(path.as_uri())
-            self.assertEqual(bytes(FETCH(path.as_uri())), self.DATA)
+            for source in (str(path), path.as_uri()):
+                with self.subTest(source=source[:7]):
+                    self.assertEqual(bytes(FETCH(source)), get_image_bytes(source))
 
     def test_http_source(self):
         data = self.DATA
