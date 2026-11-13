@@ -262,7 +262,7 @@ __global__ void __launch_bounds__(kNumThreads)
   using Ex = muse_ar_norm::Exchange<kHidden, kWorld, kNumThreads, 1, kTwoShot, kMulticast>;
   // Wait for the o_proj GEMM that writes `partial`.
   device::PDLWaitPrimary<kUsePDL>();
-  // Read this block's epoch parity: which half of the double-buffered slots this launch uses.
+  // Read the plane's epoch parity: which half of the double-buffered slots this launch uses.
   const Ex ex{params, muse_ar_norm::Epoch<kWorld>{params.ws, params.rank}, 0};
   // Phase 1: push every row this block owns to its peers.
   for (uint32_t row = blockIdx.x; row < params.num_rows; row += gridDim.x)
@@ -289,7 +289,7 @@ __global__ void __launch_bounds__(kNumThreads)
         kPostWeight,
         kGate>(params.norm, row, [&branch](int pack, int) { return branch[pack]; });
   }
-  // Flip the epoch parity for the next launch on the plane.
+  // Commit this block to the next epoch of the plane.
   ex.finish();
 }
 
@@ -314,7 +314,7 @@ __global__ void __launch_bounds__(kNumThreads)
   const uint32_t row = blockIdx.x / kClusterSize;
   // Wait for the o_proj GEMM that writes `partial`.
   device::PDLWaitPrimary<kUsePDL>();
-  // Read this block's epoch parity: which half of the double-buffered slots this launch uses.
+  // Read the plane's epoch parity: which half of the double-buffered slots this launch uses.
   const Ex ex{params, muse_ar_norm::Epoch<kWorld>{params.ws, params.rank}, cluster_rank};
   // Phase 1: push this block's part of the row to its peers.
   ex.push(row);
@@ -338,7 +338,7 @@ __global__ void __launch_bounds__(kNumThreads)
       kHasRouter,
       kPostWeight,
       kGate>(params.norm, row, [&branch](int pack, int) { return branch[pack]; });
-  // Flip the epoch parity for the next launch on the plane.
+  // Commit this block to the next epoch of the plane.
   ex.finish();
 }
 
