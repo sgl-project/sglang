@@ -126,6 +126,9 @@ def benchmark(num_tokens: int, provider: str):
         rows = max(0, min(num_tokens, row0 + per_rank) - row0)
         mine = residual[row0 : row0 + rows].clone()
         copy = provider == "fused"
+        # the model's scale layout: column-major, 16-byte aligned columns
+        groups, ld = HIDDEN // GROUP, (num_tokens + 3) // 4 * 4
+        scales = s_t.view(-1)[: groups * ld].view(groups, ld).t()[:num_tokens]
 
         def fn(x):
             if copy:
@@ -135,7 +138,7 @@ def benchmark(num_tokens: int, provider: str):
                 p_mc,
                 o_t[:num_tokens],
                 o_mc,
-                s_t[:num_tokens],
+                scales,
                 s_mc,
                 mine,
                 w_a,
@@ -147,7 +150,7 @@ def benchmark(num_tokens: int, provider: str):
                 False,
                 world_size=world_size,
             )
-            return o_t[:num_tokens], s_t[:num_tokens]
+            return o_t[:num_tokens], scales
 
     return marker.do_bench(
         fn,

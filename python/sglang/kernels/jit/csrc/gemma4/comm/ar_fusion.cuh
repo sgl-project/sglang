@@ -51,7 +51,7 @@ using device::distributed::Semaphore;
 struct Params {
   const uint8_t* partial_mc;  // [T, H] bf16, multicast VA: this rank's partial sums
   uint8_t* out_mc;            // fused: [T, H] fp8 multicast; final: [T, H] bf16 multicast (may alias partial_mc)
-  float* scales_mc;           // [T, H / 128] fp32 multicast (fused only)
+  float* scales_mc;           // [T, H / 128] fp32 multicast (fused only), strided as below
   __nv_bfloat16* residual;    // [rows, H] this rank's rows of the residual stream, updated in place
   const __nv_bfloat16* w_a;   // [H] norm before the residual add
   const __nv_bfloat16* w_b;   // [H] norm after it (fused only)
@@ -69,6 +69,9 @@ struct Params {
   // (unfused: fused add + RMSNorm). MLP site (false): the add stays fp32
   // (gemma_rmsnorm_residual_scalar) and the next norm reads the bf16 stream.
   bool round_a;
+  // scales_mc strides in floats: (H / 128, 1) row-major, (1, ld) for DeepGEMM's MN-major layout
+  int64_t scale_row_stride;
+  int64_t scale_group_stride;
 };
 
 SGL_DEVICE void unpack(const uint4& v, float* f) {
@@ -200,7 +203,9 @@ struct RowEpilogue {
       if ((t & 1) == 0) store_mc(p.out_mc, (row * kHidden + c * kVec) / 16, make_uint4(q.x, q.y, px, py));
       if (c % kGroupVecs == 0) {
         device::ptx::multimem_store_relaxed(
-            reinterpret_cast<uint32_t*>(p.scales_mc + row * kNumGroups + c / kGroupVecs), __float_as_uint(scale));
+            reinterpret_cast<uint32_t*>(
+                p.scales_mc + row * p.scale_row_stride + int64_t(c / kGroupVecs) * p.scale_group_stride),
+            __float_as_uint(scale));
       }
     }
   }
@@ -283,6 +288,8 @@ struct Gemma4ArFusionKernel {
   /// One fused site. `partial` is this rank's [T, H] bf16 view of a symmetric
   /// buffer whose multicast VA is `partial_mc`; `out` / `scales` likewise for the
   /// [T, H] fp8 rows and [T, H / 128] fp32 scales that every rank receives.
+  /// `scales` may be strided (e.g. DeepGEMM's MN-major, TMA-aligned layout); its
+  /// data pointer must be the address `scales_mc` multicasts.
   /// `residual` is this rank's [rows, H] slice of the stream, updated in place.
   /// num_blocks must be the same on every rank.
   static void site(
@@ -305,16 +312,22 @@ struct Gemma4ArFusionKernel {
     using namespace host;
     const auto& comm = *ref.get();
     auto p = make_params(comm, partial, partial_mc, residual, w_a, scalar, eps, row0, rows);
-    SymbolicSize T = {"num_tokens"};
+    SymbolicSize T = {"num_tokens"}, SR = {"scale_row_stride"}, SG = {"scale_group_stride"};
     SymbolicDevice device;
     device.set_options<kDLGPU>();
     TensorMatcher({T, kHidden}).with_dtype<fp8_e4m3_t>().with_device<kDLGPU>(device).verify(out);
-    TensorMatcher({T, kNumGroups}).with_dtype<fp32_t>().with_device<kDLGPU>(device).verify(scales);
+    TensorMatcher({T, kNumGroups})
+        .with_strides({SR, SG})
+        .with_dtype<fp32_t>()
+        .with_device<kDLGPU>(device)
+        .verify(scales);
     TensorMatcher({kHidden}).with_dtype<bf16_t>().with_device<kDLGPU>(device).verify(w_b);
     CHECK_HOST(T.unwrap() == partial.size(0)) << "out / scales and partial disagree on num_tokens";
     CHECK_HOST(out_mc != 0 && scales_mc != 0) << "the output buffers need multicast addresses";
     p.out_mc = reinterpret_cast<uint8_t*>(static_cast<uintptr_t>(out_mc));
     p.scales_mc = reinterpret_cast<float*>(static_cast<uintptr_t>(scales_mc));
+    p.scale_row_stride = SR.unwrap();
+    p.scale_group_stride = SG.unwrap();
     p.w_b = static_cast<const __nv_bfloat16*>(w_b.data_ptr());
     p.round_a = round_a;
     launch<false>(p, num_blocks, comm, partial.device());

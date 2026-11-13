@@ -41,13 +41,10 @@ DEFAULT_MIN_TOKENS = {2: 2048, 4: 128, 8: 128}
 
 # Smallest decode batch that takes the fused path, per TP size, unless
 # SGLANG_GEMMA4_AR_FUSION_DECODE_MIN_TOKENS says otherwise; a TP size not listed
-# keeps decode on the stock path. On H200 the fused site (partial written by the
-# GEMM) is 17-39 % faster than CustomAllReduceV2 + the stock norm and quant
-# kernels at 1-160 tokens, yet the TP4 decode step is 1-4 % slower below 8
-# tokens (most likely the next block-FP8 GEMM reformatting the site's row-major
-# scales) and 1-4 % faster from 8 up. At TP2 the step moves by -1.3..+1.6 %, about the
-# run-to-run spread, so TP2 keeps the stock path; TP8 is not measured.
-DEFAULT_DECODE_MIN_TOKENS = {4: 8}
+# keeps decode on the stock path. On H200 the fused site writes its scales in
+# DeepGEMM's layout and makes the decode step 1-7 % faster at TP4 and 0-3 %
+# faster at TP2 for 1-160 tokens; TP8 is not measured.
+DEFAULT_DECODE_MIN_TOKENS = {2: 1, 4: 1}
 
 
 def default_min_tokens(world_size: int) -> int:
@@ -65,6 +62,11 @@ def decode_min_tokens(world_size: int) -> Optional[int]:
 
 
 GROUP = 128
+
+
+def _tma_aligned_rows(num_tokens: int) -> int:
+    # 16-byte aligned fp32 columns, as create_per_token_group_quant_fp8_output_scale
+    return (num_tokens + 3) // 4 * 4
 
 
 def requested() -> bool:
@@ -165,7 +167,11 @@ class Gemma4ArFusion:
         # partial sums in (bf16); the last layer multicasts the bf16 residual into it
         self.partial = _symm_buffer((T, H), torch.bfloat16, state.group_name)
         self.out = _symm_buffer((T, H), torch.float8_e4m3fn, state.group_name)
-        self.scales = _symm_buffer((T, H // GROUP), torch.float32, state.group_name)
+        # stored [H / 128, align4(T)]: each site hands the block-FP8 GEMM the
+        # MN-major, TMA-aligned [T, H / 128] view DeepGEMM consumes as is
+        self.scales = _symm_buffer(
+            (H // GROUP, _tma_aligned_rows(T)), torch.float32, state.group_name
+        )
         dev = self.partial.tensor.device
         self.one = torch.ones(1, dtype=torch.float32, device=dev)
         self.used = set()  # "extend" / "decode" once their first fused forward ran
@@ -219,6 +225,14 @@ class Gemma4ArFusion:
             staged.copy_(partial)
         return staged
 
+    def _scales_out(self, num_tokens: int) -> torch.Tensor:
+        """[num_tokens, H / 128] column-major view, rows padded to 16 bytes,
+        starting at the buffer's base (the address its multicast VA maps)."""
+        groups, ld = self.scales.tensor.shape[0], _tma_aligned_rows(num_tokens)
+        return (
+            self.scales.tensor.view(-1)[: groups * ld].view(groups, ld).t()[:num_tokens]
+        )
+
     def site(
         self,
         partial: torch.Tensor,
@@ -232,16 +246,18 @@ class Gemma4ArFusion:
 
         Updates ``residual`` (this rank's rows) in place; returns ``(fp8 [T, H],
         fp32 scales [T, H / 128])`` for every row, the pre-quantized input of the
-        block-FP8 linear.
+        block-FP8 linear. The scales are column-major with TMA-aligned rows, the
+        layout DeepGEMM reads without reformatting them.
         """
         T = partial.shape[0]
         row0, rows = self.rows(T)
+        scales = self._scales_out(T)
         self._mod.site(
             self._stage(partial),
             self.partial.mc,
             self.out.tensor[:T],
             self.out.mc,
-            self.scales.tensor[:T],
+            scales,
             self.scales.mc,
             residual,
             w_a,
@@ -253,7 +269,7 @@ class Gemma4ArFusion:
             round_a,
             world_size=self.world_size,
         )
-        return self.out.tensor[:T], self.scales.tensor[:T]
+        return self.out.tensor[:T], scales
 
     def final(
         self,
