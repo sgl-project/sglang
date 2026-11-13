@@ -1793,7 +1793,7 @@ class ChatEncodingAdapterDispatchTestCase(CustomTestCase):
             patch.object(
                 OpenAIServingChat, "_resolve_chat_encoding_spec", return_value="inkling"
             ),
-            patch.object(serving_inkling, "_check_served_tokenizer"),
+            patch.object(serving_inkling, "check_served_tokenizer"),
             patch.object(
                 chat_encoding_adapters,
                 "build_chat_encoding_adapter",

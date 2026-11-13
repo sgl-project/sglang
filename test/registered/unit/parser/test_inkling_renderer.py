@@ -3,7 +3,11 @@ import unittest
 from pathlib import Path
 
 from sglang.srt.entrypoints.openai.chat_encoding import encode_simple_chat
-from sglang.srt.parser.inkling_output import InklingOutputDelta, InklingOutputParser
+from sglang.srt.parser.inkling_output import (
+    InklingOutputDelta,
+    InklingOutputParser,
+    native_byte_ids,
+)
 from sglang.srt.parser.inkling_renderer import (
     load_tml_renderers,
     render_inkling_assistant_prefix,
@@ -36,6 +40,8 @@ class TestInklingRenderer(unittest.TestCase):
                 actual = render_inkling_messages(
                     case["messages"],
                     tools=case["tools"],
+                    tool_choice=case["tool_choice"],
+                    parallel_tool_calls=case["parallel_tool_calls"],
                     reasoning_effort=case["reasoning_effort"],
                 )
                 self.assertEqual(actual, case["input_ids"])
@@ -200,7 +206,8 @@ class TestInklingOutputParser(unittest.TestCase):
 
     def test_truncated_message_surfaces_unstreamed_payload(self):
         """A message cut off before <|end_message|> (max_tokens) keeps what the
-        model generated: a call payload becomes content, streamed text is not repeated."""
+        model generated: a call payload becomes content, streamed text is not repeated,
+        and a call header cut before its payload adds no content."""
         cases = [
             (
                 (
@@ -212,6 +219,7 @@ class TestInklingOutputParser(unittest.TestCase):
                 '{"name":"get_weather","args":{"city":"San Fr',
             ),
             (("<|message_model|>", "<|content_text|>", "partial"), "partial"),
+            (("<|message_model|>", "get_weather"), ""),
         ]
         for pieces, expected in cases:
             for mode, parse in (("batch", _batch), ("stream", _stream)):
@@ -221,6 +229,188 @@ class TestInklingOutputParser(unittest.TestCase):
                     )
                     self.assertEqual(parsed.tool_calls, ())
                     self.assertEqual(parsed.content, expected)
+
+    def test_tool_error_payload_stays_visible(self):
+        """Bug regression: a generated tool-error block was dropped from the
+        answer, also when a malformed call before it recovered as text."""
+        cases = [
+            (
+                ("<|message_model|>", "<|content_tool_error|>", "Failed to run"),
+                ("<|end_message|>", "<|message_model|>", "<|content_text|>"),
+                ("Retry", "<|end_message|>", "<|content_model_end_sampling|>"),
+                "Failed to runRetry",
+                [],
+            ),
+            (
+                ("<|message_model|>", "f", "<|content_invoke_tool_json|>"),
+                ('{"name":"f","args":', "<|end_message|>", "<|message_model|>"),
+                ("<|content_tool_error|>", "Failed", "<|end_message|>"),
+                ("<|message_model|>", "f", "<|content_invoke_tool_json|>"),
+                ('{"name":"f","args":{}}', "<|end_message|>"),
+                '{"name":"f","args":Failed',
+                [("f", "{}")],
+            ),
+        ]
+        for *pieces, content, calls in cases:
+            for mode, parse in (("batch", _batch), ("stream", _stream)):
+                with self.subTest(content=content, mode=mode):
+                    parsed = parse(
+                        _ids(*(piece for group in pieces for piece in group)),
+                        separate_reasoning=True,
+                        parse_tool_calls=True,
+                    )
+                    self.assertEqual(parsed.content, content)
+                    self.assertEqual(
+                        [(call.name, call.arguments) for call in parsed.tool_calls],
+                        calls,
+                    )
+
+    def test_complete_call_cut_before_end_message_stays_a_call(self):
+        """Bug regression: a call whose JSON was complete when max_tokens hit before
+        <|end_message|> became answer text; an incomplete payload still does."""
+        call = ("<|message_model|>", "f", "<|content_invoke_tool_json|>")
+        closed = (*call, '{"name":"f","args":{"x":1}}', "<|end_message|>")
+        cases = [
+            ((*call, '{"name":"f","args":{"x":2}}'), "", ['{"x": 2}']),
+            (
+                (*closed, *call, '{"name":"f","args":{"x":2}}'),
+                "",
+                ['{"x": 1}', '{"x": 2}'],
+            ),
+            ((*call, '{"name":"f","args":{"x":2}'), '{"name":"f","args":{"x":2}', []),
+        ]
+        for pieces, content, arguments in cases:
+            for mode, parse in (("batch", _batch), ("stream", _stream)):
+                with self.subTest(pieces=pieces, mode=mode):
+                    parsed = parse(
+                        _ids(*pieces), separate_reasoning=True, parse_tool_calls=True
+                    )
+                    self.assertEqual(parsed.content, content)
+                    self.assertEqual(
+                        [call.arguments for call in parsed.tool_calls], arguments
+                    )
+
+    def test_truncated_utf8_thinking_stays_reasoning(self):
+        """Bug regression: a length cut between the byte tokens of one character
+        inside thinking moved the reasoning tail into the answer."""
+        tokenizer = load_tml_renderers().tokenizer
+        plan = tokenizer.encode_ordinary("Private plan: 👩")
+        self.assertNotEqual(tokenizer.decode_bytes(plan[-1:]), "👩".encode())
+        output_ids = _ids("<|message_model|>", "<|content_thinking|>", plan[:-1])
+        for stream_reasoning in (True, False):
+            for mode, parse in (("batch", _batch), ("stream", _stream)):
+                with self.subTest(stream_reasoning=stream_reasoning, mode=mode):
+                    parsed = parse(
+                        output_ids,
+                        separate_reasoning=True,
+                        parse_tool_calls=True,
+                        stream_reasoning=stream_reasoning,
+                    )
+                    self.assertEqual(parsed.reasoning, "Private plan: �")
+                    self.assertEqual(parsed.content, "")
+
+    def test_invalid_byte_inside_thinking_keeps_the_block_channel(self):
+        """Bug regression: reasoning after an invalid byte in a thinking block
+        was emitted as answer text."""
+        byte = native_byte_ids()[0xFF]
+        output_ids = _ids(
+            "<|message_model|>", "<|content_thinking|>", "left", [byte], "right",
+            "<|end_message|>", "<|message_model|>", "<|content_text|>", "A",
+            "<|end_message|>", "<|content_model_end_sampling|>",
+        )  # fmt: skip
+        for stream_reasoning in (True, False):
+            for mode, parse in (("batch", _batch), ("stream", _stream)):
+                with self.subTest(stream_reasoning=stream_reasoning, mode=mode):
+                    parsed = parse(
+                        output_ids,
+                        separate_reasoning=True,
+                        parse_tool_calls=True,
+                        stream_reasoning=stream_reasoning,
+                    )
+                    self.assertEqual(parsed.reasoning, "left�right")
+                    self.assertEqual(parsed.content, "A")
+
+    def test_held_reasoning_waits_for_the_block_boundary_across_recovery(self):
+        """Bug regression: with stream_reasoning=False, an invalid byte inside a
+        thinking block released partial reasoning before the block closed."""
+        byte = native_byte_ids()
+        thinking = _ids(
+            "<|message_model|>", "<|content_thinking|>", "left", [byte[0xFF]],
+            "mid", [byte[0xFF], byte[0xFE]], "right",
+        )  # fmt: skip
+        reasoning = "left�mid��right"
+        closed = [*thinking, *_ids("<|end_message|>")]
+        answer = _ids(
+            "<|message_model|>", "<|content_text|>", "A", "<|end_message|>",
+            "<|content_model_end_sampling|>",
+        )  # fmt: skip
+        for name, output_ids, boundary in (
+            ("closed", closed + answer, len(closed) - 1),
+            ("truncated", thinking, None),
+        ):
+            with self.subTest(case=name):
+                parser = InklingOutputParser(
+                    separate_reasoning=True,
+                    parse_tool_calls=True,
+                    stream_reasoning=False,
+                )
+                deltas = [parser.feed([token_id]) for token_id in output_ids]
+                deltas.append(parser.finish())
+                released = [i for i, delta in enumerate(deltas) if delta.reasoning]
+                self.assertEqual(
+                    released, [len(deltas) - 1 if boundary is None else boundary]
+                )
+                self.assertEqual(deltas[released[0]].reasoning, reasoning)
+                self.assertEqual(
+                    "".join(delta.content for delta in deltas),
+                    "A" if boundary is not None else "",
+                )
+        parser = InklingOutputParser(
+            separate_reasoning=True, parse_tool_calls=True, stream_reasoning=False
+        )
+        aborted = parser.feed(thinking[:-1]).merge(parser.abort(thinking[-1:]))
+        self.assertEqual(aborted.reasoning, "")
+
+    def test_stop_string_cut_keeps_bytes_continuing_a_character(self):
+        """Bug regression: trimming a stop inside a token that starts with a UTF-8
+        continuation byte dropped that byte, corrupting the character before it."""
+        tokenizer = load_tml_renderers().tokenizer
+        self.assertEqual(tokenizer.decode_bytes([78747]), b"\x8app")
+        output_ids = _ids(
+            "<|message_model|>", "<|content_text|>", [native_byte_ids()[0xC4], 78747]
+        )
+        for keep, content in ((False, "Ċ"), (True, "Ċp")):
+            for split in (0, len(output_ids) - 1):
+                with self.subTest(keep=keep, split=split):
+                    parser = InklingOutputParser(
+                        separate_reasoning=True, parse_tool_calls=True
+                    )
+                    delta = parser.feed(output_ids[:split]).merge(
+                        parser.finish(
+                            output_ids[split:], matched_stop="p", keep_matched_stop=keep
+                        )
+                    )
+                    self.assertEqual(delta.content, content)
+                    self.assertEqual(parser.num_consumed_tokens, len(output_ids))
+
+    def test_abort_never_completes_an_open_call(self):
+        """Bug regression: aborting inside a call whose JSON was already complete
+        emitted it as an executable tool call."""
+        output_ids = _ids(
+            "<|message_model|>", "f", "<|content_invoke_tool_json|>",
+            '{"name":"f","args":{"x":1}}',
+        )  # fmt: skip
+        for split in range(len(output_ids) + 1):
+            with self.subTest(split=split):
+                parser = InklingOutputParser(
+                    separate_reasoning=True, parse_tool_calls=True
+                )
+                delta = parser.feed(output_ids[:split]).merge(
+                    parser.abort(output_ids[split:])
+                )
+                self.assertEqual(delta.tool_calls, ())
+                self.assertEqual(parser.num_consumed_tokens, len(output_ids))
+                self.assertEqual(parser.finish(), InklingOutputDelta())
 
     def test_call_arguments_keep_the_sampled_json(self):
         """Arguments keep the model's key order, raw UTF-8, integers wider than 64
