@@ -163,6 +163,13 @@ def create_wave_backend(runner):
     return WaveAttnBackend(runner)
 
 
+@register_attention_backend("tlx")
+def create_tlx_backend(runner):
+    from sglang.srt.layers.attention.tlx_backend import TlxAttnBackend
+
+    return TlxAttnBackend(runner)
+
+
 @register_attention_backend("ascend")
 def create_ascend_backend(runner):
     from sglang.srt.hardware_backend.npu.attention.ascend_backend import (

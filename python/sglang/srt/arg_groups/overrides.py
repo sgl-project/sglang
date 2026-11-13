@@ -1497,6 +1497,17 @@ def _fa4_page_constraint(view: Any) -> dict:
 
 
 @register_post_process
+def _tlx_page_constraint(view: Any) -> dict:
+    # The tlx kernels copy whole KV pages; other page sizes would send every call to AITER.
+    if "tlx" not in attention_backends_of(view) or view.page_size in (16, 64, 128):
+        return {}
+    logger.warning(
+        f"tlx attention supports page sizes 16, 64 and 128, changing page_size from {view.page_size} to 16."
+    )
+    return {"page_size": 16}
+
+
+@register_post_process
 def _attention_backend_platform_fallbacks(view: Any) -> dict:
     if (
         view.attention_backend == "intel_amx"
@@ -1529,14 +1540,14 @@ def _hybrid_swa_memory_backend_disable(view: Any) -> dict:
     architectures = model_config.hf_config.architectures
     if not is_layer_types_hybrid_swa_model(architectures, model_config.hf_text_config):
         return {}
-    # aiter: with the SWA pool it serves these models through unified_attention,
+    # aiter, tlx: with the SWA pool they serve these models through unified_attention,
     # which loses a passkey 32K tokens back on Gemma 3 that triton retrieves;
-    # drop it here once unified_attention retrieves it too.
+    # drop them here once unified_attention retrieves it too.
     # wave, flex_attention: they never translate full-pool slots into SWA ones.
     backends = [
         backend
         for backend in attention_backends_of(view)
-        if backend in ("aiter", "wave", "flex_attention")
+        if backend in ("aiter", "tlx", "wave", "flex_attention")
     ]
     if not backends:
         return {}
