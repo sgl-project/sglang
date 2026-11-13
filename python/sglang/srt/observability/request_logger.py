@@ -398,6 +398,36 @@ def _redact_field(name: str, value: Any) -> Any:
     return value
 
 
+def _sequence_to_string_truncated(data: Union[List, Tuple], max_length: int) -> str:
+    # Nested sequences recurse here directly, one frame per level as `str()`
+    # did. Elements are redacted where they are rendered, as dict fields are.
+    if len(data) > max_length:
+        half_length = max_length // 2
+        parts = (data[:half_length], data[-half_length:])
+    else:
+        parts = (data,)
+    rendered = []
+    for part in parts:
+        if all(isinstance(v, (int, float, bool, type(None))) for v in part):
+            rendered.append(str(part))
+            continue
+        items = ", ".join(
+            [
+                (
+                    _sequence_to_string_truncated(v, max_length)
+                    if isinstance(v, (list, tuple))
+                    else _dataclass_to_string_truncated(v, max_length)
+                )
+                for v in part
+            ]
+        )
+        if isinstance(part, tuple):
+            rendered.append(f"({items},)" if len(part) == 1 else f"({items})")
+        else:
+            rendered.append(f"[{items}]")
+    return " ... ".join(rendered)
+
+
 # TODO unify this w/ `_transform_data_for_logging` if we find performance enough
 def _dataclass_to_string_truncated(
     data: Any, max_length: int = 2048, skip_names: Optional[Set[str]] = None
@@ -411,15 +441,7 @@ def _dataclass_to_string_truncated(
         else:
             return f"{repr(data)}"
     elif isinstance(data, (list, tuple)):
-        if len(data) > max_length:
-            half_length = max_length // 2
-            return (
-                str(_maybe_redact_watermark_secrets(data[:half_length]))
-                + " ... "
-                + str(_maybe_redact_watermark_secrets(data[-half_length:]))
-            )
-        else:
-            return str(_maybe_redact_watermark_secrets(data))
+        return _sequence_to_string_truncated(data, max_length)
     elif isinstance(data, dict):
         parts = []
         for k, v in data.items():
