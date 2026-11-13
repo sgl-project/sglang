@@ -57,6 +57,8 @@ _RELEASE_CONFIG = {
         "log_scaling_n_floor": 128000,
         "log_scaling_alpha": 0.1,
         "rms_norm_eps": 1e-06,
+        "pre_norm_pre_affine": False,
+        "final_norm_pre_affine": False,
         "use_value_norm_no_gamma": True,
         "qk_l2_clip_threshold": 22.627416997969522,
         "rel_l2_clip_threshold": 8.0,

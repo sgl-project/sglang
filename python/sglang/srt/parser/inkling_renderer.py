@@ -123,7 +123,6 @@ def render_inkling_messages(
         oss_messages.insert(0, _tool_declare_message(tools))
     turns = tml.chat.OpenAIMessage.from_oss_messages(oss_messages)
     for oss_message, turn in zip(oss_messages, turns, strict=True):
-        # The library reads an author name only for tool messages.
         if oss_message["role"] == "assistant" and oss_message.get("name"):
             turn.author = tml.chat.Author(
                 tml.chat.AuthorKind.Model, oss_message["name"]
