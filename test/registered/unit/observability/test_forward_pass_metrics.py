@@ -822,6 +822,9 @@ class TestForwardPassMetrics(unittest.TestCase):
                 Event=Mock, current_stream=lambda: object()
             ),
         )
+        scheduler._pp_result_done_event = types.MethodType(
+            SchedulerPPMixin._pp_result_done_event, scheduler
+        )
         wire, result, _ = SchedulerPPMixin._pp_make_skip_output_result(
             scheduler, types.SimpleNamespace(reqs=[object()]), metadata
         )
@@ -1047,8 +1050,11 @@ class TestIdleMetrics(CustomTestCase):
     def test_idle_publishes_refreshed_kv_metrics(self):
         self.reporter.current_scheduler_metrics_enabled = True
         self.scheduler.disagg_decode_prealloc_queue = types.SimpleNamespace(
-            queue=[], pre_allocated_token_counts=lambda windows=(): (0, {})
+            queue=[],
+            num_tokens_pending_prealloc=0,
+            pre_allocated_token_counts=lambda windows=(): (0, {}),
         )
+        self.scheduler.max_total_num_tokens = 1
         self.scheduler.disagg_decode_transfer_queue = types.SimpleNamespace(
             queue=[], num_pending_deferred_releases=lambda: 0
         )
@@ -1134,8 +1140,11 @@ class TestIdleMetrics(CustomTestCase):
         self.scheduler.disaggregation_mode = DisaggregationMode.DECODE
         self.scheduler.enable_priority_scheduling = True
         self.scheduler.disagg_decode_prealloc_queue = types.SimpleNamespace(
-            queue=[], pre_allocated_token_counts=lambda windows: (0, {})
+            queue=[],
+            num_tokens_pending_prealloc=0,
+            pre_allocated_token_counts=lambda windows: (0, {}),
         )
+        self.scheduler.max_total_num_tokens = 1
         host_reqs = [
             types.SimpleNamespace(req=FakeReq(priority=priority), host_staged=True)
             for priority in (1, 2)
