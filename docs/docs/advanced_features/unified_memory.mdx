@@ -137,7 +137,7 @@ Pool usage is reported per sub-pool: each window sub-pool has its own label, and
 
 ## Known limitations
 
-- **Priority preemption.** With `--enable-priority-scheduling`, unified memory turns priority preemption off, with a startup warning: a higher-priority request is admitted first but does not retract running requests, so under load it waits for running requests to finish.
+- **Priority preemption credits only what victims give back for sure.** With `--enable-priority-scheduling`, a higher-priority request preempts running requests once releasing them makes admission accept it. Admission credits their decode headroom, state slots and request rows, not their KV rows, which another request may still lock in the prefix tree; so when KV rows are what is short, the request waits instead.
 - **MPS and MLX.** Refused at startup: unified memory orders the scheduler's writes after the running forward's reads with device stream waits, and the scheduler has no device streams there.
 - **Window rows when state checkpoints stall.** On a model with sliding-window and Mamba layers whose cache keeps state checkpoints, the memory clip and admission assume each request's checkpoints advance. When no tracking or replacement state slot is free, a checkpoint stalls and the request holds more window rows than it was priced for, so an admitted request is not guaranteed to finish. See [the checkpoint retention bound](/docs/advanced_features/unified_memory_design#known-limitations).
 - **PD failed transfers.** A failed or timed-out transfer's pages are released at its deferred-release timeout, or a failed send's at once, without proof that the remote transfer engine stopped touching them.
