@@ -124,6 +124,15 @@ class Disagg(msgspec.Struct):
         int,
         "The interval to poll requests in decode server. Can be set to >1 to reduce the overhead of this.",
     ] = 1
+    disaggregation_decode_lane_balance_margin: A[
+        int,
+        "PD decode with DP attention (attention TP 1): a DP rank starts new "
+        "requests only up to ceil(mean running requests per rank) + margin, "
+        "since every rank's step "
+        "runs as long as the busiest rank's. A rank holding more than 16 "
+        "requests, or one waiting 1 s, starts them anyway. Lowers TPOT at some "
+        "TTFT cost. 0 disables it.",
+    ] = 0
     enable_pd_role_switch: A[
         bool,
         "Allow runtime prefill<->decode role switch via /pd_role_switch (PD mode).",
