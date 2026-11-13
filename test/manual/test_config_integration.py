@@ -35,7 +35,7 @@ def test_server_args_config_parser(merger):
         "incremental-streaming-output": True,
         "skip-server-warmup": False,
         "log-requests": True,
-        "show-time-cost": True,
+        "enable-cache-report": True,
         "is-embedding": False,
     }
 
@@ -67,7 +67,7 @@ def test_server_args_config_parser(merger):
         assert "--enable-metrics" in merged_args  # True boolean
         assert "--incremental-streaming-output" in merged_args  # True boolean
         assert "--log-requests" in merged_args  # True boolean
-        assert "--show-time-cost" in merged_args  # True boolean
+        assert "--enable-cache-report" in merged_args  # True boolean
         # False booleans should not be present (only add flag if True)
         assert "--trust-remote-code" not in merged_args  # False boolean
         assert "--skip-server-warmup" not in merged_args  # False boolean
