@@ -236,9 +236,12 @@ class TestMooncakePrefetch(CustomTestCase):
         linker.layer_done_counter = LayerWiseLoadCounter(2)
         linker.gc_frozen = True
         linker.pending_loads, linker.broadcast_loads = {}, {}
-        linker.load_queue, linker.offload_queue, linker.offload_results = (
-            Queue() for _ in range(3)
-        )
+        (
+            linker.lookup_queue,
+            linker.load_queue,
+            linker.offload_queue,
+            linker.offload_results,
+        ) = (Queue() for _ in range(4))
         buffers = [torch.zeros((8, 2), dtype=torch.uint8) for _ in range(2)]
         pool = DevicePoolEntry(
             name=PoolName.KV,
