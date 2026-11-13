@@ -27,6 +27,20 @@ def _make_text_config(**overrides):
     return SimpleNamespace(**defaults)
 
 
+def _make_external_mla_config(**overrides):
+    defaults = dict(
+        architectures=["ExternalMLAForCausalLM"],
+        model_type="external_mla",
+        use_mla=True,
+        kv_lora_rank=512,
+        qk_nope_head_dim=128,
+        qk_rope_head_dim=64,
+        v_head_dim=96,
+    )
+    defaults.update(overrides)
+    return _make_text_config(**defaults)
+
+
 class TestModelConfigShapes(CustomTestCase):
     def _derive_shapes(self, text_config):
         model_config = ModelConfig.__new__(ModelConfig)
@@ -34,6 +48,139 @@ class TestModelConfigShapes(CustomTestCase):
         model_config.hf_text_config = text_config
         model_config._derive_model_shapes()
         return model_config
+
+    def test_external_model_opts_into_mla(self):
+        model_config = self._derive_shapes(_make_external_mla_config())
+
+        self.assertEqual(model_config.attention_arch, AttentionArch.MLA)
+        self.assertEqual(model_config.kv_lora_rank, 512)
+        self.assertEqual(model_config.qk_nope_head_dim, 128)
+        self.assertEqual(model_config.qk_rope_head_dim, 64)
+        self.assertEqual(model_config.v_head_dim, 96)
+        self.assertEqual(model_config.head_dim, 192)
+        self.assertEqual(model_config.swa_kv_lora_rank, 512)
+        self.assertEqual(model_config.swa_qk_rope_head_dim, 64)
+        self.assertIsNone(model_config.index_head_dim)
+        self.assertAlmostEqual(model_config.scaling, 192**-0.5)
+
+    def test_external_model_requires_explicit_mla_opt_in(self):
+        for use_mla in (False, None):
+            with self.subTest(use_mla=use_mla):
+                config = _make_external_mla_config(use_mla=use_mla)
+                self.assertEqual(
+                    self._derive_shapes(config).attention_arch, AttentionArch.MHA
+                )
+        config = _make_external_mla_config()
+        del config.use_mla
+        self.assertEqual(self._derive_shapes(config).attention_arch, AttentionArch.MHA)
+
+    def test_external_model_allocates_compressed_mla_cache(self):
+        import torch
+
+        from sglang.test.test_utils import maybe_stub_sgl_kernel
+
+        maybe_stub_sgl_kernel()
+
+        from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
+        from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+        from sglang.srt.runtime_context import get_context
+
+        model_config = self._derive_shapes(_make_external_mla_config())
+        configurator = KVCacheConfigurator.__new__(KVCacheConfigurator)
+        configurator.model_config = model_config
+        configurator.use_mla_backend = model_config.attention_arch == AttentionArch.MLA
+        configurator.is_draft_worker = False
+        configurator.is_hybrid_swa = False
+        configurator.mambaish_config = None
+        configurator.kv_cache_dtype = torch.float32
+        configurator.kv_cache_dtype_str = "auto"
+        configurator.kv_shard_rank = None
+        configurator.device = "cpu"
+        configurator.layer_info = SimpleNamespace(
+            num_effective_layers=2, start_layer=0, end_layer=2
+        )
+
+        with get_context().override_server_args(page_size=1, enable_memory_saver=False):
+            pool = configurator._build_token_to_kv_pool(
+                sizes=SimpleNamespace(max_total_num_tokens=8),
+                is_dsa_model=False,
+                is_dsv4_model=False,
+                req_to_token_pool=None,
+            )
+
+        self.assertIsInstance(pool, MLATokenToKVPool)
+        self.assertEqual(len(pool.kv_buffer), 2)
+        for buffer in pool.kv_buffer:
+            # One shared latent + RoPE row per token, including a padding slot.
+            self.assertEqual(tuple(buffer.shape), (9, 1, 576))
+
+    def test_external_mla_uses_nested_text_config(self):
+        model_config = ModelConfig.__new__(ModelConfig)
+        model_config.hf_config = SimpleNamespace(
+            architectures=["ExternalMLAForConditionalGeneration"],
+            model_type="external_vlm",
+        )
+        model_config.hf_text_config = _make_external_mla_config()
+
+        model_config._derive_model_shapes()
+
+        self.assertEqual(model_config.attention_arch, AttentionArch.MLA)
+        self.assertEqual(model_config.kv_lora_rank, 512)
+        self.assertEqual(model_config.v_head_dim, 96)
+
+    def test_external_mla_rejects_missing_or_invalid_dimensions(self):
+        for name in (
+            "kv_lora_rank",
+            "qk_nope_head_dim",
+            "qk_rope_head_dim",
+            "v_head_dim",
+        ):
+            config = _make_external_mla_config()
+            delattr(config, name)
+            with self.subTest(name=name, missing=True):
+                with self.assertRaisesRegex(ValueError, name):
+                    self._derive_shapes(config)
+            for value in (None, -1, True, 1.5, "64"):
+                with self.subTest(name=name, value=value):
+                    with self.assertRaisesRegex(ValueError, name):
+                        self._derive_shapes(_make_external_mla_config(**{name: value}))
+        for name in ("kv_lora_rank", "v_head_dim"):
+            with self.subTest(name=name, value=0):
+                with self.assertRaisesRegex(ValueError, name):
+                    self._derive_shapes(_make_external_mla_config(**{name: 0}))
+        with self.assertRaisesRegex(ValueError, "qk_nope_head_dim.*qk_rope_head_dim"):
+            self._derive_shapes(
+                _make_external_mla_config(qk_nope_head_dim=0, qk_rope_head_dim=0)
+            )
+
+    def test_external_mla_allows_zero_rope_dimension(self):
+        model_config = self._derive_shapes(
+            _make_external_mla_config(qk_rope_head_dim=0)
+        )
+
+        self.assertEqual(model_config.attention_arch, AttentionArch.MLA)
+        self.assertEqual(model_config.qk_rope_head_dim, 0)
+        self.assertEqual(model_config.head_dim, 128)
+        self.assertAlmostEqual(model_config.scaling, 128**-0.5)
+
+    def test_external_mla_applies_rope_scaling(self):
+        for field in ("rope_scaling", "rope_parameters"):
+            with self.subTest(field=field):
+                model_config = self._derive_shapes(
+                    _make_external_mla_config(
+                        **{field: {"factor": 4.0, "mscale_all_dim": 1}}
+                    )
+                )
+                mscale = 0.1 * math.log(4.0) + 1.0
+                self.assertAlmostEqual(model_config.scaling, mscale**2 / math.sqrt(192))
+
+    def test_existing_mla_architecture_keeps_its_specialized_shapes(self):
+        model_config = self._derive_shapes(
+            _make_external_mla_config(architectures=["DeepseekV3ForCausalLM"])
+        )
+
+        self.assertEqual(model_config.attention_arch, AttentionArch.MLA)
+        self.assertEqual(model_config.head_dim, 256)
 
     def test_bailing_nextn_draft_keeps_the_target_attention(self):
         """A Bailing draft is renamed BailingMoeForCausalLMNextN: the V2.5 one is
