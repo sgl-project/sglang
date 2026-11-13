@@ -69,11 +69,18 @@ def static_budget_bytes(kv_configurator, pre_model_load_memory: float) -> int:
     """What is left of the static budget (``--mem-fraction-static``): free memory less the
     non-static slack and the multimodal reserve, as the KV configurator measures it (its other
     terms are for multi-GPU and post-capture KV sizing, which paged experts do not run)."""
+    from sglang.srt.distributed import get_tp_group
     from sglang.srt.mem_cache.kv_cache_configurator import mm_runtime_reservation_gb
     from sglang.srt.utils.device import get_available_gpu_memory
 
     gc.collect()
-    free_gb = get_available_gpu_memory(kv_configurator.device, kv_configurator.gpu_id)
+    tp_group = get_tp_group()
+    free_gb = get_available_gpu_memory(
+        device=kv_configurator.device,
+        gpu_id=kv_configurator.gpu_id,
+        distributed=tp_group.world_size > 1,
+        cpu_group=tp_group.cpu_group,
+    )
     slack_gb = pre_model_load_memory * (1 - get_schedule().mem_fraction_static)
     mm_gb = mm_runtime_reservation_gb(
         is_multimodal=kv_configurator.model_config.is_multimodal,

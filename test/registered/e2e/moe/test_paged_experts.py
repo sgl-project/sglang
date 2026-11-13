@@ -71,6 +71,7 @@ class _PagedMatchesUnpaged:
     median_abs_tolerance = 0.0
     #: Extra arguments for both servers.
     server_args = ()
+    paged_extra_args = ()
 
     @classmethod
     def setUpClass(cls):
@@ -78,7 +79,10 @@ class _PagedMatchesUnpaged:
         with ThreadPoolExecutor(2) as pool:
             reference = pool.submit(_reference, cls.model, cls.server_args)
             paged = pool.submit(
-                _serve_and_score, cls.model, PAGED_URL, [*cls.server_args, *PAGED_ARGS]
+                _serve_and_score,
+                cls.model,
+                PAGED_URL,
+                [*cls.server_args, *cls.paged_extra_args, *PAGED_ARGS],
             )
             cls.reference, cls.paged = reference.result(), paged.result()
 
