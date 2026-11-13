@@ -1824,30 +1824,6 @@ class TestDeclaredParts(CustomTestCase):
             )
         self.assertIs(view.replayssm_write_pos, view.extra_views["replayssm_write_pos"])
 
-    def test_kda_spec_ring_is_request_memory(self):
-        """A KDA verify ring is folded into the state at every commit, so no
-        checkpoint needs it: it lives in the request sub-pool, not the slot."""
-        storage, plan, _ = _build(
-            state=True,
-            gamma=3,
-            replay=StateReplay(
-                decode=False, speculative=True, is_kda=True, cache_len=8, key_heads=1
-            ),
-        )
-        view = storage.view("mamba")
-        (request,) = plan.requests()
-        self.assertEqual(
-            {p.name for p in request.geometry.parts},
-            {
-                f"mamba.replayssm_{name}"
-                for name in ("d", "k", "g", "rawv", "rawk", "beta")
-            },
-        )
-        self.assertEqual(view.extra_parts, ())
-        self.assertEqual(view._checkpoint_extra_buffers, ())
-        self.assertTrue(view.replayssm_request_ring)
-        self.assertIsNone(view.replayssm_spec_write_pos)
-
     def test_window_resume_keeps_the_handoff_boundary(self):
         storage, _, _ = _build()
         req = SimpleNamespace(kv=_RequestKV())

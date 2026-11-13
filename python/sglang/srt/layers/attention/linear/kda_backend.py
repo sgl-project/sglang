@@ -1300,14 +1300,9 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 "KDA target_verify requires a speculative mamba cache "
                 "(MambaPool.SpeculativeState); none found."
             )
-        # ReplaySSM: the ring-write is fused into the verify kernel
-        # (CACHE_RING) on both the fused chain-verify and the unfused triton
-        # paths; commit replays the ring instead of reading per-step
-        # snapshots. ring_kwargs stays empty for non-triton verify kernels,
-        # which never see replayssm. Ragged layouts work natively on the
-        # unfused path -- step_idx is the within-row step under varlen, so
-        # row i writes ring[slot][0..verify_lens[i]) and commit folds at most
-        # commit_lens of them (absorb overflow is bounded in-kernel).
+        # ReplaySSM: the verify kernel writes the ring (CACHE_RING) and skips
+        # per-step snapshots; commit folds the ring. Under a ragged layout, row i
+        # writes ring steps [0, verify_lens[i]) and commit folds at most commit_lens.
         replayssm_rawk = replayssm_g = replayssm_beta = None
         ring_kwargs = {}
         if replayssm_on:
@@ -1953,11 +1948,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             replayssm_rawk=replayssm_rawk,
             replayssm_g=replayssm_g,
             replayssm_beta=replayssm_beta,
-            replayssm_ring_indices=(
-                None
-                if replayssm_ring_indices is None
-                else replayssm_ring_indices.to(torch.int32)
-            ),
+            replayssm_ring_indices=replayssm_ring_indices,
             onorm_gate=onorm_gate,
             onorm_weight=onorm_weight,
             onorm_eps=onorm_eps,
