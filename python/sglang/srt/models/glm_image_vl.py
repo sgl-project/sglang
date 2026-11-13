@@ -35,9 +35,10 @@ from sglang.srt.layers.attention.vision import (
 )
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layer_boundary import (
+    append_stages,
     declare_attn,
     declare_ffn,
-    make_stages,
+    layer_stack,
 )
 from sglang.srt.layers.layer_boundary.output import OutputTransform
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
@@ -51,15 +52,16 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_pos_emb
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
 from sglang.srt.managers.mm_utils import (
-    MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
+    pad_mm_tokens,
 )
-from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen2 import Qwen2MLP as GlmImageTextMLP
@@ -67,7 +69,7 @@ from sglang.srt.models.qwen3_vl import Qwen3_VisionMLP as GlmImageVisionMLP
 from sglang.srt.models.utils import compute_cu_seqlens_from_grid_numpy
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
 from sglang.srt.runtime_context import get_mm, get_parallel
-from sglang.srt.utils import add_prefix, is_npu
+from sglang.srt.utils import is_npu
 
 logger = logging.getLogger(__name__)
 
@@ -612,7 +614,6 @@ class GlmImageTextAttention(nn.Module):
         rope_scaling: Optional[Dict[str, Any]] = None,
         max_position_embeddings: int = 131072,
         quant_config: QuantizationConfig | None = None,
-        dual_chunk_attention_config: Optional[dict[str, Any]] = None,
         partial_rotary_factor: float = 0.5,
         prefix: str = "",
     ):
@@ -907,7 +908,7 @@ class GlmImageTextDecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
         self.post_mlp_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.attn_boundary, self.ffn_boundary = make_stages(
+        self.attn_boundary, self.ffn_boundary = append_stages(
             (
                 declare_attn(
                     read=UNFUSED_NORM_READOUT,
@@ -924,8 +925,6 @@ class GlmImageTextDecoderLayer(nn.Module):
                 ),
                 self.post_attention_layernorm,
             ),
-            previous=declare_ffn() if layer_id != 0 else None,
-            terminal=layer_id == config.num_hidden_layers - 1,
         )
 
     def forward(
@@ -971,17 +970,18 @@ class GlmImageTextModel(nn.Module):
             prefix=add_prefix("embed_tokens", prefix),
         )
 
-        self.layers = nn.ModuleList(
-            [
-                GlmImageTextDecoderLayer(
-                    layer_id=i,
-                    config=config,
-                    quant_config=self.quant_config,
-                    prefix=add_prefix(f"layers.{i}", getattr(config, "prefix", "")),
-                )
-                for i in range(config.num_hidden_layers)
-            ]
-        )
+        with layer_stack():
+            self.layers = nn.ModuleList(
+                [
+                    GlmImageTextDecoderLayer(
+                        layer_id=i,
+                        config=config,
+                        quant_config=self.quant_config,
+                        prefix=add_prefix(f"layers.{i}", getattr(config, "prefix", "")),
+                    )
+                    for i in range(config.num_hidden_layers)
+                ]
+            )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
@@ -1081,8 +1081,7 @@ class GlmImageForConditionalGeneration(nn.Module):
         self.logits_processor = LogitsProcessor(logits_config)
 
     def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
-        pattern = MultiModalityDataPaddingPatternMultimodalTokens()
-        return pattern.pad_input_tokens(input_ids, mm_inputs)
+        return pad_mm_tokens(input_ids, mm_inputs)
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
         """Run vision encoder -> VQ-VAE encode -> embed_tokens on discrete indices."""

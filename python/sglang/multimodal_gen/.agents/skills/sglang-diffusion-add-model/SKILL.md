@@ -313,21 +313,15 @@ class MyModelPipelineConfig(ImagePipelineConfig):
         ...
         return freqs_cis
 
-    def prepare_pos_cond_kwargs(self, batch, latent_model_input, t, **kwargs):
-        """Build positive conditioning kwargs for each denoising step."""
+    def prepare_pos_cond_kwargs(self, batch, device, rotary_emb, dtype):
+        # Extra DiT forward() kwargs only. DenoisingStage already passes
+        # hidden_states, timestep and encoder_hidden_states (from get_pos_prompt_embeds).
         return {
-            "hidden_states": latent_model_input,
-            "encoder_hidden_states": batch.prompt_embeds[0],
-            "timestep": t,
             # ... model-specific kwargs ...
         }
 
-    def prepare_neg_cond_kwargs(self, batch, latent_model_input, t, **kwargs):
-        """Build negative conditioning kwargs for CFG."""
+    def prepare_neg_cond_kwargs(self, batch, device, rotary_emb, dtype):
         return {
-            "hidden_states": latent_model_input,
-            "encoder_hidden_states": batch.negative_prompt_embeds[0],
-            "timestep": t,
             # ... model-specific kwargs ...
         }
 
@@ -351,7 +345,7 @@ There is no separate `VideoPipelineConfig` base class. For video models, choose
 existing video configs such as Wan, LTX, Hunyuan, Helios, or MOVA when deciding
 whether to subclass `PipelineConfig` directly or use a model-specific base.
 
-**Important**: The `prepare_pos_cond_kwargs` / `prepare_neg_cond_kwargs` methods define what the DiT receives at each denoising step. These must match the DiT's `forward()` signature.
+**Important**: The `prepare_pos_cond_kwargs` / `prepare_neg_cond_kwargs` methods return only the extra kwargs your DiT `forward()` needs beyond `hidden_states`, `timestep` and `encoder_hidden_states`; override `get_pos_prompt_embeds`/`get_neg_prompt_embeds` to change the text embeddings passed.
 
 ### Step 6: Implement the BeforeDenoisingStage (Core Step)
 
@@ -657,7 +651,7 @@ BCG validation must prove all of the following:
 For a non-bit-exact optimization, integrate through the request-scoped site
 framework under `sglang.kernels.ops.diffusion.sites`. Mark sites during model
 construction and let `QualityGatedFusion` mount them for both
-`quality="extra-high"` and `quality="high"`; `quality="lossless"` must keep
+`quality="lossless"` and `quality="high"`; `quality="lossless"` must keep
 the original code path. A high-only sparse, caching, or other approximate
 path must remain outside this fusion gate.
 Eligibility must be all-or-nothing for coupled sites and fail closed on dtype,
@@ -666,7 +660,7 @@ guard/parity tests and a model wiring test instead of embedding request-policy
 branches throughout the DiT.
 
 Finally, use the benchmark/profile skill's `--quality-bcg-matrix` to run
-same-GPU ABBA pairs for Eager/BCG at lossless/extra-high/high. Report denoise and saved
+same-GPU ABBA pairs for Eager/BCG at exact/lossless/high. Report denoise and saved
 request e2e separately, require at least 1.5% repeated mean e2e improvement for
 an optimization PR, attach profile and generated-media A/B evidence, then
 delete the task-owned checkpoint cache and verify zero residual weight files

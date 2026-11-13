@@ -1,5 +1,6 @@
 import asyncio
 import os
+from contextlib import suppress
 from typing import Optional
 
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -69,8 +70,16 @@ class CloudStorage:
             )
 
         try:
-            # Offload the blocking I/O call to a thread executor
-            await asyncio.get_running_loop().run_in_executor(None, _sync_upload)
+            upload = asyncio.get_running_loop().run_in_executor(None, _sync_upload)
+            await asyncio.shield(upload)
+        except asyncio.CancelledError:
+            # the SDK may still read local files; finish before caller cleanup
+            while not upload.done():
+                with suppress(asyncio.CancelledError, Exception):
+                    await asyncio.shield(upload)
+            if not upload.cancelled():
+                upload.exception()
+            raise
         except Exception as e:
             # If upload fails, log the error and return None for fallback
             logger.error(f"Upload failed for {destination_key}: {e}")
@@ -103,6 +112,18 @@ class CloudStorage:
             except OSError as e:
                 logger.warning(f"Failed to remove temporary file {file_path}: {e}")
         return url
+
+    async def upload_all_and_cleanup(self, paths: list[str]) -> list[Optional[str]]:
+        """``upload_and_cleanup`` of every path, concurrently."""
+        results = await asyncio.gather(
+            *(self.upload_and_cleanup(path) for path in paths),
+            return_exceptions=True,
+        )
+        # join every upload before a cancellation or failure permits directory cleanup
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
+        return results
 
 
 # Global instance

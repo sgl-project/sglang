@@ -107,15 +107,6 @@ def _get_device_num_sms(device: torch.device) -> int:
     return torch.cuda.get_device_properties(device).multi_processor_count
 
 
-def _tmem_load_red_max_enabled() -> bool:
-    """Whether the SM100 forward kernel takes the softmax row max from the sm_103
-    tcgen05.ld.red TMEM load (on by default; ignored on other architectures).
-
-    SGLANG_FA4_TMEM_LOAD_RED_MAX=0 falls back to the FMNMX reduction.
-    """
-    return os.environ.get("SGLANG_FA4_TMEM_LOAD_RED_MAX", "1") != "0"
-
-
 def _validate_head_dims(
     head_dim: int, head_dim_v: int, compute_capability: int, alignment: int
 ) -> None:
@@ -127,13 +118,16 @@ def _validate_head_dims(
     is_dedicate_kernel_shape = head_dim == 256 and head_dim_v == 256
     is_standard_range = 8 <= head_dim <= 128 and 8 <= head_dim_v <= 128
 
-    is_sm90_range = 8 <= head_dim <= 256 and 8 <= head_dim_v <= 256
+    is_sm90_range = (8 <= head_dim <= 256 and 8 <= head_dim_v <= 256) or (
+        head_dim == head_dim_v == 512
+    )
     if compute_capability == 9:
         assert (
             is_sm90_range and head_dim % alignment == 0 and head_dim_v % alignment == 0
         ), (
             f"(head_dim, head_dim_v)=({head_dim}, {head_dim_v}) is not supported on SM90. "
-            f"head_dim and head_dim_v must be between 8 and 256 and divisible by {alignment}."
+            f"head_dim and head_dim_v must be between 8 and 256 and divisible by {alignment}, "
+            "or both equal to 512."
         )
     elif compute_capability in [10, 11]:
         assert (
@@ -209,9 +203,11 @@ def _tile_size_fwd_sm90(
     elif head_dim <= 192:
         tile_n = 96 if is_local else (128 if head_dim_v <= 128 else 112)
         return FwdConfig(128, tile_n, True, True)
-    else:  # hdim 256
+    elif head_dim <= 256:
         tile_n = 64 if is_local else 80
         return FwdConfig(128, tile_n, True, True)
+    else:  # hdim 512
+        return FwdConfig(64, 64, False, True)
 
 
 def maybe_contiguous(x):
@@ -232,6 +228,38 @@ def _validate_tensor(t, name, expected_shape, expected_dtype, expected_device):
         assert t.is_cuda, f"{name} must be on CUDA"
 
 
+def _check_fp8_kv_dequant_args(
+    *, k, v, qv, page_table, rel_bias, block_sparse_tensors, mma_pv_is_rs
+) -> None:
+    unsupported = {
+        "K/V other than fp8 e4m3": v.dtype != torch.float8_e4m3fn or k.dtype != v.dtype,
+        f"head_dim (k {k.shape[-1]}, v {v.shape[-1]}) other than 256 or 512": (
+            k.shape[-1] != v.shape[-1] or k.shape[-1] not in (256, 512)
+        ),
+        "a non-paged KV cache": page_table is None,
+        "qv": qv is not None,
+        "rel_bias": rel_bias is not None,
+        "block sparsity": block_sparse_tensors is not None,
+        # The fp8 staging tile only fits in smem when P stays in registers.
+        "mma_pv_is_rs=False": mma_pv_is_rs is False,
+    }
+    for feature, present in unsupported.items():
+        if present:
+            raise NotImplementedError(
+                "FA4 SM90 FP8 KV cache (fp16/bf16 Q, fp8 e4m3 K/V cast in-kernel) "
+                f"does not support {feature}."
+            )
+
+
+def _complete_descales(descales, *, shape, device):
+    if all(t is None for t in descales):
+        return descales
+    return tuple(
+        torch.ones(shape, dtype=torch.float32, device=device) if t is None else t
+        for t in descales
+    )
+
+
 torch2cute_dtype_map = {
     torch.float16: cutlass.Float16,
     torch.bfloat16: cutlass.BFloat16,
@@ -241,7 +269,14 @@ torch2cute_dtype_map = {
 }
 
 
-_shear_bias_workspace: dict = {}
+# Avoid allocating a torch.cuda.Stream wrapper on every relative-bias call.
+_get_current_stream_raw = torch._C._cuda_getCurrentRawStream
+_shear_bias_workspace: dict[tuple[int, int], torch.Tensor] = {}
+
+
+def clear_shear_bias_workspace() -> None:
+    """Drop cached eager-mode sheared-bias staging buffers."""
+    _shear_bias_workspace.clear()
 
 
 def _round_up_to_tile(size: int, tile_size: int) -> int:
@@ -251,20 +286,25 @@ def _round_up_to_tile(size: int, tile_size: int) -> int:
 
 
 def _shear_bias_empty(shape, dtype, device):
-    # Grow-only per-device workspace: the sheared-bias staging tensor is large
+    # Grow-only per-stream workspace: the sheared-bias staging tensor is large
     # (total_q x num_head x rel_extent_padded) and call shapes vary, so per-call
     # torch.empty fragments the caching allocator until GPU memory is exhausted.
     # Contents never persist across calls (written by the shear kernel, read by
-    # the fwd kernel within the same call); assumes attention calls on a device
-    # are serialized. Bypassed under graph capture (a capture-pool pointer must
-    # not leak into eager use) and fake mode (a fake tensor must not be cached).
+    # the fwd kernel within the same call). Different streams need distinct
+    # buffers because their producer-consumer pairs can overlap. Bypassed under
+    # graph capture (a capture-pool pointer must not leak into eager use) and
+    # fake mode (a fake tensor must not be cached).
     if is_fake_mode() or torch.cuda.is_current_stream_capturing():
         return torch.empty(shape, dtype=dtype, device=device)
     nbytes = math.prod(shape) * dtype.itemsize
-    buf = _shear_bias_workspace.get(device)
+    device_index = device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    workspace_key = (device_index, _get_current_stream_raw(device_index))
+    buf = _shear_bias_workspace.get(workspace_key)
     if buf is None or buf.numel() < nbytes:
         buf = torch.empty(nbytes, dtype=torch.uint8, device=device)
-        _shear_bias_workspace[device] = buf
+        _shear_bias_workspace[workspace_key] = buf
     return buf[:nbytes].view(dtype).view(shape)
 
 
@@ -281,6 +321,22 @@ def num_splits_heuristic(total_mblocks, num_SMs, num_n_blocks, max_splits):
     # NOTE: We should revisit this heuristic after persistence is supported for split KV.
     # Sometimes, it's ideal to over-schedule splits for better efficiency.
     return min(num_SMs // total_mblocks, max_splits, num_n_blocks)
+
+
+
+def num_splits_heuristic_sm90_decode(total_mblocks, num_SMs, num_n_blocks, max_splits):
+    """Conservative short-span decode policy; all inputs are host-side bounds.
+
+    A short span (at most 32 KV tiles) with at least a quarter-SM wave of
+    independent query/head blocks amortizes poorly across split/reduce launches.
+    Keep it unsplit. For sparse grids or longer spans retain the upstream
+    occupancy heuristic. These thresholds are a policy, not an autotuned optimum.
+    """
+    if num_n_blocks <= 32 and total_mblocks * 4 >= num_SMs:
+        return 1
+    return max(1, num_splits_heuristic(
+        total_mblocks, num_SMs, num_n_blocks, max_splits
+    ))
 
 
 def _resolve_causal_local_window(
@@ -534,11 +590,34 @@ def _flash_attn_fwd(
             torch.float8_e5m2,
         ], "inputs must be float16, bfloat16, fp8 e4m3fn, or fp8 e5m2"
 
+    # SM90 has no FP8 MMA path here: fp16/bf16 Q with an fp8 KV cache is cast to
+    # fp16 in-kernel instead. bf16 Q is narrowed to fp16 too, so |q| above 65504
+    # overflows to inf (Gemma-4's QK-norm keeps Q far below that).
+    fp8_kv_dequant = (
+        arch // 10 == 9
+        and q is not None
+        and q.dtype in (torch.float16, torch.bfloat16)
+        and v.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+        and not v_blockscaled
+    )
+    if fp8_kv_dequant:
+        _check_fp8_kv_dequant_args(
+            k=k,
+            v=v,
+            qv=qv,
+            page_table=page_table,
+            rel_bias=rel_bias,
+            block_sparse_tensors=block_sparse_tensors,
+            mma_pv_is_rs=mma_pv_is_rs,
+        )
+
     # qk_blockscaled: Q/K are fp8 (same dtype); V may be bf16 (no v_blockscaled) or
     # fp8 (v_blockscaled) -- exclude V from the cross-dtype check either way.
     # v_blockscaled without qk_blockscaled: Q/K bf16, V fp8 -- exclude V.
     if qk_blockscaled:
         input_tensors = {"q": q, "k": k, "qv": qv}
+    elif fp8_kv_dequant:
+        input_tensors = {"k": k, "v": v}
     elif v_blockscaled:
         input_tensors = {"q": q, "qv": qv}
     else:
@@ -609,9 +688,9 @@ def _flash_attn_fwd(
         # can't express; fall back to the dense (non-interleaved) SFQ path.
         q_sf_interleaved = False
 
-    is_fp8 = v.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+    is_fp8 = v.dtype in (torch.float8_e4m3fn, torch.float8_e5m2) and not fp8_kv_dequant
     requires_grad = any(t is not None and t.requires_grad for t in [q, k, v, qv])
-    if is_fp8 and requires_grad:
+    if (is_fp8 or fp8_kv_dequant) and requires_grad:
         raise NotImplementedError(
             "FA4 CuTe FP8 backward is not supported yet (forward-only)."
         )
@@ -676,7 +755,7 @@ def _flash_attn_fwd(
             lse.fill_(float("-inf"))
         return out, lse
 
-    if is_fp8:
+    if is_fp8 or fp8_kv_dequant:
         for t, name in (
             (q_descale, "q_descale"),
             (k_descale, "k_descale"),
@@ -691,7 +770,14 @@ def _flash_attn_fwd(
             q_descale is None and k_descale is None and v_descale is None
         ), "q_descale/k_descale/v_descale are only supported for FP8 inputs"
 
-    dtype = torch2cute_dtype_map[q_dtype]
+    if fp8_kv_dequant:
+        # The kernel's DescaleTensors arg is rebuilt positionally, so pass all
+        # three or none; a missing one is the identity.
+        q_descale, k_descale, v_descale = _complete_descales(
+            (q_descale, k_descale, v_descale), shape=(batch_size, num_head_kv), device=device
+        )
+    # fp8 -> fp16 is a single cvt on SM90, so FP8-KV computes in fp16 for any Q dtype.
+    dtype = torch2cute_dtype_map[torch.float16 if fp8_kv_dequant else q_dtype]
     if is_fp8:
         assert (
             arch // 10 == 10
@@ -764,6 +850,8 @@ def _flash_attn_fwd(
             tile_mn[0], tile_mn[1], fwd_cfg.mma_pv_is_rs, fwd_cfg.intra_wg_overlap
         )
     tile_m, tile_n = fwd_cfg.m_block_size, fwd_cfg.n_block_size
+    if fp8_kv_dequant:
+        mma_pv_is_rs = True  # an explicit False was rejected above
     if mma_pv_is_rs is None:
         mma_pv_is_rs = fwd_cfg.mma_pv_is_rs
     if intra_wg_overlap is None:
@@ -790,8 +878,8 @@ def _flash_attn_fwd(
             0,
             min(
                 max_seqlen_k,
-                (window_size_right or max_seqlen_k)
-                + (window_size_left or max_seqlen_k)
+                (max_seqlen_k if window_size_right is None else window_size_right)
+                + (max_seqlen_k if window_size_left is None else window_size_left)
                 + 1
                 + tile_m,
             ),
@@ -848,7 +936,10 @@ def _flash_attn_fwd(
         )
         num_splits = arch_forward_plan.num_splits
     elif num_splits < 1:
-        num_splits = num_splits_heuristic(
+        split_selector = num_splits_heuristic
+        if arch // 10 == 9 and max_seqlen_q == 1:
+            split_selector = num_splits_heuristic_sm90_decode
+        num_splits = split_selector(
             total_mblocks,
             num_SMs,
             num_n_blocks,
@@ -1244,7 +1335,6 @@ def _flash_attn_fwd(
             return out, lse
 
     batch_invariant = is_batch_invariant()
-    tmem_load_red_max = _tmem_load_red_max_enabled()
     compile_key = (
         dtype,
         head_dim,
@@ -1307,8 +1397,10 @@ def _flash_attn_fwd(
         sfk.ndim if sfk is not None else None,
         sfv.ndim if sfv is not None else None,
         batch_invariant,
-        tmem_load_red_max,
         fa_logging.get_fa_log_level(),
+        # dtype is the MMA dtype; FP8-KV also varies the Q/O and K/V tensor dtypes.
+        q_dtype,
+        v.dtype,
     )
 
     if compile_key not in _flash_attn_fwd.compile_cache:
@@ -1423,8 +1515,8 @@ def _flash_attn_fwd(
                 pack_gqa=pack_gqa,
                 tile_m=tile_m,
                 tile_n=tile_n,
-                # num_stages=1,
-                num_stages=2,
+                # FP8-KV casts into slot 0 of sK/sV behind one fp8 staging slot.
+                num_stages=1 if max(head_dim, head_dim_v) > 256 or fp8_kv_dequant else 2,
                 num_threads=num_threads,
                 Q_in_regs=False,
                 intra_wg_overlap=intra_wg_overlap,
@@ -1437,6 +1529,7 @@ def _flash_attn_fwd(
                 has_bias=bias is not None,
                 bias_block_size=tile_bias,
                 rel_extent_padded=rel_extent_padded,
+                fp8_kv_dequant=fp8_kv_dequant,
             )
         elif arch // 10 in [10, 11]:
             if qv is not None:
@@ -1532,7 +1625,6 @@ def _flash_attn_fwd(
                             q_sf_interleaved=q_sf_interleaved,
                             kv_sf_interleaved=kv_sf_interleaved,
                             batch_invariant=batch_invariant,
-                            tmem_load_red_max=tmem_load_red_max,
                         )
                     ),
                 )
@@ -1589,6 +1681,7 @@ def _flash_attn_fwd(
                 page_table_tensor,
                 window_size_left,
                 window_size_right,
+                None,  # mValue
                 current_stream,
                 options="--enable-tvm-ffi",
             )
@@ -1610,7 +1703,7 @@ def _flash_attn_fwd(
                 window_size_right,
                 learnable_sink_tensor,
             ]
-            if arch // 10 in [10, 11]:
+            if arch // 10 in [9, 10, 11]:
                 compile_args.append(descale_tensors_tensor)
             compile_args.extend(
                 [
@@ -1645,7 +1738,7 @@ def _flash_attn_fwd(
         q_call, k_call, v_call, qv_call = [
             t.detach() if t is not None else None for t in (q, k, v, qv)
         ]
-        if is_fp8 or qk_blockscaled:
+        if is_fp8 or qk_blockscaled or fp8_kv_dequant:
             # need uint8 workaround until we pin torch >= 2.11.0 where fp8 export
             # is supported. Under qk_blockscaled/v_blockscaled some tensors stay
             # bf16 (e.g. bf16 V), so view only the actual fp8 tensors.
@@ -1687,6 +1780,7 @@ def _flash_attn_fwd(
                 page_table,
                 window_size_left,
                 window_size_right,
+                None,  # mValue
             )
         else:
             call_args = [
@@ -1705,7 +1799,7 @@ def _flash_attn_fwd(
                 window_size_right,
                 learnable_sink,
             ]
-            if arch // 10 in [10, 11]:
+            if arch // 10 in [9, 10, 11]:
                 call_args.append(descale_tensors)
             call_args.extend(
                 [

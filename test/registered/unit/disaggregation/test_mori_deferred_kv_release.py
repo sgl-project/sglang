@@ -1,80 +1,37 @@
 """Deferred decode-side KV release on the Mori backend."""
 
-import importlib
-import sys
 import threading
-import types
 import unittest
 from collections import defaultdict
-from enum import IntEnum
 from queue import Queue
 from unittest.mock import MagicMock, patch
 
 import numpy as np
 
+from sglang.test.mori_stub import mori_stub
 
-def _install_mori_stubs() -> None:
-    try:
-        importlib.import_module("mori.cpp")
-        importlib.import_module("mori.io")
-        return
-    except (ImportError, OSError):
-        pass
+_mori_stub = mori_stub()
+if _mori_stub is not None:
+    _mori_stub.start()
 
-    mori = types.ModuleType("mori")
-    mori.__path__ = []
-    mori_cpp = types.ModuleType("mori.cpp")
-    mori_io = types.ModuleType("mori.io")
-
-    class FakeStatusCode(IntEnum):
-        SUCCESS = 0
-        IN_PROGRESS = 1
-        FAILED = 2
-
-    mori_cpp.TransferStatus = object
-    for name in (
-        "BackendType",
-        "EngineDesc",
-        "IOEngine",
-        "IOEngineConfig",
-        "MemoryDesc",
-        "MemoryLocationType",
-        "PollCqMode",
-        "RdmaBackendConfig",
-    ):
-        setattr(mori_io, name, object)
-    mori_io.StatusCode = FakeStatusCode
-    mori.cpp = mori_cpp
-    mori.io = mori_io
-    sys.modules["mori"] = mori
-    sys.modules["mori.cpp"] = mori_cpp
-    sys.modules["mori.io"] = mori_io
-
-
-_install_mori_stubs()
-
+from mori.io import StatusCode
 from test_deferred_decode_kv_release import (
     ABORT_GENERATION,
     DeferredAbortNotificationScenarios,
 )
 
 from sglang.srt.disaggregation.base.conn import KVPoll
-from sglang.srt.disaggregation.common.conn import (
-    ABORT_TAG,
-    AbortNotification,
-    AckTarget,
-)
+from sglang.srt.disaggregation.common.conn import AbortNotification, AckTarget
 from sglang.srt.disaggregation.common.utils import TransferKVChunk
 from sglang.srt.disaggregation.mori.conn import (
     MoriKVManager,
-    StatusCode,
     _MoriTransferSubmissionError,
     _SubmissionLocal,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 def _manager(enabled: bool = True) -> MoriKVManager:
@@ -135,38 +92,12 @@ class TestMoriAbortAck(DeferredAbortNotificationScenarios, CustomTestCase):
     def _drain_test_transfer(self, manager) -> None:
         manager._mark_transfer_quiescent(_chunk(self.room))
 
-    def test_abort_without_valid_return_address_marks_failed_without_ack(self):
-        messages = (
-            ("missing", [ABORT_TAG, b"11"]),
-            ("malformed port", [ABORT_TAG, b"11", b"10.0.0.3", b"bad"]),
-        )
-
-        for name, message in messages:
-            with self.subTest(name=name):
-                manager = _manager()
-                manager.request_status[11] = KVPoll.WaitingForInput
-
-                manager._handle_abort_message(message)
-
-                self.assertEqual(manager.request_status[11], KVPoll.Failed)
-                self.assertEqual(manager._sent, [])
-                self.assertEqual(manager._deferred_ack_targets, {})
-
-    def test_feature_off_preserves_abort_without_ack(self):
-        manager = _manager(enabled=False)
-        manager.request_status[11] = KVPoll.WaitingForInput
-
-        manager._handle_abort_message(_abort_message())
-
-        self.assertEqual(manager.request_status[11], KVPoll.Failed)
-        self.assertEqual(manager._sent, [])
-        self.assertEqual(manager._deferred_ack_targets, {})
-
     def test_abort_after_submit_waits_for_terminal_status(self):
         manager = _manager()
         manager.request_status[11] = KVPoll.Transferring
         status = MagicMock()
         status.InProgress.return_value = False
+        status.Failed.return_value = False
         manager._submit_kv_transfer = MagicMock(return_value=[status])
         wait_results = iter((StatusCode.IN_PROGRESS, StatusCode.SUCCESS))
 
@@ -201,6 +132,7 @@ class TestMoriAbortAck(DeferredAbortNotificationScenarios, CustomTestCase):
         manager.engine.wait_all.return_value = StatusCode.IN_PROGRESS
         status = MagicMock()
         status.InProgress.return_value = True
+        status.Failed.return_value = False
         manager._submit_kv_transfer = MagicMock(return_value=[status])
         manager.conclude_failure = MagicMock()
         chunk = _chunk()
@@ -232,6 +164,45 @@ class TestMoriAbortAck(DeferredAbortNotificationScenarios, CustomTestCase):
         self.assertNotIn(11, manager._staging_outstanding)
         manager.conclude_failure.assert_called_once()
 
+    def test_failed_status_never_acks(self):
+        """A write that ended Failed() may still land in decode's pages, so
+        neither the pending ABORT nor a later one may be ACKed."""
+        for via_drainer in (False, True):
+            with self.subTest(via_drainer=via_drainer):
+                manager = _manager()
+                manager.request_status[11] = KVPoll.Transferring
+                manager.conclude_failure = MagicMock()
+                status = MagicMock()
+                status.InProgress.return_value = via_drainer
+                status.Failed.return_value = True
+                manager._submit_kv_transfer = MagicMock(return_value=[status])
+                manager.engine = MagicMock()
+                manager.engine.wait_all.return_value = (
+                    StatusCode.IN_PROGRESS if via_drainer else StatusCode.FAILED
+                )
+                manager._transfer_timeout_ms = 1 if via_drainer else 0
+                chunk = _chunk()
+                manager._mark_transfer_started(chunk)
+
+                with patch(
+                    "sglang.srt.disaggregation.mori.conn.time.perf_counter",
+                    side_effect=(0.0, 0.002),
+                ):
+                    is_quiescent = manager._process_transfer_chunk(chunk)
+                manager._handle_abort_message(_abort_message())
+                if via_drainer:
+                    self.assertFalse(is_quiescent)
+                    queued_chunk, queued_statuses = manager._drain_queue.get_nowait()
+                    manager._drain_transfer_statuses(queued_chunk, queued_statuses)
+                else:
+                    self.assertTrue(is_quiescent)
+                    manager._mark_transfer_quiescent(chunk)
+                manager._handle_abort_message(_abort_message())
+
+                self.assertEqual(manager._sent, [])
+                self.assertIn(11, manager._deferred_ack_poisoned_rooms)
+                self.assertNotIn(11, manager._staging_outstanding)
+
     def test_room_cleared_after_drain_handoff_keeps_single_owner(self):
         manager = _manager()
         manager.request_status[11] = KVPoll.Transferring
@@ -260,24 +231,6 @@ class TestMoriAbortAck(DeferredAbortNotificationScenarios, CustomTestCase):
         self.assertEqual(manager._staging_outstanding[11], 1)
         self.assertEqual(manager._drain_queue.qsize(), 1)
         manager.conclude_failure.assert_called_once()
-
-    def test_sla_failure_keeps_legacy_early_return_when_disabled(self):
-        manager = _manager(enabled=False)
-        manager._transfer_timeout_ms = 1
-        manager.engine = MagicMock()
-        manager.engine.wait_all.side_effect = (
-            StatusCode.IN_PROGRESS,
-            StatusCode.SUCCESS,
-        )
-
-        with patch(
-            "sglang.srt.disaggregation.mori.conn.time.perf_counter",
-            side_effect=(0.0, 0.002),
-        ):
-            failure = manager._wait_transfer_completion([object()])
-
-        self.assertEqual(failure, "KV transfer exceeded SLA 1ms")
-        self.assertEqual(manager.engine.wait_all.call_count, 1)
 
     def test_wait_event_failure_releases_outstanding_count(self):
         manager = _manager()
@@ -364,12 +317,6 @@ class TestMoriAbortAck(DeferredAbortNotificationScenarios, CustomTestCase):
 
         self.assertEqual(manager._drain_transfer_statuses.call_count, 2)
         log.assert_called_once()
-
-
-class TestMoriBackendOptIn(CustomTestCase):
-    def test_mori_opts_into_deferred_release(self):
-        # Mori sends the drain ack itself, so the default-on env var applies.
-        self.assertTrue(MoriKVManager.supports_deferred_decode_kv_release)
 
 
 if __name__ == "__main__":

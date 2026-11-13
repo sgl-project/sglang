@@ -42,8 +42,6 @@ logger = init_logger(__name__)
 
 
 class SparseVideoGen2AttentionBackend(AttentionBackend):
-    accept_output_buffer: bool = True
-
     @staticmethod
     def get_supported_head_sizes() -> list[int]:
         return [64, 128, 256]
@@ -106,21 +104,7 @@ class SparseVideoGen2AttentionMetadata(AttentionMetadata):
     max_seqlen_k: int | None = None
 
 
-def _require_kwarg(kwargs: dict[str, Any], name: str) -> Any:
-    if name not in kwargs:
-        raise ValueError(
-            f"Missing required argument for SparseVideoGen2Attention: {name}"
-        )
-    return kwargs[name]
-
-
 class SparseVideoGen2AttentionMetadataBuilder(AttentionMetadataBuilder):
-    def __init__(self) -> None:
-        pass
-
-    def prepare(self) -> None:
-        pass
-
     def build(  # type: ignore[override]
         self,
         current_timestep: int,

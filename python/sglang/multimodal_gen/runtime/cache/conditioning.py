@@ -90,6 +90,32 @@ def prefer_conditioning_cache():
         _prefer_cache.reset(token)
 
 
+# Image-to-video VAE inputs are one image followed by all-zero frames, so most
+# blocks of large CUDA inputs are zero. Hashing the nonzero-block bitmap and only
+# those blocks still identifies every byte, without copying the zeros to host.
+_SPARSE_HASH_BLOCK_BYTES = 64 * 1024
+_SPARSE_HASH_MIN_BYTES = 16 * 1024 * 1024
+# Bound on bookkeeping, not memory: the byte budget normally binds first, even
+# for tiled VAE references that store one small entry per tile.
+DEFAULT_CONDITIONING_CACHE_MAX_ENTRIES = 4096
+
+
+def _tensor_digest(tensor):
+    data = tensor.reshape(-1).view(torch.uint8)
+    if not data.is_cuda or data.numel() < _SPARSE_HASH_MIN_BYTES:
+        return hashlib.sha256(data.cpu().numpy()).digest()
+    num_blocks = data.numel() // _SPARSE_HASH_BLOCK_BYTES
+    split = num_blocks * _SPARSE_HASH_BLOCK_BYTES
+    blocks = data[:split].view(num_blocks, _SPARSE_HASH_BLOCK_BYTES)
+    nonzero = blocks.amax(dim=1).ne(0).cpu().numpy()
+    digest = hashlib.sha256(nonzero.tobytes())
+    edges = np.flatnonzero(np.diff(np.concatenate(([0], nonzero.view(np.int8), [0]))))
+    for start, end in zip(edges[::2], edges[1::2]):
+        digest.update(blocks[start:end].cpu().numpy())
+    digest.update(data[split:].cpu().numpy())
+    return digest.digest()
+
+
 def _fingerprint(value):
     if isinstance(value, torch.Tensor):
         if (
@@ -98,15 +124,13 @@ def _fingerprint(value):
             or value.requires_grad
         ):
             raise Uncacheable("only dense inference tensors can be cached")
-        tensor = value.detach().cpu().contiguous()
-        data = tensor.reshape(-1).view(torch.uint8).numpy()
         return (
             "tensor",
             str(value.dtype),
             str(value.device),
             tuple(value.shape),
             tuple(value.stride()),
-            hashlib.sha256(data).digest(),
+            _tensor_digest(value.detach().contiguous()),
         )
     if isinstance(value, Image.Image):
         return (
@@ -154,6 +178,8 @@ class _CacheEntry:
     owner: int
     preferred: bool
     device_resident: bool = False
+    # stored by warmup and not yet hit by a served request
+    provisional: bool = False
 
     @classmethod
     def snapshot(cls, output, size, owner, preferred, device_resident):
@@ -227,6 +253,36 @@ class _GroupEntry:
         _map_output(self.output, record)
 
 
+# One stage's group-tier entries; copied_bytes totals the private snapshots.
+class _GroupEntries:
+    def __init__(self):
+        self._entries = {}
+        self.copied_bytes = 0
+
+    def __len__(self):
+        return len(self._entries)
+
+    def get(self, key):
+        return self._entries.get(key)
+
+    def items(self):
+        return self._entries.items()
+
+    def put(self, *, key, entry):
+        self.remove(key)
+        self._entries[key] = entry
+        self.copied_bytes += entry.copied_bytes
+
+    def remove(self, key):
+        entry = self._entries.pop(key, None)
+        if entry is not None:
+            self.copied_bytes -= entry.copied_bytes
+
+    def clear(self):
+        self._entries.clear()
+        self.copied_bytes = 0
+
+
 def _copy_output(value, *, share_tensors=False):
     tensors = {}
 
@@ -274,14 +330,27 @@ def _map_output(value, tensor_fn, *, restore=False):
 class ConditioningCache:
     """One bounded cache per rank with host entries and device-hot conditioning."""
 
-    def __init__(self, max_bytes: int):
+    def __init__(
+        self,
+        max_bytes: int,
+        *,
+        max_entries: int = DEFAULT_CONDITIONING_CACHE_MAX_ENTRIES,
+    ):
         if max_bytes < 0:
             raise ValueError("conditioning cache capacity must be nonnegative")
+        if max_entries < 1:
+            raise ValueError("conditioning cache entry limit must be positive")
         _live_caches.add(self)
         self.max_bytes = max_bytes
+        self.max_entries = max_entries
         self.bytes = 0
         self.hits = self.misses = self.evictions = self.bypasses = 0
+        # Least recently used first. Non-preferred keys keep the same order in
+        # _normal_keys, the only entries a non-preferred store may evict.
         self._entries = OrderedDict()
+        self._normal_keys = OrderedDict()
+        self._normal_bytes = 0
+        self._provisional_keys = set()
         self._models = weakref.WeakKeyDictionary()
         self._next_model = 0
         self._group_entries = ContextVar("conditioning_group_entries", default=None)
@@ -294,7 +363,66 @@ class ConditioningCache:
         for entry in self._entries.values():
             entry.wait()
         self._entries.clear()
-        self.bytes = 0
+        self._normal_keys.clear()
+        self._provisional_keys.clear()
+        self.bytes = self._normal_bytes = 0
+
+    def _put(self, *, key, entry):
+        if key in self._entries:
+            self._pop(key)
+        self._entries[key] = entry
+        self.bytes += entry.size
+        self._index(key=key, entry=entry)
+
+    def _pop(self, key):
+        entry = self._entries.pop(key)
+        self._unindex(key=key, entry=entry)
+        self.bytes -= entry.size
+        return entry
+
+    # Call after changing an entry's preferred/provisional flags.
+    def _reindex(self, *, key, entry):
+        self._unindex(key=key, entry=entry)
+        self._entries.move_to_end(key)
+        self._index(key=key, entry=entry)
+
+    def _index(self, *, key, entry):
+        if not entry.preferred:
+            self._normal_keys[key] = None
+            self._normal_bytes += entry.size
+            if entry.provisional:
+                self._provisional_keys.add(key)
+
+    def _unindex(self, *, key, entry):
+        if key in self._normal_keys:
+            del self._normal_keys[key]
+            self._normal_bytes -= entry.size
+        self._provisional_keys.discard(key)
+
+    # A non-preferred store may only evict non-preferred entries; False means no room.
+    def _make_room(self, *, size: int, preferred: bool) -> bool:
+        evictable = self._entries if preferred else self._normal_keys
+        evictable_bytes = self.bytes if preferred else self._normal_bytes
+        if size > self.max_bytes - self.bytes + evictable_bytes or (
+            self._entries_full() and not evictable
+        ):
+            return False
+        while evictable and (
+            self.bytes + size > self.max_bytes or self._entries_full()
+        ):
+            self._pop(next(iter(evictable))).wait()
+            self.evictions += 1
+        return True
+
+    def _entries_full(self) -> bool:
+        return len(self._entries) >= self.max_entries
+
+    def _recycle_provisional_entries(self):
+        """Free warmup-only entries so served snapshots reuse their pinned blocks
+        instead of pinning fresh pages (~0.3 ms/MB). Seeded negatives stay."""
+        for key in list(self._provisional_keys):
+            self._pop(key).wait()
+            self.evictions += 1
 
     def invalidate(self, parameters):
         if parameters is None:
@@ -309,14 +437,12 @@ class ConditioningCache:
         }
         for key, entry in list(self._entries.items()):
             if entry.owner in owners:
-                entry.wait()
-                self.bytes -= entry.size
-                del self._entries[key]
+                self._pop(key).wait()
         group_entries = self._group_entries.get()
         if group_entries is not None:
             for key, entry in list(group_entries.items()):
                 if entry.owner in owners:
-                    del group_entries[key]
+                    group_entries.remove(key)
 
     def stats(self):
         return dict(
@@ -341,7 +467,7 @@ class ConditioningCache:
     @contextmanager
     def group_scope(self, enabled=True):
         """Keep device results only while a stage executes a group of requests."""
-        token = self._group_entries.set({} if enabled else None)
+        token = self._group_entries.set(_GroupEntries() if enabled else None)
         try:
             yield
         finally:
@@ -365,9 +491,8 @@ class ConditioningCache:
         )
         # private snapshots must not retain unbounded intermediate encoder states
         if not share_in_group and (
-            len(entries) >= 128
-            or size + sum(entry.copied_bytes for entry in entries.values())
-            > 512 * 1024**2
+            len(entries) >= self.max_entries
+            or size + entries.copied_bytes > 512 * 1024**2
         ):
             return
         stored = _copy_output(output, share_tensors=share_in_group)
@@ -377,7 +502,7 @@ class ConditioningCache:
                 t.device for t in tensors.values() if t.device.type == "cuda"
             }
         )
-        entries[key] = _GroupEntry(stored, owner, size, streams)
+        entries.put(key=key, entry=_GroupEntry(stored, owner, size, streams))
 
     @contextmanager
     def scope(self, enabled=True, *, refresh=False, cross_request=True):
@@ -453,7 +578,9 @@ class ConditioningCache:
             self.hits += 1
             if entry is not None:
                 entry.preferred |= _prefer_cache.get()
-                self._entries.move_to_end(key)
+                if not _refresh_cache.get():
+                    entry.provisional = False
+                self._reindex(key=key, entry=entry)
             if group_entry is not None:
                 self.group_hits += 1
                 group_entry.wait()
@@ -473,8 +600,11 @@ class ConditioningCache:
                 else _map_output(entry.output, restore, restore=True)
             )
             if keep_on_device and not entry.device_resident:
-                self._entries[key] = _CacheEntry.snapshot(
-                    output, entry.size, entry.owner, True, True
+                self._put(
+                    key=key,
+                    entry=_CacheEntry.snapshot(
+                        output, entry.size, entry.owner, True, True
+                    ),
                 )
             self._remember_group(key, output, entry.owner, share_in_group)
             return output
@@ -507,35 +637,20 @@ class ConditioningCache:
         except Uncacheable:
             self.bypasses += 1
             return output
-        old = self._entries.pop(key, None)
-        if old is not None:
-            old.wait()
-            self.bytes -= old.size
+        if key in self._entries:
+            self._pop(key).wait()
+        refresh = _refresh_cache.get()
+        if not refresh and self._provisional_keys:
+            self._recycle_provisional_entries()
         preferred = _prefer_cache.get()
-        evictable = [
-            key
-            for key, entry in self._entries.items()
-            if preferred or not entry.preferred
-        ]
-        available = (
-            self.max_bytes
-            - self.bytes
-            + sum(self._entries[key].size for key in evictable)
-        )
-        if size > available or (len(self._entries) >= 128 and not evictable):
+        if not self._make_room(size=size, preferred=preferred):
             self.bypasses += 1
             return output
-        for evicted in evictable:
-            if self.bytes + size <= self.max_bytes and len(self._entries) < 128:
-                break
-            removed = self._entries.pop(evicted)
-            removed.wait()
-            self.bytes -= removed.size
-            self.evictions += 1
-        self._entries[key] = _CacheEntry.snapshot(
+        entry = _CacheEntry.snapshot(
             output, size, self._identity(model), preferred, keep_on_device
         )
-        self.bytes += size
+        entry.provisional = refresh
+        self._put(key=key, entry=entry)
         logger.debug(
             "Conditioning cache store: %s.%s, %d bytes",
             type(model).__name__,
@@ -637,40 +752,62 @@ def cached_conditioning(fn):
 def cached_vae_encode(fn):
     """Cache the posterior, before sample()/mode() and latent normalization.
 
-    Distributed VAEs currently bypass this cache: their encoding methods can
-    run on an owner rank or a model-specific subgroup, unlike encoder TP.
+    Distributed VAEs bypass this cache unless the decorated method explicitly
+    guarantees rank-local computation. A cache hit must not skip collectives
+    that another rank still enters.
     """
 
     @wraps(fn)
     def wrapped(self, *args, **kwargs):
         cache = _inference_cache(self)
-        if cache is None or (model_parallel_is_initialized() and get_world_size() > 1):
+        if cache is None or (
+            model_parallel_is_initialized()
+            and get_world_size() > 1
+            and not getattr(self, "conditioning_encode_is_rank_local", False)
+        ):
             return fn(self, *args, **kwargs)
-        # Tiling and slicing can change numerical results without changing x.
-        settings = {
-            name: value
-            for name, value in vars(self).items()
-            if name.startswith(
-                (
-                    "use_",
-                    "tile_",
-                    "blend_",
-                    "parallel_",
-                    "spatial_compression",
-                    "temporal_compression",
-                )
-            )
-            and type(value) in (int, float, bool, str, type(None))
-        }
         return cache.run(
             self,
             fn.__name__,
-            (args, settings),
+            (args, _vae_numeric_settings(self)),
             kwargs,
             lambda: fn(self, *args, **kwargs),
         )
 
     return wrapped
+
+
+def _vae_numeric_settings(vae):
+    # Tiling and slicing can change numerical results without changing x.
+    return {
+        name: value
+        for name, value in vars(vae).items()
+        if name.startswith(
+            (
+                "use_",
+                "tile_",
+                "blend_",
+                "parallel_",
+                "spatial_compression",
+                "temporal_compression",
+            )
+        )
+        and type(value) in (int, float, bool, str, type(None))
+    }
+
+
+def cached_vae_call(vae, method, args, compute, *, group=None):
+    """Cache a deterministic result derived from ``vae`` across requests.
+
+    When ``compute`` issues collectives, ``group`` must hold every rank that
+    runs it, so those ranks agree on hit or miss.
+    """
+    cache = _inference_cache(vae)
+    if cache is None:
+        return compute()
+    return cache.run(
+        vae, method, (args, _vae_numeric_settings(vae)), {}, compute, group
+    )
 
 
 class ConditioningEncoderMixin:

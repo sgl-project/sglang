@@ -27,6 +27,7 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
+from sglang.srt.layers.linear import _resolve_linear_group
 from sglang.srt.layers.parameter import BasevLLMParameter
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
@@ -34,14 +35,9 @@ from sglang.srt.layers.quantization.base_config import (
     method_has_implemented_embedding,
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
+from sglang.srt.layers.utils.common import set_weight_attrs
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import (
-    cpu_has_amx_support,
-    get_compiler_backend,
-    is_cpu,
-    is_npu,
-    set_weight_attrs,
-)
+from sglang.srt.utils import cpu_has_amx_support, get_compiler_backend, is_cpu, is_npu
 from sglang.srt.utils.async_probe import maybe_detect_oob
 
 DEFAULT_VOCAB_PADDING_SIZE = 64
@@ -248,6 +244,11 @@ class VocabParallelEmbedding(torch.nn.Module):
 
         self.enable_tp = enable_tp
         self.use_attn_tp_group = use_attn_tp_group
+        self.tp_group = (
+            _resolve_linear_group("attn_tp" if use_attn_tp_group else "tp")
+            if enable_tp
+            else None
+        )
         if self.enable_tp:
             if use_attn_tp_group:
                 tp_rank = get_parallel().attn_tp_rank
@@ -513,7 +514,13 @@ class VocabParallelEmbedding(torch.nn.Module):
             input_, 0, self.num_embeddings, "VocabParallelEmbedding input id"
         )
         output_parallel = self._embed_local_shard(input_)
-        if self.tp_size > 1 and not get_attn_tp_context().input_scattered:
+        # Replicated attention-TP peers have matching shapes, so all of them
+        # can skip the collective for an empty idle batch.
+        if (
+            output_parallel.numel() > 0
+            and self.tp_size > 1
+            and not get_attn_tp_context().input_scattered
+        ):
             if self.use_attn_tp_group:
                 output_parallel = attn_tp_all_reduce(output_parallel)
             else:

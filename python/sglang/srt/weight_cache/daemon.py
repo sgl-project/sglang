@@ -36,6 +36,7 @@ Usage:
 
 import argparse
 import dataclasses
+import datetime
 import logging
 import multiprocessing
 import os
@@ -47,7 +48,7 @@ from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 import torch
 import torch.distributed as dist
 
-from sglang.srt.arg_groups.overrides import resolving_view
+from sglang.srt.arg_groups.model_override_base import resolving_view
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
@@ -250,15 +251,18 @@ class WeightCacheDaemon:
 
     def load(self):
         """Full loading pipeline: disk → TP shard → quantize → export IPC handles."""
-        # CUDA IPC weight sharing relies on torch's _share_cuda_ handle export,
-        # which only exists on CUDA-alike platforms (CUDA / ROCm). Fail loud here
-        # instead of dying deep inside the export with an opaque error.
-        if not current_platform.is_cuda_alike():
+        # Zero-copy IPC weight sharing requires a platform whose tensors can be
+        # exported through multiprocessing reduction: CUDA-alike platforms
+        # (CUDA / ROCm) via _share_cuda_, and NPU via native torch_npu reduction.
+        # Fail loud here instead of dying deep inside the export with an opaque
+        # error on anything else.
+        if not current_platform.is_cuda_alike() and not current_platform.is_npu():
             raise RuntimeError(
-                f"[WeightCacheDaemon] the weight cache daemon requires a CUDA-alike "
-                f"platform (CUDA or ROCm) for CUDA IPC weight sharing, but the "
-                f"active platform device type is {current_platform.device_type!r}. "
-                f"Disable the weight cache (--weight-cache-mode off)."
+                f"[WeightCacheDaemon] the weight cache daemon requires an "
+                f"IPC-capable platform (CUDA, ROCm, or NPU/Ascend) for zero-copy "
+                f"weight sharing, but the active platform device type is "
+                f"{current_platform.device_type!r}. Disable the weight cache "
+                f"(--weight-cache-mode off)."
             )
         # expandable_segments makes torch's caching allocator hand out memory
         # that cannot be exported via _share_cuda_, so the IPC export below would
@@ -396,8 +400,7 @@ class WeightCacheDaemon:
 
         logger.info(
             f"[WeightCacheDaemon gpu={self.gpu_id} tp_rank={self.tp_rank}] "
-            f"Exported {len(self.state_entries)} tensors as IPC handles. "
-            f"Ready to serve."
+            f"Exported {len(self.state_entries)} tensors as IPC handles."
         )
 
     @staticmethod
@@ -652,7 +655,30 @@ def run_weight_cache_daemon(
     )
 
     daemon.load()
+    _await_cluster_ready_to_serve(
+        timeout=resolving_view(server_args).weight_cache_timeout
+    )
     daemon.serve()
+
+
+def _await_cluster_ready_to_serve(timeout: int) -> None:
+    if timeout <= 0:
+        # Gloo reads timedelta(0) as its wait-forever sentinel.
+        raise ValueError(f"--weight-cache-timeout must be positive, got {timeout}")
+
+    try:
+        # Gate publication on the full PP×TP daemon world.
+        dist.monitored_barrier(
+            group=get_parallel().world_group.cpu_group,
+            timeout=datetime.timedelta(seconds=timeout),
+            wait_all_ranks=True,
+        )
+    except RuntimeError:
+        logger.exception(
+            "[weight_cache] cluster readiness barrier failed; exiting without serving."
+        )
+        # Process-group teardown can block after a failed collective.
+        os._exit(1)
 
 
 def spawn_weight_cache_daemon(
