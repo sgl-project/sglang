@@ -1954,7 +1954,6 @@ def get_dsv41_spec_layout(kv_args: KVArgs) -> Optional[dict]:
 
 
 def get_spec_kv_layout(kv_args: KVArgs) -> Optional[dict]:
-    """{} without injected draft KV; None when this rank has no draft KV entries."""
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
     spec = get_spec()
@@ -1962,7 +1961,12 @@ def get_spec_kv_layout(kv_args: KVArgs) -> Optional[dict]:
     if not algorithm.is_dflash_family():
         return {}
     if not kv_args.num_draft_entries:
-        return None
+        if spec.speculative_dflash_draft_window_transfer is None:
+            return None
+        return {
+            "algorithm": algorithm.name,
+            "draft_window": kv_args.dflash_draft_window_layout,
+        }
     # No block size: prefill writes draft KV per token, unlike DSV4.1's SWA ring.
     return {
         "algorithm": algorithm.name,
@@ -1970,13 +1974,59 @@ def get_spec_kv_layout(kv_args: KVArgs) -> Optional[dict]:
     }
 
 
-def get_pd_kv_layout(token_to_kv_pool) -> Optional[str]:
+def is_draft_kv_on_target_swa(draft_token_to_kv_pool) -> bool:
+    from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+
+    return (
+        isinstance(draft_token_to_kv_pool, SWAKVPool)
+        and draft_token_to_kv_pool.full_layer_nums == 0
+        and draft_token_to_kv_pool.swa_layer_nums > 0
+    )
+
+
+def get_dflash_draft_window_layout(
+    *,
+    draft_token_to_kv_pool,
+    dflash_draft_window: int,
+    num_dflash_draft_kv_heads: int,
+    dflash_draft_attn_tp_size: int,
+) -> str:
+    rows = (
+        draft_token_to_kv_pool.swa_kv_pool
+        if is_draft_kv_on_target_swa(draft_token_to_kv_pool)
+        else draft_token_to_kv_pool
+    )
+    num_local_kv_heads = max(1, num_dflash_draft_kv_heads // dflash_draft_attn_tp_size)
+    if rows.head_num != num_local_kv_heads:
+        raise RuntimeError(
+            f"The DFLASH draft KV pool holds {rows.head_num} KV heads per rank, "
+            f"expected {num_local_kv_heads} of {num_dflash_draft_kv_heads} over "
+            f"draft attention TP size {dflash_draft_attn_tp_size}."
+        )
+    # TP-invariant fields only: PD peers may use different attention TP sizes.
+    return (
+        f"dflash_draft_window={dflash_draft_window},layers={rows.layer_num},"
+        f"kv_heads={num_dflash_draft_kv_heads},head_dim={rows.head_dim},"
+        f"v_head_dim={rows.v_head_dim},dtype={rows.dtype}"
+    )
+
+
+def get_pd_kv_layout(
+    token_to_kv_pool, *, dflash_draft_window_layout: Optional[str] = None
+) -> Optional[str]:
     """The KV byte layout both PD roles must share, for pools that have more than one."""
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 
+    layout = None
     if isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool):
-        return token_to_kv_pool.pd_kv_layout()
-    return None
+        layout = token_to_kv_pool.pd_kv_layout()
+    if dflash_draft_window_layout is not None:
+        layout = (
+            dflash_draft_window_layout
+            if layout is None
+            else f"{layout};{dflash_draft_window_layout}"
+        )
+    return layout
 
 
 def prepare_abort(req: Req, error_message: str, status_code=None):

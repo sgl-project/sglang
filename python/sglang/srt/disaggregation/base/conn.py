@@ -43,6 +43,7 @@ class StateType(str, enum.Enum):
     # KV it describes (whole sequence for full attention, window for SWA).
     BLOCK_SCALE = "block_scale"
     BLOCK_SCALE_SWA = "block_scale_swa"
+    DFLASH_DRAFT_WINDOW = "dflash_draft_window"
 
 
 @dataclasses.dataclass
@@ -136,6 +137,8 @@ class KVArgs:
     # Only used of npu, for decode total kv layers
     draft_kv_layers: int
     num_draft_entries: int = 0
+    num_dflash_draft_kv_heads: Optional[int] = None
+    dflash_draft_window_layout: Optional[str] = None
 
 
 class KVPoll:

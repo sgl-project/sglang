@@ -2188,6 +2188,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             StateType.REQUEST_ROW,
             StateType.BLOCK_SCALE,
             StateType.BLOCK_SCALE_SWA,
+            StateType.DFLASH_DRAFT_WINDOW,
         )
 
     def _requires_exact_state_index_match(self, st: StateType) -> bool:
@@ -2374,7 +2375,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     and not self.is_hybrid_mla_backend
                     and not is_replicated_state
                 )
-                if slice_kv_heads and st != StateType.SWA:
+                if slice_kv_heads and st not in (
+                    StateType.SWA,
+                    StateType.DFLASH_DRAFT_WINDOW,
+                ):
                     raise RuntimeError(
                         f"PD Disaggregation does NOT support PD different TP sizes for non-MLA {st.upper()} hybrid models yet."
                     )
@@ -2468,6 +2472,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 target_rank_registration_info.dst_attn_tp_size
                             ),
                             executor=executor,
+                            total_kv_heads=(
+                                self.kv_args.num_dflash_draft_kv_heads
+                                if st == StateType.DFLASH_DRAFT_WINDOW
+                                else None
+                            ),
                         )
                         or rc
                     )
@@ -2737,6 +2746,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         dst_tp_rank: int,
         dst_attn_tp_size: int,
         executor: concurrent.futures.ThreadPoolExecutor,
+        total_kv_heads: Optional[int] = None,
     ) -> int:
         blocks = self._get_mha_head_slice_blocks(
             src_ptrs=src_state_data_ptrs,
@@ -2747,6 +2757,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             dst_page_indices=np.asarray(dst_swa_page_indices),
             dst_attn_tp_size=dst_attn_tp_size,
             dst_tp_rank=dst_tp_rank,
+            total_kv_heads=total_kv_heads,
         )
         logger.warning_once(
             "Using SWA state head-slice transfer for different attention TP sizes: "

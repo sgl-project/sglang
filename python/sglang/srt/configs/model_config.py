@@ -669,6 +669,8 @@ def get_num_indexer_layers(config) -> int:
 
 
 class ModelConfig:
+    dflash_draft_kv_on_swa: bool = False
+
     def __init__(
         self,
         model_path: str,
@@ -694,6 +696,7 @@ class ModelConfig:
         speculative_algorithm: Optional[str] = None,
         is_draft_quantization_explicit: bool = False,
         uocr_v2_default_context_len: int = FALLBACK_CONTEXT_LENGTH,
+        dflash_draft_kv_on_swa: bool = False,
     ) -> None:
         # Parse args
         self.model_path = model_path
@@ -702,6 +705,7 @@ class ModelConfig:
         self.is_draft_model = is_draft_model
         self.is_draft_quantization_explicit = is_draft_quantization_explicit
         self.speculative_algorithm = speculative_algorithm
+        self.dflash_draft_kv_on_swa = dflash_draft_kv_on_swa
         self.uocr_v2_default_context_len = uocr_v2_default_context_len
         self.model_impl = model_impl
         self.sampling_defaults = sampling_defaults
@@ -1109,6 +1113,9 @@ class ModelConfig:
             disable_hybrid_swa_memory=cfg.disable_hybrid_swa_memory,
             model_config_parser=cfg.model_config_parser,
             speculative_algorithm=cfg.speculative_algorithm,
+            dflash_draft_kv_on_swa=(
+                is_draft_model and cfg.speculative_dflash_draft_kv_on_swa
+            ),
             uocr_v2_default_context_len=UocrDocumentConfig.from_args(
                 cfg
             ).default_context_length(),
@@ -1384,6 +1391,11 @@ class ModelConfig:
                         self.hf_text_config,
                     )
                 )
+        elif self._is_dflash_draft_kv_on_swa():
+            self.is_hybrid_swa = True
+            self.is_compressed_kv_arch = False
+            self.swa_attention_layer_ids = list(range(self.num_hidden_layers))
+            self.full_attention_layer_ids = []
 
         self.has_attention_sinks = self._detect_attention_sinks()
 
@@ -1398,6 +1410,23 @@ class ModelConfig:
             "Gemma4UnifiedForConditionalGeneration",
             "DiffusionGemmaForBlockDiffusion",
         ]
+
+    def _is_dflash_draft_kv_on_swa(self) -> bool:
+        if not (
+            self.dflash_draft_kv_on_swa
+            and self.is_draft_model
+            and self.speculative_algorithm == "DFLASH"
+            and not self.disable_hybrid_swa_memory
+        ):
+            return False
+        from sglang.srt.speculative.dflash_utils import get_dflash_layer_types
+
+        layer_types = get_dflash_layer_types(self.hf_config)
+        return (
+            layer_types is not None
+            and len(layer_types) == self.num_hidden_layers > 0
+            and all(kind == "sliding_attention" for kind in layer_types)
+        )
 
     @cached_property
     def linear_attn_registry_result(self) -> Any:
