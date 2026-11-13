@@ -142,6 +142,7 @@ from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.layers.quantization.unquant import initialize_bf16_gemm_config
 from sglang.srt.lora.lora_drainer import LoRADrainer
 from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
+from sglang.srt.managers import uniboost
 from sglang.srt.managers.deferred_output import ResponseCompletion
 from sglang.srt.managers.disagg_service import maybe_create_ascend_config_store
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
@@ -252,6 +253,7 @@ from sglang.srt.managers.schedule_batch import (
 )
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
+    CacheAwarePolicy,
     PrefillAdder,
     SchedulePolicy,
     mamba_prefill_chunk_grid,
@@ -1530,6 +1532,11 @@ class Scheduler(
             self.enable_hierarchical_cache,
             self.enable_priority_scheduling,
             self.schedule_low_priority_values_first,
+            uniboost_gamma=get_schedule().uniboost_gamma,
+            uniboost_bin_size=get_schedule().uniboost_bin_size,
+            uniboost_clock=get_schedule().uniboost_clock,
+            uniboost_adaptive_gamma=get_schedule().uniboost_adaptive_gamma,
+            uniboost_adaptive_max_jump_s=get_schedule().uniboost_adaptive_max_jump_s,
         )
         self.prefill_delayer: Optional[PrefillDelayer] = None
         self.prefill_bs_tracker = RecentPrefillBatchSizeTracker(
@@ -4648,6 +4655,12 @@ class Scheduler(
                 break
             if self.enable_lora and not self.can_schedule_lora_req(req, running_loras):
                 continue
+            if self.policy.policy == CacheAwarePolicy.UNIBOOST and uniboost.commit_held(
+                req,
+                extenders=[self.chunked_req, *adder.can_run_list],
+                now_s=time.perf_counter(),
+            ):
+                continue
 
             # A forward batch runs one pooling mode, so setwise readout requests
             # (token_indices_to_pool) cannot share a batch with last-token ones.
@@ -5764,6 +5777,7 @@ class Scheduler(
         elif batch.forward_mode.is_idle():
             self.batch_result_processor.process_batch_result_idle(batch, result)
         self._on_step_processed(batch, result)
+        self.policy.record_completed_requests(batch.reqs)
 
         # Submit this batch's queued host backups before the next scheduler step.
         self.tree_cache.flush_pending_backups()
