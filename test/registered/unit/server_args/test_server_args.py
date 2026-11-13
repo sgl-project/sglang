@@ -3702,6 +3702,53 @@ class TestPipelineParallelPrefillCudaGraphPolicy(CustomTestCase):
                 self.assertEqual((prefill.max_bs, prefill.bs[-1]), (expected, expected))
 
 
+class TestDecodeCudaGraphCeilingByMemoryTier(CustomTestCase):
+    def _resolve_decode(self, gpu_mem_mb, tp_size, max_bs=None):
+        args = ServerArgs(
+            model_path="dummy",
+            tp_size=tp_size,
+            mem_fraction_static=0.8,
+            cuda_graph_config=CudaGraphConfig(decode=PhaseConfig(max_bs=max_bs)),
+        )
+        with (
+            patch(
+                "sglang.srt.arg_groups.memory_hook.use_mla_backend",
+                return_value=False,
+            ),
+            patch(
+                "sglang.srt.arg_groups.memory_hook.get_device_memory_capacity",
+                return_value=gpu_mem_mb,
+            ),
+        ):
+            handle_gpu_memory_settings(args)
+        return resolution_result(args, "cuda_graph_config").decode
+
+    def test_ceiling_never_drops_as_memory_grows(self):
+        """A larger GPU must not get a smaller default ceiling, or decode batches
+        between the two ceilings run eager only on the larger GPU."""
+        gib = (16, 24, 35, 40, 45, 48, 60, 80, 96, 192)
+        ceilings = [self._resolve_decode(g * 1024, 1).max_bs for g in gib]
+        self.assertEqual(ceilings, sorted(ceilings), dict(zip(gib, ceilings)))
+
+    def test_default_ceiling_for_35_to_60_gib(self):
+        cases = (
+            # (reported MiB, tp_size, expected decode max_bs)
+            (35 * 1024, 1, 128),
+            (46068, 1, 128),  # L40S, A40
+            (60 * 1024 - 1, 1, 128),
+            (60 * 1024, 1, 256),
+            (46068, 4, 160),
+        )
+        for gpu_mem_mb, tp_size, expected in cases:
+            with self.subTest(gpu_mem_mb=gpu_mem_mb, tp_size=tp_size):
+                decode = self._resolve_decode(gpu_mem_mb, tp_size)
+                self.assertEqual((decode.max_bs, decode.bs[-1]), (expected, expected))
+
+    def test_explicit_ceiling_is_kept(self):
+        decode = self._resolve_decode(46068, 1, max_bs=64)
+        self.assertEqual((decode.max_bs, decode.bs[-1]), (64, 64))
+
+
 class TestCudaGraphDisaggregationRoles(CustomTestCase):
     def _handled_args(self, **overrides):
         args = ServerArgs(model_path="dummy", **overrides)
@@ -5666,7 +5713,6 @@ class TestRustServerUnsupportedArgs(CustomTestCase):
         "allowed_media_domains": ["--allowed-media-domains", "example.com"],
         "media_url_max_file_size_mb": ["--media-url-max-file-size-mb", "0"],
         "enable_trace": ["--enable-trace"],
-        "warmups": ["--warmups", "voice_chat"],
         "completion_template": ["--completion-template", "deepseek_coder"],
         "hf_chat_template_name": ["--hf-chat-template-name", "tool_use"],
         "enable_custom_logit_processor": ["--enable-custom-logit-processor"],
@@ -5675,7 +5721,6 @@ class TestRustServerUnsupportedArgs(CustomTestCase):
         "lora_paths": ["--lora-paths", "adapter=/adapters/a"],
         "tokenizer_mode": ["--tokenizer-mode", "slow"],
         "tokenizer_backend": ["--tokenizer-backend", "fastokens"],
-        "gc_warning_threshold_secs": ["--gc-warning-threshold-secs", "1"],
         "tokenizer_metrics_allowed_custom_labels": [
             "--tokenizer-metrics-allowed-custom-labels",
             "tenant",
@@ -5764,6 +5809,11 @@ class TestRustServerUnsupportedArgs(CustomTestCase):
                 "sk-test",
                 "--admin-api-key",
                 "sk-admin",
+                # Run by the Rust server's startup work.
+                "--warmups",
+                "voice_chat",
+                "--gc-warning-threshold-secs",
+                "1",
                 # Refused arguments at their default values.
                 "--media-url-max-file-size-mb",
                 "64",
@@ -5771,9 +5821,6 @@ class TestRustServerUnsupportedArgs(CustomTestCase):
                 "auto",
                 "--tokenizer-backend",
                 "huggingface",
-                # Python disables the GC warning when this is not positive.
-                "--gc-warning-threshold-secs",
-                "-1",
                 # The preprocessing cache off, as in the Rust pipelines.
                 "--mm-preprocess-cache-size-mb",
                 "0",

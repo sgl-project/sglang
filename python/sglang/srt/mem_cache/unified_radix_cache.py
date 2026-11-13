@@ -1761,6 +1761,16 @@ class UnifiedRadixCache(BasePrefixCache):
     def advance_unpublished_req(self, req: Req) -> None:
         assert not self.supports_mamba()
         token_ids = req.get_fill_ids()
+        branching_seqlen = req.swa_branching_seqlen
+        if (
+            branching_seqlen is not None
+            and branching_seqlen > req.kv.cache_protected_len
+        ):
+            branch_end = branching_seqlen + int(self.tree_core.is_eagle)
+            if req.skip_radix_cache_insert:
+                req.swa_branching_seqlen = None
+            elif branch_end <= len(token_ids):
+                self.checkpoint(req, up_to=branch_end)
         insert_params = InsertParams(
             prev_prefix_len=req.kv.cache_protected_len,
             priority=req.priority or 0,
