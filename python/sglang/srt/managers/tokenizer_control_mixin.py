@@ -177,7 +177,9 @@ def _lora_load_needs_cleanup(results: List[LoRAUpdateOutput], lora_name: str) ->
     # Rank replies include pre-existing adapters, not only the attempted ID.
     # Callers must exclude registered names before checking for partial loads.
     return any(
-        result.success or lora_name in (result.loaded_adapters or {})
+        result.success
+        or result.loaded_adapters is None
+        or lora_name in result.loaded_adapters
         for result in results
     )
 
