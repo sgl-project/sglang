@@ -13,7 +13,8 @@ The server dispatches all-reduces in two stages, and so does the tuner:
 The eager table goes in ``SGLANG_TUNED_EAGER_CONFIG`` and the graph table in
 ``SGLANG_TUNED_GRAPH_CONFIG``.
 
-Backends, under the names the tables use:
+Which backends compete is a selection file, not a list in this module.
+``generate_selection_config`` writes it. The default selection is:
 
 - ``sglang_custom_allreduce``: SGLang's CustomAllreduce.
 - ``aiter_custom_allreduce``: AITER's CustomAllreduce, the ROCm default.
@@ -22,7 +23,10 @@ Backends, under the names the tables use:
 - ``nccl``: PyNccl out-of-place all-reduce (RCCL on ROCm), the call the server
   makes for an ``nccl`` row.
 - ``torch_symm_mem``: torch symmetric-memory all-reduce.
-- ``quick_allreduce_<codec>``: AMD QuickReduce at one codec.
+- ``quick_allreduce_<codec>``: HIP QuickReduce at one codec. The server
+  dispatches this name.
+- ``quick_allreduce_flydsl_INT4``: AITER FlyDSL QuickReduce, mesh schedule,
+  INT4 on both laps. A different kernel from the HIP entry.
 """
 
 from __future__ import annotations
@@ -36,23 +40,14 @@ import statistics
 import time
 from typing import Any, Callable, ContextManager, Dict, List, Optional, Tuple
 
+from sglang.auto_tune.generate_selection_config import (
+    QR_QUANT_REGIMES,
+    build_selection,
+    load_selection,
+)
+
 logger = logging.getLogger(__name__)
 
-# Codecs QuickAllReduce reads from ROCM_QUICK_REDUCE_QUANTIZATION. NONE leaves
-# the communicator disabled, so it is not a backend. One codec is timed:
-# INT4 is faster than INT8, so the tuner does not compare them.
-QR_QUANT_REGIMES = ("FP", "INT8", "INT6", "INT4")
-
-# Names of the backends that compete. QuickReduce is one entry; the table
-# name gains the codec once ``qr_quant`` is known, as ``quick_allreduce_INT4``.
-_BACKENDS = (
-    "sglang_custom_allreduce",
-    "aiter_custom_allreduce",
-    "custom_allreduce_v2",
-    "nccl",
-    "torch_symm_mem",
-    "quick_allreduce",
-)
 _QR_QUANT_ENVS = (
     "ROCM_QUICK_REDUCE_QUANTIZATION",
     "AITER_QUICK_REDUCE_QUANTIZATION",
@@ -569,6 +564,76 @@ def _open_quick_allreduce(quant, cpu_group, device, cast_bf16_to_fp16: bool):
     )
 
 
+# FlyDSL QuickReduce refuses a payload under this floor, and its buffer window
+# is 4 GiB. Both are properties of the kernel, checked here so a declined size
+# is a skip rather than an exception inside the timed loop.
+_FLYDSL_MIN_BYTES = 128 * 1024
+_FLYDSL_MAX_BYTES = 4 * 1024**3
+_FLYDSL_ALIGN = 16
+
+
+def _open_quick_allreduce_flydsl(cpu_group, device, algorithm: str, codec: str):
+    """AITER FlyDSL QuickReduce. Mesh INT4 is the selection's second QR kernel.
+
+    The constructor exchanges IPC handles on ``cpu_group``, so every rank
+    calls it. The launch is out of place into a caller-provided buffer and
+    has no capture context, same as HIP QuickReduce.
+    """
+    import torch
+    import torch.distributed as dist
+
+    comm = None
+    ok = False
+    try:
+        from aiter.ops.flydsl import FlyQuickAllReduce
+
+        comm = FlyQuickAllReduce(
+            group=cpu_group,
+            device=device,
+            rank=dist.get_rank(group=cpu_group),
+            world_size=dist.get_world_size(group=cpu_group),
+            algorithm=algorithm,
+            rs_codec=codec,
+            ag_codec=codec,
+        )
+        ok = True
+    except Exception as e:
+        logger.warning("quick_allreduce flydsl %s failed: %s", codec, e)
+    if not _agree(ok, cpu_group):
+        if comm is not None:
+            comm.close()
+        return None
+
+    floor = int(getattr(comm, "min_bytes", _FLYDSL_MIN_BYTES))
+
+    def check(tensor) -> Optional[str]:
+        if tensor.dtype != torch.bfloat16:
+            return "FlyDSL QuickReduce supports bf16"
+        if not tensor.is_contiguous():
+            return "FlyDSL QuickReduce requires a contiguous tensor"
+        nbytes = tensor.numel() * tensor.element_size()
+        if nbytes % _FLYDSL_ALIGN:
+            return f"{nbytes}B is not a multiple of {_FLYDSL_ALIGN}"
+        if nbytes < floor:
+            return f"{nbytes}B is below the {floor}B FlyDSL floor"
+        if nbytes > _FLYDSL_MAX_BYTES:
+            return f"{nbytes}B exceeds the FlyDSL 4GiB window"
+        return None
+
+    def call(tensor):
+        out = torch.empty_like(tensor)
+        comm.allreduce(tensor, out)
+        return out
+
+    return _Backend(
+        check=check,
+        call=call,
+        close=comm.close,
+        impl=_qualname(type(comm)),
+        note=f"flydsl {algorithm} {codec}",
+    )
+
+
 def _cpu_group(group):
     """Custom all-reduce, QuickReduce and PyNccl attach to a gloo group, as in the server."""
     import torch.distributed as dist
@@ -578,77 +643,66 @@ def _cpu_group(group):
     return dist.new_group(backend="gloo")
 
 
-def _backend_open_params(
+_OPENERS = {
+    "custom_allreduce": _open_custom_allreduce,
+    "custom_allreduce_v2": _open_car_v2,
+    "nccl": _open_nccl,
+    "torch_symm_mem": _open_torch_symm_mem,
+    "quick_allreduce": _open_quick_allreduce,
+    "quick_allreduce_flydsl": _open_quick_allreduce_flydsl,
+}
+
+
+def _bind_selection(
+    selection: Dict[str, Dict[str, Any]],
     cpu_group,
     device,
-    qr_quant: str,
-    ignore_acr_max_size: bool,
-    ignore_scr_max_size: bool,
-    qr_cast_bf16_to_fp16: bool,
 ) -> Dict[str, Dict[str, Any]]:
-    """Kwargs for each backend's opener, in ``_BACKENDS`` order.
+    """Add the process group and device to each selection entry.
 
-    Built once the process has its group, device, and flags. The QuickReduce
-    key is the table name, ``quick_allreduce_<codec>``, so a row names the
-    codec the server will construct.
+    The file holds the opener name and its static arguments. ``cpu_group``
+    and ``device`` exist only after torchrun has started, so they are bound
+    here, once, and every rank binds the same selection.
     """
-    if qr_quant not in QR_QUANT_REGIMES:
-        raise ValueError(f"qr_quant must be one of {QR_QUANT_REGIMES}, got {qr_quant!r}")
-    shared = {"cpu_group": cpu_group, "device": device}
-    by_name: Dict[str, Dict[str, Any]] = {
-        "sglang_custom_allreduce": {
-            **shared,
-            "kind": "sglang",
-            "lift_cap": ignore_scr_max_size,
-        },
-        "aiter_custom_allreduce": {
-            **shared,
-            "kind": "aiter",
-            "lift_cap": ignore_acr_max_size,
-        },
-        "custom_allreduce_v2": dict(shared),
-        "nccl": dict(shared),
-        "torch_symm_mem": dict(shared),
-        "quick_allreduce": {
-            **shared,
-            "quant": qr_quant,
-            "cast_bf16_to_fp16": qr_cast_bf16_to_fp16,
-        },
-    }
-    ordered: Dict[str, Dict[str, Any]] = {}
-    for name in _BACKENDS:
-        key = f"quick_allreduce_{qr_quant}" if name == "quick_allreduce" else name
-        ordered[key] = by_name[name]
-    return ordered
-
-
-def _opener_for(name: str) -> Callable[..., Optional[_Backend]]:
-    if name.startswith("quick_allreduce_"):
-        return _open_quick_allreduce
-    return {
-        "sglang_custom_allreduce": _open_custom_allreduce,
-        "aiter_custom_allreduce": _open_custom_allreduce,
-        "custom_allreduce_v2": _open_car_v2,
-        "nccl": _open_nccl,
-        "torch_symm_mem": _open_torch_symm_mem,
-    }[name]
+    bound: Dict[str, Dict[str, Any]] = {}
+    for name, spec in selection.items():
+        opener = spec["opener"]
+        shared = {"cpu_group": cpu_group, "device": device}
+        if opener == "custom_allreduce":
+            params = {**shared, "kind": spec["kind"], "lift_cap": spec["lift_cap"]}
+        elif opener == "quick_allreduce":
+            params = {
+                **shared,
+                "quant": spec["quant"],
+                "cast_bf16_to_fp16": spec["cast_bf16_to_fp16"],
+            }
+        elif opener == "quick_allreduce_flydsl":
+            params = {
+                **shared,
+                "algorithm": spec["algorithm"],
+                "codec": spec["codec"],
+            }
+        else:
+            params = shared
+        bound[name] = {"opener": opener, "params": params}
+    return bound
 
 
 def _open_backends(
-    open_params: Dict[str, Dict[str, Any]],
+    bound: Dict[str, Dict[str, Any]],
     verbose: bool,
 ) -> Dict[str, _Backend]:
     """Open every backend once, in the same order on every rank.
 
-    ``open_params`` maps the table name to that opener's kwargs. Each torchrun
+    ``bound`` maps the table name to its opener and kwargs. Each torchrun
     process is one GPU and calls this once; the ranks pass the same map, so
     they open the same communicators.
     """
     backends: Dict[str, _Backend] = {}
-    for name, params in open_params.items():
+    for name, spec in bound.items():
         if verbose:
             print(f"  opening {name}", flush=True)
-        opened = _opener_for(name)(**params)
+        opened = _OPENERS[spec["opener"]](**spec["params"])
         if opened is None:
             if verbose:
                 print(f"  {name}: unavailable", flush=True)
@@ -681,8 +735,13 @@ def tune_allreduce(
     qr_cast_bf16_to_fp16: bool = True,
     use_median: bool = False,
     sync_every: int = _SYNC_EVERY,
+    selection_config: Optional[str] = None,
 ) -> Tuple[List[AllreduceConfig], List[Dict[str, Any]]]:
-    """Time each backend at each size in ``mode`` and return the fastest per size."""
+    """Time each backend at each size in ``mode`` and return the fastest per size.
+
+    ``selection_config`` is a JSON file from ``generate_selection_config``.
+    Without it, the selection is built from the QuickReduce and cap flags.
+    """
     import torch
     import torch.distributed as dist
 
@@ -705,17 +764,20 @@ def tune_allreduce(
     cpu_group = _cpu_group(group)
     device = torch.device("cuda", torch.cuda.current_device())
     sizes = _normalize_sizes(sizes)
-    open_params = _backend_open_params(
-        cpu_group,
-        device,
-        qr_quant,
-        ignore_acr_max_size=ignore_acr_max_size,
-        ignore_scr_max_size=ignore_scr_max_size,
-        qr_cast_bf16_to_fp16=qr_cast_bf16_to_fp16,
-    )
-    backends = _open_backends(open_params, verbose)
+    if selection_config:
+        selection = load_selection(selection_config)
+    else:
+        selection = build_selection(
+            qr_quant,
+            ignore_acr_max_size=ignore_acr_max_size,
+            ignore_scr_max_size=ignore_scr_max_size,
+            qr_cast_bf16_to_fp16=qr_cast_bf16_to_fp16,
+        )
+    backends = _open_backends(_bind_selection(selection, cpu_group, device), verbose)
     dtype = torch.bfloat16
     if verbose:
+        if selection_config:
+            print(f"  Selection file: {selection_config}", flush=True)
         print(f"  Backends: {', '.join(backends)}", flush=True)
         print(f"  Mode: {mode}", flush=True)
         stat = "median" if use_median else "mean"
@@ -836,6 +898,7 @@ def run_allreduce_tuning(
     qr_cast_bf16_to_fp16: bool = True,
     use_median: bool = False,
     sync_every: int = _SYNC_EVERY,
+    selection_config: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Tune, then write ``allreduce_configs_<mode>.json`` into ``output_dir``."""
     if verbose:
@@ -856,6 +919,7 @@ def run_allreduce_tuning(
         qr_cast_bf16_to_fp16=qr_cast_bf16_to_fp16,
         use_median=use_median,
         sync_every=sync_every,
+        selection_config=selection_config,
     )
     if not results:
         if verbose:
@@ -867,6 +931,7 @@ def run_allreduce_tuning(
         "env": "SGLANG_TUNED_GRAPH_CONFIG" if mode == "graph" else "SGLANG_TUNED_EAGER_CONFIG",
         "tp_size": tp_size,
         "qr_quant": qr_quant,
+        "selection_config": selection_config,
         "qr_cast_bf16_to_fp16": int(qr_cast_bf16_to_fp16),
         "ignore_acr_max_size": bool(ignore_acr_max_size),
         "ignore_scr_max_size": bool(ignore_scr_max_size),

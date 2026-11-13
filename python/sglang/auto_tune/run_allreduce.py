@@ -92,10 +92,22 @@ def create_parser() -> argparse.ArgumentParser:
         help="Message sizes in bytes. Each is timed as a bf16 tensor.",
     )
     parser.add_argument(
+        "--selection-config",
+        default=None,
+        help=(
+            "JSON selection from generate_selection_config. The tuner opens "
+            "exactly these backends. Without it, the selection is built from "
+            "--qr-quant and the cap flags, and includes FlyDSL INT4."
+        ),
+    )
+    parser.add_argument(
         "--qr-quant",
         default="INT4",
         choices=list(QR_QUANT_REGIMES),
-        help="QuickReduce codec to time. One codec; default INT4.",
+        help=(
+            "HIP QuickReduce codec when no --selection-config is given. "
+            "One codec; default INT4. Ignored when --selection-config is set."
+        ),
     )
     parser.add_argument(
         "--qr-cast-bf16-to-fp16",
@@ -103,8 +115,9 @@ def create_parser() -> argparse.ArgumentParser:
         choices=(0, 1),
         default=1,
         help=(
-            "ROCM_QUICK_REDUCE_CAST_BF16_TO_FP16 for QuickReduce. 1 (the "
-            "server default) casts inside the timed kernel."
+            "ROCM_QUICK_REDUCE_CAST_BF16_TO_FP16 for HIP QuickReduce. 1 (the "
+            "server default) casts inside the timed kernel. Ignored when "
+            "--selection-config is set."
         ),
     )
     parser.add_argument(
@@ -113,7 +126,8 @@ def create_parser() -> argparse.ArgumentParser:
         default=False,
         help=(
             "1: time AITER past AITER_CUSTOM_AR_MAX_SIZE, up to half its "
-            "registered pool. The server runs such a row the same way."
+            "registered pool. The server runs such a row the same way. "
+            "Ignored when --selection-config is set."
         ),
     )
     parser.add_argument(
@@ -122,7 +136,8 @@ def create_parser() -> argparse.ArgumentParser:
         default=False,
         help=(
             "1: time SGLang's custom all-reduce past its max size, up to "
-            "its buffer. The server runs such a row the same way."
+            "its buffer. The server runs such a row the same way. "
+            "Ignored when --selection-config is set."
         ),
     )
     parser.add_argument(
@@ -256,6 +271,7 @@ def main(argv: list[str] | None = None) -> None:
             qr_cast_bf16_to_fp16=bool(args.qr_cast_bf16_to_fp16),
             use_median=args.median,
             sync_every=args.sync_every,
+            selection_config=args.selection_config,
         )
         if rank == 0:
             print_allreduce_summary(results)
