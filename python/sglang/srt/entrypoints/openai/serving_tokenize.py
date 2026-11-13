@@ -5,6 +5,7 @@ from typing import List, Optional, Union
 from fastapi import Request
 
 from sglang.srt.entrypoints.openai.protocol import (
+    ChatCompletionRequest,
     DetokenizeRequest,
     DetokenizeResponse,
     ErrorResponse,
@@ -13,6 +14,7 @@ from sglang.srt.entrypoints.openai.protocol import (
 )
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.serving_chat import OpenAIServingChat
+from sglang.srt.parser.conversation import chat_templates
 
 logger = logging.getLogger(__name__)
 
@@ -51,8 +53,10 @@ class OpenAIServingTokenize(OpenAIServingBase):
             ):
                 max_model_len = self.tokenizer_manager.model_config.context_len
 
+            stop = None
+            stop_token_ids = None
             if request.messages is not None:
-                token_ids = self._tokenize_chat_request(request)
+                token_ids, stop, stop_token_ids = self._tokenize_chat_request(request)
                 tokens = token_ids
                 count = len(token_ids)
             elif isinstance(request.prompt, str):
@@ -77,7 +81,11 @@ class OpenAIServingTokenize(OpenAIServingBase):
                 )
 
             return TokenizeResponse(
-                tokens=tokens, count=count, max_model_len=max_model_len
+                tokens=tokens,
+                count=count,
+                max_model_len=max_model_len,
+                stop=stop,
+                stop_token_ids=stop_token_ids,
             )
         except ValueError as e:
             return self.create_error_response(str(e))
@@ -89,7 +97,57 @@ class OpenAIServingTokenize(OpenAIServingBase):
                 status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
             )
 
-    def _tokenize_chat_request(self, request: TokenizeRequest) -> List[int]:
+    def _collect_template_stop_token_ids(
+        self, chat_request: ChatCompletionRequest
+    ) -> Optional[List[int]]:
+        stop_ids: set[int] = set()
+        if chat_request.stop_token_ids:
+            stop_ids.update(chat_request.stop_token_ids)
+
+        if not chat_request.ignore_eos:
+            tokenizer = getattr(self.tokenizer_manager, "tokenizer", None)
+            if tokenizer is not None:
+                eos_id = getattr(tokenizer, "eos_token_id", None)
+                if isinstance(eos_id, int):
+                    stop_ids.add(eos_id)
+                elif isinstance(eos_id, (list, tuple, set)):
+                    stop_ids.update(int(t) for t in eos_id if t is not None)
+
+                add_stops = getattr(tokenizer, "additional_stop_token_ids", None)
+                if isinstance(add_stops, int):
+                    stop_ids.add(add_stops)
+                elif isinstance(add_stops, (list, tuple, set)):
+                    stop_ids.update(int(t) for t in add_stops if t is not None)
+
+            model_config = getattr(self.tokenizer_manager, "model_config", None)
+            if model_config is not None:
+                hf_eos = getattr(model_config, "hf_eos_token_id", None)
+                if isinstance(hf_eos, int):
+                    stop_ids.add(hf_eos)
+                elif isinstance(hf_eos, (list, tuple, set)):
+                    stop_ids.update(int(t) for t in hf_eos if t is not None)
+
+            if (
+                self.chat_serving is not None
+                and self.chat_serving.template_manager is not None
+                and self.chat_serving.template_manager.chat_template_name is not None
+            ):
+                template = chat_templates.get(
+                    self.chat_serving.template_manager.chat_template_name
+                )
+                if template is not None and template.stop_token_ids is not None:
+                    if isinstance(template.stop_token_ids, int):
+                        stop_ids.add(template.stop_token_ids)
+                    elif isinstance(template.stop_token_ids, (list, tuple, set)):
+                        stop_ids.update(
+                            int(t) for t in template.stop_token_ids if t is not None
+                        )
+
+        return sorted(stop_ids) if stop_ids else None
+
+    def _tokenize_chat_request(
+        self, request: TokenizeRequest
+    ) -> tuple[List[int], Optional[List[str]], Optional[List[int]]]:
         if self.chat_serving is None:
             raise ValueError("Chat template tokenization requires a template manager.")
 
@@ -119,18 +177,29 @@ class OpenAIServingTokenize(OpenAIServingBase):
             chat_request, is_multimodal
         )
 
+        stop = processed_messages.stop if processed_messages.stop else None
+        stop_token_ids = self._collect_template_stop_token_ids(chat_request)
+
         prompt_ids = processed_messages.prompt_ids
         if isinstance(prompt_ids, list) and (
             prompt_ids or not processed_messages.prompt
         ):
-            return prompt_ids
+            return prompt_ids, stop, stop_token_ids
         if isinstance(prompt_ids, str):
-            return self.tokenizer_manager.tokenizer.encode(
-                prompt_ids, add_special_tokens=False
+            return (
+                self.tokenizer_manager.tokenizer.encode(
+                    prompt_ids, add_special_tokens=False
+                ),
+                stop,
+                stop_token_ids,
             )
         if processed_messages.prompt:
-            return self.tokenizer_manager.tokenizer.encode(
-                processed_messages.prompt, add_special_tokens=False
+            return (
+                self.tokenizer_manager.tokenizer.encode(
+                    processed_messages.prompt, add_special_tokens=False
+                ),
+                stop,
+                stop_token_ids,
             )
 
         raise ValueError("Failed to render chat messages into token ids.")

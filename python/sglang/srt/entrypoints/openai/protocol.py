@@ -2000,6 +2000,8 @@ class TokenizeResponse(BaseModel):
     tokens: Union[List[int], List[List[int]]]
     count: Union[int, List[int]]
     max_model_len: int
+    stop: Optional[List[str]] = None
+    stop_token_ids: Optional[List[int]] = None
 
 
 class DetokenizeRequest(BaseModel):
