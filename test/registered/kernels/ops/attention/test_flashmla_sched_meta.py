@@ -5,6 +5,7 @@ import torch
 
 from sglang.srt.runtime_context import get_platform
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=25, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
@@ -296,6 +297,231 @@ def test_parallel_walk_replay_switches_with_lengths():
         run(False)
         assert torch.equal(outputs[0][0], outputs[1][0])
         assert torch.equal(outputs[0][1], outputs[1][1])
+
+
+def _native_flashmla():
+    from sglang.kernels.ops.attention import flash_mla_interface
+
+    if not flash_mla_interface.supports_native_heads():
+        pytest.skip("installed FlashMLA predates native head support")
+    return flash_mla_interface
+
+
+@pytest.mark.skipif(not get_platform().is_sm100, reason="native heads require SM100")
+@pytest.mark.parametrize("heads", [12, 96])
+@pytest.mark.parametrize("batch", [1, 64, 80])
+@pytest.mark.parametrize("mode", ["mixed", "zeros"])
+def test_native_heads_schedule_and_output(heads, batch, mode):
+    from sglang.kernels.ops.quantization.dsa_quant_k_cache import quantize_k_cache
+    from sglang.srt.layers.attention.deepseek_v4_backend import (
+        _maybe_precompute_flashmla_sched_meta,
+    )
+    from sglang.srt.layers.attention.dsa_backend import _flashmla_kv_padded_heads
+
+    flash_mla = _native_flashmla()
+    torch.manual_seed(42)
+    topk = 256
+    q = torch.randn(batch, 1, heads, 576, device="cuda", dtype=torch.bfloat16)
+    cache = quantize_k_cache(
+        torch.randn(16, 64, 1, 576, device="cuda", dtype=torch.bfloat16)
+    )
+    indices = torch.randint(0, 1024, (batch, 1, topk), device="cuda", dtype=torch.int32)
+    lengths = torch.full((batch,), topk, device="cuda", dtype=torch.int32)
+    if mode == "zeros":
+        lengths.zero_()
+    elif mode == "mixed":
+        lengths[::2] = 0
+        lengths[1::2] = 17
+
+    def call(query, meta):
+        return flash_mla.flash_mla_with_kvcache(
+            query,
+            cache,
+            None,
+            None,
+            512,
+            meta,
+            indices=indices,
+            topk_length=lengths,
+            is_fp8_kvcache=True,
+            softmax_scale=576**-0.5,
+            causal=False,
+        )
+
+    assert _flashmla_kv_padded_heads(heads) == heads
+    reference_meta = flash_mla.FlashMLASchedMeta()
+    reference, reference_lse = call(q, reference_meta)
+    custom_meta = flash_mla.FlashMLASchedMeta()
+    _maybe_precompute_flashmla_sched_meta(
+        custom_meta,
+        q=q,
+        indices=indices,
+        topk_length=lengths,
+        extra_indices=None,
+        extra_topk_length=None,
+        schedule="parallel",
+    )
+    expected_parts = flash_mla.sparse_decode_num_sm_parts(batch, 1, heads)
+    assert custom_meta.tile_scheduler_metadata.shape[0] == expected_parts
+    if reference_meta.tile_scheduler_metadata is not None:
+        # Word 7 is unwritten padding in the upstream scheduler.
+        assert torch.equal(
+            custom_meta.tile_scheduler_metadata[:, :7],
+            reference_meta.tile_scheduler_metadata[:, :7],
+        )
+        assert torch.equal(custom_meta.num_splits, reference_meta.num_splits)
+    actual, actual_lse = call(q, custom_meta)
+    assert torch.equal(actual.view(torch.int16), reference.view(torch.int16))
+    assert torch.equal(actual_lse.view(torch.int32), reference_lse.view(torch.int32))
+
+    padded_heads = 64 if heads <= 64 else 128
+    padded_q = torch.nn.functional.pad(q, (0, 0, 0, padded_heads - heads))
+    padded, padded_lse = call(padded_q, flash_mla.FlashMLASchedMeta())
+    assert torch.equal(actual.view(torch.int16), padded[:, :, :heads].view(torch.int16))
+    assert torch.equal(
+        actual_lse.view(torch.int32), padded_lse[:, :heads].view(torch.int32)
+    )
+
+    # DCP reuses graph buffers while per-rank top-k lengths change, including
+    # empty shards. Recompute the schedule inside the captured graph.
+    from sglang.kernels.ops.attention.dsv4.flashmla_sched_meta import (
+        flashmla_sched_meta,
+    )
+
+    def scheduled_call():
+        flashmla_sched_meta(
+            custom_meta.tile_scheduler_metadata,
+            custom_meta.num_splits,
+            topk_length=lengths,
+            extra_topk_length=None,
+            block_size_n=64,
+            fixed_overhead_num_blocks=5,
+            topk=topk,
+            extra_topk=0,
+            schedule="parallel",
+        )
+        return call(q, custom_meta)
+
+    scheduled_call()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_out, graph_lse = scheduled_call()
+    lengths.fill_(topk if mode == "zeros" else 0)
+    graph.replay()
+    fresh_out, fresh_lse = call(q, flash_mla.FlashMLASchedMeta())
+    torch.cuda.synchronize()
+    assert torch.equal(graph_out.view(torch.int16), fresh_out.view(torch.int16))
+    assert torch.equal(graph_lse.view(torch.int32), fresh_lse.view(torch.int32))
+
+
+def _graph_backend(mode, max_bs, **attrs):
+    """A flashmla_kv DSA backend with CUDA-graph state for up to max_bs requests
+    of eight verify tokens; attrs are set before the state is built."""
+    from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+    from sglang.test.kits.dsa_metadata_kit import inputs, make_backend
+
+    seq, req = inputs([64] * 4, list(range(4)))
+    backend = make_backend(mode, seq, req)
+    backend.dsa_decode_impl = "flashmla_kv"
+    backend.speculative_num_draft_tokens = 8
+    backend.hisparse_coordinator = None
+    backend.use_fused_topk = True
+    backend._memory_saver_adapter = TorchMemorySaverAdapter.create(enable=False)
+    backend.req_to_token = torch.arange(
+        max_bs * 512, device="cuda", dtype=torch.int32
+    ).view(max_bs, 512)
+    backend._arange_buf = torch.arange(max_bs * 8 + 1, device="cuda", dtype=torch.int32)
+    for name, value in attrs.items():
+        setattr(backend, name, value)
+    backend.init_cuda_graph_state(max_bs=max_bs, max_num_tokens=max_bs * 8)
+    return backend
+
+
+def _graph_schedules(backend, mode, batch_sizes):
+    """Build each batch size's graph metadata in turn; yield the batch size and
+    its FlashMLA schedule, checking that a batch size keeps its buffers."""
+    saved = {}
+    for bs in batch_sizes:
+        seq = torch.full((bs,), 128 + bs, device="cuda", dtype=torch.int64)
+        req = torch.arange(bs, device="cuda", dtype=torch.int64)
+        backend._apply_cuda_graph_metadata(
+            bs, req, seq, seq.cpu(), mode, spec_info=None
+        )
+        actual = backend.forward_metadata.flashmla_metadata
+        pointers = (actual.flashmla_metadata.data_ptr(), actual.num_splits.data_ptr())
+        assert pointers == saved.setdefault(bs, pointers)
+        yield bs, actual
+
+
+@pytest.mark.skipif(not get_platform().is_sm100, reason="native heads require SM100")
+class TestFlashMLAGraphMetadata(CustomTestCase):
+    def test_partition_changes_between_graph_batch_sizes(self):
+        from sglang.srt.model_executor.forward_mode import ForwardMode
+
+        _native_flashmla()
+        for mode in (ForwardMode.DECODE, ForwardMode.TARGET_VERIFY):
+            with self.subTest(mode=mode):
+                backend = _graph_backend(
+                    mode, 80, num_q_heads=96, flashmla_kv_num_q_heads=96
+                )
+                # Decode and eight-token verify cross the native-head partition
+                # boundary at different request counts. Replay in both directions.
+                for _, actual in _graph_schedules(
+                    backend, mode, (80, 64, 16, 8, 1, 8, 80, 1, 64)
+                ):
+                    expected = backend._compute_flashmla_metadata(
+                        backend.forward_metadata.dsa_cache_seqlens_int32, seq_len_q=1
+                    )
+                    self.assertEqual(
+                        actual.flashmla_metadata.shape, expected.flashmla_metadata.shape
+                    )
+                    # Word 7 is unwritten padding in the FlashMLA scheduler.
+                    torch.testing.assert_close(
+                        actual.flashmla_metadata[:, :7],
+                        expected.flashmla_metadata[:, :7],
+                        rtol=0,
+                        atol=0,
+                    )
+                    torch.testing.assert_close(actual.num_splits, expected.num_splits)
+
+
+class TestFlashMLAGraphScheduleShape(CustomTestCase):
+    def test_graphs_keep_schedules_of_different_shapes(self):
+        """Graphs whose schedules differ in partition count capture and replay."""
+        from sglang.srt.model_executor.forward_mode import ForwardMode
+
+        def parts(rows):
+            # Native-head FlashMLA at 128 heads: 74 partitions up to 73 rows.
+            return 74 if rows <= 73 else 148
+
+        def get_mla_metadata(*, cache_seqlens, **kwargs):
+            rows = cache_seqlens.shape[0]
+            meta = cache_seqlens.new_full((parts(rows), 8), rows)
+            meta[:, 0] = cache_seqlens.sum()
+            return meta, torch.cumsum(
+                torch.nn.functional.pad(cache_seqlens, (1, 0)), 0, dtype=torch.int32
+            )
+
+        for mode in (ForwardMode.DECODE, ForwardMode.TARGET_VERIFY):
+            with self.subTest(mode=mode):
+                backend = _graph_backend(
+                    mode,
+                    256,
+                    flashmla_kv_num_q_heads=128,
+                    _call_get_mla_metadata=get_mla_metadata,
+                )
+                rows_per_req = 8 if mode.is_target_verify() else 1
+                for bs, actual in _graph_schedules(
+                    backend, mode, (256, 8, 64, 1, 128, 8, 256, 1)
+                ):
+                    rows = bs * rows_per_req
+                    self.assertEqual(actual.flashmla_metadata.shape[0], parts(rows))
+                    self.assertEqual(actual.num_splits.shape[0], rows + 1)
+                    self.assertEqual(
+                        actual.flashmla_metadata[0, 0].item(),
+                        backend.forward_metadata.dsa_cache_seqlens_int32.sum().item(),
+                    )
 
 
 def _replay_schedule(meta, splits, num_blocks):
