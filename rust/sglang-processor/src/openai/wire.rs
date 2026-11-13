@@ -139,6 +139,31 @@ pub(super) fn unary_reply(
     model: &str,
     choices: Vec<Value>,
 ) -> Option<Reply> {
+    let response = unary_response(ret, n, cache_report, object, model, choices)?;
+    Some(Reply {
+        status: 200,
+        body: response.to_string(),
+    })
+}
+
+/// The cached tokens of `ret`, counted once per prompt.
+pub(super) fn cached_per_prompt(ret: &[GenerateResponse], n: usize) -> u64 {
+    ret.iter()
+        .step_by(n)
+        .filter_map(|r| r.meta_info.as_ref())
+        .map(|m| u64::from(m.cached_tokens))
+        .sum()
+}
+
+/// [`unary_reply`]'s response body, for a wire that reshapes it.
+pub(super) fn unary_response(
+    ret: &[GenerateResponse],
+    n: usize,
+    cache_report: bool,
+    object: &str,
+    model: &str,
+    choices: Vec<Value>,
+) -> Option<Value> {
     let first = ret.first()?.meta_info.as_ref();
     let sum = |stride: usize, field: fn(&GenerateMetaInfo) -> u64| -> u64 {
         ret.iter()
@@ -147,12 +172,12 @@ pub(super) fn unary_reply(
             .map(field)
             .sum()
     };
-    let cached = cache_report.then(|| sum(n, |m| u64::from(m.cached_tokens)));
+    let cached = cache_report.then(|| cached_per_prompt(ret, n));
     let mut metadata = json!({"weight_version": first.and_then(|m| m.weight_version.as_deref())});
     if let Some(meta) = first.filter(|m| !m.weight_versions.is_empty()) {
         metadata["weight_versions"] = json!(meta.weight_versions);
     }
-    let response = json!({
+    Some(json!({
         "id": first.map(|m| &m.id),
         "object": object,
         "created": now(),
@@ -160,11 +185,7 @@ pub(super) fn unary_reply(
         "choices": choices,
         "usage": usage(sum(n, |m| u64::from(m.prompt_tokens)), sum(1, |m| m.completion_tokens), sum(1, |m| m.reasoning_tokens), cached),
         "metadata": metadata,
-    });
-    Some(Reply {
-        status: 200,
-        body: response.to_string(),
-    })
+    }))
 }
 
 /// Stream state both endpoints keep: whether it started, stopped or failed,
@@ -238,22 +259,43 @@ impl StreamState {
         )
     }
 
+    /// Choice `index`'s usage with its cached tokens whatever the cache report,
+    /// and those tokens; zero for a choice no frame reached.
+    pub(super) fn reported_choice_usage(&self, index: u64) -> (Value, u64) {
+        let count = |map: &HashMap<u64, u64>| map.get(&index).copied().unwrap_or(0);
+        let cached = count(&self.cached);
+        let usage = usage(
+            count(&self.prompt),
+            count(&self.completion),
+            count(&self.reasoning),
+            Some(cached),
+        );
+        (usage, cached)
+    }
+
     /// The final usage chunk's; prompt and cached tokens count once per prompt.
     pub(super) fn total_usage(&self, n: usize, cache_report: bool) -> Value {
-        let per_prompt = |map: &HashMap<u64, u64>| -> u64 {
-            map.iter()
-                .filter(|(i, _)| *i % n as u64 == 0)
-                .map(|(_, v)| v)
-                .sum()
-        };
-        let cached = cache_report.then(|| per_prompt(&self.cached));
+        let cached = cache_report.then(|| self.cached_per_prompt(n));
         usage(
-            per_prompt(&self.prompt),
+            per_prompt(&self.prompt, n),
             self.completion.values().sum(),
             self.reasoning.values().sum(),
             cached,
         )
     }
+
+    /// The cached tokens of the stream, counted once per prompt.
+    pub(super) fn cached_per_prompt(&self, n: usize) -> u64 {
+        per_prompt(&self.cached, n)
+    }
+}
+
+/// The counts of every `n`-th choice, one per prompt.
+fn per_prompt(map: &HashMap<u64, u64>, n: usize) -> u64 {
+    map.iter()
+        .filter(|(i, _)| *i % n as u64 == 0)
+        .map(|(_, v)| v)
+        .sum()
 }
 
 /// `model_dump_json(exclude_none=True)`: drop `null` fields, recursively.
@@ -290,15 +332,24 @@ pub(super) fn finish_fields(reason: Option<&FinishReason>) -> (Option<String>, V
 }
 
 pub(super) fn abort_event(reason: Option<&FinishReason>) -> Option<String> {
+    let (code, message) = status_abort(reason)?;
+    Some(stream_error_event(
+        message,
+        http_status_name(code.into())?,
+        code,
+    ))
+}
+
+/// An abort carrying an `HTTPStatus` (timeout, OOM, validation), which ends the
+/// stream as an error; a graceful abort has none.
+pub(super) fn status_abort(reason: Option<&FinishReason>) -> Option<(u16, &str)> {
     let finish_reason::Kind::Abort(abort) = reason?.kind.as_ref()? else {
         return None;
     };
-    let code = u64::from(abort.status_code?);
-    Some(stream_error_event(
-        abort.message.as_deref().unwrap_or("Generation aborted."),
-        http_status_name(code)?,
-        code as u16,
-    ))
+    let code = u16::try_from(abort.status_code?).ok()?;
+    http_status_name(code.into())?;
+    let message = abort.message.as_deref().unwrap_or("Generation aborted.");
+    Some((code, message))
 }
 
 pub(super) fn logprob_slice<T>(items: &[T], prev: usize, total: usize, incremental: bool) -> &[T] {

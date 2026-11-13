@@ -21,7 +21,7 @@ render = [
 ]
 tokenizer = ["dep:dynamo-tokenizers"]
 # OpenAI endpoints served through `/generate`.
-openai = ["dep:regex", "dep:uuid", "dep:sglang-api-types"]
+openai = ["dep:regex", "dep:uuid", "dep:sglang-api-types", "dep:sha2"]
 
 [dependencies]
 sglang-api-types = { version = "0.1.0", path = "../sglang-api-types", optional = true }
@@ -46,6 +46,8 @@ dynamo-protocols = { version = "7.0.0", optional = true }
 dynamo-renderer = { version = "7.1.1", optional = true }
 hf-hub = { version = "0.4", default-features = false }
 regex = { version = "1", optional = true }
+# Kimi-K3's response ids hash the engine's request id.
+sha2 = { version = "0.10", optional = true }
 uuid = { workspace = true, optional = true }
 minijinja = { version = "2.24.0", features = ["unstable_machinery"], optional = true }
 

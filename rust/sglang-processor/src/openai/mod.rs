@@ -9,6 +9,7 @@
 mod chat;
 mod completions;
 mod kimi_k3_tag;
+mod kimi_k3_wire;
 mod pieces;
 mod request;
 mod wire;
@@ -36,7 +37,7 @@ impl Responder {
     ) -> Option<Reply> {
         let output = match output.into_iter().collect::<Result<Vec<_>, _>>() {
             Ok(output) => output,
-            Err(error) => return Some(Self::rejected(error)),
+            Err(error) => return Some(self.rejected(error)),
         };
         match self {
             Self::Completion(responder) => responder.unary(output),
@@ -73,13 +74,21 @@ impl Responder {
     }
 
     /// A `/generate` response with an error status.
-    pub fn rejected(error: GenerateStreamError) -> Reply {
-        wire::engine_error_reply(error)
+    pub fn rejected(&self, error: GenerateStreamError) -> Reply {
+        self.error_reply(wire::engine_error_reply(error))
     }
 
     /// The engine returned an output missing a field required by OpenAI.
-    pub fn malformed_output(missing: &str) -> Reply {
-        wire::malformed_output_reply(missing)
+    pub fn malformed_output(&self, missing: &str) -> Reply {
+        self.error_reply(wire::malformed_output_reply(missing))
+    }
+
+    /// An error reply in the shape of this response's wire.
+    fn error_reply(&self, reply: Reply) -> Reply {
+        match self {
+            Self::Chat(responder) => responder.error_reply(reply),
+            Self::Completion(_) => reply,
+        }
     }
 }
 
