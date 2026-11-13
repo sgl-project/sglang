@@ -1,3 +1,4 @@
+from copy import deepcopy
 from typing import Any, Optional
 
 from transformers.configuration_utils import PretrainedConfig
@@ -23,6 +24,7 @@ class Spark2_5Config(PretrainedConfig):
         rope_parameters: Optional[dict[str, Any]] = None,
         layer_types: list[str] = None,
         tie_word_embeddings: Optional[bool] = None,
+        num_draft_layers: int = 0,
         **kwargs,
     ) -> None:
         self.hidden_size = hidden_size
@@ -36,6 +38,7 @@ class Spark2_5Config(PretrainedConfig):
         self.vocab_size = vocab_size
         self.rms_norm_eps = rms_norm_eps
         self.max_position_embeddings = max_position_embeddings
+        self.num_draft_layers = num_draft_layers
 
         if layer_types is not None:
             layer_types = layer_types[: self.num_hidden_layers]
@@ -65,3 +68,32 @@ class Spark2_5Config(PretrainedConfig):
         ]
         self.is_hybrid_swa = any(self.hybrid_layer_pattern)
         super().__init__(**kwargs, tie_word_embeddings=tie_word_embeddings)
+
+
+def configure_spark25_dspark(config: Spark2_5Config) -> Spark2_5Config:
+    from sglang.srt.speculative.dspark_components.dspark_config import (
+        parse_dspark_draft_config,
+    )
+
+    draft = deepcopy(config)
+    dspark = parse_dspark_draft_config(draft_hf_config=config)
+    if config.num_draft_layers <= 0:
+        raise ValueError("Spark2.5 DSpark requires num_draft_layers > 0.")
+    draft.architectures = ["DSparkSpark25DraftModel"]
+    draft.num_target_layers = config.num_hidden_layers
+    draft.num_hidden_layers = config.num_draft_layers
+    draft.layer_types = ["sliding_attention"] * draft.num_hidden_layers
+    draft.hybrid_layer_pattern = [1] * draft.num_hidden_layers
+    draft.is_hybrid_swa = True
+    draft.markov_rank = dspark.markov_rank
+    draft.markov_head_type = dspark.markov_head_type or "vanilla"
+    draft.block_size = dspark.gamma
+    draft.dflash_config = dict(draft.to_dict().get("dflash_config") or {})
+    draft.dflash_config.update(
+        num_hidden_layers=draft.num_hidden_layers,
+        num_target_layers=draft.num_target_layers,
+        block_size=dspark.gamma,
+        target_layer_ids=dspark.target_layer_ids,
+        mask_token_id=dspark.mask_token_id,
+    )
+    return draft
