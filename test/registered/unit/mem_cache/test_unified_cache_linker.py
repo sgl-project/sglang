@@ -1027,6 +1027,68 @@ class TestUnifiedCacheLinkerPythonBackend(
                 consumer.path_device_indices(final_match.last_device_node), loaded
             )
         )
+        self.assertEqual(consumer_linker.offload_calls, [])
+        self.assertTrue(
+            consumer.tree_core.is_external_cache_stored(final_match.last_device_node)
+        )
+        consumer.check_hicache_events()
+        consumer.sanity_check()
+
+    def test_loaded_prefix_is_not_reoffloaded_but_new_pages_are(self):
+        cfg = CacheConfig(page_size=2, kv_size=64, max_context_len=64)
+        self.cfg = cfg
+        stored_keys = defaultdict(set)
+        tokens = list(range(1, 9))
+        extended = tokens + [20, 21, 22, 23]
+
+        producer, producer_allocator, producer_req_pool = build_fixture(cfg)
+        producer_linker = _InMemoryUnifiedCacheLinker(stored_keys)
+        producer.init_cache_linker(producer_linker)
+        self._insert(producer, producer_allocator, producer_req_pool, tokens)
+        producer_linker.complete_next_offload(True)
+        producer.check_hicache_events()
+        loaded_keys = set(stored_keys[PoolName.KV])
+
+        consumer, consumer_allocator, consumer_req_pool = build_fixture(cfg)
+        consumer_linker = _InMemoryUnifiedCacheLinker(stored_keys)
+        consumer.init_cache_linker(consumer_linker)
+        req = self._make_req(consumer_req_pool)
+        match = consumer.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", extended)), req=req)
+        )
+        self.assertEqual(match.host_hit_length, len(tokens))
+        self._apply_match_to_req(req, match)
+        consumer.init_load_back(
+            InitLoadBackParams(
+                best_match_node=match.best_match_node,
+                host_hit_length=match.host_hit_length,
+                req=req,
+            )
+        )
+        loaded = consumer.linker.private_load_indices[req.rid]
+        self.assertGreaterEqual(consumer.ready_to_load_host_cache(), 0)
+        self._bind_loaded_request(consumer, consumer_req_pool, req, extended, loaded)
+        suffix = consumer_allocator.alloc(len(extended) - len(tokens))
+        consumer_req_pool.write(
+            (req.kv.req_pool_idx, slice(len(tokens), len(extended))), suffix
+        )
+        req.kv.kv_committed_len = len(extended)
+        req.kv.kv_allocated_len = len(extended)
+        self.assertEqual(consumer.finish_external_linker_loads([req]), [])
+
+        consumer.checkpoint(req, up_to=req.extend_end)
+        consumer.unlock(req.lock)
+        req.lock = None
+
+        (kv_offload,) = (
+            t
+            for call in consumer_linker.offload_calls
+            for t in call
+            if t.name == PoolName.KV
+        )
+        self.assertEqual(len(kv_offload.keys), (len(extended) - len(tokens)) // 2)
+        self.assertTrue(loaded_keys.isdisjoint(kv_offload.keys))
+        self.assertTrue(torch.equal(kv_offload.device_indices, suffix))
         consumer_linker.complete_next_offload(True)
         consumer.check_hicache_events()
         consumer.sanity_check()
@@ -1886,12 +1948,16 @@ def test_finish_loads_releases_private_index_references(landed, caplog):
     wrapper = UnifiedCacheLinkerWrapper(
         _cache_for_wrapper(_all_reduce_attn_groups=lambda value, op: None), backend
     )
+    req = SimpleNamespace(linker_offload_skip_prefix_len=2)
     wrapper.inflight_load_rids = ["rid"]
     wrapper.private_load_indices["rid"] = torch.arange(4)
+    wrapper.private_load_ends["rid"] = (req, 6)
     wrapper.start_layer_wise_loading()
 
     assert wrapper.finish_loads() == ([] if landed else ["rid"])
     assert wrapper.private_load_indices == {}
+    assert wrapper.private_load_ends == {}
+    assert req.linker_offload_skip_prefix_len == (6 if landed else 2)
     assert ("External linker load failed" in caplog.text) is (not landed)
 
 
@@ -1899,10 +1965,12 @@ def test_finish_loads_releases_private_index_references(landed, caplog):
 def test_linker_lifecycle_releases_private_index_references(operation):
     wrapper = UnifiedCacheLinkerWrapper(_cache_for_wrapper(), _FakeLinker())
     wrapper.private_load_indices["rid"] = torch.arange(4)
+    wrapper.private_load_ends["rid"] = (SimpleNamespace(), 4)
 
     getattr(wrapper, operation)()
 
     assert wrapper.private_load_indices == {}
+    assert wrapper.private_load_ends == {}
 
 
 def test_release_request_cancels_queued_load():
@@ -1912,6 +1980,7 @@ def test_release_request_cancels_queued_load():
     wrapper.inflight_load_rids = ["rid"]
     linker.queued_loads["rid"] = [object()]
     wrapper.private_load_indices["rid"] = torch.arange(4)
+    wrapper.private_load_ends["rid"] = (SimpleNamespace(), 4)
 
     wrapper.release_request(CacheRequestHandle("rid", 0))
 
@@ -1919,6 +1988,7 @@ def test_release_request_cancels_queued_load():
     assert wrapper.inflight_load_rids == []
     assert "rid" not in linker.queued_loads
     assert wrapper.private_load_indices == {}
+    assert wrapper.private_load_ends == {}
 
 
 def test_failed_offload_rolls_back_split_fragments():
