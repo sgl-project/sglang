@@ -878,7 +878,12 @@ class TraceNullContext:
 
 class SpanAttributes:
     # Attribute names copied from here to avoid version conflicts:
-    # https://github.com/open-telemetry/semantic-conventions/blob/main/docs/gen-ai/gen-ai-spans.md
+    # https://github.com/open-telemetry/semantic-conventions-genai
+    GEN_AI_PROVIDER_NAME = "gen_ai.provider.name"
+    GEN_AI_USAGE_INPUT_TOKENS = "gen_ai.usage.input_tokens"
+    GEN_AI_USAGE_OUTPUT_TOKENS = "gen_ai.usage.output_tokens"
+    GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS = "gen_ai.usage.cache_read.input_tokens"
+    # Deprecated in the conventions; still emitted so existing dashboards keep working.
     GEN_AI_USAGE_COMPLETION_TOKENS = "gen_ai.usage.completion_tokens"
     GEN_AI_USAGE_PROMPT_TOKENS = "gen_ai.usage.prompt_tokens"
     GEN_AI_USAGE_CACHED_TOKENS = "gen_ai.usage.cached_tokens"
