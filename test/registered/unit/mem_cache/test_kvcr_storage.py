@@ -20,8 +20,10 @@ import msgspec
 import torch
 
 from sglang.srt.managers.cache_controller import HiCacheController, PrefetchOperation
+from sglang.srt.mem_cache import storage_key_binding
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 from sglang.srt.mem_cache.buffer_mode.pipeline import BufferModePipeline
+from sglang.srt.mem_cache.events import KVCacheEventRecorder, _StorageEventSpan
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
     HiCacheStorageExtraInfo,
@@ -762,6 +764,34 @@ class TestKVCRStorage(CustomTestCase):
                     RadixKey(array("q", range(8)), cache_salt=salt), 2
                 )
             )
+
+    def test_salted_peer_binding_resolves_to_published_event_hashes(self):
+        # Peer hints name the block hashes a source publishes. The dynamo event format
+        # namespaces those per cache salt, so the storage-key binding must map storage
+        # keys to the same namespaced hashes, or a salted hint silently fetches nothing.
+        self.addCleanup(
+            setattr,
+            storage_key_binding,
+            "_event_namespace_seed",
+            storage_key_binding._event_namespace_seed,
+        )
+        recorder = KVCacheEventRecorder(enabled=True, page_size=2, dynamo_format=True)
+        for salt in ("tenant-a", "租户-α"):
+            with self.subTest(salt=salt):
+                key = RadixKey(array("q", range(1, 9)), cache_salt=salt)
+                storage = get_storage_hash_str(key, page_size=2)
+                published = recorder.storage_metadata(_StorageEventSpan(key))
+                mapping = storage_key_to_event_hashes(
+                    key[4:], 2, list(key.raw_token_ids()[:4]), storage[1]
+                )
+                # Router IDs are the unsigned form of the published int64 hashes.
+                self.assertEqual(
+                    mapping,
+                    {
+                        page: published[page].block_hashes[0] & ((1 << 64) - 1)
+                        for page in storage[2:]
+                    },
+                )
 
     def test_peer_hint_translates_only_bound_requested_pages(self):
         key = RadixKey(array("q", range(8)), cache_salt="tenant-a")
