@@ -1091,6 +1091,44 @@ def dispatch_w8a8_mxfp8_linear() -> Callable:
     return dot_scaled_mxfp8_blockscaled_linear
 
 
+XPU_MXFP8_GROUP_SIZE = 32
+
+
+def xpu_mxfp8_quantize(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Quantize a 2-D [M, K] tensor to MXFP8 on Intel XPU: e4m3 values and row-major
+    [M, K // 32] e8m0 scales, the layout torch scaled_mm BlockWise1x32 expects.
+    Non-16-bit inputs are cast to bf16 first (the quant kernel takes bf16/fp16)."""
+    m, k = x.shape
+    if k % XPU_MXFP8_GROUP_SIZE != 0:
+        raise ValueError(
+            f"K={k} must be divisible by {XPU_MXFP8_GROUP_SIZE} for MXFP8."
+        )
+    if x.dtype not in (torch.bfloat16, torch.float16):
+        x = x.to(torch.bfloat16)
+    x = x.contiguous()
+    from sgl_kernel import sgl_per_token_group_quant_8bit
+
+    fp8_info = torch.finfo(torch.float8_e4m3fn)
+    q = torch.empty(m, k, dtype=torch.float8_e4m3fn, device=x.device)
+    # Row-major [M, K // 32] e8m0, the layout the BlockWise1x32 probe expects; needs
+    # sgl-kernel-xpu row-major ue8m0 output (port of sgl-project/sgl-kernel-xpu#357).
+    scale = torch.empty(
+        m, k // XPU_MXFP8_GROUP_SIZE, dtype=torch.float8_e8m0fnu, device=x.device
+    )
+    sgl_per_token_group_quant_8bit(
+        input=x,
+        output_q=q,
+        output_s=scale,
+        group_size=XPU_MXFP8_GROUP_SIZE,
+        eps=1e-10,
+        fp8_min=fp8_info.min,
+        fp8_max=fp8_info.max,
+        scale_ue8m0=True,
+        enable_v2=True,
+    )
+    return q, scale
+
+
 def xpu_mxfp8_scaled_mm_linear(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -1100,39 +1138,18 @@ def xpu_mxfp8_scaled_mm_linear(
 ) -> torch.Tensor:
     """MXFP8 dense linear on Intel XPU via torch scaled_mm BlockWise1x32: weight is
     [N, K] e4m3, weight_scale is row-major [N, K // 32] ue8m0 bytes."""
-    group_size = 32
-    input_2d = input.reshape(-1, input.shape[-1]).contiguous()
-    m, k = input_2d.shape
-    if k % group_size != 0:
-        raise ValueError(f"K={k} must be divisible by {group_size} for MXFP8.")
-
+    input_2d = input.reshape(-1, input.shape[-1])
+    k = input_2d.shape[1]
+    if k % XPU_MXFP8_GROUP_SIZE != 0:
+        raise ValueError(
+            f"K={k} must be divisible by {XPU_MXFP8_GROUP_SIZE} for MXFP8."
+        )
     if input_scale is None:
         output_dtype = input.dtype
-        if input_2d.dtype not in (torch.bfloat16, torch.float16):
-            input_2d = input_2d.to(torch.bfloat16)
-        from sgl_kernel import sgl_per_token_group_quant_8bit
-
-        fp8_info = torch.finfo(torch.float8_e4m3fn)
-        q_input = torch.empty(m, k, dtype=torch.float8_e4m3fn, device=input.device)
-        # Row-major [M, K // 32] e8m0, the layout the BlockWise1x32 probe expects; needs
-        # sgl-kernel-xpu row-major ue8m0 output (port of sgl-project/sgl-kernel-xpu#357).
-        x_scale = torch.empty(
-            m, k // group_size, dtype=torch.float8_e8m0fnu, device=input.device
-        )
-        sgl_per_token_group_quant_8bit(
-            input=input_2d,
-            output_q=q_input,
-            output_s=x_scale,
-            group_size=group_size,
-            eps=1e-10,
-            fp8_min=fp8_info.min,
-            fp8_max=fp8_info.max,
-            scale_ue8m0=True,
-            enable_v2=True,
-        )
+        q_input, x_scale = xpu_mxfp8_quantize(input_2d)
     else:
         output_dtype = torch.bfloat16
-        q_input = input_2d
+        q_input = input_2d.contiguous()
         x_scale = input_scale.view(torch.float8_e8m0fnu)
 
     # A reinterpreting view: the bytes are already e8m0 exponents.

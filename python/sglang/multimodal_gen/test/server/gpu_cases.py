@@ -1653,6 +1653,9 @@ STANDALONE_FILES = {
     "bcg-diffusion": [
         "../single_test_file/test_diffusion_bcg_zimage_turbo.py",
     ],
+    "1-gpu-xpu": [
+        "../unit/test_mxfp8_online_gemm.py",
+    ],
     "1-gpu": [
         "../single_test_file/test_generate_zimage_turbo_cli.py",
         "../single_test_file/test_nomas_offline.py",
@@ -1706,6 +1709,10 @@ if current_platform.is_hip():
 STANDALONE_FILE_EST_TIMES = {
     "bcg-diffusion": {
         "../single_test_file/test_diffusion_bcg_zimage_turbo.py": 420.0,
+    },
+    "1-gpu-xpu": {
+        # Measured 23 s locally, not on the CI runner; refresh from its CI log.
+        "../unit/test_mxfp8_online_gemm.py": 30.0,
     },
     "1-gpu": {
         "../single_test_file/test_generate_zimage_turbo_cli.py": 180.0,
