@@ -472,6 +472,27 @@ class TestRoutedExpertsStartLen(CustomTestCase):
         )
         self._assert_aborted(too_big, "is higher than the number of input tokens")
 
+    def test_start_len_minus_one_returns_generated_rows(self):
+        """`routed_experts_start_len=-1` must return one row per generated
+        token, equal to the tail of the full sequence from the last prompt
+        token on."""
+        full_resp = self._send(self._build_payload()).json()
+        full_rows = self._routed_experts(full_resp)
+        prompt_tokens = full_resp["meta_info"]["prompt_tokens"]
+
+        resp = self._send(self._build_payload(routed_experts_start_len=-1)).json()
+        rows = self._routed_experts(resp)
+
+        self.assertEqual(rows.shape[0], resp["meta_info"]["completion_tokens"])
+        self.assertTrue(
+            np.array_equal(full_rows[prompt_tokens - 1 :], rows),
+            "start_len=-1 must match the full sequence from the last prompt token",
+        )
+
+    def test_start_len_below_minus_one_aborts(self):
+        resp = self._send(self._build_payload(routed_experts_start_len=-2))
+        self._assert_aborted(resp, "is lower than -1")
+
     def test_negative_start_len_survives_intake_abort(self):
         """A request rejected by an intake check that runs before the
         routed-experts check (here an out-of-range logprob_start_len) keeps its
@@ -488,6 +509,13 @@ class TestRoutedExpertsStartLen(CustomTestCase):
 
         resp = self._send(self._build_payload())
         self.assertEqual(resp.status_code, 200, resp.text)
+        # -1 still resolves to the generated rows afterwards.
+        resp = self._send(self._build_payload(routed_experts_start_len=-1))
+        self.assertEqual(resp.status_code, 200, resp.text)
+        self.assertEqual(
+            self._routed_experts(resp.json()).shape[0],
+            resp.json()["meta_info"]["completion_tokens"],
+        )
 
     def test_start_len_with_cache_hit(self):
         """`start_len` must allow the radix prefix to extend past it. The
