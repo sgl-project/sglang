@@ -40,6 +40,7 @@ logger = logging.getLogger(__name__)
 
 import os
 import random
+import time
 from collections import Counter
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
@@ -50,6 +51,7 @@ from typing import TYPE_CHECKING, Dict, Iterable, List, Mapping, Optional, Set, 
 import torch
 
 from sglang.srt.dllm.config import DllmConfig
+from sglang.srt.managers import uniboost
 from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
@@ -170,6 +172,7 @@ class CacheAwarePolicy(Enum):
     DFS_WEIGHT = "dfs-weight"  # depth-first search weighting
     HRRN = "hrrn"  # highest response ratio next, token-based aging
     SHORTEST_PREFILL_FIRST = "shortest-prefill-first"
+    UNIBOOST = "uniboost"  # gamma-boosted arrival order (UniBoost, ICML 2026)
 
 
 class CacheAgnosticPolicy(Enum):
@@ -191,6 +194,10 @@ class SchedulePolicy:
         enable_hierarchical_cache: bool,
         enable_priority_scheduling: bool,
         schedule_low_priority_values_first: bool,
+        *,
+        uniboost_gamma: Optional[float] = None,
+        uniboost_bin_size: int = 256,
+        uniboost_clock: str = "tokens",
     ):
         self.policy = self._validate_and_adjust_policy(policy, tree_cache)
         self.tree_cache = tree_cache
@@ -200,6 +207,19 @@ class SchedulePolicy:
         self.priority_sign = 1 if schedule_low_priority_values_first else -1
         self._shortest_prefill_calls = 0
         self._waiting_prefix_refresh_calls = 0
+        self.uniboost_clock = uniboost.UniBoostClock(uniboost_clock)
+        self.uniboost_gamma = (
+            uniboost_gamma
+            if uniboost_gamma is not None
+            else uniboost.DEFAULT_GAMMA[self.uniboost_clock]
+        )
+        self.uniboost_bin_size = uniboost_bin_size
+        self.uniboost_rate: Optional[uniboost.TokenClockRate] = (
+            uniboost.TokenClockRate()
+            if self.policy == CacheAwarePolicy.UNIBOOST
+            and self.uniboost_clock is uniboost.UniBoostClock.WALL
+            else None
+        )
 
         # It is used to find the matching prefix for in-batch prefix caching.
         self.waiting_queue_radix_tree = RadixCache.create_simulated()
@@ -214,6 +234,9 @@ class SchedulePolicy:
         """The waiting requests in the order the policy admits them."""
         waiting_queue = list(waiting)
         policy = self._determine_active_policy(waiting_queue)
+        if self.policy == CacheAwarePolicy.UNIBOOST:
+            # Also on the long-queue FCFS fallback, so A(r) stays the first sighting.
+            self._stamp_uniboost_arrivals(waiting_queue, processed_tokens)
 
         # Cache-agnostic policies sort without matching; match anyway so the load
         # snapshot sees num_matched_prefix_tokens. Decode never prefills.
@@ -230,6 +253,8 @@ class SchedulePolicy:
                 SchedulePolicy._sort_by_priority_and_fcfs(
                     waiting_queue, self.priority_sign
                 )
+        elif policy == CacheAwarePolicy.UNIBOOST:
+            self._sort_by_uniboost(waiting_queue)
         elif isinstance(policy, CacheAwarePolicy):
             temporary_deprioritized = self._compute_prefix_matches(
                 waiting_queue, policy
@@ -308,12 +333,42 @@ class SchedulePolicy:
         for r in reversed(waiting_queue[:WAITING_QUEUE_PREFIX_MATCH_MAX]):
             touch_waiting_prefix(r, self.tree_cache)
 
+    def _stamp_uniboost_arrivals(
+        self, waiting_queue: List[Req], processed_tokens: int
+    ) -> None:
+        now_s = time.perf_counter()
+        if self.uniboost_rate is not None:
+            self.uniboost_rate.observe(processed_tokens, now_s)
+        uniboost.stamp_arrivals(
+            waiting_queue, processed_tokens=processed_tokens, now_s=now_s
+        )
+
+    def _sort_by_uniboost(self, waiting_queue: List[Req]) -> None:
+        temporary_deprioritized = self._compute_prefix_matches(
+            waiting_queue, CacheAwarePolicy.UNIBOOST
+        )
+        uniboost.sort_waiting_queue(
+            waiting_queue,
+            gamma=self.uniboost_gamma,
+            bin_size=self.uniboost_bin_size,
+            clock=self.uniboost_clock,
+            rate_tokens_per_s=(
+                self.uniboost_rate.tokens_per_s
+                if self.uniboost_rate is not None
+                else None
+            ),
+            temporary_deprioritized=temporary_deprioritized,
+            enable_priority_scheduling=self.enable_priority_scheduling,
+            priority_sign=self.priority_sign,
+        )
+
     def _determine_active_policy(self, waiting_queue: List[Req]) -> Policy:
         if (
             self.policy
             in (
                 CacheAwarePolicy.LPM,
                 CacheAwarePolicy.HRRN,
+                CacheAwarePolicy.UNIBOOST,
             )
             and len(waiting_queue) > WAITING_QUEUE_PREFIX_MATCH_MAX
         ):
@@ -340,6 +395,11 @@ class SchedulePolicy:
                 if policy_enum == CacheAwarePolicy.SHORTEST_PREFILL_FIRST:
                     raise ValueError(
                         "Experimental shortest-prefill-first requires prefix caching"
+                    )
+                if policy_enum == CacheAwarePolicy.UNIBOOST:
+                    logger.warning(
+                        "schedule_policy=uniboost requires prefix caching; "
+                        "falling back to fcfs"
                     )
                 # If tree_cache is disabled, using CacheAgnosticPolicy policy
                 return CacheAgnosticPolicy.FCFS
