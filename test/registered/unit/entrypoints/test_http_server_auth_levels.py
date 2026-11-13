@@ -18,6 +18,10 @@ ADMIN_PATHS = [
     "/stop_profile",
     "/set_trace_level",
     "/freeze_gc",
+    "/flush_cache",
+    "/load_lora_adapter",
+    "/load_lora_adapter_from_tensors",
+    "/unload_lora_adapter",
 ]
 
 
