@@ -140,6 +140,43 @@ class TestK2V3Detector(CustomTestCase):
         result = K2V3Detector().detect_and_parse(wire, [tool])
         self.assertEqual(json.loads(result.calls[0].parameters), {"id": 123})
 
+    def test_optional_string_keeps_text_and_null(self):
+        """Both spellings of Optional[str] keep text as text and null as null."""
+        tool = Tool(
+            type="function",
+            function=Function(
+                name="lookup",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "any_of": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+                        "type_list": {"type": ["string", "null"]},
+                    },
+                },
+            ),
+        )
+
+        def xml(key, value, arg_type=None):
+            typed = f"<ifm|arg_type>{arg_type}</ifm|arg_type>" if arg_type else ""
+            return (
+                f"<ifm|tool_call>lookup<ifm|arg_key>{key}</ifm|arg_key>{typed}"
+                f"<ifm|arg_value>{value}</ifm|arg_value></ifm|tool_call>"
+            )
+
+        cases = [
+            (xml("any_of", "123"), {"any_of": "123"}),
+            (xml("type_list", "null", "null"), {"type_list": None}),
+            (
+                '<ifm|tool_call>{"name":"lookup","arguments":{"type_list":null}}'
+                "</ifm|tool_call>",
+                {"type_list": None},
+            ),
+        ]
+        for wire, expected in cases:
+            with self.subTest(wire=wire):
+                result = K2V3Detector().detect_and_parse(wire, [tool])
+                self.assertEqual(json.loads(result.calls[0].parameters), expected)
+
     def test_non_string_json_function_name_is_forwarded_as_text(self):
         wire = '<ifm|tool_call>{"name":123,"arguments":{}}</ifm|tool_call>'
         result = K2V3Detector().detect_and_parse(wire, self.tools)
