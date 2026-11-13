@@ -855,7 +855,11 @@ def _minimax_h3_pipelined_dense_attention(
     of each shape checks the pipeline against it.
     """
     groups = envs.SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS
-    if groups in (0, 1) or torch.compiler.is_compiling():
+    if (
+        envs.SGLANG_DIFFUSION_FLASHINFER_ULYSSES
+        or groups in (0, 1)
+        or torch.compiler.is_compiling()
+    ):
         return None
     if attention._attention_backend_enum not in PIPELINED_ATTENTION_BACKENDS:
         return None
@@ -956,7 +960,8 @@ def _minimax_h3_collective_pipelined_attention(
         groups = 2
     world_size, _ = get_ulysses_ctx()
     if (
-        groups in (0, 1)
+        envs.SGLANG_DIFFUSION_FLASHINFER_ULYSSES
+        or groups in (0, 1)
         or attention._attention_backend_enum
         not in _COLLECTIVE_PIPELINED_ATTENTION_BACKENDS
         or q.shape[1] % (world_size * groups)
@@ -1001,7 +1006,8 @@ def _minimax_h3_qknorm_rope_pipelined_attention(
     # under graph capture the forward keeps the in-place norm, and the pipeline
     # runs from the attention core's eager break point instead
     if (
-        envs.SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS in (0, 1)
+        envs.SGLANG_DIFFUSION_FLASHINFER_ULYSSES
+        or envs.SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS in (0, 1)
         or torch.cuda.is_current_stream_capturing()
     ):
         return None

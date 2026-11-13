@@ -938,10 +938,12 @@ def destroy_model_parallel() -> None:
     _clear_srt_tp_group()
     # The IPC transport keeps CUDA mappings associated with the current
     # Ulysses group. Drop them before tearing down the process groups.
+    from .device_communicators.flashinfer_ulysses import close_all
     from .device_communicators.ipc_a2a import IPC_A2A
     from .device_communicators.ipc_a2a_multi import IPC_A2A_MULTI
     from .parallel_groups import PROCESS_GROUP
 
+    close_all()
     IPC_A2A.reset()
     IPC_A2A_MULTI.reset()
 
