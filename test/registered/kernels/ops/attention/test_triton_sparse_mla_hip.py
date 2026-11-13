@@ -20,6 +20,7 @@ from sglang.kernels.ops.attention.dsa.triton_sparse_mla import (
 )
 from sglang.kernels.ops.attention.dsa.triton_sparse_mla_decode import (
     _get_splitk_bufs,
+    _sparse_mla_decode_tile_shape,
     _splitk_bufs,
     triton_sparse_mla_decode_splitk,
 )
@@ -73,6 +74,33 @@ def test_gfx950_fp8_gate_supports_tp8_prefill(monkeypatch):
     for heads in (8, 16):
         assert _is_gfx950_sparse_mla_fp8(torch.float8_e4m3fn, heads, 512, 64, 576)
     assert not _is_gfx950_sparse_mla_fp8(torch.float8_e4m3fn, 4, 512, 64, 576)
+
+
+def test_decode_tile_shape_widens_heads_only_when_the_grid_fills(monkeypatch):
+    monkeypatch.setattr(
+        "sglang.kernels.ops.attention.dsa.triton_sparse_mla_decode.is_gfx95_supported",
+        lambda: True,
+    )
+    num_cu = 256
+    kv_bf16 = torch.empty(1, 1, 576, dtype=torch.bfloat16, device="meta")
+    kv_fp8 = torch.empty(1, 1, 576, dtype=torch.float8_e4m3fn, device="meta")
+
+    # One wave of 32-row head blocks or more: the wider tile halves the gather.
+    assert _sparse_mla_decode_tile_shape(128, 64, kv_bf16, False, 64, num_cu) == (32, 32)
+    assert _sparse_mla_decode_tile_shape(256, 32, kv_bf16, False, 64, num_cu) == (32, 32)
+    # Below a wave the extra head blocks are the parallelism, so only BLOCK_K moves.
+    assert _sparse_mla_decode_tile_shape(64, 64, kv_bf16, False, 64, num_cu) == (16, 32)
+    # H that 32 does not divide would change the reduce kernel's padded head count.
+    assert _sparse_mla_decode_tile_shape(256, 16, kv_bf16, False, 64, num_cu) == (16, 32)
+    # FP8 keeps its own tuning, and an already small BLOCK_K is left alone.
+    assert _sparse_mla_decode_tile_shape(256, 64, kv_fp8, True, 64, num_cu) == (16, 64)
+    assert _sparse_mla_decode_tile_shape(256, 64, kv_bf16, False, 16, num_cu) == (32, 16)
+
+    monkeypatch.setattr(
+        "sglang.kernels.ops.attention.dsa.triton_sparse_mla_decode.is_gfx95_supported",
+        lambda: False,
+    )
+    assert _sparse_mla_decode_tile_shape(256, 64, kv_bf16, False, 64, num_cu) == (16, 64)
 
 
 def test_splitk_workspaces_are_graph_and_stream_safe():
