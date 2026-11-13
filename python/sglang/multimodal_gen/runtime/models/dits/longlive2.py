@@ -44,6 +44,8 @@ class LongLive2CausalWanTransformerBlock(CausalWanTransformerBlock):
         crossattn_cache: CrossAttentionKVCache | None = None,
         current_start: int = 0,
         cache_start: int | None = None,
+        *,
+        complex_freqs: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if hidden_states.dim() == 4:
             hidden_states = hidden_states.squeeze(1)
@@ -80,6 +82,7 @@ class LongLive2CausalWanTransformerBlock(CausalWanTransformerBlock):
             kv_cache,
             current_start,
             cache_start,
+            complex_freqs=complex_freqs,
         )
         attn_output = attn_output.flatten(2)
         attn_output, _ = self.to_out(attn_output)

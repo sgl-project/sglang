@@ -7,8 +7,8 @@ Usage:
 """
 
 import argparse
+import ast
 import json
-import re
 import subprocess
 import sys
 from collections import defaultdict
@@ -21,6 +21,9 @@ DEFAULT_MODEL_URL = (
 
 # AMD / NPU live in separate workflows and are not scraped by sglang-ci-stats.
 BACKENDS = ("cuda", "cpu")
+REGISTER_FUNCS = {f"register_{backend}_ci" for backend in BACKENDS}
+# Positional slots of register_*_ci, as in ci_register._PARAM_ORDER.
+POSITIONAL_ARGS = ("est_time", "suite")
 
 # A change is "significant" if |delta| >= this many seconds AND the relative
 # change is at least SIGNIFICANT_REL_DELTA. Dual threshold filters out both
@@ -43,28 +46,32 @@ def fetch_model(url):
     return json.loads(out.stdout)
 
 
-def make_patterns(suite):
-    """Yield regex objects that match `register_{backend}_ci(est_time=N, ...)`
-    for the given suite, covering both registration styles:
+def find_est_time_literals(content):
+    """Map each suite registered by a module-level `register_{backend}_ci(...)`
+    call to the AST node of that call's `est_time` literal.
 
-      legacy: register_X_ci(est_time=N, suite="<full-suite>")
-      new:    register_X_ci(est_time=N, stage="<stage>", runner_config="<rc>")
+    Reads the call the same way ci_register.py does, so black-wrapped calls,
+    positional `register_cpu_ci(5, "suite")`, float values and any keyword
+    order all resolve.
     """
-    stage_rc = None
-    if "-test-" in suite:
-        stage, _, rc = suite.partition("-test-")
-        stage_rc = (stage, rc)
-    for backend in BACKENDS:
-        yield re.compile(
-            rf"(register_{backend}_ci\(est_time=)(\d+)"
-            rf'(,\s*suite="{re.escape(suite)}")'
+    literals = {}
+    for stmt in ast.parse(content).body:
+        call = stmt.value if isinstance(stmt, ast.Expr) else None
+        if not (
+            isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Name)
+            and call.func.id in REGISTER_FUNCS
+        ):
+            continue
+        args = dict(zip(POSITIONAL_ARGS, call.args))
+        args.update((kw.arg, kw.value) for kw in call.keywords)
+        values = {k: v.value for k, v in args.items() if isinstance(v, ast.Constant)}
+        suite = values.get("suite") or (
+            f"{values.get('stage')}-test-{values.get('runner_config')}"
         )
-        if stage_rc is not None:
-            stage, rc = stage_rc
-            yield re.compile(
-                rf"(register_{backend}_ci\(est_time=)(\d+)"
-                rf'(,\s*stage="{re.escape(stage)}",\s*runner_config="{re.escape(rc)}")'
-            )
+        if isinstance(args.get("est_time"), ast.Constant):
+            literals[suite] = args["est_time"]
+    return literals
 
 
 def update_files(model, dry_run=False):
@@ -83,25 +90,33 @@ def update_files(model, dry_run=False):
         if not filepath.exists():
             continue
         content = filepath.read_text()
-        new_content = content
-
+        literals = find_est_time_literals(content)
+        edits = []
         for suite, p90 in entries:
-            for pattern in make_patterns(suite):
-                match = pattern.search(new_content)
-                if match is None:
-                    continue
-                old_val = int(match.group(2))
-                if old_val != p90:
-                    new_content = pattern.sub(rf"\g<1>{p90}\3", new_content)
-                    changes.append((relpath, suite, old_val, p90))
-                    print(
-                        f"  {relpath}: suite={suite!r} est_time {old_val} -> {p90}",
-                        file=sys.stderr,
-                    )
-                break  # one (file, suite) -> at most one register call
+            node = literals.get(suite)
+            if node is None or node.value == p90:
+                continue
+            edits.append((node, p90))
+            changes.append((relpath, suite, node.value, p90))
+            print(
+                f"  {relpath}: suite={suite!r} est_time {node.value} -> {p90}",
+                file=sys.stderr,
+            )
 
-        if new_content != content and not dry_run:
-            filepath.write_text(new_content)
+        if edits and not dry_run:
+            # AST columns are UTF-8 byte offsets; edit back to front so earlier
+            # offsets on the same line stay valid.
+            lines = content.encode().splitlines(keepends=True)
+            for node, p90 in sorted(
+                edits, key=lambda e: (e[0].lineno, e[0].col_offset), reverse=True
+            ):
+                line = lines[node.lineno - 1]
+                lines[node.lineno - 1] = (
+                    line[: node.col_offset]
+                    + str(p90).encode()
+                    + line[node.end_col_offset :]
+                )
+            filepath.write_bytes(b"".join(lines))
 
     return changes
 

@@ -11,7 +11,10 @@ use sgl_router::config::{
 };
 use sgl_router::discovery::ModelId;
 use sgl_router::policies::request_tokens_for;
-use sgl_router::tokenizer::{adapter, chat_formatter::ChatFormatter, TokenizerRegistry};
+use sgl_router::tokenizer::chat_formatter::{ChatFormatter, ChatTemplateKwargs};
+use sgl_router::tokenizer::{adapter, TokenizerRegistry};
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 #[derive(Deserialize)]
@@ -85,13 +88,22 @@ fn starts_with_iso_date(text: &str) -> bool {
         && b[8..10].iter().all(u8::is_ascii_digit)
 }
 
-fn snapshot_tokenizer(model_id: &str) -> Option<PathBuf> {
-    let hf_home = std::env::var("HF_HOME")
+/// The HF hub cache: `HF_HUB_CACHE`, else `$HF_HOME/hub`, else `~/.cache/huggingface/hub`.
+fn hub_cache() -> Option<PathBuf> {
+    std::env::var("HF_HUB_CACHE")
         .ok()
         .map(PathBuf::from)
-        .or_else(|| dirs::home_dir().map(|h| h.join(".cache/huggingface")))?;
-    let snapshots = hf_home
-        .join("hub")
+        .or_else(|| {
+            std::env::var("HF_HOME")
+                .ok()
+                .map(PathBuf::from)
+                .or_else(|| dirs::home_dir().map(|h| h.join(".cache/huggingface")))
+                .map(|home| home.join("hub"))
+        })
+}
+
+fn snapshot_tokenizer(model_id: &str) -> Option<PathBuf> {
+    let snapshots = hub_cache()?
         .join(format!("models--{}", model_id.replace('/', "--")))
         .join("snapshots");
     std::fs::read_dir(snapshots)
@@ -102,6 +114,14 @@ fn snapshot_tokenizer(model_id: &str) -> Option<PathBuf> {
 }
 
 fn registry(model_id: &str, tokenizer_path: PathBuf) -> TokenizerRegistry {
+    registry_with_defaults(model_id, tokenizer_path, Default::default())
+}
+
+fn registry_with_defaults(
+    model_id: &str,
+    tokenizer_path: PathBuf,
+    default_chat_template_kwargs: ChatTemplateKwargs,
+) -> TokenizerRegistry {
     let cfg = Config {
         server: ServerConfig {
             host: "0".into(),
@@ -110,6 +130,7 @@ fn registry(model_id: &str, tokenizer_path: PathBuf) -> TokenizerRegistry {
         },
         observability: ObservabilityConfig::default(),
         model: ModelConfig {
+            aliases: Vec::new(),
             id: model_id.into(),
             tokenizer_path: Some(tokenizer_path.to_str().unwrap().into()),
             disable_input_ids_forwarding: false,
@@ -128,7 +149,7 @@ fn registry(model_id: &str, tokenizer_path: PathBuf) -> TokenizerRegistry {
             fused: None,
             eligibility: None,
             sampling_overrides: Default::default(),
-            default_chat_template_kwargs: Default::default(),
+            default_chat_template_kwargs,
         },
         discovery: DiscoveryBackend::StaticUrls(StaticUrlsDiscoveryConfig {
             urls: vec!["http://placeholder:0".into()],
@@ -191,4 +212,67 @@ fn chat_render_parity_matrix() {
         "no cached model snapshots; parity was not checked"
     );
     eprintln!("chat render parity: {checked} cases checked");
+}
+
+/// The router's own render and tokenization (`encode_chat`, continuation prefixes
+/// included) reproduce `rust/sglang-processor`'s parity fixtures, which SGLang's
+/// Python serving path wrote: the ids of every case it renders, and no ids where it
+/// fails. Checks only the fixtures whose pinned snapshot is cached.
+#[test]
+fn processor_fixture_parity() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../rust/sglang-processor/tests/fixtures/parity");
+    for entry in std::fs::read_dir(&root).unwrap().flatten() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(entry.path()).unwrap()).unwrap();
+        let model = fixture["model"].as_str().unwrap();
+        let snapshot = hub_cache().map(|hub| {
+            hub.join(format!("models--{}", model.replace('/', "--")))
+                .join("snapshots")
+                .join(fixture["revision"].as_str().unwrap())
+        });
+        let Some(tokenizer_path) = ["tokenizer.json", "tiktoken.model"]
+            .iter()
+            .filter_map(|file| Some(snapshot.as_ref()?.join(file)))
+            .find(|path| path.is_file())
+        else {
+            eprintln!("skip {model}: pinned snapshot not cached");
+            continue;
+        };
+        // One registry per server `--default-chat-template-kwargs`.
+        let mut registries: HashMap<String, TokenizerRegistry> = HashMap::new();
+        for case in fixture["cases"].as_array().unwrap() {
+            // A server-side template override is the processor's to check.
+            if case.get("chat_template").is_some() {
+                continue;
+            }
+            let defaults = case["default_chat_template_kwargs"].clone();
+            let reg = registries.entry(defaults.to_string()).or_insert_with(|| {
+                let defaults = defaults
+                    .as_object()
+                    .map(|d| d.clone().into_iter().collect())
+                    .unwrap_or_default();
+                registry_with_defaults(model, tokenizer_path.clone(), defaults)
+            });
+            let name = format!("{model} {}", case["name"]);
+            let ids = reg.encode_chat(model, &case["request"]);
+            if !case["error"].is_null() {
+                assert!(ids.is_none(), "{name}: SGLang rejects this request");
+                continue;
+            }
+            if case.get("known_gap").is_some() {
+                continue;
+            }
+            let ids = ids.unwrap_or_else(|| panic!("{name}: not rendered"));
+            let digest = ids.iter().fold(Sha256::new(), |hash, id| {
+                hash.chain_update(id.to_le_bytes())
+            });
+            assert_eq!(ids.len() as u64, case["token_count"], "{name}");
+            assert_eq!(
+                format!("{:x}", digest.finalize()),
+                case["token_sha256"],
+                "{name}"
+            );
+        }
+    }
 }

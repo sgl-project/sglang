@@ -8,7 +8,7 @@ host-planned steps load that state into the policy and store it back.
 from __future__ import annotations
 
 from collections import OrderedDict
-from typing import List, Tuple
+from typing import AbstractSet, List, Tuple
 
 import msgspec
 import torch
@@ -46,15 +46,22 @@ class LRUPolicy:
         )
 
 
-def plan_waves(policy: LRUPolicy, distinct: List[int]) -> List[Wave]:
-    """Split a step's distinct experts into waves of at most ``num_slots`` and place each.
+def plan_waves(
+    policy: LRUPolicy, distinct: List[int], in_host_rows: AbstractSet[int] = frozenset()
+) -> List[Wave]:
+    """Split a step's distinct experts into waves of at most ``num_slots`` and place each:
+    the resident experts first, then those in host rows (``in_host_rows``, with a store that
+    also reads experts from disk), then the rest, so a disk read never evicts a host row a
+    later wave of the step still needs.
 
     A step with no routed expert (all padding) still gets one empty wave, so the layer runs.
     """
     k = policy.num_slots
-    ordered = [e for e in distinct if e in policy.resident] + [
-        e for e in distinct if e not in policy.resident
-    ]
+    ordered = (
+        [e for e in distinct if e in policy.resident]
+        + [e for e in distinct if e not in policy.resident and e in in_host_rows]
+        + [e for e in distinct if e not in policy.resident and e not in in_host_rows]
+    )
     groups = [ordered[i : i + k] for i in range(0, len(ordered), k)] or [[]]
     return [policy.place(group) for group in groups]
 
@@ -73,27 +80,36 @@ class DeviceResidency:
         self.src = torch.zeros(num_slots, **i32)
         self.dst = torch.zeros(num_slots, **i32)
         self.count = torch.zeros(1, **i32)
+        self._step = 0  # the step the last ``load_into`` read
 
-    def load_into(self, policy: LRUPolicy) -> None:
-        """Make ``policy`` hold this state: the same residents, least recently used first."""
-        experts = self.slot_expert.tolist()
-        lastuse = self.slot_lastuse.tolist()
-        order = sorted(range(len(experts)), key=lambda s: (lastuse[s], s))
+    def load_into(self, policy: LRUPolicy, counts: torch.Tensor) -> List[int]:
+        """Make ``policy`` hold this state: the same residents, least recently used first. The
+        state is read with ``counts`` (a step's routed entries per expert) in one copy, and
+        ``counts`` is returned."""
+        k = self.slot_expert.numel()
+        host = torch.cat(
+            [self.slot_expert, self.slot_lastuse, self.step, counts]
+        ).tolist()
+        experts, lastuse, self._step = host[:k], host[k : 2 * k], host[2 * k]
+        order = sorted(range(k), key=lambda s: (lastuse[s], s))
         policy.resident = OrderedDict((experts[s], s) for s in order)
+        return host[2 * k + 1 :]
 
     def store_from(self, policy: LRUPolicy) -> None:
-        """Make this state hold ``policy``'s, its recency order as the last steps."""
-        num_slots = self.slot_expert.numel()
-        base = int(self.step.item())
-        slot_expert = [0] * num_slots
-        lastuse = [0] * num_slots
+        """Make this state hold ``policy``'s, its recency order as the last steps, in one
+        upload that does not wait for the GPU."""
+        k, e, base = self.slot_expert.numel(), self.expert_slot.numel(), self._step
+        slot_expert, lastuse, expert_slot = [0] * k, [0] * k, [-1] * e
         for rank, (expert, slot) in enumerate(policy.resident.items(), start=1):
             slot_expert[slot] = expert
             lastuse[slot] = base + rank
-        self.slot_expert.copy_(torch.tensor(slot_expert, dtype=torch.int32))
-        self.slot_lastuse.copy_(torch.tensor(lastuse, dtype=torch.int32))
-        self.expert_slot.fill_(-1)
-        self.expert_slot[self.slot_expert.long()] = torch.arange(
-            num_slots, dtype=torch.int32, device=self.expert_slot.device
+            expert_slot[expert] = slot
+        host = torch.tensor(
+            slot_expert + lastuse + [base + k] + expert_slot, dtype=torch.int32
         )
-        self.step.fill_(base + num_slots)
+        if self.step.is_cuda:
+            host = host.pin_memory()
+        host = host.to(self.step.device, non_blocking=True)
+        states = (self.slot_expert, self.slot_lastuse, self.step, self.expert_slot)
+        for state, new in zip(states, host.split([k, k, 1, e])):
+            state.copy_(new)

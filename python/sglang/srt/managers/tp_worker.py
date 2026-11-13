@@ -25,6 +25,13 @@ from sglang.srt.beam_search.logits_capture import capture_pre_sample_logits
 from sglang.srt.configs.draft_parallel import DraftParallelLayout
 from sglang.srt.configs.load_config import _DEFAULT_LOAD_GROUP, LoadGroup
 from sglang.srt.environ import envs
+from sglang.srt.hf_transformers import (
+    get_processor,
+    get_tokenizer,
+    get_tokenizer_from_processor,
+)
+from sglang.srt.layers.cp.base import is_cp_sharded_padded
+from sglang.srt.layers.cp.utils import from_cp_sharded
 from sglang.srt.managers.io_struct import (
     DestroyWeightsUpdateGroupReqInput,
     GetWeightsByNameReqInput,
@@ -36,15 +43,12 @@ from sglang.srt.managers.io_struct import (
     UnloadLoRAAdapterReqInput,
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.managers.scheduler import GenerationBatchResult
+from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
-from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
-    ForwardBatch,
-    PPProxyTensors,
-)
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode
 from sglang.srt.model_executor.graph_memory_usage import (
     merge_graph_memory_usage,
     merge_graph_time_usage,
@@ -60,12 +64,11 @@ from sglang.srt.runtime_context import (
     get_spec,
 )
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import MultiprocessingSerializer, broadcast_pyobj, set_random_seed
-from sglang.srt.utils.hf_transformers_utils import (
-    get_processor,
-    get_tokenizer,
-    get_tokenizer_from_processor,
+from sglang.srt.state_capturer.routed_experts import (
+    PP_ROUTED_EXPERTS_KEY,
+    merge_relayed_routed_experts,
 )
+from sglang.srt.utils import MultiprocessingSerializer, broadcast_pyobj, set_random_seed
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
 from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
 
@@ -544,15 +547,14 @@ class TpModelWorker(BaseTpWorker):
         if self.hicache_layer_transfer_counter is not None:
             self.hicache_layer_transfer_counter.set_consumer(consumer_index)
 
-    def register_hisparse_coordinator(self, coordinator):
-        self.model_runner.hisparse_coordinator = coordinator
-
     def get_worker_info(self):
         # The runner already reports logical DCP capacity.
         kv_capacity = (
             self.model_runner.effective_logical_max_total_num_tokens
             * page_interleave_shard_size(self.model_runner.token_to_kv_pool_allocator)
         )
+        if is_cp_sharded_padded():
+            kv_capacity = from_cp_sharded(kv_capacity)
         # Not an error: a deployment that never sends max-length requests may
         # want a small pool. Checked here because this is the final served value.
         if kv_capacity < self.model_config.context_len:
@@ -628,7 +630,9 @@ class TpModelWorker(BaseTpWorker):
         skip_attn_backend_init: Optional[bool] = None,  # deprecated
         *,
         capture_hidden_mode: Optional[CaptureHiddenMode] = None,
-        return_kv_loc_plan: bool = False,
+        pp_loras: Optional[set[Optional[str]]] = None,
+        return_iteration_ids: bool = False,
+        input_ids_from_graph: bool = False,
     ) -> GenerationBatchResult:
         # Get forward batch from schedule batch
         folded = None
@@ -655,6 +659,8 @@ class TpModelWorker(BaseTpWorker):
                 self.model_runner,
                 capture_hidden_mode=capture_hidden_mode,
                 return_hidden_states_before_norm=False,
+                input_ids_from_graph=input_ids_from_graph,
+                pp_loras=pp_loras,
             )
             if folded is not None:
                 apply_folded_extend(folded, forward_batch)
@@ -670,6 +676,14 @@ class TpModelWorker(BaseTpWorker):
 
         if self.is_dllm():
             return self._forward_batch_generation_dllm(forward_batch, batch)
+
+        # Taken out before the forward: the model and its CUDA graphs only
+        # handle the proxy keys they allocate buffers for.
+        relayed_routed_experts = (
+            None
+            if pp_proxy_tensors is None
+            else pp_proxy_tensors.tensors.pop(PP_ROUTED_EXPERTS_KEY, None)
+        )
 
         if self.pp_group.is_last_rank:
             out = self.model_runner.forward(
@@ -696,18 +710,31 @@ class TpModelWorker(BaseTpWorker):
                 logits_output=logits_output,
                 can_run_cuda_graph=can_run_cuda_graph,
                 expert_distribution_metrics=out.expert_distribution_metrics,
-                routed_experts_output=out.routed_experts_output,
+                routed_experts_output=merge_relayed_routed_experts(
+                    output=out.routed_experts_output, relayed=relayed_routed_experts
+                ),
                 indexer_topk_output=out.indexer_topk_output,
-                kv_loc_plan=(
+                iteration_ids=(
                     None
-                    if not return_kv_loc_plan
+                    if not return_iteration_ids
                     # A folded forward also wrote the replay rows; the caller's
                     # plan covers the batch it scheduled.
-                    else forward_batch.kv_loc_plan
+                    else forward_batch.iteration_ids
                     if folded is None
-                    else self.model_runner.kv_index_translator.own_plan(batch)
+                    else self.model_runner.runner_ids.own_plan(batch)
                 ),
+                kv_weight_version_record=out.kv_weight_version_record,
             )
+            if (
+                batch is not None
+                and (observer := self.model_runner.forward_observer) is not None
+            ):
+                batch_result.forward_auxiliary_output = observer.after_forward(
+                    batch,
+                    forward_batch,
+                    logits_output,
+                    can_run_graph=can_run_cuda_graph,
+                )
 
             capture_pre_sample_logits(batch, forward_batch, logits_output)
 
@@ -769,36 +796,14 @@ class TpModelWorker(BaseTpWorker):
                 pp_proxy_tensors=pp_proxy_tensors,
             )
             pp_proxy_tensors, can_run_cuda_graph = out.logits_output, out.can_run_graph
+            routed_experts_output = merge_relayed_routed_experts(
+                output=out.routed_experts_output, relayed=relayed_routed_experts
+            )
+            if routed_experts_output is not None:
+                pp_proxy_tensors[PP_ROUTED_EXPERTS_KEY] = routed_experts_output.topk
             return GenerationBatchResult(
                 pp_hidden_states_proxy_tensors=pp_proxy_tensors,
                 can_run_cuda_graph=can_run_cuda_graph,
                 expert_distribution_metrics=out.expert_distribution_metrics,
+                routed_experts_output=routed_experts_output,
             )
-
-    def forward_batch_split_prefill(self, batch: ScheduleBatch):
-        if batch.split_index == 0:
-            forward_batch = ForwardBatch.init_new(
-                batch,
-                self.model_runner,
-                return_hidden_states_before_norm=False,
-            )
-            batch.split_forward_batch = forward_batch
-
-        out = self.model_runner.forward(
-            batch.split_forward_batch, split_forward_count=batch.split_forward_count
-        )
-        logits_output, can_run_cuda_graph = out.logits_output, out.can_run_graph
-        if logits_output:
-            next_token_ids = self.model_runner.sample(
-                logits_output, batch.split_forward_batch
-            )
-        else:
-            next_token_ids = None
-        self._maybe_finalize_elastic_cuda_graph_scale()
-        batch_result = GenerationBatchResult(
-            logits_output=logits_output,
-            can_run_cuda_graph=can_run_cuda_graph,
-            expert_distribution_metrics=out.expert_distribution_metrics,
-        )
-        batch_result.next_token_ids = next_token_ids
-        return batch_result
