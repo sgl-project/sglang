@@ -132,6 +132,7 @@ if TYPE_CHECKING:
     SGLANG_USE_ROCM_VAE_CONV2D: bool = False
     SGLANG_USE_ROCM_VAE_CONV2D_BF16: bool = False
     SGLANG_USE_ROCM_AITER_TGEMM: bool = False
+    SGLANG_USE_ROCM_TRITON_MM: bool = False
 
 
 def get_default_cache_root() -> str:
@@ -534,6 +535,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # ROCm: route unquantized bf16/fp16 linears through aiter tgemm, which picks
     # the backend per (M, N, K) from aiter's bf16_tuned_gemm CSVs
     "SGLANG_USE_ROCM_AITER_TGEMM": _lazy_bool("SGLANG_USE_ROCM_AITER_TGEMM"),
+    # ROCm gfx1151: route large unquantized bf16 linears through a Triton matmul.
+    # rocBLAS lands at ~25 TFLOPS on the DiT projections of a 2048x2048 image
+    # model where the tuned Triton kernel reaches ~29, and the path is not
+    # bit-exact with rocBLAS (same fp64 error, different rounding order).
+    "SGLANG_USE_ROCM_TRITON_MM": _lazy_bool("SGLANG_USE_ROCM_TRITON_MM"),
 }
 
 # Add cache-dit Secondary Transformer Env Vars via programmatic generation to reduce duplication
