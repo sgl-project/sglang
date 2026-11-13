@@ -299,6 +299,8 @@ class ConfigManager:
                     "native_segment_profile_id",
                     "native_capture_profile",
                     "progress_kind",
+                    "progress_artifact",
+                    "given_acceptance",
                     "model_seed",
                     "native_source_binding",
                     "native_analytic_model",
@@ -322,6 +324,8 @@ class ConfigManager:
                 )
                 for key in (
                     "native_capture_profile",
+                    "progress_artifact",
+                    "given_acceptance",
                     "native_analytic_model",
                 ):
                     if options.get(key) is not None:
