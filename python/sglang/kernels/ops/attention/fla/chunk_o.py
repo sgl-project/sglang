@@ -12,8 +12,8 @@ from sglang.kernels.ops.attention.fla.index import prepare_chunk_indices
 from sglang.kernels.ops.attention.fla.op import exp, make_tensor_descriptor, safe_exp
 from sglang.kernels.ops.attention.fla.utils import (
     check_shared_mem,
-    is_intel,
     is_nvidia_hopper,
+    use_tensor_desc,
 )
 from sglang.srt.utils import use_gfx115_kernels
 
@@ -56,11 +56,7 @@ def chunk_fwd_kernel_o(
     HAS_OUTPUT_INDICES: tl.constexpr = False,
     USE_TENSOR_DESC: tl.constexpr = False,
 ):
-    # USE_TENSOR_DESC: on XPU, descriptor tiles get 2D block I/O; masked loads do not.
-    # Set only on Intel XPU (constexpr): other backends compile only the pointer path.
-    # TODO(dayanandav): drop USE_TENSOR_DESC once the XPU torch ships a triton-xpu with
-    # https://github.com/intel/intel-xpu-backend-for-triton/pull/7196 and
-    # bench_gdn_chunk_prefill_xpu.py passes on the masked path.
+    # USE_TENSOR_DESC is fla.utils.use_tensor_desc; other backends compile the pointer path.
     i_v, i_t, i_bh = (
         tl.program_id(0),
         tl.program_id(1).to(tl.int64),
@@ -364,7 +360,7 @@ def chunk_fwd_o(
             IS_VARLEN=cu_seqlens is not None,
             output_indices=output_indices,
             HAS_OUTPUT_INDICES=output_indices is not None,
-            USE_TENSOR_DESC=is_intel,
+            USE_TENSOR_DESC=use_tensor_desc,
             num_warps=4,
             num_stages=2,
         )

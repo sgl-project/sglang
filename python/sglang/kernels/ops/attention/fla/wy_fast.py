@@ -10,7 +10,7 @@ import triton.language as tl
 
 from sglang.kernels.ops.attention.fla.index import prepare_chunk_indices
 from sglang.kernels.ops.attention.fla.op import make_tensor_descriptor
-from sglang.kernels.ops.attention.fla.utils import is_intel
+from sglang.kernels.ops.attention.fla.utils import use_tensor_desc
 from sglang.srt.utils import use_gfx115_kernels
 
 
@@ -45,11 +45,7 @@ def recompute_w_u_fwd_kernel(
     HEAD_MAJOR: tl.constexpr = False,
     USE_TENSOR_DESC: tl.constexpr = False,
 ):
-    # USE_TENSOR_DESC: on XPU, descriptor tiles get 2D block I/O; masked loads do not.
-    # Set only on Intel XPU (constexpr): other backends compile only the pointer path.
-    # TODO(dayanandav): drop USE_TENSOR_DESC once the XPU torch ships a triton-xpu with
-    # https://github.com/intel/intel-xpu-backend-for-triton/pull/7196 and
-    # bench_gdn_chunk_prefill_xpu.py passes on the masked path.
+    # USE_TENSOR_DESC is fla.utils.use_tensor_desc; other backends compile the pointer path.
     # HEAD_MAJOR: heads vary fastest across the grid, so the programs running at once read
     # the same token rows ([T, H, D] puts each head's row of a chunk 4 KB apart)
     if HEAD_MAJOR:
@@ -176,7 +172,7 @@ def recompute_w_u_fwd(
     head_major = use_gfx115_kernels()
     recompute_w_u_fwd_kernel[(B * H, NT) if head_major else (NT, B * H)](
         HEAD_MAJOR=head_major,
-        USE_TENSOR_DESC=is_intel,
+        USE_TENSOR_DESC=use_tensor_desc,
         k=k,
         v=v,
         beta=beta,

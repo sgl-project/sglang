@@ -125,8 +125,10 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64_k_loop(
     # Padded rows carry the -1 sentinel; without this guard the sentinel
     # reaches pointer arithmetic and addresses before the state pool.
     valid_state = index >= 0
-    h0 = initial_state + index * stride_init_state
-    ht = initial_state + index * stride_init_state
+    # Descriptor bases stay inside the pool for padded rows; their accesses are gated off.
+    state_offset = tl.where(valid_state, index, 0) * stride_init_state
+    h0 = initial_state + state_offset
+    ht = initial_state + state_offset
     if USE_INITIAL_STATE:
         h0 = h0 + i_h * V * K
     if INPLACE_UPDATE:
@@ -158,6 +160,12 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64_k_loop(
         ########################################################################
         # Phase 1: store h to output, compute v_new = u - sum_k(w_k @ h_k^T)
         ########################################################################
+        ho_desc = make_tensor_descriptor(
+            base=h + i_t.to(tl.int64) * stride_h,
+            shape=(V, K),
+            strides=(K, 1),
+            block_shape=(BV, 64),
+        )
         b_v_corr = tl.zeros([BT, BV], dtype=tl.float32)
         for k_blk in range(0, K, 64):
             # Load h: from initial_state (i_t==0) or scratch (i_t>0)
@@ -172,12 +180,6 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64_k_loop(
                 b_h = tl.zeros([BV, 64], dtype=tl.float32)
 
             # Store pre-update h to output
-            ho_desc = make_tensor_descriptor(
-                base=h + i_t.to(tl.int64) * stride_h,
-                shape=(V, K),
-                strides=(K, 1),
-                block_shape=(BV, 64),
-            )
             ho_desc.store([i_v * BV, k_blk], b_h.to(h.dtype.element_ty))
 
             # Mid-sequence checkpoint for the mamba prefix cache: the same
@@ -206,6 +208,9 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64_k_loop(
             b_g_last = exp(b_g_last)
 
         b_v = b_v.to(k.dtype.element_ty)
+        if INPLACE_UPDATE:
+            # Phase 2 overwrites the ht tiles other warps read in Phase 1.
+            tl.debug_barrier()
 
         ########################################################################
         # Phase 2: reload h, apply gate, update h += k^T @ v, save to scratch

@@ -3,8 +3,9 @@
 On XPU these kernels load and store their tiles through tensor descriptors. Each case
 compares one kernel against a float32 torch reference on shapes where descriptor
 bounds handling matters: ragged varlen tails (sequences of 1, 63, 65 tokens), grouped
-q/k heads, and K != V. Regression guarded: with masked pointer loads, recompute_w_u
-left part of u unwritten on XPU whenever K != V.
+q/k heads, K != V, and for the state recurrence padded (-1) state slots, in-place state
+updates and the mid-sequence state checkpoint. Regression guarded: with masked pointer
+loads, recompute_w_u left part of u unwritten on XPU whenever K != V.
 """
 
 import unittest
@@ -16,6 +17,9 @@ from sglang.kernels.ops.attention.fla.chunk_o import chunk_fwd_o
 from sglang.kernels.ops.attention.fla.cumsum import chunk_local_cumsum
 from sglang.kernels.ops.attention.fla.index import prepare_chunk_indices
 from sglang.kernels.ops.attention.fla.wy_fast import recompute_w_u_fwd
+from sglang.srt.hardware_backend.xpu.kernels.fla.chunk_delta_h import (
+    chunk_gated_delta_rule_fwd_h,
+)
 from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -132,6 +136,38 @@ def _reference_o(inputs: dict, h: torch.Tensor, scale: float) -> torch.Tensor:
     return o
 
 
+def _reference_state_recurrence(inputs, w, u, pool, slots, track_chunks):
+    """Per sequence: h_c (pre-update), v_new, final state and the tracked checkpoint."""
+    k = _per_value_head(inputs["k"][0].float())
+    g = inputs["g"][0].float()
+    w, u = w[0].float(), u[0].float()
+    pool = pool.clone()
+    h_out = torch.zeros(len(list(_chunks())), *pool.shape[1:], device="xpu")
+    v_new = torch.zeros_like(u)
+    tracked = torch.zeros(len(SEQ_LENS), *pool.shape[1:], device="xpu")
+    start, chunk_index = 0, 0
+    for seq, seq_len in enumerate(SEQ_LENS):
+        slot = slots[seq]
+        state = pool[slot].clone() if slot >= 0 else torch.zeros_like(pool[0])
+        for local, chunk_start in enumerate(range(start, start + seq_len, CHUNK_SIZE)):
+            end = min(chunk_start + CHUNK_SIZE, start + seq_len)
+            h_out[chunk_index] = state
+            if local == track_chunks[seq]:
+                tracked[seq] = state
+            w_c, u_c, k_c = (x[chunk_start:end].transpose(0, 1) for x in (w, u, k))
+            v_c = u_c - w_c @ state.transpose(1, 2)  # [H, n, V]
+            v_new[chunk_start:end] = v_c.transpose(0, 1)
+            g_c = g[chunk_start:end].transpose(0, 1)  # [H, n]
+            g_last = g_c[:, -1:]
+            v_c = (v_c * torch.exp(g_last - g_c)[:, :, None]).bfloat16().float()
+            state = state * torch.exp(g_last)[:, :, None] + v_c.transpose(1, 2) @ k_c
+            chunk_index += 1
+        if slot >= 0:
+            pool[slot] = state
+        start += seq_len
+    return h_out, v_new, pool, tracked
+
+
 @unittest.skipUnless(torch.xpu.is_available(), "requires Intel XPU")
 class TestGdnChunkKernelsXpu(CustomTestCase):
     def assert_close(self, actual: torch.Tensor, expected: torch.Tensor, name: str):
@@ -215,6 +251,53 @@ class TestGdnChunkKernelsXpu(CustomTestCase):
                 unmapped = torch.ones(total + 3, dtype=torch.bool)
                 unmapped[destinations] = False
                 self.assertTrue(bool((out[unmapped.to("xpu")] == 7.0).all()))
+
+    def test_state_recurrence(self):
+        """chunk_delta_h: in-place pool update, -1 padded slots and the state checkpoint."""
+        # Sequence 1 is padding (-1): it must start from zero state and write nothing back.
+        slots = [3, -1, 0, 5, 1]
+        track_chunks = [-1, -1, 0, 0, 1]
+        for key_dim, value_dim in HEAD_DIMS:
+            with self.subTest(K=key_dim, V=value_dim):
+                inputs = _make_inputs(key_dim, value_dim)
+                total = sum(SEQ_LENS)
+                generator = torch.Generator().manual_seed(13)
+                w = _randn(generator, 1, total, NUM_V_HEADS, key_dim) * 0.1
+                u = _randn(generator, 1, total, NUM_V_HEADS, value_dim) * 0.1
+                pool = (
+                    torch.randn(
+                        7, NUM_V_HEADS, value_dim, key_dim, generator=generator
+                    ).to("xpu")
+                    * 0.1
+                )
+                expected = _reference_state_recurrence(
+                    inputs, w, u, pool, slots, track_chunks
+                )
+                actual_pool = pool.clone()
+                tracked = torch.full_like(expected[3], 7.0)
+                h, v_new = chunk_gated_delta_rule_fwd_h(
+                    k=inputs["k"],
+                    w=w,
+                    u=u,
+                    g=inputs["g"],
+                    initial_state=actual_pool,
+                    initial_state_indices=torch.tensor(slots, device="xpu"),
+                    cu_seqlens=inputs["cu_seqlens"],
+                    track_state=tracked,
+                    track_chunk_idx=torch.tensor(
+                        track_chunks, dtype=torch.int32, device="xpu"
+                    ),
+                )
+                self.assert_close(h[0], expected[0], "h")
+                self.assert_close(v_new[0], expected[1], "v_new")
+                self.assert_close(actual_pool, expected[2], "final state")
+                checkpointed = torch.tensor(track_chunks) >= 0
+                self.assert_close(
+                    tracked[checkpointed.to("xpu")],
+                    expected[3][checkpointed.to("xpu")],
+                    "tracked state",
+                )
+                self.assertTrue(bool((tracked[~checkpointed.to("xpu")] == 7.0).all()))
 
 
 if __name__ == "__main__":
