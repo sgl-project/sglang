@@ -158,8 +158,8 @@ def all_reduce_norm_residual_supported(
         cluster_size, _, _ = _launch_config(hidden_size, num_tokens, comm.world_size)
     except RuntimeError:
         return False
-    # Correctness: each block of the cluster kernel needs its own epoch counter; the row kernel
-    # caps its grid at the counter count and loops over rows.
+    # Every cluster must be co-resident (a block polls the same block on every peer); the row
+    # kernel caps its grid and loops over rows.
     return cluster_size == 1 or num_tokens * cluster_size <= comm.config.num_push_blocks
 
 

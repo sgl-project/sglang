@@ -19,7 +19,6 @@ namespace muse_ar_norm {
 template <uint32_t kWorld>
 struct Params {
   device::distributed::PushWorkSpace<kWorld> ws;
-  uint32_t num_counters;
   uint32_t rank;
   uint32_t num_rows;
   const bf16_t* partial;
@@ -58,8 +57,7 @@ SGL_DEVICE void poll_all(BF16Vec (&v)[N], void* const (&slots)[N], const int64_t
   } while (pending);
 }
 
-/// The plane's global epoch parity: every counter holds the same value; a block reads and flips its own, and block 0
-/// advances the counters of blocks this grid does not launch.
+/// The plane's epoch parity, read once after the PDL wait; every block of the grid commits once in finish().
 template <uint32_t kWorld>
 struct Epoch {
   uint8_t* const* workspaces;
@@ -69,7 +67,7 @@ struct Epoch {
   SGL_DEVICE Epoch(const device::distributed::PushWorkSpace<kWorld>& ws, uint32_t rank)
       : workspaces(ws.workspaces.data()),
         slot_bytes(ws.slot_bytes),
-        value(ws.counter[blockIdx.x].get()),
+        value(ws.counter->load()),
         inbox(ws.workspaces[rank] + (value & 1) * kWorld * slot_bytes) {}
   SGL_DEVICE uint32_t slot_offset(uint32_t src) const {
     return (src + (value & 1) * kWorld) * slot_bytes;
@@ -240,10 +238,7 @@ struct Exchange {
 
   SGL_DEVICE void finish() const {
     __syncthreads();
-    if (threadIdx.x == 0) params.ws.counter[blockIdx.x].set(epoch.value ^ 1);
-    if (blockIdx.x == 0)
-      for (uint32_t i = gridDim.x + threadIdx.x; i < params.num_counters; i += blockDim.x)
-        params.ws.counter[i].set(epoch.value ^ 1);
+    if (threadIdx.x == 0) params.ws.counter->commit();
   }
 };
 
@@ -409,7 +404,6 @@ struct MuseSparkAllReduceNormResidual {
 
     const auto params = muse_ar_norm::Params<kWorld>{
         .ws = push.get_workspace<kWorld>(slot),
-        .num_counters = push.num_blocks,
         .rank = push.rank,
         .num_rows = num_rows,
         .partial = static_cast<const bf16_t*>(partial.data_ptr()),
@@ -456,7 +450,7 @@ struct MuseSparkAllReduceNormResidual {
           RuntimeDeviceCheck(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
           return uint32_t(per_sm * sms);
         }();
-        LaunchKernel(std::min({num_rows, max_blocks, push.num_blocks}), kNumThreads, device)
+        LaunchKernel(std::min({num_rows, max_blocks, push.default_blocks}), kNumThreads, device)
             .config({.use_pdl = kUsePDL})(kernel, params);
       } else {
         constexpr auto kernel = muse_spark_all_reduce_norm_residual_cluster_kernel<
@@ -491,7 +485,6 @@ struct MuseSparkAllReduceNormResidual {
         }();
         RuntimeCheck(
             int(num_rows) <= max_clusters, "rows exceed co-resident clusters: ", num_rows, " > ", max_clusters);
-        RuntimeCheck(num_rows * kClusterSize <= push.num_blocks, "M * cluster_size exceeds the plane's block counters");
         LaunchKernel(num_rows * kClusterSize, kNumThreads, device)
             .config({.use_pdl = kUsePDL, .cluster_dim = dim3(kClusterSize, 1, 1)})(kernel, params);
       }
