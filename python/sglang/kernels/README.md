@@ -24,8 +24,8 @@ sglang/kernels/
                  # HIP or a base DeviceArch), shared by kernels and srt
   ops/
     <group>/     # one subpackage per operator group (see list below)
-  jit/           # shared JIT build/runtime infra: utils/ (incl. the Helion
-                 # runtime helper), csrc/, include/, __main__ (KERNEL_PATH)
+  jit/           # shared JIT build/runtime infra: utils/ (incl. the Helion and
+                 # TLX runtime helpers), csrc/, include/, __main__ (KERNEL_PATH)
   aot/           # source tree of the AOT `sgl_kernel` wheel (own API and
                  # packaging; not shipped in the sglang wheel)
   kda_kernels/   # agent-generated kernel backend (Kernel Design Agents)
