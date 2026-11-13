@@ -1293,6 +1293,23 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
             cfg.speculative_algorithm,
         )
 
+    # SGLANG_1093_CHUNKED_PREFILL_DEFAULT
+    # Disabling chunked prefill under EAGLE/NEXTN causes multi-turn decode
+    # bubbles (prefill starves speculative decode). Default to 1024.
+    _cps = cfg.chunked_prefill_size
+    if _cps is None or _cps <= 0:
+        declare_resolution(
+            server_args,
+            "_handle_eagle_family",
+            chunked_prefill_size=1024,
+        )
+        logger.warning(
+            "chunked_prefill_size was disabled (%s); reset to 1024 for "
+            "EAGLE/NEXTN speculative decoding to reduce multi-turn TPOT "
+            "bubbles. Override with an explicit positive --chunked-prefill-size.",
+            _cps,
+        )
+
     model_arch = model_config_of(server_args).hf_config.architectures[0]
     if model_arch in [
         "DeepseekV32ForCausalLM",
