@@ -1000,13 +1000,10 @@ class TestFusedDraftDecision(CustomTestCase):
                     )
 
     def test_an_auto_draft_dtype_sizes_the_region_as_the_loaded_draft_resolves(self):
-        """BUG REGRESSION. The region's dtype is the one the draft runner
-        resolves once its model loads, from the quant config that model keeps.
-        An `auto` sized the region in the host's dtype, so a draft that keeps
-        no quant config over an FP8-KV target (an NVFP4 Qwen3.5 checkpoint
-        whose MTP head ships in BF16) resolved BF16 into an FP8 region and
-        failed to bind; earlier, an explicit draft `auto` ignored the draft's
-        own FP8 KV declaration. Only an `auto` reads the quant config."""
+        """BUG REGRESSION. The region is sized in the dtype the loaded draft
+        resolves: an `auto` reads the quant config the draft will keep, an
+        explicit dtype never does; a BF16 MTP head over an FP8-KV target was
+        sized FP8 and failed to bind."""
         from sglang.srt.mem_cache.kv_cache_dtype import configure_kv_cache_dtype
 
         fp8_kv = SimpleNamespace(kv_cache_quant_algo="FP8")

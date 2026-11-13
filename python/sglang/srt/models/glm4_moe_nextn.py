@@ -36,8 +36,8 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.glm4_moe import Glm4MoeDecoderLayer, Glm4MoeForCausalLM
-from sglang.srt.runtime_context import get_parallel, get_spec
-from sglang.srt.utils import is_npu
+from sglang.srt.models.utils import npu_draft_quant_config
+from sglang.srt.runtime_context import get_parallel
 
 logger = logging.getLogger(__name__)
 
@@ -119,14 +119,7 @@ class Glm4MoeModelNextN(nn.Module):
 
 
 class Glm4MoeForCausalLMNextN(Glm4MoeForCausalLM):
-    @staticmethod
-    def own_quant_config(hf_config, quant_config):
-        """The quant config this class keeps, read before it is built to size
-        the draft's KV cache: an NPU draft runs unquantized unless a draft
-        quantization is named."""
-        if is_npu() and get_spec().speculative_draft_model_quantization is None:
-            return None
-        return quant_config
+    own_quant_config = staticmethod(npu_draft_quant_config)
 
     def __init__(
         self,

@@ -1341,17 +1341,13 @@ class KVCacheConfigurator:
             if self.model_config.is_multi_layer_eagle
             else 1
         )
-        # The region holds the draft's own KV, in the dtype the draft runner
-        # resolves for itself, from the same flags; an `auto` resolves from
-        # the quant config the draft model will keep, known before it loads
-        # (checked again when the draft binds). A region has typed views of
-        # its own, so a draft dtype other than the host's still fuses.
+        # The region holds the draft's KV in the dtype its runner will resolve
+        # (rechecked at bind); regions have their own typed views, so it may
+        # differ from the host's.
         from sglang.srt.mem_cache.kv_cache_dtype import configure_kv_cache_dtype
 
         kv_cache_dtype = get_model().kv_cache_dtype
         draft_kv_cache_dtype = get_spec().speculative_draft_kv_cache_dtype
-        # Only an `auto` reads the quant config; the draft's flag replaces the
-        # target's.
         resolves_auto = (
             draft_kv_cache_dtype if draft_kv_cache_dtype is not None else kv_cache_dtype
         ) == "auto"

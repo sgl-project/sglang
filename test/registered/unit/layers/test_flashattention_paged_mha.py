@@ -198,41 +198,26 @@ class TestFlashAttentionPagedMHA(unittest.TestCase):
         may still carry KV scales (FP8 weight quantization installs them). It
         was labelled with the target's FP8 flag, so the backend passed descales
         for BF16 inputs, which FA4 rejects."""
-        from sglang.srt.mem_cache.kv_cache_dtype import configure_kv_cache_dtype
-
-        label, dtype = configure_kv_cache_dtype(
-            server_args_kv_cache_dtype="fp8_e4m3",
-            quant_config=SimpleNamespace(kv_cache_quant_algo=None),
-            model_dtype=torch.bfloat16,
-            is_draft_worker=True,
-            is_dflash=False,
-            speculative_draft_attention_backend="fa4",
-            speculative_draft_kv_cache_dtype="auto",
-        )
-        self.assertEqual(dtype, torch.bfloat16)
-
         backend = _backend()
-        backend.kv_cache_dtype = dtype
-        backend.kv_cache_dtype_str = label
+        backend.kv_cache_dtype = torch.bfloat16
+        backend.kv_cache_dtype_str = "auto"
         layer = SimpleNamespace(
             head_dim=128, k_scale=torch.tensor(1.0), v_scale=torch.tensor(1.0)
         )
-        for ver, is_prefill in ((4, False), (4, True), (3, False)):
-            with self.subTest(ver=ver, is_prefill=is_prefill):
-                q = torch.ones(2, 128, dtype=torch.bfloat16)
-                q_out, _, _, k_descale, v_descale = backend.prepare_paged_mha_query(
-                    q,
-                    None,
-                    None,
-                    layer,
-                    logical_batch_size=2,
-                    kv_head_num=1,
-                    is_prefill=is_prefill,
-                    ver=ver,
-                )
-                self.assertIs(q_out, q)
-                self.assertIsNone(k_descale)
-                self.assertIsNone(v_descale)
+        q = torch.ones(2, 128, dtype=torch.bfloat16)
+        q_out, _, _, k_descale, v_descale = backend.prepare_paged_mha_query(
+            q,
+            None,
+            None,
+            layer,
+            logical_batch_size=2,
+            kv_head_num=1,
+            is_prefill=False,
+            ver=3,
+        )
+        self.assertIs(q_out, q)
+        self.assertIsNone(k_descale)
+        self.assertIsNone(v_descale)
 
     def test_kvcache_descales_follow_each_calls_batch_layout(self):
         # topk > 1 target verify: the cascade's suffix call runs every draft

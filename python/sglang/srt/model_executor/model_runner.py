@@ -1639,11 +1639,8 @@ class ModelRunner:
 
     def configure_kv_cache_dtype(self):
         spec_algorithm = getattr(self, "spec_algorithm", None)
-        # This runner's OWN resolved dtype label (target or draft), resolved
-        # with its torch dtype. Attention backends read it directly instead of
-        # the process-global get_model() bag: a draft runner does not publish
-        # its args, so the bag would carry the target's dtype and mis-drive
-        # the draft's FP8 cast/descale paths.
+        # Backends read this runner's own label, not get_model().kv_cache_dtype:
+        # a draft runner does not publish its args, so that would be the target's.
         self.kv_cache_dtype_str, self.kv_cache_dtype = (
             kv_cache_dtype.configure_kv_cache_dtype(
                 server_args_kv_cache_dtype=get_model().kv_cache_dtype,
