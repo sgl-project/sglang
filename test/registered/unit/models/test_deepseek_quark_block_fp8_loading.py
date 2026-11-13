@@ -27,6 +27,14 @@ class _FakeParam:
         self.loaded = loaded_weight
 
 
+class _FakeStackedParam:
+    def __init__(self):
+        self.loaded = {}
+
+    def weight_loader(self, param, loaded_weight, shard_id):
+        self.loaded[shard_id] = loaded_weight
+
+
 class _FakeDeepseekLoader(DeepseekV2WeightLoaderMixin):
     def __init__(self, params):
         self.config = SimpleNamespace(
@@ -135,6 +143,24 @@ class TestQuarkBlockFp8WeightLoading(CustomTestCase):
         )
 
         self.assertIs(target.loaded, loaded_scale)
+        self.assertTrue(loader.post_load_called)
+
+    def test_stacked_gate_up_scales_load_into_scale_inv(self):
+        target_name = "model.layers.0.mlp.gate_up_proj.weight_scale_inv"
+        target = _FakeStackedParam()
+        loader = _FakeDeepseekLoader({target_name: target})
+        gate_scale = torch.ones((2, 3), dtype=torch.float32)
+        up_scale = torch.full((2, 3), 2.0, dtype=torch.float32)
+
+        loader.do_load_weights(
+            [
+                ("model.layers.0.mlp.gate_proj.weight_scale", gate_scale),
+                ("model.layers.0.mlp.up_proj.weight_scale", up_scale),
+            ]
+        )
+
+        self.assertIs(target.loaded[0], gate_scale)
+        self.assertIs(target.loaded[1], up_scale)
         self.assertTrue(loader.post_load_called)
 
     def test_quark_weight_scale_is_not_misclassified_as_indexer_weight(self):
