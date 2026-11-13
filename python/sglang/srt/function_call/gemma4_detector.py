@@ -42,9 +42,29 @@ def _parse_gemma4_value(value_str: str) -> object:
     return value_str
 
 
+def _closing_brackets(text: str) -> dict[int, int]:
+    closing: dict[int, int] = {}
+    unclosed: list[int] = []
+    delim_len = len(STRING_DELIM)
+    i = 0
+    n = len(text)
+    while i < n:
+        if text[i : i + delim_len] == STRING_DELIM:
+            next_delim = text.find(STRING_DELIM, i + delim_len)
+            i = next_delim + delim_len if next_delim != -1 else n
+            continue
+        if text[i] == "[":
+            unclosed.append(i)
+        elif text[i] == "]" and unclosed:
+            closing[unclosed.pop()] = i
+        i += 1
+    return closing
+
+
 def _parse_gemma4_array(arr_str: str) -> list:
     """Parse a Gemma4 array content string into a Python list."""
     items: list = []
+    closing: Optional[dict[int, int]] = None
     i = 0
     n = len(arr_str)
 
@@ -88,6 +108,12 @@ def _parse_gemma4_array(arr_str: str) -> list:
             sub_start = i + 1
             i += 1
             while i < n and depth > 0:
+                if arr_str[i : i + len(STRING_DELIM)] == STRING_DELIM:
+                    # Skip string contents so brackets inside strings are ignored.
+                    i += len(STRING_DELIM)
+                    next_delim = arr_str.find(STRING_DELIM, i)
+                    i = next_delim + len(STRING_DELIM) if next_delim != -1 else n
+                    continue
                 if arr_str[i] == "[":
                     depth += 1
                 elif arr_str[i] == "]":
@@ -99,7 +125,17 @@ def _parse_gemma4_array(arr_str: str) -> list:
         else:
             val_start = i
             while i < n and arr_str[i] not in (",", "]"):
+                if arr_str[i] == "[":
+                    if closing is None:
+                        closing = _closing_brackets(arr_str)
+                    # An unclosed "[" is plain text.
+                    i = closing.get(i, i)
                 i += 1
+            if i == val_start:
+                # Stray ']' (malformed model output): skip it so the loop always
+                # makes progress instead of spinning forever.
+                i += 1
+                continue
             items.append(_parse_gemma4_value(arr_str[val_start:i]))
 
     return items
