@@ -13,7 +13,7 @@ use sglang_api_types::api::v1::{
     token_ids_or_list,
 };
 
-use super::kimi_k3_tag::auto_tool_call_tag;
+use super::kimi_k3_tag::{auto_tool_call_tag, no_tool_call_tag};
 use super::request::{
     OneOrList, ResponseFormat, StreamOptions, custom_labels, default_model, format_json_schema,
     lora_path, one, usage_flags, yes,
@@ -461,6 +461,7 @@ pub fn lower_chat(
     }
     let tools = request_tools(&raw)?;
     let tool_definitions = raw.get("tools").and_then(Value::as_array).cloned();
+    let no_tool_choice = raw.get("tool_choice") == Some(&json!("none"));
     let parallel_tool_calls = raw.get("parallel_tool_calls") != Some(&Value::Bool(false));
     let tool_parsing = match (tool_call_parser, &tools, &tool_definitions) {
         (Some(parser), Some(_), Some(definitions)) if deepseek.is_none() => {
@@ -545,11 +546,12 @@ pub fn lower_chat(
     else {
         unreachable!("one sampling configuration")
     };
+    let unconstrained = [&sampling.regex, &sampling.ebnf, &sampling.json_schema]
+        .iter()
+        .all(|value| value.as_deref().is_none_or(str::is_empty));
     if let (Some((tool_parser, _)), Some(definitions)) = (&tool_parsing, &tool_definitions)
         && tool_parser == "kimi_k3"
-        && [&sampling.regex, &sampling.ebnf, &sampling.json_schema]
-            .iter()
-            .all(|value| value.as_deref().is_none_or(str::is_empty))
+        && unconstrained
     {
         // `strip_structural_tag_excludes`: the reasoning parser owns the think tokens.
         let strip = parser
@@ -559,6 +561,17 @@ pub fn lower_chat(
         if let Some(tag) = auto_tool_call_tag(definitions, parallel_tool_calls, &strip)? {
             sampling.structural_tag = Some(python_json(&tag, true));
         }
+    } else if no_tool_choice
+        && tool_call_parser == Some("kimi_k3")
+        && model.is_kimi_k3()
+        && tool_definitions
+            .as_ref()
+            .is_some_and(|tools| !tools.is_empty())
+        && unconstrained
+    {
+        // `_process_messages`: K3's encoding lists the tools even for "none",
+        // so its grammar holds the turn to a response.
+        sampling.structural_tag = Some(python_json(&no_tool_call_tag(), true));
     }
     if let Some(stop) = tool_call_stop {
         let mut stops = match sampling.stop.take().and_then(|s| s.value) {
