@@ -1219,7 +1219,9 @@ class TestTriGeometry(CustomTestCase):
                 if not urgent:
                     event.fired = True
                     fa.set_latest_forward_done_event(None)
-                with patch("torch.cuda.current_stream", return_value=stream):
+                with patch.object(
+                    fa.device_module, "current_stream", return_value=stream
+                ):
                     fa.flush_for_allocation()
                     self.assertFalse(fa.usage.pending_by_key())
                     n = max(

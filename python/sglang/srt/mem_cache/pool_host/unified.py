@@ -7,13 +7,20 @@ import torch
 
 from sglang.srt.mem_cache.device_pool_info import MHABufferInfo, PageEnvelopeBufferInfo
 from sglang.srt.mem_cache.kv.memory.host_backing import _SharedPageEnvelopeHostBacking
+from sglang.srt.mem_cache.pool_host._kvcacheio import require_kvcacheio_ops
 from sglang.srt.mem_cache.pool_host.base import HostKVCache
-from sglang.srt.utils import is_cuda, is_hip
+from sglang.srt.utils import is_cuda, is_hip, is_xpu
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+_is_xpu = is_xpu()
 if _is_cuda or _is_hip:
     from sgl_kernel.kvcacheio import transfer_kv_direct, transfer_kv_per_layer_mla
+elif _is_xpu:
+    from sglang.srt.mem_cache.pool_host._kvcacheio import (
+        transfer_kv_direct,
+        transfer_kv_per_layer_mla,
+    )
 
 
 def _capture_page_envelope(device_pool) -> PageEnvelopeBufferInfo:
@@ -29,6 +36,21 @@ def _capture_page_envelope(device_pool) -> PageEnvelopeBufferInfo:
 
 class UnifiedPageEnvelopeHostPool(HostKVCache):
     """Host mirror that transfers complete unified-memory page envelopes."""
+
+    if _is_xpu:
+        # {io_backend: {layout: kvcacheio ops}} `_transfer_pages` calls,
+        # checked at construction; keep in step with its branches.
+        _kvcacheio_ops = {
+            "kernel": {
+                "layer_first": ("transfer_kv_per_layer_mla",),
+                "page_first": ("transfer_kv_per_layer_mla",),
+                "page_first_direct": ("transfer_kv_per_layer_mla",),
+            },
+            "direct": {
+                "layer_first": ("transfer_kv_direct",),
+                "page_first_direct": ("transfer_kv_direct",),
+            },
+        }
 
     stores_page_envelope = True
     storage_format_tag = "unified-token-major"
@@ -78,6 +100,10 @@ class UnifiedPageEnvelopeHostPool(HostKVCache):
             )
         if layout not in {"layer_first", "page_first", "page_first_direct"}:
             raise ValueError(f"Unsupported layout: {layout}")
+        if _is_xpu:
+            require_kvcacheio_ops(
+                pool=type(self).__name__, layout=layout, ops=self._kvcacheio_ops
+            )
 
         if _shared_backing is None:
             _shared_backing = _SharedPageEnvelopeHostBacking(
@@ -326,9 +352,9 @@ class UnifiedPageEnvelopeHostPool(HostKVCache):
             dst.index_copy_(0, dst_pages, src.index_select(0, src_pages))
             return
 
-        if not (_is_cuda or _is_hip):
+        if not (_is_cuda or _is_hip or _is_xpu):
             raise RuntimeError(
-                "Unified page-envelope transfers require a CUDA or ROCm device."
+                "Unified page-envelope transfers require a CUDA, ROCm or XPU device."
             )
         if io_backend == "kernel":
             transfer_kv_per_layer_mla(
@@ -349,6 +375,7 @@ class UnifiedPageEnvelopeHostPool(HostKVCache):
 
     @contextmanager
     def _direct_transfer(self, host_indices, device_indices, io_backend):
+        device = self._device_page_buffer.device
         self._shared_backing.acquire_layout()
         finish_event = None
         transfer_key = None
@@ -356,16 +383,15 @@ class UnifiedPageEnvelopeHostPool(HostKVCache):
             yield self.prepare_transfer_indices(
                 host_indices, device_indices, io_backend
             )
-            if self._device_page_buffer.device.type != "cpu":
-                finish_event = torch.cuda.Event()
+            if device.type != "cpu":
+                device_module = torch.get_device_module(device)
+                finish_event = device_module.Event()
                 finish_event.record()
-                transfer_key = (
-                    "direct",
-                    int(torch.cuda.current_stream().cuda_stream),
-                )
+                # XPU streams have no cuda_stream; stream_id exists on both.
+                transfer_key = ("direct", device_module.current_stream().stream_id)
         except Exception:
-            if self._device_page_buffer.device.type != "cpu":
-                torch.cuda.current_stream().synchronize()
+            if device.type != "cpu":
+                torch.get_device_module(device).current_stream().synchronize()
             raise
         finally:
             self._shared_backing.release_layout(finish_event, transfer_key)

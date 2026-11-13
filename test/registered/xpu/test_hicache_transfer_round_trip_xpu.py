@@ -21,6 +21,7 @@ load_to_device_per_layer / backup_from_device_all_layer):
 """
 
 import unittest
+from types import SimpleNamespace
 
 import torch
 
@@ -29,6 +30,7 @@ from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
 from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
 from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -213,6 +215,27 @@ class TestHiCacheTransferRoundTripXpu(CustomTestCase):
     def test_mamba_kernel_page_first_mtp_draft(self):
         # Draft layers are separate allocations; backup stacks them for the XPU op.
         self._mamba_round_trip("kernel", "page_first", num_drafts=1)
+
+    def test_page_envelope_direct_transfer_records_an_xpu_event(self):
+        """A page-envelope backup or load on XPU must hand the shared backing
+        an XPU event, keyed by the current XPU stream."""
+        released = []
+        pool = SimpleNamespace(
+            _device_page_buffer=torch.empty(1, device=DEVICE),
+            _shared_backing=SimpleNamespace(
+                acquire_layout=lambda: None,
+                release_layout=lambda event, key: released.append((event, key)),
+            ),
+            prepare_transfer_indices=lambda h, d, io_backend: (h, d),
+        )
+        with UnifiedPageEnvelopeHostPool._direct_transfer(
+            pool, host_indices=None, device_indices=None, io_backend="kernel"
+        ):
+            pass
+        ((event, key),) = released
+        self.assertIsInstance(event, torch.xpu.Event)
+        self.assertEqual(key, ("direct", torch.xpu.current_stream().stream_id))
+        event.synchronize()
 
 
 if __name__ == "__main__":

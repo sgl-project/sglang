@@ -16,6 +16,9 @@ from sglang.kernels.ops.kvcache.hicache import (
     can_use_page_unified_write_back_jit_kernel,
 )
 from sglang.srt.mem_cache.host_memory import available_host_memory_bytes
+from sglang.srt.mem_cache.pool_host._kvcacheio import (
+    xpu_transfer_ops_take_row_stride,
+)
 from sglang.srt.mem_cache.pool_host.common import (
     HostTensorAllocator,
     _cuda_host_unregister,
@@ -31,11 +34,12 @@ from sglang.srt.mem_cache.storage.mmap.mmap_allocator import (
     hugepage_size_requested,
 )
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import is_cuda, is_hip
+from sglang.srt.utils import is_cuda, is_hip, is_xpu
 
 logger = logging.getLogger(__name__)
 
 _is_cuda = is_cuda()
+_is_xpu = is_xpu()
 _is_hip = is_hip()
 
 # Host RAM to leave free when sizing HiCache pools (OS, other processes).
@@ -584,6 +588,14 @@ class HostKVCache(abc.ABC):
                 f"HiCache needs packed device rows; got strides {buf.stride()}"
             )
         self._strided_device_row_bytes = strides.pop()
+        if _is_xpu and not xpu_transfer_ops_take_row_stride():
+            raise NotImplementedError(
+                "HiCache: this device pool's KV rows are "
+                f"{self._strided_device_row_bytes} B apart (a unified-memory pool), "
+                "and this sgl-kernel-xpu build's KV transfer ops take no row "
+                "stride. Install sgl-kernel-xpu with sgl-kernel-xpu#608 "
+                "(newer than v0.6.0), or launch without --enable-hierarchical-cache."
+            )
 
     @property
     def device_rows_packed(self) -> bool:
@@ -594,13 +606,32 @@ class HostKVCache(abc.ABC):
         """Bytes between consecutive device KV rows."""
         return self._strided_device_row_bytes or self.token_stride_size
 
+    def _device_row_stride_kwargs(self, kernel: str, *, device_is_src: bool) -> dict:
+        """Row-stride kwargs for an AOT KV transfer kernel over strided device rows.
+
+        The XPU kernels step device rows by an explicit stride; the CUDA/ROCm AOT
+        kernels need packed rows.
+        """
+        if self.device_rows_packed:
+            return {}
+        if not _is_xpu:
+            self._require_packed_device_rows(kernel)
+        key = "src_row_stride" if device_is_src else "dst_row_stride"
+        return {key: self.device_row_stride_bytes}
+
     def _require_packed_device_rows(self, kernel: str) -> None:
         if not self.device_rows_packed:
+            # XPU has no JIT kernels; its AOT `kernel` backend takes the stride.
+            fix = (
+                "Use --hicache-io-backend kernel"
+                if _is_xpu
+                else "Use the JIT HiCache kernels"
+            )
             raise NotImplementedError(
                 f"HiCache: {kernel} steps device rows by the row width "
                 f"({self.token_stride_size} B), but this device pool's rows are "
-                f"{self.device_row_stride_bytes} B apart. Use the JIT HiCache "
-                "kernels with a layer_first or page_first host layout."
+                f"{self.device_row_stride_bytes} B apart. {fix} with a "
+                "layer_first or page_first host layout."
             )
 
     def _page_ids(self, token_indices: torch.Tensor) -> torch.Tensor:
