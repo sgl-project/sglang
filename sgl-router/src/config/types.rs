@@ -545,6 +545,10 @@ pub struct CacheAwareConfig {
     /// match covers less than this share of the prompt. `None` keeps the
     /// original always-merge behavior.
     pub pending_prefix_consult_below: Option<f64>,
+    /// A HiCache L3 pool shared by the workers (Mooncake Store), followed
+    /// through its master's KV-event stream; `None` routes on the workers'
+    /// own KV events only.
+    pub shared_pool: Option<crate::state::kv_events::SharedPoolConfig>,
 }
 
 impl Default for CacheAwareConfig {
@@ -558,6 +562,7 @@ impl Default for CacheAwareConfig {
             pending_prefix_ttl_ms: 0,
             pending_prefix_max_followers: 0,
             pending_prefix_consult_below: None,
+            shared_pool: None,
         }
     }
 }

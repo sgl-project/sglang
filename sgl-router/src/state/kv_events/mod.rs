@@ -16,6 +16,8 @@
 //! - [`subscriber`] — per-worker ZMQ SUB tasks.
 //! - [`discovery`] — `/server_info` parse → publisher endpoint.
 //! - [`index`] — public façade bundling the tree + subscribers + pump.
+//! - [`shared_pool`] — a HiCache L3 pool shared by the workers (Mooncake),
+//!   fed by the pool master's own event stream.
 //! - [`bootstrap`] — peer-snapshot wire format, fetch client and per-rank
 //!   tracker, so a booting replica can prewarm its tree from a warm sibling
 //!   instead of routing cache-blind.
@@ -27,6 +29,7 @@ pub mod hash;
 pub mod index;
 pub mod pending;
 pub mod prefix_provider;
+pub mod shared_pool;
 pub mod subscriber;
 pub mod tally;
 pub mod tree;
@@ -40,6 +43,7 @@ pub use hash::{compute_block_hashes, compute_block_hashes_bigram, sha256_to_i64,
 pub use index::{KvEventIndex, KvIndexMetrics};
 pub use pending::PendingPrefixes;
 pub use prefix_provider::{PrefixLookupResult, RadixTreePrefixProvider};
+pub use shared_pool::{SharedPool, SharedPoolConfig};
 pub use subscriber::{KvEventSubscriberRegistry, SubKind, WorkerEvent};
 pub use tally::{EventKind, EventTally, ReplayOutcome, TallyRow};
 pub use tree::{

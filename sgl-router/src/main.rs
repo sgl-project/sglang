@@ -77,6 +77,8 @@ async fn main() -> Result<()> {
 
     // Monitor engine-reported KV-cache events and load statistics for routing.
     let engine_state = start_engine_state_monitor(&config, external_kv_indexer_client.is_some());
+    // Follow a shared HiCache L3 pool's own KV events, when one is configured.
+    let shared_pool = start_shared_pool(&config, &engine_state);
 
     // Build the policies that choose which workers receive each request.
     let (routing_policies, chat_routing, reorg_cleanup) = match routing {
@@ -168,6 +170,10 @@ async fn main() -> Result<()> {
     discovery_handle.abort();
     worker_manager_handle.abort();
     inflight_cleanup.shutdown().await;
+    if let Some((cancel, task)) = shared_pool {
+        cancel.cancel();
+        let _ = task.await;
+    }
     if let Some(cleanup) = reorg_cleanup {
         cleanup.shutdown().await;
     }
@@ -301,6 +307,28 @@ fn start_engine_state_monitor(config: &Config, use_external_indexer: bool) -> Ar
         },
     );
     KvEventIndex::new_with_bootstrap(http, BlockSizeOracle::new(), bootstrap)
+}
+
+/// Attach the shared HiCache L3 pool to the routing tree and follow its
+/// master's KV events, so a page any member worker can load from the pool
+/// counts as cached on each of them.
+fn start_shared_pool(
+    config: &Config,
+    engine_state: &Arc<KvEventIndex>,
+) -> Option<(CancellationToken, JoinHandle<()>)> {
+    let pool = config.model.cache_aware.as_ref()?.shared_pool.clone()?;
+    let tree = engine_state.tree();
+    let endpoint = pool.endpoint.clone();
+    tree.shared_pool().enable(pool);
+    let cancel = CancellationToken::new();
+    let task = tokio::spawn(
+        sgl_router::state::kv_events::shared_pool::run_pool_subscriber(
+            endpoint,
+            tree,
+            cancel.clone(),
+        ),
+    );
+    Some((cancel, task))
 }
 
 fn start_local_inflight_tracker(

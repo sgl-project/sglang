@@ -117,6 +117,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use tracing::{debug, error};
 
 use super::pending::PendingPrefixes;
+use super::shared_pool::SharedPool;
 
 mod snapshot;
 
@@ -1196,6 +1197,9 @@ pub struct HashTree {
     pub(super) lora: Mutex<HashMap<KvWorkerId, sgl_kv_indexer::lora::LoraIndex>>,
     /// Route-time predictions, kept apart from the event-driven shards.
     pending: PendingPrefixes,
+    /// A HiCache L3 pool every member worker reads from, fed by the pool's
+    /// own event stream rather than any worker's.
+    shared_pool: SharedPool,
 }
 
 impl Default for HashTree {
@@ -1215,11 +1219,16 @@ impl HashTree {
             writer: Mutex::new(()),
             lora: Mutex::new(HashMap::new()),
             pending: PendingPrefixes::default(),
+            shared_pool: SharedPool::default(),
         }
     }
 
     pub fn pending(&self) -> &PendingPrefixes {
         &self.pending
+    }
+
+    pub fn shared_pool(&self) -> &SharedPool {
+        &self.shared_pool
     }
 
     /// Resolve an `insert`'s `parent_hash` over the COMPLETE carrier set and

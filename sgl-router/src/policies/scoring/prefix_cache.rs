@@ -67,14 +67,19 @@ impl PrefixCachePolicy {
         };
 
         let depths = self.tree.prefix_depths(None, &hashes);
+        // A shared L3 pool's pages load on any member worker.
+        let pool = self.tree.shared_pool();
+        let pool_depth = pool.depth(&hashes);
         let total = hashes.len() as f32;
         workers
             .iter()
             .map(|w| {
+                let pooled = (pool_depth > 0 && pool.is_member(&w.url)).then_some(pool_depth);
                 depths
                     .iter()
                     .filter(|(kw, _)| kw.url == w.url)
                     .map(|(_, &d)| d)
+                    .chain(pooled)
                     .max()
                     .map_or(NO_HOLDING, |d| d as f32 / total)
             })
@@ -178,6 +183,40 @@ mod tests {
             "a chain stored under block 1 means its engine holds blocks 0 and 1"
         );
         assert_eq!(scores[2], 0.0, "never seen");
+    }
+
+    #[test]
+    fn a_shared_pool_credits_its_members() {
+        use crate::state::kv_events::shared_pool::{PoolEvent, SharedPoolConfig};
+        let tree = Arc::new(HashTree::new());
+        insert(&tree, "deep", 0, 0, 3);
+        tree.shared_pool().enable(SharedPoolConfig {
+            endpoint: "tcp://127.0.0.1:1".into(),
+            key_prefix: None,
+            tenant: None,
+            min_components: 1,
+            members: Some(vec!["deep".into(), "pooled".into()]),
+        });
+        let all = compute_block_hashes(&tokens(), BLOCK);
+        tree.shared_pool().apply(
+            &all[..2]
+                .iter()
+                .map(|&h| PoolEvent::Stored {
+                    object_key: format!("{:016x}{}_0_k", h as u64, "0".repeat(48)),
+                    medium: None,
+                    tenant: None,
+                })
+                .collect::<Vec<_>>(),
+        );
+        let ws = vec![worker("deep"), worker("pooled"), worker("outside")];
+        let model = ModelId("tiny".into());
+        let ids = tokens();
+        let ctx = SelectionContext::new(&model, None).with_request_tokens(Some(&ids));
+        assert_eq!(
+            shares(&policy(tree), &ws, &ctx),
+            vec![0.75, 0.5, 0.0],
+            "the deeper own holding wins; a member without one loads the pooled half"
+        );
     }
 
     #[test]

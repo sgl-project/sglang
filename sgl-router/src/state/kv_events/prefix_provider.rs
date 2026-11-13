@@ -63,6 +63,15 @@ impl RadixTreePrefixProvider {
         for (worker, depth) in self.tree.prefix_depths(None, &hashes) {
             merge_depth(&mut depth_by_url, worker.url, depth);
         }
+        // A shared L3 pool's pages load on any member worker, so its depth is a
+        // confirmed match for each of them, not only for the one that wrote it.
+        let pool = self.tree.shared_pool();
+        let pool_depth = pool.depth(&hashes);
+        if pool_depth > 0 {
+            for url in pool.member_urls() {
+                merge_depth(&mut depth_by_url, url, pool_depth);
+            }
+        }
         let confirmed = depth_by_url.values().copied().max();
         let confirmed_by_url = depth_by_url.clone();
         // Stakes at their follower cap are already filtered out by
@@ -412,5 +421,61 @@ mod tests {
         }
         assert_eq!(provider.tree.pending().followed(), 0);
         assert_eq!(provider.tree.pending().capped(), 0);
+    }
+
+    /// A SGLang HiCache Mooncake object key for a router block hash.
+    fn pool_key(hash: i64, suffix: &str) -> String {
+        format!("tag_model_{:016x}{}_{suffix}", hash as u64, "0".repeat(48))
+    }
+
+    #[test]
+    fn shared_pool_depth_is_credited_to_every_member() {
+        use crate::state::kv_events::shared_pool::{PoolEvent, SharedPoolConfig};
+        let provider = provider(1_000, 0);
+        let prompt = tokens(3);
+        let hashes = provider
+            .block_hashes(&prompt, &CacheNamespace::default())
+            .expect("hashes");
+        let pool = provider.tree.shared_pool();
+        pool.enable(SharedPoolConfig {
+            endpoint: "tcp://127.0.0.1:1".into(),
+            key_prefix: Some("tag_model".into()),
+            tenant: None,
+            min_components: 2,
+            members: None,
+        });
+        pool.track_worker("http://a");
+        pool.track_worker("http://b");
+        let stored = |hash: i64, suffix: &str| PoolEvent::Stored {
+            object_key: pool_key(hash, suffix),
+            medium: Some("cpu".into()),
+            tenant: None,
+        };
+        // The pool holds blocks 0 and 1 whole and only K of block 2.
+        pool.apply(&[
+            stored(hashes[0], "0_k"),
+            stored(hashes[0], "0_v"),
+            stored(hashes[1], "0_k"),
+            stored(hashes[1], "0_v"),
+            stored(hashes[2], "0_k"),
+        ]);
+        confirm(&provider, "http://a", &prompt, 1);
+        assert_eq!(
+            depths(&lookup(&provider, &prompt)),
+            vec![("http://a".into(), 2), ("http://b".into(), 2)],
+            "b never wrote the prefix but loads it from the pool"
+        );
+        // A deeper device/host holding still wins on its own worker.
+        confirm(&provider, "http://a", &prompt, 3);
+        assert_eq!(
+            depths(&lookup(&provider, &prompt)),
+            vec![("http://a".into(), 3), ("http://b".into(), 2)]
+        );
+        // Off-pool workers and a disabled pool get nothing from it.
+        pool.forget_worker("http://b");
+        assert_eq!(
+            depths(&lookup(&provider, &prompt)),
+            vec![("http://a".into(), 3)]
+        );
     }
 }

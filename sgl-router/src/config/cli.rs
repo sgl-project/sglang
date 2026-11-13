@@ -384,6 +384,41 @@ pub struct CacheArgs {
     #[arg(long)]
     pub kv_bootstrap_fetch_timeout_cap_ms: Option<u64>,
 
+    /// ZMQ endpoint of a shared HiCache L3 pool's KV-event stream: a Mooncake
+    /// Store master started with `--enable_kv_events=true` and
+    /// `--kv_events_bind_endpoint`, e.g. `tcp://mooncake-master:19997`. The
+    /// workers' own KV events credit only the worker that wrote a page; a page
+    /// in this pool loads on every member worker, so cache-aware routing
+    /// credits its prefix depth to each of them. Requires --policy cache_aware
+    /// with the radix_tree prefix provider.
+    #[arg(long)]
+    pub kv_shared_pool_endpoint: Option<String>,
+
+    /// Count only pool objects whose key starts with `<prefix>_`: the SGLang
+    /// HiCache Mooncake key prefix of the served model,
+    /// `[<extra_backend_tag>_]<model path with / replaced by ->`. Unset counts
+    /// every key. Requires --kv-shared-pool-endpoint.
+    #[arg(long)]
+    pub kv_shared_pool_key_prefix: Option<String>,
+
+    /// Count only pool objects of this Mooncake tenant. Requires
+    /// --kv-shared-pool-endpoint.
+    #[arg(long)]
+    pub kv_shared_pool_tenant: Option<String>,
+
+    /// Component objects a page needs in the pool before it counts: one per
+    /// K and V of each TP rank's shard (2 x attention TP size for an MHA model
+    /// without split heads, 1 per rank for MLA). Defaults to 1, any object of
+    /// the page. Requires --kv-shared-pool-endpoint.
+    #[arg(long)]
+    pub kv_shared_pool_min_components: Option<u32>,
+
+    /// Worker URLs that read from the pool (comma-separated or repeated).
+    /// Unset: every worker the router follows KV events from. Requires
+    /// --kv-shared-pool-endpoint.
+    #[arg(long, value_delimiter = ',')]
+    pub kv_shared_pool_workers: Vec<String>,
+
     /// Hold `/readyz` at 503 when siblings were found but their tree could not
     /// be pulled. The hold is bounded at max(3x --kv-bootstrap-timeout-ms,
     /// 60s) and nothing re-sweeps during it, so it delays a failed seed's
@@ -933,6 +968,25 @@ impl CacheArgs {
                 .is_none_or(|r| r > 0.0 && r <= 1.0),
             "--cache-pending-prefix-consult-below must be above 0 and at most 1 (0 would never consult the tier; unset --cache-pending-prefix-ttl-ms to switch it off)"
         );
+        let pool_tuned = self.kv_shared_pool_key_prefix.is_some()
+            || self.kv_shared_pool_tenant.is_some()
+            || self.kv_shared_pool_min_components.is_some()
+            || !self.kv_shared_pool_workers.is_empty();
+        ensure!(
+            !pool_tuned || self.kv_shared_pool_endpoint.is_some(),
+            "--kv-shared-pool-key-prefix, --kv-shared-pool-tenant, --kv-shared-pool-min-components \
+             and --kv-shared-pool-workers require --kv-shared-pool-endpoint"
+        );
+        ensure!(
+            self.kv_shared_pool_endpoint.is_none()
+                || (policy == PolicyKind::CacheAware
+                    && cache_prefix_provider == CachePrefixProvider::RadixTree),
+            "--kv-shared-pool-endpoint requires --policy cache_aware with the radix_tree prefix provider"
+        );
+        ensure!(
+            self.kv_shared_pool_min_components != Some(0),
+            "--kv-shared-pool-min-components must be greater than zero"
+        );
         let cache_aware_uses_indexer = policy == PolicyKind::CacheAware
             && cache_prefix_provider == CachePrefixProvider::Indexer;
         if self.kv_indexer_endpoint.is_some() && !cache_aware_uses_indexer {
@@ -973,6 +1027,16 @@ impl CacheArgs {
             pending_prefix_ttl_ms: self.cache_pending_prefix_ttl_ms.unwrap_or(0),
             pending_prefix_max_followers: self.cache_pending_prefix_max_followers.unwrap_or(0),
             pending_prefix_consult_below: self.cache_pending_prefix_consult_below,
+            shared_pool: self.kv_shared_pool_endpoint.map(|endpoint| {
+                crate::state::kv_events::SharedPoolConfig {
+                    endpoint,
+                    key_prefix: self.kv_shared_pool_key_prefix,
+                    tenant: self.kv_shared_pool_tenant,
+                    min_components: self.kv_shared_pool_min_components.unwrap_or(1),
+                    members: (!self.kv_shared_pool_workers.is_empty())
+                        .then_some(self.kv_shared_pool_workers),
+                }
+            }),
         }))
     }
 }
@@ -3063,6 +3127,54 @@ mod tests {
             .expect("native cache-aware needs its default configuration");
         assert_eq!(cache.prefix_provider, CachePrefixProvider::RadixTree);
         assert!(cache.kv_indexer_endpoint.is_none());
+    }
+
+    #[test]
+    fn shared_pool_flags_build_and_validate() {
+        let cache = cfg_of("--policy cache_aware")
+            .unwrap()
+            .model
+            .cache_aware
+            .unwrap();
+        assert_eq!(cache.shared_pool, None, "off unless asked for");
+        let cache = cfg_of(
+            "--policy cache_aware --kv-shared-pool-endpoint tcp://master:19997 \
+             --kv-shared-pool-key-prefix tag_Qwen-Qwen3-8B --kv-shared-pool-min-components 8 \
+             --kv-shared-pool-workers http://a:30000,http://b:30000",
+        )
+        .unwrap()
+        .model
+        .cache_aware
+        .unwrap();
+        let pool = cache.shared_pool.expect("pool configured");
+        assert_eq!(pool.endpoint, "tcp://master:19997");
+        assert_eq!(pool.key_prefix.as_deref(), Some("tag_Qwen-Qwen3-8B"));
+        assert_eq!(pool.tenant, None);
+        assert_eq!(pool.min_components, 8);
+        assert_eq!(
+            pool.members,
+            Some(vec![
+                "http://a:30000".to_string(),
+                "http://b:30000".to_string()
+            ])
+        );
+        let defaults = cfg_of("--policy cache_aware --kv-shared-pool-endpoint tcp://m:1")
+            .unwrap()
+            .model
+            .cache_aware
+            .unwrap()
+            .shared_pool
+            .unwrap();
+        assert_eq!((defaults.min_components, defaults.members), (1, None));
+        for args in [
+            "--policy cache_aware --kv-shared-pool-key-prefix m",
+            "--policy cache_aware --kv-shared-pool-workers http://a",
+            "--policy cache_aware --kv-shared-pool-endpoint tcp://m:1 --kv-shared-pool-min-components 0",
+            "--policy round_robin --kv-shared-pool-endpoint tcp://m:1",
+        ] {
+            let err = cfg_of(args).unwrap_err().to_string();
+            assert!(err.contains("--kv-shared-pool"), "{args}: {err}");
+        }
     }
 
     #[test]

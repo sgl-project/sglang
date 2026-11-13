@@ -128,6 +128,53 @@ because of its stake, and `sgl_router_cache_pending_prefix_capped_total` lookups
 the cap left without a pending candidate; the policy's candidate and admission
 filters still decide whether a worker is picked.
 
+### Shared HiCache L3 pool (Mooncake)
+
+With SGLang's HiCache L3 on Mooncake Store
+(`--hicache-storage-backend mooncake`), a page one worker writes to the pool can
+be loaded by every worker attached to the same pool. The workers' own KV events
+credit a page only to the worker that holds it, so cache-aware routing would keep
+a prefix sticky to its writer even when a less loaded worker could load it from
+L3. `--kv-shared-pool-endpoint` makes the Router follow the pool's own event
+stream and credit the pool's prefix depth to every member worker, alongside each
+worker's device and host holdings (the deeper of the two counts).
+
+The stream is the Mooncake Store master's KV-event publisher. Build the master
+with `ENABLE_KV_EVENTS=ON` and start it with the events on and the object keys
+emitted:
+
+```bash
+mooncake_master --enable_kv_events=true \
+  --kv_events_bind_endpoint tcp://0.0.0.0:19997 --kv_events_emit_object_key=true
+
+sgl-router --policy cache_aware --worker-urls http://w0:30000,http://w1:30000 \
+  --kv-shared-pool-endpoint tcp://mooncake-master:19997 \
+  --kv-shared-pool-key-prefix Qwen-Qwen3-8B --kv-shared-pool-min-components 2
+```
+
+- Each SGLang HiCache Mooncake object is named
+  `[<extra_backend_tag>_][<model>_]<page hash>_<rank suffix>_{k|v}` (the model
+  path with `/` replaced by `-`). The Router reads the 64-hex page hash, whose top
+  64 bits are its own block hash, so a pool page lines up with the Router's block
+  of the same tokens.
+- `--kv-shared-pool-key-prefix` keeps other models and backend tags sharing the
+  store out of the count; `--kv-shared-pool-tenant` keeps one Mooncake tenant.
+- `--kv-shared-pool-min-components` is how many of a page's objects must be in
+  the pool before the page counts: one per K and per V of each rank's shard
+  (2 x attention TP for an MHA model without split heads, 1 per rank for MLA).
+  The default, 1, counts a page as soon as any of its objects lands.
+- `--kv-shared-pool-workers` lists the member workers; by default every worker
+  the Router follows KV events from is a member. Workers share pool pages only
+  with the same model, page size and TP/PP layout, because SGLang's Mooncake keys
+  carry the rank.
+- The master's stream has no replay. A sequence gap or a master restart drops
+  the Router's view of the pool, which then fills again as pages are stored, so
+  the Router under-credits after a loss but never routes on a page it may have
+  lost.
+- The pool is credited by the Router-local radix tree (`--policy cache_aware`
+  with the `radix_tree` prefix provider, both routing paths), not by an external
+  KV indexer.
+
 ### Peer bootstrap (Kubernetes)
 
 A replica that starts mid-fleet subscribes to each worker's KV topic

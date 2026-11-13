@@ -647,6 +647,8 @@ impl KvEventIndex {
         );
         if self.maintain_tree && !kv_dp_ranks.is_empty() {
             self.subscribers.add_worker(worker_url, &cfg).await;
+            // A shared L3 pool credits its hits to every worker the index follows.
+            self.tree.shared_pool().track_worker(worker_url);
         }
         if !bootstrap_obligations.is_empty() {
             // Stamped HERE, after `subscribers.add_worker` — not at `register`.
@@ -733,6 +735,7 @@ impl KvEventIndex {
         //    Any event already in the mpsc buffer at this point will be
         //    filtered by the live-set check inside the pump.
         self.engine_reported_load.forget_worker(worker_url);
+        self.tree.shared_pool().forget_worker(worker_url);
         self.bootstrap.forget(&ids);
         // 4. Hand the per-rank teardown to the pump: `held`,
         //    `awaiting_splice_proof`, the tree carriers, and the cursor. Doing
