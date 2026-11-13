@@ -10,9 +10,6 @@ import contextlib
 import glob
 import json
 import os
-import re
-import shutil
-import subprocess
 import threading
 import time
 from dataclasses import dataclass
@@ -44,33 +41,22 @@ A5_SPEC_ENV = {"ASCEND_USE_FIA": "1"}
 # ---------------------------------------------------------------------------
 
 
-def _npu_smi(*args: str) -> str:
-    return subprocess.check_output(
-        ["npu-smi", *args], text=True, stderr=subprocess.DEVNULL
-    )
+MEMORY_WAIT_MARGIN_BYTES = 2 * 1024**3
+
+
+def _torch_mem(device: int = 0) -> Tuple[int, int]:
+    """Device-wide (free, total) HBM in bytes, read in-process."""
+    free, total = torch.npu.mem_get_info(device)
+    return int(free), int(total)
 
 
 def npu_available() -> bool:
-    return _NPU_IMPORT_ERROR is None and shutil.which("npu-smi") is not None
-
-
-def _parse_npu_counts(out: str) -> Tuple[int, int]:
-    """Parse ``npu-smi info -l`` output into ``(npu_count, chip_count)``.
-
-    Driver versions disagree on this listing: some print a ``Chip Count``
-    header, others (e.g. Ascend 950) only list one ``NPU ID`` block per device
-    and omit it. This only describes the listing layout; platform identity is
-    decided by :func:`_is_ascend_950` from the SOC version.
-    """
-    total = re.search(r"Total Count\s*:\s*(\d+)", out)
-    chips = re.search(r"Chip Count\s*:\s*(\d+)", out)
-    npu_count = (
-        int(total.group(1))
-        if total is not None
-        else len(re.findall(r"^\s*NPU ID\s*:", out, flags=re.MULTILINE))
-    )
-    chip_count = int(chips.group(1)) if chips is not None else 1
-    return npu_count, chip_count
+    if _NPU_IMPORT_ERROR is not None:
+        return False
+    try:
+        return torch.npu.is_available() and torch.npu.device_count() > 0
+    except Exception:
+        return False
 
 
 def _is_ascend_950() -> bool:
@@ -78,7 +64,7 @@ def _is_ascend_950() -> bool:
 
     SOC versions 250-256 are A3; Ascend 950 reports 260.
     """
-    if not npu_available() or _NPU_IMPORT_ERROR is not None:
+    if not npu_available():
         return False
     try:
         return int(torch_npu.npu.get_soc_version()) >= 260
@@ -92,61 +78,24 @@ def npu_rl_env() -> Dict[str, str]:
 
 
 def npu_device_count() -> int:
-    if not npu_available():
+    """Number of devices visible to this process."""
+    if _NPU_IMPORT_ERROR is not None:
         return 0
-    npus, chips = _parse_npu_counts(_npu_smi("info", "-l"))
-    if _is_ascend_950():
-        chips = 1
-    return npus * chips
-
-
-def _physical_device_id(device: int) -> int:
-    """Map a process-visible logical device index to the host device id."""
-    visible_devices = os.environ.get("ASCEND_RT_VISIBLE_DEVICES")
-    if not visible_devices:
-        return device
-
-    devices = [item.strip() for item in visible_devices.split(",") if item.strip()]
-    if device < 0 or device >= len(devices):
-        raise ValueError(
-            f"logical NPU device {device} is outside ASCEND_RT_VISIBLE_DEVICES="
-            f"{visible_devices!r}"
-        )
-    return int(devices[device])
-
-
-def _npu_smi_card_and_chip(physical_device: int) -> list[str]:
-    """Translate a host device id into npu-smi's card/chip addressing.
-
-    Ascend 950 has one chip per NPU and does not accept ``-c``, so it uses
-    ``-i <device>`` directly. A3 needs card/chip addressing.
-    """
-    if _is_ascend_950():
-        return ["-i", str(physical_device)]
-    _, chips_per_card = _parse_npu_counts(_npu_smi("info", "-l"))
-    return [
-        "-i",
-        str(physical_device // chips_per_card),
-        "-c",
-        str(physical_device % chips_per_card),
-    ]
-
-
-def _hbm_capacity_and_rate(device: int = 0):
-    physical_device = _physical_device_id(device)
-    out = _npu_smi("info", "-t", "usages", *_npu_smi_card_and_chip(physical_device))
-    capacity = int(re.search(r"HBM Capacity\(MB\)\s*:\s*(\d+)", out).group(1))
-    rate = int(re.search(r"HBM Usage Rate\(%\)\s*:\s*(\d+)", out).group(1))
-    return capacity * 1024**2, rate
-
-
-def npu_total_bytes(device: int = 0) -> int:
-    return _hbm_capacity_and_rate(device)[0]
+    visible = os.environ.get("ASCEND_RT_VISIBLE_DEVICES")
+    if visible:
+        return len([item for item in visible.split(",") if item.strip()])
+    try:
+        return int(torch.npu.device_count())
+    except Exception:
+        return 0
 
 
 def npu_free_bytes(device: int = 0) -> int:
-    total, rate = _hbm_capacity_and_rate(device)
-    return total - total * rate // 100
+    return _torch_mem(device)[0]
+
+
+def npu_total_bytes(device: int = 0) -> int:
+    return _torch_mem(device)[1]
 
 
 def wait_for_free_memory(
@@ -158,8 +107,8 @@ def wait_for_free_memory(
 ) -> None:
     """Wait for a previous server process to hand device memory back.
 
-    ``device`` is a process-visible logical index, matching torch device
-    numbering under ``ASCEND_RT_VISIBLE_DEVICES``.
+    ``device`` is a process-visible logical index; ``mem_get_info`` reports
+    device-wide free bytes, so this also sees other tenants on shared hosts.
     """
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -199,6 +148,15 @@ def _wait_for_hbm_baseline(
 # ---------------------------------------------------------------------------
 
 
+def _server_arg(extra_args: Sequence[str], name: str, default: str) -> str:
+    for index, arg in enumerate(extra_args):
+        if arg == name and index + 1 < len(extra_args):
+            return extra_args[index + 1]
+        if arg.startswith(name + "="):
+            return arg.split("=", 1)[1]
+    return default
+
+
 @contextlib.contextmanager
 def npu_server(
     model_path: str,
@@ -216,10 +174,16 @@ def npu_server(
     base_url = f"http://127.0.0.1:{port}"
     baseline_free = 0
     if npu_available():
-        # The previous test's server may still be handing HBM back; a partial
-        # free is not enough for the next full KV-cache allocation. Fail instead
-        # of launching a second server on a device that is still occupied.
-        wait_for_free_memory(0, int(0.65 * npu_total_bytes(0)), timeout=300)
+        # Warm the test process's NPU context while the card is idle; the first
+        # in-process mem_get_info() call is otherwise paid while the server is
+        # starting. Then wait for the previous server to hand HBM back, using
+        # the memory fraction this server will reserve plus a fixed margin.
+        npu_free_bytes(0)
+        mem_fraction = float(_server_arg(extra_args, "--mem-fraction-static", "0.9"))
+        tp_size = max(1, int(_server_arg(extra_args, "--tp-size", "1")))
+        min_free = int(mem_fraction * npu_total_bytes(0)) + MEMORY_WAIT_MARGIN_BYTES
+        for device in range(tp_size):
+            wait_for_free_memory(device, min_free, timeout=300)
         baseline_free = npu_free_bytes(0)
     process = popen_launch_server(
         model_path,
@@ -730,9 +694,7 @@ def update_weights_from_tensor_per_rank(
             ]
             keepalive.append(tensors)
             if load_format == "flattened_bucket":
-                from sglang.srt.weight_sync.tensor_bucket import (
-                    FlattenedTensorBucket,
-                )
+                from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
 
                 bucket = FlattenedTensorBucket(named_tensors=tensors)
                 keepalive.append(bucket)
