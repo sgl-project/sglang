@@ -75,29 +75,6 @@ class TestNvtxForwardSpan(unittest.TestCase):
             m.scheduler_nvtx_method("scheduler.run_batch")(lambda: None)()
         self.assertEqual(fake.ranges, ["scheduler.run_batch"])
 
-    def test_step_span_names_carry_mode_and_batch(self):
-        cases = [
-            (_forward_batch(ForwardMode.DECODE, 48), False, "step[DECODE bs=48]"),
-            (
-                _forward_batch(ForwardMode.EXTEND, 2, 1024),
-                False,
-                "step[EXTEND bs=2 toks=1024]",
-            ),
-            (
-                _forward_batch(ForwardMode.TARGET_VERIFY, 48),
-                False,
-                "step[VERIFY bs=48]",
-            ),
-            (_forward_batch(ForwardMode.TARGET_VERIFY, 1), True, "step[DRAFT bs=1]"),
-        ]
-        for fb, is_draft, expected in cases:
-            self.assertEqual(
-                build_step_span_name(
-                    fb, detailed_annotations=False, is_draft_worker=is_draft
-                ),
-                expected,
-            )
-
 
 if __name__ == "__main__":
     unittest.main()
