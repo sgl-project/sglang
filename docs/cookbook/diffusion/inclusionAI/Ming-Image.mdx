@@ -35,11 +35,12 @@ assets, layouts, and transparent RGBA output. Use the prompt prefix
 alone does not guarantee a transparent background.
 
 [Design-Layer](https://huggingface.co/inclusionAI/Ming-Image-0.1-Design-Layer)
-decomposes one reference into ordered transparent layers. Supply `num_layers`,
-or specify a count with `into N layers` or `Number of layers: N` in the prompt;
-the prompt count takes precedence. Defaults are 12 steps with guidance 1 for
-Design and guidance 2 for Design-Layer. The model uses zero unconditional
-embeddings and does not support custom negative prompts.
+decomposes one reference into ordered transparent layers. Supply `num_layers`
+in an HTTP request, or specify a count with `into N layers` or
+`Number of layers: N` in the prompt; the prompt count takes precedence.
+Defaults are 12 steps with guidance 1 for Design and guidance 2 for
+Design-Layer. The model uses zero unconditional embeddings and does not
+support custom negative prompts.
 
 Both checkpoints use the native Bailing multimodal MoE encoder, query connector,
 joint DiT, and four-channel Qwen-style VAE. No remote modeling code is executed.
@@ -55,8 +56,13 @@ sglang generate --model-path inclusionAI/Ming-Image-0.1-Design \
 
 ```bash Layer decomposition
 sglang generate --model-path inclusionAI/Ming-Image-0.1-Design-Layer \
-  --image-path /path/to/input.png --num-layers 4 --save-output
+  --image-path /path/to/input.png \
+  --prompt "Decompose this image into 4 layers." --save-output
 ```
+
+`sglang generate` has no `--num-layers` flag: set the layer count in the prompt
+as above (four when the prompt names none), or send `num_layers` in an HTTP
+request.
 
 Design defaults to 2048 by 2048; 1024 by 1024 reduces latency and activation
 memory. Decomposition defaults to the official 1024-resolution aspect buckets;
@@ -78,6 +84,9 @@ Do not infer encoder compatibility from the DiT's head count.
 Use the standard component residency controls for `transformer`, `text_encoder`,
 and `vae`. Layerwise offload trades host memory and transfer time for lower VRAM.
 The default eager path does not use approximate caching or quantized attention.
+Unquantized BF16 DiTs fuse eligible CUDA norm, scale, and residual operations
+automatically while preserving the lossless result. Unsupported layouts,
+quantized execution, and compiled execution keep their existing expressions.
 Cache-DiT and SageAttention require workload-specific quality validation.
 VAE tiling is disabled by default to match the official inference path. Enable
 `--vae-tiling true` when decode memory is constrained; tiling can change pixels.
@@ -101,6 +110,9 @@ The validated runtime scope is:
   with a synthetic adapter.
 - Two H200s: DiT TP2, Ulysses2, Ring2 with FlashAttention, CFG parallelism for
   Design-Layer, encoder folding, and spatial VAE decoding.
+- One B300: Design text-to-image at 1024 by 1024, 12 steps, BF16 lossless,
+  including eager norm fusion, existing BCG replay with changed seeds, and
+  fallback for uncaptured prompt shapes.
 
 These are functional checks, not quality-equivalence claims for lossy
 optimizations. Other GPU families and quantized checkpoints remain unverified.

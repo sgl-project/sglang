@@ -278,7 +278,18 @@ def _num_sms(device_index: int) -> int:
 
 
 def _fast_flashmla_sched_shape(q: torch.Tensor) -> bool:
-    return q.is_cuda and get_platform().is_blackwell and q.shape[-2] == 64
+    # These layouts use the head64 kernel's schedule constants. Native heads
+    # require the newer kernel; V4's specialized head128 kernel stays excluded.
+    num_heads, head_dim = q.shape[-2], q.shape[-1]
+    if not (q.is_cuda and get_platform().is_blackwell):
+        return False
+    if num_heads == 64 or (num_heads == 128 and head_dim == 576):
+        return True
+    if not (1 <= num_heads < 128 and get_platform().is_sm100):
+        return False
+    from sglang.kernels.ops.attention import flash_mla_interface
+
+    return flash_mla_interface.supports_native_heads()
 
 
 def _maybe_precompute_flashmla_sched_meta(
@@ -289,23 +300,33 @@ def _maybe_precompute_flashmla_sched_meta(
     topk_length: Optional[torch.Tensor],
     extra_indices: Optional[torch.Tensor],
     extra_topk_length: Optional[torch.Tensor],
+    schedule: Literal["serial", "parallel", "windowed"] = "serial",
 ) -> None:
     """Fill the split-KV schedule buffers so `sparse_decode_fwd` skips its own
     `<<<1, 32>>>` scheduling kernel on the decode critical path;
-    `flashmla_sched_meta` produces the same schedule bit for bit."""
+    `flashmla_sched_meta` produces the same schedule bit for bit, or with
+    `schedule="windowed"` an equally balanced one in a fraction of the time."""
     if flashmla_metadata is None:
         return
     if getattr(flashmla_metadata, "tile_scheduler_metadata", None) is not None:
         return
     if not _fast_flashmla_sched_shape(q):
         return
+    from sglang.kernels.ops.attention import flash_mla_interface
     from sglang.kernels.ops.attention.dsv4.flashmla_sched_meta import (
         META_INTS,
         flashmla_sched_meta,
     )
 
     b, s_q = q.shape[0], q.shape[1]
-    num_sm_parts = max(_num_sms(q.device.index) // s_q, 1)
+    if flash_mla_interface.supports_native_heads():
+        # The native-head kernel divides the SMs across head blocks at small
+        # batch sizes. The schedule must use the same partition count.
+        num_sm_parts = flash_mla_interface.sparse_decode_num_sm_parts(
+            b, s_q, q.shape[2]
+        )
+    else:
+        num_sm_parts = max(_num_sms(q.device.index) // s_q, 1)
     if 4 * (5 * b + 1 + num_sm_parts * META_INTS) > 48 * 1024:
         return
     meta = torch.empty((num_sm_parts, META_INTS), dtype=torch.int32, device=q.device)
@@ -319,6 +340,7 @@ def _maybe_precompute_flashmla_sched_meta(
         fixed_overhead_num_blocks=_FLASHMLA_SCHED_FIXED_OVERHEAD,
         topk=indices.shape[-1],
         extra_topk=0 if extra_indices is None else extra_indices.shape[-1],
+        schedule=schedule,
     )
     flashmla_metadata.tile_scheduler_metadata = meta
     flashmla_metadata.num_splits = num_splits
@@ -1352,15 +1374,16 @@ class DeepseekV4AttnBackend(
             candidate_topk_blocks=getattr(cfg, "candidate_topk_blocks", 0),
             candidate_block_size=getattr(cfg, "candidate_block_size", 0),
         )
+        self.index_topk = getattr(cfg, "index_topk", DEFAULT_INDEX_TOPK)
         self.full_topk_indexer = make_full_topk_indexer(
-            token_to_kv_pool=self.token_to_kv_pool, req_to_token=self.req_to_token
+            token_to_kv_pool=self.token_to_kv_pool,
+            req_to_token=self.req_to_token,
+            index_heads=int(cfg.index_n_heads),
+            index_topk=self.index_topk,
         )
         self.MAX_SEQ_LEN_FOR_CAPTURE = self.req_to_token.shape[1]
 
         assert isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool)
-        self.index_topk = getattr(
-            model_runner.model_config.hf_text_config, "index_topk", DEFAULT_INDEX_TOPK
-        )
 
         kernel = get_exec().kernel
         self.enable_deepseek_v4_fp4_indexer = kernel.enable_deepseek_v4_fp4_indexer

@@ -35,8 +35,6 @@ from sglang.srt.layers.quantization.gguf import (
 class GGUFConfig(QuantizationConfig):
     """Select a GGUF method from each checkpoint tensor's metadata."""
 
-    supports_quantized_embeddings = True
-
     def __init__(self, gguf_file: str, tensor_meta: dict[str, GGUFTensorMeta]):
         super().__init__()
         self.gguf_file = gguf_file

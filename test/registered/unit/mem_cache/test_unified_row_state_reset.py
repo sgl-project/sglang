@@ -1,6 +1,8 @@
-"""A reused request row's request-scoped state is reset in its new request's
-first forward, on the forward stream, so the reset is ordered after the
-previous request's last forward; handing the row out writes nothing."""
+"""A reused request row's request-scoped state starts clean and is never
+reached by the previous request's late writes: under unified memory a row binds
+a zeroed unit of the request sub-pool that no forward in flight touches; on
+static pools the row is reset in its new request's first forward, on the
+forward stream, after the previous request's last forward."""
 
 import unittest
 from types import SimpleNamespace
@@ -49,7 +51,7 @@ def _storage():
             temporal_dtype=torch.float32,
         ),
         StateReplay(
-            decode=False, speculative=True, is_kda=False, cache_len=8, key_heads=1
+            decode=False, speculative=True, is_kda=False, cache_len=16, key_heads=1
         ),
         layer_ids=(1, 2),
         speculative_num_draft_tokens=3,
@@ -145,49 +147,52 @@ def _leave_free_slots(storage):
     return reqs[2]
 
 
+def _ring(storage):
+    """The GDN speculative ring and cursors, by name, as views over the request
+    sub-pool's units, and how a request row names its unit."""
+    view = storage.view("mamba")
+    tensors = {name: getattr(view, name) for name in _CURSORS}
+    tensors["replayssm_d"] = view.mamba_cache.replayssm_d
+    ids = storage.allocator.request_id_spaces()["request"]
+    return tensors, lambda row: int(ids.ids(torch.tensor([row], device="cuda"))[0])
+
+
+def _fill(tensors, unit, value):
+    _fill_units(tensors, torch.tensor([unit], device="cuda"), value)
+
+
+def _fill_units(tensors, units, value):
+    for name, tensor in tensors.items():
+        tensor.index_fill_(0 if name in _CURSORS else 1, units, value)
+
+
+def _at(tensors, name, unit):
+    tensor = tensors[name]
+    return tensor[unit] if name in _CURSORS else tensor[:, unit]
+
+
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
 class TestRowStateResetOnReuse(CustomTestCase):
     def test_reused_row_starts_clean_after_old_forward(self):
-        """A reused row's first forward reads reset cursors and ring while the
+        """A reused row's new request gets a zeroed unit of its own while the
         previous request's last forward still runs, and that forward's late
-        write does not reach the new request's cursors."""
+        write does not reach the new request's cursors or ring."""
         storage = _storage()
         steps = forward_steps_of(storage.allocator)
         self.assertIsNotNone(steps)
-        memory = storage.request_memory
-        parts = {p.name.removeprefix("mamba."): p for p in memory.parts}
-        for name in (*_CURSORS, "replayssm_d"):
-            self.assertIn(name, parts)
-        tensors = {name: memory.tensors[f"mamba.{name}"] for name in parts}
+        tensors, unit_of = _ring(storage)
         schedule = torch.cuda.current_stream()
         forward = torch.cuda.Stream()
         _leave_free_slots(storage)
 
         old = _request("old")
         (row,) = storage.acquire([old])
-        old_slot = storage.allocator.state.slots.translate(old.kv.mamba_pool_idx)
-        with torch.cuda.stream(forward):
-            storage.reset_new_rows()
-
-        # The new request's first forward is a graph that reads the cursors
-        # and ring through persistent row ids, as a decode replay does, then
-        # advances its cursor.
-        graph_rows = torch.tensor([row], device="cuda")
-        seen = {
-            name: torch.empty_like(
-                tensor.index_select(parts[name].row_axis, graph_rows)
-            )
-            for name, tensor in tensors.items()
-        }
-        graph = torch.cuda.CUDAGraph()
-        capture = torch.cuda.Stream()
-        capture.wait_stream(schedule)
-        with torch.cuda.stream(capture):
-            with torch.cuda.graph(graph, stream=capture):
-                for name, tensor in tensors.items():
-                    part = parts[name]
-                    seen[name].copy_(tensor.index_select(part.row_axis, graph_rows))
-                tensors["replayssm_spec_write_pos"].index_fill_(0, graph_rows, 4)
+        old_unit = unit_of(row)
+        # Load the fill kernels now: a first launch waits for the whole device.
+        # The ids are on the device before the hold: a copy from the host
+        # behind it would wait for it.
+        old_units = torch.tensor([old_unit], device="cuda")
+        _fill_units(tensors, old_units, 0)
         torch.cuda.synchronize()
 
         # The old request's last forward: its cursor commit (and ring write)
@@ -195,95 +200,46 @@ class TestRowStateResetOnReuse(CustomTestCase):
         steps.forward_launched()
         forward.wait_stream(schedule)
         with torch.cuda.stream(forward):
-            rows = torch.tensor([row], device="cuda")
             torch.cuda._sleep(_HOLD_CYCLES)
-            for name, tensor in tensors.items():
-                tensor.index_fill_(parts[name].row_axis, rows, 9)
+            _fill_units(tensors, old_units, 9)
             old_done = torch.cuda.Event()
             old_done.record()
         steps.forward_recorded(old_done)
 
-        # The old request ends while that forward runs: its row and state
-        # slot go back at once, and the new request takes the row.
+        # The old request ends while that forward runs: its row goes back at
+        # once, and the new request takes the row with another unit.
         storage.release_state("mamba", old)
         storage.release_row(old)
         new = _request("new")
         self.assertEqual(storage.acquire([new]), [row])
-        # Only the row is shared: the new request's state slot sits on other
-        # physical pages than the old one, whose pages wait for the forward.
-        new_slot = storage.allocator.state.slots.translate(new.kv.mamba_pool_idx)
-        self.assertNotEqual(int(new_slot), int(old_slot))
+        new_unit = unit_of(row)
+        self.assertNotEqual(new_unit, old_unit)
         schedule.synchronize()
         self.assertFalse(old_done.query(), "the old forward ended too early")
-
-        # The new request's first forward, on the forward stream.
-        forward.wait_stream(schedule)
-        with torch.cuda.stream(forward):
-            storage.reset_new_rows()
-            graph.replay()
-        torch.cuda.synchronize()
-
-        for name, tensor in tensors.items():
+        for name in tensors:
             with self.subTest(part=name):
-                # The first forward sees a clean cursor and ring.
-                self.assertTrue(torch.all(seen[name] == parts[name].reset_value))
-        # The old forward's late write did not land on the new cursor.
-        self.assertEqual(int(tensors["replayssm_spec_write_pos"][row]), 4)
-        for name in ("replayssm_cache_base", "replayssm_is_flush"):
-            self.assertEqual(int(tensors[name][row]), 0)
-
-    def test_row_reset_waits_for_the_next_forward(self):
-        """Handing out a reused row leaves its state alone; the next
-        `ModelRunner.forward` resets it, once."""
-        storage = _storage()
-        memory = storage.request_memory
-        write_pos = memory.tensors["mamba.replayssm_spec_write_pos"]
-        old = _request("old")
-        (row,) = storage.acquire([old])
-        _forward(storage.requests, storage.allocator)
-        write_pos[row] = 6
-        storage.release_state("mamba", old)
-        storage.release_row(old)
-        new = _request("new")
-        self.assertEqual(storage.acquire([new]), [row])
+                self.assertTrue(torch.all(_at(tensors, name, new_unit) == 0))
         torch.cuda.synchronize()
-        # Handing the row out writes nothing on the scheduling stream.
-        self.assertEqual(int(write_pos[row]), 6)
-        _forward(storage.requests, storage.allocator)
-        torch.cuda.synchronize()
-        self.assertEqual(int(write_pos[row]), 0)
-        # A row is reset once: later forwards leave its new values alone.
-        write_pos[row] = 2
-        _forward(storage.requests, storage.allocator)
-        torch.cuda.synchronize()
-        self.assertEqual(int(write_pos[row]), 2)
+        # The old forward's late write landed on its own unit only.
+        for name in tensors:
+            with self.subTest(part=name):
+                self.assertTrue(torch.all(_at(tensors, name, new_unit) == 0))
+                self.assertTrue(torch.all(_at(tensors, name, old_unit) == 9))
 
     def test_backup_before_first_forward_drops_previous_request_state(self):
         """A retraction backup taken before the request's first forward holds
-        reset state, not the row's previous request's; one taken after that
-        forward keeps what the forward wrote."""
+        zeroed request state, not the row's previous request's; one taken after
+        that forward keeps what the forward wrote."""
         for own_forward in (False, True):
             with self.subTest(own_forward=own_forward):
                 storage = _storage()
                 allocator = storage.allocator
-                memory = storage.request_memory
-                parts = memory.parts
-                self.assertTrue(
-                    {f"mamba.{name}" for name in (*_CURSORS, "replayssm_d")}
-                    <= {part.name for part in parts}
-                )
-
-                def fill(row, value):
-                    rows = torch.tensor([row], device="cuda")
-                    for part in parts:
-                        memory.tensors[part.name].index_fill_(
-                            part.row_axis, rows, value
-                        )
+                tensors, unit_of = _ring(storage)
 
                 old = _request("old")
                 (row,) = storage.acquire([old])
                 _forward(storage.requests, allocator)
-                fill(row, 7)
+                _fill(tensors, unit_of(row), 7)
                 storage.release_state("mamba", old)
                 storage.release_row(old)
 
@@ -291,7 +247,7 @@ class TestRowStateResetOnReuse(CustomTestCase):
                 self.assertEqual(storage.acquire([req]), [row])
                 if own_forward:
                     _forward(storage.requests, allocator)
-                    fill(row, 3)
+                    _fill(tensors, unit_of(row), 3)
                 saved = allocator.get_cpu_copy(
                     allocator.alloc(4),
                     mamba_indices=req.kv.mamba_pool_idx,
@@ -309,11 +265,11 @@ class TestRowStateResetOnReuse(CustomTestCase):
                 )
                 _forward(storage.requests, allocator)
                 torch.cuda.synchronize()
-                for part in parts:
-                    with self.subTest(part=part.name):
-                        value = memory.tensors[part.name].select(part.row_axis, new_row)
-                        expected = 3 if own_forward else part.reset_value
-                        self.assertTrue(torch.all(value == expected))
+                unit = unit_of(new_row)
+                for name in tensors:
+                    with self.subTest(part=name):
+                        expected = 3 if own_forward else 0
+                        self.assertTrue(torch.all(_at(tensors, name, unit) == expected))
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
