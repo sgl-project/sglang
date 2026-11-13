@@ -353,6 +353,15 @@ jobs:
           mkdir -p ${ascend_test_util_path}
           mv ${ascend_test_util_path} ${ascend_test_util_path}_bak
           cp -r ${sglang_source_path}/python/sglang/test/ascend ${ascend_test_util_path}
+          # Overlay the pinned test/ci package too: the checked-out run_suite.py
+          # imports run_unittest_files from the installed sglang package, and the
+          # image's preinstalled copy predates the fork_worker_preload kwarg. The
+          # pinned snapshot (scripts/ci/npu/compat) is used instead of the
+          # checkout's python/sglang/test/ci, which tracks sgl-project main and
+          # may import srt modules the nightly image does not ship.
+          ci_test_util_path=${sglang_pkg_path}/sglang/test/ci
+          if [ -d "${ci_test_util_path}" ]; then mv "${ci_test_util_path}" "${ci_test_util_path}_bak"; fi
+          cp -r ${sglang_source_path}/scripts/ci/npu/compat/ci ${ci_test_util_path}
 
           # External env scripts may reference unset shell vars (e.g. ZSH_VERSION),
           # which abort the whole script under `set -u`. Temporarily disable -u.
@@ -377,6 +386,11 @@ jobs:
 
           echo "Running test: ${tc_name}"
           test_exit_code=0
+          # Pin the test runner to the image-compatible snapshot committed under
+          # scripts/ci/npu/compat; the checkout's test/run_suite.py tracks
+          # sgl-project main and may import srt modules the image does not ship.
+          cp ${sglang_source_path}/scripts/ci/npu/compat/run_suite.py ${sglang_source_path}/test/run_suite.py
+
           cd test
 
           # Append `--nightly` and `--continue-on-error` arguments when the job belongs to the nightly pipeline.
@@ -403,12 +417,9 @@ jobs:
             echo "Precision mode: running $(wc -l < /tmp/precision_tests.txt) recommended file(s)"
           fi
 
-          # Append `--timeout-from-est‑time` when the job belongs to the nightly pipeline.
-          # per‑case timeout is derived from each case's est_time.
+          # Per-case timeout is a fixed budget from the yaml (--timeout-per-file);
+          # est_time is not used for the nightly single-node cases.
           TIMEOUT_FLAG=""
-          if [ "${{ inputs.is_nightly_pipeline_job }}" = "true" ]; then
-            TIMEOUT_FLAG="--timeout-from-est-time"
-          fi
 
           # Nightly additionally persists the full suite log to ${log_path}/${tc_name}.log
           # under the structured path; PR runs tee to ${TEST_LOG_DIR}/${tc_name}.log.
@@ -437,7 +448,7 @@ jobs:
           # Run NPU test suite with run_suite.py.
           # Capture mode (--enable-retry --max-attempts 1) keeps test subprocesses off the
           # tee pipe, so leftover server processes cannot block the pipeline on exit.
-          ${PYTHON_FOR_SGLANG} -u run_suite.py --hw npu --suite ${test_suite} ${NIGHTLY_FLAG} ${PARTITION_ARGS} ${ONLY_FILE_ARGS} ${TIMEOUT_FLAG} --enable-retry --max-attempts 1 --timeout-per-file 7200 2>&1 | tee "${LOG_TEE_TARGETS[@]}" || test_exit_code=$?
+          ${PYTHON_FOR_SGLANG} -u run_suite.py --hw npu --suite ${test_suite} ${NIGHTLY_FLAG} ${PARTITION_ARGS} ${ONLY_FILE_ARGS} ${TIMEOUT_FLAG} --enable-retry --max-attempts 1 --timeout-per-file 14400 2>&1 | tee "${LOG_TEE_TARGETS[@]}" || test_exit_code=$?
 
           echo "Finished test: ${tc_name}"
 

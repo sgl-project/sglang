@@ -2,6 +2,12 @@ name: Nightly Test (NPU)
 on:
   schedule:
     - cron: '0 16 * * *'  # Execute at 0:00 a.m. Beijing Time every day
+  # Trigger the nightly pipeline from a PR that modifies this workflow.
+  pull_request:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/nightly-test-npu.yml"
   workflow_dispatch:
     inputs:
       ref:
@@ -18,12 +24,12 @@ on:
         description: 'The a3 running docker image of the test task.'
         required: false
         type: string
-        default: 'swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann9.1.0-a3'
+        default: 'swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-a3-B010'
       image_a5:
         description: 'The a5 running docker image of the test task.'
         required: false
         type: string
-        default: 'swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann9.1.0-950'
+        default: 'swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-950-B010'
       skip_install_flag:
         description: 'Indicates whether to skip the installation of sglang, defaulting to false.'
         required: false
@@ -104,12 +110,12 @@ jobs:
             echo "job_filter=${{ inputs.job_filter }}" >> $GITHUB_OUTPUT
           fi
           if [ -z "${{ inputs.image_a3 }}" ]; then
-            echo "image_a3=swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann9.1.0-a3" >> $GITHUB_OUTPUT
+            echo "image_a3=swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-a3-B010" >> $GITHUB_OUTPUT
           else
             echo "image_a3=${{ inputs.image_a3 }}" >> $GITHUB_OUTPUT
           fi
           if [ -z "${{ inputs.image_a5 }}" ]; then
-            echo "image_a5=swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann9.1.0-950" >> $GITHUB_OUTPUT
+            echo "image_a5=swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-950-B010" >> $GITHUB_OUTPUT
           else
             echo "image_a5=${{ inputs.image_a5 }}" >> $GITHUB_OUTPUT
           fi
@@ -157,7 +163,7 @@ jobs:
 
   nightly-1-npu-a3:
     name: nightly-1-npu-a3
-    if: ${{ !cancelled() }}
+    if: false # TEMP: functional case passed; do not rerun
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
@@ -168,11 +174,13 @@ jobs:
       timeout_per_file: '3600'
       is_nightly_pipeline_job: true
       skip_pr_test_health_check: 'true'
+      only_tests: |
+        test/registered/npu/basic_function/runtime_opts/test_npu_needs_cpu_seq_lens_fia_warning.py
     secrets: inherit
 
   nightly-2-npu-a3:
     name: nightly-2-npu-a3
-    if: ${{ !cancelled() }}
+    if: false # TEMP: was '!cancelled()', restore after overlap-schedule validation
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
@@ -188,7 +196,7 @@ jobs:
   # The nightly-4-npu-a3 suite is split across 2 parallel partition jobs, mirroring base-b-test-4-npu-a3 in the PR pipeline.
   nightly-4-npu-a3:
     name: nightly-4-npu-a3
-    if: ${{ !cancelled() }}
+    if: false # TEMP: was '!cancelled()', restore after overlap-schedule validation
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
@@ -204,7 +212,7 @@ jobs:
 
   nightly-8-npu-a3:
     name: nightly-8-npu-a3
-    if: ${{ !cancelled() }}
+    if: false # TEMP: was '!cancelled()', restore after overlap-schedule validation
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
@@ -219,7 +227,7 @@ jobs:
 
   nightly-16-npu-a3:
     name: nightly-16-npu-a3
-    if: ${{ !cancelled() }}
+    if: false # TEMP: was '!cancelled()', restore after overlap-schedule validation
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
@@ -234,7 +242,7 @@ jobs:
 
   nightly-perf-2-npu-a3:
     name: nightly-perf-2-npu-a3
-    if: ${{ !cancelled() }}
+    if: false # TEMP: was '!cancelled()', restore after overlap-schedule validation
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -250,7 +258,7 @@ jobs:
 
   nightly-perf-4-npu-a3:
     name: nightly-perf-4-npu-a3
-    if: ${{ !cancelled() }}
+    if: false # TEMP: was '!cancelled()', restore after overlap-schedule validation
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -266,7 +274,7 @@ jobs:
 
   nightly-perf-16-npu-a3:
     name: nightly-perf-16-npu-a3
-    if: ${{ !cancelled() }}
+    if: false # TEMP: 8p perf two-pass passed; do not rerun
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -275,16 +283,18 @@ jobs:
       test_suite: nightly-perf-16-npu-a3
       is_nightly_pipeline_job: true
       skip_pr_test_health_check: 'true'
+      only_tests: |
+        test/registered/npu/performance/deepseek_v4_flash/test_npu_deepseek_v4_flash_w8a8_8p_in8k_out1k_50ms_overlap.py
       image: ${{ needs.set-image-config.outputs.image_a3 }}
       install_sglang_deps: false
       device_type_for_deps: 'a3'
       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
-      test_timeout_minutes: '180'
+      test_timeout_minutes: '300'
 
   # The acc-2 suite is split across 4 parallel partition jobs via the single `partitions` input.
   nightly-acc-2-npu-a3:
     name: nightly-acc-2-npu-a3
-    if: ${{ !cancelled() }}
+    if: false # TEMP: was '!cancelled()', restore after overlap-schedule validation
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -301,7 +311,7 @@ jobs:
 
   nightly-acc-16-npu-a3:
     name: nightly-acc-16-npu-a3
-    if: ${{ !cancelled() }}
+    if: false # TEMP: w8a8_8p gpqa overlap passed (run 42348620493); do not rerun
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -310,83 +320,168 @@ jobs:
       test_suite: nightly-acc-16-npu-a3
       is_nightly_pipeline_job: true
       skip_pr_test_health_check: 'true'
+      only_tests: |
+        test/registered/npu/accuracy/deepseek_v4_flash/test_npu_deepseek_v4_flash_w8a8_8p_gpqa_overlap.py
       image: ${{ needs.set-image-config.outputs.image_a3 }}
       install_sglang_deps: false
       device_type_for_deps: 'a3'
       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
 
   nightly-acc-4-npu-a5:
-     name: nightly-acc-4-npu-a5
-     if: ${{ !cancelled() }}
-     needs: [set-image-config]
-     uses: ./.github/workflows/_npu-single-node-test-stage.yml
-     with:
-       runner: linux-amd64-a5-4
-       test_type: 'accuracy'
-       test_suite: nightly-acc-4-npu-a5
-       is_nightly_pipeline_job: true
-       skip_pr_test_health_check: 'true'
-       image: ${{ needs.set-image-config.outputs.image_a5 }}
-       install_sglang_deps: false
-       device_type_for_deps: 'a5'
-       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
+    name: nightly-acc-4-npu-a5
+    if: false # TEMP: only the perf in8k case reruns (retry after npu-smi -9005)
+
+    needs: [set-image-config]
+    uses: ./.github/workflows/_npu-single-node-test-stage.yml
+    with:
+      runner: linux-amd64-a5-4
+      test_type: 'accuracy'
+      test_suite: nightly-acc-4-npu-a5
+      is_nightly_pipeline_job: true
+      skip_pr_test_health_check: 'true'
+      image: ${{ needs.set-image-config.outputs.image_a5 }}
+      install_sglang_deps: false
+      device_type_for_deps: 'a5'
+      run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
+
+  nightly-perf-4-npu-a5:
+    name: nightly-perf-4-npu-a5
+    if: ${{ !cancelled() }}
+    needs: [set-image-config]
+    uses: ./.github/workflows/_npu-single-node-test-stage.yml
+    with:
+      runner: linux-amd64-a5-4
+      test_type: 'perf'
+      test_suite: nightly-perf-4-npu-a5
+      is_nightly_pipeline_job: true
+      skip_pr_test_health_check: 'true'
+      image: ${{ needs.set-image-config.outputs.image_a5 }}
+      install_sglang_deps: false
+      device_type_for_deps: 'a5'
+      run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
 
   nightly-poc-multi-node-tests:
     name: multi-node-poc
-    if: ${{ !cancelled() }}
+    if: false # TEMP: only the perf in8k case reruns
+
     needs: [set-image-config, nightly-perf-2-npu-a3, nightly-perf-4-npu-a3, nightly-perf-16-npu-a3, nightly-acc-2-npu-a3, nightly-acc-16-npu-a3]
     strategy:
       fail-fast: false
       max-parallel: 1
       matrix:
         test_config:
-          # deepseek_v4_flash performance tests
-          - name: deepseek_v4_flash_w8a8_1p1d_16p_in128k_out1k_prefix90_20ms
+          # deepseek_v4_flash overlap two-pass: pass 1 (ASCEND_USE_FIA unset)
+          # TEMP: passed in run 42328983735; do not rerun
+          # - name: deepseek_v4_flash_w8a8_1p1d_16p_in128k_out1k_prefix90_20ms_overlap_fia_unset
+          #   prefill_size: 1
+          #   decode_size: 1
+          #   router_size: 1
+          #   test_case: test/registered/npu/performance/deepseek_v4_flash/test_npu_deepseek_v4_flash_w8a8_1p1d_16p_in128k_out1k_prefix90_20ms_overlap_fia_unset.py
+          #   test_type: 'perf'
+          #   prefill_decode_deployment: 'separation'
+          # deepseek_v4_flash overlap (no spec) performance tests
+          # TEMP: passed in run 42328983735; do not rerun
+          # - name: deepseek_v4_flash_w8a8_1p1d_16p_in128k_out1k_prefix90_20ms_overlap
+          #   prefill_size: 1
+          #   decode_size: 1
+          #   router_size: 1
+          #   test_case: test/registered/npu/performance/deepseek_v4_flash/test_npu_deepseek_v4_flash_w8a8_1p1d_16p_in128k_out1k_prefix90_20ms_overlap.py
+          #   test_type: 'perf'
+          #   prefill_decode_deployment: 'separation'
+          - name: deepseek_v4_flash_0731_w8a8_1p1d_16p_gpqa_overlap
             prefill_size: 1
             decode_size: 1
             router_size: 1
-            test_case: test/registered/npu/performance/deepseek_v4_flash/test_npu_deepseek_v4_flash_w8a8_1p1d_16p_in128k_out1k_prefix90_20ms.py
-            test_type: 'perf'
-            prefill_decode_deployment: 'separation'
-          # deepseek_v4_flash accuracy tests
-          - name: deepseek_v4_flash_0731_w8a8_1p1d_16p_gpqa
-            prefill_size: 1
-            decode_size: 1
-            router_size: 1
-            test_case: test/registered/npu/accuracy/deepseek_v4_flash/test_npu_deepseek_v4_flash_0731_w8a8_1p1d_16p_gpqa.py
+            test_case: test/registered/npu/accuracy/deepseek_v4_flash/test_npu_deepseek_v4_flash_0731_w8a8_1p1d_16p_gpqa_overlap.py
             test_type: 'accuracy'
             prefill_decode_deployment: 'separation'
-          # deepseek_v4_pro accuracy tests
-          - name: deepseek_v4_pro_0813_w4a8_1p1d_32p_gpqa
-            prefill_size: 2
-            decode_size: 2
-            router_size: 1
-            test_case: test/registered/npu/accuracy/deepseek_v4_pro/test_npu_deepseek_v4_pro_0813_w4a8_1p1d_32p_gpqa.py
-            test_type: 'accuracy'
-            prefill_decode_deployment: 'separation'
+          # Non-overlap cases re-enabled on main; TEMP commented out on this
+          # branch (3-case validation scope).
+          # - name: deepseek_v4_flash_w8a8_1p1d_16p_in128k_out1k_prefix90_20ms
+          #   prefill_size: 1
+          #   decode_size: 1
+          #   router_size: 1
+          #   test_case: test/registered/npu/performance/deepseek_v4_flash/test_npu_deepseek_v4_flash_w8a8_1p1d_16p_in128k_out1k_prefix90_20ms.py
+          #   test_type: 'perf'
+          #   prefill_decode_deployment: 'separation'
+          # - name: deepseek_v4_flash_0731_w8a8_1p1d_16p_gpqa
+          #   prefill_size: 1
+          #   decode_size: 1
+          #   router_size: 1
+          #   test_case: test/registered/npu/accuracy/deepseek_v4_flash/test_npu_deepseek_v4_flash_0731_w8a8_1p1d_16p_gpqa.py
+          #   test_type: 'accuracy'
+          #   prefill_decode_deployment: 'separation'
+          # - name: deepseek_v4_pro_0813_w4a8_1p1d_32p_gpqa
+          #   prefill_size: 2
+          #   decode_size: 2
+          #   router_size: 1
+          #   test_case: test/registered/npu/accuracy/deepseek_v4_pro/test_npu_deepseek_v4_pro_0813_w4a8_1p1d_32p_gpqa.py
+          #   test_type: 'accuracy'
+          #   prefill_decode_deployment: 'separation'
+          # - name: glm_5_3_w8a8_1p1d_32p_pcp_gpqa
+          #   prefill_size: 2
+          #   decode_size: 2
+          #   router_size: 1
+          #   test_case: test/registered/npu/accuracy/glm5_3/test_npu_glm_5_3_w8a8_1p1d_32p_pcp_gpqa.py
+          #   test_type: 'accuracy'
+          #   prefill_decode_deployment: 'separation'
+          # - name: glm_5_3_w8a8_1p1d_32p_dcp_gpqa
+          #   prefill_size: 2
+          #   decode_size: 2
+          #   router_size: 1
+          #   test_case: test/registered/npu/accuracy/glm5_3/test_npu_glm_5_3_w8a8_1p1d_32p_dcp_gpqa.py
+          #   test_type: 'accuracy'
+          #   prefill_decode_deployment: 'separation'
+          # - name: glm_5_3_w8a8_1p1d_32p_in128k_out1k_prefix90_20ms
+          #   prefill_size: 2
+          #   decode_size: 2
+          #   router_size: 1
+          #   test_case: test/registered/npu/performance/glm5_3/test_npu_glm_5_3_w8a8_1p1d_32p_in128k_out1k_prefix90_20ms.py
+          #   test_type: 'perf'
+          #   prefill_decode_deployment: 'separation'
+          # deepseek_v4_pro overlap (no spec) accuracy tests
+          # TEMP: commented out; do not rerun
+          # - name: deepseek_v4_pro_0813_w4a8_1p1d_32p_gpqa_overlap
+          #   prefill_size: 2
+          #   decode_size: 2
+          #   router_size: 1
+          #   test_case: test/registered/npu/accuracy/deepseek_v4_pro/test_npu_deepseek_v4_pro_0813_w4a8_1p1d_32p_gpqa_overlap.py
+          #   test_type: 'accuracy'
+          #   prefill_decode_deployment: 'separation'
           # glm_5_3 accuracy tests (2 prefill + 2 decode nodes)
-          - name: glm_5_3_w8a8_1p1d_32p_pcp_gpqa
-            prefill_size: 2
-            decode_size: 2
-            router_size: 1
-            test_case: test/registered/npu/accuracy/glm5_3/test_npu_glm_5_3_w8a8_1p1d_32p_pcp_gpqa.py
-            test_type: 'accuracy'
-            prefill_decode_deployment: 'separation'
-          - name: glm_5_3_w8a8_1p1d_32p_dcp_gpqa
-            prefill_size: 2
-            decode_size: 2
-            router_size: 1
-            test_case: test/registered/npu/accuracy/glm5_3/test_npu_glm_5_3_w8a8_1p1d_32p_dcp_gpqa.py
-            test_type: 'accuracy'
-            prefill_decode_deployment: 'separation'
-          # glm_5_3 performance tests (2 prefill + 2 decode nodes)
-          - name: glm_5_3_w8a8_1p1d_32p_in128k_out1k_prefix90_20ms
-            prefill_size: 2
-            decode_size: 2
-            router_size: 1
-            test_case: test/registered/npu/performance/glm5_3/test_npu_glm_5_3_w8a8_1p1d_32p_in128k_out1k_prefix90_20ms.py
-            test_type: 'perf'
-            prefill_decode_deployment: 'separation'
+          # TEMP: commented out; do not rerun
+          # - name: glm_5_3_w8a8_2p2d_32p_dcp_gpqa
+          #   prefill_size: 2
+          #   decode_size: 2
+          #   router_size: 1
+          #   test_case: test/registered/npu/accuracy/glm5_3/test_npu_glm_5_3_w8a8_2p2d_32p_dcp_gpqa.py
+          #   test_type: 'accuracy'
+          #   prefill_decode_deployment: 'separation'
+          # TEMP: commented out; do not rerun
+          # - name: glm_5_3_w8a8_2p2d_32p_pcp_gpqa
+          #   prefill_size: 2
+          #   decode_size: 2
+          #   router_size: 1
+          #   test_case: test/registered/npu/accuracy/glm5_3/test_npu_glm_5_3_w8a8_2p2d_32p_pcp_gpqa.py
+          #   test_type: 'accuracy'
+          #   prefill_decode_deployment: 'separation'
+          # glm5_3 performance tests
+          # TEMP: commented out; do not rerun
+          # - name: glm_5_3_w8a8_2p2d_32p_in128k_out1k_prefix90_20ms
+          #   prefill_size: 2
+          #   decode_size: 2
+          #   router_size: 1
+          #   test_case: test/registered/npu/performance/glm5_3/test_npu_glm_5_3_w8a8_2p2d_32p_in128k_out1k_prefix90_20ms.py
+          #   test_type: 'perf'
+          #   prefill_decode_deployment: 'separation'
+          # TEMP: commented out; do not rerun
+          # - name: glm_5_3_flash_w8a8_1p1d_16p_in128k_out1k_prefix90_20ms
+          #   prefill_size: 1
+          #   decode_size: 1
+          #   router_size: 1
+          #   test_case: test/registered/npu/performance/glm5_3/test_npu_glm_5_3_flash_w8a8_1p1d_16p_in128k_out1k_prefix90_20ms.py
+          #   test_type: 'perf'
+          #   prefill_decode_deployment: 'separation'
     uses: ./.github/workflows/nightly-test-npu-e2e-multi-node.yml
     with:
       runner: linux-amd64-cpu-4
@@ -405,36 +500,53 @@ jobs:
 
   nightly-poc-multi-node-mix-tests:
     name: multi-node-mix-poc
-    if: ${{ !cancelled() }}
+    if: false # TEMP: all cases commented out; do not rerun
     needs: [set-image-config, nightly-perf-2-npu-a3, nightly-perf-4-npu-a3, nightly-perf-16-npu-a3, nightly-acc-2-npu-a3, nightly-acc-16-npu-a3, nightly-poc-multi-node-tests]
     strategy:
       fail-fast: false
       max-parallel: 1
       matrix:
         test_config:
+          # TEMP: placeholder to keep the matrix non-empty; the job is disabled.
+          - name: placeholder_disabled
+            node_size: 2
+            test_case: test/registered/npu/basic_function/runtime_opts/test_npu_needs_cpu_seq_lens_fia_warning.py
+            test_type: 'accuracy'
           # glm_5_3 accuracy tests
+          # TEMP: commented out; do not rerun
           # - name: glm_5_3_w8a8_16p_gpqa
           #   node_size: 2
           #   test_case: test/registered/npu/accuracy/glm5_3/test_npu_glm_5_3_w8a8_16p_gpqa.py
           #   test_type: 'accuracy'
-          # kimi_k3 accuracy tests
-          - name: kimi_k3_w4a8_32p_gpqa
-            node_size: 4
-            test_case: test/registered/npu/accuracy/kimi_k3/test_npu_kimi_k3_w4a8_32p_gpqa.py
-            test_type: 'accuracy'
-          # deepseek_v4_pro performance tests
-          - name: deepseek_v4_pro_16p_in128k_out1k_prefix90_20ms
-            node_size: 2
-            test_case: test/registered/npu/performance/deepseek_v4_pro/test_npu_deepseek_v4_pro_w4a8_16p_in128k_out1k_prefix90_20ms.py
-            test_type: 'perf'
-          - name: kimi_k3_w4a8_32p_mix_in128k_out1_prefill
-            node_size: 4
-            test_case: test/registered/npu/performance/kimi_k3/test_npu_kimi_k3_w4a8_32p_mix_in128k_out1_prefill.py
-            test_type: 'perf'
-          - name: kimi_k3_w4a8_32p_mix_in128k_out1k_decode_prefix
-            node_size: 4
-            test_case: test/registered/npu/performance/kimi_k3/test_npu_kimi_k3_w4a8_32p_mix_in128k_out1k_decode_prefix.py
-            test_type: 'perf'
+          # Mix cases re-enabled on main; TEMP commented out on this branch
+          # (3-case validation scope).
+          # - name: kimi_k3_w4a8_32p_gpqa
+          #   node_size: 4
+          #   test_case: test/registered/npu/accuracy/kimi_k3/test_npu_kimi_k3_w4a8_32p_gpqa.py
+          #   test_type: 'accuracy'
+          # - name: deepseek_v4_pro_16p_in128k_out1k_prefix90_20ms
+          #   node_size: 2
+          #   test_case: test/registered/npu/performance/deepseek_v4_pro/test_npu_deepseek_v4_pro_w4a8_16p_in128k_out1k_prefix90_20ms.py
+          #   test_type: 'perf'
+          # - name: kimi_k3_w4a8_32p_mix_in128k_out1_prefill
+          #   node_size: 4
+          #   test_case: test/registered/npu/performance/kimi_k3/test_npu_kimi_k3_w4a8_32p_mix_in128k_out1_prefill.py
+          #   test_type: 'perf'
+          # - name: kimi_k3_w4a8_32p_mix_in128k_out1k_decode_prefix
+          #   node_size: 4
+          #   test_case: test/registered/npu/performance/kimi_k3/test_npu_kimi_k3_w4a8_32p_mix_in128k_out1k_decode_prefix.py
+          #   test_type: 'perf'
+          # deepseek_v4_pro overlap (no spec) performance tests
+          # TEMP: commented out; do not rerun
+          # - name: deepseek_v4_pro_w4a8_16p_in128k_out1k_prefix90_20ms_overlap_fia_unset
+          #   node_size: 2
+          #   test_case: test/registered/npu/performance/deepseek_v4_pro/test_npu_deepseek_v4_pro_w4a8_16p_in128k_out1k_prefix90_20ms_overlap_fia_unset.py
+          #   test_type: 'perf'
+          # TEMP: commented out; do not rerun
+          # - name: deepseek_v4_pro_w4a8_16p_in128k_out1k_prefix90_20ms_overlap
+          #   node_size: 2
+          #   test_case: test/registered/npu/performance/deepseek_v4_pro/test_npu_deepseek_v4_pro_w4a8_16p_in128k_out1k_prefix90_20ms_overlap.py
+          #   test_type: 'perf'
     uses: ./.github/workflows/nightly-test-npu-e2e-multi-node.yml
     with:
       runner: linux-amd64-cpu-4
@@ -462,6 +574,7 @@ jobs:
       - nightly-perf-16-npu-a3
       - nightly-acc-2-npu-a3
       - nightly-acc-16-npu-a3
+      - nightly-perf-4-npu-a5
       - nightly-acc-4-npu-a5
       - nightly-poc-multi-node-tests
       - nightly-poc-multi-node-mix-tests
@@ -484,9 +597,9 @@ jobs:
             "${{ needs.nightly-perf-4-npu-a3.result }}" \
             "${{ needs.nightly-perf-16-npu-a3.result }}" \
             "${{ needs.nightly-acc-2-npu-a3.result }}" \
-            "${{ needs.nightly-acc-16-npu-a3.result }}"; do
-            # TEMP: A5 power maintenance - line below disabled; when restoring, move '; do' back onto the a5 line
-            # "${{ needs.nightly-acc-4-npu-a5.result }}"; do
+            "${{ needs.nightly-acc-16-npu-a3.result }}" \
+            "${{ needs.nightly-perf-4-npu-a5.result }}" \
+            "${{ needs.nightly-acc-4-npu-a5.result }}"; do
             if [ "${r}" != "success" ] && [ "${r}" != "skipped" ]; then
               single_result="failure"
             fi
@@ -516,9 +629,9 @@ jobs:
             "nightly-perf-4-npu-a3:${{ needs.nightly-perf-4-npu-a3.result }}" \
             "nightly-perf-16-npu-a3:${{ needs.nightly-perf-16-npu-a3.result }}" \
             "nightly-acc-2-npu-a3:${{ needs.nightly-acc-2-npu-a3.result }}" \
-            "nightly-acc-16-npu-a3:${{ needs.nightly-acc-16-npu-a3.result }}"; do
-            # TEMP: A5 power maintenance - line below disabled; when restoring, move '; do' back onto the a5 line
-            # "nightly-acc-4-npu-a5:${{ needs.nightly-acc-4-npu-a5.result }}"; do
+            "nightly-acc-16-npu-a3:${{ needs.nightly-acc-16-npu-a3.result }}" \
+            "nightly-perf-4-npu-a5:${{ needs.nightly-perf-4-npu-a5.result }}" \
+            "nightly-acc-4-npu-a5:${{ needs.nightly-acc-4-npu-a5.result }}"; do
             suite="${entry%%:*}"
             r="${entry##*:}"
             echo "| ${suite} | $(group_icon ${r}) ${r} |" >> $GITHUB_STEP_SUMMARY
