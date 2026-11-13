@@ -6,6 +6,13 @@ spec server (sequential -- one model resident at a time; see SpecParityKit).
 
 import unittest
 
+import pytest
+import torch
+
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
+
 from sglang.srt.environ import envs
 from sglang.srt.utils import is_xpu
 from sglang.test.ci.ci_register import register_cuda_ci, register_xpu_ci

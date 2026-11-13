@@ -15,7 +15,12 @@ import math
 import multiprocessing as mp
 import unittest
 
+import pytest
 import torch
+
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
 from jinja2.sandbox import ImmutableSandboxedEnvironment
 
 from sglang.srt.hf_transformers import get_tokenizer

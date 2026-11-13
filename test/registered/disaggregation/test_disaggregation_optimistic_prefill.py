@@ -250,6 +250,7 @@ class TestOptimisticPrefillFailure(PDDisaggregationServerBase):
         time.sleep(1)  # trigger memory check
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestOptimisticPrefillL3BufferWriteThrough(
     OptimisticPrefillRetryCounterMixin, PDDisaggregationServerBase
 ):

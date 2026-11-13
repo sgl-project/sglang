@@ -1,7 +1,12 @@
 import unittest
 from typing import Optional
 
+import pytest
 import torch
+
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
 
 from sglang.srt.configs.shared_experts import SharedExpertsConfig
 from sglang.srt.layers.moe.hash_topk import HashTopK

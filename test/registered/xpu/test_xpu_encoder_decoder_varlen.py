@@ -9,7 +9,12 @@ token-slot layout, for both cross-attn (non-causal) and decoder self-attn (causa
 
 import unittest
 
+import pytest
 import torch
+
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
 
 from sglang.srt.layers.attention.xpu_backend import XPUAttentionBackend
 from sglang.test.ci.ci_register import register_xpu_ci

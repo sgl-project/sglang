@@ -3,6 +3,9 @@ import tempfile
 import unittest
 from types import SimpleNamespace
 
+import pytest
+import torch
+
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.mmmu_vlm_kit import MMMUMultiModelTestBase
 from sglang.test.test_utils import is_in_ci
@@ -26,6 +29,7 @@ class TestVLMEncoderDP(MMMUMultiModelTestBase):
         "32",
     ]
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     def test_vlm_mmmu_benchmark(self):
         models_to_test = MODELS
 

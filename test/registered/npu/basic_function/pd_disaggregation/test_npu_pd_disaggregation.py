@@ -7,6 +7,13 @@ import time
 import unittest
 from typing import Dict
 
+import pytest
+import torch
+
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
+
 import requests
 
 from sglang.benchmark.utils import get_tokenizer

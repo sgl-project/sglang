@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import unittest
 
+import pytest
+import torch
+
 from sglang.srt.kv_canary.config import CanaryMode
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kv_canary.pp_fixture import CanaryPPFixture
@@ -13,6 +16,7 @@ register_amd_ci(est_time=320, stage="extra-a", runner_config="2-gpu-large-amd")
 class TestPPBaselineSwa(CanaryPPFixture):
     kv_canary_mode = CanaryMode.LOG
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     def test_no_violation(self) -> None:
         for _ in range(self.workload_n_batches):
             self.send_parallel_requests()

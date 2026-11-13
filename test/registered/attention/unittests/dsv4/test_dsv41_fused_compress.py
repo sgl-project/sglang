@@ -316,11 +316,13 @@ class TestFusedLowRatioCompress(CustomTestCase):
                 f"cache bytes differ from the unfused chain",
             )
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_matches_the_unfused_chain(self):
         for ratio in (1, 2):
             with self.subTest(ratio=ratio):
                 self._check_step(_build(64, ratio, seed=164 + ratio), ratio)
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_pair_state_survives_the_next_decode_step(self):
         t = _build(8, 2, seed=3000)
         t.req.copy_(t.req.roll(1))
@@ -344,6 +346,7 @@ class TestFusedLowRatioCompress(CustomTestCase):
         self._check_step(t, 2)
         self.assertTrue(torch.equal(state, expected_state))
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_padded_rows_publish_nothing(self):
         """A padded graph suffix carries raw_out_loc == 0 and out_loc == 0, which
         both kernels must read off the arrays (the caller passes no mask)."""
@@ -371,6 +374,7 @@ class TestFusedLowRatioCompress(CustomTestCase):
                 else:
                     self.assertFalse(t.index_cache[0][0, : INDEX_HEAD_DIM // 2].any())
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_open_group_rows_publish_nothing(self):
         """A live ratio-2 token at an even position completes no group, so the metadata
         gives it c2_out_loc == -1; an index-K writer taking that -1 straight from

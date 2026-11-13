@@ -8,6 +8,13 @@ import unittest
 from pathlib import Path
 from typing import ClassVar, Optional
 
+import pytest
+import torch
+
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
+
 from sglang.benchmark.one_batch_server import (
     BenchArgs,
     BenchOneCaseResult,

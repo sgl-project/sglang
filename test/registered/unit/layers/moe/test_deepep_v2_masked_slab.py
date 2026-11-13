@@ -100,20 +100,25 @@ class TestDeepEPv2MaskedSlab(CustomTestCase):
                     expected = (expected * weights[s + j]).to(masked_x.dtype).float()
                 torch.testing.assert_close(out[s + j].float(), expected)
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_roundtrip_bf16(self):
         self._check_expand_roundtrip([3, 0, 5, 1], torch.bfloat16, with_scale=False)
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_roundtrip_bf16_with_topk_weight(self):
         self._check_expand_roundtrip(
             [2, 4, 0, 7], torch.bfloat16, with_scale=False, topk=True
         )
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_roundtrip_fp8_with_scale(self):
         self._check_expand_roundtrip([3, 1, 6, 2], torch.float8_e4m3fn, with_scale=True)
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_empty_experts(self):
         self._check_expand_roundtrip([0, 0, 0, 0], torch.bfloat16, with_scale=False)
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_runner_defers_expanded_route_weighting(self):
         from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
         from sglang.srt.layers.moe.moe_runner.deep_gemm import (
@@ -156,6 +161,7 @@ class TestDeepEPv2MaskedSlab(CustomTestCase):
                 if no_combine:
                     self.assertTrue(torch.equal(output.topk_weights, weights))
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_runner_expanded_nonmasked_route_weighting(self):
         # Non-masked expanded (do_expand=True prefill) post_permute. Guards the
         # no_combine / deepep_v2_weight_prefused interaction: no_combine hands
@@ -260,16 +266,19 @@ class TestDeepEPv2MaskedSlab(CustomTestCase):
                 self.assertIs(output.topk_weights, weights)
                 self.assertEqual(output.routewise_layout, RoutewiseLayout.TOKEN_TOPK)
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_single_hot_expert(self):
         self._check_expand_roundtrip(
             [0, self.MAX_M, 0, 0], torch.bfloat16, with_scale=False, topk=True
         )
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_count_at_max_m_boundary(self):
         self._check_expand_roundtrip(
             [self.MAX_M, 1, self.MAX_M], torch.bfloat16, with_scale=False
         )
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_overflow_fails_fast(self):
         counts = [self.MAX_M + 1, 2]
         recv_x, scale, psum, starts, total = _build_layout(
@@ -303,6 +312,7 @@ class TestDeepEPv2MaskedSlab(CustomTestCase):
         self.assertNotEqual(recv_x_scale.stride(1), 1)
         return recv_x, recv_x_scale, psum, starts, total, hidden
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_fp8_packed_ue8m0_scale_from_production_quantizer(self):
         for group_size in (32, 128):
             with self.subTest(group_size=group_size):
@@ -326,6 +336,7 @@ class TestDeepEPv2MaskedSlab(CustomTestCase):
                 )
                 torch.testing.assert_close(masked_x_scale[e, j], recv_x_scale[s + j])
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_expand_under_cuda_graph_capture(self):
         for group_size in (32, 128):
             with self.subTest(group_size=group_size):

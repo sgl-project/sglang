@@ -7,6 +7,13 @@ import os
 import unittest
 from pathlib import Path
 
+import pytest
+import torch
+
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
+
 import requests
 
 from sglang.srt.hf_transformers import get_tokenizer

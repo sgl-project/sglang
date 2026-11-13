@@ -9,6 +9,13 @@ Covers GDN, SWA, tri-pool, and MLA layouts.
 import time
 import unittest
 
+import pytest
+import torch
+
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
+
 import requests
 
 from sglang.srt.utils import kill_process_tree

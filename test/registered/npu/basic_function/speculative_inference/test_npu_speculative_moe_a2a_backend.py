@@ -3,6 +3,13 @@ import unittest
 from types import SimpleNamespace
 from urllib.parse import urlparse
 
+import pytest
+import torch
+
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
+
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ascend.npu_eval_accuracy_kit import _is_pr_pipeline, run_npu_pr_smoke
 from sglang.test.ascend.test_ascend_utils import (

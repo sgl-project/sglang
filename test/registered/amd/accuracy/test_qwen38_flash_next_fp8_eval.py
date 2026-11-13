@@ -20,6 +20,13 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+import torch
+
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
+
 import requests
 
 from sglang.test.ci.ci_register import register_amd_ci

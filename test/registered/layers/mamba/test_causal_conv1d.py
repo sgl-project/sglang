@@ -444,6 +444,7 @@ def test_causal_conv1d_varlen(
     assert torch.allclose(unpadded_out, out_ref_tensor, rtol=rtol, atol=atol)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_causal_conv1d_varlen_mixed_input_and_state_dtype():
     """Initial states may be bf16 even when the current hidden states are fp16."""
     device = get_device()
@@ -545,6 +546,7 @@ def test_causal_conv1d_varlen_compiles_once_across_state_row_counts():
     assert num_compiled() == compiled
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("itype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize(
     "seqlen, case",

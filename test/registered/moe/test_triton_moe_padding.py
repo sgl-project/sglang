@@ -183,6 +183,7 @@ class TestTritonMoePadding(CustomTestCase):
                 ).to(x.dtype)
         return result
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_runner_observes_updated_batch_bound(self):
         """An inactive row must stay finite and zero through both expert GEMMs."""
         for dtype, quantized in [
@@ -227,6 +228,7 @@ class TestTritonMoePadding(CustomTestCase):
                                     output[:live], cropped, rtol=0.01, atol=2e-5
                                 )
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_inactive_routes_preserve_output_layouts(self):
         """Skipping a route must respect sorted, accumulated and half-width outputs."""
         x, logits, quant, _, router, batch, config = self._fixture(torch.bfloat16)

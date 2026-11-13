@@ -3,8 +3,13 @@
 import unittest
 from types import SimpleNamespace
 
+import pytest
 import torch
 import torch.nn.functional as F
+
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
 from aiter.ops.flydsl.moe_common import GateMode
 from aiter.ops.shuffle import shuffle_weight
 from aiter.ops.triton.quant import dynamic_mxfp4_quant

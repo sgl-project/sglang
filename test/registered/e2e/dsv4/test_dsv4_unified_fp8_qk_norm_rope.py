@@ -11,7 +11,12 @@ buffer (what the v4 nm asm reader takes), plain rotated bf16 when it does not
 
 import unittest
 
+import pytest
 import torch
+
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
 
 from sglang.kernels.ops.attention.fused_qk_norm_rope_store import (
     _HAS_GROUP_QUANT,

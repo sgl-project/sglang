@@ -7,6 +7,7 @@ import time
 import unittest
 
 import requests
+import torch
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_npu_ci
@@ -26,6 +27,7 @@ TEST_MODEL_MATRIX = {
 }
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestNPUMambaHiCache(CustomTestCase):
     """Exercise Mamba state write-back and L3 load-back on NPU."""
 
