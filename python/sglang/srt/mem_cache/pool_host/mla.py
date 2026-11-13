@@ -678,50 +678,19 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             binding = self._npu_layer_bindings[layer_id]
             if binding is None:
                 return
-            compressed = (
-                binding["device_index_k"] is not None
-                and binding["device_index_k"].shape[2] != binding["page_size"]
+            transfer(
+                device_indices=device_indices,
+                host_indices=host_indices,
+                **binding,
+                impl="auto",
             )
-            if compressed:
-                # compressed Indexer pages use a different page table
-                transfer(
-                    device_indices=device_indices,
-                    host_indices=host_indices,
-                    **{
-                        key: value
-                        for key, value in binding.items()
-                        if key
-                        not in (
-                            "device_index_k",
-                            "host_index_k",
-                            "device_index_k_scale",
-                            "host_index_k_scale",
-                            "device_index_layer_id",
-                            "host_index_layer_id",
-                        )
-                    },
-                    impl="auto",
-                )
-                ratio = binding["page_size"] // binding["device_index_k"].shape[2]
+            indexer = self._npu_indexer_layer_bindings.get(layer_id)
+            if indexer is not None:
+                ratio = self.page_size // indexer["page_size"]
                 transfer(
                     device_indices=device_indices[::ratio] // ratio,
                     host_indices=host_indices[::ratio] // ratio,
-                    device_k=binding["device_index_k"],
-                    host_k=binding["host_index_k"],
-                    device_v=binding["device_index_k"].new_empty(0),
-                    host_v=binding["host_index_k"].new_empty(0),
-                    device_index_k=binding["device_index_k_scale"],
-                    host_index_k=binding["host_index_k_scale"],
-                    page_size=binding["device_index_k"].shape[2],
-                    device_layer_id=binding["device_index_layer_id"],
-                    host_layer_id=binding["host_index_layer_id"],
-                    impl="auto",
-                )
-            else:
-                transfer(
-                    device_indices=device_indices,
-                    host_indices=host_indices,
-                    **binding,
+                    **indexer,
                     impl="auto",
                 )
         else:
@@ -803,6 +772,23 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
 
     def _init_npu_transfer_bindings(self):
         self._npu_layer_bindings = {}
+        self._npu_indexer_layer_bindings = {}
+        self._npu_indexer_backup = None
+        native = self._native_buffers
+        compressed_indexer = (
+            self.index_k_buffer is not None
+            and native.index_k.shape[2] != self.page_size
+        )
+        if compressed_indexer:
+            self._npu_indexer_backup = dict(
+                device_k=native.index_k,
+                host_k=self.index_k_buffer,
+                device_v=native.index_k.new_empty(0),
+                host_v=self.index_k_buffer.new_empty(0),
+                device_index_k_scale=native.index_scales,
+                host_index_k_scale=self.index_k_scale_buffer,
+                page_size=native.index_k.shape[2],
+            )
         pools = []
         layer_start = 0
         host_layer_axis = 0 if self.layout == "layer_first_kv_split" else 1
@@ -853,7 +839,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 )
                 if index_scale is not None and index_scale.ndim == 4:
                     index_scale = index_scale.unsqueeze(-1)
-                self._npu_layer_bindings[layer_id] = dict(
+                binding = dict(
                     device_k=layer_view(native.k, 0, device_layer),
                     host_k=layer_view(self.k_buffer, host_layer_axis, host_layer),
                     device_v=layer_view(native.v, 0, device_layer),
@@ -876,6 +862,30 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                     device_index_layer_id=0 if slot is not None else None,
                     host_index_layer_id=0 if slot is not None else None,
                 )
+                if slot is not None and compressed_indexer:
+                    # Reuse the layer views for the separate Indexer copy.
+                    self._npu_indexer_layer_bindings[layer_id] = dict(
+                        device_k=binding["device_index_k"],
+                        host_k=binding["host_index_k"],
+                        device_v=binding["device_index_k"].new_empty(0),
+                        host_v=binding["host_index_k"].new_empty(0),
+                        device_index_k_scale=binding["device_index_k_scale"],
+                        host_index_k_scale=binding["host_index_k_scale"],
+                        page_size=index_k.shape[2],
+                        device_layer_id=0,
+                        host_layer_id=0,
+                        device_index_layer_id=0,
+                        host_index_layer_id=0,
+                    )
+                    binding.update(
+                        device_index_k=None,
+                        host_index_k=None,
+                        device_index_k_scale=None,
+                        host_index_k_scale=None,
+                        device_index_layer_id=None,
+                        host_index_layer_id=None,
+                    )
+                self._npu_layer_bindings[layer_id] = binding
             layer_start = layer_end
         self._npu_pool_bindings = tuple(pools)
 
@@ -1054,53 +1064,31 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 transfer = transfer_kv_all_layer_kv_split
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
+            indexer_backup = self._npu_indexer_backup
             for native, host_k, host_v, is_target in self._npu_pool_bindings:
-                compressed = (
-                    native.index_k is not None
-                    and native.index_k.shape[2] != self.page_size
+                copy_indexer_with_kv = is_target and indexer_backup is None
+                transfer(
+                    device_indices=device_indices,
+                    host_indices=host_indices,
+                    device_k=native.k,
+                    host_k=host_k,
+                    device_v=native.v,
+                    host_v=host_v,
+                    device_index_k=native.index_k,
+                    host_index_k=self.index_k_buffer if copy_indexer_with_kv else None,
+                    device_index_k_scale=native.index_scales,
+                    host_index_k_scale=(
+                        self.index_k_scale_buffer if copy_indexer_with_kv else None
+                    ),
+                    page_size=self.page_size,
+                    impl="auto",
                 )
-                if compressed:
-                    # compressed Indexer pages use a different page table
+                if is_target and indexer_backup is not None:
+                    ratio = self.page_size // indexer_backup["page_size"]
                     transfer(
-                        device_indices=device_indices,
-                        host_indices=host_indices,
-                        device_k=native.k,
-                        host_k=host_k,
-                        device_v=native.v,
-                        host_v=host_v,
-                        page_size=self.page_size,
-                        impl="auto",
-                    )
-                    if is_target:
-                        ratio = self.page_size // native.index_k.shape[2]
-                        transfer(
-                            device_indices=device_indices[::ratio] // ratio,
-                            host_indices=host_indices[::ratio] // ratio,
-                            device_k=native.index_k,
-                            host_k=self.index_k_buffer,
-                            device_v=native.index_k.new_empty(0),
-                            host_v=host_k.new_empty(0),
-                            device_index_k=native.index_scales,
-                            host_index_k=self.index_k_scale_buffer,
-                            page_size=native.index_k.shape[2],
-                            host_layer_start=0,
-                            impl="auto",
-                        )
-                else:
-                    transfer(
-                        device_indices=device_indices,
-                        host_indices=host_indices,
-                        device_k=native.k,
-                        host_k=host_k,
-                        device_v=native.v,
-                        host_v=host_v,
-                        device_index_k=native.index_k,
-                        host_index_k=self.index_k_buffer if is_target else None,
-                        device_index_k_scale=native.index_scales,
-                        host_index_k_scale=(
-                            self.index_k_scale_buffer if is_target else None
-                        ),
-                        page_size=self.page_size,
+                        device_indices=device_indices[::ratio] // ratio,
+                        host_indices=host_indices[::ratio] // ratio,
+                        **indexer_backup,
                         impl="auto",
                     )
         else:
