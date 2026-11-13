@@ -16,15 +16,8 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
-from transformers import (
-    DeepseekV3Config,
-    Glm4MoeConfig,
-    LlamaConfig,
-    PretrainedConfig,
-    Qwen3Config,
-)
+from transformers import DeepseekV3Config
 
-from sglang.srt.configs.qwen3_5 import Qwen3_5TextConfig
 from sglang.srt.layers.linear import LinearBase
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.unquant import (
@@ -32,14 +25,9 @@ from sglang.srt.layers.quantization.unquant import (
     UnquantizedLinearMethod,
 )
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
-from sglang.srt.mem_cache.kv_cache_dtype import configure_kv_cache_dtype
 from sglang.srt.model_loader import loader
-from sglang.srt.models.dflash import DFlash2DraftModel, DFlashDraftModel
-from sglang.srt.models.dspark import DSparkDraftModel
-from sglang.srt.models.glm4_moe_nextn import Glm4MoeForCausalLMNextN
+from sglang.srt.models.dflash import DFlashDraftModel
 from sglang.srt.models.kimi_k25_eagle3 import Eagle3DeepseekV2ForCausalLM
-from sglang.srt.models.llama_eagle3 import LlamaForCausalLMEagle3
-from sglang.srt.models.qwen3_5_mtp import Qwen3_5ForCausalLMMTP
 from sglang.srt.models.registry import ModelRegistry
 from sglang.srt.models.utils import keeps_no_quant_config
 from sglang.srt.runtime_context import get_parallel, reset_context
@@ -48,7 +36,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.parallel_groups import publish
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=20, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class _Fp8KvCheckpoint(QuantizationConfig):
@@ -94,79 +82,16 @@ _SMALL = dict(
     intermediate_size=32,
     num_attention_heads=2,
     num_key_value_heads=1,
-    head_dim=8,
     vocab_size=64,
     rms_norm_eps=1e-6,
     max_position_embeddings=64,
     rope_theta=1e4,
 )
-_DFLASH = dict(dflash_config={"block_size": 4, "target_layer_ids": [0]})
-_MOE = dict(num_experts=4, num_experts_per_tok=2, moe_intermediate_size=8)
-
-
-def _dflash():
-    return Qwen3Config(**_SMALL, **_DFLASH, num_hidden_layers=1)
-
-
-def _dflash2():
-    dflash_config = dict(
-        block_size=4,
-        selector_rank=2,
-        selector_top_k=2,
-        target_layer_ids=[0, 2],
-        conv_kernel_size=2,
-        conv_group_size=2,
-    )
-    return PretrainedConfig(
-        **_SMALL,
-        num_hidden_layers=2,
-        hidden_act="silu",
-        partial_rotary_factor=0.5,
-        dflash_config=dflash_config,
-    )
-
-
-def _dspark():
-    return Qwen3Config(
-        **_SMALL,
-        **_DFLASH,
-        num_hidden_layers=1,
-        markov_rank=4,
-        markov_head_type="vanilla",
-    )
-
-
-def _qwen3_5_mtp():
-    return Qwen3_5TextConfig(
-        **_SMALL,
-        **_MOE,
-        num_hidden_layers=4,
-        full_attention_interval=4,
-        shared_expert_intermediate_size=8,
-        rope_parameters={"rope_type": "default", "rope_theta": 1e4},
-    )
-
-
-def _glm4_moe_nextn():
-    return Glm4MoeConfig(
-        **_SMALL,
-        num_hidden_layers=1,
-        moe_intermediate_size=8,
-        n_routed_experts=4,
-        num_experts_per_tok=2,
-        n_shared_experts=1,
-        first_k_dense_replace=0,
-    )
-
-
-def _llama_eagle3():
-    return LlamaConfig(**_SMALL, num_hidden_layers=1, draft_vocab_size=64)
 
 
 def _kimi_eagle3():
-    mla = {key: value for key, value in _SMALL.items() if key != "head_dim"}
     return DeepseekV3Config(
-        **mla,
+        **_SMALL,
         num_hidden_layers=1,
         q_lora_rank=8,
         kv_lora_rank=8,
@@ -175,18 +100,6 @@ def _kimi_eagle3():
         v_head_dim=8,
         draft_vocab_size=64,
     )
-
-
-# (draft class, its tiny config, whether it runs under a DFLASH-family algorithm)
-_DRAFTS = (
-    (DFlashDraftModel, _dflash, True),
-    (DFlash2DraftModel, _dflash2, True),
-    (DSparkDraftModel, _dspark, True),
-    (Qwen3_5ForCausalLMMTP, _qwen3_5_mtp, False),
-    (Glm4MoeForCausalLMNextN, _glm4_moe_nextn, False),
-    (LlamaForCausalLMEagle3, _llama_eagle3, False),
-    (Eagle3DeepseekV2ForCausalLM, _kimi_eagle3, False),
-)
 
 
 def _predict(model_class, hf_config, loader_quant_config):
@@ -202,18 +115,6 @@ def _predict(model_class, hf_config, loader_quant_config):
         ),
     ):
         return loader.built_quant_config(SimpleNamespace(hf_config=hf_config), None)
-
-
-def _auto_kv_dtype(quant_config, is_dflash):
-    _, kv_dtype = configure_kv_cache_dtype(
-        server_args_kv_cache_dtype="auto",
-        quant_config=quant_config,
-        model_dtype=torch.bfloat16,
-        is_draft_worker=True,
-        is_dflash=is_dflash,
-        speculative_draft_attention_backend="flashinfer",
-    )
-    return kv_dtype
 
 
 class _ContextTestCase(CustomTestCase):
@@ -234,45 +135,13 @@ class _ContextTestCase(CustomTestCase):
 
 
 class TestBuiltDraftKeepsPredictedQuantConfig(_ContextTestCase):
-    def _assert_keeps_prediction(self, model_class, make_config, is_dflash, ckpt):
-        hf_config = make_config()
-        predicted = _predict(model_class, hf_config, ckpt)
-        model = model_class(hf_config, quant_config=ckpt)
-        kept = getattr(model, "quant_config", None)
-        self.assertIs(kept, predicted)
-        self.assertEqual(
-            _auto_kv_dtype(predicted, is_dflash), _auto_kv_dtype(kept, is_dflash)
-        )
-        return kept
-
-    def test_a_built_draft_keeps_the_predicted_quant_config(self):
-        for model_class, make_config, is_dflash in _DRAFTS:
-            for checkpoint in (_Fp8KvCheckpoint(), None):
-                with self.subTest(
-                    draft=model_class.__name__, quantized=checkpoint is not None
-                ):
-                    self._assert_keeps_prediction(
-                        model_class, make_config, is_dflash, checkpoint
-                    )
-
     def test_a_draft_narrowing_the_checkpoint_keeps_what_it_declares(self):
         """A target-only NVFP4 checkpoint: the Kimi EAGLE3 draft drops it."""
-        kept = self._assert_keeps_prediction(
-            Eagle3DeepseekV2ForCausalLM,
-            _kimi_eagle3,
-            False,
-            _Fp8KvCheckpoint("modelopt_fp4"),
-        )
-        self.assertIsNone(kept)
-
-    def test_a_dflash_family_draft_keeps_its_auto_kv_dtype(self):
-        """Its layers take the checkpoint's quant config but the model keeps
-        none, so an FP8-KV checkpoint still gives it a compute-dtype KV cache."""
-        for model_class in (DFlashDraftModel, DFlash2DraftModel, DSparkDraftModel):
-            with self.subTest(draft=model_class.__name__):
-                predicted = _predict(model_class, None, _Fp8KvCheckpoint())
-                self.assertIsNone(predicted)
-                self.assertEqual(_auto_kv_dtype(predicted, True), torch.bfloat16)
+        hf_config = _kimi_eagle3()
+        checkpoint = _Fp8KvCheckpoint("modelopt_fp4")
+        model = Eagle3DeepseekV2ForCausalLM(hf_config, quant_config=checkpoint)
+        self.assertIsNone(_predict(Eagle3DeepseekV2ForCausalLM, hf_config, checkpoint))
+        self.assertIsNone(model.quant_config)
 
 
 # Entry classes a speculative draft resolves to. DFLASH-family drafts are

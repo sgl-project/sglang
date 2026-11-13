@@ -39,8 +39,9 @@ from sglang.srt.models.glm4_moe_lite import (
     Glm4MoeLiteDecoderLayer,
     Glm4MoeLiteForCausalLM,
 )
-from sglang.srt.runtime_context import get_parallel, get_spec
-from sglang.srt.utils import BumpAllocator, is_npu
+from sglang.srt.models.utils import npu_draft_quant_config
+from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils import BumpAllocator
 
 logger = logging.getLogger(__name__)
 
@@ -138,14 +139,7 @@ class Glm4MoeLiteForCausalLMNextN(Glm4MoeLiteForCausalLM):
     # The draft checkpoint reports the NextN architecture name.
     fused_shared_experts_architecture = "Glm4MoeLiteForCausalLMNextN"
 
-    @staticmethod
-    def own_quant_config(hf_config, quant_config):
-        """The quant config this class keeps, read before it is built to size
-        the draft's KV cache: an NPU draft runs unquantized unless a draft
-        quantization is named."""
-        if is_npu() and get_spec().speculative_draft_model_quantization is None:
-            return None
-        return quant_config
+    own_quant_config = staticmethod(npu_draft_quant_config)
 
     def __init__(
         self,

@@ -1038,8 +1038,6 @@ class DFlashDraftModel(nn.Module):
     supports_fused_context_kv = True
     # Layer prefixes and a quant_config-aware `fc`, for quantized checkpoints.
     supports_quantization = False
-    # Its layers take the loader's quant config; the model keeps none, so an
-    # `auto` draft KV cache resolves to the draft's compute dtype.
     own_quant_config = staticmethod(keeps_no_quant_config)
 
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:

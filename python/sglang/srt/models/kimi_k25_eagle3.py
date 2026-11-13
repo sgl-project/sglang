@@ -325,9 +325,7 @@ class Eagle3DeepseekV2ForCausalLM(nn.Module):
 
     @staticmethod
     def own_quant_config(hf_config, quant_config):
-        """The quant config this class keeps, read before it is built to size
-        the draft's KV cache. Match deepseek_nextn behavior: modelopt_fp4 is
-        target-only and the bf16 draft must not inherit the FP4 quant method."""
+        """Like deepseek_nextn: modelopt_fp4 is target-only; the draft is bf16."""
         if quant_config is not None and quant_config.get_name() == "modelopt_fp4":
             return None
         return quant_config

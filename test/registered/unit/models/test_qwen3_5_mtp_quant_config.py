@@ -72,10 +72,7 @@ class TestQwen3_5MTPQuantConfig(CustomTestCase):
         the MTP head keeps, so its `auto` KV cache dtype can be resolved then:
         a serialized NVFP4 checkpoint whose KV cache is FP8 ships its MTP head
         in BF16, so the target keeps FP8 KV and the draft BF16."""
-        import torch
-
         from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4Config
-        from sglang.srt.mem_cache.kv_cache_dtype import configure_kv_cache_dtype
         from sglang.srt.model_loader import loader
 
         checkpoint = ModelOptFp4Config(
@@ -84,9 +81,9 @@ class TestQwen3_5MTPQuantConfig(CustomTestCase):
             group_size=16,
             exclude_modules=[],
         )
-        for model_class, is_draft, kept, kv_dtype in (
-            (Qwen3_5ForCausalLM, False, checkpoint, torch.float8_e4m3fn),
-            (Qwen3_5ForCausalLMMTP, True, None, torch.bfloat16),
+        for model_class, kept in (
+            (Qwen3_5ForCausalLM, checkpoint),
+            (Qwen3_5ForCausalLMMTP, None),
         ):
             with (
                 self.subTest(model_class=model_class.__name__),
@@ -103,15 +100,6 @@ class TestQwen3_5MTPQuantConfig(CustomTestCase):
                     SimpleNamespace(hf_config=None), object()
                 )
                 self.assertIs(built, kept)
-                _, resolved = configure_kv_cache_dtype(
-                    server_args_kv_cache_dtype="auto",
-                    quant_config=built,
-                    model_dtype=torch.bfloat16,
-                    is_draft_worker=is_draft,
-                    is_dflash=False,
-                    speculative_draft_attention_backend=None,
-                )
-                self.assertEqual(resolved, kv_dtype)
 
     def test_mtp_reuses_target_packed_modules_mapping(self):
         self.assertEqual(

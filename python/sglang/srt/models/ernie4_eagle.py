@@ -100,7 +100,6 @@ class Ernie4ModelMTP(nn.Module):
 
 
 class Ernie4_5_MoeForCausalLMMTP(nn.Module):
-    # Its layers take the loader's quant config; the model keeps none.
     own_quant_config = staticmethod(keeps_no_quant_config)
 
     def __init__(

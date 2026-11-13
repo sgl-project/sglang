@@ -104,8 +104,6 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
 
     @staticmethod
     def own_quant_config(hf_config, quant_config):
-        """The quant config this class keeps, read before it is built to size
-        the draft's KV cache."""
         return _mtp_quant_config(quant_config)
 
     @staticmethod
