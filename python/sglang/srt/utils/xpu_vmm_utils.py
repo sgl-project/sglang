@@ -566,10 +566,6 @@ class XpuVmmBackend(VmmBackend):
     def torch_device(self) -> torch.device:
         return torch.device("xpu", self.device_id)
 
-    @property
-    def visible_devices_env(self) -> str:
-        return "ZE_AFFINITY_MASK"
-
     def _impl_granularity(self) -> int:
         return get_device_granularity(self.device_id)
 
