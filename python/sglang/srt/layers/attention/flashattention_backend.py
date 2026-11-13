@@ -1218,24 +1218,25 @@ class FlashAttentionBackend(AttentionBackend):
                 cols = offsets.expand(
                     forward_batch.seq_lens.numel(), -1
                 ) + forward_batch.seq_lens.unsqueeze(1)
-                cum_len = torch.nn.functional.pad(
-                    torch.cumsum(
-                        (
-                            forward_batch.seq_lens + self.speculative_num_draft_tokens
-                        ).repeat_interleave(self.speculative_num_draft_tokens),
-                        dim=0,
-                    ),
-                    (1, 0),
-                )[:-1]
-                mask_extraction_indices = (
-                    cols.repeat_interleave(self.speculative_num_draft_tokens, dim=0)
-                    + cum_len[:, None]
-                ).view(1, -1)
-                mask = forward_batch.spec_info.custom_mask[
-                    mask_extraction_indices
-                ].view(
-                    -1, self.speculative_num_draft_tokens
-                )  # (bsz * draft_num, draft_num)
+                d = self.speculative_num_draft_tokens
+                bsz_ = forward_batch.seq_lens.numel()
+                cm_ = forward_batch.spec_info.custom_mask
+                if cm_.numel() <= self.req_to_token_pool.size * d * d:
+                    if cm_.numel() < bsz_ * d * d:
+                        cm_ = cm_.as_strided((bsz_ * d * d,), (1,))
+                    mask = cm_.view(bsz_ * d, d)
+                else:
+                    cum_len = torch.nn.functional.pad(
+                        torch.cumsum(
+                            (forward_batch.seq_lens + d).repeat_interleave(d),
+                            dim=0,
+                        ),
+                        (1, 0),
+                    )[:-1]
+                    mask_extraction_indices = (
+                        cols.repeat_interleave(d, dim=0) + cum_len[:, None]
+                    ).view(1, -1)
+                    mask = cm_[mask_extraction_indices].view(-1, d)
 
                 # shift table indices to avoid padding
                 # non_masked_page_table [[8, 9, 10],   mask (display with int format) [[1, 0, 0],
@@ -3339,27 +3340,29 @@ class FlashAttentionBackend(AttentionBackend):
                 ).unsqueeze(0)  # shape: (1, self.speculative_num_draft_tokens)
 
                 cols = offsets.expand(seq_lens.numel(), -1) + seq_lens.unsqueeze(1)
-                cum_len = torch.nn.functional.pad(
-                    torch.cumsum(
-                        (
-                            seq_lens + self.speculative_num_draft_tokens
-                        ).repeat_interleave(self.speculative_num_draft_tokens),
-                        dim=0,
-                    ),
-                    (1, 0),
-                )[:-1]
-                mask_extraction_indices = (
-                    cols.repeat_interleave(self.speculative_num_draft_tokens, dim=0)
-                    + cum_len[:, None]
-                ).view(1, -1)
-                # avoid extracting padded seq indices which will be out of boundary
-                mask_extraction_indices[
-                    :,
-                    spec_info.positions.numel() * self.speculative_num_draft_tokens :,
-                ].fill_(0)
-                mask = spec_info.custom_mask[mask_extraction_indices].view(
-                    -1, self.speculative_num_draft_tokens
-                )  # (bsz * draft_num, draft_num)
+                d = self.speculative_num_draft_tokens
+                bsz_ = seq_lens.numel()
+                cm_ = spec_info.custom_mask
+                if cm_.numel() <= self.req_to_token_pool.size * d * d:
+                    if cm_.numel() < bsz_ * d * d:
+                        cm_ = cm_.as_strided((bsz_ * d * d,), (1,))
+                    mask = cm_.view(bsz_ * d, d)
+                else:
+                    cum_len = torch.nn.functional.pad(
+                        torch.cumsum(
+                            (seq_lens + d).repeat_interleave(d),
+                            dim=0,
+                        ),
+                        (1, 0),
+                    )[:-1]
+                    mask_extraction_indices = (
+                        cols.repeat_interleave(d, dim=0) + cum_len[:, None]
+                    ).view(1, -1)
+                    mask_extraction_indices[
+                        :,
+                        spec_info.positions.numel() * d :,
+                    ].fill_(0)
+                    mask = cm_[mask_extraction_indices].view(-1, d)
 
                 col_indices = offsets.expand(
                     mask.shape[0], self.speculative_num_draft_tokens
