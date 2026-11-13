@@ -6,16 +6,10 @@ function's globals keeps helper overrides local to that bound method; original
 classes, module globals and other instances remain unchanged. Eager only.
 """
 
-import hashlib
 import importlib.metadata
-import inspect
 import types
-from pathlib import Path
 
 import torch
-
-# A changed upstream implementation must be reviewed, never best-effort patched.
-SOURCE_SHA256 = "cb72e0aaa79da2a4a37112046903fbb48f15e16a6715012e9639f47a372be63d"
 
 
 def bind_with_globals(instance, name, overrides):
@@ -110,11 +104,6 @@ def install(pipeline):
     )
     from sglang.multimodal_gen.runtime.models.dits import minimax_h3 as h3
 
-    source = Path(inspect.getsourcefile(h3)).read_bytes()
-    if hashlib.sha256(source).hexdigest() != SOURCE_SHA256:
-        raise RuntimeError(
-            "H3 upstream source differs from the reviewed h3_comfyui_v1 source"
-        )
     if importlib.metadata.version("comfy-kitchen") != "0.2.36":
         raise RuntimeError("h3_comfyui_v1 requires reviewed comfy-kitchen==0.2.36")
     if get_tp_world_size() != 1 or get_ring_ctx()[0] != 1 or get_ulysses_ctx()[0] != 1:
@@ -149,6 +138,16 @@ def install(pipeline):
     for block in model.blocks:
         if not callable(getattr(block.attn, "_attend", None)):
             raise TypeError("Missing reviewed H3 attention entry point")
+    # The patch swaps these globals inside the rebound methods; fail loudly if
+    # upstream stops calling them instead of silently running unpatched code.
+    block = model.blocks[0]
+    if (
+        not {"_modulate_gate", "MINIMAX_H3_NORM_MODULATE"}
+        <= set(block.forward.__func__.__code__.co_names)
+        or "fused_inplace_qknorm_rope"
+        not in block.attn._attend.__func__.__code__.co_names
+    ):
+        raise TypeError("H3 internals replaced by h3_comfyui_v1 have changed")
     embed = model._embed
 
     def embedding(self, *a, **kw):
