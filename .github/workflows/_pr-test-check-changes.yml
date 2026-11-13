@@ -173,7 +173,7 @@ jobs:
               - "scripts/ci/runner_configs.yml"
               - "python/pyproject.toml"
               - "python/sglang/multimodal_gen/!(*.md|*.ipynb)"
-              - "python/sglang/multimodal_gen/!(apps|test)/**/!(*.md|*.ipynb)"
+              - "python/sglang/multimodal_gen/!(apps|test|*.md|*.ipynb)/**/!(*.md|*.ipynb)"
               - "python/sglang/multimodal_gen/{apps,test}/!(*.md|*.ipynb)"
               - "python/sglang/multimodal_gen/apps/!(ComfyUI_SGLDiffusion)/**/!(*.md|*.ipynb)"
               - "python/sglang/multimodal_gen/test/!(unit)/**/!(*.md|*.ipynb)"
