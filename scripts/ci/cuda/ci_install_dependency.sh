@@ -1,7 +1,7 @@
 #!/bin/bash
 # Install dependencies for CUDA CI jobs.
 #
-# CU_VERSION (default: cu130) controls PyTorch index URL, FlashInfer JIT cache
+# CU_VERSION (default: cu134) controls PyTorch index URL, FlashInfer JIT cache
 # index, and the sglang wheel index. CUDA 13 only.
 set -euxo pipefail
 
@@ -33,8 +33,10 @@ mark_step_done() {
 configure_environment() {
     # CU_VERSION controls PyTorch index URL, FlashInfer JIT cache index, and
     # the sglang wheel index. Only CUDA 13 lanes exist: PyTorch 2.14 publishes
-    # no CUDA 12 wheels for the cu129 index the retired cu12 lane used.
-    CU_VERSION="${CU_VERSION:-cu130}"
+    # no CUDA 12 wheels for the cu129 index the retired cu12 lane used, and
+    # torch 2.15 is published for cu134 but not cu130. Workflows also set
+    # CU_VERSION explicitly, since some runners export an older value.
+    CU_VERSION="${CU_VERSION:-cu134}"
     CU_STRIP="${CU_VERSION#cu}"
     case "${CU_STRIP}" in
         13*) ;;
@@ -541,12 +543,15 @@ uninstall_stale_flashinfer() {
 
 install_pytorch_stack() {
     PYTORCH_SPECS=()
-    for package in torch torchaudio torchvision torchcodec; do
+    for package in torch torchaudio torchvision; do
         spec=$(grep -Po -m1 "\"${package}([<>=!~ ;][^\"]*)?\"" python/pyproject.toml | tr -d '"' || true)
         if [ -n "$spec" ]; then
             PYTORCH_SPECS+=("$spec")
         fi
     done
+    # torchcodec has no cu134 build on the PyTorch index; its PyPI wheel is
+    # installed separately so the PyTorch-index-only install above can resolve.
+    TORCHCODEC_SPEC=$(grep -Po -m1 '"torchcodec([<>=!~ ;][^"]*)?"' python/pyproject.toml | tr -d '"' || true)
 
     # A cancelled install can leave dist-info without files, which uv then skips.
     REINSTALL_ARGS=$(python3 -c '
@@ -564,6 +569,11 @@ for name in ("torch", "torchaudio", "torchvision", "torchcodec", "triton"):
         "${PYTORCH_SPECS[@]}" \
         $REINSTALL_ARGS \
         --index-url "https://download.pytorch.org/whl/${CU_VERSION}"
+
+    # --no-deps keeps the PyPI resolve from swapping the torch installed above.
+    if [ -n "$TORCHCODEC_SPEC" ]; then
+        $PIP_CMD install "$TORCHCODEC_SPEC" --no-deps $PIP_INSTALL_SUFFIX
+    fi
 
     mark_step_done "${FUNCNAME[0]}"
 }
@@ -626,7 +636,12 @@ install_sglang() {
     if [ -n "${RUNNER_NAME:-}" ]; then
         editable_cache_dir="${editable_cache_dir}/runners/${RUNNER_NAME}"
     fi
-    UV_CACHE_DIR="$editable_cache_dir" $PIP_CMD install -e "python[${EXTRAS}]" $PIP_INSTALL_SUFFIX
+    # The override lifts the torch==2.14.1 pin of the not yet rebuilt kernel
+    # wheels; the extra index keeps the cu134 torch build in scope, since an
+    # override drops the pyproject's [tool.uv.sources] entry for torch.
+    UV_CACHE_DIR="$editable_cache_dir" $PIP_CMD install -e "python[${EXTRAS}]" $PIP_INSTALL_SUFFIX \
+        --extra-index-url "https://download.pytorch.org/whl/${CU_VERSION}" \
+        --override "${REPO_ROOT}/scripts/ci/torch-override.txt"
 
     # Defensive: some runners ended up with nvidia-cusparselt-cu13 metadata
     # present but libcusparseLt.so.0 missing on disk, breaking any torch import.

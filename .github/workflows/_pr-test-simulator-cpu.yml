@@ -68,7 +68,8 @@ jobs:
         env:
           UV_SYSTEM_PYTHON: "1"
         run: |
-          uv pip install -e "python" --index-strategy unsafe-best-match --prerelease allow
+          # TODO: drop the override once the pinned kernel wheels require torch 2.15.
+          uv pip install -e "python" --index-strategy unsafe-best-match --prerelease allow --override scripts/ci/torch-override.txt
           uv pip install pytest
           uv pip install "./tools/sglang-simulator[aisimulate]"
 

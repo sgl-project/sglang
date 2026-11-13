@@ -63,6 +63,11 @@ permissions:
   actions: read
 
 env:
+  # PyTorch stack for scripts/ci/cuda/ci_install_dependency.sh. Set here because
+  # some self-hosted runners export an older CU_VERSION into the job environment.
+  CU_VERSION: cu134
+  # torch 2.15's NCCL2 path crashes EPLB rebalance (#45456, docker/Dockerfile.cu134).
+  TORCH_DIST_USE_NCCL2: "0"
   SGLANG_IS_IN_CI: true
   SGLANG_CUDA_COREDUMP: "1"
   OUTPUT_NAME: ${{ inputs.output_name || 'diffusion-ci-outputs' }}
