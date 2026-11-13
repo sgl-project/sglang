@@ -1231,8 +1231,8 @@ class DFlashDraftModel(nn.Module):
         draft scope reads both widths as 1.
         """
         self.split_fc = (
-            not self.quantizable
-            and envs.SGLANG_OPT_DFLASH_SPLIT_FC.get()
+            envs.SGLANG_OPT_DFLASH_SPLIT_FC.get()
+            and isinstance(self.fc, nn.Linear)
             and get_parallel().attn_dp_size == 1
             and get_parallel().attn_cp_size == 1
         )
