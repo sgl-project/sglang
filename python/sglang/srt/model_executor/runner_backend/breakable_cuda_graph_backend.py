@@ -134,14 +134,13 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseBreakableGraphBackend
         capture_inputs: Optional[Any] = None,
         post_warmup_hook: Optional[Callable[[], None]] = None,
     ) -> None:
-        warmup_out = None
-        for _ in range(2):
-            self._device_module.synchronize()
-            self._tp_group.barrier()
-            with self._precarve.measure():
-                warmup_out = forward_fn()
-            if post_warmup_hook is not None:
-                post_warmup_hook()
+        # One eager run pays the JIT, autotune and lazy allocation of this shape.
+        self._device_module.synchronize()
+        self._tp_group.barrier()
+        with self._precarve.measure():
+            warmup_out = forward_fn()
+        if post_warmup_hook is not None:
+            post_warmup_hook()
 
         graph = BreakableCUDAGraph(
             self.deduped_cuda_graph, hicache_graph_events=self._hicache_graph_events

@@ -1917,7 +1917,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # workspace cleanup between iterations; suppress it for BCG so
         # DSV4's hook (which restores forward_metadata to a stale
         # _current_capture_raw left over from decode CG capture) doesn't
-        # corrupt warmup iter 2's metadata read.
+        # corrupt the capture's metadata read.
         if isinstance(self.backend, BreakableCudaGraphBackend):
             post_warmup_hook = None
             req_pool = self.model_runner.req_to_token_pool
