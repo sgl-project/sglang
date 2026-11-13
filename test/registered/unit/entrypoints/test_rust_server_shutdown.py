@@ -21,7 +21,13 @@ from sglang.srt.entrypoints import engine
 from sglang.srt.entrypoints import sidecar as sidecar_module
 from sglang.srt.managers.io_struct import ShutdownReq
 from sglang.srt.managers.scheduler_components.dp_attn import DRAIN_STATE_NO_LISTENER
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import (
+    SpawnRanks,
+    create_context,
+    get_context,
+    get_parallel,
+    use_context,
+)
 from sglang.srt.rust_server import shutdown as rust_shutdown
 from sglang.srt.rust_server.server import (
     DRAIN_CLOSED,
@@ -30,6 +36,7 @@ from sglang.srt.rust_server.server import (
     RustServer,
     claim_sigterm_before_compiles,
 )
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -130,9 +137,32 @@ def _dp_listener(fake, *, hold, attn_dp_size=3, force_env=False, monkeypatch=Non
         monkeypatch.setenv("SGLANG_FORCE_SHUTDOWN", "1")
     server = RustServer(fake, http_port=0)
     server._broadcasts_shutdown = hold
-    with get_parallel().override(attn_dp_size=attn_dp_size):
+    context = create_context(
+        ServerArgs(model_path="dummy", tp_size=attn_dp_size, attn_dp_size=attn_dp_size),
+        role="test",
+    )
+    with use_context(context):
         server.install_sigterm_drain(hold_drain_end=hold)
     return server
+
+
+def test_dp_listener_preserves_an_existing_topology(restore_sigterm):
+    context = create_context(ServerArgs(model_path="dummy"), role="test")
+    fake = _FakeServer()
+    try:
+        with use_context(context):
+            server = _dp_listener(fake, hold=True)
+            assert get_context() is context
+            assert get_parallel().tp_size == 1
+            assert get_parallel().attn_dp_size == 1
+            fake.begin_drain(False)
+            fake.closed = True
+            server.on_drain_rows([DRAINING | CLOSED] * 3)
+            assert fake.releases == 1
+    finally:
+        signal.set_wakeup_fd(-1)
+        os.close(fake.read_fd)
+        os.close(fake.write_fd)
 
 
 def test_any_draining_listener_drains_every_listener(restore_sigterm):
@@ -238,9 +268,15 @@ def _hold_scheduler(**parallel):
     scheduler = Scheduler.__new__(Scheduler)
     scheduler.require_mlp_sync = parallel.pop("require_mlp_sync", True)
     scheduler.rust_server_endpoints = [{}] * parallel.pop("endpoints", 2)
-    fields = dict(tp_rank=0, attn_dp_size=2, dp_size=1, pp_size=1, num_dp_ranks=2)
+    tp_rank = parallel.pop("tp_rank", 0)
+    fields = dict(tp_size=2, attn_dp_size=2, dp_size=1, pp_size=1)
     fields.update(parallel)
-    return scheduler, fields
+    context = create_context(
+        ServerArgs(model_path="dummy", **fields),
+        role="test",
+        ranks=SpawnRanks(world_rank=tp_rank),
+    )
+    return scheduler, context
 
 
 @pytest.mark.parametrize(
@@ -248,7 +284,7 @@ def _hold_scheduler(**parallel):
     [
         (dict(), True),
         (dict(tp_rank=1), False),
-        (dict(attn_dp_size=1, num_dp_ranks=1, endpoints=1), False),
+        (dict(attn_dp_size=1, endpoints=1), False),
         # `--dp-size` replicas with a gathered buffer: each its own listener.
         (dict(attn_dp_size=1, dp_size=2, endpoints=1), False),
         (dict(endpoints=1), False),
@@ -262,9 +298,9 @@ def test_rank_0_holds_its_drain_end_only_where_every_step_gathers(case, hold):
 
     case = dict(case)
     skip = case.pop("skip_all_gather", False)
-    scheduler, fields = _hold_scheduler(**case)
+    scheduler, context = _hold_scheduler(**case)
     with (
-        get_parallel().override(**fields),
+        use_context(context),
         envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.override(skip),
     ):
         assert scheduler._holds_rust_drain_end() is hold
