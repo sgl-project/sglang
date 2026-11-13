@@ -423,9 +423,9 @@ class MambaAttnBackendBase(AttentionBackend):
                 0 if in_capture else getattr(forward_batch, "num_padding", None)
             ),
             in_capture=in_capture,
-            mamba_track_indices=forward_batch.mamba_track_indices,
-            ragged_verify_layout=forward_batch.ragged_verify_layout,
-            extend_seq_lens=forward_batch.extend_seq_lens,
+            mamba_track_indices=getattr(forward_batch, "mamba_track_indices", None),
+            ragged_verify_layout=getattr(forward_batch, "ragged_verify_layout", None),
+            extend_seq_lens=getattr(forward_batch, "extend_seq_lens", None),
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
