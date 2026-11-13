@@ -1,4 +1,6 @@
+import sys
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 
 import requests
@@ -11,11 +13,26 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    is_in_ci,
     popen_launch_server,
     terminate_and_kill_process_tree,
 )
 
-register_cuda_ci(est_time=526, stage="nightly", runner_config="8-gpu-h200")
+# The rerun workflow executes this file directly from ``test/``.  Python then
+# puts only ``test/registered/ep`` on sys.path, so add the test root before
+# importing the manual modules that provide the CI entry-point wrappers.
+TEST_ROOT = Path(__file__).resolve().parents[2]
+if str(TEST_ROOT) not in sys.path:
+    sys.path.insert(0, str(TEST_ROOT))
+
+from manual.ep.test_elastic_scale import (
+    TestElasticScaleUp4To6 as _TestElasticScaleUp4To6,
+)
+from manual.ep.test_nixl_ep import (
+    TestNixlEPTP as _TestNixlEPTP,
+)
+
+register_cuda_ci(est_time=1050, stage="base-c", runner_config="8-gpu-h200")
 
 DEEPSEEK_V32_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2"
 
@@ -23,6 +40,8 @@ DEEPSEEK_V32_MODEL_PATH = "deepseek-ai/DeepSeek-V3.2"
 class TestDeepseekMTP(CustomTestCase):
     @classmethod
     def setUpClass(cls):
+        if is_in_ci():
+            raise unittest.SkipTest("DeepEP large tests are disabled in CI")
         cls.model = DEFAULT_DEEPEP_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
@@ -101,6 +120,8 @@ class TestDeepseekMTP(CustomTestCase):
 class TestDeepseekV32TBO(CustomTestCase):
     @classmethod
     def setUpClass(cls):
+        if is_in_ci():
+            raise unittest.SkipTest("DeepEP large tests are disabled in CI")
         cls.model = DEEPSEEK_V32_MODEL_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
         other_args = [
@@ -148,6 +169,19 @@ class TestDeepseekV32TBO(CustomTestCase):
         acc_length, speed = send_one_prompt(args)
 
         print(f"{speed=:.2f}")
+
+
+class TestNixlEPTP(_TestNixlEPTP):
+    """CI entry point for the registered NIXL EP test."""
+
+
+@unittest.skip("Elastic EP scale test is temporarily disabled in registered CI")
+class TestElasticScaleUp4To6(_TestElasticScaleUp4To6):
+    """CI entry point for the registered Elastic EP scale test."""
+
+    # Scaling mutates the live service from EP4 to EP6 and cannot be replayed
+    # against the same process after a post-scale assertion failure.
+    expect_server_exit = True
 
 
 if __name__ == "__main__":
