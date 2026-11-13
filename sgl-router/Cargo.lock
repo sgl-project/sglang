@@ -3830,6 +3830,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sglang-api-types",
+ "sha2",
  "thiserror 2.0.20",
  "tokenizers",
  "tracing",
