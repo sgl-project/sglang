@@ -271,6 +271,10 @@ python/sglang/kernels/aot/csrc/**/*_musa/
 # never tracked/pushed.
 test/registered/xpu/test_nvidia_nemotron_3_nano.py
 
+# Local-only NPU container patch sets: kept on disk for private deployments,
+# never tracked/pushed.
+scripts/ci/npu/patches/
+
 # Others
 # diffusion 3D outputs
 *.glb
