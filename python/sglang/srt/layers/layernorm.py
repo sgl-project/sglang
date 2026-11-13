@@ -1534,7 +1534,12 @@ class Gemma3RMSNorm(BaseFusedOp):
             return x, residual
         if x.dim() == 2:
             return gemma_rmsnorm(x, self.weight.data, self.eps)
-        return self.forward_native(x)
+        if x.numel() == 0:
+            return x
+        # q_norm and k_norm get [tokens, heads, head_dim]. The norm reduces over
+        # the last dim only, so flatten the leading dims for the fused kernel.
+        flat = x.contiguous().view(-1, x.shape[-1])
+        return gemma_rmsnorm(flat, self.weight.data, self.eps).view(x.shape)
 
     def forward_xpu(self, x, residual: Optional[torch.Tensor] = None):
         if residual is not None and x.dim() == 2:
@@ -1658,26 +1663,3 @@ class Gemma4RMSNorm(BaseFusedOp):
         # sgl_kernel's gemma_rmsnorm is not available on ROCm;
         # delegate to the pure-PyTorch implementation.
         return self.forward_native(x)
-
-
-class RMSNormWithoutScale(BaseFusedOp):
-    def __init__(self, hidden_size: int, eps=1e-6):
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.eps = eps
-
-    def _norm(self, x):
-        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-
-    def forward_native(self, x):
-        orig_dtype = x.dtype
-        x = x.float()
-        variance = x.pow(2).mean(dim=-1, keepdim=True)
-        x = x * torch.rsqrt(variance + self.eps)
-        return x.to(orig_dtype)
-
-    def forward_cuda(self, x):
-        return self.forward_native(x)
-
-    def extra_repr(self):
-        return f"{self.hidden_size}, eps={self.eps}"

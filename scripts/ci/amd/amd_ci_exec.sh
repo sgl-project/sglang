@@ -1,5 +1,8 @@
 #!/bin/bash
 set -euo pipefail
+# Container the CI steps run in. Spur jobs that share a node give each job its
+# own; everywhere else it stays ci_sglang.
+CI_CONTAINER_NAME="${CI_CONTAINER_NAME:-ci_sglang}"
 
 # Detect GPU family from hostname (e.g., linux-mi35x-gpu-1-xxxxx-runner-zzzzz)
 HOSTNAME_VALUE=$(hostname)
@@ -69,7 +72,7 @@ done
 if docker exec \
   -w "$WORKDIR" \
   "${ENV_ARGS[@]}" \
-  ci_sglang "$@"; then
+  "$CI_CONTAINER_NAME" "$@"; then
   exit 0
 else
   FIRST_EXIT_CODE=$?
@@ -94,4 +97,4 @@ docker exec \
   -w "$WORKDIR" \
   "${ENV_ARGS[@]}" \
   -e HF_HUB_OFFLINE=1 \
-  ci_sglang "$@"
+  "$CI_CONTAINER_NAME" "$@"
