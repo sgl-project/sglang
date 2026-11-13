@@ -1078,6 +1078,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             # A DFLASH draft KV ring has no draft KV entries to reslice: it
             # sends its replicated window rows as a DRAFT_RING state instead.
             and StateType.DRAFT_RING not in self.kv_args.state_types
+            and self.kv_args.num_draft_entries > 0
         ):
             # Appended draft MHA KV uses physical TP shards, while target MLA
             # KV is replicated. The draft transfer cannot reslice those shards.
