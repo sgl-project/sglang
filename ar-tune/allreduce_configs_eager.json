@@ -1,0 +1,269 @@
+{
+  "mode": "eager",
+  "env": "SGLANG_TUNED_EAGER_CONFIG",
+  "tp_size": 8,
+  "qr_quant": "INT4",
+  "selection_config": "ar-tune/selection_config.json",
+  "qr_cast_bf16_to_fp16": 1,
+  "ignore_acr_max_size": false,
+  "ignore_scr_max_size": false,
+  "num_iters": 500,
+  "ingraph_calls": null,
+  "timing": "median",
+  "configs": [
+    {
+      "size_bytes": 6384,
+      "backend": "custom_allreduce_v2",
+      "time_us": 10.440000332891941,
+      "tp_size": 8,
+      "dtype": "torch.bfloat16"
+    },
+    {
+      "size_bytes": 65536,
+      "backend": "custom_allreduce_v2",
+      "time_us": 11.320499703288078,
+      "tp_size": 8,
+      "dtype": "torch.bfloat16"
+    },
+    {
+      "size_bytes": 131072,
+      "backend": "custom_allreduce_v2",
+      "time_us": 11.121000163257122,
+      "tp_size": 8,
+      "dtype": "torch.bfloat16"
+    },
+    {
+      "size_bytes": 262144,
+      "backend": "custom_allreduce_v2",
+      "time_us": 14.279999770224094,
+      "tp_size": 8,
+      "dtype": "torch.bfloat16"
+    },
+    {
+      "size_bytes": 524288,
+      "backend": "aiter_custom_allreduce",
+      "time_us": 16.55999943614006,
+      "tp_size": 8,
+      "dtype": "torch.bfloat16"
+    },
+    {
+      "size_bytes": 1048576,
+      "backend": "aiter_custom_allreduce",
+      "time_us": 17.360500060021877,
+      "tp_size": 8,
+      "dtype": "torch.bfloat16"
+    },
+    {
+      "size_bytes": 2097152,
+      "backend": "aiter_custom_allreduce",
+      "time_us": 23.041000589728355,
+      "tp_size": 8,
+      "dtype": "torch.bfloat16"
+    },
+    {
+      "size_bytes": 4194304,
+      "backend": "quick_allreduce_flydsl_INT4",
+      "time_us": 22.960999980568886,
+      "tp_size": 8,
+      "dtype": "torch.bfloat16"
+    },
+    {
+      "size_bytes": 8388608,
+      "backend": "quick_allreduce_flydsl_INT4",
+      "time_us": 25.840999558568,
+      "tp_size": 8,
+      "dtype": "torch.bfloat16"
+    },
+    {
+      "size_bytes": 16777216,
+      "backend": "quick_allreduce_flydsl_INT4",
+      "time_us": 42.48100146651268,
+      "tp_size": 8,
+      "dtype": "torch.bfloat16"
+    },
+    {
+      "size_bytes": 33554432,
+      "backend": "quick_allreduce_flydsl_INT4",
+      "time_us": 68.64099949598312,
+      "tp_size": 8,
+      "dtype": "torch.bfloat16"
+    },
+    {
+      "size_bytes": 67108864,
+      "backend": "quick_allreduce_flydsl_INT4",
+      "time_us": 123.84100258350372,
+      "tp_size": 8,
+      "dtype": "torch.bfloat16"
+    },
+    {
+      "size_bytes": 134217728,
+      "backend": "quick_allreduce_flydsl_INT4",
+      "time_us": 216.88300371170044,
+      "tp_size": 8,
+      "dtype": "torch.bfloat16"
+    },
+    {
+      "size_bytes": 268435456,
+      "backend": "quick_allreduce_flydsl_INT4",
+      "time_us": 418.0850088596344,
+      "tp_size": 8,
+      "dtype": "torch.bfloat16"
+    }
+  ],
+  "measurements": [
+    {
+      "size_bytes": 6384,
+      "times_us": {
+        "sglang_custom_allreduce": 15.080000273883343,
+        "aiter_custom_allreduce": 15.340499579906464,
+        "custom_allreduce_v2": 10.440000332891941,
+        "nccl": 14.519999735057354,
+        "quick_allreduce_INT4": null,
+        "quick_allreduce_flydsl_INT4": null
+      }
+    },
+    {
+      "size_bytes": 65536,
+      "times_us": {
+        "sglang_custom_allreduce": 15.860499814152718,
+        "aiter_custom_allreduce": 17.019999213516712,
+        "custom_allreduce_v2": 11.320499703288078,
+        "nccl": 14.639999717473984,
+        "quick_allreduce_INT4": null,
+        "quick_allreduce_flydsl_INT4": null
+      }
+    },
+    {
+      "size_bytes": 131072,
+      "times_us": {
+        "sglang_custom_allreduce": 16.039999201893806,
+        "aiter_custom_allreduce": 17.000499181449413,
+        "custom_allreduce_v2": 11.121000163257122,
+        "nccl": 14.879999682307243,
+        "quick_allreduce_INT4": null,
+        "quick_allreduce_flydsl_INT4": 23.280500434339046
+      }
+    },
+    {
+      "size_bytes": 262144,
+      "times_us": {
+        "sglang_custom_allreduce": 18.200000748038292,
+        "aiter_custom_allreduce": 16.7005006223917,
+        "custom_allreduce_v2": 14.279999770224094,
+        "nccl": 15.720000490546227,
+        "quick_allreduce_INT4": null,
+        "quick_allreduce_flydsl_INT4": 24.380499497056007
+      }
+    },
+    {
+      "size_bytes": 524288,
+      "times_us": {
+        "sglang_custom_allreduce": 19.23999935388565,
+        "aiter_custom_allreduce": 16.55999943614006,
+        "custom_allreduce_v2": 19.920000806450844,
+        "nccl": 21.880000829696655,
+        "quick_allreduce_INT4": null,
+        "quick_allreduce_flydsl_INT4": 23.240000009536743
+      }
+    },
+    {
+      "size_bytes": 1048576,
+      "times_us": {
+        "sglang_custom_allreduce": 22.71999977529049,
+        "aiter_custom_allreduce": 17.360500060021877,
+        "custom_allreduce_v2": 31.08000010251999,
+        "nccl": 25.63999965786934,
+        "quick_allreduce_INT4": null,
+        "quick_allreduce_flydsl_INT4": 23.761000484228134
+      }
+    },
+    {
+      "size_bytes": 2097152,
+      "times_us": {
+        "sglang_custom_allreduce": 30.321000143885612,
+        "aiter_custom_allreduce": 23.041000589728355,
+        "custom_allreduce_v2": 23.11999909579754,
+        "nccl": 35.88100150227547,
+        "quick_allreduce_INT4": 35.280000418424606,
+        "quick_allreduce_flydsl_INT4": 23.080499842762947
+      }
+    },
+    {
+      "size_bytes": 4194304,
+      "times_us": {
+        "sglang_custom_allreduce": 44.44050043821335,
+        "aiter_custom_allreduce": 32.48000144958496,
+        "custom_allreduce_v2": 33.67999941110611,
+        "nccl": 46.90050147473812,
+        "quick_allreduce_INT4": 38.679998368024826,
+        "quick_allreduce_flydsl_INT4": 22.960999980568886
+      }
+    },
+    {
+      "size_bytes": 8388608,
+      "times_us": {
+        "sglang_custom_allreduce": 72.76099920272827,
+        "aiter_custom_allreduce": 51.800500601530075,
+        "custom_allreduce_v2": 55.26049993932247,
+        "nccl": 71.92099839448929,
+        "quick_allreduce_INT4": 50.36100000143051,
+        "quick_allreduce_flydsl_INT4": 25.840999558568
+      }
+    },
+    {
+      "size_bytes": 16777216,
+      "times_us": {
+        "sglang_custom_allreduce": 128.4410059452057,
+        "aiter_custom_allreduce": 90.92099964618683,
+        "custom_allreduce_v2": 107.96099901199341,
+        "nccl": 114.62150141596794,
+        "quick_allreduce_INT4": 82.64099806547165,
+        "quick_allreduce_flydsl_INT4": 42.48100146651268
+      }
+    },
+    {
+      "size_bytes": 33554432,
+      "times_us": {
+        "sglang_custom_allreduce": null,
+        "aiter_custom_allreduce": 170.36199569702148,
+        "custom_allreduce_v2": null,
+        "nccl": 213.60250562429428,
+        "quick_allreduce_INT4": 134.92199778556824,
+        "quick_allreduce_flydsl_INT4": 68.64099949598312
+      }
+    },
+    {
+      "size_bytes": 67108864,
+      "times_us": {
+        "sglang_custom_allreduce": null,
+        "aiter_custom_allreduce": 327.8439939022064,
+        "custom_allreduce_v2": null,
+        "nccl": 400.424987077713,
+        "quick_allreduce_INT4": 220.50200402736664,
+        "quick_allreduce_flydsl_INT4": 123.84100258350372
+      }
+    },
+    {
+      "size_bytes": 134217728,
+      "times_us": {
+        "sglang_custom_allreduce": null,
+        "aiter_custom_allreduce": 652.3680090904236,
+        "custom_allreduce_v2": null,
+        "nccl": 673.4485030174255,
+        "quick_allreduce_INT4": 384.86500084400177,
+        "quick_allreduce_flydsl_INT4": 216.88300371170044
+      }
+    },
+    {
+      "size_bytes": 268435456,
+      "times_us": {
+        "sglang_custom_allreduce": null,
+        "aiter_custom_allreduce": 1300.9160161018372,
+        "custom_allreduce_v2": null,
+        "nccl": 1305.675983428955,
+        "quick_allreduce_INT4": 848.970502614975,
+        "quick_allreduce_flydsl_INT4": 418.0850088596344
+      }
+    }
+  ]
+}
