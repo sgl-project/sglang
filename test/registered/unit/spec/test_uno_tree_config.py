@@ -62,33 +62,23 @@ class TestUnoXpuConfig(CustomTestCase):
             _handle_uno(server_args)
 
     def test_supported_xpu_configs_start(self):
-        """Linear UNO runs with or without XPU decode graphs on either XPU
-        attention backend; tree UNO with graphs runs on triton."""
-        for decode_graph_backend in (Backend.DISABLED, Backend.FULL):
-            for attention_backend in ("intel_xpu", "triton"):
-                with self.subTest(
-                    decode_graph_backend=decode_graph_backend,
-                    attention_backend=attention_backend,
-                ):
-                    self._handle(
-                        _xpu_args(
-                            decode_graph_backend=decode_graph_backend,
-                            attention_backend=attention_backend,
+        """Linear and tree UNO start on either XPU attention backend, with or
+        without XPU decode graphs."""
+        for tree in (False, True):
+            for decode_graph_backend in (Backend.DISABLED, Backend.FULL):
+                for attention_backend in ("intel_xpu", "triton"):
+                    with self.subTest(
+                        tree=tree,
+                        decode_graph_backend=decode_graph_backend,
+                        attention_backend=attention_backend,
+                    ):
+                        self._handle(
+                            _xpu_args(
+                                decode_graph_backend=decode_graph_backend,
+                                attention_backend=attention_backend,
+                                tree=tree,
+                            )
                         )
-                    )
-        self._handle(
-            _xpu_args(
-                decode_graph_backend=Backend.FULL,
-                attention_backend="triton",
-                tree=True,
-            )
-        )
-
-    def test_intel_xpu_tree_graph_is_rejected(self):
-        """intel_xpu graphs lack tree-verify metadata, so a captured tree
-        verify would attend through stale cascade metadata."""
-        with self.assertRaisesRegex(ValueError, "requires --attention-backend triton"):
-            self._handle(_xpu_args(decode_graph_backend=Backend.FULL, tree=True))
 
 
 class TestUnoTreeConfig(CustomTestCase):
