@@ -7,9 +7,9 @@ under `python/sglang/multimodal_gen/test/unit/`.
 
 ## Test Files
 
-- `test_zimage_pipeline.py` - Z-Image native pipeline under `--comfyui-mode`
-- `test_flux_pipeline.py` - Flux native pipeline under `--comfyui-mode`
-- `test_qwen_image_pipeline.py` - Qwen-Image native pipeline under `--comfyui-mode`
+- `test_zimage_pipeline.py` - Z-Image native pipeline under `comfyui_mode`
+- `test_flux_pipeline.py` - Flux native pipeline under `comfyui_mode`
+- `test_qwen_image_pipeline.py` - Qwen-Image native pipeline under `comfyui_mode`
 - `test_qwen_image_edit_pipeline.py` - Qwen-Image-Edit native pipeline (I2I/edit; experimental)
 
 ## Running Tests

@@ -39,7 +39,7 @@ import numpy as np
 import orjson
 import requests
 from tqdm.asyncio import tqdm
-from transformers import AutoTokenizer, PreTrainedTokenizerBase
+from transformers import PreTrainedTokenizerBase
 
 from sglang.benchmark.datasets import DatasetRow, get_dataset
 from sglang.benchmark.datasets.mooncake import get_mooncake_request_over_time
@@ -54,7 +54,7 @@ from sglang.benchmark.utils import (
     remove_prefix,
     set_ulimit,
 )
-from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST
+from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST
 from sglang.srt.utils.network import resolve_base_url, resolve_host_port
 
 _ROUTING_KEY_HEADER = "X-SMG-Routing-Key"
@@ -1968,13 +1968,10 @@ async def benchmark(
     return result | result_details
 
 
-def check_chat_template(model_path):
-    try:
-        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-        return "chat_template" in tokenizer.init_kwargs
-    except Exception as e:
-        print(f"Fail to load tokenizer config with error={e}")
-        return False
+def has_chat_template(tokenizer) -> bool:
+    return bool(getattr(tokenizer, "chat_template", None)) or (
+        "chat_template" in getattr(tokenizer, "init_kwargs", {})
+    )
 
 
 def set_global_args(args_: argparse.Namespace):
@@ -2136,12 +2133,6 @@ def run_benchmark(args_: argparse.Namespace):
         print("No model specified or found. Please provide a model using `--model`.")
         sys.exit(1)
 
-    if args.backend not in _EMBEDDING_BACKENDS and not check_chat_template(args.model):
-        print(
-            "\nWARNING It is recommended to use the `Chat` or `Instruct` model for benchmarking.\n"
-            "Because when the tokenizer counts the output tokens, if there is gibberish, it might count incorrectly.\n"
-        )
-
     if (
         args.backend in _EMBEDDING_BACKENDS
         and args.dataset_name in _EMBEDDING_UNSUPPORTED_DATASETS
@@ -2184,6 +2175,11 @@ def run_benchmark(args_: argparse.Namespace):
         tokenizer_id = args.model
 
     tokenizer = get_tokenizer(tokenizer_id)
+    if args.backend not in _EMBEDDING_BACKENDS and not has_chat_template(tokenizer):
+        print(
+            "\nWARNING It is recommended to use the `Chat` or `Instruct` model for benchmarking.\n"
+            "Because when the tokenizer counts the output tokens, if there is gibberish, it might count incorrectly.\n"
+        )
     input_requests = get_dataset(args, tokenizer, model_id)
 
     # compatible with SimpleNamespace
@@ -2259,13 +2255,20 @@ def _goodput_slo(pair: str) -> Tuple[str, float]:
 def _validate_parsed_gsp_args(
     parser: argparse.ArgumentParser, args: argparse.Namespace
 ) -> None:
-    """Reject malformed GSP distribution/alpha combinations at parse time.
+    """Reject unsupported GSP argument combinations at parse time.
 
     Invoked from the CLI entry point right after ``parser.parse_args()`` so
     users see a clear argparse-style error before any server, model, or
     tokenizer setup runs and masks the real cause with an unrelated network
     failure.
     """
+    if (
+        getattr(args, "dataset_name", None) == "generated-shared-prefix"
+        and getattr(args, "tokenize_prompt", False)
+        and getattr(args, "gsp_num_turns", 1) > 1
+    ):
+        parser.error("--tokenize-prompt requires --gsp-num-turns=1")
+
     distribution = getattr(args, "gsp_group_distribution", None)
     alpha = getattr(args, "gsp_zipf_alpha", None)
     if distribution == "zipf" and alpha is None:

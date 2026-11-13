@@ -47,6 +47,9 @@ class MoeRunnerConfig:
     params_dtype: Optional[torch.dtype] = None
     routing_method_type: Optional[RoutingMethodType] = None
 
+    # None denotes a direct kernel with standard TopK and local expert IDs.
+    runner_backend: Optional[MoeRunnerBackendLike] = None
+
     # Runner configuration
     activation: str = "silu"
     is_gated: bool = True
@@ -176,6 +179,9 @@ class FusedOpPool:
     def register_fused_func(
         cls, a2a_backend_name: str, runner_backend_name: str, fused_func: Callable
     ):
+        # Key by the canonical value, which is what lookups pass, so a
+        # deprecated alias such as "flashinfer" still registers correctly.
+        a2a_backend_name = MoeA2ABackend(a2a_backend_name).value
         key = (a2a_backend_name, runner_backend_name)
         if key in cls._fused_funcs:
             raise ValueError(

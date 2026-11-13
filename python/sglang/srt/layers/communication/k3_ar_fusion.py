@@ -1,13 +1,11 @@
 """K3 MNNVL fused all-reduce dispatch.
 
-Auto-enabled on SM100/SM103 when CustomAllReduceV2 with multicast is
-available; ``SGLANG_K3_AR_FUSION`` overrides in either direction (0 = off,
+Auto-enabled on SM100/SM103 when the TP symmetric workspace has multicast; ``SGLANG_K3_AR_FUSION`` overrides in either direction (0 = off,
 1 = attempt anywhere and warn when unavailable).
 
 Glue between the model and the
 ``kernels.ops.communication.all_reduce_residual`` kernels. Small messages take
-the 1shot multicast-push through the group's CustomAllReduceV2
-workspace; large ones take the in-place NVLS 2shot, which needs its input to be a
+the 1shot multicast-push through the group's symmetric workspace; large ones take the in-place NVLS 2shot, which needs its input to be a
 :func:`symm_buffer` slice and otherwise falls back to the regular all-reduce.
 
 Call-site contract when the fusion is active: ``enabled()`` was
@@ -28,8 +26,8 @@ from sglang.kernels.jit.utils import cache_once
 from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
-    from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
-        CustomAllReduceV2,
+    from sglang.srt.distributed.device_communicators.symm_workspace import (
+        WorkspaceLease,
     )
 
 logger = logging.getLogger(__name__)
@@ -50,9 +48,20 @@ MOE_LATENT_SHARED = "moe_latent_shared"
 
 
 class _State(NamedTuple):
-    comm: CustomAllReduceV2
-    world_size: int
+    lease: WorkspaceLease
     group_name: str
+
+    @property
+    def push_slot_bytes(self) -> int:
+        return self.lease.request.push_slot_bytes
+
+    @property
+    def rank(self) -> int:
+        return self.lease.rank
+
+    @property
+    def world_size(self) -> int:
+        return self.lease.world_size
 
 
 @cache_once
@@ -64,7 +73,7 @@ def _get_state() -> Optional[_State]:
     else:
         # Auto-probe: only SM100/SM103, and not under --enable-symm-mem or EP
         # a2a (their allocator contexts misroute the buffers the pull needs).
-        from sglang.srt.utils.common import get_device_sm
+        from sglang.srt.utils.device import get_device_sm
 
         if get_device_sm() not in (100, 103):
             return None
@@ -81,36 +90,40 @@ def _get_state() -> Optional[_State]:
                 a2a_backend,
             )
             return None
-    from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
-        CustomAllReduceV2,
+    from sglang.srt.distributed.device_communicators.symm_workspace import (
+        V2_PUSH_SLOT,
+        WorkspaceRequest,
+        request_group_workspace,
     )
     from sglang.srt.runtime_context import get_parallel
 
     if get_parallel().tp_size <= 1:
         return None
     group = get_parallel().tp_group
-    comm = group.ca_comm
-    if (
-        not isinstance(comm, CustomAllReduceV2)
-        or comm.disabled
-        or not comm.has_multicast
-    ):
+    # pull barriers only; any request gets at least one semaphore per SM
+    lease = request_group_workspace(
+        group,
+        WorkspaceRequest(
+            owner="k3_ar_fusion", push_slot_bytes=V2_PUSH_SLOT, semaphores=1
+        ),
+    )
+    if lease is None or not lease.has_multicast:
         if explicit:
             logger.warning(
-                "SGLANG_K3_AR_FUSION requested but CustomAllReduceV2 with multicast "
+                "SGLANG_K3_AR_FUSION requested but a multicast symmetric workspace "
                 "is unavailable; falling back to the regular all-reduce path."
             )
         else:
             logger.info(
-                "K3 all-reduce fusion auto-probe: CustomAllReduceV2 with "
-                "multicast is unavailable; using the regular all-reduce path."
+                "K3 all-reduce fusion auto-probe: a multicast symmetric workspace "
+                "is unavailable; using the regular all-reduce path."
             )
         return None
     from sglang.kernels.ops.communication import all_reduce_residual as mod
 
-    mod.register_comm(comm.obj)
-    logger.info("K3 all-reduce fusion enabled (world_size=%d)", comm.world_size)
-    return _State(comm, comm.world_size, group.cpu_group.group_name)
+    mod.register_comm(lease.get_communicator, world_size=lease.world_size)
+    logger.info("K3 all-reduce fusion enabled (world_size=%d)", lease.world_size)
+    return _State(lease, group.cpu_group.group_name)
 
 
 def enabled() -> bool:
@@ -237,7 +250,7 @@ def all_reduce(
     if x.shape[0] == 0:
         return x if residual is None else x + residual
     nbytes = x.numel() * 2
-    if nbytes <= min(_PUSH_MAX_BYTES, state.comm.max_push_size):
+    if nbytes <= min(_PUSH_MAX_BYTES, state.push_slot_bytes):
         return mod.all_reduce_push_res(state.world_size, x, residual)
     return mod.all_reduce_pull_res(
         state.world_size, x, residual, input_mc_ptr=get_mc_ptr(x)
@@ -288,7 +301,7 @@ def all_reduce_norm(
     if x.shape[0] == 0:
         return x
     nbytes = x.numel() * 2
-    if nbytes <= min(_PUSH_MAX_BYTES, state.comm.max_push_size):
+    if nbytes <= min(_PUSH_MAX_BYTES, state.push_slot_bytes):
         return mod.all_reduce_push_norm(
             state.world_size,
             x,
@@ -312,26 +325,67 @@ def finalize_push_fits(num_tokens: int) -> bool:
     state = _get_state()
     assert state is not None
     nbytes = num_tokens * NORM_DIM * 2
-    return nbytes <= min(_PUSH_MAX_BYTES, state.comm.max_push_size)
+    return nbytes <= min(_PUSH_MAX_BYTES, state.push_slot_bytes)
+
+
+# Largest batch where the sharded up_proj tail beats the replicated GEMM + add3,
+# measured on GB300 TP8 (the only TP size KimiK3MoE runs the tail at).
+_SHARDED_UP_MAX_TOKENS = 256
 
 
 def gemm_ag_up_fits(num_tokens: int) -> bool:
-    """Whether :func:`gemm_ag_up_proj` covers this decode batch: TP8, within the
-    kernel's win range, and the staging slice fits a push slot."""
+    """Whether :func:`gemm_ag_up_proj` covers this decode batch: within its
+    row window (the fused-GEMV range only under SGLANG_K3_SHARDED_MOE=0), and
+    the [world, M, 7168 / world] staging fits a push slot."""
     from sglang.kernels.ops.communication import gemm_ag as mod
 
     state = _get_state()
     assert state is not None
-    comm = state.comm
-    return (
-        0 < num_tokens <= mod.MAX_TOKENS
-        and state.world_size == 8
-        and num_tokens * (2 * NORM_DIM // 8) * 2 <= comm.max_push_size
-        # The GEMV producer reads a single phase counter, so its grid is not
-        # bound to the counter array; the spin consumer still needs one block
-        # per counter slot plus the cleanup block.
-        and comm.config.num_push_blocks >= 2
+    max_tokens = (
+        _SHARDED_UP_MAX_TOKENS
+        if envs.SGLANG_K3_SHARDED_MOE.get()
+        else mod.GEMV_MAX_TOKENS
     )
+    return (
+        0 < num_tokens <= max_tokens
+        and num_tokens * (2 * NORM_DIM // state.world_size) * 2 <= state.push_slot_bytes
+    )
+
+
+# Warp split-K's row limit for a slice GEMM; TGV above. Both beat cuBLAS at
+# every decode M, measured on GB300 with CUDA graphs.
+_SLICE_WARP_SPLITK_MAX_TOKENS = 32
+
+
+def slice_gemm(
+    x: torch.Tensor, weight: torch.Tensor, out_dtype: torch.dtype = torch.bfloat16
+) -> torch.Tensor:
+    """``x @ weight.T`` for this rank's row block of a TP-sharded weight: the
+    sharded MoE front's [block | gate_up] (fp32 out) and the up_proj slice."""
+    from sglang.srt.layers.quantization.unquant import get_bf16_gemm_backend
+    from sglang.srt.model_executor.runner_utils.capture_mode import (
+        get_is_capture_mode,
+    )
+
+    m, n = x.shape[0], weight.shape[0]
+    if not get_bf16_gemm_backend().is_cutedsl():
+        if out_dtype == x.dtype:
+            return torch.nn.functional.linear(x, weight)
+        return torch.mm(x, weight.t(), out_dtype=out_dtype)
+    out = x.new_empty((m, n), dtype=out_dtype)
+    # warp split-K compiles per M: only captured batches (a fixed set of M) take it,
+    # and its 16- or 32-column output tiles must divide N (not the TP16 front's 1048)
+    if m <= _SLICE_WARP_SPLITK_MAX_TOKENS and n % 16 == 0 and get_is_capture_mode():
+        from sglang.kernels.ops.gemm.dense_bf16_gemm_warp_splitk import (
+            default_tactic,
+            run_warp_splitk_dense,
+        )
+
+        tactic = default_tactic(m, n, weight.shape[1])
+        return run_warp_splitk_dense(x, weight.t(), out, pdl=True, tactic=tactic)
+    from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import cutedsl_bf16_gemm_out
+
+    return cutedsl_bf16_gemm_out(x, weight, out)
 
 
 def gemm_ag_up_proj(
@@ -340,13 +394,18 @@ def gemm_ag_up_proj(
     b: torch.Tensor,
     c: Optional[torch.Tensor],
 ) -> torch.Tensor:
-    """``up_proj(x) + b (+ c)`` via column-parallel GEMV + multicast all-gather +
-    fused add3. ``weight`` is the FULL replicated up_proj (the kernel slices this
-    rank's rows). Caller checked :func:`gemm_ag_up_fits`."""
+    """``up_proj(x) + b (+ c)`` with the up_proj sharded by output column over
+    TP. ``weight`` is the FULL replicated up_proj. Caller checked
+    :func:`gemm_ag_up_fits`."""
     from sglang.kernels.ops.communication import gemm_ag as mod
 
     state = _get_state()
     assert state is not None
+    if x.shape[0] > mod.GEMV_MAX_TOKENS:
+        rows = weight.shape[0] // state.world_size
+        rank = state.rank
+        local = slice_gemm(x, weight[rank * rows : (rank + 1) * rows])
+        return mod.gather_add3(state.world_size, local, b, c, torch.empty_like(b))
     return mod.gemm_ag_up_proj(
         state.world_size,
         x,
@@ -355,6 +414,30 @@ def gemm_ag_up_proj(
         c,
         torch.empty_like(b),
     )
+
+
+def moe_front_all_gather_fits(num_tokens: int, n_local: int) -> bool:
+    """Whether :func:`moe_front_all_gather` covers a ``[num_tokens, n_local]``
+    fp32 block: it fits a push slot."""
+    state = _get_state()
+    assert state is not None
+    return (
+        num_tokens > 0
+        and n_local % 4 == 0
+        and num_tokens * n_local * 4 <= state.push_slot_bytes
+    )
+
+
+def moe_front_all_gather(local: torch.Tensor) -> torch.Tensor:
+    """``[M, world * n_local]`` fp32 column all-gather of this rank's
+    ``[M, n_local]`` block, whose rows may be strided (rank-major columns).
+    Caller checked :func:`moe_front_all_gather_fits`."""
+    from sglang.kernels.ops.communication import moe_front_ag as mod
+
+    state = _get_state()
+    assert state is not None
+    out = local.new_empty((local.shape[0], local.shape[1] * state.world_size))
+    return mod.moe_front_all_gather(state.world_size, local, out)
 
 
 def finalize_all_reduce_push_norm(

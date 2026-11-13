@@ -233,6 +233,45 @@ class Wan2_2_TI2V_5B_SamplingParam(Wan2_2_Base_SamplingParams):
         ]
     )
 
+    def _adjust_visual_fields(self, server_args, pipeline_config) -> None:
+        super()._adjust_visual_fields(server_args, pipeline_config)
+        self._align_resolution(pipeline_config)
+
+    def prepare_synthetic_warmup_request_for_queue(self, req, server_args) -> None:
+        # Warmup overwrites the dimensions after _adjust has run.
+        self._align_resolution(server_args.pipeline_config)
+
+    def _align_resolution(self, pipeline_config) -> None:
+        from sglang.multimodal_gen.configs.pipeline_configs.wan import (
+            Wan2_2_TI2V_5B_Config,
+        )
+
+        # The DiT floors an odd latent side when it splits it into 2x2 patches,
+        # so its output no longer matches the latents. The diffusers backend
+        # keeps its own size handling.
+        if not isinstance(pipeline_config, Wan2_2_TI2V_5B_Config):
+            return
+        if self.width is None or self.height is None:
+            return
+        if self.width <= 0 or self.height <= 0:
+            return
+        multiple = (
+            pipeline_config.vae_stride[1]
+            * pipeline_config.dit_config.arch_config.patch_size[1]
+        )
+        requested_size = (self.width, self.height)
+        self.width = max(multiple, self.width // multiple * multiple)
+        self.height = max(multiple, self.height // multiple * multiple)
+        if (self.width, self.height) != requested_size:
+            logger.warning(
+                "Wan2.2 TI2V requires dimensions divisible by %s; adjusted "
+                "requested resolution from %sx%s to %sx%s",
+                multiple,
+                *requested_size,
+                self.width,
+                self.height,
+            )
+
 
 @dataclass
 class Wan2_2_T2V_A14B_SamplingParam(Wan2_2_Base_SamplingParams):
@@ -392,6 +431,27 @@ class Wan_Animate_2_14B_SamplingParam(Wan2_2_Base_SamplingParams):
                 "length follows the reference video; clip_len=%s is the per-clip chunk",
                 self.num_frames,
                 self.clip_len,
+            )
+
+
+@dataclass
+class Wan_Animate_2_14B_Distilled_SamplingParam(Wan_Animate_2_14B_SamplingParam):
+    """Sampling defaults for the distilled Wan-Animate-2 14B checkpoint (10 steps, no CFG)."""
+
+    # Guidance is distilled into the weights; the stage runs a single forward at 1.0.
+    guidance_scale: float = 1.0
+    num_inference_steps: int = 10
+
+    def _validate_with_pipeline_config(self, pipeline_config) -> None:
+        super()._validate_with_pipeline_config(pipeline_config)
+        # Runs once per request on the merged params. ValueError like the base hook's
+        # input checks: the /v1/videos handler maps it to HTTP 400.
+        if self.guidance_scale != 1.0:
+            raise ValueError(
+                f"guidance_scale={self.guidance_scale} is not supported by the "
+                "distilled Wan-Animate-2 checkpoint: it samples at guidance_scale 1.0 "
+                "only (the distilled recipe has no unconditional branch); omit the "
+                "field or set it to 1.0."
             )
 
 
