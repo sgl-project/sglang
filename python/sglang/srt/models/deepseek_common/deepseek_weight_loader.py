@@ -80,6 +80,21 @@ if _use_aiter_gfx95:
 
 logger = logging.getLogger(__name__)
 
+
+_mla_absorb_bf16_logged = False
+
+
+def _log_mla_absorb_bf16_once() -> None:
+    global _mla_absorb_bf16_logged
+    if not _mla_absorb_bf16_logged:
+        _mla_absorb_bf16_logged = True
+        log_info_on_rank0(
+            logger,
+            "SGLANG_USE_MLA_ABSORB_BF16=1: keeping kv_b_proj MLA-absorb weights in "
+            "BF16 (skipping quark mxfp4 re-quant)",
+        )
+
+
 _EXPERT_INPUT_SCALE_RE = re.compile(r"(?:^|\.)experts\.\d+\.w[123]\.input_scale$")
 
 
@@ -846,9 +861,14 @@ class DeepseekV2WeightLoaderMixin:
                 == "DeepseekV3ForCausalLM"  # Avoid processing other models like GlmMoeDsaForCausalLM
                 and w.dtype not in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
             ):
-                w_kc, self_attn.w_scale_k, w_vc, self_attn.w_scale_v = (
-                    quark_post_load_weights(self_attn, w, "mxfp4")
-                )
+                if envs.SGLANG_USE_MLA_ABSORB_BF16.get():
+                    # Keep w_kc / w_vc in BF16 for the absorbed bmm instead of
+                    # re-quantizing them to mxfp4.
+                    _log_mla_absorb_bf16_once()
+                else:
+                    w_kc, self_attn.w_scale_k, w_vc, self_attn.w_scale_v = (
+                        quark_post_load_weights(self_attn, w, "mxfp4")
+                    )
 
             if not use_deep_gemm_bmm:
                 self_attn.w_kc = bind_or_assign(

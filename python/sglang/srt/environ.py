@@ -1059,6 +1059,10 @@ class Envs:
     SGLANG_AITER_INTREE_GEMM_TUNE = EnvBool(True)
     # TODO(aiter#6030): remove once ROCm/aiter#6030 is in the aiter pin
     SGLANG_AITER_INTREE_MHC_TILE_M16 = EnvBool(True)
+    # gfx95 quark DeepSeek-V3/R1: keep the kv_b_proj MLA-absorb weights (w_kc /
+    # w_vc) in BF16 instead of re-quantizing them to mxfp4, for accuracy at
+    # tight gates (MLPerf DeepSeek-R1 99%).
+    SGLANG_USE_MLA_ABSORB_BF16 = EnvBool(False)
     # Fuse MiniMax-M3 main/index QK norm + RoPE with main KV and index-K cache
     # insertion. Requires an AITER build with the fp8_e4m3_unit cache contract.
     # Enabled by default for supported configurations; set to 0 to disable.
