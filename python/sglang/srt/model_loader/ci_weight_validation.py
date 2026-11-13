@@ -11,7 +11,6 @@ import json
 import logging
 import os
 import re
-import shutil
 import tempfile
 import time
 from typing import List, Optional, Tuple
@@ -481,31 +480,6 @@ def _cleanup_corrupted_files_selective(
     return cleaned_count
 
 
-def _cleanup_corrupted_model_cache(
-    model_name_or_path: str, snapshot_dir: str, reason: str
-) -> None:
-    # Full-cache delete: for when the affected files are unknown.
-    # Navigate up to the model root directory: snapshots/hash -> snapshots -> model_root
-    repo_folder = os.path.abspath(os.path.join(snapshot_dir, "..", ".."))
-
-    try:
-        logger.warning(
-            "Removing entire cache for %s at %s. Reason: %s",
-            model_name_or_path,
-            repo_folder,
-            reason,
-        )
-        shutil.rmtree(repo_folder)
-        logger.info("Successfully removed corrupted cache directory")
-    except Exception as e:
-        logger.error(
-            "Failed to remove corrupted cache directory %s: %s. "
-            "Manual cleanup may be required.",
-            repo_folder,
-            e,
-        )
-
-
 def ci_validate_and_cleanup_local_snapshot(
     model_name_or_path: str,
     found_local_snapshot_dir: str,
@@ -523,12 +497,8 @@ def ci_validate_and_cleanup_local_snapshot(
         log_info_on_rank0(
             logger,
             f"Found {len(incomplete_files)} .incomplete files in {blobs_dir} for "
-            f"{model_name_or_path}. Will clean up and re-download.",
-        )
-        _cleanup_corrupted_model_cache(
-            model_name_or_path,
-            found_local_snapshot_dir,
-            f"Incomplete download detected ({len(incomplete_files)} incomplete files)",
+            f"{model_name_or_path}. Will re-download without deleting the shared "
+            "model cache.",
         )
         return False
 
