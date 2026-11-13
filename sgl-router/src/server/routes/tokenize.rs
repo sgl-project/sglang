@@ -42,23 +42,20 @@ pub struct DetokenizeResponse {
     pub text: String,
 }
 
-/// Distinguish a served model started with `--tokenizer-path none` from an unknown one.
-pub(crate) fn tokenizer_for(ctx: &AppContext, model: &str) -> Result<Arc<Tokenizer>, ApiError> {
-    let model = ctx.config.model.served_name(model);
-    ctx.tokenizers.get(model).ok_or_else(|| {
-        if model == ctx.config.model.id {
-            ApiError::BadRequest(format!("tokenizer disabled for model {model}"))
-        } else {
-            ApiError::ModelNotFound(model.to_owned())
-        }
-    })
+/// The served model's tokenizer. One model is served, so any `model` name uses
+/// it; a model started with `--no-tokenizer` has none.
+pub(crate) fn served_tokenizer(ctx: &AppContext) -> Result<Arc<Tokenizer>, ApiError> {
+    let model = &ctx.config.model.id;
+    ctx.tokenizers
+        .get(model)
+        .ok_or_else(|| ApiError::BadRequest(format!("tokenizer disabled for model {model}")))
 }
 
 pub async fn tokenize(
     State(ctx): State<Arc<AppContext>>,
     Json(req): Json<TokenizeRequest>,
 ) -> Result<Json<TokenizeResponse>, ApiError> {
-    let tok = tokenizer_for(&ctx, &req.model)?;
+    let tok = served_tokenizer(&ctx)?;
     // Structured log on failure so an operator can correlate
     // "every encode for model X errors" against the route, model id, and
     // prompt size. The generic anyhow-chain log in ApiError::Internal still
@@ -86,7 +83,7 @@ pub async fn detokenize(
     State(ctx): State<Arc<AppContext>>,
     Json(req): Json<DetokenizeRequest>,
 ) -> Result<Json<DetokenizeResponse>, ApiError> {
-    let tok = tokenizer_for(&ctx, &req.model)?;
+    let tok = served_tokenizer(&ctx)?;
     let text =
         off_worker::run(|| adapter::decode_complete(&tok, &req.tokens, req.skip_special_tokens))
             .map_err(|e| {
@@ -167,19 +164,6 @@ mod tests {
             worker_registry,
             policies,
         ))
-    }
-
-    /// A `--model-alias` tokenizes as `--model-id`; another name stays not found.
-    #[test]
-    fn tokenizer_for_resolves_model_alias() {
-        let mut ctx = Arc::try_unwrap(ctx_with_tiny()).ok().unwrap();
-        ctx.config.model.aliases = vec!["/snapshots/tiny".into()];
-        assert!(tokenizer_for(&ctx, "/snapshots/tiny").is_ok());
-        assert!(tokenizer_for(&ctx, "tiny").is_ok());
-        assert!(matches!(
-            tokenizer_for(&ctx, "/snapshots/other"),
-            Err(ApiError::ModelNotFound(_))
-        ));
     }
 
     #[tokio::test]
@@ -389,8 +373,9 @@ mod tests {
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
     }
 
+    /// Any `model` name tokenizes with the served model's tokenizer.
     #[tokio::test]
-    async fn unknown_model_404() {
+    async fn unknown_model_uses_the_served_tokenizer() {
         let app = crate::server::app::build_router(ctx_with_tiny());
         let body = serde_json::to_vec(&serde_json::json!({
             "model": "nope", "prompt": "x"
@@ -407,10 +392,10 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(res.status(), StatusCode::NOT_FOUND);
-        assert_eq!(
-            res.headers().get("x-router-error-code").unwrap(),
-            "model_not_found"
-        );
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let r: TokenizeResponse = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(r.model, "nope");
+        assert!(r.count > 0);
     }
 }
