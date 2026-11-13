@@ -220,7 +220,15 @@ async def create_mesh(
             detail="An input image is required for mesh generation",
         )
 
-    sampling_params = _build_sampling_params_from_request(request_id, req, input_path)
+    try:
+        sampling_params = _build_sampling_params_from_request(
+            request_id, req, input_path
+        )
+    except (TypeError, ValueError) as exc:
+        # The image and video routes answer 400 for an invalid sampling parameter;
+        # this route builds its params through the same `SamplingParams` validation,
+        # so it must not surface the same input as a 500.
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     batch = prepare_request(
         server_args=server_args,
         sampling_params=sampling_params,
