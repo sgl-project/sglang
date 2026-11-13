@@ -485,10 +485,8 @@ impl Runnable for MmWorker {
                         g.mm_buffers = buffers;
                         Event::EncodeDone
                     }
-                    Err(error) => {
-                        tracing::warn!(rid = %req.rid, %error, "mm processing rejected");
-                        Event::Error(error)
-                    }
+                    // Intake logs the failure when it fails the request.
+                    Err(error) => Event::Error(error),
                 }
             } else {
                 tracing::error!(rid = %req.rid, "mm pool received a non-generate request");
@@ -1019,7 +1017,7 @@ mod tests {
 
         // The processor's own failure and a malformed result (span past the
         // prompt) fail the request in place as the server's fault; a refusal
-        // as the client's.
+        // as the client's. Intake logs the failure, so the worker does not.
         let failing: Arc<dyn MmProcessor> = Arc::new(FailingProcessor(MediaError::Server(
             "audio decode: Cannot allocate memory".into(),
         )));
@@ -1033,10 +1031,11 @@ mod tests {
             let (mm_tx, mm_rx) = flume::unbounded::<Request>();
             let (tm_tx, tm_rx) = flume::unbounded::<TmEvent>();
             let ctx = Arc::new(MmContext::with_processor(processor, false));
-            let worker = std::thread::spawn(move || MmWorker::new(mm_rx, tm_tx, ctx).run());
             mm_tx.send(encoding_req("bad", vec![1, 2])).unwrap();
             drop(mm_tx);
-            worker.join().unwrap();
+            let logs = crate::utils::logging::capture_logs();
+            MmWorker::new(mm_rx, tm_tx, ctx).run();
+            assert_eq!(logs.text(), "");
             let TmEvent::Encoded(req) = tm_rx.try_recv().expect("returned") else {
                 panic!("expected Encoded");
             };

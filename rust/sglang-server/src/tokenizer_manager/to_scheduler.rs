@@ -141,9 +141,11 @@ impl Intake {
     /// terminal frame and a hung connection. Python cannot hit this because it
     /// validates before `rid_to_state[obj.rid] = state`.
     fn fail(&self, req: &mut Request, err: Error, registered: bool) {
-        // Expected request, capacity, and cancellation outcomes would spam.
+        // Capacity and cancellation outcomes are expected and would spam.
         if err.is_server_fault() {
             tracing::error!(rid = %req.rid, error = %err, "intake rejected request");
+        } else if let Some(reason) = err.client_fault_reason() {
+            tracing::warn!(rid = %req.rid, error = %reason, "rejected request");
         }
         let _ = req.state.apply(Event::Error(err.clone()));
         let _ = req.sink.try_send(ResponseItem::Error(err)); // client may be gone
