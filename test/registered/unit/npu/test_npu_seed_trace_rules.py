@@ -15,6 +15,10 @@ import torch
 from torch._dynamo import trace_rules
 from torch._dynamo.variables import SkipFunctionVariable, TorchInGraphFunctionVariable
 
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, stage="base-a", runner_config="cpu")
+
 UTILS = (
     Path(__file__).resolve().parents[4]
     / "python/sglang/srt/hardware_backend/npu/utils.py"

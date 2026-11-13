@@ -13,6 +13,10 @@ from unittest.mock import Mock, patch
 import torch
 import torch.nn.functional as F
 
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, stage="base-a", runner_config="cpu")
+
 ROOT = Path(__file__).resolve().parents[5]
 BACKEND = (
     ROOT / "python/sglang/srt/hardware_backend/npu/attention/ascend_dsv4_backend.py"
