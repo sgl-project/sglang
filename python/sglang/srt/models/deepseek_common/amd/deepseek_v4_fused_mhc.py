@@ -19,8 +19,8 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.utils import (
     get_bool_env_var,
-    is_gfx942_supported,
     is_gfx95_supported,
+    is_gfx942_supported,
     is_hip,
 )
 from sglang.srt.utils.device import is_gfx1250_supported
