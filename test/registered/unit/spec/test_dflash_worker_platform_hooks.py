@@ -75,6 +75,7 @@ class TestDFlashWorkerPlatformHooks(CustomTestCase):
             device=torch.device("cpu"),
             draft_window_size=8,
             page_size=1,
+            _draft_compact_page_size=1,
             _use_triton_compact_rebuild=True,
             _tail_graph_on=False,
         )
