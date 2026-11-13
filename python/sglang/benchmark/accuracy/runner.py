@@ -55,10 +55,16 @@ class AccuracyResult:
         return payload
 
 
-def resolve_eval_name(dataset_name: str, aime_year: Optional[int] = None) -> str:
-    if dataset_name == "aime":
-        year = aime_year or 25
-        return f"aime{year}"
+def _local_data_path(args) -> Optional[str]:
+    path = getattr(args, "dataset_path", None)
+    if path is None:
+        return None
+    path = str(path).strip()
+    return path or None
+
+
+def resolve_eval_name(dataset_name: str) -> str:
+    # Prefer explicit aime24/25/26 names; bare 'aime' maps to aime25.
     return _DATASET_TO_EVAL_NAME[dataset_name]
 
 
@@ -89,7 +95,8 @@ def _build_run_eval_args(args, base_url: str, eval_name: str) -> SimpleNamespace
         top_p=getattr(args, "top_p", 1.0),
         repeat=1,
         num_shots=getattr(args, "gsm8k_num_shots", 5),
-        gsm8k_data_path=getattr(args, "gsm8k_data_path", None),
+        gsm8k_data_path=_local_data_path(args),
+        data_path=_local_data_path(args),
         response_answer_regex=getattr(args, "response_answer_regex", None),
         return_latency=False,
     )
@@ -114,9 +121,7 @@ def run_accuracy_eval(args, base_url: str) -> AccuracyResult:
             f"choose one of {sorted(ACCURACY_DATASET_NAMES)}"
         )
 
-    eval_name = resolve_eval_name(
-        dataset_name, getattr(args, "aime_year", None)
-    )
+    eval_name = resolve_eval_name(dataset_name)
     eval_args = _build_run_eval_args(args, base_url, eval_name)
     metrics = run_eval(eval_args)
 

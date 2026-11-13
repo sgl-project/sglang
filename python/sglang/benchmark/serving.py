@@ -2392,7 +2392,7 @@ def cli_main():
         help="Name of the dataset to benchmark on.",
     )
     parser.add_argument(
-        "--dataset-path", type=str, default="", help="Path to the dataset."
+        "--dataset-path", type=str, default="", help="Path to the dataset. For --eval-accuracy, also the optional local corpus file (gsm8k/gpqa/aime/mmmu)."
     )
     parser.add_argument(
         "--dataset-offset",
@@ -2891,7 +2891,7 @@ def cli_main():
     parser.add_argument(
         "--eval-accuracy",
         action="store_true",
-        help="Run accuracy evaluation for gsm8k/gpqa/aime/mmmu datasets.",
+        help="Run accuracy evaluation for gsm8k/gpqa/aime24/aime25/aime26/mmmu. Use --dataset-name aime24|aime25|aime26. Optional local file via --dataset-path.",
     )
     parser.add_argument(
         "--accuracy-only",
@@ -2917,13 +2917,6 @@ def cli_main():
         help="Max generation tokens for accuracy evaluation.",
     )
     parser.add_argument(
-        "--aime-year",
-        type=int,
-        choices=[24, 25, 26],
-        default=None,
-        help="AIME year when --dataset-name aime (default: 25).",
-    )
-    parser.add_argument(
         "--hf-endpoint",
         type=str,
         default=None,
@@ -2934,12 +2927,6 @@ def cli_main():
         type=int,
         default=5,
         help="Few-shot count for GSM8K accuracy eval.",
-    )
-    parser.add_argument(
-        "--gsm8k-data-path",
-        type=str,
-        default=None,
-        help="Optional local GSM8K test.jsonl path.",
     )
     parser.add_argument(
         "--fake-prefill",
