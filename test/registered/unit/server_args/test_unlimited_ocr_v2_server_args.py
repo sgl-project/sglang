@@ -83,7 +83,7 @@ class TestUnsupportedServingModes(CustomTestCase):
         self.assertEqual(resolved_16g.max_total_tokens, 2 * 15168)
         # The warmup stays opt-in.
         self.assertIsNone(resolved_16g.warmups)
-        # 20 GiB adds one window per 2 GiB above 12 GiB; 48 GiB hits the cap.
+        # 20 GiB adds one window per 2 GiB above that limit; 48 GiB hits the cap.
         self.assertEqual(run(mem_mib=20 * 1024, **split).max_total_tokens, 6 * 15168)
         self.assertEqual(run(mem_mib=48 * 1024, **split).max_total_tokens, 8 * 15168)
         self.assertEqual(run(mem_mib=8 * 1024, **split).max_total_tokens, 15168)

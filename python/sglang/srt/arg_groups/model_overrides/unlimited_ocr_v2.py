@@ -100,23 +100,22 @@ def _unlimited_ocr_v2_overrides(server_args: Any, hf_config: Any) -> dict:
 
 # Document windows the default KV pool holds, by the Metal working-set limit
 # (torch.mps.recommended_max_memory). Measured on a 16 GB M5 (12,124 MiB limit):
-# MPDocBench at concurrency 8 ran with the same score and speed at 24k-38k
-# tokens, with the server's footprint at 12 GB (9.7 GB GPU) throughout, so the
-# default there is two windows (30,336 tokens), under the cookbook's 32,768. A
-# window's KV is about 0.9 GB; each further 2 GiB of limit adds one window, up to
-# eight, and a limit under 11 GiB or an unknown one gets one window. Macs other
-# than the 16 GB one are not measured.
-_MPS_TWO_WINDOW_MIN_MIB = 11 * 1024
-_MPS_BASE_WORKING_SET_MIB = 12 * 1024
+# MPDocBench at concurrency 8 finished in 506-542 s with pools of 24k-38k
+# tokens, and the server's footprint was 12 GB (9.7 GB GPU) at every size. The
+# default there is two windows (30,336 tokens), under the 32,768 the cookbook
+# recipe uses. A window's KV is about 0.9 GB; each further 2 GiB of limit adds
+# one window, up to eight. A lower or unknown limit keeps one window. Only the
+# 16 GB Mac is measured.
+_MPS_MEASURED_LIMIT_MIB = 12124
 _MPS_MIB_PER_EXTRA_WINDOW = 2 * 1024
 _MPS_MAX_DEFAULT_WINDOWS = 8
 
 
 def _mps_window_budget(gpu_mem_mib: Optional[float]) -> int:
-    if gpu_mem_mib is None or gpu_mem_mib < _MPS_TWO_WINDOW_MIN_MIB:
+    if gpu_mem_mib is None or gpu_mem_mib < _MPS_MEASURED_LIMIT_MIB:
         return 1
-    extra = max(0, int(gpu_mem_mib) - _MPS_BASE_WORKING_SET_MIB)
-    return min(2 + extra // _MPS_MIB_PER_EXTRA_WINDOW, _MPS_MAX_DEFAULT_WINDOWS)
+    extra = int(gpu_mem_mib - _MPS_MEASURED_LIMIT_MIB) // _MPS_MIB_PER_EXTRA_WINDOW
+    return min(2 + extra, _MPS_MAX_DEFAULT_WINDOWS)
 
 
 def mps_window_tokens(
