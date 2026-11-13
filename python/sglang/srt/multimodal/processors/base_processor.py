@@ -37,6 +37,7 @@ from sglang.srt.multimodal.media_io import (
     load_audio,
     load_image,
     load_video,
+    media_url_security_config,
     smart_to_rgb,
 )
 from sglang.srt.multimodal.modality import Modality, MultimodalInputFormat
@@ -230,6 +231,12 @@ def _forget_parent_executor_wakeups():
     concurrent.futures.process._threads_wakeups.clear()
 
 
+def _init_cpu_worker(media_url_policy: tuple) -> None:
+    _forget_parent_executor_wakeups()
+    # A spawned worker starts from the default media policy, not the server's.
+    configure_media_url_security(*media_url_policy)
+
+
 class BaseMultimodalProcessor(ABC):
     models = []
     gpu_image_decode = True  # Enable GPU decoding by default
@@ -274,6 +281,8 @@ class BaseMultimodalProcessor(ABC):
         configure_media_url_security(
             get_mm().allowed_media_domains,
             get_mm().media_url_max_file_size_mb,
+            get_mm().media_url_timeout,
+            get_mm().allow_local_media_files,
         )
         configured_mm_feature_transport = get_mm().mm_feature_transport
         self.mm_feature_transport = (
@@ -531,7 +540,8 @@ class BaseMultimodalProcessor(ABC):
         return concurrent.futures.ProcessPoolExecutor(
             mp_context=mp.get_context(start_method),
             max_workers=int(os.environ.get("SGLANG_CPU_WORKERS", os.cpu_count())),
-            initializer=_forget_parent_executor_wakeups,
+            initializer=_init_cpu_worker,
+            initargs=(media_url_security_config(),),
         )
 
     def _replace_broken_cpu_executor(
@@ -977,28 +987,6 @@ class BaseMultimodalProcessor(ABC):
         **kwargs,
     ) -> Optional[Dict[str, Any]]:
         pass
-
-    def get_estimated_frames_list(self, image_data):
-        """
-        estimate the total frame count from all visual input
-        """
-        from sglang.srt.utils.video_decoder import VideoDecoderWrapper
-
-        # Before processing inputs
-        if not image_data or len(image_data) == 0:
-            return []
-        estimated_frames_list = []
-        for image in image_data:
-            if isinstance(image, str) and image.startswith("video:"):
-                path = image[len("video:") :]
-                decoder = VideoDecoderWrapper(path)
-                num_frames = len(decoder)
-            else:
-                # For images, each contributes one frame
-                num_frames = 1
-            estimated_frames_list.append(num_frames)
-
-        return estimated_frames_list
 
     @classmethod
     def _load_single_item(

@@ -1189,29 +1189,6 @@ def _tbo_event(key) -> torch.cuda.Event:
     return ev
 
 
-def dp_gather_partial_async(
-    global_tokens: torch.Tensor,
-    local_tokens: torch.Tensor,
-    forward_batch: ForwardBatch,
-    event_key=("gather", 0),
-) -> torch.cuda.Event:
-    """Launch `dp_gather_partial` (all_gatherv) on the shared DP TBO comm stream;
-    re-record + return a PERSISTENT event (keyed by `event_key`) that fires when
-    the gather completes. Caller yields, then `compute_stream.wait_event(ev)`
-    before reading `global_tokens`."""
-    comm = get_dp_tbo_comm_stream()
-    compute = torch.cuda.current_stream()
-    # Keep buffers alive across streams (caching allocator).
-    local_tokens.record_stream(comm)
-    global_tokens.record_stream(comm)
-    ev = _tbo_event(event_key)
-    with torch.cuda.stream(comm):
-        comm.wait_stream(compute)  # inputs were produced on the compute stream
-        dp_gather_partial(global_tokens, local_tokens, forward_batch)
-        ev.record(comm)
-    return ev
-
-
 # Persistent grow-only buffers for non-EP DP TBO, keyed by (kind, tbo_subbatch).
 # Reused across ALL layers (and forwards) so the caching allocator does not churn
 # a fresh per-layer `torch.empty` for the 8x DP-gather / combine buffers. That
@@ -1295,11 +1272,6 @@ def attn_tp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
 
 def attn_cp_all_gather_into_tensor(output: torch.Tensor, input: torch.Tensor):
     return get_parallel().attn_cp_group.all_gather_into_tensor(output, input)
-
-
-def get_moe_cp_group() -> GroupCoordinator:
-    """Returns the MOE_DP group, which includes CP partners when attn_cp_size > moe_dp_size."""
-    return get_parallel().moe_dp_group
 
 
 def get_moe_cp_rank() -> int:

@@ -665,6 +665,7 @@ class MambaPool:
         envelope_layout: bool = False,
         enable_linear_replayssm_spec: bool = False,
         replayssm_request_ring: bool = False,
+        allocate_intermediate_ssm: bool = True,
     ):
         conv_state_shape = cache_params.shape.conv
         temporal_state_shape = cache_params.shape.temporal
@@ -779,6 +780,25 @@ class MambaPool:
                 hv, v_dim, k_dim = temporal_state_shape
                 h_k = getattr(cache_params.shape, "num_k_heads_per_tp", hv)
                 L = linear_replayssm_cache_len
+                if enable_linear_replayssm_spec and not cache_params.is_kda:
+                    # The GDN verify writes its window at ring positions
+                    # [write_pos, write_pos + T) and drops stores past L; the
+                    # commit folds early enough to keep the window inside the
+                    # ring only if a whole window fits. The compact commit
+                    # reduces over the whole ring with tl.dot, which needs at
+                    # least 16 positions.
+                    if L & (L - 1) != 0:
+                        raise ValueError(
+                            "spec-verify ring length --linear-replayssm-cache-len "
+                            f"must be a power of two, got {L}"
+                        )
+                    min_len = max(16, speculative_num_draft_tokens or 0)
+                    if L < min_len:
+                        raise ValueError(
+                            "spec-verify ring too small: --linear-replayssm-cache-len "
+                            f"{L} < {min_len} (at least 16 and the draft tokens, "
+                            f"{speculative_num_draft_tokens})"
+                        )
                 # GDN speculative replay is request-lifetime scratch. KDA stays
                 # on every mamba slot unless host-only checkpoints index the
                 # ring by req_pool_idx (see replayssm_request_ring).
@@ -900,7 +920,7 @@ class MambaPool:
                 # KDA verify kernel takes intermediate_states_buffer=None (skips the
                 # per-step write, CACHE_INTERMEDIATE_STATES=False) and the commit
                 # replays the ring into the checkpoint instead. This is the memory win.
-                if enable_linear_replayssm_spec:
+                if enable_linear_replayssm_spec or not allocate_intermediate_ssm:
                     intermediate_ssm_state_cache = None
                 else:
                     intermediate_ssm_state_cache = torch.zeros(
@@ -1427,6 +1447,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         linear_replayssm_cache_len: int = 16,
         mamba_envelope_layout: bool = False,
         enable_linear_replayssm_spec: bool = False,
+        allocate_intermediate_ssm: bool = True,
         short_conv_layer_ids: Optional[List[int]] = None,
         short_conv_state_shape: Optional[Tuple[int, int]] = None,
         ngram_context_len: int = 0,
@@ -1466,6 +1487,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             linear_replayssm_cache_len=linear_replayssm_cache_len,
             mamba_envelope_layout=mamba_envelope_layout,
             enable_linear_replayssm_spec=enable_linear_replayssm_spec,
+            allocate_intermediate_ssm=allocate_intermediate_ssm,
             short_conv_layer_ids=short_conv_layer_ids,
             short_conv_state_shape=short_conv_state_shape,
             ngram_context_len=ngram_context_len,
@@ -1487,6 +1509,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         linear_replayssm_cache_len: int = 16,
         mamba_envelope_layout: bool = False,
         enable_linear_replayssm_spec: bool = False,
+        allocate_intermediate_ssm: bool = True,
         short_conv_layer_ids: Optional[List[int]] = None,
         short_conv_state_shape: Optional[Tuple[int, int]] = None,
         ngram_context_len: int = 0,
@@ -1508,6 +1531,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             envelope_layout=mamba_envelope_layout,
             enable_linear_replayssm_spec=enable_linear_replayssm_spec,
             replayssm_request_ring=replayssm_request_ring,
+            allocate_intermediate_ssm=allocate_intermediate_ssm,
         )
         self.mamba_allocator = MambaSlotAllocator(
             size=mamba_size,
@@ -1941,6 +1965,9 @@ class KVCache(abc.ABC):
     # Whether get_cpu_copy/load_cpu_copy carry the recurrent state. False when the
     # state lives on the request pool instead, and the caller has to move it.
     cpu_copy_carries_mamba: bool = False
+    # A draft pool whose rows are the target's sliding-window ids
+    # (SGLANG_ROCM_ENABLE_DFLASH_SWA_DRAFT_KV), not its full-attention ids.
+    follows_target_swa_ids: bool = False
 
     @abc.abstractmethod
     def __init__(
@@ -2179,15 +2206,25 @@ def _set_mha_kv_buffer_prefix_valid(
             f"head_dim={pool.head_dim} v_head_dim={pool.v_head_dim}."
         )
 
-    fused_k_scale = _resolve_fused_scale(
-        k_scale,
-        getattr(layer, "k_scale", None),
-        getattr(layer, "k_scale_float", None),
+    # No scale on ROCm: the eager fallback below is a plain saturating cast, which the fused kernel does
+    # bit-exactly at scale 1.0 (one launch instead of five per layer).
+    fused_k_scale = (
+        1.0
+        if _is_hip and k_scale is None
+        else _resolve_fused_scale(
+            k_scale,
+            getattr(layer, "k_scale", None),
+            getattr(layer, "k_scale_float", None),
+        )
     )
-    fused_v_scale = _resolve_fused_scale(
-        v_scale,
-        getattr(layer, "v_scale", None),
-        getattr(layer, "v_scale_float", None),
+    fused_v_scale = (
+        1.0
+        if _is_hip and v_scale is None
+        else _resolve_fused_scale(
+            v_scale,
+            getattr(layer, "v_scale", None),
+            getattr(layer, "v_scale_float", None),
+        )
     )
     # fuse quantization and writing into the same kernel
     if (
@@ -4250,6 +4287,8 @@ class HybridLinearKVPool(KVCache):
         # full-attention layers instead of constructing one internally.
         full_kv_pool: Optional[KVCache] = None,
         post_capture_active: bool = False,
+        # HiSparse only: forwarded to a HiSparseDSATokenToKVPool full pool.
+        host_to_device_ratio: Optional[int] = None,
         use_fp4_indexer: bool = False,
         use_combined_kv_buffer: bool = False,
     ):
@@ -4307,6 +4346,11 @@ class HybridLinearKVPool(KVCache):
                 if full_kv_pool_class is not None
                 else DSATokenToKVPool
             )
+            hisparse_kwargs = (
+                {}
+                if host_to_device_ratio is None
+                else {"host_to_device_ratio": host_to_device_ratio}
+            )
             self.full_kv_pool = DSAPoolClass(
                 size=size,
                 page_size=self.page_size,
@@ -4324,6 +4368,7 @@ class HybridLinearKVPool(KVCache):
                 max_running_requests=max_running_requests,
                 skip_topk_layers=skip_topk_layers,
                 kv_scale_ue8m0=kv_scale_ue8m0,
+                **hisparse_kwargs,
                 use_fp4_indexer=use_fp4_indexer,
             )
         else:
@@ -4456,6 +4501,25 @@ class HybridLinearKVPool(KVCache):
 
     def maybe_get_custom_mem_pool(self):
         return self.full_kv_pool.maybe_get_custom_mem_pool()
+
+    def register_mapping(self, mapping: torch.Tensor) -> None:
+        self.full_kv_pool.register_mapping(mapping)
+
+    def _translate_loc_to_hisparse_device(self, indices: torch.Tensor) -> torch.Tensor:
+        return self.full_kv_pool._translate_loc_to_hisparse_device(indices)
+
+    def translate_loc_to_hisparse_device(self, indices: torch.Tensor) -> torch.Tensor:
+        return self.full_kv_pool.translate_loc_to_hisparse_device(indices)
+
+    def translate_loc_from_full_to_hisparse_device(
+        self, indices: torch.Tensor
+    ) -> torch.Tensor:
+        return self.full_kv_pool.translate_loc_from_full_to_hisparse_device(indices)
+
+    def translate_loc_from_full_to_compressed(
+        self, indices: torch.Tensor
+    ) -> torch.Tensor:
+        return self.full_kv_pool.translate_loc_from_full_to_compressed(indices)
 
     def _transfer_full_attention_id(self, layer_id: int):
         if layer_id not in self.full_attention_layer_id_mapping:

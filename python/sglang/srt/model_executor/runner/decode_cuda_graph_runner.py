@@ -291,6 +291,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     _target_metadata_glue = False
     _padded_glue = False
     _metadata_prep_fork: Optional[tuple] = None
+    # Set in __init__: a speculative verify's checkpoint ids for its replay prep.
+    _verify_checkpoint_ids: Optional[torch.Tensor] = None
     _metadata_prep_fork_resolved = False
     _early_verify_metadata = None
     _skips_prefilled_inputs = False
@@ -512,6 +514,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         enable_mamba_track = (
             get_exec().mamba.enable_mamba_extra_buffer
             and self.model_runner.spec_algorithm.is_none()
+        )
+        # A verify's commit writes checkpoint slots that have no graph input;
+        # the replay prep resolves them from this stable buffer.
+        self._verify_checkpoint_ids: Optional[torch.Tensor] = (
+            torch.zeros(self.max_bs, dtype=torch.int64, device=self.device)
+            if get_exec().mamba.enable_mamba_extra_buffer
+            and not enable_mamba_track
+            and self.capture_forward_mode == ForwardMode.TARGET_VERIFY
+            and not model_runner.is_draft_worker
+            else None
         )
 
         if self.require_gathered_buffer:
@@ -1813,6 +1825,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         attention_variant,
     ) -> None:
         """The attention backend's out-of-graph metadata prep for this replay."""
+        self._stage_verify_checkpoint_ids(forward_batch, bs)
         # Glue-graph fast path: pointer-stable prep (static buffers + pool
         # tensors only) is captured per key; guards keep every python-visible
         # branch inside the backends constant for that key.
@@ -1876,6 +1889,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.model_runner.lora_manager.prepare_lora_batch(
                 cast(ForwardBatch, fb_view)
             )
+        if (
+            self._verify_checkpoint_ids is not None
+            and fb_view.mamba_track_indices is None
+            and forward_batch.mamba_track_indices is not None
+        ):
+            fb_view.mamba_track_indices = self._verify_checkpoint_ids[:bs]
         if glue_key is not None:
             self._glue_draft_inputs(fb_view, num_tokens)
             with self._prep_attention_variant(attention_variant):
@@ -1885,6 +1904,22 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 self._metadata_glue.note_not_routed()
             with self._prep_attention_variant(attention_variant):
                 attn_backend.init_forward_metadata_out_graph(fb_view)
+
+    def _stage_verify_checkpoint_ids(self, forward_batch: ForwardBatch, bs: int):
+        """Copy the batch's checkpoint ids into their static buffer, padded rows
+        on the reserved slot 0."""
+        if self._verify_checkpoint_ids is None:
+            return
+        ids = forward_batch.mamba_track_indices
+        if ids is None:
+            return
+        n = ids.shape[0]
+        assert n <= bs <= self._verify_checkpoint_ids.shape[0], (
+            f"checkpoint ids do not fit the replay: {n=} {bs=}"
+        )
+        self._verify_checkpoint_ids[:n].copy_(ids, non_blocking=True)
+        if n < bs:
+            self._verify_checkpoint_ids[n:bs].zero_()
 
     def _wants_early_verify_metadata(self) -> bool:
         """SGLANG_OPT_DSV41_TARGET_METADATA_EARLY, from facts fixed before the buffers
