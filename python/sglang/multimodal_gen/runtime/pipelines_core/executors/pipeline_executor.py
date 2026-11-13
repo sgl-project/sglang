@@ -17,7 +17,10 @@ from sglang.multimodal_gen.runtime.cache.conditioning import (
     conditioning_cache_group,
 )
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
-from sglang.multimodal_gen.runtime.distributed import get_world_rank
+from sglang.multimodal_gen.runtime.distributed import (
+    get_replica_group,
+    get_world_rank,
+)
 from sglang.multimodal_gen.runtime.managers.progress_reporter import (
     get_progress_reporter,
 )
@@ -28,6 +31,9 @@ from sglang.multimodal_gen.runtime.managers.request_cancel_error import (
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
+from sglang.multimodal_gen.runtime.utils.device_errors import (
+    is_unrecoverable_device_error,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.nvtx_pytorch_hooks import maybe_nvtx_range
 from sglang.multimodal_gen.runtime.utils.profiler import (
@@ -40,6 +46,18 @@ if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 
 logger = init_logger(__name__)
+
+
+def _forward_error_ends_the_replica(error: Exception) -> bool:
+    """Errors the worker turns into an exit instead of a request error.
+
+    An error output would let this rank take the next request while the other
+    ranks are still inside the failed forward's collectives, or keep serving
+    from a device that can no longer be trusted.
+    """
+    if isinstance(error, torch.OutOfMemoryError):
+        return get_replica_group().world_size > 1
+    return is_unrecoverable_device_error(error)
 
 
 class PipelineExecutor(ABC):
@@ -295,6 +313,8 @@ class PipelineExecutor(ABC):
                         error=str(e), cancelled=True, metrics=batch.metrics
                     )
                 except Exception as e:
+                    if _forward_error_ends_the_replica(e):
+                        raise
                     logger.error(
                         "Sequential DiT/VAE inference failed for request %s: %s",
                         batch.request_id,
