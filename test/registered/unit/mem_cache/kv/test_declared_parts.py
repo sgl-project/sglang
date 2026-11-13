@@ -668,7 +668,7 @@ class TestDeclaredParts(CustomTestCase):
                 cfg._unified_config_from_budget(1 << 20).max_total_num_tokens, 0
             )
 
-    def test_kda_spec_replay_pd_is_rejected_before_state_allocation(self):
+    def test_kda_spec_replay_keeps_pd_state_entries_alike(self):
         from unittest.mock import patch
 
         from sglang.srt.configs.mamba_utils import (
@@ -698,32 +698,38 @@ class TestDeclaredParts(CustomTestCase):
         cfg.layer_info = SimpleNamespace(start_layer=0, end_layer=2)
         cfg.hybrid_gdn_config = None
         cfg.hybrid_kda_config = cfg.mambaish_config
-        with (
-            patch(
-                "sglang.srt.mem_cache.kv_cache_configurator.mamba_cache_chunk_size",
-                return_value=4,
-            ),
-            get_context().override_server_args(
-                enable_linear_replayssm_spec=True,
-                disaggregation_mode="decode",
-                speculative_algorithm="DFLASH",
-            ),
-        ):
-            with self.assertRaisesRegex(ValueError, "different state entry layouts"):
-                cfg._kv_layer_decls()
 
-        with (
-            patch(
-                "sglang.srt.mem_cache.kv_cache_configurator.mamba_cache_chunk_size",
-                return_value=4,
-            ),
-            get_context().override_server_args(
-                enable_linear_replayssm_spec=True,
-                disaggregation_mode="null",
-                speculative_algorithm="DFLASH",
-            ),
-        ):
-            self.assertEqual(len(cfg._kv_layer_decls()), 2)
+        def plan_for(*, mode, replay_spec):
+            with (
+                patch(
+                    "sglang.srt.mem_cache.kv_cache_configurator.mamba_cache_chunk_size",
+                    return_value=4,
+                ),
+                get_context().override_server_args(
+                    enable_linear_replayssm_spec=replay_spec,
+                    disaggregation_mode=mode,
+                    speculative_algorithm="DFLASH" if replay_spec else None,
+                ),
+            ):
+                return plan_kv_storage(cfg._kv_layer_decls(), page_size=4)
+
+        # A PD prefill server runs no verify, so it declares no ring; its decode
+        # peer does. The ring is request memory, so the state entries they
+        # transfer are laid out alike.
+        prefill = plan_for(mode="prefill", replay_spec=False)
+        decode = plan_for(mode="decode", replay_spec=True)
+        (request,) = decode.requests()
+        self.assertIn("mamba.replayssm_rawv", {p.name for p in request.geometry.parts})
+        self.assertFalse(prefill.requests())
+        sent = prefill.sub_pool("mamba").spec
+        received = decode.sub_pool("mamba").spec
+        self.assertEqual(received.entry_bytes(), sent.entry_bytes())
+        self.assertEqual(received.entry_layout().offsets, sent.entry_layout().offsets)
+        self.assertEqual(
+            [(e.sub_pool, e.part, e.state_type) for e in decode.wire_entries()],
+            [(e.sub_pool, e.part, e.state_type) for e in prefill.wire_entries()],
+        )
+        self.assertNotIn(request.name, {e.sub_pool for e in decode.wire_entries()})
 
     def test_window_shares_do_not_limit_shared_arena_borrowing(self):
         """A long FULL history may borrow bytes released by its short window,
@@ -1527,9 +1533,10 @@ class TestDeclaredParts(CustomTestCase):
                 physical_active = a.mamba_allocator.ids.translate(active)
                 physical_track = a.mamba_allocator.ids.translate(track)
                 self.assertFalse(torch.equal(active, physical_active))
-                req.req_index_to_mamba_index_mapping[1] = active.int()[0]
+                (row,) = storage.take_rows(1)
+                req.req_index_to_mamba_index_mapping[row] = active.int()[0]
                 batch = SimpleNamespace(
-                    req_pool_indices=torch.tensor([1]),
+                    req_pool_indices=torch.tensor([row]),
                     forward_mode=ForwardMode.TARGET_VERIFY,
                     mamba_track_indices=track,
                     seq_lens=torch.tensor([15]),
@@ -1560,17 +1567,30 @@ class TestDeclaredParts(CustomTestCase):
                 runner.attn_backend = SimpleNamespace(
                     forward_state_slots=lambda n, track_ids: forward_slots
                 )
-                outputs, conv_destinations = [], []
+                # The row's ring unit is neither its row nor its state slot; after
+                # the forward resolved it, the row is rebound to another unit,
+                # which a commit reading the live table would pick up.
+                ring_ids = runner.runner_ids.request_ids()
+                resolved = forward_slots.ring
+                self.assertNotIn(int(resolved[0]), (row, int(physical_active[0])))
+                storage.release_rows([row])
+                spare = row + 1
+                self.assertTrue(a.alloc_request_rows(torch.tensor([spare])))
+                self.assertEqual(storage.take_rows(1), [row])
+                live = ring_ids.ids(torch.tensor([row]))
+                self.assertFalse(torch.equal(live, resolved))
+                ring_keyword = {
+                    "gdn_circular": "replay_indices",
+                    "kda_fold": "ring_indices",
+                }
+                outputs, conv_destinations, ring_rows = [], [], []
 
                 def commit(**kw):
                     outputs.append(
                         (kw["state_batch_indices"], kw["mamba_track_indices"])
                     )
-                    if "replay_indices" in kw:
-                        # The ring rows the forward resolved, not the table's.
-                        torch.testing.assert_close(
-                            kw["replay_indices"], forward_slots.ring
-                        )
+                    if mode in ring_keyword:
+                        ring_rows.append(kw[ring_keyword[mode]])
 
                 def scatter(*args):
                     conv_destinations.append(args[2])
@@ -1602,6 +1622,11 @@ class TestDeclaredParts(CustomTestCase):
                         prepared_step_indices=(torch.tensor([1]), torch.tensor([0])),
                     )
                 self.assertEqual(len(outputs), 1)
+                if mode in ring_keyword:
+                    # The ring rows the forward resolved, not the table's.
+                    torch.testing.assert_close(
+                        ring_rows[0], resolved, check_dtype=False
+                    )
                 torch.testing.assert_close(
                     outputs[0][0], physical_active, check_dtype=False
                 )
@@ -1621,6 +1646,61 @@ class TestDeclaredParts(CustomTestCase):
                     active,
                     check_dtype=False,
                 )
+
+    def test_direct_kda_commit_uses_the_resolved_ring_rows(self):
+        """DSPARK and DFLASH commit KDA through the hybrid backend directly: it
+        writes the ring rows the forward resolved, not what the request table
+        names when the commit runs."""
+        from unittest.mock import patch
+
+        from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+            HybridLinearAttnBackend,
+        )
+        from sglang.srt.layers.attention.mamba.mamba2_metadata import (
+            ForwardStateSlots,
+        )
+
+        storage, plan, _ = _build(
+            state=True,
+            gamma=4,
+            replay=StateReplay(
+                decode=False, speculative=True, is_kda=True, cache_len=8, key_heads=1
+            ),
+        )
+        a = storage.allocator
+        a.state.bind_routes(a.get_kvcache().layer_router)
+        (request,) = plan.requests()
+        ring_ids = a.request_id_spaces()[request.name]
+        (row,) = storage.take_rows(1)
+        resolved = ring_ids.ids(torch.tensor([row]))
+        slots = a.alloc_state_slots(1)
+        working = a.mamba_allocator.ids.translate(slots)
+        forward_slots = ForwardStateSlots(working, None, resolved)
+        # The row is rebound to another unit before the commit runs.
+        storage.release_rows([row])
+        self.assertTrue(a.alloc_request_rows(torch.tensor([row + 1])))
+        self.assertEqual(storage.take_rows(1), [row])
+        self.assertFalse(torch.equal(ring_ids.ids(torch.tensor([row])), resolved))
+
+        hybrid = object.__new__(HybridLinearAttnBackend)
+        hybrid.linear_attn_backend = SimpleNamespace(state_pool=a.state.pool)
+        with patch(
+            "sglang.kernels.ops.attention.linear.kda_replayssm_spec_decode."
+            "commit_kda_replayssm_after_verify"
+        ) as commit:
+            hybrid.update_mamba_state_after_mtp_verify(
+                torch.tensor([1]),
+                None,
+                None,
+                None,
+                req_pool_indices=torch.tensor([row]),
+                state_slots=forward_slots,
+            )
+        kwargs = commit.call_args.kwargs
+        torch.testing.assert_close(kwargs["ring_indices"], resolved, check_dtype=False)
+        torch.testing.assert_close(
+            kwargs["state_batch_indices"], working, check_dtype=False
+        )
 
     def test_gdn_replay_spec_declares_parts_for_every_algorithm(self):
         from sglang.srt.configs.qwen3_next import Qwen3NextConfig
@@ -1720,38 +1800,29 @@ class TestDeclaredParts(CustomTestCase):
         self.assertEqual(view.replayssm_spec_write_pos.stride(0) * 4, entry)
         self.assertEqual(view.replayssm_is_flush.stride(0), entry)
 
-    def test_replay_state_records_and_cursor_move_together(self):
-        for speculative in (False, True):
-            with self.subTest(speculative=speculative):
-                storage, plan, _ = _build(
-                    state=True,
-                    gamma=3 if speculative else None,
-                    replay=StateReplay(
-                        decode=True,
-                        speculative=speculative,
-                        is_kda=speculative,
-                        cache_len=8,
-                        key_heads=1,
-                    ),
-                )
-                view = storage.view("mamba")
-                self.assertFalse(plan.requests())
-                self.assertEqual(len(view.extra_parts), 7 if speculative else 4)
-                for part in view.extra_parts:
-                    view.extra_views[part.name].select(part.row_axis, 3).fill_(5)
-                view.copy_from(torch.tensor([3]), torch.tensor([7]))
-                saved = view.get_cpu_copy(torch.tensor([7]))
-                view.clear_slots(torch.tensor([7]))
-                view.load_cpu_copy(saved, torch.tensor([7]))
-                for part in view.extra_parts:
-                    self.assertTrue(
-                        torch.all(
-                            view.extra_views[part.name].select(part.row_axis, 7) == 5
-                        )
-                    )
-                self.assertIs(
-                    view.replayssm_write_pos, view.extra_views["replayssm_write_pos"]
-                )
+    def test_decode_replay_records_and_cursor_move_together(self):
+        """The decode ring and its cursor lag the slot's state, so they are the
+        slot's: copied, cleared and backed up with its entry."""
+        storage, plan, _ = _build(
+            state=True,
+            replay=StateReplay(
+                decode=True, speculative=False, is_kda=False, cache_len=8, key_heads=1
+            ),
+        )
+        view = storage.view("mamba")
+        self.assertFalse(plan.requests())
+        self.assertEqual(len(view.extra_parts), 4)
+        for part in view.extra_parts:
+            view.extra_views[part.name].select(part.row_axis, 3).fill_(5)
+        view.copy_from(torch.tensor([3]), torch.tensor([7]))
+        saved = view.get_cpu_copy(torch.tensor([7]))
+        view.clear_slots(torch.tensor([7]))
+        view.load_cpu_copy(saved, torch.tensor([7]))
+        for part in view.extra_parts:
+            self.assertTrue(
+                torch.all(view.extra_views[part.name].select(part.row_axis, 7) == 5)
+            )
+        self.assertIs(view.replayssm_write_pos, view.extra_views["replayssm_write_pos"])
 
     def test_window_resume_keeps_the_handoff_boundary(self):
         storage, _, _ = _build()
