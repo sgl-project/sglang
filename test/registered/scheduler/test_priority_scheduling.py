@@ -422,6 +422,40 @@ def _verify_genereate_responses(
         )
 
 
+class TestPrioritySchedulingUnifiedMemory(
+    TestPrioritySchedulingMultipleRunningRequests
+):
+    """The preemption cases on a unified memory pool, where admission prices
+    whether releasing the victims makes room."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = "google/gemma-4-E2B-it"
+        cls.base_url = DEFAULT_URL_FOR_TEST
+
+        cls.stdout = open(STDOUT_FILENAME, "w")
+        cls.stderr = open(STDERR_FILENAME, "w")
+
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            other_args=(
+                "--enable-unified-memory",
+                "--attention-backend",
+                "triton",
+                "--mem-fraction-static",
+                "0.8",
+                "--max-running-requests",
+                "2",
+                "--max-queued-requests",
+                "3",
+                "--enable-priority-scheduling",
+            ),
+            return_stdout_stderr=(cls.stdout, cls.stderr),
+        )
+
+
 def _verify_max_running_requests_and_max_queued_request_validation(
     max_running_requests: int, max_queued_requests: int
 ):
