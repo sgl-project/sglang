@@ -1008,5 +1008,42 @@ class TestThinkingObject(unittest.TestCase):
         self.assertIs(request.chat_template_kwargs["thinking"], False)
 
 
+class TestExplicitNullFields(CustomTestCase):
+    """Clients send null for unset OpenAI fields; it must read as the default."""
+
+    COMPLETION_FIELDS = {
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "n": 1,
+        "stream": False,
+        "max_tokens": 16,
+        "frequency_penalty": 0.0,
+        "presence_penalty": 0.0,
+        "echo": False,
+    }
+    CHAT_FIELDS = {
+        "n": 1,
+        "stream": False,
+        "frequency_penalty": 0.0,
+        "presence_penalty": 0.0,
+        "logprobs": False,
+    }
+
+    def test_completion_null_uses_default(self):
+        for name, default in self.COMPLETION_FIELDS.items():
+            with self.subTest(field=name):
+                request = CompletionRequest(prompt="hi", **{name: None})
+                self.assertEqual(getattr(request, name), default)
+                self.assertNotIn(name, request.model_fields_set)
+
+    def test_chat_null_uses_default(self):
+        messages = [{"role": "user", "content": "hi"}]
+        for name, default in self.CHAT_FIELDS.items():
+            with self.subTest(field=name):
+                request = ChatCompletionRequest(messages=messages, **{name: None})
+                self.assertEqual(getattr(request, name), default)
+                self.assertNotIn(name, request.model_fields_set)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
