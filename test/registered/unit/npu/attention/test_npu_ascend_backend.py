@@ -2,9 +2,9 @@
 Unit tests for sglang.srt.hardware_backend.npu.attention.ascend_backend.
 """
 
-from contextlib import contextmanager
 import sys
 import unittest
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
