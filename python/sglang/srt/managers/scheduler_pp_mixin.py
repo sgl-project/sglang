@@ -863,6 +863,14 @@ class SchedulerPPMixin:
                 tensor_dict["spec_next_top_scores"] = (
                     result.next_verify_top_scores_index
                 )
+        elif self._pp_spec_relay and result.next_verify_chain is not None:
+            # Prefill tail draft: the first decode round's chain, sent without
+            # an accept result (prefill never verifies).
+            tensor_dict["spec_next_chain"] = result.next_verify_chain
+            if result.next_draft_input is not None:
+                tensor_dict["spec_bonus_tokens"] = (
+                    result.next_draft_input.bonus_tokens
+                )
 
         # Draft extend runs only on the last stage, but every rank needs its relayed
         # output to fill PD auxiliary buffers.
@@ -1047,6 +1055,20 @@ class SchedulerPPMixin:
                 if logits_output is None:
                     logits_output = LogitsProcessorOutput(next_token_logits=None)
                 logits_output.auxiliary_device_output = auxiliary_output
+
+        if (
+            self._pp_spec_relay
+            and "spec_next_chain" in pp_outputs.tensors
+            and "spec_accept_lens" not in pp_outputs.tensors
+        ):
+            # Prefill tail draft: install the first decode round's chain on
+            # every stage. No accept/seq-lens bookkeeping runs on a prefill.
+            fwd_batch = (
+                mb_metadata.fwd_batch if mb_metadata.fwd_batch is not None else batch
+            )
+            self._pp_spec_adopt_relayed_tree(
+                batch, [req.rid for req in fwd_batch.reqs], pp_outputs
+            )
 
         if self._pp_spec_relay and "spec_accept_lens" in pp_outputs.tensors:
             # PP+spec verify round. Relayed tensors align with the composition
@@ -1289,9 +1311,14 @@ class SchedulerPPMixin:
                 num_draft_tokens=num_draft_tokens,
             )
         else:
+            # DSpark's chain width is its verify width, which need not equal the
+            # spec-level num_draft_tokens; derive it from the relayed tensor.
+            width = (
+                chain.numel() // len(fwd_rids) if fwd_rids else num_draft_tokens
+            )
             relayed = PPSpecRelayInput(
                 rids=fwd_rids,
-                tokens=chain.to(torch.int64).reshape(len(fwd_rids), num_draft_tokens),
+                tokens=chain.to(torch.int64).reshape(len(fwd_rids), width),
                 parents=pp_outputs.tensors.get("spec_next_parents"),
                 top_scores=pp_outputs.tensors.get("spec_next_top_scores"),
             )
@@ -1333,6 +1360,65 @@ class SchedulerPPMixin:
         ).repeat(bs, 1)
         return parent_list, top_scores_index
 
+    def _pp_dspark_rebuild_verify_input(self: Scheduler, batch: ScheduleBatch) -> None:
+        """Rebuild the DSpark verify input from the relayed linear chain.
+
+        DSpark verifies a linear chain ``[anchor | drafts]``; the relay's
+        ``PPSpecRelayInput.tokens`` carries exactly those tokens (column 0 is
+        the anchor/bonus). Positions and virtual cache slots are re-planned
+        locally because scheduling is mirrored on every stage.
+        """
+        from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+        from sglang.srt.speculative.dflash_info import DFlashVerifyInput
+        from sglang.srt.speculative.dspark_components.dspark_verify import (
+            prepare_pp_verify_input,
+        )
+        from sglang.srt.speculative.pp_spec_relay import PPSpecRelayInput
+
+        spec = get_spec()
+        bs = batch.batch_size()
+        device = self.device
+        if batch.forward_mode.is_idle() or bs == 0:
+            zero = torch.zeros((0,), dtype=torch.int64, device=device)
+            batch.spec_info = DFlashVerifyInput(
+                draft_token=zero,
+                positions=zero,
+                draft_token_num=spec.speculative_num_draft_tokens,
+                custom_mask=None,
+                capture_hidden_mode=CaptureHiddenMode.FULL,
+            )
+            batch.out_cache_loc = zero
+            return
+        relay = batch.spec_info
+        if not isinstance(relay, PPSpecRelayInput):
+            raise RuntimeError(
+                "PP DSpark verify round expected a PPSpecRelayInput, got "
+                f"{type(relay).__name__}"
+            )
+        live_rids = [req.rid for req in batch.reqs]
+        if relay.rids != live_rids:
+            relay = relay.reindex(live_rids)
+            batch.spec_info = relay
+        tokens = relay.tokens.to(device=device, dtype=torch.int64)
+        if tokens.ndim != 2 or tokens.shape[0] != bs or tokens.shape[1] <= 0:
+            raise RuntimeError(
+                "PP DSpark relay chain is not a [bs, verify_w] linear chain: "
+                f"got {tuple(tokens.shape)} for bs={bs}"
+            )
+        verify_w = tokens.shape[1]
+        if self.pp_group.is_last_rank:
+            # The last stage verifies its tail-drafted proposal. Its verify
+            # window was planned at tail time; re-planning here would advance
+            # the allocator a second time and diverge from the tail.
+            batch.spec_info = relay
+            return
+        batch.spec_info = prepare_pp_verify_input(
+            verify_ids_2d=tokens,
+            batch=batch,
+            target_worker=self.tp_worker,
+            verify_num_draft_tokens=verify_w,
+        )
+
     def _pp_spec_rebuild_verify_input(self: Scheduler, batch: ScheduleBatch) -> None:
         """Rebuild batch.spec_info (EagleVerifyInput) from relayed per-request
         state, without a draft model.
@@ -1352,6 +1438,9 @@ class SchedulerPPMixin:
         from sglang.srt.speculative.pp_spec_relay import PPSpecRelayInput
 
         spec = get_spec()
+        if self.spec_algorithm.is_dspark():
+            self._pp_dspark_rebuild_verify_input(batch)
+            return
         steps = spec.speculative_num_steps
         num_draft_tokens = spec.speculative_num_draft_tokens
         bs = batch.batch_size()

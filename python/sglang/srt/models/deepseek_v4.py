@@ -213,6 +213,7 @@ from sglang.srt.runtime_context import (
     get_forward,
     get_parallel,
     get_platform,
+    get_spec,
 )
 from sglang.srt.utils import (
     LazyValue,
@@ -3907,7 +3908,12 @@ class DeepseekV4Model(nn.Module):
         self.config = config
         self.pp_group = get_parallel().pp_group
         self.hidden_size = config.hidden_size
-        if self.pp_group.is_first_rank:
+        # The last stage also builds the embedding under speculative decoding:
+        # the draft shares the target's embed/head (e.g. DSV4.1 DSpark on A5,
+        # where the target's last stage is the only one hosting the draft).
+        if deepseek_v2.pp_stage_needs_embedding(
+            self.pp_group, get_spec().speculative_algorithm
+        ):
             embedding_quant_config = (
                 quant_config
                 if quant_config is not None and quant_config.get_name() == "expert_pack"
@@ -4130,8 +4136,10 @@ class DeepseekV4Model(nn.Module):
         input_ids_global: torch.Tensor,
         capture_dspark: bool,
         dspark_aux_hidden_states: Optional[AuxHiddenStatePacker],
+        prev_pre: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[LateLayerTail]]:
-        assert self.pp_group.world_size == 1, "pre-mix hand-off across PP is not wired"
+        # The previous stage's last sublayer already produced this stage's first
+        # pre-mix; the per-stage layer loop hands it on through HcState.pre.
         hash_ids = None
         cp_extend = (
             is_cp_active(forward_batch) and forward_batch.forward_mode.is_extend()
@@ -4201,7 +4209,7 @@ class DeepseekV4Model(nn.Module):
         # its producer update explicitly before these readers below.
         # mHC assumes full token rows per rank; LayerNorm SP needs its own path.
         assert not get_forward().sp_active
-        state = mhc.HcState(hidden_states)
+        state = mhc.HcState(hidden_states, pre=prev_pre)
         if _is_cuda:
             residual_batch.start(forward_batch)
             hidden_states = residual_batch.set_written(state, forward_batch)
@@ -4370,6 +4378,13 @@ class DeepseekV4Model(nn.Module):
                         input_ids=input_ids,
                         forward_batch=forward_batch,
                         input_ids_global=input_ids_global,
+                        # The next stage's first sublayer lives on another rank:
+                        # its post+combine+norm fusion must not be attempted
+                        # here; materialize this stage's post before the relay.
+                        allow_cross_layer_fusion=not (
+                            not self.pp_group.is_last_rank
+                            and i == self.end_layer - 1
+                        ),
                     )
                 else:
                     if _is_hip and self.layers[i].hc_boundary_fused:
@@ -4578,6 +4593,7 @@ class DeepseekV4Model(nn.Module):
         input_embeds: Optional[torch.Tensor],
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
+        prev_pre = None
         if self.pp_group.is_first_rank:
             if input_embeds is None:
                 hidden_states = self.embed_tokens(input_ids)
@@ -4594,6 +4610,25 @@ class DeepseekV4Model(nn.Module):
                 hidden_states = hidden_states.view(
                     hidden_states.shape[0], self.hc_mult, self.hidden_size
                 )
+            if self.hc_pre_from_prev_sublayer:
+                # The previous stage's last sublayer produced this stage's first
+                # pre-mix. Without it the first combine would silently fall back
+                # to stream 0 instead of the model's intended mix.
+                prev_pre = pp_proxy_tensors.tensors.get("mhc_pre")
+                if self.pp_group.world_size > 1 and prev_pre is None:
+                    raise ValueError(
+                        "mHC pre-mix hand-off across PP is missing: the "
+                        "previous stage did not send 'mhc_pre'"
+                    )
+                if prev_pre is not None and (
+                    prev_pre.dtype != torch.float32
+                    or prev_pre.shape != (hidden_states.shape[0], self.hc_mult)
+                ):
+                    raise ValueError(
+                        "mHC pre-mix has the wrong layout: expected fp32 "
+                        f"{(hidden_states.shape[0], self.hc_mult)}, got "
+                        f"{prev_pre.dtype} {tuple(prev_pre.shape)}"
+                    )
 
         if get_parallel().attn_dp_size > 1 and get_moe_a2a_backend().is_none():
             input_ids_global = torch.empty(
@@ -4664,6 +4699,7 @@ class DeepseekV4Model(nn.Module):
                 input_ids_global,
                 capture_dspark,
                 dspark_aux_hidden_states,
+                prev_pre=prev_pre,
             )
         elif run_tbo:
             # Two-batch-overlap prefill (EP / mori). Cross-layer mHC fusion is
@@ -4734,7 +4770,19 @@ class DeepseekV4Model(nn.Module):
 
         if not self.pp_group.is_last_rank:
             # Flatten 3D mHC tensor for PP IPC.
-            return PPProxyTensors({"hidden_states": hidden_states.flatten(1)})
+            proxy_tensors = {"hidden_states": hidden_states.flatten(1)}
+            if self.hc_pre_from_prev_sublayer:
+                # The next stage's first sublayer consumes this pre-mix; the
+                # residual stream alone does not determine it.
+                assert last_pre is not None, (
+                    "mHC pre-mix hand-off across PP requires this stage to "
+                    "produce HcState.pre"
+                )
+                assert last_pre.dtype == torch.float32, (
+                    f"mHC pre-mix must stay fp32 across PP, got {last_pre.dtype}"
+                )
+                proxy_tensors["mhc_pre"] = last_pre
+            return PPProxyTensors(proxy_tensors)
 
         pre_hc_head = hidden_states.flatten(1)
 
@@ -5699,9 +5747,10 @@ class DeepseekV4ForCausalLM(nn.Module):
                                 continue
                             if name.endswith(".bias") and name not in params_dict:
                                 continue
-                            if (
-                                ".embed_tokens." in name
-                                and not self.pp_group.is_first_rank
+                            if ".embed_tokens." in name and not (
+                                deepseek_v2.pp_stage_needs_embedding(
+                                    self.pp_group, get_spec().speculative_algorithm
+                                )
                             ):
                                 continue
                             if (
@@ -5843,7 +5892,9 @@ class DeepseekV4ForCausalLM(nn.Module):
             "attn_mqa.v_scale",
             "blockscale_swizzled",
         ]
-        if not self.pp_group.is_first_rank:
+        if not deepseek_v2.pp_stage_needs_embedding(
+            self.pp_group, get_spec().speculative_algorithm
+        ):
             skipped_checking_patterns.append("embed_tokens")
         if not self.pp_group.is_last_rank:
             skipped_checking_patterns.append("model.norm.")

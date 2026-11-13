@@ -125,12 +125,27 @@ def check_pipeline_parallel_compat(cfg: Any) -> None:
         "Pipeline parallelism is not compatible with overlap schedule"
     )
     if cfg.speculative_algorithm == "DSPARK":
-        assert cfg.disaggregation_mode == "prefill", (
-            "Pipeline parallel DSPARK requires disaggregation-mode=prefill"
-        )
-        assert not envs.SGLANG_ENABLE_PP_SPEC.get(), (
-            "SGLANG_ENABLE_PP_SPEC does not support DSPARK PD prefill"
-        )
+        if cfg.disaggregation_mode == "prefill":
+            assert not envs.SGLANG_ENABLE_PP_SPEC.get(), (
+                "SGLANG_ENABLE_PP_SPEC does not support DSPARK PD prefill"
+            )
+        else:
+            assert cfg.disaggregation_mode == "null", (
+                "Pipeline parallel DSPARK requires disaggregation-mode=prefill "
+                "or non-disaggregated serving"
+            )
+            # Non-PD PP decode: the draft lives on the last stage, so the
+            # other stages need the relayed verify input.
+            assert envs.SGLANG_ENABLE_PP_SPEC.get(), (
+                "DSpark + PP without PD requires SGLANG_ENABLE_PP_SPEC=1"
+            )
+            assert not cfg.speculative_adaptive, (
+                "SGLANG_ENABLE_PP_SPEC is not compatible with --speculative-adaptive"
+            )
+            assert not attn_dp_enabled_of(cfg), (
+                "SGLANG_ENABLE_PP_SPEC is not compatible with attention DP "
+                "(--attn-dp-size)"
+            )
     elif cfg.speculative_algorithm is not None:
         assert (
             cfg.speculative_algorithm.upper() == "EAGLE"

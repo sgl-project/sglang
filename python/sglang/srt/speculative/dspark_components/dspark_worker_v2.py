@@ -1,5 +1,12 @@
 import logging
-from typing import TYPE_CHECKING, Callable, Optional, Protocol, runtime_checkable
+from typing import (
+    TYPE_CHECKING,
+    Callable,
+    NamedTuple,
+    Optional,
+    Protocol,
+    runtime_checkable,
+)
 
 import torch
 
@@ -152,6 +159,22 @@ def sim_draw_ahead_enabled(simulated_correct_len: Optional[torch.Tensor]) -> boo
     )
 
 
+class _PPTailState(NamedTuple):
+    """The last stage's pre-drafted next verify round.
+
+    PP decode needs the next round's chain before the round starts: every
+    stage must run the same verify forward, but the draft model lives only on
+    the last stage. The chain (plus the proposal it came from) is produced at
+    the end of the previous round and consumed at the head of the next one.
+    """
+
+    rids: list
+    draft_input: object
+    verify_window: object
+    proposal: object
+    verify_ids_2d: torch.Tensor
+
+
 class DSparkWorkerV2(BaseSpecWorker):
     """Non-last PP stages run only the target; draft state belongs to the last stage."""
 
@@ -160,6 +183,8 @@ class DSparkWorkerV2(BaseSpecWorker):
     _sim_draw_ahead = False
     num_sim_draws_ahead = 0
     _prepare_inputs_once = False
+    # Last-stage PP tail draft for the next decode round (see _PPTailState).
+    _pp_tail_state = None
     num_folded_verify_ids_steps = 0
     num_relayed_in_graph_steps = 0
     _verify_inputs_ready = None
@@ -892,6 +917,19 @@ class DSparkWorkerV2(BaseSpecWorker):
             bonus_tokens=next_token_ids,
             new_seq_lens=new_seq_lens,
         )
+        if get_parallel().pp_size > 1:
+            # PP: the first decode round needs a chain too, and the draft runs
+            # only here; produce it before the prefill result goes back.
+            self._pp_tail_state = self._pp_dspark_tail_draft(
+                batch=batch,
+                next_draft_input=batch_output.next_draft_input,
+                target_model=self.target_worker.model_runner.model,
+                bs=batch.batch_size(),
+                device=self.device,
+                seq_lens=batch_output.new_seq_lens,
+                sampling_info=batch.sampling_info,
+            )
+            batch_output.next_verify_chain = self._pp_tail_state.verify_ids_2d
         return batch_output
 
     def _idle_verify_ragged_layout(self, batch: ScheduleBatch):
@@ -973,10 +1011,6 @@ class DSparkWorkerV2(BaseSpecWorker):
         if batch.spec_info is None:
             batch.spec_info = DFlashDraftInputV2.create_idle_input(device=self.device)
         draft_input = batch.spec_info
-        if not isinstance(draft_input, DFlashDraftInputV2):
-            raise RuntimeError(
-                "DSpark spec-v2 expected DFlashDraftInputV2 state on the running batch."
-            )
 
         global_num_reqs = (
             max(batch.global_num_tokens)
@@ -996,6 +1030,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
 
         if batch.forward_mode.is_idle():
+            self._pp_tail_state = None
             self._observers.note_idle_decode_step()
             if get_parallel().attn_dp_enabled:
                 if self._draft_is_moe:
@@ -1009,6 +1044,35 @@ class DSparkWorkerV2(BaseSpecWorker):
                 )
             return self._decode_idle_result(on_publish=on_publish)
 
+        pp_tail = self._pp_tail_state
+        self._pp_tail_state = None
+        if pp_tail is not None:
+            # The previous round (or the prefill) already drafted this round's
+            # chain; every stage verifies exactly that chain.
+            if [req.rid for req in batch.reqs] != pp_tail.rids:
+                raise RuntimeError(
+                    "PP DSpark decode batch changed between the tail draft and "
+                    "this round; the tail state cannot be reindexed safely."
+                )
+            relayed = getattr(batch.spec_info, "tokens", None)
+            if relayed is not None and not torch.equal(
+                relayed.to(pp_tail.verify_ids_2d.device).reshape(
+                    pp_tail.verify_ids_2d.shape
+                ),
+                pp_tail.verify_ids_2d,
+            ):
+                raise RuntimeError(
+                    "PP DSpark relayed chain differs from the last stage's tail "
+                    "draft; the stages would verify different proposals."
+                )
+            draft_input = pp_tail.draft_input
+        elif not isinstance(draft_input, DFlashDraftInputV2):
+            raise RuntimeError(
+                "PP DSpark decode has no tail draft for the current batch; the "
+                "last stage must tail-draft after prefill and after every "
+                "verify round."
+            )
+
         batch.seq_lens.record_stream(
             torch.get_device_module(self.device).current_stream()
         )
@@ -1021,7 +1085,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         target_model = self.target_worker.model_runner.model
         anchor_ids = (
             self._proposer.draft_block_ids_view(bs=bs, device=prefix_lens.device)
-            if self._prepare_inputs_once
+            if self._prepare_inputs_once and pp_tail is None
             else None
         )
         window_seq_lens_cpu = (
@@ -1029,17 +1093,25 @@ class DSparkWorkerV2(BaseSpecWorker):
             if batch.seq_lens_cpu is not None
             else draft_input.nxt_kv_lens_cpu
         )
-        verify_window = alloc_verify_window(
-            batch=batch,
-            bs=bs,
-            device=device,
-            verify_num_draft_tokens=self.verify_num_draft_tokens,
-            block_pos_offsets=self._block_pos_offsets,
-            model_runner=self.model_runner,
-            seq_lens_cpu=window_seq_lens_cpu,
-            bonus=draft_input.bonus_tokens.view(-1) if anchor_ids is not None else None,
-            anchor_ids=anchor_ids,
-        )
+        if pp_tail is not None:
+            # Planned by the tail draft against this round's seq_lens.
+            verify_window = pp_tail.verify_window
+        else:
+            verify_window = alloc_verify_window(
+                batch=batch,
+                bs=bs,
+                device=device,
+                verify_num_draft_tokens=self.verify_num_draft_tokens,
+                block_pos_offsets=self._block_pos_offsets,
+                model_runner=self.model_runner,
+                seq_lens_cpu=window_seq_lens_cpu,
+                bonus=(
+                    draft_input.bonus_tokens.view(-1)
+                    if anchor_ids is not None
+                    else None
+                ),
+                anchor_ids=anchor_ids,
+            )
         if self._verify_inputs_ready is not None:
             # The verify's inputs are final here; the early metadata waits for this.
             self._verify_inputs_ready.record()
@@ -1068,17 +1140,22 @@ class DSparkWorkerV2(BaseSpecWorker):
             self._begin_simulated_step_ahead(
                 bs=bs, simulate_bonus_sampling_info=simulate_bonus_sampling_info
             )
-        with self._draft_context(), self._observers.segment(InfoSegment.DRAFT):
-            proposal = self._proposer.propose(
-                batch=batch,
-                draft_input=draft_input,
-                verify_window=verify_window,
-                bs=bs,
-                device=device,
-                target_model=target_model,
-                sampling_info=sampling_info,
-                anchor_prepared=anchor_ids is not None,
-            )
+        if pp_tail is not None:
+            # The tail draft already ran the proposal; reuse it as-is so this
+            # round's verify matches the chain the other stages received.
+            proposal = pp_tail.proposal
+        else:
+            with self._draft_context(), self._observers.segment(InfoSegment.DRAFT):
+                proposal = self._proposer.propose(
+                    batch=batch,
+                    draft_input=draft_input,
+                    verify_window=verify_window,
+                    bs=bs,
+                    device=device,
+                    target_model=target_model,
+                    sampling_info=sampling_info,
+                    anchor_prepared=anchor_ids is not None,
+                )
         if self._verify_inputs_ready is not None:
             self._stage_target_verify_metadata(
                 batch=batch,
@@ -1110,6 +1187,10 @@ class DSparkWorkerV2(BaseSpecWorker):
             dp_tier_num_tokens=self._dp_verify_tier_num_tokens(batch),
         )
         run_compact = self._verify_planner.should_run_compact(layout=layout)
+        if get_parallel().pp_size > 1:
+            # PP needs the eager, non-compact verify: non-last stages rebuild
+            # the chain from the relay and the accept must stay host-visible.
+            run_compact = False
 
         verify_ids_2d = proposal.verify_ids
         if verify_ids_2d is None:
@@ -1143,6 +1224,9 @@ class DSparkWorkerV2(BaseSpecWorker):
                 or self._verify_executor.verify_epilogue.simulate_fold
             )
             and not batch.has_grammar
+            # PP's accept crosses stages through the host; the in-graph accept
+            # and its relay do not run there.
+            and get_parallel().pp_size == 1
         )
         if not self._sim_draw_ahead:
             self._verify_executor.begin_simulated_step()
@@ -1355,6 +1439,20 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
         if relay is not None:
             relay.published_bonus = next_draft_input.bonus_tokens
+        next_verify_chain = None
+        if get_parallel().pp_size > 1:
+            # PP tail draft: earlier stages need the next round's chain before
+            # running their half of its verify forward.
+            self._pp_tail_state = self._pp_dspark_tail_draft(
+                batch=batch,
+                next_draft_input=next_draft_input,
+                target_model=target_model,
+                bs=bs,
+                device=device,
+                seq_lens=accept.new_seq_lens,
+                sampling_info=batch.sampling_info,
+            )
+            next_verify_chain = self._pp_tail_state.verify_ids_2d
         return GenerationBatchResult(
             logits_output=logits_output,
             next_token_ids=accept.out_tokens.reshape(-1),
@@ -1367,8 +1465,97 @@ class DSparkWorkerV2(BaseSpecWorker):
             ),
             can_run_cuda_graph=can_run_cuda_graph,
             next_draft_input=next_draft_input,
+            next_verify_chain=next_verify_chain,
             speculative_num_draft_tokens=int(self.verify_num_draft_tokens),
             new_seq_lens=accept.new_seq_lens,
+        )
+
+    def _pp_dspark_tail_draft(
+        self,
+        *,
+        batch: ScheduleBatch,
+        next_draft_input,
+        target_model,
+        bs: int,
+        device,
+        seq_lens: torch.Tensor,
+        sampling_info,
+    ) -> _PPTailState:
+        """Draft the next round's chain at the end of this one.
+
+        The draft model lives only on the last PP stage, while every stage
+        must run the same verify forward, so the chain cannot wait for the
+        next iteration. Runs after the accept/commit so the draft KV already
+        holds this round's accepted tokens.
+        """
+        from sglang.srt.speculative.dspark_components.dspark_planner import (
+            alloc_verify_window,
+        )
+
+        rids = [req.rid for req in batch.reqs]
+        seq_lens_cpu = seq_lens.to("cpu")
+        anchor_ids = (
+            self._proposer.draft_block_ids_view(bs=bs, device=device)
+            if self._prepare_inputs_once
+            else None
+        )
+        saved = (
+            batch.seq_lens,
+            batch.seq_lens_cpu,
+            batch.seq_lens_sum,
+            batch.forward_mode,
+        )
+        try:
+            # The next round starts from this round's accepted lengths.
+            batch.seq_lens = seq_lens
+            batch.seq_lens_cpu = seq_lens_cpu
+            batch.seq_lens_sum = int(seq_lens_cpu.sum())
+            batch.forward_mode = ForwardMode.DECODE
+            verify_window = alloc_verify_window(
+                batch=batch,
+                bs=bs,
+                device=device,
+                verify_num_draft_tokens=self.verify_num_draft_tokens,
+                block_pos_offsets=self._block_pos_offsets,
+                model_runner=self.model_runner,
+                seq_lens_cpu=seq_lens_cpu,
+                bonus=(
+                    next_draft_input.bonus_tokens.view(-1)
+                    if anchor_ids is not None
+                    else None
+                ),
+                anchor_ids=anchor_ids,
+            )
+            with self._draft_context():
+                proposal = self._proposer.propose(
+                    batch=batch,
+                    draft_input=next_draft_input,
+                    verify_window=verify_window,
+                    bs=bs,
+                    device=device,
+                    target_model=target_model,
+                    sampling_info=sampling_info,
+                    anchor_prepared=anchor_ids is not None,
+                )
+        finally:
+            (
+                batch.seq_lens,
+                batch.seq_lens_cpu,
+                batch.seq_lens_sum,
+                batch.forward_mode,
+            ) = saved
+        verify_ids = proposal.verify_ids
+        if verify_ids is None:
+            verify_ids = torch.cat(
+                [proposal.draft_block_ids[:, :1], proposal.draft_block.draft_tokens],
+                dim=1,
+            ).contiguous()
+        return _PPTailState(
+            rids=rids,
+            draft_input=next_draft_input,
+            verify_window=verify_window,
+            proposal=proposal,
+            verify_ids_2d=verify_ids,
         )
 
     def _force_watermark(

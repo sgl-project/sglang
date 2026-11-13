@@ -719,10 +719,24 @@ def _handle_dspark(server_args: ServerArgs) -> None:
             )
 
     if cfg.pp_size != 1:
-        if cfg.disaggregation_mode != "prefill":
+        if cfg.disaggregation_mode == "prefill":
+            # PD prefill: the draft lives on the last PP stage and every other
+            # stage only runs the target; no PP spec relay is involved.
+            pass
+        elif cfg.disaggregation_mode == "null":
+            # Single-node PP decode: every stage must rebuild the same verify
+            # input from the last stage's tail draft, which is the PP spec
+            # relay's job.
+            if not envs.SGLANG_ENABLE_PP_SPEC.get():
+                raise ValueError(
+                    "DSpark pipeline parallelism without PD requires "
+                    "SGLANG_ENABLE_PP_SPEC=1 so every stage rebuilds the "
+                    "verify input from the last stage's tail draft."
+                )
+        else:
             raise ValueError(
-                "DSpark pipeline parallelism requires PD prefill; "
-                "decode and non-disaggregated serving require pp_size == 1."
+                "DSpark pipeline parallelism is supported on prefill or "
+                "non-disaggregated serving only."
             )
 
     if cfg.speculative_draft_model_path is None:

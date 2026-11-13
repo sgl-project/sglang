@@ -5177,24 +5177,38 @@ class Scheduler(
                     # returns pp_hidden_states_proxy_tensors for relay.
                     self.resolve_forward_inputs(batch, self.future_map)
                     if is_verify_round:
-                        from sglang.srt.speculative.eagle_utils import (
-                            eagle_prepare_for_verify,
-                        )
-
-                        # Isolation is load-bearing: eagle_prepare_for_verify
-                        # mutates SB fields (forward_mode -> TARGET_VERIFY,
-                        # input_ids, out_cache_loc); without the restore the
-                        # next get_next_batch_to_run treats this decode batch
-                        # as extend and re-merges it (duplicate reqs).
+                        # Isolation is load-bearing: the prepare mutates SB
+                        # fields (forward_mode -> TARGET_VERIFY, input_ids,
+                        # out_cache_loc); without the restore the next
+                        # get_next_batch_to_run treats this decode batch as
+                        # extend and re-merges it (duplicate reqs).
                         with self._forward_isolation(batch, overlap=False):
-                            verify_forward_batch, can_run_cuda_graph = (
-                                eagle_prepare_for_verify(
-                                    batch.spec_info,
-                                    self.req_to_token_pool,
-                                    batch,
-                                    self.tp_worker,
+                            if self.spec_algorithm.is_dspark():
+                                # The relayed linear chain was rebuilt into a
+                                # DFlashVerifyInput; its own prepare builds the
+                                # verify batch (positions/cache slots are
+                                # re-planned locally).
+                                verify_forward_batch, _ = (
+                                    batch.spec_info.prepare_for_verify(
+                                        batch, self.tp_worker
+                                    )
                                 )
-                            )
+                                # PP decode graphs do not carry the relayed
+                                # chain; take the eager verify path.
+                                can_run_cuda_graph = False
+                            else:
+                                from sglang.srt.speculative.eagle_utils import (
+                                    eagle_prepare_for_verify,
+                                )
+
+                                verify_forward_batch, can_run_cuda_graph = (
+                                    eagle_prepare_for_verify(
+                                        batch.spec_info,
+                                        self.req_to_token_pool,
+                                        batch,
+                                        self.tp_worker,
+                                    )
+                                )
                             batch_result = self.tp_worker.forward_batch_generation(
                                 batch=None,
                                 forward_batch=verify_forward_batch,

@@ -913,6 +913,12 @@ class ModelRunner:
             start_layer=self.layer_info.start_layer,
         )
 
+    def get_pp_proxy_hc_pre_width(self) -> int:
+        return misc_utils.resolve_pp_proxy_hc_pre_width(
+            model_config=self.model_config,
+            start_layer=self.layer_info.start_layer,
+        )
+
     def decode_num_tokens_per_req(
         self, *, num_draft_tokens: Optional[int] = None
     ) -> int:

@@ -1,0 +1,1 @@
+## 当前基于dsv4.1在sglang上面的npu适配代码，我们需要进一步开发PP功能，阅读pr-49005-dsv41分支代码，基于此代码，进行dsv4.1在npu平台上面的PP适配。这里的首先需要配确认dsv4.1在gpu上面是否支持pp，然后在基于gpu的公共代码进行开发npu的功能。可以参考历史dsv4的适配，需要尽可能最小修复，最大复用gpu代码，最少出现is_npu这种分支。历史上dsv4基于npu平台的pp适配pr为https://github.com/sgl-project/sglang/pull/39820

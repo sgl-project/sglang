@@ -85,6 +85,7 @@ def _allocate_decode_buffers(
     hc_hidden_size: Optional[int] = None,
     pp_proxy_topk_size: Optional[int] = None,
     pp_proxy_residual_num_blocks: Optional[int] = None,
+    pp_proxy_mhc_pre_width: int = 0,
     allocate_logits_buffer: bool = True,
 ) -> SimpleNamespace:
     """Allocate the FB-shared decode buffers."""
@@ -150,6 +151,11 @@ def _allocate_decode_buffers(
             if pp_proxy_topk_size is not None:
                 pp_proxy_tensors["topk_indices"] = torch.zeros(
                     (max_num_token, pp_proxy_topk_size), dtype=torch.int32
+                )
+            if pp_proxy_mhc_pre_width:
+                # DSV4.1's lagged mHC pre-mix, token-major in fp32.
+                pp_proxy_tensors["mhc_pre"] = torch.zeros(
+                    (max_num_token, pp_proxy_mhc_pre_width), dtype=torch.float32
                 )
         else:
             pp_proxy_tensors = None
@@ -475,6 +481,7 @@ class BaseRunner(ABC):
             hc_hidden_size=getattr(mr.model_config, "hc_hidden_size", None),
             pp_proxy_topk_size=mr.get_pp_proxy_topk_size(),
             pp_proxy_residual_num_blocks=mr.get_pp_proxy_residual_num_blocks(),
+            pp_proxy_mhc_pre_width=mr.get_pp_proxy_hc_pre_width(),
             allocate_logits_buffer=allocate_logits_buffer,
         )
 

@@ -397,7 +397,7 @@ class CompressorAscendBackendMixin:
             if is_decode:
                 self._build_seq_metadata_decode(_seq_lens)
             if not is_decode:
-                for ratio in self._dsv4_compress_ratios:
+                for ratio in self._dsv4_unique_compress_ratios:
                     if ratio in (4, 128):
                         if f"c{ratio}_loc" not in result:
                             setattr(fm, f"c{ratio}_loc", None)
@@ -2344,7 +2344,8 @@ class LowRatioCompressAscendBackendMixin:
     _DSV41_SLOT_SKIP = -1
 
     def _dsv41_low_ratios(self) -> list:
-        return [r for r in self._dsv4_unique_compress_ratios if r in (1, 2)]
+        # Stage-scoped: a PP stage may hold only one of ratio 1 / ratio 2.
+        return [r for r in self._dsv4_stage_unique_compress_ratios if r in (1, 2)]
 
     def _dsv41_candidate_ratio(self) -> Optional[int]:
         """The compression ratio of the layer that publishes candidate blocks."""
@@ -2354,10 +2355,14 @@ class LowRatioCompressAscendBackendMixin:
         return self._dsv4_compress_ratios[layer_id]
 
     def _dsv41_has_candidate_consumers(self) -> bool:
-        """Whether any later index source layer rescoring inside the candidates."""
+        """Whether a later index source layer on this stage rescoring inside
+        the candidates. PP keeps the candidate source with its consumers."""
         source = self._dsv41_candidate_source_layer
-        return self._dsv41_candidate_ratio() is not None and any(
-            layer > source for layer in self._dsv41_index_source_layers
+        if self._dsv41_candidate_ratio() is None:
+            return False
+        return any(
+            source < layer and layer in self._dsv4_stage_layer_ids
+            for layer in self._dsv41_index_source_layers
         )
 
     @staticmethod
@@ -2962,8 +2967,29 @@ class DeepseekV4AscendAttnBackend(
         self._dsv41_qsli_caches: dict = {}
         if getattr(model_runner, "is_draft_worker", False):
             self._dsv4_compress_ratios = type(hf.compress_ratios)()
-        self._dsv4_has_c4 = 4 in self._dsv4_compress_ratios
-        self._dsv4_has_c128 = 128 in self._dsv4_compress_ratios
+            stage_present_ratios: tuple = ()
+        else:
+            # PP stages own disjoint layer slices; metadata and graph buffers
+            # may only cover the compress ratios actually present on this
+            # stage. A ratio absent here keeps no pool to index.
+            pool = self.token_to_kv_pool
+            stage_present_ratios = tuple(
+                sorted(
+                    {
+                        pool.compression_ratios[layer_id]
+                        for layer_id in pool.stage_layer_ids
+                    }
+                )
+            )
+        self._dsv4_stage_layer_ids = frozenset(
+            getattr(self.token_to_kv_pool, "stage_layer_ids", ())
+        )
+        self._dsv4_stage_present_ratios = stage_present_ratios
+        self._dsv4_stage_unique_compress_ratios = tuple(
+            ratio for ratio in stage_present_ratios if ratio in (0, 1, 2, 4, 128)
+        )
+        self._dsv4_has_c4 = 4 in self._dsv4_stage_unique_compress_ratios
+        self._dsv4_has_c128 = 128 in self._dsv4_stage_unique_compress_ratios
         # DeepSeek-V4.1 generation signal. Both generations report KVLayout.V4
         # on NPU, so the ratios themselves are the only discriminator.
         self._dsv4_has_low_ratio = any(
@@ -2988,7 +3014,7 @@ class DeepseekV4AscendAttnBackend(
             cfg.sliding_window_size if cfg.sliding_window_size is not None else 128
         )
         self._dsv4_unique_compress_ratios = list(
-            dict.fromkeys(self._dsv4_compress_ratios)
+            self._dsv4_stage_unique_compress_ratios
         )
         self._is_dspark_algorithm = bool(
             model_runner.spec_algorithm is not None

@@ -101,6 +101,23 @@ def resolve_pp_proxy_residual_num_blocks(
     return (start_layer + block_size - 1) // block_size
 
 
+def resolve_pp_proxy_hc_pre_width(
+    *, model_config: ModelConfig, start_layer: int
+) -> int:
+    """Width of the lagged mHC pre-mix a later PP stage receives.
+
+    DSV4.1's `pre_from_prev` scheme consumes the previous sublayer's pre-mix,
+    so every stage after the first must receive it from its predecessor.
+    """
+    parallel = get_parallel()
+    if parallel.pp_size <= 1 or parallel.pp_rank == 0:
+        return 0
+    hf_config = model_config.hf_text_config
+    if not getattr(hf_config, "hc_pre_from_prev_sublayer", False):
+        return 0
+    return int(getattr(hf_config, "hc_mult", 0))
+
+
 @runtime_checkable
 class _SupportsDSparkPPProxy(Protocol):
     def get_pp_proxy_dspark_hidden_size(self) -> int: ...

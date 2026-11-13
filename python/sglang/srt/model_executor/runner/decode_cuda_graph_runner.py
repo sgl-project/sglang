@@ -557,6 +557,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             pp_proxy_dspark_hidden_size=(
                 self.model_runner.get_pp_proxy_dspark_hidden_size()
             ),
+            pp_proxy_mhc_pre_width=self.model_runner.get_pp_proxy_hc_pre_width(),
             aux_hidden_states_width=self.model_runner.get_aux_hidden_states_width(),
         )
         # The early verify metadata writes these slots beside the draft graph, which

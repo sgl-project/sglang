@@ -1390,3 +1390,49 @@ def accept_draft_tokens(
         sampling_trim=sampling_trim,
     )
     return selected.correct_len, selected.bonus, selected.cap_trim_lens
+
+
+def prepare_pp_verify_input(
+    *,
+    verify_ids_2d: torch.Tensor,
+    batch,
+    target_worker,
+    verify_num_draft_tokens: int,
+):
+    """Build a non-last PP stage's verify input from the relayed chain.
+
+    Request scheduling is mirrored on every stage, so positions and the
+    virtual cache slots can be re-planned locally; only the chain tokens come
+    from the last stage's tail draft. ``batch.out_cache_loc`` is installed for
+    ``prepare_for_verify`` exactly like ``run_non_compact`` does.
+    """
+    from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+    from sglang.srt.speculative.dflash_info import DFlashVerifyInput
+    from sglang.srt.speculative.draft_worker_common import build_block_pos_offsets
+    from sglang.srt.speculative.dspark_components.dspark_planner import (
+        alloc_verify_window,
+    )
+
+    device = batch.seq_lens.device
+    bs = batch.batch_size()
+    verify_window = alloc_verify_window(
+        batch=batch,
+        bs=bs,
+        device=device,
+        verify_num_draft_tokens=verify_num_draft_tokens,
+        block_pos_offsets=build_block_pos_offsets(
+            length=verify_num_draft_tokens, device=device
+        ),
+        model_runner=target_worker.model_runner,
+        seq_lens_cpu=batch.seq_lens_cpu,
+    )
+    batch.out_cache_loc = verify_window.verify_cache_loc
+    return DFlashVerifyInput(
+        draft_token=verify_ids_2d.reshape(-1),
+        positions=verify_window.positions_2d.reshape(-1),
+        draft_token_num=verify_num_draft_tokens,
+        custom_mask=None,
+        capture_hidden_mode=CaptureHiddenMode.FULL,
+        live_seq_lens_cpu=batch.seq_lens_cpu,
+        iteration_ids=verify_window.iteration_ids,
+    )

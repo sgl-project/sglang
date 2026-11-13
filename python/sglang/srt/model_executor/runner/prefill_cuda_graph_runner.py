@@ -492,6 +492,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             pp_proxy_dspark_hidden_size=(
                 self.model_runner.get_pp_proxy_dspark_hidden_size()
             ),
+            pp_proxy_mhc_pre_width=self.model_runner.get_pp_proxy_hc_pre_width(),
         )
         self.buffers.share_buffers()
         # Token-axis FB-shared slot registry adopting PrefillInputBuffers
