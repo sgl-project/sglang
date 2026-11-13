@@ -107,6 +107,7 @@ class _FakeReq(FakeReq):
         self.cached_tokens_device = 0
         self.cached_tokens_host = 0
         self.cached_tokens_storage = 0
+        self.cache_miss_tokens = None
         self.retraction_count = 0
         self.request_stats_retraction_count = None
         self.time_stats = None

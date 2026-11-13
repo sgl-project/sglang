@@ -466,6 +466,7 @@ def build_kv_cache(
         eviction_policy=get_memory().radix_eviction_policy,
         eviction_policy_config=get_memory().radix_eviction_policy_config,
         enable_metrics=enable_metrics,
+        enable_cache_miss_attribution=get_memory().enable_cache_miss_attribution,
         enable_kv_cache_events=enable_kv_cache_events,
         dynamo_kv_event_format=dynamo_kv_event_format,
         kv_event_lora_names=kv_event_lora_names,

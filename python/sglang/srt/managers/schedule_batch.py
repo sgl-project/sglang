@@ -756,6 +756,10 @@ class Req(ReqDllmMixin):
         self._cache_breakdown_computed = (
             False  # Track if breakdown was already computed
         )
+        # Cached full-attention KV the last match found, beyond what it served.
+        self.full_kv_hit_length = 0
+        # Uncached prompt tokens by cause (--enable-cache-miss-attribution).
+        self.cache_miss_tokens: Optional[Dict[str, int]] = None
 
         # Per-request count of verification forward passes.
         self.spec_verify_ct = 0
@@ -2487,6 +2491,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                         host_hit_is_storage=req.host_hit_is_storage,
                     )
                     req._cache_breakdown_computed = True
+                    attribution = self.tree_cache.miss_attribution
+                    if attribution is not None:
+                        req.cache_miss_tokens = attribution.attribute(
+                            req.origin_input_ids,
+                            prompt_len=len(req.origin_input_ids),
+                            hit_len=pre_len,
+                            kv_len=req.full_kv_hit_length,
+                        )
 
                 req.already_computed = seq_len
             req.is_retracted = False

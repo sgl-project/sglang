@@ -411,6 +411,11 @@ def handle_cache_compatibility(server_args: Any) -> None:
             "The arguments enable-hierarchical-cache and disable-radix-cache are mutually exclusive "
             "and cannot be used at the same time. Please use only one of them."
         )
+    if cfg.enable_cache_miss_attribution and cfg.disable_radix_cache:
+        raise ValueError(
+            "--enable-cache-miss-attribution explains prefix cache misses; it "
+            "cannot be combined with --disable-radix-cache."
+        )
 
     if cfg.enable_prefill_weight_versions:
         if cfg.enable_unified_memory:

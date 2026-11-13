@@ -139,6 +139,34 @@ class TestGreedyDualSizeOnUnifiedPool(CustomTestCase):
         self.assertEqual(tree.match(long).device_prefix_len, 40)
 
 
+class TestMissAttributionOnUnifiedPool(CustomTestCase):
+    def test_a_state_evicted_under_cached_kv_is_a_dependency_miss(self):
+        tree = _UnifiedCache(
+            enable_cache_miss_attribution=True, enable_mamba_unit_eviction=False
+        )
+        prompt = _tokens(100, 16)
+        tree.insert(prompt[:12])
+        # A stateless branch below keeps the state's KV cached once it goes.
+        tree.insert(prompt[:12] + _tokens(900, 4), state=False)
+        tree.cache.miss_attribution.record_computed(prompt[:12], 12)
+        tree.cache.evict(EvictParams(mamba_num=1))
+        match = tree.match(prompt)
+        split = tree.cache.miss_attribution.attribute(
+            prompt,
+            prompt_len=len(prompt),
+            hit_len=match.device_prefix_len,
+            kv_len=match.full_kv_hit_length,
+        )
+        self.assertEqual(match.device_prefix_len, 0)
+        self.assertEqual(
+            split, {"new": 4, "placement": 0, "dependency": 12, "capacity": 0}
+        )
+
+    def test_without_the_switch_nothing_is_recorded(self):
+        tree = _UnifiedCache()
+        self.assertIsNone(tree.cache.miss_attribution)
+
+
 if __name__ == "__main__":
     import unittest
 

@@ -2595,6 +2595,12 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--enable-cache-miss-attribution`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Split each new request&apos;s uncached prompt tokens by cause: never computed (<code>new</code>), past the last position where a state was ever saved (<code>placement</code>), KV cached but its state evicted (<code>dependency</code>), or both evicted (<code>capacity</code>). Reported per request in <code>meta_info</code> <code>cache_miss_tokens</code> and as <code>sglang:cache_miss_tokens_total</code>. A debugging aid: it keeps hashes of every computed prefix in the scheduler.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--cuda-graph-config`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Canonical per-phase CUDA graph settings as JSON, e.g. <code>{`{"decode":{"backend":"full","max_bs":256},"prefill":{"backend":"breakable"}}`}</code>. JSON wins over the per-phase <code>--cuda-graph-*</code> convenience flags and over the legacy flags. Allowed backends: <code>full</code>, <code>breakable</code>, <code>disabled</code>.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>

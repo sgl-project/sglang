@@ -35,6 +35,7 @@ class CacheInitParams:
     eviction_policy_config: Optional[dict[str, Any]] = None
 
     enable_metrics: bool = False
+    enable_cache_miss_attribution: bool = False
     enable_kv_cache_events: bool = False
     dynamo_kv_event_format: bool = False
     # LoRA names for KV events; the scheduler registers requests in it.

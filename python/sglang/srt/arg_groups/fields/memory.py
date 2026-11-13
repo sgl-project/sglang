@@ -76,6 +76,15 @@ class Memory(msgspec.Struct):
             resolvable=True,
         ),
     ] = False
+    enable_cache_miss_attribution: A[
+        bool,
+        "Split each new request's uncached prompt tokens by cause: never "
+        "computed (new), past the last position where a state was ever saved "
+        "(placement), KV cached but its state evicted (dependency), or both "
+        "evicted (capacity). Reported per request in meta_info "
+        "cache_miss_tokens and as sglang:cache_miss_tokens_total. A debugging "
+        "aid: it keeps hashes of every computed prefix in the scheduler.",
+    ] = False
     enable_page_major_kv_layout: A[
         bool,
         "Store the Mamba state and full/SWA KV caches as one entry per token "

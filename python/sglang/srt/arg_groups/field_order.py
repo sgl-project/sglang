@@ -572,5 +572,6 @@ POSITIONAL_FIELD_ORDER = (
     "_max_running_requests_explicitly_set",
     "hybrid_cache_checkpoints_level",
     "enable_mamba_unit_eviction",
+    "enable_cache_miss_attribution",
 )
 # fmt: on
