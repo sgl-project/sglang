@@ -3125,6 +3125,26 @@ mod tests {
         );
     }
 
+    /// Reorg's cache-aware groups build their own prefix provider; it must honor
+    /// --cache-pending-prefix-consult-below like the other routing path does.
+    #[tokio::test]
+    async fn reorg_prefix_provider_honors_pending_consult_below() {
+        let state = crate::state::kv_events::KvEventIndex::new();
+        let provider = |argv: &str| {
+            let config = cfg_of(argv).unwrap();
+            crate::policies_reorg::factory::local_prefix_provider(&config.model, &state)
+        };
+        let set = provider(
+            "--chat-routing reorg --policy cache_aware --cache-pending-prefix-ttl-ms 60000 \
+             --cache-pending-prefix-consult-below 0.8",
+        );
+        assert_eq!(set.pending_consult_below(), Some(0.8));
+        let unset = provider(
+            "--chat-routing reorg --policy cache_aware --cache-pending-prefix-ttl-ms 60000",
+        );
+        assert_eq!(unset.pending_consult_below(), None);
+    }
+
     #[test]
     fn pending_prefix_ttl_needs_the_local_radix_tree() {
         let cache = cfg_of("--policy cache_aware --cache-pending-prefix-ttl-ms 500")
