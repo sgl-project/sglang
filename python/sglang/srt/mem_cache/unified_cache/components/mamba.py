@@ -397,6 +397,9 @@ class MambaComponent(TreeComponent):
             self.tree_core.component_evictable_size_[self.component_type] += (
                 self.reclaimable_value_len(node)
             )
+            units = self.tree_core.state_units
+            if units is not None:
+                units.state_changed(node)
             self._emit_excess_path_states_eviction(node, cache_actions)
             return
         if node.component_data[self.component_type].value is None:
@@ -498,6 +501,9 @@ class MambaComponent(TreeComponent):
         # HiCache: mamba host_value stays on child (mamba = leaf-only data)
         new_parent.component_data[ct].host_value = None
         new_parent.component_data[ct].host_lock_ref = 0
+        units = self.tree_core.state_units
+        if units is not None:
+            units.split(new_parent, child)
 
     def evict_component(
         self,
@@ -536,6 +542,9 @@ class MambaComponent(TreeComponent):
             if not host_lru.in_list(node):
                 host_lru.insert_mru(node)
 
+        units = self.tree_core.state_units
+        if units is not None:
+            units.state_changed(node)
         return freed, host_freed
 
     def _evict_device_start(self, request_cnt: int) -> None:

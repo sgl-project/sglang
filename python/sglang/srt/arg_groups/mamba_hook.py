@@ -26,6 +26,24 @@ def handle_mamba_backend(server_args: Any):
             f"integer, got {cfg.mamba_max_states_per_path}."
         )
 
+    if cfg.enable_mamba_unit_eviction:
+        if cfg.disable_radix_cache:
+            raise ValueError(
+                "--enable-mamba-unit-eviction orders the radix cache's evictions; "
+                "it cannot be combined with --disable-radix-cache."
+            )
+        if cfg.radix_cache_backend is not None:
+            raise ValueError(
+                "--enable-mamba-unit-eviction only supports the built-in radix "
+                f"cache; --radix-cache-backend={cfg.radix_cache_backend!r} does "
+                "not implement it. Omit --radix-cache-backend."
+            )
+        if cfg.enable_hierarchical_cache:
+            raise ValueError(
+                "--enable-mamba-unit-eviction orders the device tier's evictions "
+                "only and does not support --enable-hierarchical-cache yet."
+            )
+
     if cfg.enable_mamba_cache_stochastic_rounding:
         if cfg.mamba_ssm_dtype != "float16":
             raise ValueError(

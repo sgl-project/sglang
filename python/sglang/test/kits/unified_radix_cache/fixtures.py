@@ -267,6 +267,7 @@ def build_fixture(
             ),
         ),
         enable_mamba_extra_buffer=cfg.enable_mamba_extra_buffer,
+        enable_mamba_unit_eviction=cfg.enable_mamba_unit_eviction,
         enable_kv_cache_events=enable_kv_cache_events,
         dynamo_kv_event_format=dynamo_kv_event_format,
         kv_event_lora_names=kv_event_lora_names or KvEventLoraNames(),

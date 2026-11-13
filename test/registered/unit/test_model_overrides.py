@@ -857,6 +857,12 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 "LlamaForCausalLM", "llama", mamba_radix_cache_strategy="extra_buffer"
             )
 
+    def test_mamba_unit_eviction_without_mamba_states_fails_fast(self):
+        with self.assertRaisesRegex(ValueError, "enable-mamba-unit-eviction"):
+            self._construct(
+                "LlamaForCausalLM", "llama", enable_mamba_unit_eviction=True
+            )
+
     def test_explicit_extra_buffer_is_harmless_with_radix_cache_disabled(self):
         sa = self._construct(
             "LlamaForCausalLM",

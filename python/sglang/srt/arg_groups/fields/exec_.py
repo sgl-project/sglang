@@ -568,6 +568,15 @@ class ExecMamba(msgspec.Struct):
             choices=[2, 3],
         ),
     ] = 2
+    enable_mamba_unit_eviction: A[
+        bool,
+        "Evict a cached Mamba state together with the full-attention KV that only "
+        "it can serve, and evict cached KV that no state can serve before other "
+        "KV. Without it, evicting an interior state keeps its KV, which no "
+        "request can resume from. Needs a hybrid model with Mamba states. "
+        "Switches the radix tree core from the default Rust one to the slower "
+        "Python one.",
+    ] = False
     enable_mamba_cache_stochastic_rounding: A[
         bool,
         "Enable stochastic rounding when writing FP16 Mamba SSM cache states. Requires --mamba-ssm-dtype float16 and CUDA. With --mamba-backend triton, requires SM100.",

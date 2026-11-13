@@ -45,6 +45,8 @@ class CacheInitParams:
 
     enable_mamba_extra_buffer: bool = False
     enable_mamba_extra_buffer_lazy: bool = False
+    # Evict a Mamba state together with the full KV that only it can serve.
+    enable_mamba_unit_eviction: bool = False
 
     pp_rank: int = 0
     pp_size: int = 1

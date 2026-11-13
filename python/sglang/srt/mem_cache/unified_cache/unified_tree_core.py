@@ -87,6 +87,7 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     UnifiedTreeCoreInterface,
     uses_joint_lru,
 )
+from sglang.srt.mem_cache.unified_cache.unit_eviction import StateUnits
 from sglang.srt.mem_cache.utils import (
     compute_node_hash_values,
     get_eviction_strategy,
@@ -117,6 +118,13 @@ class StorageBackupSpec(NamedTuple):
 
 class UnifiedTreeNode:
     counter = 0
+    # Unit eviction only (StateUnits), class defaults so that no node pays for
+    # them otherwise: whether this node's state is counted, the nodes at or
+    # below it holding a state on either tier, and its children whose subtrees
+    # hold one.
+    _unit_holds_state = False
+    _unit_states_below = 0
+    _unit_state_branches = 0
 
     def __init__(self, tree_components: tuple[ComponentType, ...], priority: int = 0):
         # Plain dict (not defaultdict): a missing-key read must raise, never
@@ -511,6 +519,11 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         # The node _tlru_* lens are read only by TLRUStrategy.get_priority;
         # every other policy skips the per-insert bookkeeping entirely.
         self.tlru_bookkeeping = params.eviction_policy.lower() == "tlru"
+        self.state_units: Optional[StateUnits] = (
+            StateUnits(self)
+            if params.enable_mamba_unit_eviction and TREE_STATE in self._family_slot_ids
+            else None
+        )
 
         # ``device`` is derived from the construction-time allocator; the
         # allocator/pool themselves are owned by the cache, not the tree.
@@ -563,6 +576,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 component.evict_device_end()
         # Internal victims awaiting the controller's backup and finish call.
         self._pending_internal_evictions: dict[ComponentType, NodeId] = {}
+        if self.state_units is not None:
+            self.state_units.reset()
         # Maintains the NodeId -> active tree node mapping.
         self._node_arena: dict[NodeId, UnifiedTreeNode] = {}
         self.joint_lru = JointLRU() if self._keeps_joint_lru else None
@@ -1769,6 +1784,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         """Update both device and host leaf sets for a node."""
         if self._is_device_leaf(node):
             self.evictable_device_leaves.add(node)
+            units = self.state_units
+            if units is not None:
+                units.evictable_leaf(node)
         else:
             self.evictable_device_leaves.discard(node)
 
@@ -2463,6 +2481,17 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
         self._update_evictable_leaf_sets(node)
 
+        units = self.state_units
+        if (
+            units is not None
+            and target is EvictLayer.DEVICE
+            and trigger.component_type == units.state_component
+            and not units.holds(node)
+        ):
+            units.release(
+                node, tracker, device_frees, host_frees, cache_actions=cache_actions
+            )
+
     def _is_cascade_evict_leaf(self, node: UnifiedTreeNode, target: EvictLayer) -> bool:
         if target == EvictLayer.DEVICE:
             return node in self.evictable_device_leaves
@@ -2609,6 +2638,17 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
             has_device = cur.component_data[ct].value is not None
             has_host = cur.component_data[ct].host_value is not None
+
+            units = self.state_units
+            if units is not None and not units.holds(cur) and not units.pinned(cur):
+                # A childless node without a state: KV no request resumes from.
+                parent = cur.parent
+                units.delete_dead(
+                    cur, tracker, device_frees, host_frees, cache_actions=cache_actions
+                )
+                self._update_evictable_leaf_sets(parent)
+                cur = parent
+                continue
 
             if has_device:
                 self._update_evictable_leaf_sets(cur)
@@ -3330,6 +3370,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             self.component_protected_size_[component_type] += ledger
         else:
             self.component_evictable_size_[component_type] += ledger
+        units = self.state_units
+        if units is not None and component_type == units.state_component:
+            units.state_changed(node)
 
     def adjust_component_size(
         self, node_id: NodeId, component_type: ComponentType, delta: int
@@ -3620,6 +3663,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                     f"[Ongoing] node {node.id} load_back_pending_id="
                     f"{node.load_back_pending_id} has no live load-back"
                 )
+
+        # -- PART 6: Eviction bookkeeping of hybrid-model states --
+        if self.state_units is not None:
+            self.state_units.check(E)
 
         if errors:
             msg = (

@@ -210,11 +210,19 @@ class FullComponent(TreeComponent):
         self._ensure_eviction_strategy()
         self._evict_device_request_cnt = request_cnt
         self._evict_device_last_node = None
-        self._evict_device_heap = [
+        # Unit eviction takes the KV that no state serves from its queue and
+        # ranks the leaves only once that runs out.
+        self._evict_device_heap = (
+            None if self.tree_core.state_units is not None else self._device_leaf_heap()
+        )
+
+    def _device_leaf_heap(self) -> list:
+        heap = [
             (self.session_ref_eviction_strategy(n), n)
             for n in self.tree_core.evictable_device_leaves
         ]
-        heapq.heapify(self._evict_device_heap)
+        heapq.heapify(heap)
+        return heap
 
     def _evict_device_next_node(
         self,
@@ -227,6 +235,7 @@ class FullComponent(TreeComponent):
         lv = self._evict_device_last_node
         if (
             lv is not None
+            and self._evict_device_heap is not None
             and lv.parent is not None
             and self.tree_core._is_device_walk_candidate(lv.parent)
         ):
@@ -235,6 +244,15 @@ class FullComponent(TreeComponent):
                 (self.session_ref_eviction_strategy(lv.parent), lv.parent),
             )
         self._evict_device_last_node = None
+        units = self.tree_core.state_units
+        if units is not None and tracker[ct] < self._evict_device_request_cnt:
+            # KV that no cached state can serve goes before any other.
+            x = units.next_dead_leaf()
+            if x is not None:
+                self._evict_device_last_node = x
+                return x.id
+            if self._evict_device_heap is None:
+                self._evict_device_heap = self._device_leaf_heap()
         while tracker[ct] < self._evict_device_request_cnt and self._evict_device_heap:
             _, x = heapq.heappop(self._evict_device_heap)
             if not self.tree_core._is_device_walk_candidate(x):
