@@ -11,6 +11,7 @@ maybe_stub_sgl_kernel()
 from sglang.srt.managers.schedule_batch import ScheduleBatch  # noqa: E402
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
 from sglang.srt.model_executor.forward_mode import ForwardMode  # noqa: E402
+from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2  # noqa: E402
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm  # noqa: E402
 
 register_cpu_ci(est_time=2, suite="base-a-test-cpu")
@@ -79,6 +80,41 @@ class TestMixedGrammarOverlapSync(unittest.TestCase):
 
     def test_no_last_batch_overlaps(self):
         self.assertFalse(_early(None))
+
+
+class _Stop(Exception):
+    pass
+
+
+class TestDFlashPrefillBarrier(unittest.TestCase):
+    def _before_sample(self, mode, reqs):
+        seen = {}
+
+        def target_forward(batch, **kwargs):
+            seen.update(kwargs)
+            raise _Stop
+
+        worker = SimpleNamespace(
+            _validate_phase1_sampling_support=lambda batch: None,
+            _wait_for_fused_hicache_load=lambda batch: None,
+            target_worker=SimpleNamespace(forward_batch_generation=target_forward),
+        )
+        batch = _batch(mode, reqs)
+        batch.is_extend_in_batch = False
+        barrier = object()
+        with self.assertRaises(_Stop):
+            DFlashWorkerV2.forward_batch_generation(
+                worker, batch, grammar_barrier=barrier
+            )
+        return seen["before_sample"], barrier
+
+    def test_mixed_grammar_decode_rows_get_barrier(self):
+        got, barrier = self._before_sample(ForwardMode.MIXED, [_req(True)])
+        self.assertIs(got, barrier)
+
+    def test_other_prefills_skip_barrier(self):
+        self.assertIsNone(self._before_sample(ForwardMode.MIXED, [_req(False)])[0])
+        self.assertIsNone(self._before_sample(ForwardMode.EXTEND, [_req(True)])[0])
 
 
 if __name__ == "__main__":
