@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 import asyncio
+import copy
 import json
 import math
+import threading
 import time
 from collections import deque
 from types import SimpleNamespace
@@ -12,6 +14,7 @@ import torch
 import torch.nn.functional as F
 from transformers.cache_utils import DynamicCache
 
+from sglang.kernels.ops.diffusion.rope import rope_rotate_half_bitexact
 from sglang.multimodal_gen.configs.pipeline_configs.sensenova_u1 import (
     SenseNovaU1PipelineConfig,
 )
@@ -33,10 +36,18 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
 )
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
 from sglang.multimodal_gen.runtime.managers.scheduler import Scheduler
+from sglang.multimodal_gen.runtime.models.sensenova_u1.loader import (
+    assign_layer_devices,
+    module_weight_bytes,
+    place_model,
+    shard_decoder_for_tensor_parallel,
+)
 from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify import (
     modeling_fm_modules,
+    modeling_qwen3,
 )
 from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.configuration_neo_chat import (
+    NEOChatConfig,
     NEOLLMConfig,
 )
 from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.configuration_neo_vit import (
@@ -53,8 +64,10 @@ from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.modeling_qwen3 
     Qwen3MLP,
     _flash_or_sdpa,
     _sdpa_attn_func,
+    apply_rotary_pos_emb,
     create_block_causal_mask,
     position_ids_from_indexes,
+    rotate_half,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.executors.pipeline_executor import (
     PipelineExecutor,
@@ -771,13 +784,14 @@ def test_sensenova_u1_scheduler_merge_and_split_preserve_request_order():
     assert scheduler._try_merge_generation_reqs(requests) is None
 
 
-def test_sensenova_u1_rejects_multi_gpu_during_arg_validation():
+def test_sensenova_u1_rejects_multi_gpu_without_tensor_parallelism():
     config = SenseNovaU1PipelineConfig()
 
-    with pytest.raises(ValueError, match="num_gpus=1"):
+    with pytest.raises(ValueError, match="tensor parallelism only"):
         config.validate_server_args(
             SimpleNamespace(
                 num_gpus=2,
+                tp_size=None,
                 enable_torch_compile=False,
                 lora_path=None,
                 attention_backend=None,
@@ -790,6 +804,7 @@ def test_sensenova_u1_clears_auto_tuned_runtime_defaults():
     config = SenseNovaU1PipelineConfig()
     args = SimpleNamespace(
         num_gpus=1,
+        tp_size=None,
         enable_torch_compile=False,
         lora_path=None,
         component_residency={"transformer": "layerwise-offload"},
@@ -835,6 +850,7 @@ def test_sensenova_u1_allows_explicit_resident_component_residency():
     config = SenseNovaU1PipelineConfig()
     args = SimpleNamespace(
         num_gpus=1,
+        tp_size=None,
         enable_torch_compile=False,
         lora_path=None,
         component_residency={"transformer": "resident"},
@@ -909,6 +925,7 @@ def test_sensenova_u1_rejects_unsupported_runtime_modes(override, expected):
     config = SenseNovaU1PipelineConfig()
     args = {
         "num_gpus": 1,
+        "tp_size": None,
         "enable_torch_compile": False,
         "lora_path": None,
         "component_residency": None,
@@ -1372,3 +1389,256 @@ def test_sensenova_u1_timestep_frequencies_are_built_once():
         for _ in range(3):
             torch.testing.assert_close(embed(t, 2 * half), expected, atol=0, rtol=0)
     assert exp.call_count == 1
+
+
+def test_sensenova_u1_layer_split_balances_bytes_with_primary_weights():
+    devices = [torch.device("meta", 0), torch.device("meta", 1)]
+    assignment = assign_layer_devices(
+        layer_weight_bytes=[8] * 42, primary_weight_bytes=24, devices=devices
+    )
+
+    # The primary device also holds the 24 non-layer bytes, so it takes fewer layers.
+    assert assignment == [devices[0]] * 19 + [devices[1]] * 23
+
+
+def _tiny_neo_chat_model(
+    intermediate_size: int, num_key_value_heads: int, dtype: torch.dtype
+) -> NEOChatModel:
+    llm_config = dict(
+        architectures=["Qwen3ForCausalLM"],
+        vocab_size=64,
+        hidden_size=32,
+        intermediate_size=intermediate_size,
+        num_hidden_layers=6,
+        num_attention_heads=2,
+        num_key_value_heads=num_key_value_heads,
+        head_dim=16,
+        max_position_embeddings=64,
+        max_position_embeddings_hw=64,
+    )
+    config = NEOChatConfig(
+        llm_config=llm_config,
+        vision_config=dict(hidden_size=16, llm_hidden_size=32),
+        template="neo1_0",
+        downsample_ratio=0.5,
+        fm_head_dim=16,
+        fm_head_layers=2,
+        fm_head_mlp_ratio=1,
+        use_pixel_head=True,
+        add_noise_scale_embedding=True,
+        concat_time_token_num=0,
+        time_schedule="standard",
+        time_shift_type="exponential",
+        base_shift=0.5,
+        max_shift=1.15,
+        base_image_seq_len=64,
+        max_image_seq_len=4096,
+        noise_scale=1.0,
+        noise_scale_mode="resolution",
+        noise_scale_base_image_seq_len=64,
+        noise_scale_max_value=16.0,
+    )
+    config.llm_config._attn_implementation = "eager"
+    return NEOChatModel(config).to(dtype).eval()
+
+
+def test_sensenova_u1_tensor_parallel_shard_does_not_layer_split(monkeypatch):
+    """Each tensor-parallel rank owns one device, so an oversized shard must fail, not spill onto a peer's device."""
+    model = _tiny_neo_chat_model(
+        intermediate_size=64, num_key_value_heads=2, dtype=torch.float32
+    )
+    monkeypatch.setattr(
+        current_platform,
+        "get_device_total_memory",
+        lambda device_id: module_weight_bytes(model) - 1,
+    )
+    with pytest.raises(ValueError, match="raise --tp-size"):
+        place_model(model=model, device=torch.device("cpu"), allow_layer_split=False)
+
+
+def test_sensenova_u1_weights_that_fit_one_device_are_not_split(monkeypatch):
+    """Weights above the layer-split share but within device memory (A100-40GB) load on one device."""
+    model = _tiny_neo_chat_model(
+        intermediate_size=64, num_key_value_heads=2, dtype=torch.float32
+    )
+    monkeypatch.setattr(
+        current_platform,
+        "get_device_total_memory",
+        lambda device_id: module_weight_bytes(model),
+    )
+    placed = place_model(
+        model=model, device=torch.device("cpu"), allow_layer_split=True
+    )
+    assert {parameter.device for parameter in placed.parameters()} == {
+        torch.device("cpu")
+    }
+
+
+@pytest.mark.skipif(
+    not torch.accelerator.is_available() or torch.accelerator.device_count() < 2,
+    reason="needs two accelerator devices",
+)
+@torch.inference_mode()
+def test_sensenova_u1_split_decoder_matches_single_device(monkeypatch):
+    """A decoder split over two devices must give the single-device outputs and KV cache."""
+    model = _tiny_neo_chat_model(
+        intermediate_size=2048, num_key_value_heads=1, dtype=torch.bfloat16
+    )
+    device = torch.device(torch.accelerator.current_accelerator().type, 0)
+    reference = copy.deepcopy(model).to(device)
+    # A device smaller than the weights; 75% of it holds 60% of the weights.
+    monkeypatch.setattr(
+        current_platform,
+        "get_device_total_memory",
+        lambda device_id: 0.8 * module_weight_bytes(model),
+    )
+    split = place_model(model=model, device=device, allow_layer_split=True)
+    layer_devices = [
+        next(layer.parameters()).device for layer in split.language_model.model.layers
+    ]
+    # Wide FFN layers put the split mid-stack: layers on both devices, then back for the norm.
+    assert layer_devices[0] == device and layer_devices[-1] != device
+
+    tokens = torch.tensor([[1, 2, 3]], device=device)
+    image = torch.randn(1, 4, 32, device=device, dtype=torch.bfloat16)
+    indexes = torch.tensor([[[3, 3, 3, 3], [0, 0, 1, 1], [0, 1, 0, 1]]], device=device)
+    outputs = []
+    for candidate in (reference, split):
+        prefix = candidate.language_model(input_ids=tokens, use_cache=True)
+        denoise = candidate.language_model.model(
+            inputs_embeds=image,
+            indexes=indexes,
+            past_key_values=prefix.past_key_values,
+            attention_mask={"full_attention": None},
+            use_cache=True,
+            update_cache=False,
+            image_gen_indicators=torch.ones(1, 4, dtype=torch.bool, device=device),
+        )
+        keys = [layer.keys.to(device) for layer in prefix.past_key_values.layers]
+        outputs.append((prefix.logits, denoise.last_hidden_state, keys))
+    # The split forward ends on its last device, so the primary can start the other CFG branch.
+    assert outputs[1][1].device == layer_devices[-1]
+    outputs[1] = (outputs[1][0], outputs[1][1].to(device), outputs[1][2])
+    torch.testing.assert_close(outputs[1], outputs[0], rtol=0, atol=0)
+
+
+@torch.inference_mode()
+def test_sensenova_u1_tensor_parallel_decoder_matches_unsharded(monkeypatch):
+    """Two decoder shards summing their row-parallel outputs must reproduce the full decoder."""
+    world_size = 2
+    model = _tiny_neo_chat_model(
+        intermediate_size=64, num_key_value_heads=2, dtype=torch.float32
+    )
+    shards = [copy.deepcopy(model) for _ in range(world_size)]
+    barrier = threading.Barrier(world_size)
+    partials: dict[int, torch.Tensor] = {}
+
+    def all_reduce_across_threads(tensor: torch.Tensor) -> torch.Tensor:
+        rank = threading.current_thread().rank
+        partials[rank] = tensor
+        barrier.wait()
+        total = sum(partials[r] for r in range(world_size))
+        barrier.wait()
+        return total
+
+    monkeypatch.setattr(
+        "sglang.multimodal_gen.runtime.models.sensenova_u1.loader."
+        "tensor_model_parallel_all_reduce",
+        all_reduce_across_threads,
+    )
+    for rank, shard in enumerate(shards):
+        shard_decoder_for_tensor_parallel(model=shard, rank=rank, world_size=world_size)
+    layer = shards[0].language_model.model.layers[0]
+    assert layer.self_attn.q_proj_mot_gen.weight.shape == (16, 32)
+    assert layer.self_attn.o_proj_mot_gen.weight.shape == (32, 16)
+    # The NPU fused MLP splits its packed gate/up weight at intermediate_size.
+    assert layer.mlp.intermediate_size == layer.mlp_mot_gen.intermediate_size == 32
+
+    tokens = torch.tensor([[1, 2, 3]])
+    image = torch.randn(1, 4, 32)
+    indexes = torch.tensor([[[3, 3, 3, 3], [0, 0, 1, 1], [0, 1, 0, 1]]])
+
+    def run(candidate: NEOChatModel) -> tuple[torch.Tensor, torch.Tensor]:
+        prefix = candidate.language_model(input_ids=tokens, use_cache=True)
+        denoise = candidate.language_model.model(
+            inputs_embeds=image,
+            indexes=indexes,
+            past_key_values=prefix.past_key_values,
+            attention_mask={"full_attention": None},
+            use_cache=True,
+            update_cache=False,
+            image_gen_indicators=torch.ones(1, 4, dtype=torch.bool),
+        )
+        return prefix.logits, denoise.last_hidden_state
+
+    outputs: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+
+    def run_rank(rank: int) -> None:
+        threading.current_thread().rank = rank
+        with torch.inference_mode():
+            outputs[rank] = run(shards[rank])
+
+    threads = [
+        threading.Thread(target=run_rank, args=(rank,)) for rank in range(world_size)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    expected = run(model)
+    for rank in range(world_size):
+        torch.testing.assert_close(outputs[rank], expected, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.skipif(not torch.accelerator.is_available(), reason="needs an accelerator")
+@torch.inference_mode()
+def test_sensenova_u1_rope_uses_bitexact_kernel_on_accelerators():
+    """SenseNova's t/h/w rotate-half RoPE takes the fused kernel on CUDA and XPU, bit-exact vs eager."""
+    device = torch.device(torch.accelerator.current_accelerator().type, 0)
+    calls = []
+    kernel = rope_rotate_half_bitexact.fused_rope_rotate_half_bitexact
+
+    def counted(*args):
+        calls.append(args[0].shape[-1])
+        return kernel(*args)
+
+    with patch.object(
+        rope_rotate_half_bitexact, "fused_rope_rotate_half_bitexact", counted
+    ):
+        for head_dim in (64, 32):
+            q = torch.randn(1, 32, 256, head_dim, device=device, dtype=torch.bfloat16)
+            k = torch.randn(1, 8, 256, head_dim, device=device, dtype=torch.bfloat16)
+            cos = torch.randn(1, 256, head_dim, device=device, dtype=torch.bfloat16)
+            sin = torch.randn_like(cos)
+            output = apply_rotary_pos_emb(q, k, cos, sin)
+            c, s = cos.unsqueeze(1), sin.unsqueeze(1)
+            expected = (q * c + rotate_half(q) * s, k * c + rotate_half(k) * s)
+            torch.testing.assert_close(output, expected, rtol=0, atol=0)
+    assert calls == [64, 64, 32, 32]
+
+
+@pytest.mark.skipif(
+    not torch.xpu.is_available(),
+    reason="needs an XPU device",
+)
+@torch.inference_mode()
+def test_sensenova_u1_xpu_unmasked_attention_uses_flash():
+    """Unmasked XPU attention takes sgl-kernel flash attention; set_attn_backend('sdpa') still forces SDPA."""
+    q = torch.randn(1, 512, 32, 128, device="xpu", dtype=torch.bfloat16)
+    k = torch.randn(1, 600, 8, 128, device="xpu", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    expected = _sdpa_attn_func(q, k, v)
+    flash = modeling_qwen3.xpu_flash_attn
+    with patch.object(
+        flash, "flash_attn_varlen_func", wraps=flash.flash_attn_varlen_func
+    ) as calls:
+        # Measured worst case over 5 seeds at this and the 2048x2048 shape: 3.9e-3.
+        torch.testing.assert_close(_flash_or_sdpa(q, k, v), expected, rtol=0, atol=1e-2)
+        previous = modeling_qwen3.set_attn_backend("sdpa")
+        try:
+            torch.testing.assert_close(
+                _flash_or_sdpa(q, k, v), expected, rtol=0, atol=0
+            )
+        finally:
+            modeling_qwen3.set_attn_backend(previous)
+    assert calls.call_count == 1

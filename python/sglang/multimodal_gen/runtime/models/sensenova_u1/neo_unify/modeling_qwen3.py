@@ -24,6 +24,7 @@ from transformers.processing_utils import Unpack
 from transformers.utils import TransformersKwargs, can_return_tuple
 from transformers.utils.deprecation import deprecate_kwarg
 
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.srt.layers.layernorm import RMSNorm
 
 from .transformers_compat import (
@@ -39,6 +40,20 @@ try:
 except ImportError:  # pragma: no cover - exercised only in CPU-only / no-flash envs
     flash_attn_func = None  # type: ignore
     _HAS_FLASH_ATTN = False
+
+if current_platform.is_xpu():
+    import sgl_kernel.flash_attn as xpu_flash_attn
+
+    from sglang.multimodal_gen.runtime.layers.attention.backends.xpu_backend import (
+        XPUAttentionBackend,
+    )
+
+    # sgl-kernel-xpu flash attention needs BMG or later.
+    XPU_FLASH_ATTN_SUPPORTED = xpu_flash_attn.is_fa3_supported()
+    XPU_FLASH_ATTN_HEAD_SIZES = tuple(XPUAttentionBackend.get_supported_head_sizes())
+else:
+    XPU_FLASH_ATTN_SUPPORTED = False
+    XPU_FLASH_ATTN_HEAD_SIZES = ()
 
 
 # Attention backend dispatch.
@@ -162,6 +177,40 @@ def _sdpa_attn_func(
     return out.transpose(1, 2).contiguous()
 
 
+def _xpu_flash_attn(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    softmax_scale: Optional[float],
+    causal: bool,
+) -> torch.Tensor:
+    # [B, S, H, D] with equal lengths per batch row, packed for the varlen kernel.
+    batch_size, query_length = q.shape[:2]
+    key_length = k.shape[1]
+    query_offsets = torch.arange(
+        0,
+        (batch_size + 1) * query_length,
+        query_length,
+        dtype=torch.int32,
+        device=q.device,
+    )
+    key_offsets = torch.arange(
+        0, (batch_size + 1) * key_length, key_length, dtype=torch.int32, device=q.device
+    )
+    output = xpu_flash_attn.flash_attn_varlen_func(
+        q.reshape(-1, *q.shape[2:]),
+        k.reshape(-1, *k.shape[2:]),
+        v.reshape(-1, *v.shape[2:]),
+        query_offsets,
+        key_offsets,
+        query_length,
+        key_length,
+        softmax_scale=softmax_scale,
+        causal=causal,
+    )
+    return output.view(batch_size, query_length, *output.shape[1:])
+
+
 def _flash_or_sdpa(
     q,
     k,
@@ -266,8 +315,17 @@ def _flash_or_sdpa(
                 )
             )
         return torch.cat(outputs, dim=0)
-    # flash-attn ships CUDA kernels only. On XPU / CPU we transparently fall
-    # back to SDPA even if the user asked for ``flash`` — the alternative
+    if (
+        q.device.type == "xpu"
+        and XPU_FLASH_ATTN_SUPPORTED
+        and q.shape[-1] in XPU_FLASH_ATTN_HEAD_SIZES
+        and get_attn_backend() != "sdpa"
+        and attention_mask is None
+        and dropout_p == 0.0
+    ):
+        return _xpu_flash_attn(q, k, v, softmax_scale=softmax_scale, causal=causal)
+    # flash-attn ships CUDA kernels only. Other XPU inputs and CPU fall back to
+    # SDPA even if the user asked for ``flash`` — the alternative
     # (crashing on first forward) is worse, and ``set_attn_backend('flash')``
     # already guarded against the "package missing" case.
     if backend == "flash" and q.device.type == "cuda" and attention_mask is None:
@@ -415,7 +473,7 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
         `tuple(torch.Tensor)` comprising of the query and key tensors rotated using the Rotary Position Embedding.
     """
     if (
-        q.is_cuda
+        q.device.type in ("cuda", "xpu")
         and q.dtype is torch.bfloat16
         and k.dtype is torch.bfloat16
         and cos.dtype is torch.bfloat16
@@ -1347,6 +1405,8 @@ class Qwen3Model(Qwen3PreTrainedModel):
         inputs_embeds: Optional[torch.FloatTensor] = None,
         use_cache: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
+        exist_image_gen_tokens: Optional[bool] = None,
+        exist_non_image_gen_tokens: Optional[bool] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> BaseModelOutputWithPast:
 
@@ -1357,7 +1417,8 @@ class Qwen3Model(Qwen3PreTrainedModel):
         if image_gen_indicators is None:
             exist_non_image_gen_tokens = True
             exist_image_gen_tokens = False
-        else:
+        # Callers that pass both token kinds skip this device readback.
+        elif exist_image_gen_tokens is None or exist_non_image_gen_tokens is None:
             # Normalize once before the decoder loop. Leaving these as CUDA
             # scalar tensors makes every layer's Python branch read them back
             # to the host, serializing the compute stream and defeating weight
