@@ -37,19 +37,6 @@ runs:
         path: sgl-router-bin/sgl-router
         key: sgl-router-${{ runner.arch == 'ARM64' && 'aarch64' || 'x86_64' }}-${{ hashFiles('sgl-router/**', 'rust/**', '.github/workflows/_pr-test-sgl-router-build.yml', 'scripts/ci/utils/build_sgl_router.sh') }}
 
-    - name: Build sgl-router from source
-      if: steps.artifact.outcome != 'success' && steps.cache.outputs.cache-hit != 'true'
+    - name: Build sgl-router if neither had it, and export its path
       shell: bash
-      run: |
-        bash scripts/ci/utils/install_rustup.sh
-        bash scripts/ci/utils/build_sgl_router.sh sgl-router-bin
-
-    # An artifact download drops the executable bit.
-    - name: Export the binary path
-      shell: bash
-      run: |
-        set -euo pipefail
-        binary="${GITHUB_WORKSPACE}/sgl-router-bin/sgl-router"
-        chmod +x "${binary}"
-        "${binary}" --help >/dev/null
-        echo "SGLANG_TEST_PD_ROUTER_BINARY=${binary}" >> "$GITHUB_ENV"
+      run: bash scripts/ci/utils/prepare_sgl_router.sh

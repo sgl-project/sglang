@@ -55,11 +55,11 @@ on:
         type: string
         default: ''
       sgl_router:
-        description: 'Download sgl-router for the PD disaggregation tests in this suite.'
+        description: 'Fetch sgl-router for the PD disaggregation tests in this suite.'
         type: boolean
         default: false
       sgl_router_artifact:
-        description: "sgl-router-build's artifact; empty falls back as download-sgl-router describes."
+        description: "sgl-router-build's artifact; empty builds sgl-router here."
         type: string
         default: ''
       github-token:
@@ -206,12 +206,19 @@ jobs:
               core.notice('[health-check] PASS: no root cause failures detected');
             }
 
-      # Before the install: its build output under rust/ would change the hashed key.
+      # Not download-sgl-router: these k8s container jobs cannot load a local action.
+      # continue-on-error: the artifact expires in a day, so a re-run builds instead.
       - name: Download prebuilt sgl-router
-        if: inputs.sgl_router
-        uses: ./.github/actions/download-sgl-router
+        if: inputs.sgl_router && inputs.sgl_router_artifact != ''
+        continue-on-error: true
+        uses: actions/download-artifact@v4
         with:
-          artifact_name: ${{ inputs.sgl_router_artifact }}
+          name: ${{ inputs.sgl_router_artifact }}
+          path: sgl-router-bin
+
+      - name: Build sgl-router if no artifact, and export its path
+        if: inputs.sgl_router
+        run: bash scripts/ci/utils/prepare_sgl_router.sh
 
       - name: Install dependencies
         env:
