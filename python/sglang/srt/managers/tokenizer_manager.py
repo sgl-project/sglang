@@ -93,6 +93,7 @@ from sglang.srt.managers.embed_types import (
     validate_positional_embed_overrides,
 )
 from sglang.srt.managers.io_struct import (
+    AbortBroadcastReq,
     AbortReq,
     ActiveRanksOutput,
     BaseBatchReq,
@@ -951,6 +952,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 (ActiveRanksOutput, self.update_active_ranks),
                 (ElasticScaleUpdateReq, self.forward_elastic_scale_update),
                 (PauseContinueBroadcastReq, self._handle_pause_continue_broadcast),
+                (AbortBroadcastReq, self._handle_abort_broadcast),
             ]
         )
         self.init_communicators()
@@ -2449,7 +2451,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 state.abort_sent = True
             elif get_serving().tokenizer_worker_num == 1:
                 return
-        req = AbortReq(rid=rid, abort_all=abort_all)
+        req = AbortReq(
+            rid=rid,
+            abort_all=abort_all,
+            # A rid another worker holds: the router forwards this abort to the
+            # scheduler and broadcasts it so the owning worker aborts locally.
+            forward=not abort_all and state is None,
+        )
         try:
             self._dispatch_to_scheduler(req)
         except BaseException:
@@ -2512,6 +2520,15 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self._pause_continue_future = loop.create_future()
         self._dispatch_to_scheduler(obj)
         await self._pause_continue_future
+
+    def _handle_abort_broadcast(self, obj: AbortBroadcastReq):
+        """Abort a broadcast rid this worker holds; an unknown rid is a no-op
+        (re-forwarding it here would loop the abort through the router)."""
+        state = self.rid_to_state.get(obj.rid)
+        if state is None:
+            return
+        logger.debug(f"Abort broadcast hit. {obj.rid=} {state.dispatched=}")
+        self.abort_request(rid=obj.rid)
 
     def _handle_pause_continue_broadcast(self, obj: PauseContinueBroadcastReq):
         """Called from handle_loop when a broadcast arrives from the router."""
