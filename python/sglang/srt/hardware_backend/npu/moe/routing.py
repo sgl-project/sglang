@@ -2,11 +2,9 @@
 
 Every Ascend MoE path — no-A2A ``standard``, ``ascend_ops`` alltoallv and
 allgather — permutes tokens into expert order with
-``npu_moe_init_routing_v2`` and reverses that permutation with
-``npu_moe_finalize_routing``; the paths only differ in which op parameters
-they use.  These two functions are the single place that talks to the
-torch_npu routing ops, so a future interface change only has to be adapted
-here:
+``npu_moe_init_routing_v2``. Standard and AllToAllV undo the permutation
+with ``npu_moe_finalize_routing``. AllGather uses ``npu_moe_token_unpermute``
+to combine each rank's subset of the global routes.
 
 - :func:`npu_moe_init_routing`: quantizing pass (``quant_mode``), or
   scale-reuse pass (``scale``) that re-permutes already-quantized tokens
@@ -86,7 +84,7 @@ class RoutedTokens:
     """
 
     hidden_states: torch.Tensor  # expert-ordered (optionally quantized) rows
-    expanded_row_idx: torch.Tensor  # source row of each routed row
+    expanded_row_idx: torch.Tensor  # expert-ordered destination for each source route
     expert_tokens: torch.Tensor  # per-expert token counts, int64
     scale: Optional[torch.Tensor]  # per-token / block scale, None for bf16
 
@@ -98,6 +96,7 @@ def npu_moe_init_routing(
     quant_mode: int = -1,
     scale: Optional[torch.Tensor] = None,
     active_num: Optional[int] = None,
+    active_expert_range: Optional[list[int]] = None,
 ) -> RoutedTokens:
     """Permute tokens into expert order with ``npu_moe_init_routing_v2``.
 
@@ -110,7 +109,19 @@ def npu_moe_init_routing(
 
     ``active_num`` changes the op's reverse-mapping index semantics; call
     sites pass the exact form each path was validated with.
+    ``active_expert_range`` selects a half-open range of global expert IDs.
+    The result may retain capacity for the full set of routes.
     """
+    op_kwargs = {
+        "expert_num": num_experts,
+        "expert_tokens_num_type": 1,
+        "expert_tokens_num_flag": True,
+        "row_idx_type": 0,
+        "active_expert_range": active_expert_range or [0, num_experts],
+        "quant_mode": quant_mode,
+    }
+    if active_num is not None:
+        op_kwargs["active_num"] = active_num
     if scale is not None:
         if quant_mode not in (INT8_QUANT_MODE, MXFP8_QUANT_MODE, MXFP4_QUANT_MODE):
             raise ValueError(
@@ -118,42 +129,10 @@ def npu_moe_init_routing(
                 f"{(INT8_QUANT_MODE, MXFP8_QUANT_MODE, MXFP4_QUANT_MODE)}, "
                 f"got {quant_mode}"
             )
-        op_kwargs = dict(
-            expert_num=num_experts,
-            expert_tokens_num_flag=True,
-            expert_tokens_num_type=1,
-            row_idx_type=0,
-            active_expert_range=[0, num_experts],
-            # Already quantized: permute the payload and its traveling scale
-            # without quantizing again.
-            quant_mode=-1,
-            scale=scale,
-            x_dtype=quant_mode_dtype(quant_mode),
+        # Already quantized: permute the payload and its traveling scale.
+        op_kwargs.update(
+            quant_mode=-1, scale=scale, x_dtype=quant_mode_dtype(quant_mode)
         )
-        if active_num is not None:
-            op_kwargs["active_num"] = active_num
-        hidden_states, expanded_row_idx, expert_tokens, pertoken_scale = (
-            torch.ops.npu.npu_moe_init_routing_v2(hidden_states, topk_ids, **op_kwargs)
-        )
-        if quant_mode in (MXFP8_QUANT_MODE, MXFP4_QUANT_MODE):
-            pertoken_scale = normalize_mxfp_scale(pertoken_scale)
-        return RoutedTokens(
-            hidden_states,
-            expanded_row_idx,
-            expert_tokens.to(torch.int64),
-            pertoken_scale,
-        )
-
-    op_kwargs = dict(
-        expert_num=num_experts,
-        expert_tokens_num_type=1,
-        expert_tokens_num_flag=True,
-        row_idx_type=0,
-        active_expert_range=[0, num_experts],
-        quant_mode=quant_mode,
-    )
-    if active_num is not None:
-        op_kwargs["active_num"] = active_num
     hidden_states, expanded_row_idx, expert_tokens, pertoken_scale = (
         torch.ops.npu.npu_moe_init_routing_v2(hidden_states, topk_ids, **op_kwargs)
     )
@@ -197,4 +176,19 @@ def npu_moe_finalize_routing(
         expanded_src_to_dst_row=expanded_row_idx.to(torch.int32).contiguous(),
         export_for_source_row=topk_ids,
         drop_pad_mode=drop_pad_mode,
+    )
+
+
+def npu_moe_token_unpermute(
+    hidden_states: torch.Tensor,
+    expanded_row_idx: torch.Tensor,
+    topk_weights: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Unpermute and weight local expert outputs in the GMM output dtype."""
+    import torch_npu
+
+    return torch_npu.npu_moe_token_unpermute(
+        permuted_tokens=hidden_states,
+        sorted_indices=expanded_row_idx,
+        probs=topk_weights,
     )

@@ -425,9 +425,12 @@ def fetch_server_context(
             "measured from real static-mode DSpark verify steps; relaunch with "
             "--speculative-algorithm DSPARK and SGLANG_RAGGED_VERIFY_MODE=static."
         )
-    if info.get("disable_cuda_graph"):
+    if (
+        info.get("disable_cuda_graph")
+        or info.get("cuda_graph_backend_decode") == "disabled"
+    ):
         raise ValueError(
-            "The server runs with --disable-cuda-graph; an SPS table measured "
+            "The server runs with decode cuda graphs disabled; an SPS table measured "
             "without cuda graphs is uselessly slow. Relaunch with cuda graphs "
             "enabled."
         )

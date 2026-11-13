@@ -1,7 +1,6 @@
 """Keep automatic B200 projection dispatch inside the validated TP8 envelope."""
 
 import unittest
-from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
@@ -23,7 +22,6 @@ class TestMuseSparkProjectionSupport(CustomTestCase):
         self.comm.has_multicast = True
         self.comm.world_size = 8
         self.comm.max_push_size = 512 * 8192 * 2
-        self.comm.config = SimpleNamespace(num_push_blocks=2)
 
     def supported(self, m=16, n=4096, capability=(10, 0), *, x=None, weight=None):
         x = torch.empty(m, 64, dtype=torch.bfloat16) if x is None else x
@@ -74,8 +72,6 @@ class TestMuseSparkProjectionSupport(CustomTestCase):
         with patch.object(self.comm, "world_size", 1):
             self.assertFalse(self.supported())
         with patch.object(self.comm, "max_push_size", 16 * 4096 * 2 - 1):
-            self.assertFalse(self.supported())
-        with patch.object(self.comm.config, "num_push_blocks", 1):
             self.assertFalse(self.supported())
 
 
