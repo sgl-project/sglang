@@ -11,7 +11,7 @@ serving requests.
 from __future__ import annotations
 
 import functools
-from typing import Any, Callable
+from typing import Any
 
 import torch
 
@@ -92,23 +92,14 @@ def _build_scheduler_rollout_controller(
     return current_rollout_controller
 
 
-def prepare_rollout_if_enabled(
-    *,
-    batch: Req,
-    pipeline_config: Any,
-    build_controller: Callable[..., FlowRolloutController] = (
-        _build_scheduler_rollout_controller
-    ),
-) -> None:
+def prepare_rollout_if_enabled(*, batch: Req, pipeline_config: Any) -> None:
     """Create the rollout controller of the visual stream of this request.
 
     Must run before SP sharding so the controller records the full latent shape.
-    ``build_controller(batch=, pipeline_config=)`` returns it; a loop without a
-    scheduler passes its own.
     """
     if not batch.rollout:
         return
-    current_rollout_controller = build_controller(
+    current_rollout_controller = _build_scheduler_rollout_controller(
         batch=batch, pipeline_config=pipeline_config
     )
     batch.rollout_controllers = {VISUAL_STREAM: current_rollout_controller}

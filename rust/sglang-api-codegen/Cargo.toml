@@ -4,6 +4,7 @@ description = "Generator: proto/sglang -> checked-in bindings (prost structs, to
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish = false
 
 # No [package.metadata.sglang]: not a Python extension; wheel builds skip it.
 

@@ -2,6 +2,7 @@
 
 #include <sgl_kernel/tensor.h>
 
+#include <sgl_kernel/activation.cuh>
 #include <sgl_kernel/utils.cuh>
 #include <sgl_kernel/vec.cuh>
 #include <sgl_kernel/warp.cuh>
@@ -20,10 +21,6 @@ static constexpr int kInklingTotalExperts = kInklingRoutedExperts + kInklingShar
 static constexpr int kInklingTopK = 6;
 static constexpr int kInklingWarpSize = 32;
 static constexpr int kInklingValuesPerLane = kInklingRoutedExperts / kInklingWarpSize;
-
-__device__ __forceinline__ float inkling_sigmoid(float x) {
-  return 1.0f / (1.0f + __expf(-x));
-}
 
 // Order-preserving uint32 key of an fp32 (same total order as the triton
 // kernel's fpval_to_key): flip sign bit for positives, all bits for negatives.
@@ -106,7 +103,7 @@ __device__ __forceinline__ void inkling_gate_row(
 #pragma unroll
     for (int j = 0; j < kVecF32; ++j) {
       raw[i * kVecF32 + j] = v[j];
-      sel[i * kVecF32 + j] = inkling_sigmoid(v[j]) + st.bias[i * kVecF32 + j];
+      sel[i * kVecF32 + j] = device::activation::sigmoid(v[j]) + st.bias[i * kVecF32 + j];
     }
   }
 
@@ -172,10 +169,10 @@ __device__ __forceinline__ void inkling_gate_row(
   float active[kInklingTopK + kInklingSharedExperts];
 #pragma unroll
   for (int k = 0; k < kInklingTopK; ++k) {
-    active[k] = inkling_sigmoid(sel_raw[k]);
+    active[k] = device::activation::sigmoid(sel_raw[k]);
   }
-  active[kInklingTopK] = inkling_sigmoid(sh0);
-  active[kInklingTopK + 1] = inkling_sigmoid(sh1);
+  active[kInklingTopK + 0] = device::activation::sigmoid(sh0);
+  active[kInklingTopK + 1] = device::activation::sigmoid(sh1);
   float sum = 0.0f;
 #pragma unroll
   for (int i = 0; i < kInklingTopK + kInklingSharedExperts; ++i) {

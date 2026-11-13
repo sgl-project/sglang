@@ -25,8 +25,10 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
 from sglang.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
 from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.managers import overlap_utils
 from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.mem_cache.kv.router import STATE_PART, KVLayerRouter, PlainPoolRouter
+from sglang.srt.mem_cache.kv.decl import STATE_PART
+from sglang.srt.mem_cache.kv.router import KVLayerRouter, PlainPoolRouter
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.runtime_context import get_context, publish, reset_context
@@ -151,10 +153,11 @@ def _megakernel(**entries):
     """SGLang's side of a draft offering these entries."""
     return EagleMegakernel(
         draft_worker=SimpleNamespace(
+            cuda_graph_runner=None,
             draft_runner=SimpleNamespace(
                 model=_model(**entries),
                 model_config=SimpleNamespace(hidden_size=4, dtype=torch.float32),
-            )
+            ),
         ),
     )
 
@@ -577,6 +580,92 @@ class TestEagleEntries(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "multi-step draft"):
             _init(draft={"draft_extend": print}, num_steps=1)
 
+    def test_a_target_verify_megakernel_without_draft_entries_is_refused(self):
+        """A target megakernel covering only the verify step reads the same
+        ReplaySSM ring while its draft offers no entry, so SGLang's side of the
+        entries never runs: the install refuses it before the build, and so before
+        any capture. Static pools keep it."""
+        for unified in (False, True):
+            with self.subTest(unified_memory=unified):
+                model = torch.nn.Module()
+                original = model.forward
+                built = SimpleNamespace(
+                    widths=(2, 4),
+                    summary=lambda: "target_verify",
+                    plan=MagicMock(return_value=None),
+                    forward=MagicMock(),
+                    draft_sampler=None,
+                    draft_loop=None,
+                    draft_extend=None,
+                    begin_draft_round=None,
+                    graph_variants=None,
+                    speculative_runtime_hooks=None,
+                )
+                target_spec = SimpleNamespace(
+                    name="qwen3_5_verify",
+                    build=MagicMock(return_value=built),
+                    prepare=None,
+                    max_rows=4,
+                    numerics=SimpleNamespace(kind=SimpleNamespace(value="exact")),
+                )
+                hooks = []
+                refused = (
+                    self.assertRaisesRegex(ValueError, "ReplaySSM speculative ring")
+                    if unified
+                    else contextlib.nullcontext()
+                )
+                with (
+                    self._target_install_context(unified_memory=unified),
+                    patch.object(
+                        runtime, "_find_spec_on_every_rank", return_value=target_spec
+                    ),
+                    refused,
+                ):
+                    runtime.install_megakernel(
+                        model=model,
+                        hf_config=SimpleNamespace(
+                            architectures=["Qwen3_5MoeForCausalLM"]
+                        ),
+                        capture_tail_hooks=hooks,
+                        is_draft=False,
+                    )
+                if unified:
+                    target_spec.build.assert_not_called()
+                    self.assertEqual(model.forward, original)
+                    self.assertEqual(hooks, [])
+                else:
+                    target_spec.build.assert_called_once()
+                    self.assertNotEqual(model.forward, original)
+                    self.assertEqual(len(hooks), 1)
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _target_install_context(*, unified_memory):
+        """install_megakernel's runtime reads on one CPU rank with speculative
+        ReplaySSM on, and unified memory as given."""
+        memory = SimpleNamespace(enable_unified_memory=unified_memory)
+        exec_ = SimpleNamespace(
+            mamba=SimpleNamespace(enable_linear_replayssm_spec=True)
+        )
+        with (
+            patch.object(runtime, "megakernel_enabled", return_value=True),
+            patch.object(runtime, "msa_serves", return_value=False),
+            patch.object(runtime, "_requirement_reasons", return_value=[]),
+            patch.object(runtime, "_model_disable_reasons", return_value=[]),
+            patch.object(runtime, "get_memory", return_value=memory),
+            patch.object(runtime, "get_exec", return_value=exec_),
+            patch.object(
+                runtime,
+                "get_device",
+                return_value=SimpleNamespace(watchdog_timeout=None),
+            ),
+            patch.object(runtime, "_tokens_per_request", return_value=2),
+            patch.object(runtime, "_decode_graphs_enabled", return_value=True),
+            patch.object(runtime, "_gather_tp", side_effect=lambda x, group=None: [x]),
+            patch.object(torch.cuda, "mem_get_info", return_value=(0, 0)),
+        ):
+            yield
+
     def test_the_draft_worker_takes_its_megakernel_once_both_backends_exist(self):
         """The draft's graph runners read the worker's megakernel when they capture,
         and its init reads both of the draft's attention backends:
@@ -655,7 +744,7 @@ class TestEagleEntries(CustomTestCase):
         """The megakernel may reuse what its draft extend left behind only when that
         extend produced this round's input: not after another extend, not for other
         requests (a PD decode instance's first round), and only once. The extend's
-        tokens are SGLang's own copy, which the next replay leaves alone."""
+        tokens remain graph-owned until the unchanged next round consumes them."""
         rounds, outs = [], {}
 
         def draft_extend(**buffers):
@@ -698,9 +787,13 @@ class TestEagleEntries(CustomTestCase):
 
         outs["topk_index"][0] = 5  # what the extend's replay wrote
         _, _, topk_index = served_extend("a")
-        outs["topk_index"].zero_()  # the next replay rewrites it
+        self.assertEqual(topk_index.data_ptr(), outs["topk_index"].data_ptr())
         self.assertEqual(topk_index.tolist(), [[5]])
+        draft_input.topk_index = topk_index
         self.assertTrue(begin("a"))
+        self.assertIs(rounds[-1].topk_index, topk_index)
+        outs["topk_index"].zero_()  # a later replay rewrites the shared view
+        self.assertEqual(topk_index.tolist(), [[0]])
         self.assertFalse(begin("a"))
         served_extend("a")
         mk.note_draft_extend()  # an extend the megakernel did not serve
@@ -847,6 +940,79 @@ class TestSpeculativeRuntimeHooks(CustomTestCase):
         self.assertIs(batch.forward_mode, ForwardMode.TARGET_VERIFY)
         self.assertIs(batch.sampling_info, io.sampling_info)
         self.assertIs(batch.req_pool_indices, io.req_pool_indices)
+
+
+class TestSpecRelayBypass(CustomTestCase):
+    @staticmethod
+    def _future_map():
+        future_map = overlap_utils.FutureMap.__new__(overlap_utils.FutureMap)
+        future_map._deferred_relay = None
+        future_map.output_tokens_buf = torch.empty(8, dtype=torch.int64)
+        future_map.spec_algo = SimpleNamespace(is_ngram=lambda: False)
+        return future_map
+
+    @staticmethod
+    def _draft_input(indices):
+        return SimpleNamespace(
+            future_indices=indices,
+            bonus_tokens=torch.tensor([7, 8], dtype=torch.int32),
+            topk_p=torch.tensor([[0.7], [0.8]]),
+            topk_index=torch.tensor([[3], [4]]),
+            hidden_states=torch.arange(8, dtype=torch.float32).view(2, 4),
+            draft_probs=None,
+            dsa_topk_indices=None,
+            future_dsa_topk_indices_available=False,
+        )
+
+    def test_unchanged_batch_consumes_the_draft_input_in_place(self):
+        future_map = self._future_map()
+        future_map._stash = MagicMock()
+        indices = torch.tensor([2, 5])
+        draft_input = self._draft_input(indices)
+        payload = overlap_utils.RelayPayload.from_draft_input(draft_input)
+        topk_p, topk_index, hidden = (
+            draft_input.topk_p,
+            draft_input.topk_index,
+            draft_input.hidden_states,
+        )
+        future_map.defer_relay(indices, payload, draft_input)
+        batch = SimpleNamespace(
+            spec_info=draft_input,
+            prefill_input_ids_cpu=None,
+            input_ids=torch.tensor([0]),
+            enable_overlap=True,
+            spec_algorithm=SimpleNamespace(is_none=lambda: False),
+        )
+
+        overlap_utils.resolve_forward_inputs(batch, future_map)
+
+        future_map._stash.assert_not_called()
+        self.assertIsNone(future_map._deferred_relay)
+        self.assertIs(draft_input.topk_p, topk_p)
+        self.assertIs(draft_input.topk_index, topk_index)
+        self.assertIs(draft_input.hidden_states, hidden)
+        self.assertEqual(draft_input.bonus_tokens.dtype, torch.int64)
+        self.assertEqual(draft_input.bonus_tokens.tolist(), [7, 8])
+
+    def test_changed_batch_flushes_before_it_can_overwrite_the_outputs(self):
+        future_map = self._future_map()
+        future_map._stash = MagicMock()
+        indices = torch.tensor([2, 5])
+        draft_input = self._draft_input(indices)
+        payload = overlap_utils.RelayPayload.from_draft_input(draft_input)
+        future_map.defer_relay(indices, payload, draft_input)
+        other = self._draft_input(indices.clone())
+        batch = SimpleNamespace(
+            spec_info=other,
+            prefill_input_ids_cpu=None,
+            input_ids=torch.tensor([0]),
+            enable_overlap=False,
+        )
+
+        overlap_utils.resolve_forward_inputs(batch, future_map)
+
+        future_map._stash.assert_called_once_with(indices, payload)
+        self.assertIsNone(future_map._deferred_relay)
 
 
 if __name__ == "__main__":

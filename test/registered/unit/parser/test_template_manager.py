@@ -32,11 +32,26 @@ class _DummyTokenizer:
 
 
 def _patch_hf_transformers(get_tokenizer, get_config=None):
-    module = ModuleType("sglang.srt.utils.hf_transformers")
+    module = ModuleType("sglang.srt.hf_transformers")
     module.get_tokenizer = get_tokenizer
     if get_config is not None:
         module.get_config = get_config
     return patch.dict(sys.modules, {module.__name__: module})
+
+
+_GRANITE_THINKING_TOGGLES = (
+    "{% set enable_thinking = enable_thinking if enable_thinking is defined else True %}\n"
+    "{% set truncate_history_thinking = truncate_history_thinking"
+    " if truncate_history_thinking is defined else True %}\n"
+)
+_GRANITE_DEFERRED_TOOL_LOADING = "{%- if tool.defer_loading is not defined or not tool.defer_loading %}{%- endif %}\n"
+_XML_TOOL_CALL_BLOCK = (
+    "<tool_call>\n<function=example_function_name>\n"
+    "<parameter=example_parameter_1>\nvalue_1\n</parameter>\n</function>\n</tool_call>"
+)
+_GRANITE_42_TEMPLATE = (
+    _GRANITE_THINKING_TOGGLES + _GRANITE_DEFERRED_TOOL_LOADING + _XML_TOOL_CALL_BLOCK
+)
 
 
 def _glm53_template(concat):
@@ -897,6 +912,40 @@ class TestToolCallParserDetection(unittest.TestCase):
                 )
                 self.assertEqual(result, expected)
 
+    def test_granite_tool_parser_needs_xml_block_and_granite_signature(self):
+        cases = [
+            ("granite_4_2", _GRANITE_42_TEMPLATE, "granite_toolcall_parser"),
+            (
+                "nemotron_3_shared_xml_block",
+                _GRANITE_THINKING_TOGGLES + _XML_TOOL_CALL_BLOCK,
+                "qwen3_coder",
+            ),
+            (
+                "granite_signature_without_xml_block",
+                _GRANITE_THINKING_TOGGLES + _GRANITE_DEFERRED_TOOL_LOADING,
+                "qwen",
+            ),
+            (
+                "granite_4_0_json_tool_call",
+                "For each tool call, return a json object with function name and "
+                "arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n"
+                '{"name": <function-name>, "arguments": <args-json-object>}\n</tool_call>',
+                None,
+            ),
+            (
+                "granite_3_3_tool_call_token",
+                "respond only with <|tool_call|> followed by a JSON list of tools used.",
+                None,
+            ),
+        ]
+        for name, template, expected in cases:
+            with self.subTest(name=name):
+                force, config = detect_reasoning_pattern(template)
+                result = detect_tool_call_parser(
+                    template, _DummyTokenizer([]), config, force
+                )
+                self.assertEqual(result, expected)
+
     def test_glm45_rule_precedes_xml_kv_fallback(self):
         # The specific GLM-4.5 family check must run before the generic
         # xml_kv_tool_call fallback. Both currently map to "glm45", so the
@@ -929,6 +978,9 @@ class TestToolCallParserDetection(unittest.TestCase):
         self.assertLess(tool_index["hunyuan"], tool_index["xml_kv_tool_call"])
         self.assertLess(tool_index["poolside_v1"], tool_index["xml_kv_tool_call"])
         self.assertLess(tool_index["step3p5"], tool_index["qwen3_coder"])
+        self.assertLess(
+            tool_index["granite_toolcall_parser"], tool_index["qwen3_coder"]
+        )
         self.assertLess(tool_index["step3"], tool_index["deepseek_v3"])
         self.assertLess(tool_index["qwen3_coder"], tool_index["qwen"])
 
@@ -1074,6 +1126,16 @@ class TestResolveAutoParsers(CustomTestCase):
 
         self.assertEqual(_declared(args, "reasoning_parser"), "qwen3")
         self.assertEqual(_declared(args, "tool_call_parser"), "qwen")
+
+    def test_tool_only_auto_selects_granite_tool_parser(self):
+        args = self._make_server_args(tool_call_parser="auto")
+        tokenizer = _DummyTokenizer([], chat_template=_GRANITE_42_TEMPLATE)
+
+        with _patch_hf_transformers(Mock(return_value=tokenizer)):
+            resolve_auto_parsers(args)
+
+        self.assertEqual(_declared(args, "tool_call_parser"), "granite_toolcall_parser")
+        self.assertIsNone(_declared(args, "reasoning_parser"))
 
     def test_response_template_fills_undetected_parsers(self):
         args = self._make_server_args(
