@@ -42,6 +42,8 @@ else:
         load_cache_to_device_buffer_dsv4_mla,
         load_cache_to_device_buffer_mla,
         load_cache_to_device_buffer_spec_mla,
+        SPEC_SWAP_MAX_OCCURRENCES,
+        SPEC_SWAP_MAX_STEPS,
     )
 
 from sglang.srt.configs.model_config import dsa_layer_skips_topk, is_deepseek_dsa
@@ -57,7 +59,11 @@ from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
     HiSparseTokenToKVPoolAllocator,
 )
-from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool, ReqToTokenPool
+from sglang.srt.mem_cache.memory_pool import (
+    HybridLinearKVPool,
+    MiniMaxSparseKVPool,
+    ReqToTokenPool,
+)
 from sglang.srt.mem_cache.memory_pool_host import DeepSeekV4PagedHostPool
 from sglang.srt.mem_cache.pool_host.mha import HiSparseMHATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
@@ -186,13 +192,17 @@ class HiSparseSpecSwapManager:
             raise ValueError("HiSparse speculative swap is unsupported on XPU.")
         if coordinator.is_dsv4_hisparse:
             raise ValueError("HiSparse spec swap currently supports DSA caches only.")
-        if not 2 <= num_draft_tokens <= 4 or coordinator.top_k < 1024:
+        if not 2 <= num_draft_tokens <= SPEC_SWAP_MAX_STEPS or coordinator.top_k < 1024:
             raise ValueError(
-                "HiSparse spec swap requires 2-4 draft tokens and top_k >= 1024."
+                f"HiSparse spec swap requires 2-{SPEC_SWAP_MAX_STEPS} draft tokens "
+                "and top_k >= 1024."
             )
         workspace_capacity = num_draft_tokens * coordinator.top_k
-        if workspace_capacity > 8192:
-            raise ValueError("HiSparse spec swap supports at most 8192 occurrences.")
+        if workspace_capacity > SPEC_SWAP_MAX_OCCURRENCES:
+            raise ValueError(
+                "HiSparse spec swap supports at most "
+                f"{SPEC_SWAP_MAX_OCCURRENCES} occurrences."
+            )
         if max_num_req_slots > coordinator.device_buffer_size:
             raise ValueError(
                 "HiSparse spec request capacity must not exceed device_buffer_size."
@@ -642,6 +652,13 @@ class HiSparseCoordinator:
                 )
                 self.item_size_bytes = self.mem_pool_host.token_stride_size
         self.page_size = self.mem_pool_device.page_size
+        # Model layer id -> layer index of the dense full pool; None when the
+        # attention callers already pass pool layer indices.
+        self._pool_layer_index: Optional[Dict[int, int]] = (
+            kvcache.full_attention_layer_id_mapping
+            if isinstance(kvcache, HybridLinearKVPool)
+            else None
+        )
 
         max_num_req_slots = req_to_token_pool.req_to_token.shape[0]
         max_context_len = req_to_token_pool.max_context_len
@@ -1601,6 +1618,8 @@ class HiSparseCoordinator:
         With prefetch enabled, anchors swap in synchronously (recording the miss
         plan) and prefetch their skip layers' copies; skip layers just wait.
         """
+        if self._pool_layer_index is not None:
+            layer_id = self._pool_layer_index[layer_id]
         if not self.enable_prefetch:
             return self._run_swap_in_kernel(
                 req_pool_indices,

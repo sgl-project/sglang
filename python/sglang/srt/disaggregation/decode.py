@@ -128,12 +128,12 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 from sglang.srt.mem_cache.capacity import capacity_decision
 from sglang.srt.mem_cache.common import (
     RetractionBackup,
-    dsv4_needs_rebootstrap,
     finish_restore_kv_cache,
     kv_to_page_indices,
     match_kv_cache,
     page_align_floor,
     restore_kv_cache,
+    retraction_needs_rebootstrap,
     start_restore_kv_cache,
     suffix_page_indices,
 )
@@ -183,6 +183,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.managers.scheduler import Scheduler
     from sglang.srt.mem_cache.kv.storage import KVStorage
+    from sglang.srt.speculative.dflash_draft_ring import DFlashDraftKVRing
 
 CLIP_MAX_NEW_TOKEN = envs.SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION.get()
 
@@ -488,12 +489,14 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         max_total_num_tokens: int,
         num_reserved_decode_tokens: int,
         transfer_backend: TransferBackend,
+        draft_kv_ring: Optional[DFlashDraftKVRing],
     ):
         parallel = get_parallel()
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.token_to_kv_pool = token_to_kv_pool_allocator.get_kvcache()
         self.draft_token_to_kv_pool = draft_token_to_kv_pool
+        self.draft_kv_ring = draft_kv_ring
         self.is_mla_backend = is_mla_backend(self.token_to_kv_pool)
         self.metadata_buffers = metadata_buffers
         self.req_to_metadata_buffer_idx_allocator = req_to_metadata_buffer_idx_allocator
@@ -590,12 +593,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if enable_kv_checksum:
             kv_args = self.kv_manager.kv_args
             self.kv_checksum_signature = kv_layout_signature(kv_args)
-            self.scheduler.kv_checksum_computer = KvChecksumComputer(
-                device=torch.device(f"cuda:{get_device().gpu_id}"),
-                kv_data_ptrs=kv_args.kv_data_ptrs,
-                kv_item_lens=kv_args.kv_item_lens,
-                state_data_ptrs=kv_args.state_data_ptrs,
-                state_item_lens=kv_args.state_item_lens,
+            self.scheduler.kv_checksum_computer = KvChecksumComputer.for_kv_args(
+                kv_args, torch.device(f"cuda:{get_device().gpu_id}")
             )
         else:
             self.scheduler.kv_checksum_computer = None
@@ -912,6 +911,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             self.draft_token_to_kv_pool,
             total_kv_layers=self.scheduler.model_config.num_hidden_layers,
             window_tails=storage.retained_window_lengths(),
+            draft_kv_ring=self.draft_kv_ring,
         )
         if get_disagg().disaggregation_decode_host_receive_threshold < 1:
             pool = self.token_to_kv_pool
@@ -1126,7 +1126,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if not is_retracted and not is_rebootstrap and is_unadmitted_reject(req):
             self.scheduler.request_retirer.retire_unadmitted(req)
             return
-        if is_retracted and dsv4_needs_rebootstrap(self.token_to_kv_pool_allocator):
+        if is_retracted and retraction_needs_rebootstrap(
+            self.token_to_kv_pool_allocator
+        ):
             req.time_stats.set_retract_time()
             is_retracted = False
             is_rebootstrap = True
@@ -1380,6 +1382,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             resumed_reqs.append(req)
             req.is_retracted = False
             self._pre_alloc(req)
+            if self.draft_kv_ring is not None:
+                # Its ring rows were not backed up.
+                self.draft_kv_ring.reset_floor(
+                    int(req.kv.req_pool_idx), pre_alloc_fill_len(req)
+                )
             full_allocatable_tokens = self._allocatable_token_budgets(
                 count_retracted=False,
                 extra_reserved_reqs=len(resumed_reqs),
@@ -1936,6 +1943,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 prefix_len,
                 total_prefix_len,
             )
+            if self.draft_kv_ring is not None and _is_fake_transfer(decode_req.req):
+                # No prefill sends this request's floor.
+                self.draft_kv_ring.reset_floor(
+                    int(decode_req.req.kv.req_pool_idx),
+                    pre_alloc_fill_len(decode_req.req),
+                )
             decode_req.prefix_match = prefix_match
             hisparse_req_budget -= 1
             # Recompute from actual pool state for the next queue entry.
@@ -2197,6 +2210,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 int(decode_req.req.kv.req_pool_idx), seq_len
             )
 
+        def _draft_ring_payload():
+            return self.draft_kv_ring.transfer_rows(
+                int(decode_req.req.kv.req_pool_idx), seq_len
+            )
+
         def _request_row_payload():
             return np.array([decode_req.req.kv.req_pool_idx], dtype=np.int32)
 
@@ -2218,6 +2236,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             StateType.MINIMAX_INDEX_K: _minimax_payload,
             StateType.MINIMAX_DENSE_KV: _full_kv_pages_payload,
             StateType.SWA_RING: _swa_ring_payload,
+            StateType.DRAFT_RING: _draft_ring_payload,
             StateType.DSV4_REQUEST_STATE: _request_state_payload,
             StateType.REQUEST_ROW: _request_row_payload,
             StateType.BLOCK_SCALE: _full_kv_pages_payload,
