@@ -1348,6 +1348,12 @@ def _packed_drafts(
         if not pool.layer_router.routes_to(sub_pool):
             continue
         view = pool.layer_router.view(sub_pool)
+        # Its host copies take the sub-pool's id translation (`host_ids`), so
+        # only a draft fused into the target's entries can pack here.
+        assert view.requires_physical_write_loc, (
+            f"a draft packed into unified sub-pool {sub_pool!r} must be fused "
+            f"into its entries; got {type(view).__name__}"
+        )
         if sub_pool != owner and pool.swa_uses_full_indices:
             by_owner_ids.append(view)
         else:
@@ -1444,7 +1450,11 @@ def build_unified_host_stack(
     parallel = get_parallel()
 
     def build_host(name, drafts):
-        layout = storage.host_layout(name)
+        # Packed draft rows need per-layer host rows; an envelope already
+        # carries its entries' draft parts.
+        layout = (
+            storage.packed_host_layout(name) if drafts else storage.host_layout(name)
+        )
         options = HostPoolOptions(
             ratio=memory.hicache_ratio,
             size=memory.hicache_size if host_sizes[name] is None else host_sizes[name],

@@ -38,6 +38,7 @@ from sglang.srt.mem_cache.layout.fused_draft import (
     LAYER_WINDOW,
     DenseDraftRegion,
     DenseHostKind,
+    DraftBand,
     DraftKVGeometry,
     DraftKVProfile,
     DraftLayerSet,
@@ -739,47 +740,74 @@ class TestFusedDraftDecision(CustomTestCase):
         draft_mla=False,
         draft_hf_config=None,
         hicache=False,
+        hicache_storage=None,
         retraction_backup=None,
         draft_parallel_layout=None,
         is_hip=False,
         resolved_window=128,
         draft_window=None,
         draft_cls=None,
+        host="swa",
+        mla_host=False,
+        nextn=False,
+        host_head_dim=64,
+        decide=None,
     ):
         from sglang.srt.configs.model_config import AttentionArch
         from sglang.srt.mem_cache import kv_cache_configurator as kvc
         from sglang.srt.speculative import draft_worker_common
 
         cfg = kvc.KVCacheConfigurator.__new__(kvc.KVCacheConfigurator)
-        # The window the runner resolved for its layers.
-        cfg.sliding_window_size = resolved_window
-        cfg.draft_parallel_layout = draft_parallel_layout
-        cfg.is_hybrid_swa = True
+        # Two layers whose declarations name the sub-pools the draft may fuse
+        # into: one full layer and, by `host`, one window layer ("swa"), one
+        # recurrent-state layer ("mamba"), or one window layer holding state
+        # too ("swa+mamba", the three-sub-pool host).
+        cfg.is_hybrid_swa = "swa" in host
         cfg.is_hybrid_swa_compress = False
-        cfg.mambaish_config = None
-        cfg.use_mla_backend = False
+        cfg.mambaish_config = (
+            SimpleNamespace(
+                full_attention_layer_ids=[0],
+                mamba2_cache_params=SimpleNamespace(
+                    layers=[1],
+                    shape=SimpleNamespace(
+                        conv=[(2, 4)], temporal=(1, 8, 8), num_k_heads_per_tp=2
+                    ),
+                    dtype=SimpleNamespace(conv=_DTYPE, temporal=torch.float32),
+                    is_kda=False,
+                ),
+            )
+            if "mamba" in host
+            else None
+        )
+        # The window the runner resolved for its layers.
+        cfg.sliding_window_size = resolved_window if cfg.is_hybrid_swa else None
+        cfg.draft_parallel_layout = draft_parallel_layout
+        cfg.hybrid_gdn_config = None
+        cfg.hybrid_kda_config = None
+        cfg.use_mla_backend = mla_host
         cfg.is_draft_worker = False
         cfg.spec_algorithm = SpeculativeAlgorithm.from_string(algorithm)
-        # A hybrid sliding-window host: one full and one window layer, whose
-        # declarations name the sub-pools the draft may fuse into.
         cfg.layer_info = SimpleNamespace(
             start_layer=0,
             end_layer=2,
             full_attention_layer_ids=[0],
-            swa_attention_layer_ids=[1],
+            swa_attention_layer_ids=[1] if cfg.is_hybrid_swa else [],
         )
         cfg.model_config = SimpleNamespace(
             is_multi_layer_eagle=False,
-            sliding_window_size=128,
+            sliding_window_size=128 if cfg.is_hybrid_swa else None,
             hf_config=SimpleNamespace(architectures=["GptOssForCausalLM"]),
             get_num_kv_heads=lambda tp, dcp: 4,
-            head_dim=64,
-            v_head_dim=64,
+            head_dim=host_head_dim,
+            v_head_dim=host_head_dim,
             get_swa_num_kv_heads=lambda tp: 4,
             swa_head_dim=64,
             swa_v_head_dim=64,
+            kv_lora_rank=8,
+            qk_rope_head_dim=4,
         )
         cfg.kv_cache_dtype = host_kv_dtype
+        cfg.page_size = 1
         cfg.spec_aux_config = SimpleNamespace(
             eagle_draft_num_layers=1,
             draft_kv_num_layers=1,
@@ -795,7 +823,8 @@ class TestFusedDraftDecision(CustomTestCase):
                 swa_head_dim=64,
                 swa_v_head_dim=64,
                 is_compressed_kv_arch=False,
-                num_nextn_predict_layers=None,
+                num_nextn_predict_layers=1 if nextn else None,
+                hf_text_config=SimpleNamespace(),
                 get_num_kv_heads=lambda tp: max(1, 4 // tp),
                 head_dim=64,
                 v_head_dim=64,
@@ -811,9 +840,12 @@ class TestFusedDraftDecision(CustomTestCase):
             ),
         )
         memory = SimpleNamespace(
-            enable_unified_memory=True, enable_hierarchical_cache=hicache
+            enable_unified_memory=True,
+            enable_hierarchical_cache=hicache,
+            hicache_storage_backend=hicache_storage,
         )
         spec = SimpleNamespace(
+            speculative_algorithm=algorithm,
             speculative_num_steps=1,
             speculative_draft_kv_cache_dtype=draft_kv_dtype,
             speculative_draft_attention_backend=draft_backend,
@@ -825,12 +857,14 @@ class TestFusedDraftDecision(CustomTestCase):
                 attn_dp_size=attn_dp_size,
             ),
             patch.object(kvc, "get_memory", return_value=memory),
+            patch.object(kvc, "mamba_cache_chunk_size", return_value=64),
             patch.object(kvc, "_is_hip", is_hip),
             patch.object(
                 kvc,
                 "get_disagg",
                 return_value=SimpleNamespace(
-                    disaggregation_decode_retraction_backup=retraction_backup
+                    disaggregation_decode_retraction_backup=retraction_backup,
+                    disaggregation_mode="null",
                 ),
             ),
             patch.object(kvc, "get_spec", return_value=spec),
@@ -844,7 +878,10 @@ class TestFusedDraftDecision(CustomTestCase):
             patch.object(
                 draft_worker_common, "attention_backends", return_value=target_backends
             ),
-            patch("sglang.srt.configs.hybrid_arch.mambaish_config", return_value=None),
+            patch(
+                "sglang.srt.configs.hybrid_arch.mambaish_config",
+                return_value=cfg.mambaish_config,
+            ),
             get_parallel().override(attn_dcp_size=dcp_size),
             override_platform(is_xpu=False, is_hip=False),
             patch(
@@ -852,7 +889,7 @@ class TestFusedDraftDecision(CustomTestCase):
                 return_value=(draft_cls or _RawWindowDraft, "Draft"),
             ),
         ):
-            return cfg._fused_draft_decision()
+            return decide(cfg) if decide else cfg._fused_draft_decision()
 
     def test_a_stateless_draft_is_placed(self):
         self.assertIsNotNone(self._decide().placement)
@@ -1152,6 +1189,146 @@ class TestFusedDraftDecision(CustomTestCase):
             decision = self._decide(algorithm="DSPARK", **flags)
             self.assertIsNotNone(decision.placement, decision.declined)
             self.assertEqual(decision.placement.hosts(), ("full",))
+
+    def test_hierarchical_cache_fuses_where_page_envelopes_carry_the_rows(self):
+        """A hybrid-SWA host's page envelopes copy whole pages, draft rows
+        included, where the storage backend keeps whole pages."""
+        for algorithm in ("EAGLE", "EAGLE3"):
+            for storage in (None, "mori", "file"):
+                decision = self._decide(
+                    algorithm=algorithm, hicache=True, hicache_storage=storage
+                )
+                self.assertIsNotNone(decision.placement, (algorithm, storage))
+            for storage in ("mooncake", "dynamic"):
+                declined = self._decide(
+                    algorithm=algorithm, hicache=True, hicache_storage=storage
+                )
+                self.assertIsNone(declined.placement, (algorithm, storage))
+                self.assertIn("page envelopes", declined.declined)
+                self.assertIn(storage, declined.declined)
+
+    def test_hierarchical_cache_takes_a_nextn_head_on_a_mamba_host(self):
+        """Whole entries carry the head where the backend keeps them; a backend
+        that copies rows layer by layer gets it packed in the target's shape."""
+        from sglang.srt.mem_cache.layout.fused_draft import MLADraftRegion
+
+        for storage in (None, "file", "mori", "mooncake"):
+            decision = self._decide(
+                host="mamba", nextn=True, hicache=True, hicache_storage=storage
+            )
+            self.assertIsNotNone(decision.placement, (storage, decision.declined))
+            decision = self._decide(
+                host="mamba",
+                nextn=True,
+                hicache=True,
+                hicache_storage=storage,
+                draft_mla=True,
+                mla_host=True,
+            )
+            self.assertIsInstance(decision.placement.region("full"), MLADraftRegion)
+        # Without HiCache nothing has to pack.
+        self.assertIsNotNone(self._decide(host="mamba", host_head_dim=128).placement)
+
+    def test_hierarchical_cache_declines_what_no_route_keeps(self):
+        """Whatever the backend: a host or a draft outside the two routes."""
+        cases = (
+            dict(host="mamba"),
+            dict(host="mamba", algorithm="EAGLE3", nextn=True),
+            # A window layer's rows are not in the full entries.
+            dict(host="mamba", nextn=True, draft_window=64),
+            # The three-sub-pool host has no route for this draft.
+            dict(host="swa+mamba", nextn=True),
+        )
+        for storage in (None, "mooncake"):
+            for case in cases:
+                declined = self._decide(hicache=True, hicache_storage=storage, **case)
+                self.assertIsNone(declined.placement, (storage, case))
+                self.assertIn("NEXTN head with one layer per runner", declined.declined)
+
+    def test_hierarchical_cache_declines_a_head_with_a_window_lane_too(self):
+        """A lane in the full entries does not carry a lane beside them."""
+        region = DenseDraftRegion(
+            lane_num=1, head_num=4, head_dim=64, store_dtype=_DTYPE
+        )
+        placement = FusedDraftPlacement.from_counts(
+            counts={"full": [1], "draft_swa": [1]},
+            regions={"full": region, "draft_swa": region},
+            new_bands={"draft_swa": DraftBand(kind="window", window=16)},
+        )
+        for storage in (None, "mooncake"):
+            declined = self._decide(
+                host="mamba",
+                nextn=True,
+                hicache=True,
+                hicache_storage=storage,
+                decide=lambda cfg: cfg._hicache_fused_eagle_declined(placement),
+            )
+            self.assertIn("NEXTN head with one layer per runner", declined)
+
+    def test_only_a_row_backend_needs_the_targets_row_shape(self):
+        """A host of whole entries copies any row shape as it is, so these fuse
+        with no backend and are declined only where the rows would have to pack."""
+        cases = (
+            # Rows unlike the target's: wider heads, another storage dtype.
+            dict(host="mamba", nextn=True, host_head_dim=128),
+            dict(host="mamba", nextn=True, draft_kv_dtype="fp8_e4m3"),
+            # Dense rows on an MLA host, latent rows on an MHA host.
+            dict(host="mamba", nextn=True, mla_host=True),
+            dict(host="mamba", nextn=True, draft_mla=True),
+            # Replicated rows.
+            dict(host="mamba", nextn=True, dcp_size=2, draft_backend="flashinfer"),
+        )
+        for case in cases:
+            kept = self._decide(hicache=True, **case)
+            self.assertIsNotNone(kept.placement, (case, kept.declined))
+            declined = self._decide(hicache=True, hicache_storage="mooncake", **case)
+            self.assertIsNone(declined.placement, case)
+            self.assertIn("must pack after the target's", declined.declined)
+
+    def test_other_algorithms_have_no_fused_route_to_change(self):
+        """Fusion is for the EAGLE and DFLASH families. Others decide nothing here,
+        and unified memory refuses them first, FROZEN_KV_MTP included, though
+        `is_eagle()` covers it."""
+        from sglang.srt.arg_groups.kv_cache_hook import handle_unified_memory_pool
+        from sglang.srt.server_args import ServerArgs
+
+        for algorithm in ("NGRAM", "STANDALONE"):
+            for storage in (None, "mooncake"):
+                decision = self._decide(
+                    algorithm=algorithm, hicache=True, hicache_storage=storage
+                )
+                self.assertIsNone(decision.placement, algorithm)
+                self.assertIsNone(decision.declined, algorithm)
+        self.assertTrue(SpeculativeAlgorithm.from_string("FROZEN_KV_MTP").is_eagle())
+        for algorithm in ("FROZEN_KV_MTP", "NGRAM", "STANDALONE", "UNO"):
+            args = ServerArgs(
+                model_path="dummy",
+                enable_unified_memory=True,
+                speculative_algorithm=algorithm,
+            )
+            with self.assertRaisesRegex(AssertionError, "only supports"):
+                handle_unified_memory_pool(args)
+
+    def test_hierarchical_cache_changes_nothing_for_the_dflash_family(self):
+        """Fusion decides these on main's rules: the same placement with and
+        without HiCache, on every host, width and backend."""
+        for algorithm in ("DFLASH", "DSPARK"):
+            for case in (
+                dict(host="swa"),
+                dict(host="mamba"),
+                dict(host="mamba", draft_mla=True, mla_host=True),
+                dict(host="swa", dcp_size=2, draft_backend="flashinfer"),
+            ):
+                base = self._decide(algorithm=algorithm, **case)
+                for storage in (None, "mooncake", "file"):
+                    with_cache = self._decide(
+                        algorithm=algorithm,
+                        hicache=True,
+                        hicache_storage=storage,
+                        **case,
+                    )
+                    self.assertEqual(with_cache.placement, base.placement, case)
+                    self.assertEqual(with_cache.declined, base.declined, case)
 
 
 if __name__ == "__main__":

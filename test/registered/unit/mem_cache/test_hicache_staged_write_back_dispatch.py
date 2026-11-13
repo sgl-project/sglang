@@ -510,6 +510,72 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
             host_pool.load_to_device_per_layer.call_args_list[1].kwargs["is_draft"]
         )
 
+    def test_a_private_packed_draft_keeps_the_controllers_ids(self):
+        """A target with no translation gives its private draft none either: the
+        fused draft's translation must not reach an unrelated draft's ids."""
+        host_pool = MHATokenToKVPoolHost.__new__(MHATokenToKVPoolHost)
+        host_pool.load_to_device_per_layer = mock.Mock()
+        controller = HybridCacheController.__new__(HybridCacheController)
+        entry = PoolEntry(
+            name=PoolName.KV,
+            host_pool=host_pool,
+            device_pool=SimpleNamespace(device="cpu"),
+            layer_mapper={0: 0, 1: 1}.get,
+            is_primary_index_anchor=True,
+            packed_draft_device_pools=(SimpleNamespace(device="cpu"),),
+        )
+        controller.mem_pool_host = SimpleNamespace(
+            anchor_entry=entry,
+            entry_map={entry.name: entry},
+        )
+        controller.transfer_layer_id_max = 1
+
+        transfers = controller._l2_load_transfers(_indices(0, 2), _indices(2, 4))
+        with mock.patch.object(transfer_module, "device_module", _FakeDeviceModule):
+            L2TransferEngine("kernel").submit_host_to_device(
+                transfers, transfer_layer_id_max=1
+            )
+
+        calls = host_pool.load_to_device_per_layer.call_args_list
+        self.assertEqual([call.kwargs["is_draft"] for call in calls], [False, True])
+        for call in calls:
+            self.assertEqual(call.args[2].tolist(), [2, 3])
+
+    def test_a_packed_draft_load_resolves_its_ids_like_its_entry(self):
+        """A draft fused into a unified pool's entries shares the target's
+        slots, so the engine must resolve the controller's ids for the draft's
+        packed layer through the entry's translation, as for the target's
+        layers: loaded at the raw ids, the draft's rows would land in other
+        requests' slots."""
+        host_pool = MHATokenToKVPoolHost.__new__(MHATokenToKVPoolHost)
+        host_pool.load_to_device_per_layer = mock.Mock()
+        controller = HybridCacheController.__new__(HybridCacheController)
+        entry = PoolEntry(
+            name=PoolName.KV,
+            host_pool=host_pool,
+            device_pool=SimpleNamespace(device="cpu"),
+            layer_mapper={0: 0, 1: 1}.get,
+            is_primary_index_anchor=True,
+            packed_draft_device_pools=(SimpleNamespace(device="cpu"),),
+            device_translate=lambda ids: ids + 100,
+        )
+        controller.mem_pool_host = SimpleNamespace(
+            anchor_entry=entry,
+            entry_map={entry.name: entry},
+        )
+        controller.transfer_layer_id_max = 1
+
+        transfers = controller._l2_load_transfers(_indices(0, 2), _indices(2, 4))
+        with mock.patch.object(transfer_module, "device_module", _FakeDeviceModule):
+            L2TransferEngine("kernel").submit_host_to_device(
+                transfers, transfer_layer_id_max=1
+            )
+
+        calls = host_pool.load_to_device_per_layer.call_args_list
+        self.assertEqual([call.kwargs["is_draft"] for call in calls], [False, True])
+        for call in calls:
+            self.assertEqual(call.args[2].tolist(), [102, 103])
+
     def test_mixed_staged_write_resolves_indices_per_pool(self):
         anchor_host_pool = SimpleNamespace(can_use_write_back_jit=True)
         extra_host_pool = SimpleNamespace(can_use_write_back_jit=False)

@@ -235,6 +235,24 @@ class KVStorage:
             )
         return layout
 
+    def packed_host_layout(self, name: str):
+        """The sub-pool's host layout when a fused draft's rows are packed after
+        its layers, for a storage backend that does not keep whole entries. The
+        state sub-pool has no such form."""
+        if name == self._allocator.roles.state:
+            return self.host_layout(name)
+        band = (
+            self._allocator.full_attn_allocator
+            if name == self.owner
+            else self._band(name)
+        )
+        if band.page_size != band.pool_page_size:
+            raise ValueError(
+                f"sub-pool {name!r} pages span {band.page_size // band.pool_page_size} "
+                "pool pages, which per-layer host rows cannot address"
+            )
+        return self.view(name).per_layer_host_layout()
+
     @property
     def request_memory(self):
         """Fixed REQUEST parts, copied together when a request is retracted."""
