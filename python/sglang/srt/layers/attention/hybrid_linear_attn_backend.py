@@ -1705,6 +1705,8 @@ class HybridLinearAttnBackend(AttentionBackend):
                 accept_lens=last_correct_step_indices + 1,
                 last_correct_step_indices=last_correct_step_indices,
                 fold_every_commit=True,
+                window_only=getattr(mamba_pool, "replayssm_window_only", False),
+                max_cache_len=getattr(mamba_pool, "linear_replayssm_cache_len", None),
                 mamba_track_indices=mamba_track_indices,
                 mamba_steps_to_track=mamba_steps_to_track,
                 src_indices_raw=src_indices_raw,

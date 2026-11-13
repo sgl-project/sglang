@@ -17,6 +17,7 @@ for rows with a state slot, and CUDA graph replay must match eager.
 import math
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
 import torch.nn.functional as F
@@ -104,7 +105,16 @@ def _conv_window(dtype):
 class _Arm:
     """One verify/commit path over its own copy of the pool contents."""
 
-    def __init__(self, template, *, replayssm, dispatcher, ring_len=RING, lazy=False):
+    def __init__(
+        self,
+        template,
+        *,
+        replayssm,
+        dispatcher,
+        ring_len=RING,
+        lazy=False,
+        window_only=False,
+    ):
         conv = template["conv"].clone()
         temporal = template["temporal"].clone()
         if replayssm:
@@ -155,6 +165,9 @@ class _Arm:
             self.pool = SimpleNamespace(
                 replayssm_is_kda=False, replayssm_spec_fold=False
             )
+        if window_only:
+            self.pool.replayssm_window_only = True
+            self.pool.linear_replayssm_cache_len = RING
         self.dispatcher = dispatcher
         self.lazy = lazy
 
@@ -314,6 +327,164 @@ class TestGDNReplaySSMDirectCommit(CustomTestCase):
 
     def _replayssm(self, template):
         return _Arm(template, replayssm=True, dispatcher=self.dispatcher)
+
+    def _window_arm(self, template):
+        return _Arm(
+            template,
+            replayssm=True,
+            dispatcher=self.dispatcher,
+            ring_len=WIDTH,
+            window_only=True,
+        )
+
+    def test_window_factors_match_ring_with_track_and_padding(self):
+        """Smaller physical windows preserve the original arithmetic, including
+        non-power-of-two lengths, track slots and reordered request rows."""
+        for width in (3, 4, 8, 16):
+            for dtype in (torch.bfloat16,):
+                with (
+                    self.subTest(width=width, dtype=dtype),
+                    mock.patch.dict(globals(), WIDTH=width),
+                ):
+                    torch.manual_seed(911 + width)
+                    layers = _make_layers()
+                    template = _template(dtype)
+                    rows, slots = _rows_and_slots()
+                    qsl = torch.arange(
+                        0,
+                        NUM_SLOTS * WIDTH + 1,
+                        WIDTH,
+                        device="cuda",
+                        dtype=torch.int32,
+                    )
+                    old = self._replayssm(template)
+                    new = self._window_arm(template)
+                    # Ignored metadata must not participate in either kernel.
+                    new.pool.replayssm_spec_write_pos.fill_(11)
+                    new.pool.replayssm_cache_base.fill_(7)
+                    new.pool.replayssm_is_flush.fill_(1)
+                    backends = [arm.backend(qsl, slots) for arm in (old, new)]
+                    active = set(slots[:NUM_REAL].tolist())
+                    tracks = torch.tensor(
+                        [slot for slot in range(NUM_POOL_SLOTS) if slot not in active][
+                            :NUM_REAL
+                        ],
+                        device="cuda",
+                        dtype=torch.int32,
+                    )
+                    batch = _batch(NUM_SLOTS * WIDTH, rows)
+                    for _ in range(32):
+                        inputs = _dense_inputs()
+                        outputs = [_verify(b, layers, batch, inputs) for b in backends]
+                        for a, b in zip(*outputs):
+                            self.assertTrue(torch.equal(a, b), "verify output")
+                        steps = torch.randint(0, WIDTH, (NUM_REAL,), device="cuda")
+                        track_steps = torch.where(
+                            torch.arange(NUM_REAL, device="cuda") % 2 == 0,
+                            steps // 2,
+                            -1,
+                        )
+                        for arm in (old, new):
+                            arm.commit(steps, rows[:NUM_REAL], tracks, track_steps)
+                        self.assertTrue(
+                            torch.equal(old.state.temporal, new.state.temporal),
+                            "checkpoint",
+                        )
+                        self.assertTrue(
+                            torch.equal(old.state.conv[0], new.state.conv[0]), "conv"
+                        )
+                    self.assertTrue(torch.all(new.pool.replayssm_spec_write_pos == 11))
+                    self.assertTrue(torch.all(new.pool.replayssm_cache_base == 7))
+                    self.assertTrue(torch.all(new.pool.replayssm_is_flush == 1))
+
+    def test_window_rejected_non_finite_factors(self):
+        with mock.patch.dict(globals(), WIDTH=4):
+            for dtype in (torch.bfloat16,):
+                torch.manual_seed(927)
+                layers = _make_layers()
+                template = _template(dtype)
+                rows, slots = _rows_and_slots()
+                qsl = torch.arange(
+                    0, NUM_SLOTS * WIDTH + 1, WIDTH, device="cuda", dtype=torch.int32
+                )
+                clean, poisoned = [self._window_arm(template) for _ in range(2)]
+                inputs = _dense_inputs()
+                bad = [tuple(t.clone() for t in values) for values in inputs]
+                for values in bad:
+                    for tensor in values:
+                        view = tensor.view(NUM_SLOTS, WIDTH, -1)
+                        view[:, 2] = float("nan")
+                        view[:, 3] = float("inf")
+                outputs = []
+                for arm, data in [(clean, inputs), (poisoned, bad)]:
+                    outputs.append(
+                        _verify(
+                            arm.backend(qsl, slots),
+                            layers,
+                            _batch(NUM_SLOTS * WIDTH, rows),
+                            data,
+                        )
+                    )
+                    arm.commit(
+                        torch.ones(NUM_REAL, device="cuda", dtype=torch.int64),
+                        rows[:NUM_REAL],
+                    )
+                for a, b in zip(*outputs):
+                    self.assertTrue(
+                        torch.equal(
+                            a.reshape(NUM_SLOTS, WIDTH, -1)[:, :2],
+                            b.reshape(NUM_SLOTS, WIDTH, -1)[:, :2],
+                        )
+                    )
+                self.assertTrue(
+                    torch.equal(clean.state.temporal, poisoned.state.temporal)
+                )
+                self.assertTrue(
+                    torch.equal(clean.state.conv[0], poisoned.state.conv[0])
+                )
+
+    def test_window_verify_and_commit_cuda_graph(self):
+        with mock.patch.dict(globals(), WIDTH=4):
+            torch.manual_seed(929)
+            layers = _make_layers()
+            template = _template(torch.bfloat16)
+            rows, slots = _rows_and_slots()
+            qsl = torch.arange(
+                0, NUM_SLOTS * WIDTH + 1, WIDTH, device="cuda", dtype=torch.int32
+            )
+            inputs = _dense_inputs()
+            steps = torch.tensor([0, 1, 2, 3, 1, 2], device="cuda")
+            arm = self._window_arm(template)
+            backend = arm.backend(qsl, slots)
+            batch = _batch(NUM_SLOTS * WIDTH, rows)
+
+            def run():
+                output = _verify(backend, layers, batch, inputs)
+                arm.commit(steps, rows[:NUM_REAL])
+                return output
+
+            stream = torch.cuda.Stream()
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                run()
+            torch.cuda.current_stream().wait_stream(stream)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                captured = run()
+            for _ in range(3):
+                for values in inputs:
+                    for tensor in values:
+                        tensor.copy_(_randn(*tensor.shape))
+                arm.state.temporal.copy_(template["temporal"])
+                arm.state.conv[0].copy_(template["conv"])
+                eager = self._window_arm(template)
+                expected = _verify(eager.backend(qsl, slots), layers, batch, inputs)
+                eager.commit(steps, rows[:NUM_REAL])
+                graph.replay()
+                for a, b in zip(captured, expected):
+                    self.assertTrue(torch.equal(a, b))
+                self.assertTrue(torch.equal(arm.state.temporal, eager.state.temporal))
+                self.assertTrue(torch.equal(arm.state.conv[0], eager.state.conv[0]))
 
     def test_chain_matches_reference(self):
         """Chained verify/commit steps with random accepted lengths: outputs

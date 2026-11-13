@@ -625,7 +625,7 @@ class ExecMamba(msgspec.Struct):
     ] = False
     linear_replayssm_cache_len: A[
         int,
-        "Ring-buffer length L for ReplaySSM linear-attn decode. The full recurrent state is flushed to HBM every L decode steps. With --enable-linear-replayssm-spec on GDN models it is also the spec-verify ring length, which must be a power of two, at least 16 and at least the number of draft tokens.",
+        "Ring-buffer length L for ReplaySSM linear-attn decode. The full recurrent state is flushed to HBM every L decode steps. With --enable-linear-replayssm-spec on GDN models it is also the logical spec-verify ring length, which must be a power of two, at least 16 and at least the number of draft tokens. BF16 GDN DFLASH/DSPARK without PD keeps only one window of factors; the configured length still bounds the window and commit reduction.",
     ] = 16
     # ReplaySSM spec-verify (Part B of RFC #28511): linear-attn target-verify via
     # fold-every-commit instead of per-draft full-state snapshots -- the verify

@@ -1673,8 +1673,20 @@ class KVCacheConfigurator:
                 host_only_mamba_checkpoint() and self.hybrid_kda_config is not None
             ),
             allocate_intermediate_ssm=self.allocate_intermediate_ssm,
+            replayssm_window_only=self._gdn_replayssm_window_only(),
         )
         return req_to_token_pool
+
+    def _gdn_replayssm_window_only(self) -> bool:
+        return (
+            get_exec().mamba.enable_linear_replayssm_spec
+            and self.hybrid_gdn_config is not None
+            and self.hybrid_gdn_config.mamba2_cache_params.dtype.temporal
+            == torch.bfloat16
+            and (get_spec().speculative_algorithm or "").upper() in ("DFLASH", "DSPARK")
+            and get_disagg().disaggregation_mode == "null"
+            and not get_disagg().enable_pd_role_switch
+        )
 
     def _build_default_req_pool(
         self,
@@ -3483,6 +3495,8 @@ class KVCacheConfigurator:
         )
         if replayssm_active:
             record_len = get_exec().mamba.linear_replayssm_cache_len
+            if self._gdn_replayssm_window_only():
+                record_len = max_speculative_num_draft_tokens()
             replayssm_ring_per_req = (
                 config.mamba2_cache_params.replayssm_ring_bytes_per_req(
                     record_len=record_len

@@ -664,6 +664,7 @@ class MambaPool:
         linear_replayssm_cache_len: int = 16,
         envelope_layout: bool = False,
         enable_linear_replayssm_spec: bool = False,
+        replayssm_window_only: bool = False,
         replayssm_request_ring: bool = False,
         allocate_intermediate_ssm: bool = True,
     ):
@@ -690,6 +691,15 @@ class MambaPool:
         self.enable_linear_replayssm_spec = enable_linear_replayssm_spec
         self.replayssm_spec_fold = bool(
             enable_linear_replayssm_spec and cache_params.is_kda
+        )
+        # Direct BF16 callers materialize every accepted window; their factors
+        # have no cross-step history. Keep the circular protocol for other modes.
+        self.replayssm_window_only = bool(
+            enable_linear_replayssm_spec
+            and not cache_params.is_kda
+            and speculative_num_draft_tokens is not None
+            and replayssm_window_only
+            and ssm_dtype == torch.bfloat16
         )
         _replayssm_on = enable_linear_replayssm or enable_linear_replayssm_spec
         self.replayssm_request_ring = False
@@ -832,14 +842,16 @@ class MambaPool:
                     )
                 else:
                     record_len = L
+                if self.replayssm_window_only:
+                    record_len = speculative_num_draft_tokens
                 if not self.replayssm_spec_fold or cache_params.is_kda:
                     replayssm_d = torch.zeros(
-                        size=(num_mamba_layers, num_slots, hv, L, v_dim),
+                        size=(num_mamba_layers, num_slots, hv, record_len, v_dim),
                         dtype=ring_dtype,
                         device=device,
                     )
                     replayssm_k = torch.zeros(
-                        size=(num_mamba_layers, num_slots, h_k, L, k_dim),
+                        size=(num_mamba_layers, num_slots, h_k, record_len, k_dim),
                         dtype=ring_dtype,
                         device=device,
                     )
@@ -1053,7 +1065,7 @@ class MambaPool:
                 )
             if _replayssm_on:
                 logger.info(
-                    f"GDN ReplaySSM ring buffers allocated "
+                    f"GDN ReplaySSM {'window factors' if self.replayssm_window_only else 'ring buffers'} allocated "
                     f"(record_len={record_len}, fold={self.replayssm_spec_fold}, "
                     f"slots={num_slots}, request_ring={self.replayssm_request_ring}): "
                     f"d={get_tensor_size_bytes(replayssm_d) / GB if replayssm_d is not None else 0.0:.3f}GB, "
@@ -1447,6 +1459,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         linear_replayssm_cache_len: int = 16,
         mamba_envelope_layout: bool = False,
         enable_linear_replayssm_spec: bool = False,
+        replayssm_window_only: bool = False,
         allocate_intermediate_ssm: bool = True,
         short_conv_layer_ids: Optional[List[int]] = None,
         short_conv_state_shape: Optional[Tuple[int, int]] = None,
@@ -1487,6 +1500,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             linear_replayssm_cache_len=linear_replayssm_cache_len,
             mamba_envelope_layout=mamba_envelope_layout,
             enable_linear_replayssm_spec=enable_linear_replayssm_spec,
+            replayssm_window_only=replayssm_window_only,
             allocate_intermediate_ssm=allocate_intermediate_ssm,
             short_conv_layer_ids=short_conv_layer_ids,
             short_conv_state_shape=short_conv_state_shape,
@@ -1509,6 +1523,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         linear_replayssm_cache_len: int = 16,
         mamba_envelope_layout: bool = False,
         enable_linear_replayssm_spec: bool = False,
+        replayssm_window_only: bool = False,
         allocate_intermediate_ssm: bool = True,
         short_conv_layer_ids: Optional[List[int]] = None,
         short_conv_state_shape: Optional[Tuple[int, int]] = None,
@@ -1530,6 +1545,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             linear_replayssm_cache_len=linear_replayssm_cache_len,
             envelope_layout=mamba_envelope_layout,
             enable_linear_replayssm_spec=enable_linear_replayssm_spec,
+            replayssm_window_only=replayssm_window_only,
             replayssm_request_ring=replayssm_request_ring,
             allocate_intermediate_ssm=allocate_intermediate_ssm,
         )
