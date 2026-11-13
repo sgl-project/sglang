@@ -465,12 +465,6 @@ click [Server Arguments](../../../advanced_features/server_arguments).
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>bool flag<br/> (set to enable)</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>A2, A3, 950PR/DT Series</td>
     </tr>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--min-free-slots-delay`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>None</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Type: int. Hold new prefills until at least N running-request slots have freed up, admitting them in one batch instead of one at a time. Capped by --max-running-requests; `1` disables. When unset, auto-enabled by a formula on DFLASH workloads, off otherwise. Not supported with pipeline parallelism.</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>A2, A3, 950PR/DT Series</td>
-    </tr>
 <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--prefill-delayer-max-delay-passes`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`30`</td>
@@ -562,7 +556,7 @@ click [Server Arguments](../../../advanced_features/server_arguments).
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--attention-context-parallel-size`<br/>`--attn-cp-size`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`1`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Type: int; must divide --tp-size evenly (and must equal --tp-size when CP-TP group sharing is on)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Type: int; must be equal to --tp-size</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>A2, A3, 950PR/DT Series</td>
     </tr>
     <tr>
@@ -1667,7 +1661,7 @@ non-default speculative acceptance thresholds or deterministic inference.
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--deepep-dispatcher-output-dtype`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`auto`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`auto`,<br/> `bf16`,<br/> `int8`<br/>(When enabling DeepEP for a quantized model, set the dispatcher output dtype according to your model’s quantization.
-If the value is int8, you must also set the environment variable:DEEP_NORMAL_MODE_USE_INT8_QUANT=1. On current builds the flag alone selects the dispatch dtype, but the legacy pybind dispatch-buffer path still selects it from this environment variable inside the DeepEP runtime, so published pinned-image scripts set both)</td>
+If the value is int8, you must also set the environment variable:DEEP_NORMAL_MODE_USE_INT8_QUANT=1)</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>A2, A3 Series</td>
     </tr>
     <tr>
@@ -2361,13 +2355,13 @@ If the value is int8, you must also set the environment variable:DEEP_NORMAL_MOD
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--enable-prefill-cp`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`False`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>bool flag (set to enable)<br/>(On HIP, only DeepSeek V4; on Ascend, used by the DeepSeek V3.2 and GLM prefill-CP deployments)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>bool flag (set to enable)<br/>(Currently only DeepSeek V4 is supported)</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>A2, A3 Series</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--cp-strategy`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`None`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`zigzag`, `interleave`<br/>(model-dependent: DeepSeek V3.2 rejects `zigzag` on current builds; MiMo V2 requires `zigzag`; DeepSeek V4 accepts both)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`zigzag`<br/>(Currently only DeepSeek V4 is supported)</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>A2, A3 Series</td>
     </tr>
     <tr>
