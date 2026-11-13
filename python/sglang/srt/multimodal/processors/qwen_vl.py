@@ -1,3 +1,4 @@
+import logging
 import math
 import os
 import re
@@ -51,7 +52,8 @@ from sglang.srt.multimodal.transport.cuda_ipc import (
 from sglang.srt.runtime_context import get_mm, get_parallel
 from sglang.srt.utils import cpu_has_amx_support, is_cpu
 from sglang.srt.utils.video_decoder import VideoDecoderWrapper
-from sglang.utils import logger
+
+logger = logging.getLogger(__name__)
 
 IMAGE_FACTOR = 28
 MIN_PIXELS = 4 * 28 * 28
@@ -840,12 +842,10 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
                 feature_offset : feature_offset + feature_length
             ].contiguous()
             feature_offset += feature_length
-            # The artifact key already commits to the media content, processor
-            # fingerprint, and every preprocessing kwarg. Derive the downstream
-            # cache identity from it so independently preprocessed copies in
-            # different tokenizer workers share the same radix/VLM cache key.
+            # hash typed encoder inputs once on a miss; retain the complete
+            # digest even when cache_value drops the device feature
             feature_hash = resolve_multimodal_item_hash(
-                existing_hash=0, namespace=entry.artifact_key
+                feature=(feature, grid), namespace=entry.artifact_key
             )
             artifacts.append(
                 QwenVLImagePreprocessArtifact(
@@ -920,7 +920,7 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
                 offsets=[offset],
                 model_specific_data=deepcopy(artifact.model_specific_data),
             )
-            item.set_hash(artifact.feature_hash)
+            item.set_identity(artifact.feature_hash.to_bytes(32, "big"))
             mm_items.append(item)
 
         padded_input_ids = MultimodalProcessorOutput.build_padded_input_ids(

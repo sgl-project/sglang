@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """CuTe DSL DeepSeek-V3 fused-A GEMM (sm90+): out[M, N] = mat_a[M, K] @ weight,
-N in {2112, 6144}, M = num_tokens in [1, 16], K any multiple of 1024, bf16.
+N in {2112, 6144}, M = num_tokens in [1, 16], K any multiple of 256, bf16.
 
 Adapted from NVIDIA TensorRT-LLM dsv3FusedAGemm.cu
 (cpp/tensorrt_llm/kernels/dsv3MinLatencyKernels/dsv3FusedAGemm.cu), reimplemented
@@ -34,7 +34,7 @@ from cutlass.utils import get_smem_capacity_in_bytes
 
 from sglang.kernels.arch import current_arch
 from sglang.kernels.kernel_api_logging import debug_kernel_api
-from sglang.srt.utils.common import direct_register_custom_op
+from sglang.srt.utils.custom_op import direct_register_custom_op
 
 TILE_M = 16
 TILE_K = 256
@@ -336,7 +336,7 @@ def _dsv3_fused_a_gemm_run(mat_a: torch.Tensor, mat_b: torch.Tensor) -> torch.Te
     M, K = mat_a.shape
     N = mat_b.shape[1]
     assert mat_a.dtype == torch.bfloat16 and mat_b.dtype == torch.bfloat16
-    assert K % 1024 == 0, f"K must be a multiple of 1024, got {K}"
+    assert K % TILE_K == 0, f"K must be a multiple of {TILE_K}, got {K}"
     assert N % TILE_M == 0, f"N must be a multiple of {TILE_M}, got {N}"
     assert tuple(mat_b.shape) == (K, N) and mat_b.stride(0) == 1, (
         "mat_b must be [K, N] column-major"
@@ -376,7 +376,7 @@ def dsv3_fused_a_gemm(
 ) -> torch.Tensor:
     """out[M, N] = mat_a[M, K] @ mat_b, with mat_a row-major [M, K] (M in [1, 16]),
     mat_b column-major [K, N] (the weight, stride(0) == 1), N a multiple of 16
-    (e.g. 2112, 6144), K a multiple of 1024."""
+    (e.g. 2112, 6144), K a multiple of 256."""
     result = torch.ops.sglang.cutedsl_dsv3_fused_a_gemm(mat_a, mat_b)
     if output is not None:
         output.copy_(result)

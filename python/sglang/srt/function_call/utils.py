@@ -1,4 +1,7 @@
 import ast
+import json
+import logging
+import math
 import threading
 import warnings
 from json import JSONDecodeError, JSONDecoder
@@ -7,9 +10,13 @@ from typing import Any, Dict, Iterable, List, Literal, Optional, Tuple, Union
 
 import orjson
 import partial_json_parser
+from jsonschema import Draft202012Validator
 from partial_json_parser.core.options import Allow
+from referencing import Registry
 
 from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
+
+logger = logging.getLogger(__name__)
 
 _STANDARD_JSON_SCHEMA_TYPES = {
     "null",
@@ -108,6 +115,27 @@ def _normalize_type_list(raw_items: List[Any]) -> List[Any]:
         if normalized_item not in normalized_items:
             normalized_items.append(normalized_item)
     return normalized_items
+
+
+# Identifier keywords name a schema and never constrain an instance. The draft
+# 2020-12 metaschema does constrain their form: ``$id`` may not carry a
+# non-empty fragment, which the draft-07 plain-name style (``"$id": "#foo"``)
+# does. Dropping them before ``check_schema`` accepts such schemas without
+# changing which instances validate.
+_SCHEMA_IDENTIFIER_KEYWORDS = ("$id", "$anchor", "$dynamicAnchor")
+
+
+def without_schema_identifiers(schema: Any) -> Any:
+    """Return a copy of a JSON Schema without identifier keywords, for metaschema checks."""
+    if isinstance(schema, dict):
+        return {
+            key: without_schema_identifiers(value)
+            for key, value in schema.items()
+            if key not in _SCHEMA_IDENTIFIER_KEYWORDS
+        }
+    if isinstance(schema, list):
+        return [without_schema_identifiers(item) for item in schema]
+    return schema
 
 
 def normalize_json_schema_types(schema: Any) -> None:
@@ -427,6 +455,43 @@ def infer_type_from_json_schema(schema: Dict[str, Any]) -> Optional[str]:
         return "array"
 
     return None
+
+
+def _parse_finite_float(value: str) -> float:
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError("Non-finite JSON number")
+    return number
+
+
+def convert_string_union_value(
+    value: str, schema: Any, root_schema: Optional[dict] = None
+) -> Any:
+    """Decode a string-typed ``anyOf``/``oneOf`` value to its object/array when it
+    validates against ``schema``; local ``$ref``s resolve against ``root_schema``."""
+    if not (
+        isinstance(schema, dict)
+        and ("anyOf" in schema or "oneOf" in schema)
+        and value.lstrip().startswith(("{", "["))
+    ):
+        return value
+    try:
+        decoded = json.loads(
+            value,
+            parse_constant=_parse_finite_float,
+            parse_float=_parse_finite_float,
+        )
+        if isinstance(decoded, (dict, list)) and Draft202012Validator(
+            root_schema if root_schema is not None else schema,
+            registry=Registry(),
+        ).evolve(schema=schema).is_valid(decoded):
+            return decoded
+    except Exception as exc:
+        logger.debug(
+            "Structured union conversion failed (%s); preserving the original string.",
+            type(exc).__name__,
+        )
+    return value
 
 
 def get_json_schema_constraint(
