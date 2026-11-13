@@ -105,6 +105,17 @@ def parse_arguments(
         if arg_type == "number" and isinstance(parsed_value, str):
             parsed_value = _convert_to_number(parsed_value)
 
+        # A string-typed parameter whose JSON value is a bare scalar (an
+        # unquoted numeric id like 123, or true/null) must keep the raw text
+        # the model emitted; str() would mangle it ("True", "None"). Dict and
+        # list values fall through so the caller can re-serialize them.
+        if (
+            arg_type == "string"
+            and not isinstance(parsed_value, str)
+            and not isinstance(parsed_value, (dict, list))
+        ):
+            return json_value, True
+
         return parsed_value, True
     except (json.JSONDecodeError, ValueError):
         pass
@@ -116,6 +127,13 @@ def parse_arguments(
 
         if arg_type == "number" and isinstance(parsed_value, str):
             parsed_value = _convert_to_number(parsed_value)
+
+        if (
+            arg_type == "string"
+            and not isinstance(parsed_value, str)
+            and not isinstance(parsed_value, (dict, list))
+        ):
+            return json_value, True
 
         return parsed_value, True
     except (json.JSONDecodeError, ValueError, KeyError):
