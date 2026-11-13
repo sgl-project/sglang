@@ -18,7 +18,7 @@ import logging
 import os
 from contextlib import contextmanager
 from enum import IntEnum
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -552,14 +552,19 @@ class LogitsProcessor(nn.Module):
         # gather itself (see finish_deferred_gather / deferred_argmax).
         self.defer_verify_gather = False
         self.defer_plain_gather = envs.SGLANG_OPT_DFLASH_DEFER_PLAIN_GATHER.get()
-        self._sharded_verify_eligible = (
-            _runtime_optimized_vocab_shards_enabled()
-            and self.do_tensor_parallel_all_gather
+        self._sharded_verify_layout_ok = (
+            self.do_tensor_parallel_all_gather
             and not self.use_attn_tp_group
             and not self.do_tensor_parallel_all_gather_dp_attn
             and not self.use_tp_lm_head_all_to_all
             and not return_full_logits
         )
+        self._sharded_verify_eligible = (
+            _runtime_optimized_vocab_shards_enabled() and self._sharded_verify_layout_ok
+        )
+        # Set by a consumer that picks the logits format per step itself: the graph
+        # runner asks it first (padded replays included); eager verifies stay full.
+        self.verify_shards_predicate: Optional[Callable[[ForwardBatch], bool]] = None
         # A speculative worker must explicitly opt in after establishing that
         # its verify consumer understands ``next_token_logits_vocab_shard``.
         # UNO, DSpark, and out-of-tree consumers otherwise retain the stock
@@ -612,13 +617,21 @@ class LogitsProcessor(nn.Module):
             self.vocab_size, chunking_group=chunking_group
         )
 
-    def enable_sharded_verify(self, *, temperature_keys: bool = False) -> None:
+    def enable_sharded_verify(
+        self, *, temperature_keys: bool = False, require_runtime_env: bool = True
+    ) -> None:
         """Opt in a verify consumer that understands vocab-shard outputs.
 
         temperature_keys: the bound local key policy may serve temperature rows;
         the stock policy serves greedy rows only.
+        require_runtime_env: False for a consumer with its own switch, which then
+        needs only the LM head's layout.
         """
-        self.sharded_verify = self._sharded_verify_eligible
+        self.sharded_verify = (
+            self._sharded_verify_eligible
+            if require_runtime_env
+            else self._sharded_verify_layout_ok
+        )
         self._sharded_verify_temperature_keys = temperature_keys
 
     def verify_uses_vocab_shards(self, forward_batch: ForwardBatch) -> bool:
@@ -628,6 +641,8 @@ class LogitsProcessor(nn.Module):
         batch sampling parameters that every rank receives identically.
         """
         if not (self.sharded_verify and forward_batch.forward_mode.is_target_verify()):
+            return False
+        if self.verify_shards_predicate is not None:
             return False
         info = forward_batch.sampling_info
         if info is None:

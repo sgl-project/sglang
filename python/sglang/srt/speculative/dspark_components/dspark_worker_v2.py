@@ -546,6 +546,8 @@ class DSparkWorkerV2(BaseSpecWorker):
             self.model_runner.capture_tail_hooks.append(
                 self._verify_epilogue.capture_hook
             )
+            if self._verify_epilogue.wants_vocab_shards():
+                self._enable_verify_vocab_shards(self._verify_epilogue)
             if (
                 envs.SGLANG_OPT_DSV41_SAMPLING_ACCEPT_GRAPH.get()
                 and static_epilogue_supported
@@ -719,6 +721,39 @@ class DSparkWorkerV2(BaseSpecWorker):
         ) is not None and hasattr(
             self.model_runner.attn_backend,
             "update_mamba_state_after_mtp_verify",
+        )
+
+    def _enable_verify_vocab_shards(self, epilogue) -> None:
+        """The target captures both logits formats; a step verifies on vocab shards
+        when the epilogue serves it (``shard_step``), on full logits otherwise."""
+        from sglang.srt.layers.logits_processor import LogitsProcessor
+
+        processors = [
+            m
+            for m in self.model_runner.model.modules()
+            if isinstance(m, LogitsProcessor)
+        ]
+        if len(processors) != 1:
+            logger.warning(
+                "DSpark verify on vocab shards needs one target logits processor, "
+                "found %d; verifying on full logits.",
+                len(processors),
+            )
+            return
+        processor = processors[0]
+        processor.enable_sharded_verify(
+            temperature_keys=True, require_runtime_env=False
+        )
+        if not processor.sharded_verify:
+            logger.warning(
+                "DSpark verify on vocab shards: the LM head layout does not allow "
+                "shards; verifying on full logits."
+            )
+            return
+        processor.verify_shards_predicate = lambda forward_batch: epilogue.shard_step
+        logger.info(
+            "DSpark verify on vocab shards for served static steps (softcap %s)",
+            processor.final_logit_softcapping,
         )
 
     def init_cuda_graphs(self):
@@ -1229,6 +1264,15 @@ class DSparkWorkerV2(BaseSpecWorker):
                 or sampled_fold
             )
         )
+        if epilogue is not None:
+            # rank-uniform: sampling params, the plan and the epilogue's capture only
+            epilogue.shard_step = bool(
+                fold_eligible
+                and not run_compact
+                and epilogue.shard_static_captured
+                and not self._observers.reads_folded_target_logits()
+                and epilogue.serves_shards()
+            )
         if fold_eligible:
             epilogue.begin_fold(
                 bs,

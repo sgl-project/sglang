@@ -820,6 +820,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         processor = self._verify_logits_processor
         if processor is None:
             return None
+        predicate = processor.verify_shards_predicate
+        if predicate is not None:
+            return (
+                VERIFY_VOCAB_SHARDS if predicate(forward_batch) else VERIFY_FULL_LOGITS
+            )
         # The full-logits graph gathers the vocabulary of every padding row too;
         # a padded replay keeps shards so the consumer gathers only real rows.
         if padded or processor.verify_uses_vocab_shards(forward_batch):
