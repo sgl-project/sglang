@@ -188,18 +188,21 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64(
             p_h4 = h + i_t.to(tl.int64) * stride_h + o_v[:, None] * K + o_k4[None, :]
             tl.store(p_h4, b_h4.to(p_h4.dtype.element_ty), mask=m_h4)
 
-        if TRACK_STATE and i_t == i_track:
-            p_t1 = p_track_base + o_v[:, None] * K + o_k1[None, :]
-            tl.store(p_t1, b_h1, mask=m_h1)
-            if K > 64:
-                p_t2 = p_track_base + o_v[:, None] * K + o_k2[None, :]
-                tl.store(p_t2, b_h2, mask=m_h2)
-            if K > 128:
-                p_t3 = p_track_base + o_v[:, None] * K + o_k3[None, :]
-                tl.store(p_t3, b_h3, mask=m_h3)
-            if K > 192:
-                p_t4 = p_track_base + o_v[:, None] * K + o_k4[None, :]
-                tl.store(p_t4, b_h4, mask=m_h4)
+        # The constexpr guard must nest: MUSA triton evaluates both operands of
+        # `TRACK_STATE and ...` and dereferences the None track_state pointer.
+        if TRACK_STATE:
+            if i_t == i_track:
+                p_t1 = p_track_base + o_v[:, None] * K + o_k1[None, :]
+                tl.store(p_t1, b_h1, mask=m_h1)
+                if K > 64:
+                    p_t2 = p_track_base + o_v[:, None] * K + o_k2[None, :]
+                    tl.store(p_t2, b_h2, mask=m_h2)
+                if K > 128:
+                    p_t3 = p_track_base + o_v[:, None] * K + o_k3[None, :]
+                    tl.store(p_t3, b_h3, mask=m_h3)
+                if K > 192:
+                    p_t4 = p_track_base + o_v[:, None] * K + o_k4[None, :]
+                    tl.store(p_t4, b_h4, mask=m_h4)
 
         p_w = w + o_t[:, None] * stride_w + o_k1[None, :]
         b_w = tl.load(p_w, mask=m_t[:, None] & m_k1[None, :], other=0.0)
