@@ -19,6 +19,7 @@ from sglang.srt.arg_groups.model_override_base import (
 from sglang.srt.arg_groups.overrides import (
     _speculative_moe_runner_default,
     declare_resolution,
+    max_speculative_num_draft_tokens,
     record_foreign_defaults,
     run_post_process_pass,
 )
@@ -1245,6 +1246,24 @@ def _fall_back_xpu_draft_attention_for_head_size(server_args: ServerArgs) -> Non
     )
 
 
+def _validate_qsa_speculative_window(server_args: ServerArgs) -> None:
+    from sglang.srt.layers.attention.qsa.config import parse_qsa_profile
+
+    profile = parse_qsa_profile(model_config_of(server_args).hf_config)
+    if profile is None:
+        return
+
+    # Include adaptive candidates, not just the initial verify window. The
+    # current pending index-key ring holds one compression group per request.
+    draft_tokens = max_speculative_num_draft_tokens(server_args)
+    if draft_tokens is not None and draft_tokens > profile.compress_ratio:
+        raise ValueError(
+            "QSA requires maximum speculative_num_draft_tokens <= the indexer "
+            f"compression ratio ({profile.compress_ratio}); got {draft_tokens}. "
+            "Reduce --speculative-num-steps or adaptive candidate_steps."
+        )
+
+
 def _handle_eagle_family(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
     _check_oot_speculative_algorithm(
@@ -1458,6 +1477,8 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
             f"{_PAGE_TREE_SPEC_BACKENDS}; got attention_backend="
             f"{view.attention_backend!r}. Use page_size == 1 or one of those backends."
         )
+
+    _validate_qsa_speculative_window(server_args)
 
 
 def _handle_ngram(server_args: ServerArgs) -> None:
