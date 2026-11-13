@@ -13,8 +13,8 @@ only, since its full-backend prefill capture fails in SGLang (the GDN
 out-of-graph metadata is decode-only); and Qwen3-30B-A3B-FP8 with EAGLE3
 speculative decoding plus full-backend prefill graphs, which exercises the
 prefill set and the three decode-type graph kinds. Every engine runs with the
-environment pins of Foundry's recipes (_ENGINE_ENV); each engine prints its
-launch-to-ready time and LOAD its per-set capture-loop numbers.
+environment pins of Foundry's recipes (_ENGINE_ENV); each engine prints
+SGLang's startup timings and LOAD its per-set capture-loop numbers.
 test_cuda_graph_persistence_nightly.py runs the second configuration without
 the pins, as the comparison.
 
@@ -88,6 +88,8 @@ _LOAD_LOOP = re.compile(
 _CAPTURED_BS = re.compile(
     r"Capture target (?:decode|verify) CUDA graph end\. bs=\[([0-9, ]*)\]"
 )
+# SGLang's own startup timers (the launcher prints them once the schedulers are up).
+_STARTUP_TIMINGS = re.compile(r"Engine startup timings \(s\): (.*)")
 _PREFILL_PASSES = re.compile(
     r'^sglang:cuda_graph_passes_total\{[^}]*mode="prefill_cuda_graph"[^}]*\}'
     r"\s+([0-9.eE+-]+)$",
@@ -124,7 +126,8 @@ def _generate(base_url: str, text):
 
 class TestFoundryGraphPersistence(CustomTestCase):
     model = "Qwen/Qwen3.5-2B"
-    decode_bs = [1, 2, 3, 4, 5, 6, 7, 8]
+    # Every decode batch size up to 128; EP / attention-TP layouts clamp or align it.
+    decode_bs = list(range(1, 129))
     # Empty = prefill graphs disabled; the prefill assertions then expect none.
     prefill_bs = []
     # None = SGLang's default (fa3 on Hopper).
@@ -260,8 +263,15 @@ class TestFoundryGraphPersistence(CustomTestCase):
             f"{kind}: {int(n)} shapes, restore {restore}s, prep {prep}s"
             for kind, _, n, restore, prep in _LOAD_LOOP.findall(result["log"])
         )
+        # The launch wait polls /health every 10 s; the engine's own timers are exact.
+        timings = _STARTUP_TIMINGS.search(result["log"])
+        startup = (
+            timings.group(1)
+            if timings
+            else f"launch -> ready {result['ready_s']:.0f}s (10 s poll)"
+        )
         print(
-            f"[Foundry e2e] {cls.__name__} {name}: launch -> ready {result['ready_s']:.1f}s"
+            f"[Foundry e2e] {cls.__name__} {name}: {startup}"
             + (f"; LOAD capture loop {loops}" if loops else "")
         )
         return result
@@ -374,7 +384,6 @@ class TestFoundryGraphPersistenceSpecPrefill(TestFoundryGraphPersistence):
     # Ungated target and draft (the default EAGLE3 pair's Llama target is gated).
     model = "Qwen/Qwen3-30B-A3B-FP8"
     attention_backend = "flashinfer"
-    decode_bs = [1, 2, 4, 8]
     # Tokens per bucket. A prefill replays only when bucket padding is at most 2x,
     # so the smallest bucket must cover the 5-12 token prompts.
     prefill_bs = [8, 16, 32, 64]
