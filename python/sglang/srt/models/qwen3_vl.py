@@ -229,7 +229,7 @@ class Qwen3_VisionBlock(nn.Module):
         self.attn = VisionAttention(
             embed_dim=dim,
             num_heads=num_heads,
-            head_size=head_size,
+            head_dim=head_size,
             projection_size=num_heads * head_size,
             use_qkv_parallel=True,
             proj_bias=True,
@@ -577,22 +577,6 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
 
         return torch.cat(result_parts, dim=0)
 
-    def _torch_interp_indices(
-        self, dim_size: int, device: torch.device
-    ) -> torch.Tensor:
-        side = self.num_grid_per_side
-        if self.align_corners:
-            # align_corners=True
-            return torch.linspace(
-                0, side - 1, dim_size, dtype=torch.float32, device=device
-            )
-        else:
-            # align_corners=False  (match _get_interpolation_indices)
-            idx = (torch.arange(dim_size, dtype=torch.float32, device=device) + 0.5) * (
-                side / dim_size
-            ) - 0.5
-            return idx.clamp_(0, side - 1)
-
     def fast_pos_embed_interpolate_from_list(self, grid_thw):
         num_grid_per_side = self.num_grid_per_side
         m_size = self.spatial_merge_size
@@ -777,26 +761,6 @@ class Qwen3VLMoeVisionModel(nn.Module, RotaryPosMixin):
         merged = torch.empty_like(patch)
         merged[out_within + thw_off[out_image_id]] = patch
         return merged
-
-    def add_padding_to_fi_seqlens(
-        self, seq: np.ndarray, batch_size: int, padding_value: int
-    ) -> np.ndarray:
-        batch_size_padded = next(
-            (b for b in BATCH_BUCKETS if b >= batch_size),
-            # For large batches (> max bucket), round up to a multiple of
-            # the base bucket size to avoid negative pad length.
-            round_up(batch_size, BATCH_BUCKETS[0]),
-        )
-        if batch_size_padded == batch_size:
-            return seq
-        return np.concatenate(
-            [
-                seq,
-                np.full(
-                    (batch_size_padded - batch_size,), padding_value, dtype=seq.dtype
-                ),
-            ]
-        )
 
     def bucket_flashinfer_max_seqlen(self, real_max_seqlen: int) -> int:
         if real_max_seqlen <= 0:

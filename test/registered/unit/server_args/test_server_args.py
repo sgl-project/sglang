@@ -156,7 +156,7 @@ class TestServerArgsPositionalOrder(CustomTestCase):
             with self.subTest(index=index):
                 self.assertEqual(fields[index].name, name)
         defaults = ServerArgs(model_path="dummy")
-        # Surviving legacy inputs retain their slots after an intentional removal.
+        # deprecated constructor fields keep their historical slots
         positional = [getattr(defaults, field.name) for field in fields[:533]]
         positional[95] = True
         positional[96] = False
@@ -1001,6 +1001,30 @@ class TestPrepareServerArgs(CustomTestCase):
                 reconstructed, "_speculative_draft_quantization_explicitly_set"
             )
         )
+
+    def test_config_deprecated_no_op_boolean_flags(self):
+        """Retired booleans in YAML remain accepted without changing arguments."""
+        parser = argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        base_args = ["--model-path", "dummy"]
+        baseline = vars(parser.parse_args(base_args))
+
+        for flag in (
+            "disable-outlines-disk-cache",
+            "show-time-cost",
+            "triton-attention-reduce-in-fp32",
+        ):
+            for value in (True, False):
+                with (
+                    self.subTest(flag=flag, value=value),
+                    tempfile.NamedTemporaryFile(mode="w", suffix=".yaml") as f,
+                ):
+                    f.write(f"{flag}: {str(value).lower()}\n")
+                    f.flush()
+                    merged = ConfigArgumentMerger(parser).merge_config_with_args(
+                        ["--config", f.name] + base_args
+                    )
+                    self.assertEqual(vars(parser.parse_args(merged)), baseline)
 
     def test_config_nested_dict_args_are_json(self):
         with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
@@ -3676,6 +3700,53 @@ class TestPipelineParallelPrefillCudaGraphPolicy(CustomTestCase):
                     handle_gpu_memory_settings(args)
                 prefill = resolution_result(args, "cuda_graph_config").prefill
                 self.assertEqual((prefill.max_bs, prefill.bs[-1]), (expected, expected))
+
+
+class TestDecodeCudaGraphCeilingByMemoryTier(CustomTestCase):
+    def _resolve_decode(self, gpu_mem_mb, tp_size, max_bs=None):
+        args = ServerArgs(
+            model_path="dummy",
+            tp_size=tp_size,
+            mem_fraction_static=0.8,
+            cuda_graph_config=CudaGraphConfig(decode=PhaseConfig(max_bs=max_bs)),
+        )
+        with (
+            patch(
+                "sglang.srt.arg_groups.memory_hook.use_mla_backend",
+                return_value=False,
+            ),
+            patch(
+                "sglang.srt.arg_groups.memory_hook.get_device_memory_capacity",
+                return_value=gpu_mem_mb,
+            ),
+        ):
+            handle_gpu_memory_settings(args)
+        return resolution_result(args, "cuda_graph_config").decode
+
+    def test_ceiling_never_drops_as_memory_grows(self):
+        """A larger GPU must not get a smaller default ceiling, or decode batches
+        between the two ceilings run eager only on the larger GPU."""
+        gib = (16, 24, 35, 40, 45, 48, 60, 80, 96, 192)
+        ceilings = [self._resolve_decode(g * 1024, 1).max_bs for g in gib]
+        self.assertEqual(ceilings, sorted(ceilings), dict(zip(gib, ceilings)))
+
+    def test_default_ceiling_for_35_to_60_gib(self):
+        cases = (
+            # (reported MiB, tp_size, expected decode max_bs)
+            (35 * 1024, 1, 128),
+            (46068, 1, 128),  # L40S, A40
+            (60 * 1024 - 1, 1, 128),
+            (60 * 1024, 1, 256),
+            (46068, 4, 160),
+        )
+        for gpu_mem_mb, tp_size, expected in cases:
+            with self.subTest(gpu_mem_mb=gpu_mem_mb, tp_size=tp_size):
+                decode = self._resolve_decode(gpu_mem_mb, tp_size)
+                self.assertEqual((decode.max_bs, decode.bs[-1]), (expected, expected))
+
+    def test_explicit_ceiling_is_kept(self):
+        decode = self._resolve_decode(46068, 1, max_bs=64)
+        self.assertEqual((decode.max_bs, decode.bs[-1]), (64, 64))
 
 
 class TestCudaGraphDisaggregationRoles(CustomTestCase):

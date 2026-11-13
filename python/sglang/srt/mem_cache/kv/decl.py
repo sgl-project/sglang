@@ -44,7 +44,17 @@ class StateLifetime(msgspec.Struct, frozen=True, tag="state"):
         return (self.rank, 0)
 
 
-KVLifetime = Union[FullLifetime, WindowLifetime, StateLifetime]
+class RequestLifetime(msgspec.Struct, frozen=True, tag="request"):
+    """One unit per request row, held while the row is bound and never cached
+    by the prefix tree. Ranked with the windows, so it floats in the chain."""
+
+    rank: ClassVar[int] = 1
+
+    def retention(self) -> Tuple[int, float]:
+        return (self.rank, 0)
+
+
+KVLifetime = Union[FullLifetime, WindowLifetime, StateLifetime, RequestLifetime]
 
 
 def declares_lifetime_beside_full(model_config) -> bool:
@@ -76,10 +86,61 @@ class MHAGeometry(msgspec.Struct, frozen=True, kw_only=True):
     kv_cache_dtype: torch.dtype
 
 
-class MLAGeometry(msgspec.Struct, frozen=True, kw_only=True):
+# The stored latent row format of FP8 MLA with per-block scales: the FP8 NoPE
+# values, one FP32 scale per 128 of them, then the BF16 RoPE tail.
+FP8_DS_MLA = "fp8_ds_mla"
+
+
+class MLARowFormat(msgspec.Struct, frozen=True, kw_only=True):
+    """A stored latent row other than ``kv_lora_rank + qk_rope_head_dim``
+    values of the cache dtype: its format, its width in bytes, and whether its
+    block scales are rounded up to powers of two."""
+
+    name: str
+    row_bytes: int
+    scale_ue8m0: bool = False
+
+
+class MLAGeometry(msgspec.Struct, frozen=True, kw_only=True, repr_omit_defaults=True):
+    """One latent row per token per layer. ``row_format`` stores rows in another
+    format than the cache dtype's (None: plain rows). ``layer_major`` lays each
+    page out layer by layer -- a layer's rows of the page contiguous, a row
+    apart -- for readers that want a row-sized token stride within a page and
+    address pages by the page's stride; otherwise rows are token-major."""
+
     kv_lora_rank: int
     qk_rope_head_dim: int
     kv_cache_dtype: torch.dtype
+    row_format: Optional[MLARowFormat] = None
+    layer_major: bool = False
+
+    def row_bytes(self) -> int:
+        if self.row_format is not None:
+            return self.row_format.row_bytes
+        return (
+            self.kv_lora_rank + self.qk_rope_head_dim
+        ) * self.kv_cache_dtype.itemsize
+
+
+class IndexKeyGeometry(msgspec.Struct, frozen=True, kw_only=True):
+    """A sparse-attention indexer's keys: one blob per page, the page's keys
+    then their scales, as the paged index kernels read it. FP8 keys keep one
+    FP32 scale per 128 values; FP4 keys pack two values per byte and keep one
+    exponent byte per 32 values."""
+
+    index_head_dim: int
+    use_fp4: bool = False
+    quant_block_size: ClassVar[int] = 128
+
+    @property
+    def key_bytes_per_token(self) -> int:
+        return self.index_head_dim // 2 if self.use_fp4 else self.index_head_dim
+
+    @property
+    def bytes_per_token(self) -> int:
+        if self.use_fp4:
+            return self.index_head_dim // 2 + self.index_head_dim // 32
+        return self.index_head_dim + self.index_head_dim // self.quant_block_size * 4
 
 
 class StateReplay(msgspec.Struct, frozen=True, kw_only=True):
@@ -97,6 +158,8 @@ class StateGeometry(msgspec.Struct, frozen=True, kw_only=True):
     temporal_dtype: torch.dtype
     conv_slice_axis: int = 0
     extra_parts: Tuple["TensorPartDecl", ...] = ()
+    # Payload a running request owns beside its slot and the prefix tree never
+    # caches; planned as the request sub-pool's entry (`RequestGeometry`).
     request_parts: Tuple["TensorPartDecl", ...] = ()
     scratch_parts: Tuple["TensorPartDecl", ...] = ()
     replay: Optional[StateReplay] = None
@@ -115,7 +178,15 @@ class StateGeometry(msgspec.Struct, frozen=True, kw_only=True):
         )
 
 
-PartGeometry = Union[MHAGeometry, MLAGeometry, StateGeometry]
+class RequestGeometry(msgspec.Struct, frozen=True, kw_only=True):
+    """One request row's entry: the parts, each over its layers."""
+
+    parts: Tuple["TensorPartDecl", ...]
+
+
+PartGeometry = Union[
+    MHAGeometry, MLAGeometry, IndexKeyGeometry, StateGeometry, RequestGeometry
+]
 
 
 class KVPartDecl(msgspec.Struct, frozen=True, kw_only=True):
@@ -135,6 +206,13 @@ class WindowLayers(msgspec.Struct, frozen=True, kw_only=True):
     layer_ids: Tuple[int, ...]
     geometry: Union[MHAGeometry, MLAGeometry]
     window: Optional[int] = None
+
+
+class FullLayerParts(msgspec.Struct, frozen=True, kw_only=True):
+    """A part some full-attention layers keep beside their KV."""
+
+    layer_ids: Tuple[int, ...]
+    geometry: PartGeometry
 
 
 def window_sub_pool_name(window: Optional[int]) -> str:
@@ -164,11 +242,13 @@ def kv_layer_decls(
     state_layer_ids: Sequence[int] = (),
     state_geometry: Optional[StateGeometry] = None,
     checkpoint_interval: Optional[int] = None,
+    full_layer_parts: Sequence[FullLayerParts] = (),
 ) -> Tuple[KVLayerDecl, ...]:
     """One declaration per layer that stores anything, in layer order. A layer
     may hold an attention part and a state part at once. Window layers come as
     ``windows``, one group per window length, or as one group through the
-    ``window_*`` arguments."""
+    ``window_*`` arguments. ``full_layer_parts`` are further parts full
+    layers keep with their KV, declared after it."""
     windows = list(windows)
     if window_layer_ids:
         assert window_geometry is not None, "window layers need their geometry"
@@ -190,6 +270,12 @@ def kv_layer_decls(
     full = KVPartDecl(lifetime=FullLifetime(), geometry=full_geometry)
     for layer_id in full_layer_ids:
         parts.setdefault(layer_id, []).append(full)
+    for extra in full_layer_parts:
+        stray = set(extra.layer_ids) - set(full_layer_ids)
+        assert not stray, f"layers {sorted(stray)} keep a part beside no full KV"
+        part = KVPartDecl(lifetime=FullLifetime(), geometry=extra.geometry)
+        for layer_id in extra.layer_ids:
+            parts[layer_id].append(part)
     for group in windows:
         part = KVPartDecl(
             lifetime=WindowLifetime(window=group.window), geometry=group.geometry
@@ -208,10 +294,6 @@ def kv_layer_decls(
         KVLayerDecl(layer_id=layer_id, parts=tuple(parts[layer_id]))
         for layer_id in sorted(parts)
     )
-
-
-class RequestLifetime(msgspec.Struct, frozen=True, tag="request"):
-    """A row owned by a request, reset when the row is acquired again."""
 
 
 class TensorPartDecl(msgspec.Struct, frozen=True, kw_only=True):
@@ -254,15 +336,6 @@ class ScratchDecl(msgspec.Struct, frozen=True, kw_only=True):
     """Captured workspace with one row per active request, outside the chain."""
 
     part: TensorPartDecl
-
-
-class RequestPartDecl(msgspec.Struct, frozen=True, kw_only=True):
-    """Persistent request-row payload, including preallocated transfer rows."""
-
-    part: TensorPartDecl
-    lifetime: RequestLifetime = RequestLifetime()
-    # Parts with the same wire name form one transfer component, in declaration order.
-    wire: Optional[str] = None
 
 
 class DerivedPartDecl(msgspec.Struct, frozen=True, kw_only=True):
@@ -366,16 +439,19 @@ def with_state_replay(
             )
         )
     extras, requests = list(geometry.extra_parts), list(geometry.request_parts)
-    if replay.speculative and not replay.is_kda:
+    if replay.speculative:
+        # A verify's ring never enters a checkpoint (each commit folds what it
+        # accepted into the state): it is the request's, not the slot's.
         requests.extend(ring)
-        requests.extend(
-            TensorPartDecl(name=name, shape=(), dtype=dtype)
-            for name, dtype in (
-                ("replayssm_spec_write_pos", torch.int32),
-                ("replayssm_cache_base", torch.int32),
-                ("replayssm_is_flush", torch.int8),
+        if not replay.is_kda:
+            requests.extend(
+                TensorPartDecl(name=name, shape=(), dtype=dtype)
+                for name, dtype in (
+                    ("replayssm_spec_write_pos", torch.int32),
+                    ("replayssm_cache_base", torch.int32),
+                    ("replayssm_is_flush", torch.int8),
+                )
             )
-        )
     else:
         extras.extend(ring)
     if replay.decode:
@@ -439,6 +515,8 @@ def with_state_ple(
 
 # The part every token KV view holds; derived parts get their own names.
 KV_PART = "kv"
+# A sparse-attention indexer's keys, beside a layer's KV in the same sub-pool.
+INDEX_K_PART = "index_k"
 # A request's recurrent state, one slot per request, in the state sub-pool.
 STATE_PART = "state"
 

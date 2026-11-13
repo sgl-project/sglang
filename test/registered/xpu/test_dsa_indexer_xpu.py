@@ -225,6 +225,8 @@ class MockModelRunner:
             },
         )()
         self.hisparse_coordinator = None
+        # A static pool: page tables hold the ids req_to_token holds.
+        self.runner_ids = None
 
 
 @unittest.skipIf(not torch.xpu.is_available(), "XPU is required")
