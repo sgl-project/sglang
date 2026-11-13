@@ -64,6 +64,14 @@ _is_npu = is_npu()
 _is_xpu = is_xpu()
 
 
+def _force_cpu_image_preprocessing() -> bool:
+    """SGLANG_FORCE_CPU_IMAGE_PREPROCESSING; honored on NVIDIA CUDA only."""
+    return (
+        envs.SGLANG_FORCE_CPU_IMAGE_PREPROCESSING.get()
+        and platforms.current_platform.is_cuda()
+    )
+
+
 @dataclasses.dataclass
 class BaseMultiModalProcessorOutput:
     # input_text with all multimodality placeholder token expanded
@@ -312,6 +320,9 @@ class BaseMultimodalProcessor(ABC):
         if processor_config.disable_fast_image_processor:
             self.image_processor_backend = "pil"
         self.disable_fast_image_processor = self.image_processor_backend == "pil"
+        if _force_cpu_image_preprocessing():
+            # Decode with PIL, not nvJPEG; the cache fingerprint reads this.
+            self.gpu_image_decode = False
         self.skip_tokenizer_init = get_serving().skip_tokenizer_init
 
         mm_process_config = processor_config.mm_process_config
@@ -354,6 +365,7 @@ class BaseMultimodalProcessor(ABC):
             )
 
         self._tokenizer = _tokenizer_of(self._processor)
+        self._log_tokenizer_workers_on_the_gpu()
 
         # Same guard as in serving_chat.py against double BOS.
         try:
@@ -773,6 +785,34 @@ class BaseMultimodalProcessor(ABC):
             return self._processor, self._tokenizer
         return processor, _tokenizer_of(processor)
 
+    def _log_tokenizer_workers_on_the_gpu(self) -> None:
+        """With several tokenizer workers that each use the GPU for images,
+        mention SGLANG_FORCE_CPU_IMAGE_PREPROCESSING. Placement is unchanged."""
+        workers = get_serving().tokenizer_worker_num
+        if workers <= 1 or not platforms.current_platform.is_cuda():
+            return
+        if _force_cpu_image_preprocessing():
+            return
+        decode_on_gpu = bool(self.gpu_image_decode)
+        fast_on_gpu = self._preprocessing_competes_with_the_scheduler()
+        if not (decode_on_gpu or fast_on_gpu):
+            return
+        on_gpu = " and ".join(
+            part
+            for part, on in (
+                ("decode JPEG images", decode_on_gpu),
+                ("run the fast image processor", fast_on_gpu),
+            )
+            if on
+        )
+        logger.info(
+            "%d tokenizer workers each %s on the GPU (one device context per "
+            "worker). To decode and preprocess images on the CPU instead, set "
+            "SGLANG_FORCE_CPU_IMAGE_PREPROCESSING=1.",
+            workers,
+            on_gpu,
+        )
+
     def _preprocessing_competes_with_the_scheduler(self) -> bool:
         """Whether image preprocessing contends with the serving accelerator.
 
@@ -782,7 +822,7 @@ class BaseMultimodalProcessor(ABC):
         """
         if _is_cpu or get_exec().deterministic.rl_on_policy_target is not None:
             return False
-        if self.disable_fast_image_processor:
+        if self.disable_fast_image_processor or _force_cpu_image_preprocessing():
             return False
         image_processor = getattr(self._processor, "image_processor", None)
         if not isinstance(image_processor, BaseImageProcessor):
@@ -821,7 +861,13 @@ class BaseMultimodalProcessor(ABC):
         tokenizer process each carry their own ``base_gpu_id``.
         """
         server_args = self.server_args
-        if _is_cpu or get_exec().deterministic.rl_on_policy_target is not None:
+        if (
+            _is_cpu
+            or get_exec().deterministic.rl_on_policy_target is not None
+            or _force_cpu_image_preprocessing()
+        ):
+            # Return "cpu" explicitly when forcing cpu image preprocessing. Otherwise,
+            # the processor would follow the input tensor's device.
             return "cpu"
         if _is_xpu:
             return "xpu"
@@ -1022,7 +1068,10 @@ class BaseMultimodalProcessor(ABC):
             return data
         try:
             if modality == Modality.IMAGE:
-                img, _ = load_image(data, cls.gpu_image_decode)
+                gpu_image_decode = (
+                    False if _force_cpu_image_preprocessing() else cls.gpu_image_decode
+                )
+                img, _ = load_image(data, gpu_image_decode)
                 if isinstance(img, torch.Tensor):
                     return img  # JPEG already decoded on GPU by nvJPEG
                 # PIL decodes lazily; do it here in the io worker so the decode

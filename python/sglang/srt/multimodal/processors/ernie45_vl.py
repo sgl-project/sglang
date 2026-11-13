@@ -18,6 +18,7 @@ from sglang.srt.multimodal.processors.base_processor import (
 )
 from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
+    _force_cpu_image_preprocessing,
 )
 from sglang.srt.multimodal.processors.qwen_vl import (
     ceil_by_factor,
@@ -295,7 +296,7 @@ class Ernie4_5_VLImageProcessor(SGLangBaseProcessor):
             and not self.disable_fast_image_processor
         ):
             if not _is_npu:
-                kwargs["device"] = "cuda"
+                kwargs["device"] = "cpu" if _force_cpu_image_preprocessing() else "cuda"
 
         result = processor.__call__(
             text=[input_text],

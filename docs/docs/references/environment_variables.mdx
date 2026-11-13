@@ -2128,6 +2128,11 @@ MPS and does not read them.
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_FORCE_CPU_IMAGE_PREPROCESSING</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Decode and preprocess images on the CPU. On NVIDIA GPUs, multimodal processors skip nvJPEG decode and run the fast image processor on the CPU; use it with <code>--tokenizer-worker-num</code> &gt; 1 when image requests fail with CUDA out of memory, since otherwise every tokenizer worker opens its own CUDA context on the serving GPU. Workers still allocate GPU memory with <code>--mm-feature-transport cuda_ipc</code> or <code>cuda_vmm</code>; keep the default <code>cpu</code> transport. Not covered: Kimi-K3, Step3-VL and InternVL (they preprocess on the GPU themselves), the Transformers backend, and MiMo-V2 (follows <code>SGLANG_ENCODER_IMAGE_PROCESSOR_USE_GPU</code>). Kimi-K2.5 and diffusion input preprocessing honor it on every platform.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_VIT_ENABLE_CUDA_GRAPH</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Capture the vision encoder (ViT) in a CUDA graph.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
