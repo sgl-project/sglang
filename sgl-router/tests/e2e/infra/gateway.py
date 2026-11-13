@@ -100,9 +100,8 @@ class WorkerInfo:
     """Worker visible to the gateway via ``/v1/models``-style introspection.
 
     Mirrors SMG's WorkerInfo shape so test code reads the same. sgl-router
-    does not currently surface a `/v1/workers` admin API — this is a
-    placeholder for a future admin surface; current tests scrape
-    `/metrics` for per-worker observability instead.
+    exposes its admin API at `/workers` rather than `/v1/workers`; these
+    tests still scrape `/metrics` for per-worker observability.
     """
 
     id: str

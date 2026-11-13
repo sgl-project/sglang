@@ -105,6 +105,7 @@ every flag.
 | `POST /v1/embeddings`, `/v1/classify`, `/v1/rerank` | [Embeddings, classify and rerank](#embeddings-classify-and-rerank) |
 | `POST /v1/tokenize`, `/v1/detokenize` | Tokenize with the router's tokenizer |
 | `GET /v1/models` | The served model |
+| `POST`/`GET /workers`, `GET`/`PUT`/`DELETE /workers/{id}` | Asynchronous runtime Worker management and inspection |
 | `POST /flush_cache` | Fan out a cache flush to every worker, with the caller's `timeout` |
 | `GET /server_info` | Answered by one healthy worker (a decode worker under P/D, which reports decode's state); `/get_server_info` is an alias |
 | `GET /model_info`, `/health_generate` | Answered by one healthy worker (a prefill worker under P/D; `/health_generate` also runs on one of its decode peers and returns the decode's answer when both pass); `/get_model_info` is an alias |
@@ -112,9 +113,13 @@ every flag.
 | `GET /metrics` | Prometheus metrics, see [monitoring/README.md](monitoring/README.md) |
 
 sgl-model-gateway endpoints for features the router does not provide yet
-(the Responses and Conversations APIs, `/parse/*`, `/workers`,
+(the Responses and Conversations APIs, `/parse/*`,
 `/v1/tokenizers`, `/wasm`, `/ha/*`, `/v1/loads`, `/get_loads`,
 `/engine_metrics`) answer `501` with error code `unsupported_endpoint`.
+
+Worker mutations return `202`. `GET /workers/{id}` exposes the operation and
+runtime state. `PUT` and `DELETE` require the current revision in `If-Match`;
+workers created by static or Kubernetes discovery are read-only.
 
 Both edges speak cleartext HTTP/2 where the peer does; see
 [operations](#operations). With `--grpc-port`, the router also serves the
