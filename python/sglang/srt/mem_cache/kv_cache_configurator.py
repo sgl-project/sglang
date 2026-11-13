@@ -1635,6 +1635,10 @@ class KVCacheConfigurator:
         max_num_reqs: int,
         extra_max_context_len: int,
     ) -> ReqToTokenPool:
+        if get_exec().mamba.enable_linear_bole_spec and self.hybrid_gdn_config is None:
+            raise ValueError(
+                "--enable-linear-bole-spec requires a GDN hybrid linear-attn model."
+            )
         req_to_token_pool = HybridReqToTokenPool(
             size=max_num_reqs,
             mamba_size=get_schedule().max_mamba_cache_size,
@@ -1672,9 +1676,18 @@ class KVCacheConfigurator:
             replayssm_request_ring=(
                 host_only_mamba_checkpoint() and self.hybrid_kda_config is not None
             ),
+            enable_linear_bole_spec=self._bole_spec_active(),
             allocate_intermediate_ssm=self.allocate_intermediate_ssm,
         )
         return req_to_token_pool
+
+    def _bole_spec_active(self) -> bool:
+        return (
+            get_exec().mamba.enable_linear_bole_spec
+            and self.hybrid_gdn_config is not None
+            and not self.spec_algorithm.is_none()
+            and not _pd_prefill_skips_mamba_spec_state()
+        )
 
     def _build_default_req_pool(
         self,
@@ -3513,6 +3526,27 @@ class KVCacheConfigurator:
             assert get_spec().speculative_num_draft_tokens is not None
             assert get_schedule().max_running_requests is not None
 
+        # Per-request bytes of one draft step's spec state. Bole drops the SSM
+        # snapshot (the dominant part) and keeps the conv windows; its factor
+        # workspaces are a fixed reservation instead.
+        spec_step_per_req = stage_per_req
+        bole_active = reserves_spec_state and self._bole_spec_active()
+        if bole_active:
+            cache_params = config.mamba2_cache_params
+            temporal_per_req = int(
+                math.prod(cache_params.shape.temporal)
+                * cache_params.dtype.temporal.itemsize
+                * len(cache_params.layers)
+                * pp_layer_scale
+            )
+            spec_step_per_req = stage_per_req - temporal_per_req
+            total_rest_memory -= get_exec().mamba.linear_bole_workspace_mb / 1024
+            logger.info(
+                "Bole spec-verify: per-draft SSM snapshots not reserved "
+                f"({temporal_per_req / (1 << 20):.1f} MiB per request per draft "
+                f"step); workspace reserve {get_exec().mamba.linear_bole_workspace_mb} MiB."
+            )
+
         if get_schedule().max_mamba_cache_size is not None:
             # Use explicitly set max_mamba_cache_size
             get_context().override(
@@ -3530,7 +3564,7 @@ class KVCacheConfigurator:
                     get_schedule().max_mamba_cache_size // ratio,
                 )
                 intermediate_size = (
-                    stage_per_req
+                    spec_step_per_req
                     * (capped_reqs + 1)
                     * get_spec().speculative_num_draft_tokens
                 )
@@ -3550,7 +3584,7 @@ class KVCacheConfigurator:
             # pool's padding slot). Skipped under replayssm and on PD prefill.
             if reserves_spec_state:
                 intermediate_size = (
-                    stage_per_req
+                    spec_step_per_req
                     * (get_schedule().max_mamba_cache_size + 1)
                     * get_spec().speculative_num_draft_tokens
                 )
@@ -3576,8 +3610,13 @@ class KVCacheConfigurator:
                 get_context().override(
                     "mamba_pool.memory_budget_spec",
                     max_mamba_cache_size=int(
-                        (mamba_budget_bytes - per_req * (1 + D) - extra_per_slot)
-                        // (per_req * (1 + D / ratio) + extra_per_slot)
+                        (
+                            mamba_budget_bytes
+                            - per_req
+                            - spec_step_per_req * D
+                            - extra_per_slot
+                        )
+                        // (per_req + spec_step_per_req * D / ratio + extra_per_slot)
                     ),
                 )
                 # Intermediate memory is included in mamba_budget, subtract it
@@ -3586,7 +3625,7 @@ class KVCacheConfigurator:
                     max(1, get_schedule().max_running_requests // self.attn_dp_size),
                     get_schedule().max_mamba_cache_size // ratio,
                 )
-                intermediate_size = per_req * (capped_reqs + 1) * D
+                intermediate_size = spec_step_per_req * (capped_reqs + 1) * D
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
             else:
                 per_slot = per_req + extra_per_slot

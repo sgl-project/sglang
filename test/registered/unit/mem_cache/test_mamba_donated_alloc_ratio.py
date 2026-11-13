@@ -634,7 +634,9 @@ class TestPPMambaPoolSizing(CustomTestCase):
 
 class TestExtraMambaCacheSizing(CustomTestCase):
     @staticmethod
-    def _size(extra_bytes, *, pp_size=1, dp_size=1, draft_tokens=None, **schedule):
+    def _size(
+        extra_bytes, *, pp_size=1, dp_size=1, draft_tokens=None, bole=False, **schedule
+    ):
         from sglang.srt import runtime_context as rc
         from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
         from sglang.srt.runtime_context import get_schedule
@@ -642,11 +644,15 @@ class TestExtraMambaCacheSizing(CustomTestCase):
         fake = SimpleNamespace(
             mambaish_config=SimpleNamespace(
                 mamba2_cache_params=SimpleNamespace(
-                    layers=[0, 1, 2, 3], mamba_cache_per_req=4 << 20
+                    layers=[0, 1, 2, 3],
+                    mamba_cache_per_req=4 << 20,
+                    shape=SimpleNamespace(temporal=(192, 1024)),
+                    dtype=SimpleNamespace(temporal=torch.float32),
                 )
             ),
             extra_mamba_cache_bytes_per_req=extra_bytes,
             allocate_intermediate_ssm=True,
+            _bole_spec_active=lambda: bole,
             fused_entry_bytes=lambda name: None,
             spec_algorithm=SimpleNamespace(is_none=lambda: draft_tokens is None),
             attn_dp_size=dp_size,
@@ -661,6 +667,8 @@ class TestExtraMambaCacheSizing(CustomTestCase):
             mamba_full_memory_ratio=0.5,
             enable_linear_replayssm_spec=False,
             speculative_num_draft_tokens=draft_tokens,
+            enable_linear_bole_spec=bole,
+            linear_bole_workspace_mb=8,
         )
         args.update(schedule)
         with rc.get_context().override_server_args(**args):
@@ -691,6 +699,15 @@ class TestExtraMambaCacheSizing(CustomTestCase):
     def test_speculative_auto_capacity_keeps_scratch_separate(self):
         self.assertEqual(self._size(0, draft_tokens=2), (3, 88 << 20))
         self.assertEqual(self._size(4 << 20, draft_tokens=2), (2, 80 << 20))
+
+    def test_bole_reserves_conv_scratch_and_fixed_workspace(self):
+        # 4 MiB per slot = 3 MiB temporal + 1 MiB conv, with 8 MiB
+        # reserved for Bole's factors. Draft scratch only contains conv state.
+        self.assertEqual(self._size(0, draft_tokens=2, bole=True), (6, 76 << 20))
+        self.assertEqual(
+            self._size(0, draft_tokens=2, bole=True, max_mamba_cache_size=8),
+            (8, 66 << 20),
+        )
 
     def test_pd_prefill_does_not_reserve_speculative_scratch(self):
         """A PD prefill server's hybrid req pool never allocates the per-draft-token
