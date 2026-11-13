@@ -498,7 +498,11 @@ supports:
 - GQA models, striped over zigzag prefill CP ranks (see below).
 
 Each layer's prefix is all-gathered over XCCL into a scratch buffer that attention
-reads. DSA models are refused. Use the Mooncake or NIXL transfer backend, and set
+reads, one layer ahead on a side stream and on a process group of its own. To
+measure that gather's bandwidth and how much of it hides behind compute on your
+cards, run
+`torchrun --nproc-per-node 2 benchmark/kernels/all_gather/bench_kv_shard_gather.py --device xpu`.
+DSA models are refused. Use the Mooncake or NIXL transfer backend, and set
 `SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=python` on the prefill server. It has not
 been validated on XPU hardware yet.
 
