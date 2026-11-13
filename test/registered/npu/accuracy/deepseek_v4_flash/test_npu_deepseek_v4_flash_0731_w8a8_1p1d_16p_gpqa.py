@@ -12,10 +12,8 @@ from sglang.test.ascend.e2e.test_npu_performance_utils import (
     run_bench_serving,
 )
 from sglang.test.ci.ci_register import register_npu_ci
-from sglang.test.ascend.e2e.test_npu_multi_node_utils import (
-    NIC_NAME,
-    build_hicache_storage_extra_config,
-)
+from sglang.test.ascend.e2e.test_npu_multi_node_utils import NIC_NAME
+from sglang.test.ascend.test_ascend_utils import build_hicache_storage_extra_config
 
 logger = logging.getLogger(__name__)
 
@@ -25,11 +23,12 @@ register_npu_ci(
     nightly=True,
 )
 
-# npu_memcache L3 backend config; launch_pd_separation_node retargets the
-# MetaService/config-store endpoints at the master prefill node that hosts the
-# service. world_size is the prefill instance's tp_size*pp_size and dram_size
-# is the per-rank host DRAM contribution (all 16 ranks live on the prefill
-# node, so the node donates 16 x 4GB = 64GB).
+# npu_memcache L3 backend config; building it resolves the master node IP from
+# the harness ConfigMap, starts the single cluster-wide MetaService there and
+# points every pod's endpoints at that IP. world_size is the prefill
+# instance's tp_size*pp_size and dram_size is the per-rank host DRAM
+# contribution (all 16 ranks live on the prefill node, so the node donates
+# 16 x 4GB = 64GB).
 HICACHE_STORAGE_EXTRA_CONFIG = build_hicache_storage_extra_config(
     world_size=16,
     protocol="device_sdma",

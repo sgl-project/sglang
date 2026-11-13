@@ -22,6 +22,7 @@ from sglang.test.ascend.e2e.test_npu_multi_node_utils import (
     launch_router,
     wait_server_ready,
 )
+from sglang.test.ascend.test_ascend_utils import get_meta_service_process
 from sglang.test.test_utils import (
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
@@ -571,6 +572,12 @@ class TestNpuAccuracyTestCaseBase(CustomTestCase):
                 kill_process_tree(cls.process.pid)
             except Exception as e:
                 logger.error(f"Error during tearDown: {e}")
+        meta_service_process = get_meta_service_process()
+        if meta_service_process:
+            try:
+                kill_process_group(meta_service_process)
+            except Exception as e:
+                logger.error(f"Error stopping MetaService during tearDown: {e}")
         cls._save_metrics_json()
         cls._backup_plog()
 
