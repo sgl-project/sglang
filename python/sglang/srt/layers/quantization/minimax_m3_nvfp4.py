@@ -6,7 +6,11 @@ from typing import Any
 
 import torch
 
-from sglang.srt.layers.moe.utils import get_moe_a2a_backend, get_moe_runner_backend
+from sglang.srt.layers.moe.utils import (
+    MoeRunnerBackend,
+    get_moe_a2a_backend,
+    get_moe_runner_backend,
+)
 from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
     CompressedTensorsFusedMoEMethod,
 )
@@ -135,8 +139,9 @@ class MiniMaxM3Nvfp4Config(Fp8Config):
 class MiniMaxM3Nvfp4MoE(CompressedTensorsW4A4Nvfp4MoE):
     """Select an expert backend for MiniMax's compressed-tensors NVFP4 weights.
 
-    cuTile is opt-in on SM12x. Existing paths use MegaMoE/TRT-LLM on Blackwell,
-    requantized experts on gfx950, or Marlin W4A16 elsewhere.
+    cuTile and Marlin are explicit options on SM12x. Existing paths use
+    MegaMoE/TRT-LLM on Blackwell, requantized experts on gfx950, or Marlin
+    W4A16 elsewhere.
     """
 
     # Cleared because __init__ below supplies a non-Blackwell expert path.
@@ -146,14 +151,24 @@ class MiniMaxM3Nvfp4MoE(CompressedTensorsW4A4Nvfp4MoE):
         super().__init__()
         # Marlin's kernels are CUDA-only; gfx950 requantizes the experts at load
         platform = get_platform()
-        self.use_flashinfer_cutile = get_moe_runner_backend().is_flashinfer_cutile()
+        backend = get_moe_runner_backend()
+        self.use_flashinfer_cutile = backend.is_flashinfer_cutile()
         self.requantizes_experts = (
             platform.is_hip and platform.is_gfx95 and not self.use_flashinfer_cutile
         )
         # Marlin unpacks the packed NVFP4 weights in-register and multiplies on
         # bf16 tensor cores, keeping the 4-bit footprint without FP4 hardware.
+        # SM12x is also Blackwell, but an explicit Marlin request must reach
+        # this portable path rather than the SM100-only expert implementations.
+        # Keep automatic selection and other Blackwell architectures unchanged.
         self.use_marlin = (
-            not platform.is_blackwell
+            (
+                not platform.is_blackwell
+                or (
+                    platform.device_sm in (120, 121)
+                    and backend == MoeRunnerBackend.MARLIN
+                )
+            )
             and not self.requantizes_experts
             and not self.use_flashinfer_cutile
         )
