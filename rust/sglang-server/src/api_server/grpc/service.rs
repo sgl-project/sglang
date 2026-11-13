@@ -669,33 +669,47 @@ mod tests {
     }
 
     /// A runtime failure after admission is this request's in-stream error item
-    /// (the SSE error frame's twin), not an RPC status; the call is disarmed.
+    /// (the SSE error frame's twin, `type` and `retryable` included), not an
+    /// RPC status; the call is disarmed.
     #[tokio::test]
     async fn runtime_failure_rides_the_stream_as_an_error_item() {
-        let harness = Harness::new(1, false, Duration::from_secs(1));
-        let mut stream = harness
-            .service
-            .generate(Request::new(ids_request(&[1], None)))
-            .await
-            .unwrap()
-            .into_inner();
-        let intake = harness.next_generation().await;
-        assert!(intake.admission.try_accept());
-        intake
-            .sink
-            .try_send(ResponseItem::Error(crate::utils::error::Error::Validation(
-                "bad sampling".into(),
-            )))
-            .unwrap();
+        use crate::utils::error::Error;
+        for (failure, code, kind, retryable) in [
+            (
+                Error::Validation("bad sampling".into()),
+                400,
+                "invalid_request_error",
+                false,
+            ),
+            (
+                Error::Internal("bad state".into()),
+                500,
+                "internal_error",
+                true,
+            ),
+        ] {
+            let harness = Harness::new(1, false, Duration::from_secs(1));
+            let mut stream = harness
+                .service
+                .generate(Request::new(ids_request(&[1], None)))
+                .await
+                .unwrap()
+                .into_inner();
+            let intake = harness.next_generation().await;
+            assert!(intake.admission.try_accept());
+            intake.sink.try_send(ResponseItem::Error(failure)).unwrap();
 
-        let error = stream_error(stream.next().await.unwrap().unwrap());
-        assert_eq!(error.index, None);
-        let body = error.error.unwrap();
-        assert_eq!(body.code, 400);
-        assert!(body.message.contains("bad sampling"));
-        assert!(stream.next().await.is_none());
-        drop(stream);
-        assert!(harness.abort_rx.try_recv().is_err());
+            let error = stream_error(stream.next().await.unwrap().unwrap());
+            assert_eq!(error.index, None);
+            let body = error.error.unwrap();
+            assert_eq!(body.code, code);
+            assert!(body.message.contains("bad "), "{}", body.message);
+            assert_eq!(body.r#type.as_deref(), Some(kind));
+            assert_eq!(body.retryable, Some(retryable));
+            assert!(stream.next().await.is_none());
+            drop(stream);
+            assert!(harness.abort_rx.try_recv().is_err());
+        }
     }
 
     #[tokio::test]

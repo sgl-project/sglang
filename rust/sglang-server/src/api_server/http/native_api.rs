@@ -19,6 +19,7 @@ use super::pre_generate::HeldGeneration;
 use super::request_headers::apply_header_overrides;
 use crate::api_server::core::{
     BodySnapshot, CoreError, CoreEvent, CoreOutput, HealthStatus, RawBody, ReceivedAs,
+    STREAM_INVALID_REQUEST_ERROR,
 };
 use crate::api_server::handlers::{CoreCall, PendingGeneration, recv_indexed};
 #[cfg(test)]
@@ -30,7 +31,7 @@ use crate::message::response::{CustomizedInfo, RequestStats};
 use crate::message::wire::{ClientMaxNewTokens, merge_preferred_sampling};
 use crate::utils::{
     environ,
-    response::{error_response, error_value, sse_response},
+    response::{error_response, error_value, sse_error_response, sse_response},
 };
 use axum::{
     Extension, Json, Router,
@@ -493,13 +494,30 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
 }
 
 /// native api error response: unary → `code` plus the JSON `body`,
-/// streaming → 200 with one SSE error frame + `[DONE]`.
+/// streaming → 200 with one SSE error frame + `[DONE]`. A message-only error
+/// is a request the handler refused before it reached the core, which Python
+/// raises as a `ValueError`, so its stream frame is `invalid_request_error`
+/// and not retryable (see [`CoreError::stream_error`]).
 pub(super) fn native_error(code: StatusCode, message: &str, stream: bool) -> Response {
-    error_response(code, error_value(code.as_u16(), message), stream)
+    if !stream {
+        return error_response(code, error_value(code.as_u16(), message), false);
+    }
+    let body = api::ErrorBody {
+        message: message.to_owned(),
+        code: u32::from(code.as_u16()),
+        r#type: Some(STREAM_INVALID_REQUEST_ERROR.to_owned()),
+        retryable: Some(false),
+    };
+    sse_error_response(serde_json::json!({ "error": body }))
 }
 
 fn native_core_error(error: CoreError, stream: bool) -> Response {
-    native_error(error.http_status(), &error.to_string(), stream)
+    if !stream {
+        return native_error(error.http_status(), &error.to_string(), false);
+    }
+    sse_error_response(
+        serde_json::to_value(error.stream_error(None)).expect("an error item is JSON"),
+    )
 }
 
 /// `/health` + `/health_generate`. Both env knobs are resolved ONCE here, at
@@ -846,7 +864,7 @@ pub(super) async fn drain_unary(
         Ok(frame) => (StatusCode::OK, GenerateItem::Frame(Box::new(frame))),
         Err(error) => (
             error.http_status(),
-            GenerateItem::Error(error.stream_error(None)),
+            GenerateItem::Error(error.item_error(None)),
         ),
     }
 }
@@ -1534,6 +1552,15 @@ mod tests {
                 };
                 assert_eq!(error["error"]["message"], message, "{body}");
                 assert_eq!(error["error"]["code"], 400, "{body}");
+                // Python's stream frame names the error's type and that a
+                // retry won't help; its unary body has neither.
+                if stream {
+                    assert_eq!(error["error"]["type"], "invalid_request_error", "{body}");
+                    assert_eq!(error["error"]["retryable"], false, "{body}");
+                } else {
+                    assert!(error["error"].get("type").is_none(), "{body}");
+                    assert!(error["error"].get("retryable").is_none(), "{body}");
+                }
                 let rejections = logs.rejections();
                 assert!(
                     matches!(rejections.as_slice(), [line] if line.contains("WARN") && line.contains(message)),
@@ -1849,6 +1876,12 @@ mod tests {
     #[tokio::test]
     async fn generate_validator_refuses_every_ingress_before_submission() {
         let native = serde_json::json!({"code": 400, "message": "top_logprobs_num 2"});
+        let native_stream = serde_json::json!({
+            "code": 400,
+            "message": "top_logprobs_num 2",
+            "type": "invalid_request_error",
+            "retryable": false,
+        });
         let openai = serde_json::json!({
             "object": "error",
             "message": "top_logprobs_num 2",
@@ -1892,7 +1925,7 @@ mod tests {
                     true,
                 ),
                 StatusCode::OK,
-                &native,
+                &native_stream,
             ),
             (
                 "/generate",
@@ -2889,6 +2922,93 @@ mod tests {
         assert!(abort_rx.try_recv().is_err());
     }
 
+    /// A core failure before the stream starts is one SSE frame with Python's
+    /// `type` and `retryable` for its kind; unary, it's the bare native body.
+    #[tokio::test]
+    async fn core_error_frames_name_type_and_retryable() {
+        for (error, code, error_type, retryable) in [
+            (CoreError::Unavailable, 503, "invalid_request_error", false),
+            (
+                CoreError::Internal("bug".into()),
+                500,
+                "internal_error",
+                true,
+            ),
+        ] {
+            let message = error.to_string();
+            let streamed = native_core_error(error.clone(), true);
+            assert_eq!(streamed.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(streamed.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            let text = std::str::from_utf8(&bytes).unwrap();
+            let frame = text
+                .strip_prefix("data: ")
+                .and_then(|rest| rest.strip_suffix("\n\ndata: [DONE]\n\n"))
+                .unwrap_or_else(|| panic!("one error frame then [DONE]: {text}"));
+            assert_eq!(
+                parse(frame),
+                serde_json::json!({"error": {
+                    "message": message, "code": code, "type": error_type, "retryable": retryable,
+                }})
+            );
+
+            let unary = native_core_error(error, false);
+            assert_eq!(unary.status().as_u16(), code);
+            let bytes = axum::body::to_bytes(unary.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            assert_eq!(
+                parse(std::str::from_utf8(&bytes).unwrap()),
+                serde_json::json!({"error": {"message": message, "code": code}})
+            );
+        }
+    }
+
+    /// The Rust server answers the failures Python's handler answered in
+    /// `testdata/error_frames.json` (built by `build_rust_error_frames_fixture`
+    /// in `test_rust_server_error_frames.py`): the same stream frame, and the
+    /// same unary status and body, which Rust extends with `code` only.
+    #[tokio::test]
+    async fn error_frames_match_python_fixture() {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../../../testdata/error_frames.json")).unwrap();
+        for (name, case) in fixture.as_object().unwrap() {
+            let message = case["message"].as_str().unwrap().to_owned();
+            let error = match name.as_str() {
+                "invalid_argument" => CoreError::InvalidArgument(message),
+                "status_503" => CoreError::Overloaded(message),
+                other => panic!("no Rust failure for fixture case {other}"),
+            };
+
+            let streamed = native_core_error(error.clone(), true);
+            assert_eq!(
+                streamed.status().as_u16(),
+                case["stream"]["status"],
+                "{name}"
+            );
+            let bytes = axum::body::to_bytes(streamed.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            let text = std::str::from_utf8(&bytes).unwrap();
+            let frame = text
+                .strip_prefix("data: ")
+                .and_then(|rest| rest.strip_suffix("\n\ndata: [DONE]\n\n"))
+                .unwrap_or_else(|| panic!("one error frame then [DONE]: {text}"));
+            assert_eq!(parse(frame), case["stream"]["frame"], "{name}");
+
+            let unary = native_core_error(error, false);
+            assert_eq!(unary.status().as_u16(), case["unary"]["status"], "{name}");
+            let bytes = axum::body::to_bytes(unary.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            let mut body = parse(std::str::from_utf8(&bytes).unwrap());
+            assert_eq!(body["error"]["code"], case["unary"]["status"], "{name}");
+            body["error"].as_object_mut().unwrap().remove("code");
+            assert_eq!(body, case["unary"]["body"], "{name}");
+        }
+    }
+
     /// A per-item error is surfaced with its `index` and doesn't end the batch;
     /// `[DONE]` still waits for the other item.
     #[tokio::test]
@@ -2915,6 +3035,8 @@ mod tests {
         let v = parse(&stream.next().await.unwrap());
         assert_eq!(v["index"], 0);
         assert_eq!(v["error"]["code"], 400);
+        assert_eq!(v["error"]["type"], "invalid_request_error");
+        assert_eq!(v["error"]["retryable"], false);
 
         tx1.send(done(11, "ok")).await.unwrap();
         let v = parse(&stream.next().await.unwrap());
