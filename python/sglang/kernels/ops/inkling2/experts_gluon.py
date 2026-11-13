@@ -134,7 +134,8 @@ def _grouped_gemm(
     """_grouped_dequant_gemm (BM 16, BN 64, BK 256) on MFMA-order weights; W is
     MXFP8's as int16 pairs."""
     gl.static_assert((BM == 16) & (BN == 64) & (BK == 256))
-    entry = gl.load(Schedule + gl.program_id(0))
+    # schedule entries vary slowest, so active entries' programs dispatch first
+    entry = gl.load(Schedule + gl.program_id(2))
     if entry == -1:
         return
     expert = (entry & 0xFFFF).to(gl.int64)
@@ -177,8 +178,8 @@ def _grouped_gemm(
     SX: gl.constexpr = gl.SwizzledSharedLayout(
         vec=8, per_phase=1, max_phase=8, order=[1, 0]
     )
-    n0 = gl.program_id(1) * BN
-    split = gl.program_id(2)
+    n0 = gl.program_id(0) * BN
+    split = gl.program_id(1)
     W = W + expert * N * (K // 2)
     WS = WS + expert * N * (K // 16 if NVFP4 else K // 32)
 
@@ -300,7 +301,7 @@ def grouped_gemm(x, weight, scales, partials, route, rows, gather_div, splits, b
     n, k = weight.shape[1], x.shape[1]
     assert n % BN == 0 and k % (BK * splits) == 0, (n, k, splits)
     nvfp4 = weight.dtype == torch.uint8
-    _grouped_gemm[(blocks, n // BN, splits)](
+    _grouped_gemm[(n // BN, splits, blocks)](
         x,
         weight if nvfp4 else weight.view(torch.int16),
         scales,
