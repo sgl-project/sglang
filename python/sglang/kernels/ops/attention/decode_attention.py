@@ -40,6 +40,16 @@ from sglang.srt.utils import (
 _is_hip = is_hip()
 _is_gfx1250 = _is_hip and is_gfx1250_supported()
 
+# RDNA3 (gfx110x), RDNA3.5 (gfx115x) and RDNA4 (gfx120x). gfx1250 has its own paths here and is
+# unmeasured, so it stays out.
+_is_rdna = (
+    _is_hip
+    and torch.cuda.is_available()
+    and torch.cuda.get_device_properties(0).gcnArchName.startswith(
+        ("gfx110", "gfx115", "gfx120")
+    )
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -56,6 +66,37 @@ def _rotate_batch(batch: int, uneven_batch: Optional[torch.Tensor]) -> bool:
 
 # heads per stage-1 tile, shared so the budget's head_tiles cannot drift from the launch
 _GROUPED_BLOCK_H = 16
+
+
+def _rdna_grouped_num_warps(
+    block_dmodel: int,
+    block_dpe: int,
+    kv_dtype: torch.dtype,
+    batch: int,
+    head_tiles: int,
+    core_count: int,
+) -> Optional[int]:
+    """num_warps for stage 1 on RDNA without the CDNA hints, or None to keep them.
+
+    The hints cap waves in flight, so the memory-bound GQA decode reads KV 1.4-2.7x slower
+    at batch on gfx1151; served throughput at 64 requests rose 1.08x on gfx1201 and 1.26x on
+    gfx1100 without them. Measured on gfx1151, they still win for MLA, fp8 KV (dequant is
+    emulated) and small grids (under 8 programs per split there, scaled up for bigger parts),
+    and dropping them is neutral at head_dim 256.
+    """
+    if block_dpe > 0 or block_dmodel > 128:
+        return None
+    if kv_dtype not in (torch.bfloat16, torch.float16):
+        return None
+    # Under CUDA graphs batch is the captured (padded) size, so this is decided per graph.
+    # The bar of 8 programs was tuned on gfx1151, which reports 20 cores (WGPs); a bigger part
+    # needs a bigger grid before the hints stop paying (W7900: 1 request on a 16/8 model was
+    # 0.98x at 8 programs). Scaled as a ratio, so it holds whether a part reports CUs or WGPs.
+    if batch * head_tiles < max(8, 8 * core_count // 20):
+        return None
+    # Batch-dependent, yet deterministic inference stays batch-invariant on this path: a request
+    # alone vs in batches of 2-16 was bitwise identical on gfx1151 with Triton 3.6.
+    return 2
 
 
 # gfx950 wants 32 where the HIP path otherwise takes 16. That is the model it was picked
@@ -843,6 +884,18 @@ def _decode_grouped_att_m_fwd(
         # https://github.com/triton-lang/triton/blob/main/third_party/amd/backend/compiler.py
         extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
         num_stages = 1
+        if _is_rdna:
+            rdna_warps = _rdna_grouped_num_warps(
+                block_dmodel=BLOCK_DMODEL,
+                block_dpe=BLOCK_DPE,
+                kv_dtype=k_buffer.dtype,
+                batch=batch,
+                head_tiles=head_tiles,
+                core_count=current_arch().num_sms,
+            )
+            if rdna_warps is not None:
+                extra_kargs = {}
+                num_warps = rdna_warps
 
     if tune_mla:
         # num_warps reorders the fp32 accumulation, so whoever declined the batch-wide
