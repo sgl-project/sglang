@@ -509,6 +509,7 @@ class DSANPUIndexerMixin:
             is_prefill
             and self.dsa_enable_prefill_cp
             and forward_batch.attn_cp_metadata is not None
+            and not use_quant_indexer
         ):
             if use_quant_indexer:
                 raise RuntimeError(
@@ -524,11 +525,11 @@ class DSANPUIndexerMixin:
             )
             return topk_indices
         else:
-            block_table = (
-                block_table[: actual_seq_lengths_q.size()[0]]
-                if is_prefill
-                else block_table
-            )
+            if is_prefill and uses_prefill_cp:
+                weights = weights.contiguous().view(-1, weights.shape[-1])
+                actual_seq_lengths_q = actual_seq_lengths_q.to(q.device)
+            elif is_prefill:
+                block_table = block_table[: actual_seq_lengths_q.size(0)]
             query = q.view(-1, self.n_heads, self.head_dim)
             # The full width for the gather, NOT query.shape[0] (already cut).
             num_query_tokens = bs
@@ -554,12 +555,11 @@ class DSANPUIndexerMixin:
                     op_weights = weights.to(torch.float16)
                     # torch_npu.npu_quant_lightning_indexer is not working
                     # for int8 cache in case of custom_ops imported
-                    quant_lightning_indexer = torch.ops.npu.npu_quant_lightning_indexer
                 else:
                     op_weights = weights
-                    quant_lightning_indexer = torch_npu.npu_quant_lightning_indexer
 
-                topk_indices = quant_lightning_indexer(
+                # custom_ops can replace the torch_npu alias with a different schema.
+                topk_indices = torch.ops.npu.npu_quant_lightning_indexer(
                     query=query,
                     key=past_key_states,
                     weights=op_weights,

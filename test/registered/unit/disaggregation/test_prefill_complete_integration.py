@@ -481,6 +481,8 @@ class TestAllocationIntegration(CustomTestCase):
                             owner_list=None,
                             finished_reason=None,
                             to_finish=None,
+                            prefix_len=0,
+                            extend_end=64,
                             inflight_steps=inflight_steps,
                         )
                         scheduler = _ChunkedSlot(
@@ -520,6 +522,28 @@ class TestAllocationIntegration(CustomTestCase):
                             self.assertEqual(list(launched), [req])
                     finally:
                         override.restore()
+
+    def test_parked_chunk_is_neither_checkpointed_nor_sent(self):
+        for overlap in (False, True):
+            with self.subTest(overlap=overlap):
+                # add_chunked_req parked it: extend_end stayed at prefix_len.
+                req = Mock(prefix_len=64, extend_end=64, tmp_end_idx=None)
+                scheduler = SimpleNamespace(
+                    chunked_req=req,
+                    enable_overlap=overlap,
+                    check_bootstrap=Mock(return_value=True),
+                    checkpoint_disagg_prefill=Mock(),
+                    send_kv_chunk=Mock(),
+                )
+                running = SimpleNamespace(batch_is_full=True)
+                SchedulerDisaggregationPrefillMixin.process_prefill_chunk(
+                    scheduler, None, running
+                )
+                scheduler.checkpoint_disagg_prefill.assert_not_called()
+                scheduler.send_kv_chunk.assert_not_called()
+                self.assertIsNone(req.tmp_end_idx)
+                self.assertIs(scheduler.chunked_req, req)
+                self.assertFalse(running.batch_is_full)
 
     def test_yielded_request_requeues_after_its_chunk_once_bootstrap_completes(self):
         # The yield is decided before its chunk in flight is processed; a bootstrap
