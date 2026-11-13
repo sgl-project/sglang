@@ -71,7 +71,6 @@ jobs:
               - "test/registered/xpu/**/!(*.md)"
               - "test/registered/e2e/xpu/**/!(*.md)"
               - "test/registered/attention/test_chunk_gated_delta_rule.py"
-              - "test/registered/kernels/benchmark/attention/bench_gdn_chunk_prefill_xpu.py"
               - "test/registered/attention/test_deterministic.py"
               - "test/registered/disaggregation/test_disaggregation_xpu.py"
               - "test/registered/kernels/ops/kvcache/test_hisparse.py"

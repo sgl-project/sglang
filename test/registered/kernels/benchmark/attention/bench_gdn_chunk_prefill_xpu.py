@@ -14,7 +14,7 @@ from sglang.kernels.ops.attention.fla.chunk import chunk_gated_delta_rule
 from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_xpu_ci(est_time=30, suite="stage-b-test-1-gpu-xpu")
+register_xpu_ci(est_time=30, suite="nightly-xpu-kernel-main-1-gpu", nightly=True)
 
 # PPLX-Decider-v1-27B (Qwen3.5 hybrid) per-rank shape at TP=4: one 4K-token chunk.
 SEQ_LEN = 4096
