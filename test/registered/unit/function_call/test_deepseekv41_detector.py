@@ -258,6 +258,68 @@ class TestDeepSeekV41ParameterGrammar(CustomTestCase):
         )
 
 
+class TestDeepSeekV41ProseGuard(CustomTestCase):
+    """The prose guard must use this class's spaced spellings, so a stray or
+    literal marker in prose keeps streaming on V4.1 too (#44941)."""
+
+    def setUp(self):
+        self.tools = _tools()
+
+    def _feed(self, chunks):
+        detector = DeepSeekV41Detector()
+        normal, calls = "", []
+        for chunk in chunks:
+            result = detector.parse_streaming_increment(chunk, self.tools)
+            normal += result.normal_text
+            calls.extend(result.calls)
+        return normal, calls
+
+    def test_stray_left_angle_pipe_in_prose_keeps_streaming(self):
+        chunks = ["Use the ", "<｜", "end｜> token", " to stop.", " More text."]
+        text = "".join(chunks)
+
+        detector = DeepSeekV41Detector()
+        normals = [
+            detector.parse_streaming_increment(chunk, self.tools).normal_text
+            for chunk in chunks
+        ]
+        self.assertTrue(any("token" in n for n in normals))
+        self.assertEqual(
+            "".join(normals) + detector.finish(self.tools).normal_text, text
+        )
+
+    def test_literal_dsml_token_in_prose_streams_like_one_shot(self):
+        text = f"The tag {DSML} marks tool calls."
+
+        for width in (1, 3, len(text)):
+            with self.subTest(width=width):
+                normal, calls = self._feed(
+                    [text[i : i + width] for i in range(0, len(text), width)]
+                )
+                self.assertEqual(normal, text)
+                self.assertEqual(calls, [])
+
+    def test_streaming_skips_unknown_tool_like_one_shot(self):
+        call = (
+            f'<{DSML} calls>\n<{DSML} invoke name="no_such_tool">\n'
+            f'<{DSML} parameter name="city" string="true">SF'
+            f"</{DSML} parameter>\n</{DSML} invoke>\n</{DSML} calls>"
+        )
+        text = "Checking.\n\n" + call
+
+        for width in (1, 4, len(text)):
+            with self.subTest(width=width):
+                normal, calls = self._feed(
+                    [text[i : i + width] for i in range(0, len(text), width)]
+                )
+                result = DeepSeekV41Detector().detect_and_parse(text, self.tools)
+                self.assertEqual(
+                    [(c.name, c.parameters) for c in calls],
+                    [(c.name, c.parameters) for c in result.calls],
+                )
+                self.assertEqual(normal, result.normal_text)
+
+
 if __name__ == "__main__":
     import unittest
 
