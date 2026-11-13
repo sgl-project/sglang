@@ -52,6 +52,7 @@ def _cache(backend, interval=16, page_size=1, bigram=False):
     cache.hicache_storage_pass_prefix_keys = True
     cache.sidecar_pool_specs = []
     cache.ongoing_backup = {}
+    cache.ongoing_write_through = {}
     cache.insert_session_id = None
     cache.cache_controller = SimpleNamespace(write_storage=Mock(side_effect=count()))
     params = CacheInitParams(
@@ -109,6 +110,7 @@ def _backup(cache, node, pending=False):
     core.commit_backup(node, full + 1000, transfers)
     if pending:
         core.mark_write_through_pending([node], ack_id=91)
+        cache.ongoing_write_through[91] = (node, None, [node])
 
 
 def _has_mamba(spec):
@@ -176,21 +178,30 @@ def test_controller_filters_l3_but_keeps_kv_and_registered_state_sidecar(backend
 
 @pytest.mark.parametrize("backend", ["python", "rust"])
 @pytest.mark.parametrize("pending", [False, True])
-def test_existing_node_promotion_retries_once_after_host_ack(backend, pending):
+@pytest.mark.parametrize("length", [8, 16])
+def test_existing_node_promotion_writes_only_when_needed(backend, pending, length):
     cache = _cache(backend)
-    node = _insert(cache, 8)
+    node = _insert(cache, length)
     _backup(cache, node, pending=pending)
-    assert not _has_mamba(cache.tree_core.build_storage_backup_spec(node, False, 16))
-    assert _insert(cache, 8, slot=2, endpoint=True) == node
+    periodic = length == 16
+    assert (
+        _has_mamba(cache.tree_core.build_storage_backup_spec(node, False, 16))
+        == periodic
+    )
+    if not pending:
+        _write_and_ack(cache, node)
+    assert _insert(cache, length, slot=2, endpoint=True) == node
     writes = cache.cache_controller.write_storage.call_count
-    assert writes == (0 if pending else 1)
+    assert writes == (0 if pending else 1 + int(not periodic))
     assert _has_mamba(cache.tree_core.build_storage_backup_spec(node, False, 16))
-    _insert(cache, 8, slot=3, endpoint=True)
+    _insert(cache, length, slot=3, endpoint=True)
     assert cache.cache_controller.write_storage.call_count == writes
     if pending:
-        cache.tree_core.finish_write_through([node], 91)
-        call = _write_and_ack(cache, node)
-        assert any(x.name == PoolName.MAMBA for x in call.kwargs["extra_pools"])
+        cache._finish_write_through_ack(91)
+        assert not cache.ongoing_write_through
+        assert cache.cache_controller.write_storage.call_count == 1
+    call = cache.cache_controller.write_storage.call_args
+    assert any(x.name == PoolName.MAMBA for x in call.kwargs["extra_pools"])
 
 
 @pytest.mark.parametrize("backend", ["python", "rust"])
@@ -204,20 +215,36 @@ def test_new_endpoint_is_kept_when_its_l2_copy_becomes_available(backend):
 
 
 @pytest.mark.parametrize("backend", ["python", "rust"])
-def test_endpoint_mark_stays_on_original_tail_after_split(backend):
-    cache = _cache(backend, interval=64)
-    tail = _insert(cache, 12, endpoint=True)
-    _backup(cache, tail)
-    _insert(cache, 12, slot=2, tokens=list(range(8)) + [90, 91, 92, 93])
-    tail_spec = cache.tree_core.build_storage_backup_spec(tail, False, 64)
-    assert _has_mamba(tail_spec)
-    prefix = cache.tree_core.match_prefix(
-        MatchPrefixParams(key=_key(list(range(8))))
-    ).last_device_node
+@pytest.mark.parametrize("endpoint", [False, True])
+def test_kv_split_preserves_selected_state_until_real_ack(backend, endpoint):
+    interval = 64 if endpoint else 16
+    cache = _cache(backend, interval=interval, page_size=2)
+    tail = _insert(cache, 20, endpoint=endpoint)
+    _backup(cache, tail, pending=True)
+    assert _has_mamba(cache.tree_core.build_storage_backup_spec(tail, False, interval))
+    match = cache.tree_core.match_prefix(MatchPrefixParams(key=_key(list(range(18)))))
+    for action in match.cache_actions:
+        cache._replace_pending_write_through_node(
+            action.ack_id,
+            action.old_node_id,
+            [action.new_node_id, action.new_child_node_id],
+        )
+    cache._finish_write_through_ack(91)
+    assert not cache.ongoing_write_through
+    calls = cache.cache_controller.write_storage.call_args_list
+    assert sum(len(call.args[0]) for call in calls) == 20
+    assert (
+        sum(
+            any(x.name == PoolName.MAMBA for x in call.kwargs["extra_pools"] or ())
+            for call in calls
+        )
+        == 1
+    )
+    prefix = match.last_device_node
     assert prefix != tail
-    assert not cache.tree_core.promote_mamba_storage_boundary(prefix)
+    assert not cache.tree_core.promote_mamba_storage_boundary(prefix, interval)
     assert not cache.tree_core.promote_mamba_storage_boundary(
-        cache.tree_core.root_node_handle(None)
+        cache.tree_core.root_node_handle(None), interval
     )
 
 
@@ -229,7 +256,7 @@ def test_zero_keeps_all_writes_and_reset_drops_endpoint_marks(backend):
     assert _has_mamba(cache.tree_core.build_storage_backup_spec(node, False))
     # With the policy off, the insertion did not install a preservation mark.
     assert not _has_mamba(cache.tree_core.build_storage_backup_spec(node, False, 64))
-    assert cache.tree_core.promote_mamba_storage_boundary(node)
+    assert cache.tree_core.promote_mamba_storage_boundary(node, 64)
     cache.tree_core.reset()
     new = _insert(cache, 8, slot=2)
     _backup(cache, new)

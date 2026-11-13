@@ -2869,7 +2869,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 comp_xfers[comp.component_type] = t
         return device_value, comp_xfers
 
-    def promote_mamba_storage_boundary(self, node_id: NodeId) -> bool:
+    def promote_mamba_storage_boundary(
+        self, node_id: NodeId, mamba_l3_snapshot_interval: int
+    ) -> bool:
         node = self.node_by_id(node_id)
         state_slot = self.slot_id(TREE_STATE)
         if state_slot is None or node.parent is None or node.mamba_storage_boundary:
@@ -2877,22 +2879,33 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         state = node.component_data[state_slot]
         if state.value is None and state.host_value is None:
             return False
-        node.mamba_storage_boundary = True
-        return (
+        needs_write = (
             node.backuped
             and state.host_value is not None
             and node.write_through_pending_id is None
+            and not self._backup_mamba_storage(node, mamba_l3_snapshot_interval)
         )
+        node.mamba_storage_boundary = True
+        return needs_write
 
-    @staticmethod
-    def _backup_mamba_storage(node: UnifiedTreeNode, interval: int) -> bool:
+    def _backup_mamba_storage(self, node: UnifiedTreeNode, interval: int) -> bool:
         if interval == 0 or node.mamba_storage_boundary:
             return True
         if node.parent is None:
             return False
         span = len(node.key)
-        end = span
         parent = node.parent
+        state_slot = self.slot_id(TREE_STATE)
+        if state_slot is None:
+            return False
+        # KV-only splits must not change the span between legal checkpoints.
+        while parent.parent is not None:
+            state = parent.component_data[state_slot]
+            if state.value is not None or state.host_value is not None:
+                break
+            span += len(parent.key)
+            parent = parent.parent
+        end = span
         while parent.parent is not None:
             end += len(parent.key)
             parent = parent.parent

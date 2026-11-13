@@ -766,7 +766,8 @@ class UnifiedRadixCache(BasePrefixCache):
                         and params.mamba_storage_prompt_boundary
                         and step.result.last_device_node is not None
                         and self.tree_core.promote_mamba_storage_boundary(
-                            step.result.last_device_node
+                            step.result.last_device_node,
+                            self.hicache_mamba_l3_snapshot_interval,
                         )
                     ):
                         self.write_backup_storage(step.result.last_device_node)

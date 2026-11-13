@@ -4252,21 +4252,22 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     pub fn promote_mamba_storage_boundary(
         &mut self,
         node_id: NodeId,
+        mamba_l3_snapshot_interval: usize,
     ) -> Result<bool, NodeAccessError> {
         let idx = self.arena.resolve(node_id)?;
-        let node = self.arena.node_mut(idx);
+        let node = self.arena.node(idx);
         if node.is_root()
             || node.mamba_storage_boundary
             || (!node.has_device_value(MAMBA) && !node.has_host_value(MAMBA))
         {
             return Ok(false);
         }
-        node.mamba_storage_boundary = true;
-        Ok(
-            node.backuped()
-                && node.has_host_value(MAMBA)
-                && node.write_through_pending_id.is_none(),
-        )
+        let needs_write = node.backuped()
+            && node.has_host_value(MAMBA)
+            && node.write_through_pending_id.is_none()
+            && !self.backup_mamba_storage(idx, mamba_l3_snapshot_interval);
+        self.arena.node_mut(idx).mamba_storage_boundary = true;
+        Ok(needs_write)
     }
 
     fn backup_mamba_storage(&self, idx: NodeIdx_, interval: usize) -> bool {
@@ -4274,9 +4275,18 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         if interval == 0 || node.mamba_storage_boundary {
             return true;
         }
-        let span = node.key.as_ref().len();
-        let mut end = span;
+        let mut span = node.key.as_ref().len();
         let mut parent = node.parent;
+        // KV-only splits must not change the span between legal checkpoints.
+        while let Some(idx) = parent {
+            let node = self.arena.node(idx);
+            if node.is_root() || node.has_device_value(MAMBA) || node.has_host_value(MAMBA) {
+                break;
+            }
+            span += node.key.as_ref().len();
+            parent = node.parent;
+        }
+        let mut end = span;
         while let Some(idx) = parent {
             let node = self.arena.node(idx);
             end += node.key.as_ref().len();

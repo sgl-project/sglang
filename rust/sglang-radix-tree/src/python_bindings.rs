@@ -1812,9 +1812,9 @@ macro_rules! tree_core_methods {
             }
 
             fn promote_mamba_storage_boundary(
-                &mut self, py: Python<'_>, node_id: NodeId,
+                &mut self, py: Python<'_>, node_id: NodeId, mamba_l3_snapshot_interval: usize,
             ) -> PyResult<bool> {
-                py.detach(|| self.core().promote_mamba_storage_boundary(node_id))
+                py.detach(|| self.core().promote_mamba_storage_boundary(node_id, mamba_l3_snapshot_interval))
                     .map_err(node_access_error)
             }
 
@@ -3251,9 +3251,9 @@ macro_rules! tree_core_binding {
             }
 
             fn promote_mamba_storage_boundary(
-                &mut self, py: Python<'_>, node_id: NodeId,
+                &mut self, py: Python<'_>, node_id: NodeId, mamba_l3_snapshot_interval: usize,
             ) -> PyResult<bool> {
-                catch_native_panic(|| self.inner.promote_mamba_storage_boundary(py, node_id))
+                catch_native_panic(|| self.inner.promote_mamba_storage_boundary(py, node_id, mamba_l3_snapshot_interval))
             }
 
             /// Whether the node is a (default or named) root.

@@ -1118,8 +1118,12 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                 torch.cat(full_values)
             ).to(torch.int64)
 
-    def promote_mamba_storage_boundary(self, node_id: NodeId) -> bool:
-        return self._binding.promote_mamba_storage_boundary(node_id)
+    def promote_mamba_storage_boundary(
+        self, node_id: NodeId, mamba_l3_snapshot_interval: int
+    ) -> bool:
+        return self._binding.promote_mamba_storage_boundary(
+            node_id, mamba_l3_snapshot_interval
+        )
 
     def build_storage_backup_spec(
         self,
