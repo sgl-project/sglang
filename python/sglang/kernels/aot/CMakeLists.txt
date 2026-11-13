@@ -425,6 +425,20 @@ if (SGL_KERNEL_ENABLE_FA3)
         "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdimdiff_e4m3*_sm90.cu")
     list(APPEND FA3_FP8_GEN_SRCS ${FA3_FP8_GEN_SRCS_})
 
+    # Opt-in: build the head_dim=256 FP8 instantiations without two-level
+    # accumulation (sgl-attn 141fa063). This restores the prefill timing reported
+    # in #49541, but brings back the long-KV FP8 accumulation bias that #46770
+    # fixed. Off by default; enable only after accepting that trade-off.
+    option(SGL_FA3_FP8_HDIM256_NO_TWO_LEVEL_ACC
+        "Disable FA3 FP8 two-level accumulation for head_dim=256 (trades accuracy for speed)" OFF)
+    if(SGL_FA3_FP8_HDIM256_NO_TWO_LEVEL_ACC)
+        file(GLOB FA3_FP8_HDIM256_SRCS
+            "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdim256_e4m3*_sm90.cu")
+        set_source_files_properties(${FA3_FP8_HDIM256_SRCS} PROPERTIES
+            COMPILE_DEFINITIONS "FLASHATTENTION_DISABLE_FP8_TWO_LEVEL_ACCUMULATION")
+        message(STATUS "FA3 FP8 hdim256: two-level accumulation disabled")
+    endif()
+
     set(FA3_GEN_SRCS ${FA3_BF16_GEN_SRCS} ${FA3_FP16_GEN_SRCS} ${FA3_FP8_GEN_SRCS} ${FA3_SM8X_GEN_SRCS})
 
     set(FLASH_SOURCES
