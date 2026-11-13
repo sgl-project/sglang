@@ -1247,5 +1247,50 @@ class TestCandidateIndexerGating(CustomTestCase):
                 make(2048, 8)
 
 
+class TestPrefillSelectionPadding(CustomTestCase):
+    """The fused ragged selection pads a row shorter than ``k`` with -1, so those
+    slots must not be gathered as if they were reachable."""
+
+    def test_padded_slots_stay_unreachable(self):
+        from sglang.srt.layers.attention.dsv4.v41_indexer.scoring import (
+            ChunkScores,
+            RequestScores,
+            write_prefill,
+        )
+
+        rows, k, lc = 2, 4, 6
+        request = RequestScores(
+            lc=lc,
+            k=k,
+            columns=torch.arange(lc),
+            tok=torch.tensor([2, 5]),
+            lens=torch.tensor([lc, 3], dtype=torch.int32),
+            slots=torch.arange(100, 100 + lc),
+        )
+        chunk = ChunkScores(
+            rows=slice(0, rows),
+            tok=request.tok,
+            lens=request.lens,
+            scores=torch.zeros((rows, lc)),
+        )
+        untouched = torch.full((8, k), -9, dtype=torch.int32)
+        inputs = SimpleNamespace(
+            out_page_indices=untouched.clone(),
+            out_raw_indices=untouched.clone(),
+        )
+        # Unordered, exactly as `topk_transform_ragged_v2` emits it for these rows.
+        idx = torch.tensor([[5, 1, 3, 0], [2, 1, -1, -1]], dtype=torch.int32)
+
+        write_prefill(inputs, request, chunk, idx)
+
+        blank = [-9] * k
+        self.assertEqual(
+            inputs.out_raw_indices.tolist(),
+            [blank, blank, [0, 1, 3, 5], blank, blank, [-1, -1, 1, 2], blank, blank],
+        )
+        self.assertEqual(inputs.out_page_indices[2].tolist(), [100, 101, 103, 105])
+        self.assertEqual(inputs.out_page_indices[5].tolist(), [-1, -1, 101, 102])
+
+
 if __name__ == "__main__":
     unittest.main()
