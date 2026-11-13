@@ -115,6 +115,7 @@ def _build_server_args(
         "speculative_ngram_external_corpus_max_tokens": get_spec().speculative_ngram_external_corpus_max_tokens,
         "gc_threshold": get_device().gc_threshold,
         "enable_pd_role_switch": get_disagg().enable_pd_role_switch,
+        "enable_streaming_session": get_serving().enable_streaming_session,
         "engine_info_bootstrap_url": scheduler.server_args.engine_info_bootstrap_url,
         "enable_hierarchical_cache": get_memory().enable_hierarchical_cache,
         "hicache_ratio": get_memory().hicache_ratio,

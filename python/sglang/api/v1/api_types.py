@@ -436,6 +436,67 @@ class UpdateWeightVersionResponse(msgspec.Struct, kw_only=True, frozen=True):
         return encode_UpdateWeightVersionResponse(self)
 
 
+class OpenSessionRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.OpenSessionRequest: JSON object (unknown keys ignored)."""
+
+    capacity_of_str_len: int = 0
+    session_id: Optional[str] = None
+    streaming: Optional[bool] = None
+    timeout: Optional[float] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "OpenSessionRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_OpenSessionRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_OpenSessionRequest(self)
+
+
+class OpenSessionResponse(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.OpenSessionResponse: JSON object (unknown keys ignored)."""
+
+    session_id: str = ""
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "OpenSessionResponse":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_OpenSessionResponse(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_OpenSessionResponse(self)
+
+
+class CloseSessionRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.CloseSessionRequest: JSON object (unknown keys ignored)."""
+
+    session_id: str = ""
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "CloseSessionRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_CloseSessionRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_CloseSessionRequest(self)
+
+
+class CloseSessionResponse(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.CloseSessionResponse: JSON object (unknown keys ignored)."""
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "CloseSessionResponse":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_CloseSessionResponse(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_CloseSessionResponse(self)
+
+
 class AddExternalCorpusRequest(msgspec.Struct, kw_only=True, frozen=True):
     """sglang.api.v1.AddExternalCorpusRequest: JSON object (unknown keys ignored)."""
 
@@ -2484,6 +2545,73 @@ def encode_UpdateWeightVersionResponse(v: UpdateWeightVersionResponse) -> Dict[s
     d["message"] = v.message
     if v.new_version is not None:
         d["new_version"] = v.new_version
+    return d
+
+
+def decode_OpenSessionRequest(value: Any) -> OpenSessionRequest:
+    m = _expect_map(value, expected="struct OpenSessionRequest")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "capacity_of_str_len":
+            kw["capacity_of_str_len"] = _expect_int(x, expected="i64")
+        elif key == "session_id":
+            kw["session_id"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "streaming":
+            kw["streaming"] = None if x is None else _expect_bool(x, expected="a boolean")
+        elif key == "timeout":
+            kw["timeout"] = None if x is None else _expect_float(x, expected="f64")
+    return OpenSessionRequest(**kw)
+
+
+def encode_OpenSessionRequest(v: OpenSessionRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["capacity_of_str_len"] = v.capacity_of_str_len
+    if v.session_id is not None:
+        d["session_id"] = v.session_id
+    if v.streaming is not None:
+        d["streaming"] = v.streaming
+    if v.timeout is not None:
+        d["timeout"] = float(v.timeout)
+    return d
+
+
+def decode_OpenSessionResponse(value: Any) -> OpenSessionResponse:
+    m = _expect_map(value, expected="struct OpenSessionResponse")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "session_id":
+            kw["session_id"] = _expect_str(x, expected="a string")
+    return OpenSessionResponse(**kw)
+
+
+def encode_OpenSessionResponse(v: OpenSessionResponse) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["session_id"] = v.session_id
+    return d
+
+
+def decode_CloseSessionRequest(value: Any) -> CloseSessionRequest:
+    m = _expect_map(value, expected="struct CloseSessionRequest")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "session_id":
+            kw["session_id"] = _expect_str(x, expected="a string")
+    return CloseSessionRequest(**kw)
+
+
+def encode_CloseSessionRequest(v: CloseSessionRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["session_id"] = v.session_id
+    return d
+
+
+def decode_CloseSessionResponse(value: Any) -> CloseSessionResponse:
+    m = _expect_map(value, expected="struct CloseSessionResponse")
+    return CloseSessionResponse()
+
+
+def encode_CloseSessionResponse(v: CloseSessionResponse) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
     return d
 
 

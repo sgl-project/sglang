@@ -39,8 +39,10 @@ wire_struct! {
         return_routed_experts: bool,
         routed_experts_start_len: i64,
         return_indexer_topk: bool,
-        session_id: (),
-        session_params: (),
+        /// Python's top-level `session_id` (radix-native sessions).
+        session_id: Option<&'a str>,
+        /// Python's `SessionParams`, positional (see `request::SessionParams`).
+        session_params: Option<&'a super::request::SessionParams>,
         lora_id: Option<&'a str>,
         custom_logit_processor: (),
         positional_embed_overrides: (),
@@ -214,6 +216,19 @@ control_messages! {
     /// `/list_external_corpora`.
     ListExternalCorporaReqInput {}
 
+    /// `/open_session`: Python's `OpenSessionReqInput`.
+    OpenSessionReqInput {
+        capacity_of_str_len: i64,
+        session_id: Option<String>,
+        streaming: Option<bool>,
+        timeout: Option<f64>,
+    }
+
+    /// `/close_session`: Python's `CloseSessionReqInput`.
+    CloseSessionReqInput {
+        session_id: String,
+    }
+
     /// `/update_weights_from_disk`: Python's `UpdateWeightFromDiskReqInput`.
     /// `is_async`, `keep_pause`, `token_step` and `manifest` are carried as
     /// Python carries them; its scheduler reads none of them.
@@ -377,8 +392,8 @@ impl<'a> From<&'a GenerateRequest> for TokenizedGenerateReqInput<'a> {
             return_routed_experts: false,
             routed_experts_start_len: 0,
             return_indexer_topk: false,
-            session_id: (),
-            session_params: (),
+            session_id: req.session_id.as_deref(),
+            session_params: req.session_params.as_ref(),
             lora_id: req.lora_id.as_deref(),
             custom_logit_processor: (),
             positional_embed_overrides: (),
@@ -513,6 +528,33 @@ impl RemoveExternalCorpusReqInput {
 impl ListExternalCorporaReqInput {
     pub fn new(rid: String) -> Self {
         Self { rid }
+    }
+}
+
+/// The `/open_session` fields; the owned form of `api::OpenSessionRequest`.
+#[derive(Debug, Clone, Default)]
+pub struct SessionOpen {
+    pub capacity_of_str_len: i64,
+    pub session_id: Option<String>,
+    pub streaming: Option<bool>,
+    pub timeout: Option<f64>,
+}
+
+impl OpenSessionReqInput {
+    pub fn new(rid: String, open: SessionOpen) -> Self {
+        Self {
+            rid,
+            capacity_of_str_len: open.capacity_of_str_len,
+            session_id: open.session_id,
+            streaming: open.streaming,
+            timeout: open.timeout,
+        }
+    }
+}
+
+impl CloseSessionReqInput {
+    pub fn new(rid: String, session_id: String) -> Self {
+        Self { rid, session_id }
     }
 }
 
@@ -1121,6 +1163,50 @@ mod tests {
             Some(true),
             "return_hidden_states at idx 16"
         );
+        assert!(
+            arr[20].is_nil() && arr[21].is_nil(),
+            "no session at idx 20/21"
+        );
+    }
+
+    /// A session turn lands at Python's slots: the top-level `session_id` at
+    /// idx 20 and `SessionParams` at idx 21 as the positional 5-array its
+    /// `array_like` struct decodes.
+    #[test]
+    fn header_session_params_are_positional() {
+        let req = GenerateRequest {
+            rid: "turn-2".into(),
+            input_ids: Some(vec![]),
+            session_params: Some(crate::message::request::SessionParams {
+                id: Some("s".into()),
+                rid: Some("turn-1".into()),
+                offset: None,
+                replace: None,
+                drop_previous_output: Some(true),
+            }),
+            ..Default::default()
+        };
+        let bytes = TokenizedGenerateReqInput::from(&req).encode().unwrap();
+        let val = rmpv::decode::read_value(&mut &bytes[..]).unwrap();
+        let arr = val.as_array().expect("array");
+        assert!(arr[20].is_nil());
+        assert_eq!(
+            arr[21],
+            rmpv::Value::Array(vec![
+                "s".into(),
+                "turn-1".into(),
+                rmpv::Value::Nil,
+                rmpv::Value::Nil,
+                true.into()
+            ])
+        );
+        let radix = GenerateRequest {
+            session_id: Some("s".into()),
+            ..Default::default()
+        };
+        let bytes = TokenizedGenerateReqInput::from(&radix).encode().unwrap();
+        let val = rmpv::decode::read_value(&mut &bytes[..]).unwrap();
+        assert_eq!(val.as_array().unwrap()[20].as_str(), Some("s"));
     }
 
     /// Python's `KvHintsEnvelope` / `KvHintAction` are dict-shaped msgspec

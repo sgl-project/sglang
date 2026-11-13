@@ -9,11 +9,11 @@ use crate::message::ids::Rid;
 use tokio::sync::oneshot;
 
 use crate::message::io_struct::{
-    AbortReq, CheckWeightsReqInput, ContinueGenerationReqInput, ControlRequest,
-    ExpertDistributionAction, ExpertDistributionReq, FlushCacheReqInput, FreezeGCReq,
-    PauseGenerationReqInput, PdRoleSwitch, PdRoleSwitchReqInput, ProfileOptions, ProfileReq,
-    ReleaseMemoryOccupationReqInput, ResumeMemoryOccupationReqInput, SetInternalStateReq,
-    SlowDownReqInput, UpdateWeightVersionReqInput,
+    AbortReq, CheckWeightsReqInput, CloseSessionReqInput, ContinueGenerationReqInput,
+    ControlRequest, ExpertDistributionAction, ExpertDistributionReq, FlushCacheReqInput,
+    FreezeGCReq, OpenSessionReqInput, PauseGenerationReqInput, PdRoleSwitch, PdRoleSwitchReqInput,
+    ProfileOptions, ProfileReq, ReleaseMemoryOccupationReqInput, ResumeMemoryOccupationReqInput,
+    SessionOpen, SetInternalStateReq, SlowDownReqInput, UpdateWeightVersionReqInput,
 };
 use crate::message::request::RequestKind;
 use crate::message::response::ResponseItem;
@@ -418,6 +418,61 @@ impl CoreHandle {
         self.inner.frontend.set_paused(paused);
     }
 
+    /// `/open_session`: open a session on every DP rank's scheduler, as
+    /// Python's `TokenizerManager.open_session`: a streaming session needs
+    /// `--enable-streaming-session`, an unset id is minted here, and a second
+    /// open of an id still in flight is refused. The id comes back once every
+    /// rank opened it; a rank that refused (the id is still open there)
+    /// answers `None`, Python's "check if a session with the same id is still
+    /// open".
+    pub(crate) async fn open_session(
+        &self,
+        mut open: SessionOpen,
+    ) -> Result<Option<String>, CoreError> {
+        if open.streaming == Some(true)
+            && !self.inner.metadata.deployment_info.enable_streaming_session
+        {
+            return Err(CoreError::InvalidArgument(
+                "Streaming sessions are disabled. Please relaunch with --enable-streaming-session."
+                    .into(),
+            ));
+        }
+        let session_id = open
+            .session_id
+            .get_or_insert_with(|| uuid::Uuid::new_v4().simple().to_string())
+            .clone();
+        if !self.inner.frontend.begin_opening(&session_id) {
+            return Ok(None);
+        }
+        let outcome = self
+            .control(&|| {
+                ControlRequest::OpenSessionReqInput(OpenSessionReqInput::new(
+                    Rid::new().to_string(),
+                    open.clone(),
+                ))
+            })
+            .await
+            .decode::<OpenSessionOutput>("open-session");
+        self.inner.frontend.end_opening(&session_id);
+        let outputs = outcome?;
+        Ok(outputs
+            .iter()
+            .all(|output| output.success)
+            .then_some(session_id))
+    }
+
+    /// `/close_session`: close the session on every DP rank; the scheduler
+    /// acks (it has no reply of its own).
+    pub(crate) async fn close_session(&self, session_id: String) -> Result<(), CoreError> {
+        self.ack("close-session", &|| {
+            ControlRequest::CloseSessionReqInput(CloseSessionReqInput::new(
+                Rid::new().to_string(),
+                session_id.clone(),
+            ))
+        })
+        .await
+    }
+
     /// Deliver one control request to every DP rank of the deployment.
     pub(super) async fn control(&self, build: &RequestBuilder<'_>) -> fanout::Replies {
         fanout::fan_out(
@@ -611,6 +666,12 @@ pub(crate) struct ProfileOutcome {
     pub(crate) success: bool,
     #[serde(default)]
     pub(crate) message: String,
+}
+
+/// The scheduler's `OpenSessionReqOutput`.
+#[derive(Debug, serde::Deserialize)]
+struct OpenSessionOutput {
+    success: bool,
 }
 
 /// The scheduler's `SetInternalStateReqOutput`.
@@ -1473,5 +1534,119 @@ mod tests {
         let released = accept_intake(harness.intake_rx.recv_async().await.unwrap());
         assert!(matches!(released.kind, RequestKind::Generate(_)));
         drop(parked);
+    }
+
+    /// `open_session` mints an id, carries Python's fields positionally,
+    /// answers the id once every rank opened it and `None` when one did
+    /// not, refuses a streaming session without the launch flag before any
+    /// rank, and refuses a second open of an id still in flight.
+    #[tokio::test]
+    async fn open_and_close_session_follow_python() {
+        use crate::api_server::core::CoreErrorKind;
+        use crate::message::io_struct::SessionOpen;
+        let harness = Harness::unbounded(8);
+        let error = harness
+            .handle
+            .open_session(SessionOpen {
+                streaming: Some(true),
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), CoreErrorKind::InvalidArgument);
+        assert!(harness.intake_rx.try_recv().is_err());
+
+        let reply = |session_id: &str, success: bool| {
+            Bytes::from(
+                rmp_serde::to_vec_named(
+                    &serde_json::json!({"session_id": session_id, "success": success}),
+                )
+                .unwrap(),
+            )
+        };
+        let handle = harness.handle.clone();
+        let (opened, items) = tokio::join!(
+            handle.open_session(SessionOpen {
+                capacity_of_str_len: 1000,
+                timeout: Some(30.0),
+                ..Default::default()
+            }),
+            async {
+                let request = accept_intake(harness.intake_rx.recv_async().await.unwrap());
+                let RequestKind::Control(control) = &request.kind else {
+                    panic!("expected a control request");
+                };
+                let rmpv::Value::Array(items) =
+                    rmpv::decode::read_value(&mut &control.encode().unwrap()[..]).unwrap()
+                else {
+                    panic!("positional wire");
+                };
+                let minted = items[4].as_str().unwrap().to_owned();
+                request
+                    .sink
+                    .try_send(ResponseItem::Control(reply(&minted, true)))
+                    .unwrap();
+                items
+            },
+        );
+        // [tag, rid, ipc, capacity_of_str_len, session_id, streaming, timeout]
+        assert_eq!(items[0].as_str(), Some("OpenSessionReqInput"));
+        assert_eq!(items[3].as_i64(), Some(1000));
+        let minted = items[4].as_str().unwrap();
+        assert_eq!(minted.len(), 32, "a uuid4 hex, as Python mints");
+        assert!(items[5].is_nil());
+        assert_eq!(items[6].as_f64(), Some(30.0));
+        assert_eq!(opened.unwrap().as_deref(), Some(minted));
+
+        // The id is in flight: a second open answers None before any rank.
+        let handle = harness.handle.clone();
+        let first = tokio::spawn(async move {
+            handle
+                .open_session(SessionOpen {
+                    session_id: Some("dup".into()),
+                    ..Default::default()
+                })
+                .await
+        });
+        let request = accept_intake(harness.intake_rx.recv_async().await.unwrap());
+        assert_eq!(
+            harness
+                .handle
+                .open_session(SessionOpen {
+                    session_id: Some("dup".into()),
+                    ..Default::default()
+                })
+                .await
+                .unwrap(),
+            None
+        );
+        assert!(harness.intake_rx.try_recv().is_err());
+        request
+            .sink
+            .try_send(ResponseItem::Control(reply("dup", false)))
+            .unwrap();
+        assert_eq!(first.await.unwrap().unwrap(), None, "the scheduler refused");
+
+        let handle = harness.handle.clone();
+        let (closed, session_id) = tokio::join!(handle.close_session("dup".into()), async {
+            let request = accept_intake(harness.intake_rx.recv_async().await.unwrap());
+            let RequestKind::Control(control) = &request.kind else {
+                panic!("expected a control request");
+            };
+            let rmpv::Value::Array(items) =
+                rmpv::decode::read_value(&mut &control.encode().unwrap()[..]).unwrap()
+            else {
+                panic!("positional wire");
+            };
+            request
+                .sink
+                .try_send(ResponseItem::Control(Bytes::from(
+                    rmp_serde::to_vec_named(&serde_json::json!({"rid": "x"})).unwrap(),
+                )))
+                .unwrap();
+            items[3].as_str().map(str::to_owned)
+        });
+        closed.unwrap();
+        assert_eq!(session_id.as_deref(), Some("dup"));
     }
 }

@@ -349,6 +349,34 @@ pub struct UpdateWeightVersionResponse {
     #[prost(string, optional, tag = "3")]
     pub new_version: ::core::option::Option<::prost::alloc::string::String>,
 }
+/// `/open_session`: open a multi-turn session on every DP rank's scheduler.
+/// Python's `OpenSessionReqInput`; the frontend mints `session_id` when unset.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OpenSessionRequest {
+    #[prost(int64, tag = "1")]
+    pub capacity_of_str_len: i64,
+    #[prost(string, optional, tag = "2")]
+    pub session_id: ::core::option::Option<::prost::alloc::string::String>,
+    /// A streaming session needs `--enable-streaming-session`.
+    #[prost(bool, optional, tag = "3")]
+    pub streaming: ::core::option::Option<bool>,
+    #[prost(double, optional, tag = "4")]
+    pub timeout: ::core::option::Option<f64>,
+}
+/// The session's id; HTTP answers it as a bare JSON string, as Python does.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct OpenSessionResponse {
+    #[prost(string, tag = "1")]
+    pub session_id: ::prost::alloc::string::String,
+}
+/// `/close_session`.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct CloseSessionRequest {
+    #[prost(string, tag = "1")]
+    pub session_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct CloseSessionResponse {}
 /// `/add_external_corpus`: exactly one of `file_path` (a JSONL file of strings
 /// on the server) or `documents`; `token_chunks` is for pre-tokenized input.
 #[derive(Clone, PartialEq, ::prost::Message)]
