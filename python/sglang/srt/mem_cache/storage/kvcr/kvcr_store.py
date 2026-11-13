@@ -46,6 +46,11 @@ from sglang.srt.mem_cache.storage.kvcr.inventory import KVCRInventory
 
 logger = logging.getLogger(__name__)
 
+# The completion poll runs at this interval while callers wait or completions arrive,
+# and backs off to the cap while idle: each wakeup takes the GIL from the scheduler.
+_POLL_INTERVAL_SECONDS = 0.001
+_IDLE_POLL_MAX_SECONDS = 0.02
+
 # Pools HiCache restores as TRAILING_PAGES windows (SWA, its DeepSeek V4
 # compressor states, Mamba): a page need not have state in them.
 _TRAILING_POOLS = frozenset(
@@ -125,6 +130,8 @@ class KVCRStore(HiCacheStorage):
         self._lookup_claims = {}
         self._poll_thread = None
         self._stop_poll = threading.Event()
+        # Callers blocked in _wait; the poll loop stays at its short interval while any wait.
+        self._waiters = 0
         self._closed = False
         self._pinning = _NoFrameworkPinning()
         self._extra = dict(storage_config.extra_config or {})
@@ -464,22 +471,30 @@ class KVCRStore(HiCacheStorage):
         # There can be concurrent backup and prefetch threads. One caller may
         # drain another caller's completion; keep it until the owner consumes it.
         with self._completion:
-            while handle not in self._completed:
-                self._completed.update(self._runner.poll_completed())
-                if handle not in self._completed:
-                    self._completion.wait(timeout=0.001)
+            self._waiters += 1
+            try:
+                while handle not in self._completed:
+                    self._completed.update(self._runner.poll_completed())
+                    if handle not in self._completed:
+                        self._completion.wait(timeout=_POLL_INTERVAL_SECONDS)
+            finally:
+                self._waiters -= 1
             result = self._completed.pop(handle)
             self._completion.notify_all()
             return result
 
     def _poll_loop(self):
+        wait = _POLL_INTERVAL_SECONDS
         while not self._stop_poll.is_set():
+            busy = True
             try:
                 with self._completion:
-                    self._completed.update(self._runner.poll_completed())
+                    completed = list(self._runner.poll_completed())
+                    self._completed.update(completed)
                     self._completion.notify_all()
                     if self._diagnostic_telemetry:
                         self._drain_diagnostics()
+                    busy = bool(completed) or self._waiters > 0
             except Exception:
                 # Native progress failure cannot safely be treated as a cache
                 # miss: HiCache could recycle a buffer still exposed to NIXL.
@@ -487,7 +502,10 @@ class KVCRStore(HiCacheStorage):
                     "KVCR L3 progress failed; terminating worker", exc_info=True
                 )
                 os._exit(1)
-            self._stop_poll.wait(0.001)
+            wait = (
+                _POLL_INTERVAL_SECONDS if busy else min(wait * 2, _IDLE_POLL_MAX_SECONDS)
+            )
+            self._stop_poll.wait(wait)
 
     def _record_inventory(self, event):
         if self._inventory is not None and event.tier.value == "DRAM":
