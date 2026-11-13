@@ -40,9 +40,14 @@ SGL_TEST_FILES_CI_DATA_REPO = "sgl-project/ci-data-diffusion"
 SGL_TEST_FILES_CI_DATA_REVISION = "75992dbf1d6eaeacbc1c2cd6beb48f77dd7ae4f7"
 
 # The NPU pin is kept as a separate branch so ascend GT can be bumped independently
-# when it's regenerated on its own cadence.
+# when it's regenerated on its own cadence. 2173af2f re-generated the MiniMax-H3
+# frames after #38671 made num_inference_steps=50 run 50 denoising updates
+# (previously 49). The regeneration must run on a branch where
+# pin_consistency_quality=False for this case (npu_diffusion_ci_fixes_2): generating
+# on main pins quality='exact', which disables MiniMax-H3's env-selected Cache-DiT
+# and produces a golden from a different code path than the test runs.
 if current_platform.is_npu():
-    SGL_TEST_FILES_CI_DATA_REVISION = "609c4cef31864d75dbd11fe3c26b8ae09469204d"
+    SGL_TEST_FILES_CI_DATA_REVISION = "2173af2fe762e2c95e18b06d017604d520196eff"
 
 SGL_TEST_FILES_CONSISTENCY_GT_ROOT = (
     "https://raw.githubusercontent.com/"

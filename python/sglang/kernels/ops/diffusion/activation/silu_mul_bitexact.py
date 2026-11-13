@@ -99,7 +99,7 @@ def fused_silu_mul_bitexact(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
 def fused_packed_silu_mul_bitexact(x: torch.Tensor) -> torch.Tensor:
     """Bit-exact SwiGLU over a contiguous packed ``[..., 2 * D]`` input."""
     if not (
-        x.is_cuda
+        (x.is_cuda or x.is_xpu)
         and x.dtype is torch.bfloat16
         and x.dim() == 3
         and x.stride(-1) == 1
@@ -113,7 +113,7 @@ def fused_packed_silu_mul_bitexact(x: torch.Tensor) -> torch.Tensor:
     rows = x.numel() // x.shape[-1]
     row_stride = x.stride(-2)
     out = torch.empty((*x.shape[:-1], hidden), dtype=x.dtype, device=x.device)
-    with torch.cuda.device(x.device):
+    with torch.get_device_module(x.device).device(x.device):
         _packed_silu_mul_kernel[(rows, triton.cdiv(hidden, 1024))](
             out,
             x,

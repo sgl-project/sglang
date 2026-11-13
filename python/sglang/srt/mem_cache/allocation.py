@@ -30,6 +30,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_hip,
     is_npu,
+    is_xpu,
     next_power_of_2,
     support_triton,
 )
@@ -38,6 +39,7 @@ from sglang.srt.utils.common import is_pin_memory_available
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_cuda = is_cuda()
+_is_xpu = is_xpu()
 _is_cpu = is_cpu()
 
 if _is_cpu:
@@ -346,7 +348,7 @@ def _alloc_page_size(batch: ScheduleBatch) -> int:
     # the real allocator's page_size there. Elsewhere the two are equal --
     # including under KV sharding, which widens the index space but keeps the
     # allocator page at the physical page.
-    if (_is_hip or _is_cuda) and get_parallel().dcp_enabled:
+    if (_is_hip or _is_cuda or _is_xpu) and get_parallel().dcp_enabled:
         return batch.tree_cache.token_to_kv_pool_allocator.page_size
     return batch.tree_cache.page_size
 

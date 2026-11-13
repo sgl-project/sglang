@@ -36,7 +36,7 @@ conda create -n sgl-xpu python=3.12 -y
 conda activate sgl-xpu
 
 # Set PyTorch XPU as primary pip install channel to avoid installing the larger CUDA-enabled version and prevent potential runtime issues.
-pip3 install torch==2.13.0+xpu torchvision==0.28.0+xpu torchaudio==2.11.0+xpu --index-url https://download.pytorch.org/whl/xpu
+pip3 install torch==2.14.0+xpu torchvision==0.29.0+xpu torchaudio==2.11.0+xpu --index-url https://download.pytorch.org/whl/xpu
 pip3 install xgrammar==0.1.33 --no-deps # xgrammar will introduce CUDA-enabled triton which might conflict with XPU
 
 # Clone the SGLang code
@@ -49,7 +49,7 @@ cd python
 cp pyproject_xpu.toml pyproject.toml
 # Install SGLang dependent libs, and build SGLang main package
 pip install --upgrade pip setuptools
-pip install -v . --extra-index-url https://download.pytorch.org/whl/xpu
+pip install -v ".[dev,diffusion]" --extra-index-url https://download.pytorch.org/whl/xpu
 ```
 
 ### Install Using Docker
@@ -284,6 +284,24 @@ via `--cuda-graph-backend-prefill` or `--cuda-graph-config`.
 |---|---|
 | Two-batch overlap (`--enable-two-batch-overlap`) | Not yet supported |
 | Speculative decoding | Not yet implemented |
+
+## Decode Context Parallel (DCP) on Intel XPU [Experimental]
+
+DCP shards the KV cache across the ranks of a TP group by token position. It grows
+the servable context only when `tp_size` exceeds the model's KV heads, which TP would
+otherwise replicate, and decode gets slower, so use it only when the context you need
+does not fit.
+
+```bash
+python -m sglang.launch_server --model-path Qwen/Qwen3.5-4B --device xpu \
+    --attention-backend intel_xpu --tp 2 --dcp-size 2 \
+    --disable-radix-cache --mem-fraction-static 0.60
+```
+
+It needs the `intel_xpu` attention backend and ranks that share their DCP group's
+KV heads: Qwen3.5 models, or models with at most `tp_size / dcp_size` KV heads.
+Unsupported features are refused at startup. If startup fails with
+`UR_RESULT_ERROR_OUT_OF_RESOURCES`, lower `--mem-fraction-static`.
 
 ## Memory Saver (release/resume memory occupation) on Intel XPU [Experimental]
 

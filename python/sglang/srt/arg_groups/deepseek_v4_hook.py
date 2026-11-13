@@ -289,23 +289,41 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             read_ragged_verify_mode,
         )
 
+        # CP size may still be implicit here; validate_deepseek_v4_cp resolves it.
+        supported_prefill_cp = (
+            cfg.disaggregation_mode == "prefill"
+            and cfg.enable_prefill_cp
+            and cfg.cp_strategy == "interleave"
+        )
         if (
             read_ragged_verify_mode() is not RaggedVerifyMode.STATIC
             or cfg.disaggregation_transfer_backend != "mooncake"
-            or cfg.enable_prefill_cp
-            or cfg.attn_cp_size != 1
+            or (
+                (cfg.enable_prefill_cp or cfg.attn_cp_size != 1)
+                and not supported_prefill_cp
+            )
             or cfg.dcp_size != 1
         ):
             raise ValueError(
                 "DeepSeek-V4.1 DSpark PD requires static verify, Mooncake, "
-                "and CP=1 on both servers. DP attention is supported when "
+                "DCP=1, and CP=1 on decode. Prefill CP requires "
+                "--enable-prefill-cp with the interleave strategy. "
+                "DP attention is supported when "
                 "both servers use the same block size and target/draft KV layout."
             )
 
     prefill_graph = cfg.cuda_graph_config.prefill
-    if prefill_graph.backend != Backend.DISABLED and prefill_graph.max_seq_len is None:
-        # The captured low-ratio indexer scores a static context width; 16k
-        # keeps it inside the candidate window at under 1 ms per layer.
+    cp_breakable_prefill = (
+        cfg.enable_prefill_cp
+        and cfg.cp_strategy == "interleave"
+        and cfg.tp_size > 1
+        and prefill_graph.backend == Backend.BREAKABLE
+    )
+    if (
+        prefill_graph.backend != Backend.DISABLED
+        and prefill_graph.max_seq_len is None
+        and not cp_breakable_prefill
+    ):
         declare_resolution(
             server_args,
             "validate_deepseek_v41_features",

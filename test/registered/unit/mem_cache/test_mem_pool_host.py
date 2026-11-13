@@ -1,5 +1,6 @@
 """Unit tests for host-pool allocation and free-list bookkeeping."""
 
+import contextlib
 import threading
 import unittest
 import unittest.mock
@@ -13,6 +14,7 @@ from sglang.srt.mem_cache.memory_pool import (
     MambaPool,
     MHATokenToKOnlyPool,
     MHATokenToKVPool,
+    MLATokenToKVPool,
 )
 from sglang.srt.mem_cache.memory_pool_host import (
     DeepSeekV4PagedHostPool,
@@ -60,6 +62,88 @@ class TestHostKVCache(CustomTestCase):
             device="cpu",
             allocator_type="default",
         )
+
+    def test_packed_transfers_use_captured_target_and_draft_buffers(self):
+        """Target and draft rows retain their bound destinations during transfer."""
+
+        def copy_rows(*, src_layers, dst_layers, src_indices, dst_indices, page_size):
+            for src, dst in zip(src_layers, dst_layers, strict=True):
+                dst[dst_indices] = src[src_indices]
+
+        for mla in (False, True):
+            with self.subTest(mla=mla):
+                pool_type = MLATokenToKVPool if mla else MHATokenToKVPool
+                host_type = MLATokenToKVPoolHost if mla else MHATokenToKVPoolHost
+                geometry = (
+                    dict(kv_lora_rank=2, qk_rope_head_dim=2)
+                    if mla
+                    else dict(head_num=1, head_dim=4)
+                )
+                pools = tuple(
+                    pool_type(
+                        size=4,
+                        page_size=2,
+                        dtype=torch.float16,
+                        layer_num=layers,
+                        device="cpu",
+                        enable_memory_saver=False,
+                        **geometry,
+                    )
+                    for layers in (2, 1, 1)
+                )
+                host = host_type(
+                    pools[0],
+                    host_to_device_ratio=2,
+                    host_size=0,
+                    page_size=2,
+                    layout="layer_first",
+                    pin_memory=False,
+                    mtp_draft_device_pools=pools[1:],
+                )
+                self.addCleanup(host.destroy)
+                names = ("kv_buffer",) if mla else ("k_buffer", "v_buffer")
+                buffers = [
+                    buffer
+                    for name in names
+                    for pool in pools
+                    for buffer in getattr(pool, name)
+                ]
+                for value, buffer in enumerate(buffers, 1):
+                    buffer.fill_(value)
+                source = torch.tensor([2, 3])
+                saved = [buffer[source].clone() for buffer in buffers]
+                destination = torch.tensor([4, 5])
+                host_indices = torch.tensor([0, 1])
+                module = "mla" if mla else "mha"
+                with unittest.mock.patch(
+                    f"sglang.srt.mem_cache.pool_host.{module}.transfer_kv_direct",
+                    side_effect=copy_rows,
+                    create=True,
+                ):
+                    with contextlib.ExitStack() as patches:
+                        for pool in pools:
+                            for name in names:
+                                patches.enter_context(
+                                    unittest.mock.patch.object(pool, name, None)
+                                )
+                        host.backup_from_device_all_layer(
+                            pools[0], host_indices, source, "direct"
+                        )
+                        for buffer in buffers:
+                            buffer.zero_()
+                        for layer in range(4):
+                            pool = pools[0] if layer < 2 else pools[layer - 1]
+                            host.load_to_device_per_layer(
+                                pool,
+                                host_indices,
+                                destination,
+                                layer,
+                                "direct",
+                                is_draft=layer >= 2,
+                            )
+                for buffer, expected in zip(buffers, saved, strict=True):
+                    torch.testing.assert_close(buffer[destination], expected)
+                    self.assertEqual(torch.count_nonzero(buffer[:4]).item(), 0)
 
     def test_index_k_host_pool_joins_a_host_pool_group(self):
         """Grouping a main KV pool with a K-only index pool raised AttributeError."""

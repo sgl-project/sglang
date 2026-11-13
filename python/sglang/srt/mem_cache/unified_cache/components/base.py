@@ -99,6 +99,30 @@ class PrepareLoadBackResult:
     allocated_mamba_slot: Optional[torch.Tensor] = None
 
 
+class BufferLoadBackContext:
+    """A component's part in one buffer-mode load-back; the default has none.
+
+    ``load_xfers`` are H2D destinations beyond the staged transfers. After
+    ``cc.load``, ``finalize_allocation`` commits or rolls back preparation;
+    on success, ``get_insert_fields()`` supplies the node data for insert.
+    ``get_redundant_device_slots()`` returns slots to free after the H2D ack.
+    """
+
+    load_xfers: tuple[PoolTransfer, ...] = ()
+
+    def finalize_allocation(self, success: bool) -> None:
+        """Commit or roll back after allocation; H2D may still be pending."""
+        pass
+
+    def get_insert_fields(self) -> dict[str, Any]:
+        return {}
+
+    def get_redundant_device_slots(
+        self, insert_result: InsertResult
+    ) -> list[tuple[PoolName, torch.Tensor]]:
+        return []
+
+
 @dataclasses.dataclass(frozen=True)
 class PreparePrefetchResult:
     """Outcome of prepare_prefetch; default = the component takes no part."""
@@ -751,6 +775,16 @@ class TreeComponent(ABC):
         component owns; None picks the built-in one for the transfer's hit
         policy."""
         return None
+
+    def prepare_buffer_load_back(
+        self, req: Req, staged: list[PoolTransfer]
+    ) -> Optional[BufferLoadBackContext]:
+        """Validate staged data and prepare this component's load-back context.
+
+        Return None on insufficient device capacity. Invalid staged data is
+        an invariant violation, not a capacity failure.
+        """
+        return BufferLoadBackContext()
 
     def build_hicache_transfers(
         self,

@@ -120,6 +120,10 @@ class TestMLAHostDedupPrimitives(unittest.TestCase):
                         device="cpu",
                         kv_buffer=[torch.zeros(10, 1, 6) for _ in range(2)],
                     )
+                    pool.data_ptrs = torch.tensor(
+                        [buffer.data_ptr() for buffer in pool.kv_buffer],
+                        dtype=torch.uint64,
+                    )
                     kwargs = dict(
                         host_to_device_ratio=2,
                         host_size=host_size,

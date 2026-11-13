@@ -9,6 +9,7 @@ from tvm_ffi import Module
 
 from sglang.kernels.jit.utils import (
     cache_once,
+    cuda_stubs_dir,
     empty_sentinel,
     is_arch_support_pdl,
     lazy_register_class,
@@ -182,7 +183,7 @@ class Communicator(tvm_ffi.Object):
 def _init_ipc_manager() -> None:
     module = load_jit(
         "cuda_ipc",
-        extra_ldflags=["-lcuda"],
+        extra_ldflags=[f"-L{cuda_stubs_dir()}", "-lcuda"],
         cuda_files=["distributed/ipc.cuh"],
         cuda_wrappers=[("register_once", "register_ipc_manager")],
     )

@@ -33,6 +33,7 @@ from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry  # noqa: E402
 from sglang.srt.managers.io_struct import (  # noqa: E402
     AbortReq,
     BatchStrOutput,
+    EmbeddingReqInput,
     GenerateReqInput,
     wrap_as_pickle,
 )
@@ -606,6 +607,164 @@ class TestInitReqStateDuplicateDetection(CustomTestCase):
 
         tm._init_req_state(obj)
         self.assertIn(rid, tm.rid_to_state)
+
+
+class TestInitReqStateAtomicity(CustomTestCase):
+    def assert_map_unchanged(self, tm, original_map, original_states):
+        self.assertIs(tm.rid_to_state, original_map)
+        self.assertEqual(set(tm.rid_to_state), set(original_states))
+        for rid, state in original_states.items():
+            self.assertIs(tm.rid_to_state[rid], state)
+
+    def test_live_collision_preserves_map_and_adapter_references(self):
+        for request_type in (GenerateReqInput, EmbeddingReqInput):
+            for collision_index in range(3):
+                with self.subTest(
+                    request_type=request_type.__name__, position=collision_index
+                ):
+                    tm = _make_tm_for_generate(self, enable_lora=True)
+                    tm.enable_trace = True
+                    live_state = _make_req_state("live")
+                    tm.rid_to_state = {"live": live_state}
+                    original_map = tm.rid_to_state
+                    original_states = dict(original_map)
+                    tm.abort_request = Mock()
+                    tm._release_lora_once = Mock()
+                    tm._tokenize_one_request = AsyncMock()
+                    tm._send_one_request = AsyncMock()
+                    rids = ["fresh0", "fresh1", "fresh2"]
+                    rids[collision_index] = "live"
+                    obj = request_type(
+                        text=["a", "b", "c"], rid=rids, lora_path="adapter"
+                    )
+
+                    async def drive():
+                        live_state.obj.lora_path = "adapter"
+                        live_state.obj.lora_id = await tm.lora_registry.acquire(
+                            "adapter"
+                        )
+                        with self.assertRaisesRegex(
+                            ValueError, "Duplicate request ID detected: live"
+                        ):
+                            await tm.generate_request(obj).__anext__()
+                        self.assertEqual(
+                            tm.lora_registry._counters["adapter"].value(), 1
+                        )
+
+                    with patch.object(APIServerReqTimeStats, "init_trace_ctx") as trace:
+                        asyncio.run(drive())
+                    self.assert_map_unchanged(tm, original_map, original_states)
+                    trace.assert_not_called()
+                    tm.abort_request.assert_not_called()
+                    tm._release_lora_once.assert_not_called()
+                    tm._tokenize_one_request.assert_not_called()
+                    tm._send_one_request.assert_not_called()
+                    tm.send_to_scheduler.send_pyobj.assert_not_called()
+                    self.assertFalse(live_state.abort_sent)
+                    self.assertFalse(live_state.lora_released)
+
+    def test_initialization_exceptions_preserve_map(self):
+        targets = (
+            "ReqState",
+            "APIServerReqTimeStats",
+            "APIServerReqTimeStats.init_trace_ctx",
+            "APIServerReqTimeStats.set_created_time",
+        )
+        for target in targets:
+            for failure_index in range(2):
+                with self.subTest(target=target, failure_index=failure_index):
+                    tm = _make_tokenizer_manager(self)
+                    tm.enable_trace = True
+                    tm.rid_to_state = {"live": _make_req_state("live")}
+                    original_map = tm.rid_to_state
+                    original_states = dict(original_map)
+                    obj = GenerateReqInput(text=["a", "b"], rid=["fresh0", "fresh1"])
+                    obj.normalize_batch_and_arguments()
+                    first_result = {
+                        "ReqState": _make_req_state("fresh0"),
+                        "APIServerReqTimeStats": APIServerReqTimeStats(),
+                    }.get(target)
+                    effects = [first_result] * failure_index + [
+                        RuntimeError("initialization failed")
+                    ]
+                    with patch(
+                        f"sglang.srt.managers.tokenizer_manager.{target}",
+                        side_effect=effects,
+                    ):
+                        with self.assertRaisesRegex(
+                            RuntimeError, "initialization failed"
+                        ):
+                            tm._init_req_state(obj)
+                    self.assert_map_unchanged(tm, original_map, original_states)
+
+    def test_valid_single_and_batch_requests(self):
+        for request_type in (GenerateReqInput, EmbeddingReqInput):
+            for single in (True, False):
+                with self.subTest(request_type=request_type.__name__, single=single):
+                    tm = _make_tokenizer_manager(self)
+                    live_state = _make_req_state("live")
+                    tm.rid_to_state = {"live": live_state}
+                    obj = request_type(
+                        text="a" if single else ["a", "b"],
+                        rid="fresh" if single else ["fresh0", "fresh1"],
+                        received_time=123.0,
+                    )
+                    obj.normalize_batch_and_arguments()
+                    tm._init_req_state(obj)
+                    items = [obj] if single else [obj[i] for i in range(len(obj.rid))]
+                    self.assertEqual(len(tm.rid_to_state), len(items) + 1)
+                    self.assertIs(tm.rid_to_state["live"], live_state)
+                    for item in items:
+                        state = tm.rid_to_state[item.rid]
+                        self.assertIs(state.obj, item)
+                        self.assertEqual(state.time_stats.created_time, 123.0)
+                        self.assertFalse(state.dispatched)
+                        self.assertFalse(state.event.is_set())
+
+    def test_within_batch_duplicates_preserve_map(self):
+        for request_type in (GenerateReqInput, EmbeddingReqInput):
+            with self.subTest(request_type=request_type.__name__):
+                tm = _make_tm_for_generate(self)
+                tm.rid_to_state = {"live": _make_req_state("live")}
+                original_map = tm.rid_to_state
+                original_states = dict(original_map)
+                obj = request_type(text=["a", "b"], rid=["duplicate", "duplicate"])
+
+                async def drive():
+                    with self.assertRaisesRegex(ValueError, "Duplicate"):
+                        await tm.generate_request(obj).__anext__()
+
+                asyncio.run(drive())
+                self.assert_map_unchanged(tm, original_map, original_states)
+
+    def test_direct_initialization_rejects_duplicate_ids(self):
+        tm = _make_tokenizer_manager(self)
+        obj = GenerateReqInput(text=["a", "b"], rid=["fresh0", "fresh1"])
+        obj.normalize_batch_and_arguments()
+        obj.rid = ["duplicate", "duplicate"]
+        with self.assertRaisesRegex(ValueError, "Duplicate request ID"):
+            tm._init_req_state(obj)
+        self.assertFalse(tm.rid_to_state)
+
+    def test_trace_metadata_is_preserved(self):
+        tm = _make_tokenizer_manager(self)
+        tm.enable_trace = True
+        obj = GenerateReqInput(
+            text=["a", "b"],
+            rid=["fresh0", "fresh1"],
+            bootstrap_room=[10, 11],
+            received_time=123.0,
+        )
+        obj.normalize_batch_and_arguments()
+        request = Mock(headers={"traceparent": "parent", "unrelated": "ignored"})
+        with patch.object(APIServerReqTimeStats, "init_trace_ctx") as trace:
+            tm._init_req_state(obj, request)
+        self.assertEqual(trace.call_count, 2)
+        for i, trace_call in enumerate(trace.call_args_list):
+            self.assertEqual(
+                trace_call.args, (obj.rid[i], 10 + i, {"traceparent": "parent"})
+            )
+            self.assertEqual(tm.rid_to_state[obj.rid[i]].time_stats.created_time, 123.0)
 
 
 class TestResubmitAfterCompletion(CustomTestCase):

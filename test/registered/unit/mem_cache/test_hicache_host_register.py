@@ -110,6 +110,7 @@ class TestHiCacheHostRegister(unittest.TestCase):
         pool.kv_cache_dim = 5
         pool.dtype = torch.float16
         pool.device_pool = SimpleNamespace(device="cuda")
+        pool._transfer_device = torch.device("cuda")
         pool.device = "cpu"
         pool.pin_memory = True
         pool.allocator = object()
@@ -133,6 +134,7 @@ class TestHiCacheHostRegister(unittest.TestCase):
         pool.head_dim = 4
         pool.dtype = torch.float16
         pool.device_pool = SimpleNamespace(device="cuda")
+        pool._transfer_device = torch.device("cuda")
         pool.device = "cpu"
         pool.pin_memory = True
         pool.allocator = object()
@@ -290,6 +292,7 @@ class TestHiCacheHostRegister(unittest.TestCase):
                 pool.v_head_dim = 7
                 pool.dtype = torch.float16
                 pool.device_pool = SimpleNamespace(device="cuda")
+                pool._transfer_device = torch.device("cuda")
                 pool.device = "cpu"
                 pool.pin_memory = True
                 pool.allocator = object()

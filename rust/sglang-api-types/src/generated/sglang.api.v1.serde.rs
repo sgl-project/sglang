@@ -2314,6 +2314,9 @@ impl ::serde::Serialize for MediaRef {
         if let Some(v) = &self.use_audio {
             ::serde::ser::SerializeMap::serialize_entry(&mut map, "use_audio", v)?;
         }
+        if let Some(v) = &self.image_grid_thw {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "image_grid_thw", v)?;
+        }
         ::serde::ser::SerializeMap::end(map)
     }
 }
@@ -2335,6 +2338,7 @@ impl<'de> ::serde::Deserialize<'de> for MediaRef {
             "max_tokens_per_frame",
             "max_image_tokens",
             "use_audio",
+            "image_grid_thw",
         ];
         struct V;
         impl<'de> ::serde::de::Visitor<'de> for V {
@@ -2360,6 +2364,7 @@ impl<'de> ::serde::Deserialize<'de> for MediaRef {
                 let mut f_max_tokens_per_frame = None;
                 let mut f_max_image_tokens = None;
                 let mut f_use_audio = None;
+                let mut f_image_grid_thw = None;
                 while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
                     match key.as_ref() {
                         "url" => {
@@ -2456,6 +2461,12 @@ impl<'de> ::serde::Deserialize<'de> for MediaRef {
                             }
                             f_use_audio = Some(map.next_value::<Option<bool>>()?);
                         }
+                        "image_grid_thw" => {
+                            if f_image_grid_thw.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("image_grid_thw"));
+                            }
+                            f_image_grid_thw = Some(map.next_value::<Option<ImageGridThw>>()?);
+                        }
                         other => {
                             return Err(::serde::de::Error::unknown_field(other, FIELDS));
                         }
@@ -2476,10 +2487,27 @@ impl<'de> ::serde::Deserialize<'de> for MediaRef {
                     max_tokens_per_frame: f_max_tokens_per_frame.flatten(),
                     max_image_tokens: f_max_image_tokens.flatten(),
                     use_audio: f_use_audio.flatten(),
+                    image_grid_thw: f_image_grid_thw.flatten(),
                 })
             }
         }
         deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for ImageGridThw {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.rows.iter())
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for ImageGridThw {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(ImageGridThw {
+            rows: <::prost::alloc::vec::Vec<Int64List> as ::serde::Deserialize>::deserialize(
+                deserializer,
+            )?,
+        })
     }
 }
 
