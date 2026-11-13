@@ -114,34 +114,17 @@ def copy_reference(sources, destinations, source_rows, destination_rows, valid):
     )
 
 
-def mapping_reference(
-    plan, batch, valid, capacity, slots, req, lens, prefixes, extends
-):
-    dst, eligible, offset = [], [], 0
-    for r, length, p, e, width in zip(req, lens, prefixes, extends, slots):
-        for col in range(width):
-            live = r > 0 and length > 0 and col < e
-            dst.append(offset + p + col if live else 0)
-            eligible.append(live)
-        if r >= 0 and length > 0:
-            offset += length
+def mapping_device_reference(plan, valid, dst, eligible):
     device = plan.source.device
-    dst = torch.tensor(dst, device=device)
-    eligible = torch.tensor(eligible, device=device)
-    loc = batch.out_cache_loc.long()
-    return mapping_device_reference(plan, loc, valid, capacity, dst, eligible)
-
-
-def mapping_device_reference(plan, loc, valid, capacity, dst, eligible):
-    device = plan.source.device
-    mask = eligible & valid & (loc >= 0) & (loc < capacity)
-    safe = loc.clamp(0, capacity - 1)
-    counts = torch.zeros(capacity, device=device, dtype=torch.int32)
-    counts.scatter_add_(0, safe, mask.int())
-    mask &= (counts[safe] == 1) & (plan.source[dst] == loc)
+    mask = eligible & valid
     occupied = torch.zeros(plan.total_tokens, device=device, dtype=torch.int32)
     occupied.scatter_add_(0, dst, mask.int())
-    return torch.arange(loc.numel(), device=device), dst, mask, occupied == 0
+    return (
+        torch.arange(valid.numel(), device=device),
+        torch.where(mask, dst, 0),
+        mask,
+        occupied == 0,
+    )
 
 
 def measure(reference, candidate, device, repeats, *, capture=True):
@@ -449,7 +432,10 @@ def main():
             logical_max_context_len=16,
         )
         total = sum(length for r, length in zip(req, lens) if r >= 0 and length > 0)
-        source, dest, valid = kernels.prefill_plan(batch, manager, total)
+        source, dest, valid, current_mapping = kernels.prefill_plan(
+            batch, manager, total
+        )
+        assert current_mapping is None
         expected = torch.cat(
             [table[r, :length] for r, length in zip(req, lens) if r >= 0 and length > 0]
         )
@@ -461,32 +447,8 @@ def main():
                 torch.ones(total, device=d, dtype=torch.bool),
             ),
         )
-        plan = SimpleNamespace(source=source, total_tokens=total)
-        loc = []
-        for r, p, e, width in zip(req, prefixes, extends, slots):
-            loc.extend(
-                [
-                    int(table[max(r, 0), p + col].cpu()) if col < e else -1
-                    for col in range(width)
-                ]
-            )
-        batch.out_cache_loc = torch.tensor(loc, device=d)
-        current_valid = torch.ones(len(loc), device=d, dtype=torch.bool)
-        for variation in ("normal", "duplicate", "invalid"):
-            if variation == "duplicate" and len(loc) > 1:
-                batch.out_cache_loc[1] = batch.out_cache_loc[0]
-            if variation == "invalid":
-                batch.out_cache_loc[0] = 999
-                current_valid[-1] = False
-            ref = lambda: mapping_reference(
-                plan, batch, current_valid, 128, slots, req, lens, prefixes, extends
-            )
-            fused = lambda: kernels.prefill_current_mapping(
-                plan, batch, current_valid, 128, slots, req, lens, prefixes, extends
-            )
-            exact(fused(), ref())
-            results["cases"].append(f"mapping/{req}/{variation}")
-            checkpoint(args, results)
+        results["cases"].append(f"prefill-host-plan/{req}/tokens={total}")
+        checkpoint(args, results)
     if d == "npu":
         large_prefill_cases(args, kernels, results)
     if args.mf:
@@ -532,7 +494,7 @@ def large_prefill_cases(args, kernels, results):
         total = sum(lens)
         actual = kernels.prefill_plan(batch, manager, total)
         exact(
-            actual,
+            actual[:3],
             (
                 torch.cat([table[r, :n] for r, n in zip(req, lens)]).long(),
                 torch.arange(total, device=d),
@@ -544,43 +506,13 @@ def large_prefill_cases(args, kernels, results):
             [table[r, n - width : n] for r, n in zip(req, lens)]
         ).long()
         current_valid = torch.ones(b * width, device=d, dtype=torch.bool)
-        ref = lambda: mapping_reference(
-            plan,
-            batch,
-            current_valid,
-            table.numel(),
-            [width] * b,
-            req,
-            lens,
-            batch.extend_prefix_lens_cpu,
-            batch.extend_seq_lens_cpu,
-        )
-        fused = lambda: kernels.prefill_current_mapping(
-            plan,
-            batch,
-            current_valid,
-            table.numel(),
-            [width] * b,
-            req,
-            lens,
-            batch.extend_prefix_lens_cpu,
-            batch.extend_seq_lens_cpu,
-        )
-        exact(fused(), ref())
-        # Full current-mapping wrappers, including the baseline, construct
-        # synchronous host-to-device tensors and cannot use GLOBAL capture.
-        current_valid[::2] = False
-        exact(fused(), ref())
-        current_valid.fill_(True)
+        # Prepare metadata before capture and exercise the fused device plan.
         graph_stage = prefill_mapping_device_case(
-            kernels, plan, batch, current_valid, lens, width
+            kernels, manager, plan, batch, current_valid, lens, width
         )
         results["cases"].append(f"prefill-device-graph/B{b}/L{length}/Q{width}")
         results["cases"].append(f"prefill-large/B{b}/L{length}/Q{width}")
         if args.benchmark:
-            results["benchmarks"][f"mapping/B{b}L{length}Q{width}"] = measure(
-                ref, fused, d, 30, capture=False
-            )
             results["benchmarks"][f"mapping_device_stage/B{b}L{length}Q{width}"] = (
                 measure(graph_stage[0], graph_stage[1], d, 30)
             )
@@ -592,16 +524,6 @@ def large_prefill_cases(args, kernels, results):
                     "candidate_prefill_kv_plan", SOURCE / "prefill_kv_plan.py"
                 )
                 new = lambda: new_module.make_fused_prefill_plan(batch, manager, None)
-                old_mapping = lambda: reference_module.fused_prefill_current_mapping(
-                    plan, batch, current_valid, table.numel()
-                )
-                new_mapping = lambda: new_module.fused_prefill_current_mapping(
-                    plan, batch, current_valid, table.numel()
-                )
-                exact(new_mapping(), old_mapping())
-                results["benchmarks"][
-                    f"fused_prefill_current_mapping/B{b}L{length}Q{width}"
-                ] = measure(old_mapping, new_mapping, d, 30, capture=False)
                 results["benchmarks"][f"make_prefill_plan/B{b}L{length}"] = measure(
                     old, new, d, 30
                 )
@@ -660,16 +582,18 @@ def large_prefill_cases(args, kernels, results):
         checkpoint(args, results)
 
 
-def prefill_mapping_device_case(kernels, plan, batch, current_valid, lens, width):
-    """Validate the same three device kernels after CPU metadata upload."""
+def prefill_mapping_device_case(
+    kernels, manager, plan, batch, current_valid, lens, width
+):
+    """Validate fused prefix/current mapping after CPU metadata upload."""
     device = plan.source.device
     b, n, total = len(lens), current_valid.numel(), plan.total_tokens
-    capacity = (b + 1) * max(lens)
     starts = [sum(lens[:r]) for r in range(b)]
-    ends = [(r + 1) * width for r in range(b)]
     prefixes = [length - width for length in lens]
     metadata = torch.tensor(
-        ends + starts + prefixes + ends, device=device, dtype=torch.long
+        [r * width for r in range(b)] + prefixes + [width] * (2 * b),
+        device=device,
+        dtype=torch.long,
     )
     dst = torch.cat(
         [
@@ -678,45 +602,21 @@ def prefill_mapping_device_case(kernels, plan, batch, current_valid, lens, width
         ]
     )
     eligible = torch.ones(n, device=device, dtype=torch.bool)
-    reference = lambda: mapping_device_reference(
-        plan, batch.out_cache_loc, current_valid, capacity, dst, eligible
-    )
+    reference = lambda: mapping_device_reference(plan, current_valid, dst, eligible)
 
     def candidate():
-        source = torch.empty(n, device=device, dtype=torch.long)
-        destination = torch.empty_like(source)
-        valid = torch.empty(n, device=device, dtype=torch.bool)
-        host_mask = torch.empty(total, device=device, dtype=torch.bool)
-        counts = torch.empty(capacity, device=device, dtype=torch.int32)
-        kernels.kernels._mapping_init_kernel[
-            (kernels.kernels.triton.cdiv(max(capacity, total), 512),)
-        ](counts, host_mask, capacity, total, 512)
-        kernels.kernels._mapping_count_kernel[(kernels.kernels.triton.cdiv(n, 32),)](
-            metadata,
-            batch.out_cache_loc,
-            current_valid,
-            counts,
-            source,
-            destination,
-            valid,
-            n,
-            b,
-            capacity,
-            kernels.kernels.triton.next_power_of_2(b),
-            32,
-        )
-        kernels.kernels._mapping_finish_kernel[(kernels.kernels.triton.cdiv(n, 32),)](
-            plan.source,
-            batch.out_cache_loc,
-            counts,
-            destination,
-            valid,
-            host_mask,
-            n,
-            capacity,
-            32,
-        )
-        return source, destination, valid, host_mask
+        return kernels.kernels.prefill_plan(
+            batch.req_pool_indices,
+            batch.seq_lens,
+            manager.req_to_token_pool.req_to_token,
+            total,
+            max(lens),
+            manager.actual_request_rows,
+            manager.logical_max_context_len,
+            current_metadata=metadata,
+            current_valid=current_valid,
+            max_current_width=width,
+        )[3]
 
     graph, output = replay(candidate, reference)
     current_valid[::2] = False

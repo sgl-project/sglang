@@ -53,7 +53,9 @@ class FusedPrefillPlan:
     current_mapping: object = None
 
 
-def make_fused_prefill_plan(batch, manager, stream, *, prepared=None):
+def make_fused_prefill_plan(
+    batch, manager, stream, *, prepared=None, current_valid=None
+):
     _, total = (
         prepare_prefill_gather_rows(
             batch.req_pool_indices_cpu,
@@ -73,27 +75,38 @@ def make_fused_prefill_plan(batch, manager, stream, *, prepared=None):
         prefill_plan,
     )
 
-    source, destination, valid = prefill_plan(batch, manager, total)
-    return FusedPrefillPlan(stream, total, source, destination, valid)
+    current_metadata = None
+    max_current_width = 0
+    if current_valid is not None:
+        current_metadata, max_current_width = _current_metadata(batch, current_valid)
+    source, destination, valid, current_mapping = prefill_plan(
+        batch,
+        manager,
+        total,
+        current_valid=(
+            current_valid.reshape(-1) if current_metadata is not None else None
+        ),
+        current_metadata=current_metadata,
+        max_current_width=max_current_width,
+    )
+    return FusedPrefillPlan(stream, total, source, destination, valid, current_mapping)
 
 
-def fused_prefill_current_mapping(plan, batch, current_valid, host_token_capacity):
-    """Return fixed-shape D2D mapping or None for ambiguous CPU layouts."""
+def _current_metadata(batch, current_valid):
+    """Build native fused-plan metadata, or request an all-host fallback."""
     req = batch.req_pool_indices_cpu
     lengths = batch.seq_lens_cpu
     ext = batch.extend_seq_lens_cpu
     prefix = batch.extend_prefix_lens_cpu
-    loc = batch.out_cache_loc
     n = req.numel()
     if (
         ext is None
         or prefix is None
-        or loc is None
         or len(ext) != n
         or len(prefix) != n
         or lengths.numel() != n
     ):
-        return None
+        return None, 0
     counts = [int(x) for x in ext]
     prefixes = [int(x) for x in prefix]
     lens = [int(x) for x in lengths]
@@ -103,28 +116,23 @@ def fused_prefill_current_mapping(plan, batch, current_valid, host_token_capacit
         e < 0 or p < 0 or e + p != length
         for e, p, length in zip(counts, prefixes, lens)
     ):
-        return None
-    rows = int(loc.numel())
-    if rows != current_valid.numel() or not rows or not plan.total_tokens:
-        return None
+        return None, 0
+    rows = int(current_valid.numel())
+    if not rows:
+        return None, 0
     if sum(counts) == rows:
         slots = counts
     elif n and rows % n == 0 and all(e <= rows // n for e in counts):
         slots = [rows // n] * n
     else:
-        return None
-    from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.row_metadata import (
-        prefill_current_mapping,
+        return None, 0
+    starts, offset = [], 0
+    for width in slots:
+        starts.append(offset)
+        offset += width
+    metadata = torch.tensor(
+        starts + prefixes + counts + slots,
+        device=batch.req_pool_indices.device,
+        dtype=torch.long,
     )
-
-    return prefill_current_mapping(
-        plan,
-        batch,
-        current_valid,
-        host_token_capacity,
-        slots,
-        requests,
-        lens,
-        prefixes,
-        counts,
-    )
+    return metadata, max(slots, default=0)

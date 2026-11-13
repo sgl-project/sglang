@@ -79,7 +79,9 @@ def forward_fused_sparse_kv_offload(
     if not backend.graph_mode and forward_batch.forward_mode == ForwardMode.EXTEND:
         gather_plan = backend.forward_metadata.sparse_kv_fused_prefill_plan
         if gather_plan is None:
-            gather_plan = manager.prepare_forward_kv_plan(forward_batch, stream)
+            gather_plan = manager.prepare_forward_kv_plan(
+                forward_batch, stream, current=current_inputs
+            )
             backend.forward_metadata.sparse_kv_fused_prefill_plan = gather_plan
     k_nope, k_pe = manager.get_forward_kv(
         layer, forward_batch, stream, plan=gather_plan, current=current_inputs

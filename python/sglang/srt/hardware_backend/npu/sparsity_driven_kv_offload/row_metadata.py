@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import torch
 from sgl_kernel_npu.sparsity_driven_kv_offload import row_metadata as kernels
 
 
@@ -54,7 +53,15 @@ def mtp_publication_rows(batch, num_tokens, request_rows, context_len, host_capa
     )
 
 
-def prefill_plan(batch, manager, total):
+def prefill_plan(
+    batch,
+    manager,
+    total,
+    *,
+    current_valid=None,
+    current_metadata=None,
+    max_current_width=0,
+):
     """Keep CPU-derived output sizing outside the tensor-only device operator."""
     return kernels.prefill_plan(
         batch.req_pool_indices,
@@ -64,36 +71,9 @@ def prefill_plan(batch, manager, total):
         int(batch.seq_lens_cpu.max()) if total else 0,
         manager.actual_request_rows,
         manager.logical_max_context_len,
-    )
-
-
-def prefill_current_mapping(
-    plan, batch, current_valid, capacity, slots, requests, lengths, prefixes, extends
-):
-    """Build a D2D map while rejecting duplicate physical current rows."""
-    locations = batch.out_cache_loc.reshape(-1).contiguous()
-    current_valid = current_valid.reshape(-1).contiguous()
-    ends, starts, live_ends = [], [], []
-    row_end = full_start = 0
-    for width, req, length, ext in zip(slots, requests, lengths, extends):
-        starts.append(full_start)
-        live_ends.append(row_end + ext if req > 0 and length > 0 else row_end)
-        row_end += width
-        ends.append(row_end)
-        if req >= 0 and length > 0:
-            full_start += length
-    device = plan.source.device
-    metadata = torch.tensor(
-        ends + starts + prefixes + live_ends, device=device, dtype=torch.long
-    )
-    return kernels.prefill_current_mapping(
-        plan.source,
-        locations,
-        current_valid,
-        metadata,
-        capacity,
-        plan.total_tokens,
-        len(slots),
+        current_metadata=current_metadata,
+        current_valid=current_valid,
+        max_current_width=max_current_width,
     )
 
 

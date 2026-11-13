@@ -24,17 +24,19 @@ class PrefillReferenceTest(unittest.TestCase):
     def setUp(self):
         # Exercise framework planning on CPU; device kernel parity is tested by
         # test_sparse_kv_row_metadata.py and the companion NPU kernel tests.
-        reference_path = (
-            PATH.parents[6] / "test/manual/npu/test_sparse_kv_row_metadata.py"
-        )
-        reference_spec = importlib.util.spec_from_file_location(
-            "row_metadata_test_reference", reference_path
-        )
-        reference = importlib.util.module_from_spec(reference_spec)
-        reference_spec.loader.exec_module(reference)
         adapter = ModuleType("row_metadata_test_adapter")
 
-        def prefill_plan(batch, manager, total):
+        def prefill_plan(
+            batch,
+            manager,
+            total,
+            *,
+            current_metadata=None,
+            current_valid=None,
+            max_current_width=0,
+        ):
+            if (current_metadata is None) != (current_valid is None):
+                raise ValueError("current metadata and validity must be paired")
             rows, positions = [], []
             for req, length in zip(batch.req_pool_indices_cpu, batch.seq_lens_cpu):
                 if req >= 0 and length > 0:
@@ -43,10 +45,47 @@ class PrefillReferenceTest(unittest.TestCase):
             source = manager.host_source_indices(
                 torch.tensor(rows), torch.tensor(positions)
             )
-            return source, torch.arange(total), torch.ones(total, dtype=torch.bool)
+            current_mapping = None
+            if current_metadata is not None and current_valid is not None:
+                n = batch.req_pool_indices_cpu.numel()
+                starts, prefixes, extends, widths = current_metadata.split(n)
+                dst = torch.zeros(current_valid.numel(), dtype=torch.long)
+                eligible = torch.zeros_like(current_valid, dtype=torch.bool)
+                for i, (req, start, prefix, extend, width) in enumerate(
+                    zip(
+                        batch.req_pool_indices_cpu.tolist(),
+                        starts.tolist(),
+                        prefixes.tolist(),
+                        extends.tolist(),
+                        widths.tolist(),
+                    )
+                ):
+                    for col in range(extend):
+                        row = start + col
+                        if req > 0:
+                            dst[row] = (
+                                sum(int(x) for x in batch.seq_lens_cpu[:i])
+                                + prefix
+                                + col
+                            )
+                            eligible[row] = True
+                mask = eligible & current_valid.bool()
+                host_mask = torch.ones(total, dtype=torch.bool)
+                host_mask[dst[mask]] = False
+                current_mapping = (
+                    torch.arange(current_valid.numel()),
+                    dst,
+                    mask,
+                    host_mask,
+                )
+            return (
+                source,
+                torch.arange(total),
+                torch.ones(total, dtype=torch.bool),
+                current_mapping,
+            )
 
         adapter.prefill_plan = prefill_plan
-        adapter.prefill_current_mapping = reference.mapping_reference
         self.enterContext(
             patch.dict(
                 sys.modules,
@@ -57,7 +96,7 @@ class PrefillReferenceTest(unittest.TestCase):
         )
 
 
-class TestPhysicalPrefillPlan(PrefillReferenceTest):
+class TestLogicalPrefillPlan(PrefillReferenceTest):
     def check_case(
         self,
         request_map,
@@ -89,20 +128,31 @@ class TestPhysicalPrefillPlan(PrefillReferenceTest):
         )
         host = torch.arange(32, dtype=torch.float32).to(dtype)
         payload = torch.tensor(values, dtype=dtype)
-        for loc, value, is_valid in zip(locations, payload, valid):
-            if is_valid and 0 <= loc < len(host):
-                host[loc] = value
+        # Independently assemble request KV in logical order. Current payload
+        # row IDs are allocator slots; prefix/current placement follows only
+        # prefix and extend lengths, never physical ID equality.
         reference = torch.cat(
-            [
-                host[request_map[r, :length]]
-                for r, length in zip(req, lengths)
-                if r >= 0 and length > 0
-            ]
+            [host[request_map[r, :length]] for r, length in zip(req, lengths)]
         )
-        plan = module.make_fused_prefill_plan(batch, Manager(), "stream")
-        mapping = module.fused_prefill_current_mapping(
-            plan, batch, torch.tensor(valid), len(host)
+        current_row = 0
+        output_offset = 0
+        slots = (
+            extends
+            if sum(extends) == len(valid)
+            else [len(valid) // len(req)] * len(req)
         )
+        for request, length, prefix, extend, width in zip(
+            req, lengths, prefixes, extends, slots
+        ):
+            for col in range(width):
+                if col < extend and request > 0 and valid[current_row + col]:
+                    reference[output_offset + prefix + col] = payload[current_row + col]
+            current_row += width
+            output_offset += length
+        plan = module.make_fused_prefill_plan(
+            batch, Manager(), "stream", current_valid=torch.tensor(valid)
+        )
+        mapping = plan.current_mapping
         if mapping is None:
             result = host[plan.source].clone()
         else:
@@ -113,30 +163,30 @@ class TestPhysicalPrefillPlan(PrefillReferenceTest):
         torch.testing.assert_close(result, reference, rtol=0, atol=0)
         return mapping
 
-    def test_physical_aliases_and_invalid_rows(self):
+    def test_ragged_and_padded_current_rows(self):
         table = torch.zeros((8, 8), dtype=torch.long)
         table[1, :4] = torch.tensor([4, 7, 10, 11])
         table[2, :4] = torch.tensor([4, 9, 11, 13])
         for dtype in (torch.float16, torch.bfloat16, torch.float32):
             with self.subTest(dtype=dtype):
-                # Prefix aliases another request's current physical row 11.
+                # Prefix physical rows may alias; current rows remain unique.
                 mapping = self.check_case(
                     table,
                     [1, 2],
                     [4, 4],
                     [2, 2],
                     [2, 2],
-                    [10, 11, 11, 13],
+                    [14, 15, 16, 17],
                     [100, 101, 102, 103],
                     [True] * 4,
                     dtype,
                 )
-                self.assertEqual(mapping[2].tolist(), [True, False, False, True])
-                # A mismatched mapping and invalid row must retain Host gather.
+                self.assertEqual(mapping[2].tolist(), [True, True, True, True])
+                # Invalid current rows retain the Host value at that logical slot.
                 mapping = self.check_case(
-                    table, [1], [4], [2], [2], [12, -1], [120, 0], [True, False], dtype
+                    table, [1], [4], [2], [2], [18, 19], [120, 0], [True, False], dtype
                 )
-                self.assertEqual(mapping[2].tolist(), [False, False])
+                self.assertEqual(mapping[2].tolist(), [True, False])
                 # Padded current rows use fixed shape without a dynamic boolean index.
                 mapping = self.check_case(
                     table,
@@ -144,7 +194,7 @@ class TestPhysicalPrefillPlan(PrefillReferenceTest):
                     [3, 4],
                     [2, 2],
                     [1, 2],
-                    [10, -1, 11, 13],
+                    [20, 21, 22, 23],
                     [11, 0, 12, 13],
                     [True, False, True, True],
                     dtype,
@@ -172,20 +222,45 @@ class TestPhysicalPrefillPlan(PrefillReferenceTest):
             "zero-prefix: D2D valid rows=4; Host valid copy rows=0; Host kernel still submitted"
         )
 
-    def test_duplicate_request_falls_back(self):
-        table = torch.arange(64).reshape(8, 8) % 32
+    def test_request_zero_current_stays_on_host(self):
+        table = torch.zeros((8, 8), dtype=torch.long)
+        table[0, :2] = torch.tensor([2, 3])
+        table[2, :2] = torch.tensor([5, 7])
         mapping = self.check_case(
             table,
-            [1, 1],
+            [0, 2],
             [2, 2],
             [1, 1],
             [1, 1],
-            [9, 9],
-            [20, 30],
+            [20, 21],
+            [31, 37],
             [True, True],
             torch.float32,
         )
-        self.assertIsNone(mapping)
+        self.assertEqual(mapping[2].tolist(), [False, True])
+
+    def test_unknown_current_layout_falls_back(self):
+        table = torch.arange(64).reshape(8, 8) % 32
+
+        class Manager:
+            size = 8
+            max_context_len = 8
+
+            def host_source_indices(self, rows, positions):
+                return table[rows, positions]
+
+        batch = SimpleNamespace(
+            req_pool_indices=torch.tensor([1, 2]),
+            req_pool_indices_cpu=torch.tensor([1, 2]),
+            seq_lens=torch.tensor([2, 2]),
+            seq_lens_cpu=torch.tensor([2, 2]),
+            extend_prefix_lens_cpu=[1, 1],
+            extend_seq_lens_cpu=[1, 1],
+        )
+        plan = module.make_fused_prefill_plan(
+            batch, Manager(), "stream", current_valid=torch.ones(3, dtype=torch.bool)
+        )
+        self.assertIsNone(plan.current_mapping)
 
 
 class TestWorkspaceLifecycle(PrefillReferenceTest):
@@ -220,7 +295,6 @@ class TestWorkspaceLifecycle(PrefillReferenceTest):
             "ForwardBatch": object,
             "prepare_prefill_gather_rows": module.prepare_prefill_gather_rows,
             "make_fused_prefill_plan": module.make_fused_prefill_plan,
-            "fused_prefill_current_mapping": module.fused_prefill_current_mapping,
             "unidex_copy_inplace": copy,
         }
         code = ast.Module(
@@ -320,23 +394,41 @@ class TestWorkspaceLifecycle(PrefillReferenceTest):
             current_batch.extend_seq_lens_cpu = [1, 1]
             current_batch.out_cache_loc = torch.tensor([12, 7])
             current = torch.full((2, 1, 576), 3, dtype=dtype)
-            host[0, 12] = current[0]
-            host[0, 7] = current[1]
-            plan = m.prepare_forward_kv_plan(current_batch, "A")
+            current_inputs = (current, None, torch.tensor([True, True]))
+            plan = m.prepare_forward_kv_plan(current_batch, "A", current=current_inputs)
             n, r = m.get_forward_kv(
                 0,
                 current_batch,
                 "A",
                 plan=plan,
-                current=(current, None, torch.tensor([True, True])),
+                current=current_inputs,
             )
             current_reference = torch.cat(
                 [host[0, table[1, :3]], host[0, table[2, :2]]]
             )
+            current_reference[2] = current[0, 0]
+            current_reference[4] = current[1, 0]
             torch.testing.assert_close(
                 torch.cat((n, r), -1), current_reference, rtol=0, atol=0
             )
             self.assertEqual(plan.current_mapping[2].tolist(), [True, True])
+
+            # The cached plan may carry a D2D mapping from an earlier layer,
+            # while a later layer omits current payload. That call must gather
+            # the complete logical sequence from Host.
+            host_only, rope_only = m.get_forward_kv(
+                1, current_batch, "A", plan=plan, current=None
+            )
+            layer_host = m.host_kv_buffer[1]
+            host_reference = torch.cat(
+                [layer_host[0, table[1, :3]], layer_host[0, table[2, :2]]]
+            )
+            torch.testing.assert_close(
+                torch.cat((host_only, rope_only), -1),
+                host_reference,
+                rtol=0,
+                atol=0,
+            )
 
 
 if __name__ == "__main__":

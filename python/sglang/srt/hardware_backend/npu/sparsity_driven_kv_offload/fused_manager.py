@@ -20,7 +20,6 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
     use_pd_split_kv,
 )
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.prefill_kv_plan import (
-    fused_prefill_current_mapping,
     make_fused_prefill_plan,
     prepare_prefill_gather_rows,
 )
@@ -576,7 +575,7 @@ class FusedSparseKVCacheManager:
 
             return src_tensor, token_positions, valid_mask
 
-    def prepare_forward_kv_plan(self, forward_batch, stream):
+    def prepare_forward_kv_plan(self, forward_batch, stream, current=None):
         """Use a fixed budgeted workspace on one compute stream only."""
         current_stream = torch.npu.current_stream()
         actual_stream = current_stream if stream is None else stream
@@ -598,8 +597,13 @@ class FusedSparseKVCacheManager:
             self._prefill_workspace_stream = actual_stream
         if self._prefill_workspace_stream != actual_stream:
             return None
+        current_valid = None if current is None else current[2]
         return make_fused_prefill_plan(
-            forward_batch, self, actual_stream, prepared=prepared
+            forward_batch,
+            self,
+            actual_stream,
+            prepared=prepared,
+            current_valid=current_valid,
         )
 
     def get_forward_kv(
@@ -654,11 +658,7 @@ class FusedSparseKVCacheManager:
             rope = self.prefill_rope[:total]
             mapping = None
             if current is not None:
-                current_payload, _, current_valid = current
-                if plan.current_mapping is None:
-                    plan.current_mapping = fused_prefill_current_mapping(
-                        plan, forward_batch, current_valid, self.host_token_capacity
-                    )
+                current_payload, _, _ = current
                 mapping = plan.current_mapping
             host_mask = plan.valid if mapping is None else mapping[3]
             with torch.npu.stream(actual_stream):
