@@ -358,6 +358,32 @@ class UnifiedRadixCache(BasePrefixCache):
                     f"{sorted(ct.name for ct in self.components)}."
                 )
             self.tree_core.gds.state_tokens = self._state_slot_kv_tokens()
+        # A finished request's state at its exact end (MambaComponent and
+        # insert_exact_leaf); a request resuming inside a page copies it.
+        self.exact_checkpoint = (
+            not self.disable
+            and self.enable_mamba_extra_buffer
+            and params.enable_mamba_exact_checkpoint
+        )
+        if self.exact_checkpoint and set(self.components) != {
+            BASE_COMPONENT_TYPE,
+            ComponentType.MAMBA,
+        }:
+            raise ValueError(
+                "--enable-mamba-exact-checkpoint supports trees of full "
+                "attention and Mamba states only, got "
+                f"{sorted(ct.name for ct in self.components)}."
+            )
+        if (
+            self.exact_checkpoint
+            and self.token_to_kv_pool_allocator.page_size != self.page_size
+        ):
+            # A leaf ending inside a page owns the request's page holding it.
+            raise ValueError(
+                "--enable-mamba-exact-checkpoint needs the allocator's page to be "
+                f"the tree's, got {self.token_to_kv_pool_allocator.page_size} "
+                f"and {self.page_size}."
+            )
 
         # Session ref tracking (--enable-session-radix-cache).
         self.session_refs = UnifiedSessionRefTracker(
@@ -1741,12 +1767,24 @@ class UnifiedRadixCache(BasePrefixCache):
 
         kv_indices = kv_indices_orig[:effective_cache_len]
 
+        # An exact state that ends inside a page hangs below the page-aligned
+        # insert as a leaf of its own (_insert_exact_leaf).
+        exact_key = (
+            radix_key
+            if insert_params.mamba_from_live_slot
+            and effective_cache_len % self.page_size
+            else None
+        )
         radix_key = radix_key.page_aligned(self.page_size)
         page_aligned_len = len(radix_key)
         values = kv_indices[:page_aligned_len].to(dtype=torch.int64, copy=True)
 
         insert_params.key = radix_key
         insert_params.value = values
+        exact_state = None
+        if exact_key is not None:
+            exact_state, insert_params.mamba_value = insert_params.mamba_value, None
+            insert_params.allow_missing_mamba = True
         reuse_existing_mamba = False
         if self._mamba_host_only_checkpoint():
             mamba = self.components.get(ComponentType.MAMBA)
@@ -1822,6 +1860,20 @@ class UnifiedRadixCache(BasePrefixCache):
             (req.kv.req_pool_idx, slice(req.kv.cache_protected_len, len(new_indices))),
             new_indices[req.kv.cache_protected_len :],
         )
+        protected_len = len(new_indices)
+        if exact_key is not None:
+            result = self._insert_exact_leaf(
+                new_last_node,
+                exact_key[page_aligned_len:],
+                kv_indices[page_aligned_len : page_aligned_len + 1],
+                exact_state,
+                insert_params.priority,
+                token_ids,
+            )
+            if not result.mamba_exist:
+                # The leaf took the request's page holding these tokens.
+                new_last_node = result.last_device_node
+                protected_len = effective_cache_len
 
         self.unlock(req.lock)
         # Opt-in: leave the matched-prefix mamba evictable during decode (it is
@@ -1841,7 +1893,7 @@ class UnifiedRadixCache(BasePrefixCache):
         )
 
         # Update req fields
-        req.kv.protect_prefix(len(new_indices))
+        req.kv.protect_prefix(protected_len)
         req.last_node = new_last_node
 
         # cleanup
@@ -1860,6 +1912,30 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.session_refs.register_session_ref(
                     req, leaf=result.last_device_node
                 )
+
+    def _insert_exact_leaf(
+        self,
+        parent: NodeId,
+        key: RadixKey,
+        first_slot: torch.Tensor,
+        mamba_value: torch.Tensor,
+        priority: int,
+        token_ids: array,
+    ) -> InsertResult:
+        """Cache a finished request's state that ends inside a page under
+        ``parent``: the leaf takes the state slot and the request's whole page
+        holding ``key``, which starts at ``first_slot`` (a slot keeps its
+        token's offset in the page)."""
+        value = first_slot.to(torch.int64) + torch.arange(
+            self.page_size, dtype=torch.int64, device=first_slot.device
+        )
+        result, actions = self.tree_core.insert_exact_leaf(
+            parent, key, value, mamba_value, priority=priority
+        )
+        self._apply_cache_actions(actions)
+        if not result.mamba_exist and self.miss_attribution is not None:
+            self.miss_attribution.record_state(token_ids, len(token_ids))
+        return result
 
     @rank_consensus(same_params=["req.rid"])
     def advance_unpublished_req(self, req: Req) -> None:
@@ -4990,7 +5066,40 @@ class UnifiedRadixCache(BasePrefixCache):
             if tail is not None:
                 path = torch.cat([path, tail])
         assert len(path) >= req.prefix_len, (req.rid, len(path), req.prefix_len)
+        if self.exact_checkpoint and req.kv.kv_copy_dst is not None:
+            # The page take_resume_page gave the request replaces the cached one.
+            start = req.kv.cache_protected_len
+            own = req.kv.kv_copy_dst[: req.prefix_len - start].to(path.dtype)
+            return torch.cat([path[:start], own])
         return path[: req.prefix_len]
+
+    def resume_copy_tokens(self, req: Req) -> int:
+        """The tokens of the page a request whose prefix ends inside a cached
+        page (an exact leaf's) takes to copy that page into; 0 for any other."""
+        if (
+            self.exact_checkpoint
+            and not req.kv.holds_kv
+            and req.prefix_len % self.page_size
+            and req.prefix_len > req.kv.cache_protected_len
+        ):
+            return self.page_size
+        return 0
+
+    def take_resume_page(self, req: Req) -> None:
+        """A request resuming inside a cached page (an exact leaf's) takes a
+        page of its own, allocated here (which may evict) and given a copy of
+        the cached page before its first forward. Its prefix then maps the
+        tree's path up to that page and the first slots of its own, so its
+        writes past the prefix never land in the cached page."""
+        if req.kv.kv_copy_dst is not None or not self.resume_copy_tokens(req):
+            return
+        from sglang.srt.mem_cache.allocation import alloc_token_slots
+
+        start = req.kv.cache_protected_len
+        root = self.root_node_handle(req.extra_key)
+        path = self.tree_core.collect_full_device_indices(req.last_node, root)
+        req.kv.kv_copy_src = path[start : start + self.page_size].to(torch.int64)
+        req.kv.kv_copy_dst = alloc_token_slots(self, self.page_size).to(torch.int64)
 
     def path_device_indices(self, node: NodeId) -> torch.Tensor:
         return self.tree_core.collect_full_device_indices(node, self.root_node_handle())

@@ -119,6 +119,7 @@ class TestPrefillAdder(CustomTestCase):
         tree_cache.buffer_pipeline = None
         tree_cache.window_checkpoint_interval.return_value = 0
         tree_cache.logical_page_size = 1
+        tree_cache.exact_checkpoint = False
         return tree_cache
 
     def create_token_allocator(

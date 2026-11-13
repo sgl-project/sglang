@@ -577,6 +577,14 @@ class ExecMamba(msgspec.Struct):
         "Switches the radix tree core from the default Rust one to the slower "
         "Python one.",
     ] = False
+    enable_mamba_exact_checkpoint: A[
+        bool,
+        "Cache a finished request's Mamba state at its exact end, where its live "
+        "state is, instead of at the last tracked checkpoint. A state that ends "
+        "inside a page keeps that page; each request resuming from it copies the "
+        "page. Requires --mamba-radix-cache-strategy extra_buffer. Runs on the "
+        "Python radix tree core.",
+    ] = False
     enable_mamba_cache_stochastic_rounding: A[
         bool,
         "Enable stochastic rounding when writing FP16 Mamba SSM cache states. Requires --mamba-ssm-dtype float16 and CUDA. With --mamba-backend triton, requires SM100.",

@@ -344,6 +344,8 @@ def _prefix_kv_indices(batch: ScheduleBatch, req: Req) -> torch.Tensor:
         return row[: req.prefix_len].to(torch.int64)
     if req.prefix_len == 0:
         return _EMPTY_PREFIX
+    if batch.tree_cache.exact_checkpoint:
+        batch.tree_cache.take_resume_page(req)
     return batch.tree_cache.prefix_device_indices(req)
 
 

@@ -893,10 +893,14 @@ class PrefillAdder:
     ) -> int:
         if extend_input_len is None:
             extend_input_len = len(req.full_untruncated_fill_ids) - req.prefix_len
-        return self.token_to_kv_pool_allocator.request_slot_reserve(
+        reserve = self.token_to_kv_pool_allocator.request_slot_reserve(
             has_req_pool_slot=req.kv.req_pool_idx is not None,
             prefill_tokens=req.prefix_len + extend_input_len,
         )
+        if self.tree_cache.exact_checkpoint:
+            # A prefix ending inside a cached page resumes on its own copy of it.
+            reserve += self.tree_cache.resume_copy_tokens(req)
+        return reserve
 
     def ceil_paged_tokens(self, tokens: int) -> int:
         return -(-tokens // self.page_size) * self.page_size

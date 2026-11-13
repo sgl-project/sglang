@@ -594,6 +594,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             self.gds.reset()
         # Maintains the NodeId -> active tree node mapping.
         self._node_arena: dict[NodeId, UnifiedTreeNode] = {}
+        # Leaves whose key ends inside a page (insert_exact_leaf), by parent.
+        self._exact_leaves: dict[UnifiedTreeNode, list[UnifiedTreeNode]] = {}
         self.joint_lru = JointLRU() if self._keeps_joint_lru else None
         # Its component walks ended above, so a suspended joint walk ends too.
         self._joint_walk: Optional[_JointEvictionWalk] = None
@@ -1107,7 +1109,23 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             if key_offset < len(key):
                 child_key = key.child_key_at(key_offset, self.page_size)
 
-        return self._match_post_processor(
+        page_end = full_kv_hit_length
+        exact_leaf = None
+        if self._exact_leaves:
+            exact_leaf = self._match_exact_leaf(
+                node, params.key, page_end, device_validators
+            )
+        if exact_leaf is not None:
+            # Its state covers the whole walked path, so the hit runs to its end.
+            leaf_len = len(exact_leaf.key)
+            value.append(
+                exact_leaf.component_data[BASE_COMPONENT_TYPE].value[:leaf_len]
+            )
+            best_match_node = best_match_device_node = node = exact_leaf
+            best_match_device_value_len = len(value)
+            full_kv_hit_length += leaf_len
+
+        result = self._match_post_processor(
             params,
             value,
             best_match_node,
@@ -1118,6 +1136,37 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             last_visited_node_id=node.id if node is not self.root_node else None,
             device_validators=device_validators,
         )
+        if exact_leaf is not None:
+            # The leaf keeps its page; a request resuming there copies it
+            # (UnifiedRadixCache.prefix_device_indices) and owns the copy.
+            result = result._replace(cache_protected_len=page_end)
+        return result
+
+    def _match_exact_leaf(
+        self,
+        node: UnifiedTreeNode,
+        key: RadixKey,
+        node_end: int,
+        validators: tuple[Callable[[UnifiedTreeNode], bool], ...],
+    ) -> Optional[UnifiedTreeNode]:
+        """The longest leaf ending inside a page under ``node``, which ends
+        ``node_end`` tokens into ``key``, that ``key`` continues within its
+        length."""
+        best = None
+        for leaf in self._exact_leaves.get(node, ()):
+            leaf_len = len(leaf.key)
+            if (
+                node_end + leaf_len > len(key)
+                or (best is not None and leaf_len <= len(best.key))
+                or leaf.key.extra_key != key.extra_key
+                or leaf.key.cache_salt != key.cache_salt
+            ):
+                continue
+            if leaf.key.match_at(key, node_end) == leaf_len and all(
+                validator(leaf) for validator in validators
+            ):
+                best = leaf
+        return best
 
     def _device_prefix_covered_by_match(
         self, best_match_node: UnifiedTreeNode
@@ -1767,6 +1816,63 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self._update_evictable_leaf_sets(parent)
         self.kv_events.record_store(new_node, session_id=session_id)
         return new_node
+
+    def insert_exact_leaf(
+        self,
+        node_id: NodeId,
+        key: RadixKey,
+        value: torch.Tensor,
+        mamba_value: torch.Tensor,
+        priority: int = 0,
+    ) -> tuple[InsertResult, list[CacheAction | ComponentAction]]:
+        """Cache a state that ends inside a page as a leaf under ``node_id``,
+        the node ending where that page starts.
+
+        ``key`` holds the tokens from the page start to the state, ``value``
+        the slots of the whole page (the leaf owns the page) and
+        ``mamba_value`` the state. The leaf's child key is its own tokens,
+        fewer than a page, which no page-aligned walk produces; only
+        ``_match_exact_leaf`` finds it. An equal leaf already cached is
+        refreshed and comes back with ``mamba_exist`` set: the caller keeps
+        ``value`` and ``mamba_value``."""
+        parent = self.node_by_id(node_id)
+        assert 0 < len(key) < self.page_size and len(value) == self.page_size, (
+            f"an exact leaf ends inside one page: {len(key)=}, {len(value)=}"
+        )
+        child_key = key.child_key_at(0, len(key))
+        leaf = parent.children.get(child_key)
+        is_new_leaf = leaf is None
+        if is_new_leaf:
+            leaf = self._new_node(priority=priority)
+            leaf.parent = parent
+            leaf.key = key
+            if self.tlru_bookkeeping:
+                _set_tlru_lens_and_raise_history(leaf, parent)
+            leaf.rotation_base = parent.rotation_base
+            leaf.component_data[BASE_COMPONENT_TYPE].value = value.clone()
+            parent.children[child_key] = leaf
+            self._exact_leaves.setdefault(parent, []).append(leaf)
+            self.component_evictable_size_[BASE_COMPONENT_TYPE] += (
+                self.components_by_type[BASE_COMPONENT_TYPE].reclaimable_value_len(leaf)
+            )
+            self._update_evictable_leaf_sets(leaf)
+            self._update_evictable_leaf_sets(parent)
+        else:
+            self._touch_node(leaf)
+        params = InsertParams(
+            key=key, value=value, mamba_value=mamba_value, priority=priority
+        )
+        result = InsertResult(prefix_len=0, last_device_node=leaf.id)
+        actions: list[CacheAction | ComponentAction] = []
+        for component in self.components:
+            component.commit_insert_component_data(
+                node=leaf,
+                is_new_leaf=is_new_leaf,
+                params=params,
+                result=result,
+                cache_actions=actions,
+            )
+        return result, actions
 
     def _unevict_node_on_insert(
         self,
@@ -2617,7 +2723,15 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         for component in self.components:
             component.discard_deleted_session_leaf(node)
 
-        key = node.key.child_key(self.page_size)
+        # Only an exact leaf is shorter than a page.
+        if self._exact_leaves and len(node.key) < self.page_size:
+            key = node.key.child_key_at(0, len(node.key))
+            leaves = self._exact_leaves[node.parent]
+            leaves.remove(node)
+            if not leaves:
+                del self._exact_leaves[node.parent]
+        else:
+            key = node.key.child_key(self.page_size)
         v = node.parent.children.pop(key, None)
         assert v == node
         # Deleted nodes must not linger in duplicate tracking as ghosts.

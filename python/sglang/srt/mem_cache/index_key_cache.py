@@ -92,6 +92,15 @@ class IndexKeyCache:
             scales = index_k[:, key_bytes:].view(index_k.shape[0], page_size, -1)
             scales[tgt_page, tgt_offset] = scales[src_page, src_offset]
 
+    def move_pages(self, tgt_pages: torch.Tensor, src_pages: torch.Tensor) -> None:
+        """Copy whole pages of index keys, ``src_pages`` -> ``tgt_pages`` (ids
+        of the pool's pages; ``buffer`` keeps one row per page). Unlike
+        ``move``, this keeps pooled keys, which mix several tokens, intact."""
+        for index_k in self.buffer:
+            if index_k.shape[0] == 0:
+                continue
+            index_k[tgt_pages] = index_k[src_pages]
+
     def get_local_buffer(self, layer_id: int) -> torch.Tensor:
         if self.pool.layer_transfer_counter is not None:
             self.pool.layer_transfer_counter.wait_until(

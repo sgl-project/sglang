@@ -7,6 +7,9 @@ slots, and with the switch off the cache behaves as before.
 """
 
 from array import array
+from types import SimpleNamespace
+
+import torch
 
 from sglang.srt.mem_cache.allocation import alloc_token_slots
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -19,6 +22,7 @@ from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.tree_slots import tree_slots_of
@@ -165,6 +169,75 @@ class TestMissAttributionOnUnifiedPool(CustomTestCase):
     def test_without_the_switch_nothing_is_recorded(self):
         tree = _UnifiedCache()
         self.assertIsNone(tree.cache.miss_attribution)
+
+
+class TestExactCheckpointPiecesOnUnifiedPool(CustomTestCase):
+    PAGE = 4
+
+    def test_the_cache_builds_with_the_switch_on_a_unified_pool(self):
+        tree = _UnifiedCache(
+            page_size=self.PAGE,
+            enable_mamba_extra_buffer=True,
+            enable_mamba_exact_checkpoint=True,
+        )
+        self.assertTrue(tree.cache.exact_checkpoint)
+
+    def test_a_resume_page_copy_moves_the_rows_through_the_arena(self):
+        tree = _UnifiedCache(page_size=self.PAGE, enable_mamba_extra_buffer=True)
+        src = tree.allocator.alloc(self.PAGE)
+        dst = tree.allocator.alloc(self.PAGE)
+        kv = tree.allocator.get_kvcache()
+        k_buffer = kv.get_key_buffer(0)
+        # The allocator hands out virtual ids; the rows sit at the physical ones.
+        src_rows = tree.allocator.translate_kv_loc(src).long()
+        dst_rows = tree.allocator.translate_kv_loc(dst).long()
+        rows = torch.arange(1, 1 + src.numel() * k_buffer[0].numel())
+        k_buffer[src_rows] = rows.view(src.numel(), *k_buffer.shape[1:]).to(
+            k_buffer.dtype
+        )
+
+        def run_copy(is_draft_worker):
+            runner = SimpleNamespace(
+                req_to_token_pool=tree.bundle.req_to_token_pool,
+                token_to_kv_pool_allocator=tree.allocator,
+                token_to_kv_pool=kv,
+                is_draft_worker=is_draft_worker,
+            )
+            ModelRunner._maybe_copy_deferred_kv_pages(
+                runner, SimpleNamespace(kv_copy_src_locs=src, kv_copy_dst_locs=dst)
+            )
+
+        run_copy(is_draft_worker=False)
+        self.assertTrue(torch.equal(k_buffer[dst_rows], k_buffer[src_rows]))
+        self.assertFalse(torch.equal(dst_rows, src_rows))
+        # The target's copy moved a fused draft's rows too, and the forward
+        # has written the page since: the draft runner's copy does nothing.
+        k_buffer[dst_rows] = 0
+        run_copy(is_draft_worker=True)
+        self.assertFalse(k_buffer[dst_rows].any())
+
+    def test_an_exact_leaf_inside_a_page_holds_the_page_and_the_state(self):
+        tree = _UnifiedCache(
+            page_size=self.PAGE,
+            enable_mamba_extra_buffer=True,
+            enable_mamba_exact_checkpoint=True,
+        )
+        prefix = _tokens(100, 2 * self.PAGE)
+        tree.insert(prefix)
+        parent = tree.match(prefix).last_device_node
+        page = tree.allocator.alloc(self.PAGE)
+        result = tree.cache._insert_exact_leaf(
+            parent,
+            RadixKey(array("q", _tokens(500, 2))),
+            page[:1],
+            tree.storage.take_state_slots(None, 1),
+            0,
+            array("q", prefix + _tokens(500, 2)),
+        )
+        tree.cache.sanity_check()
+        self.assertFalse(result.mamba_exist)
+        match = tree.match(prefix + _tokens(500, 2))
+        self.assertEqual(match.device_prefix_len, 2 * self.PAGE + 2)
 
 
 if __name__ == "__main__":

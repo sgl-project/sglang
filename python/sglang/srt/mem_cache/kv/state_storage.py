@@ -250,12 +250,15 @@ class StateStorage:
         table,
         req: Req,
         mamba_ping_pong_track_buffer_to_keep: Optional[int] = None,
+        keep_state_slot: bool = False,
     ) -> None:
         """Gives back the request's state slot and its ping-pong slots, except
-        the one kept for the radix cache."""
+        the one kept for the radix cache, or the state slot itself when the
+        radix cache took that one (``keep_state_slot``)."""
         mamba_index = req.kv.mamba_pool_idx
         assert mamba_index is not None, "double free? mamba_index is None"
-        self.slots.free(mamba_index.unsqueeze(0))
+        if not keep_state_slot:
+            self.slots.free(mamba_index.unsqueeze(0))
         req.kv.mamba_pool_idx = None
 
         if table.enable_mamba_extra_buffer:

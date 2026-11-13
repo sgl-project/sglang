@@ -577,6 +577,7 @@ class TestSharedPrefillAdmission(unittest.TestCase):
             window_checkpoint_interval=lambda: 0,
             transfers_in_flight=lambda: False,
             supports_mamba=lambda: False,
+            exact_checkpoint=False,
         )
         adder = PrefillAdder(
             page_size=page_size,

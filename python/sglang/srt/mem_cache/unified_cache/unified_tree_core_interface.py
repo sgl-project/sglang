@@ -627,6 +627,18 @@ class UnifiedTreeCoreInterface(ABC):
         """Finish the insert (idempotent); returns still-pending actions to drain."""
         ...
 
+    def insert_exact_leaf(
+        self,
+        node_id: NodeId,
+        key: RadixKey,
+        value: torch.Tensor,
+        mamba_value: torch.Tensor,
+        priority: int = 0,
+    ) -> tuple[InsertResult, list[CacheAction | ComponentAction]]:
+        """Cache a state that ends inside a page as a leaf under ``node_id``
+        (--enable-mamba-exact-checkpoint, which selects the Python core)."""
+        raise NotImplementedError(f"{type(self).__name__} has no exact leaves")
+
     @abstractmethod
     def drive_host_eviction(
         self, component_type: ComponentType, num_tokens: int

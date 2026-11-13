@@ -867,6 +867,12 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         with self.assertRaisesRegex(ValueError, "radix-eviction-policy gds"):
             self._construct("LlamaForCausalLM", "llama", radix_eviction_policy="gds")
 
+    def test_exact_mamba_checkpoint_without_tracked_states_fails_fast(self):
+        with self.assertRaisesRegex(ValueError, "enable-mamba-exact-checkpoint"):
+            self._construct(
+                "LlamaForCausalLM", "llama", enable_mamba_exact_checkpoint=True
+            )
+
     def test_explicit_extra_buffer_is_harmless_with_radix_cache_disabled(self):
         sa = self._construct(
             "LlamaForCausalLM",

@@ -573,5 +573,6 @@ POSITIONAL_FIELD_ORDER = (
     "hybrid_cache_checkpoints_level",
     "enable_mamba_unit_eviction",
     "enable_cache_miss_attribution",
+    "enable_mamba_exact_checkpoint",
 )
 # fmt: on

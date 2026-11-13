@@ -688,12 +688,39 @@ class KVStorage:
         self._allocator.state.pool.copy_from(ids.ids(src), ids.ids(dst))
 
     def release_state(
-        self, sub_pool: str, req: Req, *, keep: Optional[int] = None
+        self,
+        sub_pool: str,
+        req: Req,
+        *,
+        keep: Optional[int] = None,
+        keep_state_slot: bool = False,
     ) -> None:
         """Give back a finished request's state slots, keeping its tracking
-        slot ``keep`` when the tree took that one."""
+        slot ``keep``, or its state slot (``keep_state_slot``), when the tree
+        took that one."""
         self._allocator.state.release(
-            self.requests, req, mamba_ping_pong_track_buffer_to_keep=keep
+            self.requests,
+            req,
+            mamba_ping_pong_track_buffer_to_keep=keep,
+            keep_state_slot=keep_state_slot,
+        )
+
+    def copy_token_pages(
+        self, pool, dst: torch.Tensor, src: torch.Tensor, *, draft: bool = False
+    ) -> None:
+        """Copy whole pages of token rows ``src`` -> ``dst`` (every slot of each
+        page, in order) on the current stream. A page envelope holds every
+        layer's rows, a fused draft's included, and its side parts move with
+        it, so the target runner's copy is the only one."""
+        if draft:
+            return
+        sub_pool = self._allocator.roles.owner
+        unit = self.unit_tokens(sub_pool)
+        ids = self._allocator.id_spaces()[sub_pool]
+        self._allocator.arena.move_units(
+            sub_pool,
+            ids.ids(dst.to(torch.int64))[::unit] // unit,
+            ids.ids(src.to(torch.int64))[::unit] // unit,
         )
 
     def donate_tracking_slot(

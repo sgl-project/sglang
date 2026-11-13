@@ -73,6 +73,8 @@ class _FakeAllocator:
 
 
 class _FakeTreeCache:
+    exact_checkpoint = False
+
     def __init__(self, allocator, req_to_token_pool=None):
         self.page_size = allocator.page_size
         self.token_to_kv_pool_allocator = allocator
