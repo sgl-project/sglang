@@ -186,9 +186,8 @@ class NPUCompressStatePool(CompressStatePool):
 
 
 class NPUDeepSeekV4IndexerPool(DeepSeekV4IndexerPool):
-    """NPU c4-indexer pool. Keeps the base packed CUDA buffer (read by
-    get_contiguous_buf_infos / NSA) and ADDS dedicated int8 K + float16 scale
-    buffers in PA_ND layout at the native C4 ``kernel_page_size``, written by
+    """NPU c4-indexer pool with separate K and scale buffers in PA_ND layout
+    at the native C4 ``kernel_page_size``, written by
     ``torch_npu.npu_scatter_nd_update_`` and read by
     ``torch.ops.custom.npu_quant_lightning_indexer``.
     """
@@ -199,9 +198,8 @@ class NPUDeepSeekV4IndexerPool(DeepSeekV4IndexerPool):
         super().__init__(*args, **kwargs)
 
     def _create_buffer(self):
-        # Base allocates the packed CUDA index_k_with_scale_buffer (kept for
-        # get_contiguous_buf_infos / NSA compat); then add the NPU buffers.
-        super()._create_buffer()
+        # NPU compute, PD and HiCache use the separate buffers below.
+        self.index_k_with_scale_buffer = None
         kp = self._kernel_page_size
         npu_num_pages = (self.size + kp + 1) // kp
         if is_npu_arch35():
@@ -249,6 +247,15 @@ class NPUDeepSeekV4IndexerPool(DeepSeekV4IndexerPool):
     @property
     def has_npu_storage(self) -> bool:
         return True
+
+    def contiguous_page_row_buffers(self) -> List[torch.Tensor]:
+        return [
+            buf.view(torch.uint8).flatten(1)
+            for buf in (*self.index_k_buffer, *self.index_scale_buffer)
+        ]
+
+    def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
+        raise NotImplementedError("NPU indexer keys and scales use separate buffers")
 
     def get_index_k(self, layer_id: int) -> torch.Tensor:
         return self.index_k_buffer[layer_id]
