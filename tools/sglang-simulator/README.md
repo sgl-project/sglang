@@ -418,6 +418,101 @@ integration, see
 process/HTTP path, see
 [`test_simulation_sglang_serving.py`](test/test_simulation_sglang_serving.py).
 
+## Optional committed-output ledger
+
+Iteration records retain their complete JSONL representation in
+`iteration.jsonl`. During a profile window, the scheduler compresses these
+records into an exclusive `.iteration-*.spool` file in the configured output
+directory and keeps only small metric summaries in memory. Provision disk space
+for the spool and final exports; select an output directory on disk for long
+CPU simulations. This changes evidence storage, not virtual costs or progress.
+The spool is removed after a successful export and profile reset. Export or
+spool-write failures preserve it for diagnosis and must not be treated as a
+completed profile.
+
+For long runs, explicitly set `SGLANG_SIMULATOR_EVIDENCE_COMPRESSION=gzip`
+to export `iteration.jsonl.gz` instead. Decompression recovers the unchanged
+JSONL records; metrics and virtual execution are unaffected. The default is
+`none`, retaining `iteration.jsonl`. For native evaluated-cost evidence, an
+explicit path ending in `.gz` selects complete concatenated gzip members,
+one per original JSONL row. Its reported byte count and SHA-256 cover the
+uncompressed JSONL, explicitly identified by `digest_scope`. Artifact custody
+must additionally hash the actual compressed file. An interrupted or failed
+stream is still incomplete and cannot establish successful execution.
+
+For repeated large evidence documents, install this project's optional `zstd`
+extra (`pip install '.[zstd]'`) and explicitly set
+`SGLANG_SIMULATOR_EVIDENCE_COMPRESSION=zstd`. This selects checksummed Zstandard
+frames for the private iteration spool and exports `iteration.jsonl.zst`.
+Use a native evaluated-cost evidence path ending in `.zst` to select one complete,
+checksummed Zstandard frame per original JSONL row. Concatenated frames retain
+completed evaluated rows when a later write fails. The default and existing
+plain/gzip formats remain available without the optional dependency.
+
+Both codecs recover the original JSONL bytes, including row order. Evaluated
+metrics continue to hash and count the uncompressed stream; separately hash
+the compressed artifact for custody. A reader must decode every frame and
+validate its checksum and the uncompressed SHA/size before admitting evidence.
+Record the selected source and codec for each new run. Preserve earlier source
+files, failed spools and compressed identities; never reinterpret an older
+artifact as a different codec. Provision for the spool and final export to
+coexist, and measure peak use before selecting a smaller run budget. Codec
+tests establish storage equivalence, not workload accuracy or successful E2E.
+
+For metrics-only runs, explicitly set `SGLANG_SIMULATOR_EVIDENCE_LEVEL=metrics`
+in the container environment. The default is `full`. Metrics-only mode retains
+the numeric iteration summaries used by metric reduction, request statistics,
+and any separately enabled token-event ledger, while omitting the verbose
+iteration spool/export and native evaluated-cost file (even if its path was
+configured). Metrics explicitly mark those artifacts as omitted by policy;
+the absence does not establish independent per-step cost verification.
+Prediction, request progress, scheduling, and validation of each SDK result
+still run normally. Client-side raw request/response and protocol recording
+are controlled separately by the selected client configuration.
+
+Select the retention level before starting a new process. Record it in the run
+identity and provision storage for the artifacts actually requested. Do not
+change a running process's policy or delete its originals to adopt a new mode.
+Use `full` when downstream acceptance requires complete regional-cost and
+committed-step evidence; a metrics-only run cannot satisfy that contract.
+
+For coordinated OFFLINE runs, set
+`SGLANG_SIMULATOR_TOKEN_EVENTS=/absolute/path/to/token_events.jsonl` to retain
+native visible output-token commits. The parent directory must exist and the
+file must be new. With the variable unset, the recorder is disabled and does no
+file I/O. Recording does not change virtual batch costs or scheduling.
+
+The JSONL stream starts with
+`{"event":"start","version":1,"clock":"virtual_ns"}`. Each output-producing
+batch writes an `output_commit` containing integer `at_ns` and `commits` entries
+with `rid`, zero-based `output_index`, and positive incremental `token_count`.
+Counts come from native visible output progression, including the first prefill
+token and multi-token commits. Empty/chunk-only/aborted results add no tokens.
+Previously committed tokens remain in the stream when their request is later
+cancelled. This measures output, not speculative or cancelled computation whose
+tokens were discarded before becoming visible.
+
+Only successful coordinator completion writes a `finish` footer containing
+`run_id`, integer `at_ns`, `status: "FINISHED"`, and `total_output_tokens`.
+Interrupted or failed streams have no success footer and must not be treated as
+complete results. Writes are flushed per batch; a write failure aborts the
+coordinated run. Existing files are never overwritten.
+
+The ledger contains no workload phases. A caller supplies exact integer virtual
+phase boundaries and request ownership separately. For fixed-duration throughput,
+sum the selected profiling requests' commits in `[start_ns, start_ns + duration_ns)`
+and divide by that configured duration, retaining output from requests later
+cancelled. Exclude warmup by request ownership as well as time: warmup completion
+and profiling start can share a timestamp. Report grace-period output and successful
+request latency cohorts separately. An early-ended measurement is incomplete and
+must not be presented as a full-duration throughput point. Legacy request statistics'
+requested `output_length` are not a substitute for this ledger.
+
+The AgentX reference output-token throughput counts output from successful
+profiling requests over their observed earliest-start/latest-end span. It uses a
+different output cohort and denominator; report it separately from fixed-window
+committed throughput.
+
 ## Simulation modes
 
 | Mode | Behavior |
@@ -545,101 +640,6 @@ Runtime changes should also be validated in a matching official SGLang image
 with both `OFFLINE` and `BLOCKING` modes. Predictor changes should report
 step-level error, and scheduler or cache changes should compare request latency,
 throughput, and prefix-cache reuse against measured traces.
-
-## Optional committed-output ledger
-
-Iteration records retain their complete JSONL representation in
-`iteration.jsonl`. During a profile window, the scheduler compresses these
-records into an exclusive `.iteration-*.spool` file in the configured output
-directory and keeps only small metric summaries in memory. Provision disk space
-for the spool and final exports; select an output directory on disk for long
-CPU simulations. This changes evidence storage, not virtual costs or progress.
-The spool is removed after a successful export and profile reset. Export or
-spool-write failures preserve it for diagnosis and must not be treated as a
-completed profile.
-
-For long runs, explicitly set `SGLANG_SIMULATOR_EVIDENCE_COMPRESSION=gzip`
-to export `iteration.jsonl.gz` instead. Decompression recovers the unchanged
-JSONL records; metrics and virtual execution are unaffected. The default is
-`none`, retaining `iteration.jsonl`. For native evaluated-cost evidence, an
-explicit path ending in `.gz` selects complete concatenated gzip members,
-one per original JSONL row. Its reported byte count and SHA-256 cover the
-uncompressed JSONL, explicitly identified by `digest_scope`. Artifact custody
-must additionally hash the actual compressed file. An interrupted or failed
-stream is still incomplete and cannot establish successful execution.
-
-For repeated large evidence documents, install this project's optional `zstd`
-extra (`pip install '.[zstd]'`) and explicitly set
-`SGLANG_SIMULATOR_EVIDENCE_COMPRESSION=zstd`. This selects checksummed Zstandard
-frames for the private iteration spool and exports `iteration.jsonl.zst`.
-Use a native evaluated-cost evidence path ending in `.zst` to select one complete,
-checksummed Zstandard frame per original JSONL row. Concatenated frames retain
-completed evaluated rows when a later write fails. The default and existing
-plain/gzip formats remain available without the optional dependency.
-
-Both codecs recover the original JSONL bytes, including row order. Evaluated
-metrics continue to hash and count the uncompressed stream; separately hash
-the compressed artifact for custody. A reader must decode every frame and
-validate its checksum and the uncompressed SHA/size before admitting evidence.
-Record the selected source and codec for each new run. Preserve earlier source
-files, failed spools and compressed identities; never reinterpret an older
-artifact as a different codec. Provision for the spool and final export to
-coexist, and measure peak use before selecting a smaller run budget. Codec
-tests establish storage equivalence, not workload accuracy or successful E2E.
-
-For metrics-only runs, explicitly set `SGLANG_SIMULATOR_EVIDENCE_LEVEL=metrics`
-in the container environment. The default is `full`. Metrics-only mode retains
-the numeric iteration summaries used by metric reduction, request statistics,
-and any separately enabled token-event ledger, while omitting the verbose
-iteration spool/export and native evaluated-cost file (even if its path was
-configured). Metrics explicitly mark those artifacts as omitted by policy;
-the absence does not establish independent per-step cost verification.
-Prediction, request progress, scheduling, and validation of each SDK result
-still run normally. Client-side raw request/response and protocol recording
-are controlled separately by the selected client configuration.
-
-Select the retention level before starting a new process. Record it in the run
-identity and provision storage for the artifacts actually requested. Do not
-change a running process's policy or delete its originals to adopt a new mode.
-Use `full` when downstream acceptance requires complete regional-cost and
-committed-step evidence; a metrics-only run cannot satisfy that contract.
-
-For coordinated OFFLINE runs, set
-`SGLANG_SIMULATOR_TOKEN_EVENTS=/absolute/path/to/token_events.jsonl` to retain
-native visible output-token commits. The parent directory must exist and the
-file must be new. With the variable unset, the recorder is disabled and does no
-file I/O. Recording does not change virtual batch costs or scheduling.
-
-The JSONL stream starts with
-`{"event":"start","version":1,"clock":"virtual_ns"}`. Each output-producing
-batch writes an `output_commit` containing integer `at_ns` and `commits` entries
-with `rid`, zero-based `output_index`, and positive incremental `token_count`.
-Counts come from native visible output progression, including the first prefill
-token and multi-token commits. Empty/chunk-only/aborted results add no tokens.
-Previously committed tokens remain in the stream when their request is later
-cancelled. This measures output, not speculative or cancelled computation whose
-tokens were discarded before becoming visible.
-
-Only successful coordinator completion writes a `finish` footer containing
-`run_id`, integer `at_ns`, `status: "FINISHED"`, and `total_output_tokens`.
-Interrupted or failed streams have no success footer and must not be treated as
-complete results. Writes are flushed per batch; a write failure aborts the
-coordinated run. Existing files are never overwritten.
-
-The ledger contains no workload phases. A caller supplies exact integer virtual
-phase boundaries and request ownership separately. For fixed-duration throughput,
-sum the selected profiling requests' commits in `[start_ns, start_ns + duration_ns)`
-and divide by that configured duration, retaining output from requests later
-cancelled. Exclude warmup by request ownership as well as time: warmup completion
-and profiling start can share a timestamp. Report grace-period output and successful
-request latency cohorts separately. An early-ended measurement is incomplete and
-must not be presented as a full-duration throughput point. Legacy request statistics'
-requested `output_length` are not a substitute for this ledger.
-
-The AgentX reference output-token throughput counts output from successful
-profiling requests over their observed earliest-start/latest-end span. It uses a
-different output cohort and denominator; report it separately from fixed-window
-committed throughput.
 
 ### Explicit CPU bootstrap
 
