@@ -1068,14 +1068,11 @@ python3 -m pip install --no-deps --only-binary=:all: "mindiesd==3.2.0"
 ```
 
 `--no-deps` preserves the installed Torch/TorchNPU versions; it does not guarantee
-binary compatibility. The historical H3 runs used the source-built
-`3.1.0+fb774c4.c8v16` SDK. The fixed 3.2.0 source recipe and published wheels
-still need end-to-end validation in the target environment.
+binary compatibility.
 
 | Environment | Validation status |
 | --- | --- |
 | Ascend 950, Torch/TorchNPU 2.10.0, CANN 9.2.0-beta.2, custom SDK `3.1.0+fb774c4.c8v16` | H3 generation/performance runs for FP8, MXFP8, and MXFP4; not model-quality parity. |
-| Ascend 950, CANN 9.1.1, official SDK 3.2.0 | Pending integration validation; do not infer support from an import check. |
 | Ascend 910 / 910B / 910_93 | These A5 quantized attention paths are not supported; use native FA. |
 
 On the target NPU host, activate the CANN environment and check the public API:
