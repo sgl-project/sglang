@@ -34,7 +34,8 @@ from sglang.srt.runtime_context import (
     max_prefill_buffer_tokens,
 )
 from sglang.srt.utils import is_flashinfer_available
-from sglang.srt.utils.common import is_sm120, next_power_of_2
+from sglang.srt.utils.device import is_sm120
+from sglang.srt.utils.triton_utils import next_power_of_2
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
@@ -278,8 +279,7 @@ def _prepare_input(
 def _sm120_mtp_mma_supported() -> bool:
     import os
 
-    # This implementation preserves FlashInfer's default FP4 quantizer and
-    # fused FC2 epilogue. Other quantization recipes retain the stock runner.
+    # Matches only FlashInfer's default FP4 quantizer with the fused FC2 epilogue.
     return (
         is_sm120()
         and envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.get()
@@ -417,7 +417,7 @@ def fused_experts_none_to_flashinfer_cutlass(
     return StandardCombineInput(hidden_states=output)
 
 
-@register_fused_func("flashinfer", "flashinfer_cutlass")
+@register_fused_func("flashinfer_nvlink_one_sided", "flashinfer_cutlass")
 def fused_experts_flashinfer_to_flashinfer_cutlass(
     dispatch_output: FlashinferDispatchOutput | StandardDispatchOutput,
     quant_info: MoeQuantInfo,

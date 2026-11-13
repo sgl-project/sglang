@@ -189,6 +189,8 @@ pub struct Node<K: ChildKeyType> {
     pub rotation_base: Option<i64>,
     /// The in-flight write-through backup's ack id.
     pub write_through_pending_id: Option<usize>,
+    /// Queued for its demote by the running write-back eviction walk.
+    pub write_back_queued: bool,
     /// Load-back anchor currently reading this node's Full host slots.
     /// Auxiliary transfers are protected by their component locks.
     pub load_back_pending_id: Option<NodeId>,
@@ -264,9 +266,18 @@ impl<K: ChildKeyType> Node<K> {
         self.has_value_(ValueSlotIdx::device(component_type))
     }
 
-    /// The component's device value length, or 0 when value-less.
+    /// Logical length of the stored device-index tensor, or 0 when absent.
     pub fn device_value_len(&self, component_type: ComponentType) -> usize {
         self.value_len_(ValueSlotIdx::device(component_type))
+    }
+
+    /// Allocator slots reclaimed on eviction; roots and absent device values contribute zero.
+    /// Ordinary backing uses logical length; released/shared backing needs its own accounting.
+    pub fn device_reclaimable_value_len(&self, component_type: ComponentType) -> usize {
+        if self.is_root() {
+            return 0;
+        }
+        self.device_value_len(component_type)
     }
 
     /// Set the component's device value; panics if already set.
@@ -417,6 +428,7 @@ impl<K: ChildKeyType> Node<K> {
             external_cache_stored: false,
             rotation_base: None,
             write_through_pending_id: None,
+            write_back_queued: false,
             load_back_pending_id: None,
             last_access_counter: 0,
             creation_counter: 0,
@@ -444,6 +456,7 @@ impl<K: ChildKeyType> Node<K> {
             external_cache_stored: false,
             rotation_base: None,
             write_through_pending_id: None,
+            write_back_queued: false,
             load_back_pending_id: None,
             last_access_counter: 0,
             creation_counter: 0,
@@ -756,6 +769,9 @@ pub enum TreeCoreRuntimeError {
     /// `resume_insert` called without a suspended insert.
     #[error("no in-flight insert")]
     NoInFlightInsert,
+    /// Overlap preparation must complete before incoming values can be consumed.
+    #[error("invalid insert overlap: {0}")]
+    InvalidInsertOverlap(&'static str),
     /// A `NodeIdx_` beyond the arena's bounds — never allocated. `size` is the
     /// arena's current slot count, so valid ids are `0..size`.
     #[error("node access out of bounds: id {id} not in [0, {size})")]
@@ -1175,6 +1191,11 @@ impl<K: ChildKeyType> NodeArena<K> {
         idx
     }
 
+    /// Whether the slot holds a live node.
+    pub fn is_allocated(&self, id: NodeIdx_) -> bool {
+        self.nodes.get(id.0).is_some_and(Option::is_some)
+    }
+
     /// Every live node id, in slot order.
     pub fn live_ids(&self) -> impl Iterator<Item = NodeIdx_> + '_ {
         self.nodes
@@ -1489,7 +1510,7 @@ impl<K: ChildKeyType> NodeArena<K> {
         self.node(id).has_device_value(component_type)
     }
 
-    /// The node's device value length for the component, or 0 when value-less.
+    /// Logical length of the node's stored device-index tensor, or 0 when absent.
     pub fn device_value_len(&self, id: NodeIdx_, component_type: ComponentType) -> usize {
         self.node(id).device_value_len(component_type)
     }

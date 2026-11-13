@@ -21,16 +21,14 @@ from sglang.multimodal_gen.configs.models.vaes.hunyuanvae import HunyuanVAEConfi
 from sglang.multimodal_gen.configs.models.vaes.kandinsky6_audio import (
     Kandinsky6AudioVAEConfig,
 )
-from sglang.multimodal_gen.configs.pipeline_configs.base import (
-    ModelTaskType,
-    PipelineConfig,
-)
+from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.kandinsky6_sr import (
     _is_kandinsky6_sr,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
     qwen_image_postprocess_text,
 )
+from sglang.multimodal_gen.configs.task_type import ModelTaskType
 from sglang.multimodal_gen.runtime.distributed.cfg_policy import CFGPolicy
 
 # checkpoint-trained template: preserve its exact bytes, including misspellings
@@ -152,7 +150,6 @@ class Kandinsky6TI2VAPipelineConfig(PipelineConfig):
     flow_shift: float | None = 5.0
 
     # audio frames = ceil(pixel_frames / fps * sample_rate / downsample_factor)
-    sample_fps: float = 24.0
     audio_sample_rate: int = 44100
     audio_downsample_factor: int = 1024
 

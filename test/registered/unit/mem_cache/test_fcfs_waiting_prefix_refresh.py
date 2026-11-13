@@ -22,7 +22,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 OLDER_PREFIX = [1, 2, 3, 4]
 NEWER_PREFIX = [5, 6, 7, 8]
@@ -87,11 +87,11 @@ class TestFcfsWaitingPrefixRefresh(CustomTestCase):
         # Isolate the scheduler clock from the radix cache's recency timestamps.
         with patch("sglang.srt.managers.schedule_policy.time", create=True) as clock:
             clock.monotonic.return_value = 100.0
-            policy.calc_priority(queue)
+            queue = policy.calc_priority(queue)
             if second_refresh_time is not None:
                 cache.touch_prefix(RadixKey(array("q", NEWER_PREFIX)))
                 clock.monotonic.return_value = second_refresh_time
-                policy.calc_priority(queue)
+                queue = policy.calc_priority(queue)
         cache.evict(EvictParams(num_tokens=len(OLDER_PREFIX)))
         return [
             cache.match_prefix(

@@ -27,8 +27,13 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
-from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
-    BaseCudaGraphBackend,
+from sglang.srt.model_executor.runner_backend.base_graph_backend import (
+    BaseGraphBackend,
+)
+from sglang.srt.model_executor.runner_backend_utils.replay_hooks import (
+    has_replay_hooks,
+    replay_until_settled,
+    save_recurrent_state,
 )
 from sglang.srt.model_executor.runner_utils.pool import (
     GraphPoolPrecarve,
@@ -96,7 +101,7 @@ def _copy_output_to_buffer(output: Any, output_buffer: Any) -> Optional[Any]:
     return None
 
 
-class FullCudaGraphBackend(BaseCudaGraphBackend):
+class FullCudaGraphBackend(BaseGraphBackend):
     """One torch.cuda.CUDAGraph per shape; attention metadata is
     captured inside the graph. Memory-saver-aware.
     """
@@ -110,6 +115,7 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
     ) -> None:
         self._graphs: Dict[Any, torch.cuda.CUDAGraph] = {}
         self._outputs: Dict[Any, Any] = {}
+        self._capture_inputs: Dict[Any, Any] = {}
         self._pool = None
         self._cuda_graph_runner = cuda_graph_runner
         self._device_module = cuda_graph_runner.device_module
@@ -214,6 +220,8 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
 
         self._graphs[shape_key] = graph
         self._outputs[shape_key] = out
+        # Captured kernels can read tensors owned only by the dummy batch.
+        self._capture_inputs[shape_key] = capture_inputs
 
     def can_run(self, forward_batch: ForwardBatch, shape_key: ShapeKey) -> bool:
         return shape_key in self._graphs
@@ -229,7 +237,15 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         **kwargs,
     ) -> Any:
         with graph_pool_replay_scope():
-            self._graphs[shape_key].replay()
+            if not has_replay_hooks():
+                self._graphs[shape_key].replay()
+            else:  # a step may need replaying (paged experts' disk tier)
+                restore = save_recurrent_state(
+                    self._cuda_graph_runner.model_runner.req_to_token_pool,
+                    static_forward_batch.req_pool_indices,
+                )
+                self._graphs[shape_key].replay()
+                replay_until_settled(self._graphs[shape_key].replay, restore)
         return self._outputs[shape_key]
 
     def cleanup(self) -> None:
@@ -237,5 +253,6 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
             graph.reset()
         self._graphs.clear()
         self._outputs.clear()
+        self._capture_inputs.clear()
         self._output_buffer = None
         self._pool = None
