@@ -208,6 +208,7 @@ class TestTopK(CustomTestCase):
             self._run_single_test(123, 64, 6, renormalize, torch.bfloat16)
             self._run_single_test(123, 256, 4, renormalize, torch.bfloat16)
             self._run_single_test(123, 160, 6, renormalize, torch.bfloat16)
+            self._run_single_test(123, 2560, 8, renormalize, torch.bfloat16)
 
     def test_topk_softmax_mixed_input_dtypes(self):
         torch.manual_seed(0)
@@ -240,7 +241,7 @@ class TestTopK(CustomTestCase):
         """Bias must affect expert selection without becoming a routing weight."""
         for num_tokens, num_experts, topk, with_bias, renormalize in itertools.product(
             [1, 17, 128],
-            [16, 128, 384, 512],
+            [16, 128, 384, 512, 2560],
             [1, 2, 4, 8],
             [False, True],
             [False, True],

@@ -22,7 +22,6 @@
 #include <sgl_kernel/vec.cuh>
 
 #include <tvm/ffi/container/tensor.h>
-#include <tvm/ffi/extra/cuda/device_guard.h>
 
 #include <algorithm>
 #include <cstddef>
@@ -91,7 +90,15 @@ struct Token {
   AlignedVector<bf16x2_t, kVec / 2> shared;
 
   SGL_DEVICE void load(const Params& p, const uint32_t token, const uint32_t chunk, const uint32_t lane_id) {
+    load_shared(p, token, chunk);
+    load_route(p, token, lane_id);
+  }
+
+  SGL_DEVICE void load_shared(const Params& p, const uint32_t token, const uint32_t chunk) {
     if constexpr (kHasShared) shared.load(p.shared + token * (int64_t{p.num_chunks} * kVec), chunk);
+  }
+
+  SGL_DEVICE void load_route(const Params& p, const uint32_t token, const uint32_t lane_id) {
     row = -1;
     weight = 0;
     if (lane_id < K) {
@@ -107,8 +114,9 @@ struct Token {
 // stride gridDim.y, prefetching the next token's route; otherwise every token
 // has its own CTA row and the body runs once (the launcher picks it only while
 // the grid fits one wave).
-// route_before_wait: the caller guarantees that the route and the shared row
-// were complete when this kernel launched, so they load before the PDL wait.
+// route_before_wait: the caller guarantees that the route was complete when
+// this kernel launched, so it loads before the PDL wait. The shared row always
+// loads after the wait: in a CUDA graph, its cross-stream join is a PDL edge too.
 template <typename TW, uint32_t K, uint32_t kVec, bool kPersistent, bool kHasShared, bool kUsePDL>
 __global__ __launch_bounds__(kBlockSize, 1) void finalize_kernel(const __grid_constant__ Params p) {
   static_assert(K <= 32, "the route is spread over one warp");
@@ -125,8 +133,9 @@ __global__ __launch_bounds__(kBlockSize, 1) void finalize_kernel(const __grid_co
   if (!p.route_before_wait) PDLWaitPrimary<kUsePDL>();
   uint32_t token = blockIdx.y;
   token_t cur;
-  cur.load(p, token, safe_chunk, lane_id);
+  cur.load_route(p, token, lane_id);
   if (p.route_before_wait) PDLWaitPrimary<kUsePDL>();
+  cur.load_shared(p, token, safe_chunk);
   do {
     pairs_t in[K];
 #pragma unroll
@@ -260,8 +269,6 @@ struct MoeFinalizeKernel {
         .route_before_wait = kUsePDL && route_before_wait,
     };
     const auto dev = device.unwrap();
-    // The stream comes from the inputs' device, which may differ from the current one.
-    const tvm::ffi::CUDADeviceGuard guard(dev.device_id);
     const uint32_t grid_x = div_ceil(params.num_chunks, kBlockSize);
     if (uint64_t{grid_x} * num_tokens <= resident_ctas<false>(dev.device_id)) {
       LaunchKernel(dim3{grid_x, num_tokens}, kBlockSize, dev)  //

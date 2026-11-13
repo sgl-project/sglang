@@ -23,7 +23,7 @@ from sglang.srt.layers.moe.moe_runner.triton_utils.moe_align_block_size import (
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 # Bucket counts above this are not uniformly supported by the AOT sgl_kernel
 # path across wheel versions, so the cross-check against it stops here; the

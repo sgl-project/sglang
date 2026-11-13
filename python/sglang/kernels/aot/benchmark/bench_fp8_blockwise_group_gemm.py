@@ -7,9 +7,9 @@ import deep_gemm
 import torch
 from sgl_kernel import fp8_blockwise_scaled_grouped_mm
 
-from sglang.utils import is_in_ci
+from sglang.srt.environ import envs
 
-IS_CI = is_in_ci()
+IS_CI = envs.SGLANG_IS_IN_CI.get()
 
 
 def get_m_alignment_for_contiguous_layout():

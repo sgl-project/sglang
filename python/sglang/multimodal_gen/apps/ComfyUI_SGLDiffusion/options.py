@@ -38,7 +38,7 @@ _FIELDS = {
     "model_type": _field(
         "basic",
         ["auto-detect", "qwen_image", "qwen_image_edit", "qwen_image21"]
-        + ["flux", "lumina2", "minimax_h3"],
+        + ["flux", "lumina2", "minimax_h3", "ltxav"],
         "auto-detect",
         "FastH3 / VDN-H3 load through the Native Model Loader.",
     ),

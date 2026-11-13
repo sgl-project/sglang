@@ -16,33 +16,8 @@
 import hashlib
 from typing import Any, Callable, List, Optional, Tuple
 
-from sglang.kernels.ops.kvcache.mla_buffer import (
-    get_mla_kv_buffer_kernel as get_mla_kv_buffer_kernel,
-)
-from sglang.kernels.ops.kvcache.mla_buffer import (
-    get_mla_kv_buffer_triton as get_mla_kv_buffer_triton,
-)
-from sglang.kernels.ops.kvcache.mla_buffer import (
-    set_mla_kv_buffer_dcp_sharded_triton as set_mla_kv_buffer_dcp_sharded_triton,
-)
-from sglang.kernels.ops.kvcache.mla_buffer import (
-    set_mla_kv_buffer_fp8_quant_kernel as set_mla_kv_buffer_fp8_quant_kernel,
-)
-from sglang.kernels.ops.kvcache.mla_buffer import (
-    set_mla_kv_buffer_kernel as set_mla_kv_buffer_kernel,
-)
-from sglang.kernels.ops.kvcache.mla_buffer import (
-    set_mla_kv_buffer_triton as set_mla_kv_buffer_triton,
-)
-from sglang.kernels.ops.kvcache.mla_buffer import (
-    set_mla_kv_buffer_triton_fp8_quant as set_mla_kv_buffer_triton_fp8_quant,
-)
-from sglang.kernels.ops.kvcache.mla_buffer import (
-    set_mla_kv_scale_buffer_kernel as set_mla_kv_scale_buffer_kernel,
-)
-from sglang.kernels.ops.kvcache.mla_buffer import (
-    set_mla_kv_scale_buffer_triton as set_mla_kv_scale_buffer_triton,
-)
+import torch
+
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.cpp_utils.native_hash import get_native_hash
 from sglang.srt.mem_cache.evict_policy import (
@@ -241,3 +216,29 @@ def split_node_hash_value(
     child_hash = child_hash_value[split_pages:]
 
     return new_node_hash, child_hash
+
+
+def get_num_new_pages(
+    seq_lens: torch.Tensor,
+    page_size: int,
+    prefix_lens: Optional[torch.Tensor] = None,
+    decode: bool = False,
+) -> torch.Tensor:
+    """
+    Get the number of new pages for the given prefix and sequence lengths.
+    We use cpu tensors to avoid blocking kernel launch.
+    """
+    cpu_device = torch.device("cpu")
+    assert seq_lens.device == cpu_device
+
+    if prefix_lens is None or decode:
+        # NOTE: Special case for handling decode, which prefix lens is `seq_lens - 1`.
+        assert decode
+        return (seq_lens % page_size == 1).int().sum().item()
+
+    assert prefix_lens.device == cpu_device
+    num_pages_after = (seq_lens + page_size - 1) // page_size
+    num_pages_before = (prefix_lens + page_size - 1) // page_size
+    num_new_pages = num_pages_after - num_pages_before
+    sum_num_new_pages = torch.sum(num_new_pages).to(torch.int64)
+    return sum_num_new_pages.item()
