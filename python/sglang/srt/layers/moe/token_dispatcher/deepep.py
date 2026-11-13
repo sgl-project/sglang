@@ -548,6 +548,32 @@ class _DeepEPDispatcherImplBase:
 class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
     dispatch_mode = DeepEPMode.NORMAL
 
+    def _validate_and_adjust_dtype(self) -> None:
+        super()._validate_and_adjust_dtype()
+        if not (_is_npu and envs.SGLANG_NPU_DEEPEP_NORMAL_BF16.get()):
+            return
+        from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+
+        if is_npu_arch35() or self.deepep_output_dtype not in (
+            DispatcherOutputDtype.BF16,
+            DispatcherOutputDtype.INT8,
+            DispatcherOutputDtype.FP8,
+        ):
+            return
+        # On A2/A3 the FP8 selector also uses the INT8 wire format. Older
+        # DeepEP builds choose that format through this environment variable.
+        if os.environ.get("DEEP_NORMAL_MODE_USE_INT8_QUANT", "0") == "1":
+            raise ValueError(
+                "SGLANG_NPU_DEEPEP_NORMAL_BF16 requires "
+                "DEEP_NORMAL_MODE_USE_INT8_QUANT=0."
+            )
+        if self.deepep_output_dtype == DispatcherOutputDtype.BF16:
+            return
+        self.deepep_output_dtype = DispatcherOutputDtype.BF16
+        logger.info_once(
+            "DeepEP Normal dispatch uses BF16 under SGLANG_NPU_DEEPEP_NORMAL_BF16."
+        )
+
     def __init__(self, async_finish: bool, **kwargs):
         super().__init__(**kwargs)
 
