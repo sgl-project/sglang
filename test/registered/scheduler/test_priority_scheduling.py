@@ -445,7 +445,7 @@ class TestPrioritySchedulingUnifiedMemory(
                 "--attention-backend",
                 "triton",
                 "--mem-fraction-static",
-                "0.8",
+                "0.55",
                 "--max-running-requests",
                 "2",
                 "--max-queued-requests",
