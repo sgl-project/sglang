@@ -29,7 +29,7 @@ class TestEmptyBatchFullLatch(CustomTestCase):
         s.grammar_manager = SimpleNamespace(has_waiting_grammars=lambda: False)
         s.enable_priority_preemption = False
         s.waiting_queue = IndexedReqList(ListKind.WAITING)
-        s.waiting_queue.join([SimpleNamespace(rid="req-0")])
+        s.waiting_queue._join([SimpleNamespace(rid="req-0", owner_list=None)])
         s.chunked_reqs = IndexedReqList(ListKind.CHUNKED)
         s.min_free_slots_delayer = None
         s.get_num_allocatable_reqs = Mock(return_value=8)
