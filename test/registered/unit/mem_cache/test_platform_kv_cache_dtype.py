@@ -68,12 +68,14 @@ class TestPlatformKVCacheDtype(CustomTestCase):
             )
 
     def test_the_platform_pool_gets_the_registered_storage_dtype(self):
+        """The runner's label stays the registered name: the pool guard and the
+        platform's pool both key off it."""
         platform_kv_cache_dtype.register_kv_cache_dtype(
             _NAME, storage_dtype=torch.float8_e4m3fn
         )
-        self.assertIs(self._storage_dtype(_NAME), torch.float8_e4m3fn)
+        self.assertEqual(self._configure(_NAME), (_NAME, torch.float8_e4m3fn))
         with self.assertRaisesRegex(ValueError, "Unsupported"):
-            self._storage_dtype("unregistered_kv")
+            self._configure("unregistered_kv")
 
     def test_only_constructing_a_kind_the_platform_lacks_fails(self):
         """A registered dtype resolves a missing kind to a class that refuses to be
@@ -226,16 +228,15 @@ class TestPlatformKVCacheDtype(CustomTestCase):
             )
 
     @staticmethod
-    def _storage_dtype(name):
-        _, dtype = configure_kv_cache_dtype(
+    def _configure(name):
+        return configure_kv_cache_dtype(
             server_args_kv_cache_dtype=name,
-            model=None,
+            quant_config=None,
             model_dtype=torch.bfloat16,
             is_draft_worker=False,
             is_dflash=False,
             speculative_draft_attention_backend=None,
         )
-        return dtype
 
 
 def _configurator(*, kv_cache_dtype_str):
