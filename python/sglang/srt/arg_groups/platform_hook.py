@@ -335,6 +335,16 @@ def handle_sail_attention_backend_compatibility(server_args: Any):
 def handle_cpu_backends(server_args: Any):
     cfg = resolving_view(server_args)
     if cfg.device == "cpu":
+        if os.getenv("SGLANG_USE_CPU_ENGINE", "0") != "1":
+            # `--device cpu` must fully activate the CPU engine. Platform
+            # selection and layer-level device dispatch gate on the
+            # SGLANG_USE_CPU_ENGINE env var (see platforms/__init__.py),
+            # and is_cpu() is lru_cached, so set the var and clear the
+            # cache before any scheduler subprocess is forked.
+            os.environ["SGLANG_USE_CPU_ENGINE"] = "1"
+            from sglang.srt.utils.device import is_cpu
+
+            is_cpu.cache_clear()
         if cfg.attention_backend is None:
             declare_resolution(
                 server_args,
