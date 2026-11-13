@@ -1,20 +1,20 @@
-"""Public adapter for the Ascend combined/split-host Copy-SFA operator."""
+"""Public adapter for Ascend combined and split HBM Copy-SFA operators."""
 
 from __future__ import annotations
 
 import torch
 
 
-def load_copy_sfa_operator():
+def load_copy_sfa_operator(*, split_hbm=False):
     """Resolve the registered A3 implementation before graph capture."""
+    name = "fused_scatter_copy_sparse_flash_attention" + ("_split" if split_hbm else "")
     try:
         import sgl_kernel_npu  # noqa: F401
 
-        return torch.ops.npu.fused_scatter_copy_sparse_flash_attention.default
+        return getattr(torch.ops.npu, name).default
     except (ImportError, AttributeError) as error:
         raise RuntimeError(
-            "Copy-SFA requires an sgl-kernel-npu A3 wheel containing "
-            "npu::fused_scatter_copy_sparse_flash_attention."
+            f"Copy-SFA requires an sgl-kernel-npu A3 wheel containing npu::{name}."
         ) from error
 
 
@@ -38,11 +38,18 @@ def fused_scatter_copy_sparse_flash_attention(
     scale_value,
     *,
     operator=None,
+    split_hbm_rope=None,
     full_visible=False,
     resident_refresh_tail=False,
     resident_inputs=None,
 ) -> None:
-    """Copy resident KV and attend to selected combined-cache tokens.
+    """Copy resident KV and attend to selected cache tokens.
+
+    Without ``split_hbm_rope``, ``combined_hbm_cache`` is the legacy combined
+    HBM cache. With it, that argument is the CKV component and
+    ``split_hbm_rope`` is the RoPE component. The production split ABI receives
+    ``(query, query_rope, hbm_ckv, hbm_rope)`` as its first four arguments.
+    Split host storage supplies ``dram_rope_dev_ptr`` in ``resident_inputs``.
 
     Query tensors use contiguous TND ``[T, H, 512|64]`` and request-level
     cumulative query lengths. ``topk_src_ids`` and ``topk_dst_slots`` use
@@ -66,7 +73,7 @@ def fused_scatter_copy_sparse_flash_attention(
     if query.dtype not in (torch.float16, torch.bfloat16):
         raise ValueError("Copy-SFA requires FP16/BF16 query and KV storage.")
     if operator is None:
-        operator = load_copy_sfa_operator()
+        operator = load_copy_sfa_operator(split_hbm=split_hbm_rope is not None)
     inputs = (
         query,
         query_rope,
@@ -86,6 +93,8 @@ def fused_scatter_copy_sparse_flash_attention(
         attention_out,
         scale_value,
     )
+    if split_hbm_rope is not None:
+        inputs = (*inputs[:3], split_hbm_rope, *inputs[3:])
     operator(
         *inputs,
         full_visible=full_visible,

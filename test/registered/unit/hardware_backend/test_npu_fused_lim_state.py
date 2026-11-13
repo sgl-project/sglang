@@ -111,18 +111,16 @@ class TestLIMState(CustomTestCase):
         plan = resolve_sparse_kv_budget(**self.options(prefill_workspace_tokens=129))
         self.assertEqual(base.prefill_workspace_tokens, 0)
         self.assertEqual(plan.prefill_workspace_tokens, 129)
+        self.assertNotIn("prefill_packed", plan.manager_buffers)
         for name, width in (
-            ("prefill_packed", 576),
             ("prefill_nope", 512),
             ("prefill_rope", 64),
         ):
             spec = plan.manager_buffers[name]
             self.assertEqual(spec.shape, (129, 1, width))
             self.assertEqual(spec.dtype, torch.bfloat16)
-        self.assertEqual(
-            plan.managed_hbm_bytes - base.managed_hbm_bytes, 129 * 1152 * 2
-        )
-        self.assertEqual(plan.prefill_workspace_bytes, 129 * 1152 * 2)
+        self.assertEqual(plan.managed_hbm_bytes - base.managed_hbm_bytes, 129 * 576 * 2)
+        self.assertEqual(plan.prefill_workspace_bytes, 129 * 576 * 2)
         self.assertEqual(plan.copy_sfa_bytes, base.copy_sfa_bytes)
         fitting = resolve_sparse_kv_budget(
             **self.options(
@@ -351,7 +349,15 @@ class TestLIMState(CustomTestCase):
             return tensor, tensor.data_ptr(), tensor.data_ptr()
 
         with (
-            patch.object(fused_manager, "load_copy_sfa_operator", return_value=None),
+            patch.object(
+                fused_manager,
+                "load_copy_sfa_operator",
+                return_value=SimpleNamespace(
+                    _schema=SimpleNamespace(
+                        arguments=[SimpleNamespace(name="dram_rope_dev_ptr")]
+                    )
+                ),
+            ),
             patch.object(fused_manager, "create_shm_tensor", side_effect=shm),
             patch.object(
                 torch, "npu", SimpleNamespace(current_device=lambda: 0), create=True
@@ -369,6 +375,17 @@ class TestLIMState(CustomTestCase):
                 req_pool, None, 2048, paged_kv_cache=pool
             )
         self.assertIs(manager.budget, plan)
+        self.assertEqual(
+            [tuple(component[0].shape) for component in manager.host_pool.buffers],
+            [
+                (1, plan.host_token_capacity, 1, 512),
+                (1, plan.host_token_capacity, 1, 64),
+            ],
+        )
+        self.assertEqual(
+            sum(t.nbytes for component in manager.host_pool.buffers for t in component),
+            plan.host_kv_bytes,
+        )
         self.assertIs(pool.sparse_kv_budget_plan, plan)
         pool.get_index_k_buffer.assert_called_with(1)
 
@@ -439,11 +456,13 @@ class TestLIMState(CustomTestCase):
         )
 
         def native_copy_sfa(*tensors, **kwargs):
-            self.assertEqual(tensors[6].ndim, 2)
+            self.assertEqual(tensors[2].shape[-1], 512)
+            self.assertEqual(tensors[3].shape[-1], 64)
             self.assertEqual(tensors[7].ndim, 2)
-            torch.testing.assert_close(tensors[6], source_values)
-            torch.testing.assert_close(tensors[7], slot_values)
-            tensors[15].fill_(3)
+            self.assertEqual(tensors[8].ndim, 2)
+            torch.testing.assert_close(tensors[7], source_values)
+            torch.testing.assert_close(tensors[8], slot_values)
+            tensors[16].fill_(3)
 
         manager._copy_sfa_operator = native_copy_sfa
         result = manager.copy_sfa_attention(

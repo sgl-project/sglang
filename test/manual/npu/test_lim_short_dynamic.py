@@ -134,10 +134,11 @@ def test_prefill_attention_and_short_residency():
             sources = sources.masked_fill(
                 sources > torch.tensor(positions, device="npu")[:, None], -1
             )
-            for layer_id, host in enumerate(manager.host_kv_buffer):
+            for layer_id in range(manager.layer_num):
                 payload = torch.randn(2 * context, 576, dtype=torch.bfloat16)
                 fresh = torch.randn(4, 1, 576, device="npu", dtype=torch.bfloat16)
-                host.view(-1, 576).copy_(payload)
+                manager.host_k_buffer[layer_id].view(-1, 512).copy_(payload[:, :512])
+                manager.host_v_buffer[layer_id].view(-1, 64).copy_(payload[:, 512:])
                 payload[physical] = fresh.cpu().view(4, 576)
                 layer = SimpleNamespace(
                     layer_id=layer_id,
@@ -171,6 +172,10 @@ def test_prefill_attention_and_short_residency():
                     torch.testing.assert_close(
                         output[token].cpu().float(), expected, rtol=0.025, atol=0.025
                     )
+                host = torch.cat(
+                    (manager.host_k_buffer[layer_id], manager.host_v_buffer[layer_id]),
+                    dim=-1,
+                )
                 for row, length in enumerate(lengths[:2]):
                     torch.testing.assert_close(
                         host.view(-1, 576)[mapping[row, :length]],
@@ -254,8 +259,9 @@ def test_short_sparse_graph_lifecycle(
             payloads = [
                 torch.randn(2 * context, 576, dtype=torch.bfloat16) for _ in range(2)
             ]
-            for host, payload in zip(manager.host_kv_buffer, payloads):
-                host.view(-1, 576).copy_(payload)
+            for layer_id, payload in enumerate(payloads):
+                manager.host_k_buffer[layer_id].view(-1, 512).copy_(payload[:, :512])
+                manager.host_v_buffer[layer_id].view(-1, 64).copy_(payload[:, 512:])
             tokens = batch * width + 3  # TP suffix is separate from request padding.
             query = torch.randn(tokens, heads, 512, dtype=torch.bfloat16, device="npu")
             rope = torch.randn(tokens, heads, 64, dtype=torch.bfloat16, device="npu")
@@ -487,7 +493,14 @@ def test_short_sparse_graph_lifecycle(
 
             def check_chunk(ends):
                 torch.npu.synchronize()
-                for layer_id, host in enumerate(manager.host_kv_buffer):
+                for layer_id in range(manager.layer_num):
+                    host = torch.cat(
+                        (
+                            manager.host_k_buffer[layer_id],
+                            manager.host_v_buffer[layer_id],
+                        ),
+                        dim=-1,
+                    )
                     for r in range(2):
                         torch.testing.assert_close(
                             host.view(-1, 576)[mapping[r, : ends[r]]],

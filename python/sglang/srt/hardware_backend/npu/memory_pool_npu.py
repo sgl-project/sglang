@@ -1023,6 +1023,9 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
     def _get_disagg_buffer_entries(self):
         """Return (buffer, uses_global_slots) entries in PD transfer order."""
         host_pool = self._get_pd_split_host_pool()
+        if host_pool is not None and not host_pool.supports_pd_export:
+            # Colocated SHM device mappings are not MF PD registrations.
+            host_pool = None
         if host_pool is not None:
             # Match native prefill's CKV layers, then KPE layers, then indexer.
             entries = [

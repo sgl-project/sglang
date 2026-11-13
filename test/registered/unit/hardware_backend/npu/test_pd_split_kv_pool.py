@@ -1,4 +1,6 @@
+import ast
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -6,6 +8,7 @@ import torch
 
 from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, stage="base-a", runner_config="cpu")
 
@@ -30,7 +33,7 @@ def _make_pool():
     return pool
 
 
-class TestPDSplitKVPool(unittest.TestCase):
+class TestPDSplitKVPool(CustomTestCase):
     def test_native_combined_export_uses_upstream_layout(self):
         pool = _make_pool()
         pool.use_combined_kv_buffer = True
@@ -46,7 +49,7 @@ class TestPDSplitKVPool(unittest.TestCase):
         prefill, decode = _make_pool(), _make_pool()
         k, v = list(decode.k_buffer), list(decode.v_buffer)
         decode.sparse_kv_manager = SimpleNamespace(
-            host_pool=SimpleNamespace(buffers=(k, v))
+            host_pool=SimpleNamespace(buffers=(k, v), supports_pd_export=True)
         )
         decode.k_buffer = decode.v_buffer = None
 
@@ -107,6 +110,211 @@ class TestPDSplitKVPool(unittest.TestCase):
             self.assertEqual(torch.count_nonzero(buf).item(), 0)
         for buf, want in zip(buffers[4:], expected[4:], strict=True):
             torch.testing.assert_close(buf[dst], want, rtol=0, atol=0)
+
+    def test_colocated_shm_is_not_exported_as_pd_memory(self):
+        pool = _make_pool()
+        pool.sparse_kv_manager = SimpleNamespace(
+            host_pool=SimpleNamespace(supports_pd_export=False, buffers=([], []))
+        )
+        expected = (
+            [t.data_ptr() for t in pool.k_buffer]
+            + [t.data_ptr() for t in pool.v_buffer]
+            + [t.data_ptr() for t in pool.index_k_buffer]
+        )
+        self.assertEqual(pool.get_contiguous_buf_infos()[0], expected)
+
+    def test_shm_split_roundtrip_move_and_retraction(self):
+        # Run the real manager/pool methods with only the NPU allocation and
+        # row-copy boundaries emulated. The fake device pointer is deliberately
+        # different from the CPU address so accidental address substitution fails.
+        path = Path(__file__).resolve().parents[5] / (
+            "python/sglang/srt/hardware_backend/npu/"
+            "sparsity_driven_kv_offload/fused_manager.py"
+        )
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        shm = next(
+            n
+            for n in tree.body
+            if isinstance(n, ast.ClassDef) and n.name == "ShmSplitKVPool"
+        )
+        manager = next(
+            n
+            for n in tree.body
+            if isinstance(n, ast.ClassDef) and n.name == "FusedSparseKVCacheManager"
+        )
+        move = next(
+            n
+            for n in manager.body
+            if isinstance(n, ast.FunctionDef) and n.name == "move_host_kv"
+        )
+        attention = next(
+            n
+            for n in manager.body
+            if isinstance(n, ast.FunctionDef) and n.name == "copy_sfa_attention"
+        )
+        pointers = {}
+        observed = {}
+
+        def copy_sfa(*args, **kwargs):
+            observed["ckv"] = args[14]
+            observed["kpe"] = kwargs["resident_inputs"]["dram_rope_dev_ptr"]
+
+        def allocate(*, shape, dtype, device_id, name):
+            tensor = torch.zeros(shape, dtype=dtype)
+            ptr = 100000 + len(pointers) * 4096
+            pointers[ptr] = tensor.data_ptr()
+            return tensor, tensor.data_ptr(), ptr
+
+        def copy(src, dst, si, di, valid, sd, dd, **kw):
+            for tensor, key in ((src, "src_ptr"), (dst, "dst_ptr")):
+                base = tensor.untyped_storage().data_ptr()
+                matched = [device for device, cpu in pointers.items() if cpu == base]
+                if matched:
+                    self.assertEqual(kw[key], matched[0] + tensor.data_ptr() - base)
+                else:
+                    self.assertNotIn(key, kw)
+            self.assertEqual(sd, src.ndim - 2)
+            self.assertEqual(dd, dst.ndim - 2)
+            src = src.reshape(-1, *src.shape[-2:])
+            dst = dst.reshape(-1, *dst.shape[-2:])
+            dst[di[valid]] = src[si[valid]]
+
+        ns = {
+            "torch": torch,
+            "create_shm_tensor": allocate,
+            "unidex_copy_inplace": copy,
+            "fused_scatter_copy_sparse_flash_attention": copy_sfa,
+        }
+        code = ast.Module(
+            body=[
+                shm,
+                ast.ClassDef(
+                    name="Manager",
+                    bases=[],
+                    keywords=[],
+                    body=[move, attention],
+                    decorator_list=[],
+                ),
+            ],
+            type_ignores=[],
+        )
+        exec(compile(ast.fix_missing_locations(code), str(path), "exec"), ns)
+        host = ns["ShmSplitKVPool"](
+            shape=(2, 128, 1, 576),
+            widths=(512, 64),
+            layers=2,
+            dtype=torch.bfloat16,
+            device_id=0,
+            name="test",
+        )
+        self.assertEqual(
+            [x[0].shape for x in host.buffers], [(2, 128, 1, 512), (2, 128, 1, 64)]
+        )
+        m = ns["Manager"]()
+        m.host_pool, m.host_k_buffer, m.host_v_buffer = host, *host.buffers
+        m.device, m.store_dtype = "cpu", torch.bfloat16
+        m.kv_lora_rank, m.qk_rope_head_dim = 512, 64
+        m.head_num, m.head_dim, m.start_layer = 1, 576, 0
+        m.dev_ptr_list, m.rope_dev_ptr_list = host.dev_ptrs
+        m.fused_attn_out = torch.zeros(1, 1, 512)
+        m.device_kv_buffer = [torch.zeros(128, 1, 512)]
+        m.device_rope_buffer = [torch.zeros(128, 1, 64)]
+        m.lim_adapter = SimpleNamespace(copy_sfa_metadata=lambda *_: torch.zeros(1))
+        for name in (
+            "planner_actual_seq_lengths_kv",
+            "planner_num_cache_tokens",
+            "planner_hbm_block_table",
+            "planner_dram_block_table",
+            "resident_begin",
+            "resident_end",
+        ):
+            setattr(m, name, torch.zeros(1, 1, dtype=torch.long))
+        m.req_to_token_pool = SimpleNamespace(req_to_token=torch.zeros(1, 1))
+        m.host_token_capacity, m._copy_sfa_operator = 256, object()
+        plan = SimpleNamespace(
+            request_safe_slots=torch.zeros(1, dtype=torch.long),
+            query_width=1,
+            source_ids=torch.zeros(1),
+            device_slots=torch.zeros(1),
+            topk_misses=None,
+            miss_sources=None,
+            miss_slots=None,
+            miss_counts=None,
+            valid_rows=torch.ones(1, dtype=torch.bool),
+        )
+        m.copy_sfa_attention(
+            SimpleNamespace(layer_id=0),
+            torch.zeros(1, 1, 512),
+            torch.zeros(1, 1, 64),
+            1,
+            1.0,
+            plan,
+            (None, None, None),
+        )
+        self.assertEqual(
+            observed, {"ckv": host.dev_ptrs[0][0], "kpe": host.dev_ptrs[1][0]}
+        )
+        payload = [
+            torch.full((2, 1, width), 17, dtype=torch.bfloat16) for width in (512, 64)
+        ]
+        host.copy_rows(
+            payload,
+            [c[0] for c in host.buffers],
+            torch.tensor([0, 1]),
+            torch.tensor([3, 4]),
+            torch.tensor([True, False]),
+        )
+        for component in host.buffers:
+            self.assertTrue(torch.all(component[0].flatten(0, 1)[3] == 17))
+            self.assertTrue(torch.all(component[0].flatten(0, 1)[4] == 0))
+        offset = [component[0][1] for component in host.buffers]
+        host.copy_rows(
+            payload,
+            offset,
+            torch.tensor([0, 1]),
+            torch.tensor([3, 4]),
+            torch.tensor([True, False]),
+        )
+        for component in host.buffers:
+            self.assertTrue(torch.all(component[0][1, 3] == 17))
+        for component in host.buffers:
+            for layer, buf in enumerate(component):
+                rows = buf.flatten(0, 1)
+                rows[:, 0, :] = torch.arange(256, dtype=torch.bfloat16)[:, None] + layer
+        before = [
+            [buf.flatten(0, 1).clone() for buf in component]
+            for component in host.buffers
+        ]
+        src, dst = torch.tensor([5, 6, 7]), torch.tensor([6, 7, 5])
+        m.move_host_kv(dst, src)
+        for component, original in zip(host.buffers, before, strict=True):
+            for buf, old in zip(component, original, strict=True):
+                torch.testing.assert_close(
+                    buf.flatten(0, 1)[dst], old[src], rtol=0, atol=0
+                )
+        pool = _make_pool()
+        pool.sparse_kv_manager = SimpleNamespace(
+            host_pool=host, reset_requests=lambda _: None
+        )
+        pool.k_buffer = pool.v_buffer = None
+        slots, target = torch.tensor([5, 129, 250]), torch.tensor([20, 130, 251])
+        expected = [
+            [buf.flatten(0, 1)[slots].clone() for buf in component]
+            for component in host.buffers
+        ]
+        with patch.object(
+            torch, "npu", SimpleNamespace(synchronize=lambda: None), create=True
+        ):
+            snapshot = pool.get_cpu_copy(slots)
+            for component in host.buffers:
+                for buf in component:
+                    buf.zero_()
+            pool.load_cpu_copy(snapshot, target, req_pool_index=3)
+        for component, original in zip(host.buffers, expected, strict=True):
+            for buf, old in zip(component, original, strict=True):
+                torch.testing.assert_close(
+                    buf.flatten(0, 1)[target], old, rtol=0, atol=0
+                )
 
 
 if __name__ == "__main__":

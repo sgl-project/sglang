@@ -284,7 +284,7 @@ class TestWorkspaceLifecycle(PrefillReferenceTest):
 
         def copy(source, dest, src, dst, mask, *args, **kwargs):
             cls.copy_calls.append((src.clone(), dst.clone(), mask.clone()))
-            source = source.reshape(-1, 1, 576)
+            source = source.reshape(-1, 1, source.shape[-1])
             dest[dst[mask]] = source[src[mask]]
 
         namespace = {
@@ -330,7 +330,16 @@ class TestWorkspaceLifecycle(PrefillReferenceTest):
         )
         for dtype in (torch.float16, torch.bfloat16, torch.float32):
             m = self.manager_type()
-            m.host_pool = None
+
+            class SplitPool:
+                def copy_rows(self, sources, destinations, src, dst, mask):
+                    for source, dest in zip(sources, destinations):
+                        source = source.reshape(-1, 1, source.shape[-1])
+                        dest.reshape(-1, 1, dest.shape[-1])[dst[mask]] = source[
+                            src[mask]
+                        ]
+
+            m.host_pool = SplitPool()
             m.budget = SimpleNamespace(prefill_workspace_tokens=8)
             m._prefill_workspace_stream = None
             m.size, m.max_context_len, m.start_layer, m.layer_num = 4, 4, 0, 2
@@ -341,7 +350,6 @@ class TestWorkspaceLifecycle(PrefillReferenceTest):
                 64,
             )
             m.head_dim, m.store_dtype, m.host_token_capacity = 576, dtype, 16
-            m.prefill_packed = torch.empty((8, 1, 576), dtype=dtype)
             m.prefill_nope = torch.empty((8, 1, 512), dtype=dtype)
             m.prefill_rope = torch.empty((8, 1, 64), dtype=dtype)
             table = torch.tensor(
@@ -353,7 +361,9 @@ class TestWorkspaceLifecycle(PrefillReferenceTest):
                 .reshape(1, 16, 1, 576)
                 .to(dtype)
             )
-            m.host_kv_buffer, m.dev_ptr_list = [host, host + 1], [0, 0]
+            hosts = [host, host + 1]
+            m.host_k_buffer = [h[..., :512].clone() for h in hosts]
+            m.host_v_buffer = [h[..., 512:].clone() for h in hosts]
 
             def batch(ids, lens):
                 ids, lens = torch.tensor(ids), torch.tensor(lens)
@@ -419,7 +429,7 @@ class TestWorkspaceLifecycle(PrefillReferenceTest):
             host_only, rope_only = m.get_forward_kv(
                 1, current_batch, "A", plan=plan, current=None
             )
-            layer_host = m.host_kv_buffer[1]
+            layer_host = hosts[1]
             host_reference = torch.cat(
                 [layer_host[0, table[1, :3]], layer_host[0, table[2, :2]]]
             )

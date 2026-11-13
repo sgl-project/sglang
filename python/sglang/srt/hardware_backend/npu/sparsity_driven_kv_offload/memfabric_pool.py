@@ -16,6 +16,7 @@ class MemFabricKVPool:
     """
 
     alignment = 2 * 1024 * 1024
+    supports_pd_export = True
 
     def __init__(self, *, tokens, layers, widths, dtype, device, group):
         if tokens <= 0 or tokens % 128 or layers <= 0 or tuple(widths) != (512, 64):

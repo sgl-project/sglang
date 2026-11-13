@@ -167,11 +167,12 @@ def test_real_manager_mtp_owner_share_lifecycle(graph, heads, query_width, capac
                 paged_kv_cache=index_pool,
             )
             for i in range(2):
-                manager.host_kv_buffer[i].copy_(
-                    torch.randn(
-                        manager.host_kv_buffer[i].shape, generator=generator
-                    ).to(torch.bfloat16)
-                )
+                for component in (manager.host_k_buffer[i], manager.host_v_buffer[i]):
+                    component.copy_(
+                        torch.randn(component.shape, generator=generator).to(
+                            torch.bfloat16
+                        )
+                    )
             backend = SimpleNamespace(
                 graph_mode=graph,
                 device=device,
@@ -238,7 +239,9 @@ def test_real_manager_mtp_owner_share_lifecycle(graph, heads, query_width, capac
             assert plan.miss_counts.cpu().tolist() == [C, Q, 0]
             ids = plan.source_ids.cpu()
             for i in range(2):
-                host = manager.host_kv_buffer[i]
+                host = torch.cat(
+                    (manager.host_k_buffer[i], manager.host_v_buffer[i]), dim=-1
+                )
                 actual = outputs[i].cpu().float().view(token_rows, heads, 512)
                 errors = []
                 for row in range(2):
@@ -299,7 +302,9 @@ def test_real_manager_mtp_owner_share_lifecycle(graph, heads, query_width, capac
             assert plan.miss_counts.cpu().tolist() == [C, C, 0]
             ids = plan.source_ids.cpu()
             for i in range(2):
-                host = manager.host_kv_buffer[i]
+                host = torch.cat(
+                    (manager.host_k_buffer[i], manager.host_v_buffer[i]), dim=-1
+                )
                 actual = outputs[i].cpu().float().view(token_rows, heads, 512)
                 errors = []
                 for row in range(2):

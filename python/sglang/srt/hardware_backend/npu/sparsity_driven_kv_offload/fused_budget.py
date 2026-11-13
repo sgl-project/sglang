@@ -85,7 +85,12 @@ class BudgetPlan:
         metadata_dtype = torch.int32
         self.manager_buffers = {
             "device_kv_buffer": BufferSpec(
-                (request_rows, cache_tokens, 1, self.kv_cache_dim),
+                (request_rows, cache_tokens, 1, kv_lora_rank),
+                kv_dtype,
+                num_layers,
+            ),
+            "device_rope_buffer": BufferSpec(
+                (request_rows, cache_tokens, 1, qk_rope_head_dim),
                 kv_dtype,
                 num_layers,
             ),
@@ -115,10 +120,6 @@ class BudgetPlan:
         }
         if prefill_workspace_tokens:
             self.manager_buffers.update(
-                prefill_packed=BufferSpec(
-                    (prefill_workspace_tokens, 1, self.kv_cache_dim),
-                    kv_dtype,
-                ),
                 prefill_nope=BufferSpec(
                     (prefill_workspace_tokens, 1, kv_lora_rank), kv_dtype
                 ),
@@ -157,12 +158,15 @@ class BudgetPlan:
             self.adapter_buffers[name] = BufferSpec((batch_capacity,), metadata_dtype)
         for name in ("_pre_sparse", "_pre_valid"):
             self.adapter_buffers[name] = BufferSpec((batch_capacity,), torch.bool)
-        self.device_kv_bytes = self.manager_buffers["device_kv_buffer"].nbytes
+        self.device_kv_bytes = sum(
+            self.manager_buffers[n].nbytes
+            for n in ("device_kv_buffer", "device_rope_buffer")
+        )
         self.slot_map_bytes = self.manager_buffers["device_slot_map"].nbytes
         self.copy_sfa_bytes = sum(
             s.nbytes
             for n, s in self.manager_buffers.items()
-            if n not in ("device_kv_buffer", "device_slot_map")
+            if n not in ("device_kv_buffer", "device_rope_buffer", "device_slot_map")
             and not n.startswith("prefill_")
         )
         self.prefill_workspace_bytes = sum(
@@ -195,7 +199,7 @@ class BudgetPlan:
         """Drop the optional allocation before the plan is bound to a pool."""
         if self.host_token_capacity is not None:
             raise ValueError("Cannot change a bound sparse KV budget plan.")
-        for name in ("prefill_packed", "prefill_nope", "prefill_rope"):
+        for name in ("prefill_nope", "prefill_rope"):
             self.manager_buffers.pop(name, None)
         self.prefill_workspace_tokens = 0
         self.prefill_workspace_bytes = 0
