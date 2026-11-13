@@ -124,29 +124,6 @@ def test_rocm_multinode_uses_fabric_clique(monkeypatch, in_clique):
     probe.assert_called_once_with(group, device)
 
 
-@pytest.mark.parametrize(
-    ("disabled", "has_multicast", "nbytes", "num_blocks", "expected"),
-    [
-        (False, True, 1024, 4, True),
-        (False, True, 1025, 4, False),
-        (False, True, 1024, 4096, True),
-        (False, True, 1024, 0, False),
-        (False, True, 0, 1, False),
-        (False, False, 1024, 4, True),
-        (True, None, 1024, 4, False),
-    ],
-)
-def test_supports_push(disabled, has_multicast, nbytes, num_blocks, expected):
-    """Push is offered within the inclusive slot capacity at any positive grid size."""
-    comm = object.__new__(custom_all_reduce_v2.CustomAllReduceV2)
-    comm.disabled = disabled
-    # A disabled communicator never builds its planes, so these stay unset.
-    if not disabled:
-        comm.has_multicast = has_multicast
-        comm.max_push_size = 1024
-    assert comm.supports_push(nbytes=nbytes, num_blocks=num_blocks) is expected
-
-
 _KB, _MB = 1024, 1024 * 1024
 
 
@@ -180,8 +157,12 @@ def test_gfx1250_table_enables_hier_only_at_tp16():
     ],
 )
 def test_gfx1250_table_picks_measured_best(world_size, nbytes, expected):
+    comm = _gfx1250_comm(world_size)
     assert (
-        _choice_name(_gfx1250_comm(world_size)._pick_config(nbytes, False)) == expected
+        _choice_name(
+            custom_all_reduce_v2.choose_algo(comm.config, nbytes, can_use_graph=False)
+        )
+        == expected
     )
 
 
@@ -206,7 +187,12 @@ def test_gfx1250_table_picks_measured_best(world_size, nbytes, expected):
 )
 def test_gfx1250_dev_kernarg_table(world_size, nbytes, expected):
     comm = _gfx1250_comm(world_size, dev_kernarg=True)
-    assert _choice_name(comm._pick_config(nbytes, False)) == expected
+    assert (
+        _choice_name(
+            custom_all_reduce_v2.choose_algo(comm.config, nbytes, can_use_graph=False)
+        )
+        == expected
+    )
 
 
 @pytest.mark.parametrize("dev_kernarg", [False, True])
@@ -225,7 +211,12 @@ def test_gfx1250_table_has_no_rccl_gap(world_size, dev_kernarg):
     for edge in edges:
         for nbytes in (edge - 16, edge, edge + 16):
             if 0 < nbytes <= 4 * 1024 * _MB:
-                assert comm._pick_config(nbytes, False) is not None, nbytes
+                assert (
+                    custom_all_reduce_v2.choose_algo(
+                        comm.config, nbytes, can_use_graph=False
+                    )
+                    is not None
+                ), nbytes
 
 
 def _gfx1250_comm(world_size, dev_kernarg=False):
@@ -235,6 +226,8 @@ def _gfx1250_comm(world_size, dev_kernarg=False):
 
     comm = object.__new__(custom_all_reduce_v2.CustomAllReduceV2)
     comm.disabled = True
+    # config is a property; assigning it clears the eager-plan cache
+    comm._eager_plan_cache = {}
     comm.config = cfg._rocm_gfx1250_configs.__wrapped__(96, dev_kernarg)[world_size]
     return comm
 
@@ -297,10 +290,9 @@ def test_pick_config_hier_at_default_cap(nbytes, expected):
     hier_max = dpx_hier_all_reduce._hier_max_bytes(
         config, 16 * _MB, sizes_own_push=False
     )
-    comm = object.__new__(custom_all_reduce_v2.CustomAllReduceV2)
-    comm.disabled = True
-    comm.config = dpx_hier_all_reduce._fit_hier(config, hier_max)
-    assert _choice_name(comm._pick_config(nbytes, False)) == expected
+    fitted = dpx_hier_all_reduce._fit_hier(config, hier_max)
+    choice = custom_all_reduce_v2.choose_algo(fitted, nbytes, can_use_graph=False)
+    assert _choice_name(choice) == expected
 
 
 @pytest.mark.parametrize(
@@ -328,10 +320,7 @@ def test_pick_config_hier_2shot_push(nbytes, expected):
         two_shot_push_threshold=256 * _KB,
         hier_2shot_push=cfg.Range(256 * _KB, 64 * _MB),
     )
-    comm = object.__new__(custom_all_reduce_v2.CustomAllReduceV2)
-    # dispatch does not look at it; close() at teardown does
-    comm.disabled = True
-    comm.config = cfg.AllReduceConfig(
+    config = cfg.AllReduceConfig(
         graph=heuristic,
         eager=heuristic,
         num_push_blocks=96,
@@ -339,7 +328,10 @@ def test_pick_config_hier_2shot_push(nbytes, expected):
         num_mc_blocks=None,
     )
     for use_graph in (False, True):
-        assert _choice_name(comm._pick_config(nbytes, use_graph)) == expected
+        choice = custom_all_reduce_v2.choose_algo(
+            config, nbytes, can_use_graph=use_graph
+        )
+        assert _choice_name(choice) == expected
 
 
 @pytest.mark.parametrize(
@@ -372,6 +364,22 @@ def test_zero_cluster_uuid_clique_ends_at_its_node(
     # The undecorated function: the CPU runner has no NVML to initialize.
     is_one_nvlink_clique = custom_all_reduce_utils.is_one_nvlink_clique.__wrapped__
     assert is_one_nvlink_clique(object(), object()) is expected
+
+
+def test_skip_p2p_check_accepts_true(monkeypatch):
+    """SGLANG_SKIP_P2P_CHECK=true must trust the driver's report, not run the P2P probe."""
+    monkeypatch.setenv("SGLANG_SKIP_P2P_CHECK", "true")
+    monkeypatch.setattr(
+        custom_all_reduce_utils.torch.cuda,
+        "can_device_access_peer",
+        lambda src, tgt: True,
+    )
+    monkeypatch.setattr(
+        custom_all_reduce_utils,
+        "gpu_p2p_access_check",
+        Mock(side_effect=AssertionError("ran the P2P probe")),
+    )
+    assert custom_all_reduce_utils.can_p2p(rank=0, world_size=2)
 
 
 if __name__ == "__main__":

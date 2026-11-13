@@ -48,10 +48,20 @@ def _paged_experts_num_resident(value: str) -> Optional[int]:
     )
 
 
+def _parse_attention_backend_arg(value: str) -> str:
+    """Reject the retired alias before argparse checks supported choices."""
+    if value == "compressed":
+        raise argparse.ArgumentTypeError("compressed was removed; use dsv4")
+    return value
+
+
 class ExecFeatures(msgspec.Struct):
     """Namespace ``exec.features``."""
 
     _NS_PATH = "exec.features"
+    disable_outlines_disk_cache: A[
+        Optional[bool], Arg(help="Deprecated. Has no effect.", no_cli=True)
+    ] = None
     enable_fp32_lm_head: A[
         bool,
         "If set, the LM head outputs (logits) are in FP32.",
@@ -170,7 +180,10 @@ class ExecFeatures(msgspec.Struct):
         "EAGLE3 defaults to the model's EAGLE3 layers.",
     ] = None
     enable_return_routed_experts: A[
-        bool, "Enable returning routed experts of each layer with responses."
+        bool,
+        "Enable returning routed experts of each layer with responses. With "
+        "pipeline parallelism each hop also carries the routed experts of the "
+        "layers run so far, up to num_layers * top-k int32 ids per token.",
     ] = False
     enable_return_indexer_topk: A[
         bool,
@@ -204,10 +217,6 @@ class ExecFeatures(msgspec.Struct):
         "Use the same value on disaggregated prefill and decode nodes; clients "
         "should set top_k below the limit to leave headroom for cutoff ties.",
     ] = 4096
-    disable_outlines_disk_cache: A[
-        bool,
-        "Disable disk cache of outlines to avoid possible crashes related to file system or high concurrency.",
-    ] = False
     enable_mis: A[
         bool,
         "Enable Multi-Item Scoring optimization. Combines query and multiple items into a single sequence for efficient batch processing. Requires --attention-backend flashinfer; auto-disables CUDA graph, radix cache, and chunked prefill.",
@@ -218,6 +227,9 @@ class ExecKernel(msgspec.Struct):
     """Namespace ``exec.kernel``."""
 
     _NS_PATH = "exec.kernel"
+    triton_attention_reduce_in_fp32: A[
+        Optional[bool], Arg(help="Deprecated. Has no effect.", no_cli=True)
+    ] = None
 
     # -------------------------------------------------------------------------
     # Kernel backend
@@ -227,6 +239,7 @@ class ExecKernel(msgspec.Struct):
         Arg(
             help="Choose the kernels for attention layers.",
             choices=ATTENTION_BACKEND_CHOICES,
+            type_parser=_parse_attention_backend_arg,
             resolvable=True,
         ),
     ] = None
@@ -235,6 +248,7 @@ class ExecKernel(msgspec.Struct):
         Arg(
             help="Choose the kernels for decode attention layers (have priority over --attention-backend).",
             choices=ATTENTION_BACKEND_CHOICES,
+            type_parser=_parse_attention_backend_arg,
             resolvable=True,
         ),
     ] = None
@@ -255,6 +269,7 @@ class ExecKernel(msgspec.Struct):
         Arg(
             help="Choose the kernels for prefill attention layers (have priority over --attention-backend).",
             choices=ATTENTION_BACKEND_CHOICES,
+            type_parser=_parse_attention_backend_arg,
             resolvable=True,
         ),
     ] = None
@@ -317,7 +332,8 @@ class ExecKernel(msgspec.Struct):
     dsa_prefill_backend: A[
         Optional[str],
         Arg(
-            help="DSA (DeepSeek Sparse Attention) prefill backend. If not specified, auto-detects based on hardware and kv_cache_dtype.",
+            help="DSA (DeepSeek Sparse Attention) prefill backend. If not specified, auto-detects based on hardware and kv_cache_dtype. "
+            "'prims_ts': FlashInfer Prims-TS sparse MLA (SM100/SM103/SM107, fp8_e4m3 KV).",
             choices=[
                 "flashmla_sparse",
                 "flashmla_sparse_q8",
@@ -330,6 +346,7 @@ class ExecKernel(msgspec.Struct):
                 "triton",
                 "aiter",
                 "trtllm",
+                "prims_ts",
                 "intel_xpu",
             ],
             resolvable=True,
@@ -367,7 +384,8 @@ class ExecKernel(msgspec.Struct):
     dsa_decode_backend: A[
         Optional[str],
         Arg(
-            help="DSA (DeepSeek Sparse Attention) decode backend. If not specified, auto-detects based on hardware and kv_cache_dtype.",
+            help="DSA (DeepSeek Sparse Attention) decode backend. If not specified, auto-detects based on hardware and kv_cache_dtype. "
+            "'prims_ts': FlashInfer Prims-TS sparse MLA (SM100/SM103/SM107, fp8_e4m3 KV).",
             choices=[
                 "flashmla_sparse",
                 "flashmla_sparse_q8",
@@ -379,6 +397,7 @@ class ExecKernel(msgspec.Struct):
                 "triton",
                 "aiter",
                 "trtllm",
+                "prims_ts",
                 "intel_xpu",
             ],
             resolvable=True,
@@ -431,11 +450,6 @@ class ExecKernel(msgspec.Struct):
             nargs="+",
         ),
     ] = None
-    triton_attention_reduce_in_fp32: A[
-        bool,
-        "Cast the intermediate attention results to fp32 to avoid possible crashes related to fp16."
-        "This only affects Triton attention kernels.",
-    ] = False
     triton_attention_num_kv_splits: A[
         int,
         "The number of KV splits in flash decoding Triton kernel. Larger value is better in longer context scenarios. The default value is 8.",
@@ -510,6 +524,11 @@ class ExecMamba(msgspec.Struct):
         fn="sglang.srt.arg_groups.overrides.mamba_extra_buffer_lazy_of",
         doc="The lazy variant: the strategy is `extra_buffer_lazy` exactly.",
     )
+    mamba_path_state_cap = Derived(
+        fn="sglang.srt.arg_groups.overrides.mamba_path_state_cap_of",
+        doc="Mamba states kept per root-to-tail path (-1 is unlimited): an "
+        "explicit --mamba-max-states-per-path, else 1 below checkpoint level 3.",
+    )
     mamba_backend: A[
         str,
         Arg(
@@ -524,13 +543,31 @@ class ExecMamba(msgspec.Struct):
             choices=["float32", "bfloat16", "float16"],
         ),
     ] = None
+    # Deprecated spelling; `--hybrid-cache-checkpoints-level 2` replaces it.
+    # Its only command-line entry is the deprecated registration in server_args.
     mamba_max_states_per_path: A[
+        Optional[int],
+        Arg(
+            help="Maximum number of cached Mamba states retained per root-to-tail "
+            "path (-1 means unlimited). When enabled, after each insert the "
+            "shallowest eligible interior states beyond the cap are removed while "
+            "their full KV remains. Tail, fork, and locked nodes are preserved. "
+            "Must be -1 or a positive integer.",
+            no_cli=True,
+        ),
+    ] = None
+    hybrid_cache_checkpoints_level: A[
         int,
-        "Maximum number of cached Mamba states retained per root-to-tail path "
-        "(-1 means unlimited). When enabled, after each insert the shallowest eligible "
-        "interior states beyond the cap are removed while their full KV remains. "
-        "Tail, fork, and locked nodes are preserved. Must be -1 or a positive integer.",
-    ] = -1
+        Arg(
+            help="Where a hybrid model's prefix cache checkpoints recurrent "
+            "state. 2: branching points and request ends only (a PD prefill worker's "
+            "end is its complete prompt), with a soft cap of one state per path. "
+            "Host and storage tiers receive published states; models that also have "
+            "sliding-window layers still checkpoint every chunk. 3: every "
+            "prefill chunk and decode tracking boundary.",
+            choices=[2, 3],
+        ),
+    ] = 2
     enable_mamba_cache_stochastic_rounding: A[
         bool,
         "Enable stochastic rounding when writing FP16 Mamba SSM cache states. Requires --mamba-ssm-dtype float16 and CUDA. With --mamba-backend triton, requires SM100.",
@@ -1062,8 +1099,19 @@ class ExecMoe(msgspec.Struct):
         bool,
         "Let Paged Experts write to disk under $SGLANG_CACHE_DIR/paged_experts: each MoE "
         "layer's experts are kept there (about the size of the experts), so that later starts "
-        "read them instead of loading and repacking them. Requires --enable-paged-experts.",
+        "read them instead of loading and repacking them, and experts that do not fit the "
+        "host budget (--paged-experts-host-memory-gb) are served from there. Requires "
+        "--enable-paged-experts.",
     ] = False
+    paged_experts_host_memory_gb: A[
+        Optional[float],
+        "Pinned host memory (GiB) for the experts of all MoE layers with --enable-paged-experts. "
+        "When not every expert fits, each layer keeps only some experts in pinned memory and "
+        "reads the others from its file under $SGLANG_CACHE_DIR/paged_experts, which needs "
+        "--paged-experts-enable-disk. Unset: every expert is pinned; with "
+        "--paged-experts-enable-disk, the experts that do not fit what is available at "
+        "startup within the container's memory limit go to disk, keeping 10 GiB free.",
+    ] = None
 
     # -------------------------------------------------------------------------
     # Ktransformers/AMX expert parallelism
