@@ -1139,6 +1139,7 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
         output_len=2,
         fast_prepare=True,
         global_seed=None,
+        input_ids=False,
     ):
         # GSP's own `seed` kwarg only feeds the cache filename; reproducibility
         # of compute_random_lens / gen_prompt comes from seeding the module
@@ -1161,6 +1162,7 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
             ordered=ordered,
             group_distribution=mode,
             zipf_alpha=alpha,
+            input_ids=input_ids,
         )
 
     @staticmethod
@@ -1197,6 +1199,65 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
         self.assertTrue(path.name.startswith("gen_shared_prefix_7_3_4_16_8_4_"))
         self.assertTrue(path.name.endswith(".pkl"))
         self.assertEqual(path.parent, Path.home() / ".cache" / "sglang" / "benchmark")
+
+    def test_gsp_cache_respects_ordering(self):
+        """Warm or legacy caches must not change ordering or prompt representation."""
+        for mode, alpha in (("uniform", None), ("zipf", 1.5)):
+            for first_ordered in (False, True):
+                home = self.tmpdir_path / f"{mode}-{first_ordered}"
+                for input_ids in (False, True):
+                    with self.subTest(
+                        mode=mode, first_ordered=first_ordered, input_ids=input_ids
+                    ):
+                        kwargs = dict(mode=mode, alpha=alpha, input_ids=input_ids)
+                        with patch(
+                            "sglang.benchmark.datasets.generated_shared_prefix.Path.home",
+                            return_value=home / f"fresh-{input_ids}",
+                        ):
+                            expected = {
+                                ordered: self._row_fields(
+                                    self._run_gsp(ordered=ordered, **kwargs)
+                                )
+                                for ordered in (False, True)
+                            }
+
+                        with patch(
+                            "sglang.benchmark.datasets.generated_shared_prefix.Path.home",
+                            return_value=home,
+                        ):
+                            legacy_path = get_gen_prefix_cache_path(
+                                seed=42,
+                                num_groups=4,
+                                prompts_per_group=5,
+                                system_prompt_len=4,
+                                question_len=3,
+                                output_len=2,
+                                tokenizer=self.tokenizer,
+                                group_distribution=mode,
+                                zipf_alpha=alpha,
+                                input_ids=input_ids,
+                            )
+                            legacy_path.parent.mkdir(parents=True, exist_ok=True)
+                            with open(legacy_path, "wb") as f:
+                                pickle.dump(
+                                    [
+                                        DatasetRow(
+                                            prompt="LEGACY", prompt_len=1, output_len=1
+                                        )
+                                    ],
+                                    f,
+                                )
+                            for ordered in (
+                                first_ordered,
+                                not first_ordered,
+                                first_ordered,
+                            ):
+                                self.assertEqual(
+                                    self._row_fields(
+                                        self._run_gsp(ordered=ordered, **kwargs)
+                                    ),
+                                    expected[ordered],
+                                )
 
     def test_zipf_group_probs_helper(self):
         # Rank-based probability vector: weight(rank) = 1 / rank ** alpha,
@@ -1357,6 +1418,7 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
                 question_len=common["question_len"],
                 output_len=common["output_len"],
                 tokenizer=self.tokenizer,
+                ordered=common["ordered"],
             )
             zipf_path_a = get_gen_prefix_cache_path(
                 seed=common["seed"],
@@ -1368,6 +1430,7 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
                 tokenizer=self.tokenizer,
                 group_distribution="zipf",
                 zipf_alpha=1.5,
+                ordered=common["ordered"],
             )
             zipf_path_b = get_gen_prefix_cache_path(
                 seed=common["seed"],
@@ -1379,6 +1442,7 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
                 tokenizer=self.tokenizer,
                 group_distribution="zipf",
                 zipf_alpha=2.0,
+                ordered=common["ordered"],
             )
             self.assertNotEqual(uniform_path, zipf_path_a)
             self.assertNotEqual(zipf_path_a, zipf_path_b)
