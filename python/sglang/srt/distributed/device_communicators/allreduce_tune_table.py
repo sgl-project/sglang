@@ -27,6 +27,9 @@ _LOAD_CACHE: Dict[Tuple[str, int], Optional["AllreduceTuneTable"]] = {}
 TUNE_TABLE_GROUPS = frozenset({"tp", "attention_tp", "moe_tp", "shared_experts_tp"})
 
 _QR_PREFIX = "quick_allreduce_"
+# FlyDSL INT4 is a different communicator from HIP QuickReduce. Its table
+# name starts with the same prefix, so it has to be recognized first.
+_FLYDSL_QR_PREFIX = "quick_allreduce_flydsl"
 
 
 @dataclass(frozen=True)
@@ -55,6 +58,8 @@ class AllreduceTuneTable:
         codecs: List[str] = []
         for row in self.rows:
             if not row.backend.startswith(_QR_PREFIX):
+                continue
+            if row.backend.startswith(_FLYDSL_QR_PREFIX):
                 continue
             codec = row.backend[len(_QR_PREFIX) :]
             if codec and codec not in codecs:
@@ -86,7 +91,8 @@ def parse_tune_backend(backend: str) -> Optional[str]:
 
     ``None`` means the name is not a backend this table can select.
     ``"nccl"`` is the NCCL all-reduce. On ROCm the library is RCCL.
-    ``"qr:INT4"`` carries the codec.
+    ``"qr:INT4"`` carries the HIP QuickReduce codec.
+    ``"qr_flydsl"`` is AITER FlyDSL INT4, not a HIP codec.
     """
     if backend == "custom_allreduce":
         return "ca"
@@ -100,6 +106,8 @@ def parse_tune_backend(backend: str) -> Optional[str]:
         return "nccl"
     if backend == "torch_symm_mem":
         return "torch_symm_mem"
+    if backend.startswith(_FLYDSL_QR_PREFIX):
+        return "qr_flydsl"
     if backend.startswith(_QR_PREFIX) and backend[len(_QR_PREFIX) :]:
         return "qr:" + backend[len(_QR_PREFIX) :]
     return None

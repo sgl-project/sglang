@@ -135,6 +135,47 @@ _QR_QUANT_ENVS = (
 )
 
 
+def _flydsl_quick_allreduce_fits(comm, tensor) -> bool:
+    """Whether AITER FlyDSL INT4 QuickReduce can run this tensor.
+
+    The class itself refuses anything under ``min_bytes``. bf16, a contiguous
+    layout, and 16-byte alignment are the same limits the tuner applies.
+    """
+    if tensor.dtype != torch.bfloat16 or not tensor.is_contiguous():
+        return False
+    nbytes = tensor.numel() * tensor.element_size()
+    if nbytes % 16 != 0 or tensor.data_ptr() % 16 != 0:
+        return False
+    if hasattr(comm, "is_beneficial"):
+        return bool(comm.is_beneficial(nbytes))
+    return nbytes >= int(getattr(comm, "min_bytes", 0))
+
+
+def _open_flydsl_quick_allreduce(group, device, rank: int, world_size: int):
+    """AITER FlyDSL INT4, separate from the HIP QuickReduce workspace."""
+    try:
+        from aiter.ops.flydsl import QuickAllReduceInt4
+
+        comm = QuickAllReduceInt4(
+            group=group,
+            device=device,
+            rank=rank,
+            world_size=world_size,
+        )
+        # Compiles the binaries before a graph capture. The current class
+        # calls this preload; an older build used compile.
+        if hasattr(comm, "preload"):
+            comm.preload()
+        elif hasattr(comm, "compile"):
+            warmup = torch.empty(1024 * 1024 // 2, dtype=torch.bfloat16, device=device)
+            comm.compile(warmup, torch.empty_like(warmup))
+            torch.cuda.synchronize(device)
+        return comm
+    except Exception as e:
+        logger.warning(f"Setup FlyDSL QuickReduce for the tune table failed with {e}.")
+        return None
+
+
 def _quick_allreduce_with_quant(group, device, quant: str):
     """Build QuickAllReduce at one codec. Init reads the codec from the env."""
     from sglang.srt.distributed.device_communicators.quick_all_reduce import (
@@ -522,6 +563,7 @@ class GroupCoordinator:
         self.ca_sglang_comm: Optional[Any] = None
         self.ca_aiter_comm: Optional[Any] = None
         self.qr_by_quant: Dict[str, Any] = {}
+        self.qr_flydsl_comm: Optional[Any] = None
         self.eager_tune = None
         self.graph_tune = None
         self._tune_fallback_logged = False
@@ -711,6 +753,15 @@ class GroupCoordinator:
                 if not comm.disabled:
                     self.qr_by_quant[quant] = comm
 
+            if any(
+                parse_tune_backend(row.backend) == "qr_flydsl"
+                for table in tables
+                for row in table.rows
+            ):
+                self.qr_flydsl_comm = _open_flydsl_quick_allreduce(
+                    self.cpu_group, self.device, self.rank_in_group, self.world_size
+                )
+
         if self.rank_in_group == 0:
             opened = [
                 name
@@ -721,6 +772,8 @@ class GroupCoordinator:
                 )
                 if comm is not None
             ] + [f"quick_allreduce_{quant}" for quant in self.qr_by_quant]
+            if self.qr_flydsl_comm is not None:
+                opened.append("quick_allreduce_flydsl_INT4")
             logger.info(
                 "[AR] Tuned all-reduce on group %s: eager=%s, graph=%s, opened %s",
                 self.group_name,
@@ -1146,8 +1199,6 @@ class GroupCoordinator:
         including warm-up runs inside the capture context and the split ops of
         a piecewise graph, uses the eager table.
         """
-        if self.eager_tune is None and self.graph_tune is None:
-            return _TUNE_NO_DECISION
         table = (
             self.graph_tune
             if torch.cuda.is_current_stream_capturing()
@@ -1158,45 +1209,54 @@ class GroupCoordinator:
         nbytes = input_.numel() * input_.element_size()
         backend = table.backend_for(nbytes, str(input_.dtype))
         method = parse_tune_backend(backend)
-        comm = None
+
         if method == "nccl":
             return "nccl"
         if method == "ca":
-            comm = self.ca_comm
-            if comm is not None and not comm.disabled and comm.should_custom_ar(input_):
+            if (
+                self.ca_comm is not None
+                and not self.ca_comm.disabled
+                and self.ca_comm.should_custom_ar(input_)
+            ):
                 return "ca"
         elif method == "sglang_ca":
-            comm = self.ca_sglang_comm
-        elif method == "aiter_ca":
-            comm = self.ca_aiter_comm
-        elif method == "car_v2":
-            comm = self.ca_v2_comm
-            # v2 has no path past its own plan; a size with no plan cannot run.
-            if comm is not None and not comm.should_custom_ar(input_):
-                comm = None
-        elif method == "torch_symm_mem":
-            comm = self.torch_symm_mem_comm
             if (
-                comm is not None
-                and not comm.disabled
-                and comm.should_torch_symm_mem_allreduce(input_)
+                self.ca_sglang_comm is not None
+                and not self.ca_sglang_comm.disabled
+                and self._tuned_custom_ar_fits(self.ca_sglang_comm, method, input_)
             ):
                 return method
-            comm = None
-        elif method is not None and method.startswith("qr:"):
-            comm = self.qr_by_quant.get(method.split(":", 1)[1])
-            if comm is not None and comm.should_quick_allreduce(input_):
+        elif method == "aiter_ca":
+            if (
+                self.ca_aiter_comm is not None
+                and not self.ca_aiter_comm.disabled
+                and self._tuned_custom_ar_fits(self.ca_aiter_comm, method, input_)
+            ):
                 return method
-            comm = None
-        if method == "car_v2" and comm is not None and not comm.disabled:
-            return method
-        if (
-            method in ("sglang_ca", "aiter_ca")
-            and comm is not None
-            and not comm.disabled
-            and self._tuned_custom_ar_fits(comm, method, input_)
-        ):
-            return method
+        elif method == "car_v2":
+            # v2 has no path past its own plan; a size with no plan cannot run.
+            if (
+                self.ca_v2_comm is not None
+                and not self.ca_v2_comm.disabled
+                and self.ca_v2_comm.should_custom_ar(input_)
+            ):
+                return method
+        elif method == "torch_symm_mem":
+            if (
+                self.torch_symm_mem_comm is not None
+                and not self.torch_symm_mem_comm.disabled
+                and self.torch_symm_mem_comm.should_torch_symm_mem_allreduce(input_)
+            ):
+                return method
+        elif method == "qr_flydsl":
+            if self.qr_flydsl_comm is not None and _flydsl_quick_allreduce_fits(
+                self.qr_flydsl_comm, input_
+            ):
+                return method
+        elif method is not None and method.startswith("qr:"):
+            qr_comm = self.qr_by_quant.get(method.split(":", 1)[1])
+            if qr_comm is not None and qr_comm.should_quick_allreduce(input_):
+                return method
         if not self._tune_fallback_logged:
             logger.info(
                 "[AR] Tune table %s chose %s for %d bytes, which this group "
@@ -1394,6 +1454,7 @@ class GroupCoordinator:
                 self.ca_sglang_comm,
                 self.ca_aiter_comm,
                 self.qr_by_quant,
+                self.qr_flydsl_comm,
                 pymscclpp_comm,
                 torch_symm_mem_comm,
                 pynccl_comm,
@@ -1408,6 +1469,9 @@ class GroupCoordinator:
             out = self._tuned_custom_all_reduce(self.ca_aiter_comm, "aiter_ca", input_)
         elif outplace_all_reduce_method == "car_v2":
             out = self._tuned_custom_all_reduce(self.ca_v2_comm, "car_v2", input_)
+        elif outplace_all_reduce_method == "qr_flydsl":
+            out = torch.empty_like(input_)
+            self.qr_flydsl_comm.allreduce(input_, out)
         elif outplace_all_reduce_method.startswith("qr:"):
             qr_tuned = self.qr_by_quant[outplace_all_reduce_method.split(":", 1)[1]]
             out = qr_tuned.quick_all_reduce(input_)
@@ -2472,6 +2536,9 @@ class GroupCoordinator:
         self.ca_sglang_comm = None
         self.ca_aiter_comm = None
         self.qr_by_quant = {}
+        if self.qr_flydsl_comm is not None and hasattr(self.qr_flydsl_comm, "close"):
+            self.qr_flydsl_comm.close()
+        self.qr_flydsl_comm = None
         if self.mq_broadcaster is not None:
             self.mq_broadcaster = None
 
