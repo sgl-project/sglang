@@ -211,6 +211,8 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
                             self.run_and_check(
                                 scheduler, event_loop, mode, pattern == "idle_cycle"
                             )
+                        # Each launched micro-batch gets its write-after-read barrier.
+                        self.assertEqual(scheduler._apply_war_barrier.call_count, 4)
                         # Transfers suppress housekeeping, not the idle flag.
                         self.assertEqual(
                             scheduler.on_idle.call_count,
@@ -589,6 +591,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         scheduler.running_batch = ScheduleBatch(reqs=[])
         scheduler.last_batch = None
         scheduler.chunked_reqs = IndexedReqList(ListKind.CHUNKED)
+        scheduler._pending_chunked_abort_req = None
         scheduler.waiting_queue = IndexedReqList(ListKind.WAITING)
         scheduler.disagg_prefill_transfer_queue = []
         scheduler.disagg_decode_transfer_queue = SimpleNamespace(
@@ -600,7 +603,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         )
         scheduler.process_input_requests = Mock()
         scheduler.disagg_prefill_bootstrap_queue = SimpleNamespace(
-            pop_bootstrapped=Mock(return_value=[])
+            move_bootstrapped=Mock(return_value=[])
         )
         scheduler.disagg_decode_prealloc_queue = SimpleNamespace(
             prefetch_prefill_dp_rank_queries=Mock(), queue=[]
@@ -632,6 +635,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
     def prepare_pp_scheduler(self, scheduler):
         enter_scope(self, get_parallel().override(pp_size=2, pp_rank=0))
         scheduler.pp_group = SimpleNamespace(is_last_rank=True)
+        scheduler.token_to_kv_pool_allocator = None
         scheduler.forward_stream_ctx = nullcontext()
         scheduler.forward_stream = Mock()
         scheduler.schedule_stream = Mock()

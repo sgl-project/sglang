@@ -236,57 +236,6 @@ class DynamicGradMode(_DecoratorContextManager):
             return self.__class__()
 
 
-show_time_cost = False
-time_infos = {}
-
-
-def enable_show_time_cost():
-    global show_time_cost
-    show_time_cost = True
-
-
-class TimeInfo:
-    def __init__(self, name, interval=0.1, color=0, indent=0):
-        self.name = name
-        self.interval = interval
-        self.color = color
-        self.indent = indent
-
-        self.acc_time = 0
-        self.last_acc_time = 0
-
-    def check(self):
-        if self.acc_time - self.last_acc_time > self.interval:
-            self.last_acc_time = self.acc_time
-            return True
-        return False
-
-    def pretty_print(self):
-        print(f"\x1b[{self.color}m", end="")
-        print("-" * self.indent * 2, end="")
-        print(f"{self.name}: {self.acc_time:.3f}s\x1b[0m")
-
-
-def mark_start(name, interval=0.1, color=0, indent=0):
-    global time_infos, show_time_cost
-    if not show_time_cost:
-        return
-    torch.cuda.synchronize()
-    if time_infos.get(name, None) is None:
-        time_infos[name] = TimeInfo(name, interval, color, indent)
-    time_infos[name].acc_time -= time.perf_counter()
-
-
-def mark_end(name):
-    global time_infos, show_time_cost
-    if not show_time_cost:
-        return
-    torch.cuda.synchronize()
-    time_infos[name].acc_time += time.perf_counter()
-    if time_infos[name].check():
-        time_infos[name].pretty_print()
-
-
 def set_random_seed(seed: int) -> None:
     """Set the random seed for all libraries."""
     random.seed(seed)
