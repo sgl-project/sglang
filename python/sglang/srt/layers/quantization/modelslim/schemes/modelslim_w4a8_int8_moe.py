@@ -74,7 +74,11 @@ class ModelSlimW4A8Int8MoE(ModelSlimMoEScheme):
         else:  # w2
             out_features = hidden_size // 2
             in_features = intermediate_size_per_partition
-            bias_last_dim = 16 // self.tp_size
+            # Checkpoint bias partials follow the actual expert TP partition.
+            moe_tp_size = layer.moe_tp_size
+            if not 1 <= moe_tp_size <= 16 or 16 % moe_tp_size:
+                raise ValueError("W4A8 compensation requires MoE TP to divide 16")
+            bias_last_dim = 16 // moe_tp_size
 
         prefix = self.weight_prefix
 
@@ -129,8 +133,7 @@ class ModelSlimW4A8Int8MoE(ModelSlimMoEScheme):
             layer.register_parameter(f"{prefix}_weight_offset_second", offset_second)
             set_weight_attrs(offset_second, extra_weight_attrs)
 
-        # ---- bias for scale (activation clip path) ----
-        # This parameter is always created; the kernel uses it only when activation_use_clip is True.
+        # Compensation partials must be sharded along K before summation.
         scale_bias = torch.nn.Parameter(
             torch.empty(
                 num_experts, 2 * out_features, bias_last_dim, dtype=torch.float32
@@ -138,7 +141,13 @@ class ModelSlimW4A8Int8MoE(ModelSlimMoEScheme):
             requires_grad=False,
         )
         layer.register_parameter(f"{prefix}_scale_bias", scale_bias)
-        set_weight_attrs(scale_bias, extra_weight_attrs)
+        set_weight_attrs(
+            scale_bias,
+            dict(
+                extra_weight_attrs,
+                quant_method=FusedMoeWeightScaleSupported.GROUP.value,
+            ),
+        )
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Delegate weight processing to the kernel for the assigned weight group."""
