@@ -18,16 +18,6 @@ on:
         required: false
         type: string
         default: 'swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-a3-mooncake-v2'
-      install_sglang_from_source:
-        description: 'Install sglang from the checked-out source inside the pods.'
-        required: false
-        type: boolean
-        default: false
-      transformers_version:
-        description: 'Optional transformers version for the test pods (empty keeps the image default).'
-        required: false
-        type: string
-        default: ''
 
 concurrency:
   group: npu-release-model-data-${{ github.ref }}
@@ -86,13 +76,11 @@ jobs:
       decode_size: ${{ matrix.decode_size }}
       router_size: ${{ matrix.router_size }}
       test_case: ${{ matrix.test_case }}
-      # PR-triggered runs have no inputs: they fall back to the dispatch image and
-      # always install sglang from the checked-out source so the PR change is
-      # what runs.
+      # PR-triggered runs have no inputs: they fall back to the dispatch image.
+      # The image already ships the sglang build, so the source install is off.
       image: ${{ inputs.image || 'swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-a3-mooncake-v2' }}
-      install_sglang_from_source: ${{ github.event_name == 'pull_request' || inputs.install_sglang_from_source || false }}
+      install_sglang_from_source: false
       prefill_decode_deployment: ${{ matrix.prefill_decode_deployment }}
-      transformers_version: ${{ inputs.transformers_version || '' }}
       container_patches: ${{ matrix.container_patches }}
       run_start_metadata: ${{ needs.metadata.outputs.run_start_metadata }}
     secrets: inherit
@@ -202,4 +190,4 @@ jobs:
           path: |
             release-data.json
             release-data.md
-          retention-days: 90
+          retention-days: 7
