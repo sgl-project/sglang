@@ -236,6 +236,19 @@ class TestDSAIndexKElision(CustomTestCase):
     """Skip-topk layers get a 0-row index-K buffer, and the host (L2) indexer
     pool packs only the layers that actually own index keys."""
 
+    @staticmethod
+    def _dsa_test_page_size() -> int:
+        # The pool assert demands page_size 64 (CUDA) or, on ROCm, either 16
+        # (HIP preshuffle) or 1 (legacy aiter). Match the runtime's branch so
+        # the tests run on both.
+        if is_hip():
+            from sglang.srt.layers.attention.dsa.utils import (
+                aiter_can_use_preshuffle_paged_mqa,
+            )
+
+            return 16 if aiter_can_use_preshuffle_paged_mqa() else 1
+        return 64
+
     def setUp(self):
         if not torch.cuda.is_available():
             self.skipTest("CUDA is required for DSA pool allocation tests.")
@@ -262,7 +275,7 @@ class TestDSAIndexKElision(CustomTestCase):
         )
 
     def test_skip_topk_layers_get_zero_row_buffers(self):
-        page_size = 1 if is_hip() else 64
+        page_size = self._dsa_test_page_size()
         # Layer 1 reuses layer 0's top-k, so it never writes index-K.
         pool = self._build_pool(page_size, [False, True, False])
 
@@ -280,7 +293,7 @@ class TestDSAIndexKElision(CustomTestCase):
         self.assertGreater(item_lens[2], 0)
 
     def test_all_layers_owned_when_nothing_is_skipped(self):
-        page_size = 1 if is_hip() else 64
+        page_size = self._dsa_test_page_size()
         pool = self._build_pool(page_size, [False, False])
 
         self.assertTrue(all(buf.shape[0] > 0 for buf in pool.index_k_with_scale_buffer))
@@ -289,7 +302,7 @@ class TestDSAIndexKElision(CustomTestCase):
         self.assertTrue(all(length > 0 for length in item_lens))
 
     def test_host_indexer_pool_packs_only_owning_layers(self):
-        page_size = 1 if is_hip() else 64
+        page_size = self._dsa_test_page_size()
         skip_topk_layers = [False, True, False, True]
         pool = self._build_pool(page_size, skip_topk_layers)
 
@@ -318,7 +331,7 @@ class TestDSAIndexKElision(CustomTestCase):
         self.assertFalse(indexer_host._is_device_layer_owned(pool, 1))
 
     def test_pool_exposes_no_indexer_info_when_every_layer_skips(self):
-        page_size = 1 if is_hip() else 64
+        page_size = self._dsa_test_page_size()
         pool = self._build_pool(page_size, [True, True])
 
         # No layer owns index keys, so there is nothing to mirror to the host.
@@ -330,7 +343,7 @@ class TestDSAIndexKElision(CustomTestCase):
         # `index_buf_size = size * host_to_device_ratio`, so eliding a skip layer
         # saves ratio times as much as on a plain DSA pool. The elide decision
         # still arrives as the same `skip_topk_layers` kwarg.
-        page_size = 1 if is_hip() else 64
+        page_size = self._dsa_test_page_size()
         ratio = 2
 
         def build(skip_topk_layers):
