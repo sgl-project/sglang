@@ -2648,7 +2648,17 @@ class TestPortArgs(unittest.TestCase):
         with self.assertRaises(ValueError):
             PortArgs.init_new(server_args)
 
-    def test_init_new_with_single_node_dp_attention(self):
+    def _assert_endpoint_ports_checked(self, port_args, wait_port_available):
+        checked = [args[0] for args, _ in wait_port_available.call_args_list]
+        for ipc_name in (
+            port_args.tokenizer_ipc_name,
+            port_args.scheduler_input_ipc_name,
+            port_args.detokenizer_ipc_name,
+        ):
+            self.assertIn(int(ipc_name.rsplit(":", 1)[1]), checked)
+
+    @patch("sglang.srt.server_args.wait_port_available")
+    def test_init_new_with_single_node_dp_attention(self, wait_port_available):
 
         server_args = ServerArgs(model_path="dummy")
         server_args.port = 30000
@@ -2665,6 +2675,7 @@ class TestPortArgs(unittest.TestCase):
         )
         self.assertTrue(port_args.detokenizer_ipc_name.startswith("tcp://127.0.0.1:"))
         self.assertIsInstance(port_args.nccl_port, int)
+        self._assert_endpoint_ports_checked(port_args, wait_port_available)
 
     @patch("sglang.srt.server_args.wait_port_available")
     def test_init_new_with_dp_rank(self, wait_port_available):
@@ -2712,7 +2723,8 @@ class TestPortArgs(unittest.TestCase):
                 )
                 self.assertIsInstance(port_args.nccl_port, int)
 
-    def test_init_new_with_ipv4_address(self):
+    @patch("sglang.srt.server_args.wait_port_available")
+    def test_init_new_with_ipv4_address(self, wait_port_available):
         server_args = ServerArgs(model_path="dummy")
         server_args.port = 30000
         server_args.nccl_port = None
@@ -2729,6 +2741,7 @@ class TestPortArgs(unittest.TestCase):
         )
         self.assertTrue(port_args.detokenizer_ipc_name.startswith("tcp://192.168.1.1:"))
         self.assertIsInstance(port_args.nccl_port, int)
+        self._assert_endpoint_ports_checked(port_args, wait_port_available)
 
     def test_init_new_with_malformed_ipv4_address(self):
         server_args = ServerArgs(model_path="dummy")
