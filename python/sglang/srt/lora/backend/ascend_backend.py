@@ -6,8 +6,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.utils import is_npu
 
 if is_npu():
-    import sgl_kernel_npu  # noqa: F401
-    import torch_npu  # noqa: F401
     from sgl_kernel_npu.operators.lora import sgemmv_expand, sgemmv_shrink
 
 
