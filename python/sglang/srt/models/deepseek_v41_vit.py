@@ -12,7 +12,7 @@ from sglang.srt.layers.attention.vision import (
     prepare_vision_attention_metadata,
 )
 from sglang.srt.layers.layernorm import RMSNorm
-from sglang.srt.utils.common import get_compiler_backend
+from sglang.srt.utils.device import get_compiler_backend
 
 
 def _rms_norm(dim: int) -> RMSNorm:
