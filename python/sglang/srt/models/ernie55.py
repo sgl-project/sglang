@@ -77,6 +77,8 @@ from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.utils import PPMissingLayer
+from sglang.srt.layers.utils.common import add_prefix, set_weight_attrs
+from sglang.srt.layers.utils.layer_list import make_pp_layers
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -108,13 +110,7 @@ from sglang.srt.models.deepseek_v4 import (
     make_hc_mixing_params,
 )
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import (
-    BumpAllocator,
-    add_prefix,
-    is_cuda,
-    make_pp_layers,
-    set_weight_attrs,
-)
+from sglang.srt.utils import BumpAllocator, is_cuda
 
 
 def check_supported_deployment(config: Ernie5_5_MoeConfig) -> None:
@@ -155,7 +151,7 @@ def logits_rows(forward_batch: ForwardBatch) -> Optional[torch.Tensor]:
         forward_batch.forward_mode != ForwardMode.EXTEND
         or forward_batch._original_forward_mode == ForwardMode.IDLE
         or forward_batch.is_prefill_only
-        or runs_sp(forward_batch.forward_mode)
+        or runs_sp(forward_batch.forward_mode, forward_batch.input_ids.shape[0])
         or _heads_are_split()
         or (forward_batch.attn_cp_metadata is not None and is_cp_active(forward_batch))
         or torch.cuda.is_current_stream_capturing()

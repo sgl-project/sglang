@@ -19,7 +19,8 @@ def handle_mamba_backend(server_args: Any):
     if cfg.mamba_cache_philox_rounds < 0:
         raise ValueError("--mamba-cache-philox-rounds must be non-negative.")
 
-    if cfg.mamba_max_states_per_path == 0 or cfg.mamba_max_states_per_path < -1:
+    cap = cfg.mamba_max_states_per_path
+    if cap is not None and (cap == 0 or cap < -1):
         raise ValueError(
             "--mamba-max-states-per-path must be -1 (unlimited) or a positive "
             f"integer, got {cfg.mamba_max_states_per_path}."
