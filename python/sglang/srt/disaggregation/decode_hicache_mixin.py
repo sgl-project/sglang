@@ -121,6 +121,7 @@ class DecodeHiCachePreallocMixin:
         Clears the L3 span unless the prefetch was taken, so prefill is never
         promised tokens nothing will load.
         """
+        req.time_stats.reset_prefetch_start_time()
         if (
             prefix_match is None
             or prefix_match.l3_storage_hit_length <= 0
@@ -154,6 +155,9 @@ class DecodeHiCachePreallocMixin:
             if not (prefix_match.prefetch_registered or ticketed):
                 # Declined (below prefetch_threshold or rate limited): nothing loads.
                 prefix_match.l3_storage_hit_length = 0
+
+            if prefix_match.prefetch_registered:
+                req.time_stats.set_prefetch_start_time()
         except Exception as e:
             logger.warning(
                 "HiCache L3 prefetch failed for rid=%s: %s; falling back to L2-only LoadingBack",
@@ -220,6 +224,7 @@ class DecodeHiCacheTransferMixin:
             if not self.tree_cache.check_prefetch_progress(dr.req.cache_request_handle):
                 return False
             self.tree_cache.pop_prefetch_loaded_tokens(dr.req.cache_request_handle)
+            dr.req.time_stats.observe_prefetch_stage_finish()
 
         # The transfer suffix is already allocated: rematch only promised tokens,
         # without overwriting the request's preallocation state or lock receipt.

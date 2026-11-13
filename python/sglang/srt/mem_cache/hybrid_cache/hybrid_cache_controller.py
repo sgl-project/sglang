@@ -60,7 +60,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.kv.storage import KVStorage
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 
-from sglang.srt.mem_cache.utils import get_storage_hash_str
+from sglang.srt.mem_cache.utils import get_storage_hash_str, log_hicache_event
 from sglang.srt.utils import broadcast_pyobj
 
 logger = logging.getLogger(__name__)
@@ -1912,6 +1912,9 @@ class HybridCacheController(BaseHiCacheController):
                     )
                 pool_hits = count_pool_hits(results)
             except Exception:
+                # Flagged so the ack drain counts the transfer as read_failed
+                # instead of a full miss with zero sidecar hits.
+                operation.prefetch_read_failed = True
                 logger.exception(
                     "HiCache sidecar prefetch failed for request %s",
                     operation.request_id,
@@ -1967,8 +1970,14 @@ class HybridCacheController(BaseHiCacheController):
             )
             success = self.page_set_func(batch_hashes, batch_host_indices, extra_info)
             if not success:
-                logger.warning(
-                    f"Write page to storage: {len(batch_hashes)} pages failed."
+                operation.write_storage_failed = True
+                log_hicache_event(
+                    event="backup",
+                    tier="l2_to_l3",
+                    result="failed",
+                    reason="error",
+                    tokens=len(operation.token_ids),
+                    extra=f"Write page to storage: {len(batch_hashes)} pages failed.",
                 )
                 break
             if prefix_keys is not None:
@@ -2039,6 +2048,7 @@ class HybridCacheController(BaseHiCacheController):
                         sidecar_ok = False
                         break
                 if not sidecar_ok:
+                    operation.write_storage_failed = True
                     # The ack drain settles the KV span on the writer rank's
                     # evidence; a rank-sharded sidecar is not retried.
                     logger.warning(

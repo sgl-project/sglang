@@ -14,6 +14,7 @@
 """Common utilities."""
 
 import hashlib
+import logging
 from typing import Any, Callable, List, Optional, Tuple
 
 import torch
@@ -31,6 +32,8 @@ from sglang.srt.mem_cache.evict_policy import (
     SLRUStrategy,
     TLRUStrategy,
 )
+
+logger = logging.getLogger(__name__)
 
 _EVICTION_POLICY_FACTORIES: dict[str, Callable[..., EvictionStrategy]] = {
     "lru": LRUStrategy,
@@ -242,3 +245,24 @@ def get_num_new_pages(
     num_new_pages = num_pages_after - num_pages_before
     sum_num_new_pages = torch.sum(num_new_pages).to(torch.int64)
     return sum_num_new_pages.item()
+
+
+def log_hicache_event(
+    event: str,
+    tier: str,  # "l1_to_l2" | "l2_to_l3" | "l3_to_l2" | "l2_to_l1"
+    result: str,  # "success" | "failed" | "partial"
+    reason: str = "",  # "capacity" | "error"
+    rid: str = "",
+    node_id: int = 0,
+    tokens: int = 0,
+    duration_ms: float = 0.0,
+    extra: str = "",
+):
+    level = logging.WARNING if result == "failed" else logging.DEBUG
+    logger.log(
+        level,
+        f"[HICACHE] rid={rid} event={event} tier={tier} node={node_id} "
+        f"tokens={tokens} result={result} reason={reason} "
+        f"duration_ms={duration_ms:.1f} {extra}",
+        stacklevel=2,
+    )
