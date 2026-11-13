@@ -7,8 +7,10 @@ from unittest import mock
 
 from sglang.srt.platforms.cpu import CpuSRTPlatform
 from sglang.srt.platforms.cuda import CudaSRTPlatform
+from sglang.srt.platforms.musa import MusaSRTPlatform
+from sglang.srt.platforms.rocm import RocmSRTPlatform
 from sglang.srt.utils import vmm_backend
-from sglang.srt.utils.vmm_common import recv_fd, send_fd, visible_physical_device_ids
+from sglang.srt.utils.vmm_common import recv_fd, send_fd
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -43,22 +45,10 @@ class TestVmmBackendDispatch(CustomTestCase):
             CudaSRTPlatform().get_vmm_backend_class(), vmm_backend.CudaVmmBackend
         )
 
-
-class TestPhysicalDeviceIds(CustomTestCase):
-    def test_ordinals_map_through_the_visibility_variable(self) -> None:
-        """With one visible device per process every rank's ordinal is 0, so the peer check must compare physical ids."""
-        with mock.patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "6"}):
-            self.assertEqual(
-                visible_physical_device_ids("CUDA_VISIBLE_DEVICES", 1), ["6"]
-            )
-        with mock.patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "2,3"}):
-            self.assertEqual(
-                visible_physical_device_ids("CUDA_VISIBLE_DEVICES", 2), ["2", "3"]
-            )
-        with mock.patch.dict(os.environ, {}, clear=True):
-            self.assertEqual(
-                visible_physical_device_ids("CUDA_VISIBLE_DEVICES", 2), ["0", "1"]
-            )
+    def test_cuda_alike_platforms_without_the_cuda_driver_have_no_backend(self) -> None:
+        for platform in (RocmSRTPlatform(), MusaSRTPlatform()):
+            with self.subTest(platform=platform.device_name):
+                self.assertIsNone(platform.get_vmm_backend_class())
 
 
 class TestFdTransfer(CustomTestCase):

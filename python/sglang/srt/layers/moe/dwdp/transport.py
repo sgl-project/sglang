@@ -4,8 +4,6 @@
 from __future__ import annotations
 
 import logging
-import os
-import socket
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -24,6 +22,7 @@ from sglang.srt.utils.vmm_common import (
     align_down,
     align_up,
     all_ranks_ok,
+    close_fds_quietly,
 )
 
 logger = logging.getLogger(__name__)
@@ -136,13 +135,12 @@ class DWDPTransport:
         use_fabric, peer_handles = self._backend.exchange_handles(
             handle_list, cpu_group, layout.dwdp_rank, layout.dwdp_size
         )
-        imported = False
         try:
             logger.info(
                 f"DWDP handle exchange via {'FABRIC' if use_fabric else 'POSIX fd'} "
                 f"({len(sorted_keys)} handles)"
             )
-            import_error: RuntimeError | OSError | None = None
+            import_error: Exception | None = None
             try:
                 for key_idx, (layer_idx, name) in enumerate(sorted_keys):
                     spec = layer_weight_specs[layer_idx][name]
@@ -188,54 +186,39 @@ class DWDPTransport:
                             dtype=spec.dtype,
                         )
                         self._peer_views[(peer_rank, layer_idx, name)] = peer_tensor
-            except (RuntimeError, OSError) as error:
+            # any failure, not only driver errors, must reach the collective below
+            except Exception as error:
                 import_error = error
             # a rank failing alone would leave its peers waiting in the barrier
             if not all_ranks_ok(cpu_group, import_error is None):
                 raise import_error or RuntimeError(
                     "DWDP peer import failed on another rank"
                 )
-            imported = True
         finally:
-            fds_to_close = [] if use_fabric else list(peer_handles.values())
-            first_close_error: OSError | None = None
-            for fd in fds_to_close:
-                try:
-                    os.close(fd)
-                except OSError as error:
-                    first_close_error = first_close_error or error
-            # a close error must not replace the error already propagating
-            if imported and first_close_error is not None:
-                raise first_close_error
+            if not use_fabric:
+                close_fds_quietly(list(peer_handles.values()))
 
     def _check_peer_access(
         self, cpu_group: ProcessGroup, layout: DwdpExpertLayout
     ) -> None:
-        # ordinals are process-local: compare physical ids, and check only same-host peers this process can see
-        local_physical_ids = self._backend.physical_device_ids()
-        locations = [None] * layout.dwdp_size
+        # ordinals are process-local and visibility variables can be bypassed, so match peers by UUID
+        local_uuids = self._backend.device_uuids()
+        peer_uuids = [None] * layout.dwdp_size
         dist.all_gather_object(
-            locations,
-            (socket.gethostname(), local_physical_ids[self._backend.device_id]),
-            group=cpu_group,
+            peer_uuids, local_uuids[self._backend.device_id], group=cpu_group
         )
-        host = locations[layout.dwdp_rank][0]
-        unreachable_physical_ids = [
-            peer_physical_id
-            for peer_rank, (peer_host, peer_physical_id) in enumerate(locations)
+        unreachable_uuids = [
+            peer_uuid
+            for peer_rank, peer_uuid in enumerate(peer_uuids)
             if peer_rank != layout.dwdp_rank
-            and peer_host == host
-            and peer_physical_id in local_physical_ids
-            and not self._backend.can_access_peer(
-                local_physical_ids.index(peer_physical_id)
-            )
+            and peer_uuid in local_uuids
+            and not self._backend.can_access_peer(local_uuids.index(peer_uuid))
         ]
         # a rank that raised alone would leave its peers blocked in the exchange
-        if not all_ranks_ok(cpu_group, not unreachable_physical_ids):
+        if not all_ranks_ok(cpu_group, not unreachable_uuids):
             raise RuntimeError(
                 f"DWDP needs peer access between all ranks; devices unreachable "
-                f"from device {locations[layout.dwdp_rank][1]}: "
-                f"{unreachable_physical_ids}"
+                f"from device {peer_uuids[layout.dwdp_rank]}: {unreachable_uuids}"
             )
 
     @property

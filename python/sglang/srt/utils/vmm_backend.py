@@ -25,7 +25,6 @@ from sglang.srt.utils.cuda_vmm_utils import (
 from sglang.srt.utils.vmm_common import (
     Reservation,
     exchange_exported_handles,
-    visible_physical_device_ids,
 )
 
 
@@ -107,12 +106,13 @@ class VmmBackend(ABC):
             close_local_fds=self.owns_exported_fds(),
         )
 
-    def physical_device_ids(self) -> list[str]:
-        """Physical ids of the devices this process sees, by local ordinal."""
-        return visible_physical_device_ids(
-            self.visible_devices_env,
-            torch.get_device_module(self.torch_device).device_count(),
-        )
+    def device_uuids(self) -> list[str]:
+        """UUIDs of the devices this process sees, by local ordinal; unlike ordinals they are the same in every process."""
+        device_module = torch.get_device_module(self.torch_device)
+        return [
+            str(device_module.get_device_properties(ordinal).uuid)
+            for ordinal in range(device_module.device_count())
+        ]
 
     @abstractmethod
     def owns_exported_fds(self) -> bool:
@@ -140,12 +140,6 @@ class VmmBackend(ABC):
     def torch_device(self) -> torch.device:
         raise NotImplementedError
 
-    @property
-    @abstractmethod
-    def visible_devices_env(self) -> str:
-        """Environment variable that maps physical devices to this process's ordinals."""
-        raise NotImplementedError
-
     @abstractmethod
     def _impl_granularity(self) -> int:
         raise NotImplementedError
@@ -155,10 +149,6 @@ class CudaVmmBackend(VmmBackend):
     @property
     def torch_device(self) -> torch.device:
         return torch.device("cuda", self.device_id)
-
-    @property
-    def visible_devices_env(self) -> str:
-        return "CUDA_VISIBLE_DEVICES"
 
     def _impl_granularity(self) -> int:
         return get_device_granularity(self.device_id)
