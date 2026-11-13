@@ -4736,7 +4736,8 @@ class Scheduler(
                 truncation_align_size=self.truncation_align_size,
             )
 
-            if self.enable_lora:
+            # A held request is not admitted, so its adapter takes no slot.
+            if self.enable_lora and res != AddReqResult.HELD:
                 running_loras.add(req.lora_id)
 
             if res != AddReqResult.CONTINUE:

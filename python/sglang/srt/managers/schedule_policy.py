@@ -918,6 +918,11 @@ class PrefillAdder:
                 table.mamba_allocator.available_size()
                 + self.tree_cache.mamba_evictable_size()
             )
+            # Checkpoints pinned after this point (admits, the temporary pin
+            # of the request asked about) stop being evictable.
+            self.protected_state_slots_at_start = (
+                self.tree_cache.mamba_protected_size()
+            )
             # What acquire takes for a request with no state (StateStorage).
             self.fresh_state_slots = 1 + (
                 table.mamba_initial_tracking_slots
@@ -966,8 +971,14 @@ class PrefillAdder:
             return True
         if not self.is_hybrid_ssm_cache:
             return False
-        free_states = self.free_state_slots_at_start - self.fresh_state_slots * (
-            len(self.can_run_list) + 1
+        pinned_states = (
+            self.tree_cache.mamba_protected_size()
+            - self.protected_state_slots_at_start
+        )
+        free_states = (
+            self.free_state_slots_at_start
+            - pinned_states
+            - self.fresh_state_slots * (len(self.can_run_list) + 1)
         )
         return free_states < self.cache_reserve_state_slots
 

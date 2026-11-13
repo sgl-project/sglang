@@ -2961,6 +2961,7 @@ class TestPrefillAdder(CustomTestCase):
         if state_pool is not None:
             self.mock_tree_cache.full_evictable_size.return_value = 300
             self.mock_tree_cache.mamba_evictable_size.return_value = 0
+            self.mock_tree_cache.mamba_protected_size.return_value = 0
             table = self.mock_tree_cache.req_to_token_pool
             table.mamba_allocator = state_pool
             table.enable_mamba_extra_buffer = True
@@ -3068,6 +3069,30 @@ class TestPrefillAdder(CustomTestCase):
         adder.can_run_list = [MagicMock(), MagicMock(), MagicMock()]
         # Three admitted already: 40 - 4 * 3 = 28 slots are left.
         self.assertTrue(adder._holds_for_cache_reserve(req, total_tokens=40))
+
+    def test_cache_reserve_counts_checkpoints_the_pass_pins(self):
+        """A cold request matching a cached checkpoint pins it while it is asked
+        about, so that slot is no longer evictable: 32 free and 1 evictable at the
+        pass start, minus the pin and 3 fresh slots, leave 29 under the 30 kept."""
+        pool = MambaSlotAllocator(size=100, device="cpu")
+        pool.alloc(68)
+        adder = self._cache_reserve_adder(running=True, state_pool=pool)
+        tree = self.mock_tree_cache
+        pinned = []
+        tree.inc_lock_ref.side_effect = lambda node: (
+            pinned.append(node) or IncLockRefResult()
+        )
+        tree.dec_lock_ref.side_effect = lambda node, receipt: (
+            pinned.remove(node) or DecLockRefResult()
+        )
+        tree.mamba_evictable_size.return_value = 1
+        tree.mamba_protected_size.side_effect = lambda: len(pinned)
+        adder._init_cache_reserve()
+        req = self._reserve_req(prefix_len=5, prompt_len=20)
+        # Unpinned, 33 - 3 = 30 slots are left: exactly the reserve.
+        self.assertFalse(adder._holds_for_cache_reserve(req, total_tokens=40))
+        with adder._lock_node(req.last_node):
+            self.assertTrue(adder._holds_for_cache_reserve(req, total_tokens=40))
 
 
 if __name__ == "__main__":
