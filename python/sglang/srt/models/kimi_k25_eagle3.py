@@ -31,6 +31,7 @@ from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ColumnParallelLinear, ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.utils import rename_excluded_modules
 from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -247,7 +248,7 @@ class Eagle3MLAModel(nn.Module):
             config,
             layer_id=0,
             quant_config=quant_config,
-            prefix=prefix,
+            prefix=add_prefix("midlayer", prefix),
         )
 
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -322,6 +323,11 @@ class Eagle3DeepseekV2ForCausalLM(nn.Module):
     """
 
     draft_parallel_spec = DraftParallelSpec(tp_execution=DraftTPExecution.SINGLE_GROUP)
+    # Checkpoint shards of the fused layers, so quantization configs match their exclusions.
+    packed_modules_mapping = {
+        "fused_qkv_a_proj_with_mqa": ["q_a_proj", "kv_a_proj_with_mqa"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
 
     def __init__(
         self,
@@ -339,6 +345,11 @@ class Eagle3DeepseekV2ForCausalLM(nn.Module):
                 "modelopt_fp4 target; draft weights are bf16."
             )
             quant_config = None
+        # The checkpoint names the draft layer `layers.0`, also in its exclusions:
+        # rename them as load_weights renames the weights.
+        quant_config = rename_excluded_modules(
+            quant_config, lambda n: re.sub(r"^layers\.0\.", "midlayer.", n)
+        )
         self.quant_config = quant_config
         self.pp_group = get_parallel().pp_group
 

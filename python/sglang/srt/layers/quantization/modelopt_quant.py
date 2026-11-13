@@ -487,8 +487,8 @@ class ModelOptFp8Config(ModelOptQuantConfig):
             else:
                 kv_cache_quant_method = config.get("kv_cache_quant_algo")
 
-            # Map 'ignore' field to 'exclude_modules'
-            exclude_modules = config.get("ignore")
+            # Map 'ignore' field to 'exclude_modules' (earlier flat exports name it so)
+            exclude_modules = config.get("ignore", config.get("exclude_modules"))
         else:
             # Fall back to nested format (hf_quant_config.json - will be deprecated)
             try:
