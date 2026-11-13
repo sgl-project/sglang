@@ -6,8 +6,10 @@ import json
 import sys
 import tempfile
 import unittest
+from datetime import timedelta
 from pathlib import Path
-from unittest.mock import patch
+from types import ModuleType, SimpleNamespace
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import bench_cutile_nvfp4 as benchmark
@@ -17,7 +19,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from test.manual.layers.moe import test_flashinfer_cutile_nvfp4 as helpers
+helpers = benchmark.load_test_helpers()
 
 import torch
 
@@ -74,6 +76,10 @@ class TestCuTileBenchmark(CustomTestCase):
             ("--max-relative-l2", "1"),
             ("--streams", "0"),
             ("--backends", "cutile", "cutile"),
+            ("--distributed-timeout", "0"),
+            ("--distributed-timeout", "-1"),
+            ("--distributed-timeout", "nan"),
+            ("--distributed-timeout", "inf"),
         ]
         for extra in invalid:
             with self.subTest(extra=extra), contextlib.redirect_stderr(io.StringIO()):
@@ -85,6 +91,152 @@ class TestCuTileBenchmark(CustomTestCase):
         )
         self.assertEqual(args.samples, 100)
         self.assertEqual(args.cutile_api, "fused")
+
+    def test_helper_import_ignores_shadowing_test_package(self):
+        shadow = ModuleType("test")
+        with patch.dict(sys.modules, {"test": shadow}):
+            loaded = benchmark.load_test_helpers()
+            self.assertEqual(
+                Path(loaded.__file__).resolve(),
+                benchmark.REPO_ROOT
+                / "test/manual/layers/moe/test_flashinfer_cutile_nvfp4.py",
+            )
+            self.assertIs(sys.modules["test"], shadow)
+
+    def test_distributed_timeout_is_explicit_and_configurable(self):
+        default = benchmark.parse_args(self.arguments())
+        self.assertEqual(benchmark.distributed_timeout(default), timedelta(seconds=600))
+        selected = benchmark.parse_args(self.arguments("--distributed-timeout", "12.5"))
+        self.assertEqual(
+            benchmark.distributed_timeout(selected), timedelta(seconds=12.5)
+        )
+
+    def test_full_output_check_rejects_nonfinite_tail_and_wrong_shape(self):
+        output = torch.ones(65, 2)
+        benchmark.validate_output(output, (65, 2))
+        for invalid in (float("nan"), float("inf"), -float("inf")):
+            with self.subTest(invalid=invalid):
+                broken = output.clone()
+                broken[64, 0] = invalid
+                # This is the former blind spot: reference prefix is finite,
+                # and byte-wise comparison accepts a stable nonfinite pattern.
+                self.assertTrue(torch.isfinite(broken[:64]).all().item())
+                self.assertTrue(benchmark.bit_equal(broken, broken.clone()))
+                with self.assertRaises(benchmark.BenchmarkCheckError) as caught:
+                    benchmark.validate_output(broken, output.shape)
+                self.assertEqual(caught.exception.metrics["nonfinite_elements"], 1)
+        with self.assertRaises(benchmark.BenchmarkCheckError) as caught:
+            benchmark.validate_output(output, (64, 2))
+        self.assertEqual(caught.exception.metrics["actual_shape"], [65, 2])
+
+    def test_repeat_gates_preserve_bit_identity_and_marlin_tolerance(self):
+        expected = torch.ones(1)
+        small = expected + 0.0005
+        checked = benchmark.repeat_metrics("marlin", small, expected)
+        self.assertFalse(checked["bit_identity"])
+        self.assertLess(checked["relative_l2"], 0.001)
+        with self.assertRaises(benchmark.BenchmarkCheckError):
+            benchmark.repeat_metrics("cutile", small, expected)
+        with self.assertRaises(benchmark.BenchmarkCheckError) as caught:
+            benchmark.repeat_metrics("marlin", expected + 0.002, expected)
+        self.assertGreater(caught.exception.metrics["relative_l2"], 0.001)
+
+    def test_distributed_failure_keeps_stage_and_metrics_before_exit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            evidence = benchmark.RunEvidence(Path(tmp), rank=1)
+            evidence.stage(
+                "repeat-check",
+                backend="marlin",
+                tokens=1,
+                execution="eager",
+                check_index=7,
+            )
+            error = benchmark.BenchmarkCheckError(
+                "repeat failed", {"relative_l2": 0.006}
+            )
+            with (
+                patch.object(
+                    benchmark, "exit_distributed_failure", side_effect=SystemExit(1)
+                ) as terminate,
+                patch.object(benchmark.traceback, "print_exception") as trace,
+            ):
+                with self.assertRaises(SystemExit):
+                    benchmark.report_failure(evidence, error, distributed_worker=True)
+            terminate.assert_called_once_with()
+            trace.assert_called_once_with(type(error), error, error.__traceback__)
+            saved = json.loads(evidence.path.read_text())
+            self.assertFalse(saved["complete"])
+            self.assertFalse(saved["running"])
+            self.assertEqual(saved["phase"], "repeat-check")
+            self.assertEqual(saved["backend"], "marlin")
+            self.assertEqual(saved["tokens"], 1)
+            self.assertEqual(saved["check_index"], 7)
+            self.assertEqual(saved["metrics"], error.metrics)
+
+    def test_graph_failure_preserves_completed_eager_samples(self):
+        # Only CUDA operations are mocked; real CPU tensors, checking, sample
+        # aggregation, per-mode persistence and failure reporting run normally.
+        def dispatch(value):
+            return SimpleNamespace(
+                hidden_states=torch.full((65, 2), float(value)),
+                topk_output=SimpleNamespace(
+                    topk_ids=torch.zeros(65, 1, dtype=torch.int32),
+                    topk_weights=torch.ones(65, 1),
+                    router_logits=torch.zeros(65, 1),
+                ),
+            )
+
+        inputs = [dispatch(value) for value in (1, 2, 3, 4)]
+        references = [
+            (item.hidden_states[:64].clone(), item.hidden_states[:64].clone(), {})
+            for item in inputs
+        ]
+        call = Mock(side_effect=lambda item: item.hidden_states.clone())
+        call.layer = object()
+        event = Mock()
+        event.elapsed_time.return_value = 1.0
+        args = benchmark.parse_args(self.arguments())
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp)
+            evidence = benchmark.RunEvidence(output, rank=0)
+            evidence.stage("backend-checks", tokens=65, backend="cutile")
+            rows = []
+            with (
+                patch.object(benchmark, "make_inputs", return_value=[dispatch(0)]),
+                patch.object(torch.cuda, "Event", return_value=event),
+                patch.object(torch.cuda, "CUDAGraph", return_value=Mock()),
+                patch.object(
+                    torch.cuda, "graph", side_effect=RuntimeError("capture failed")
+                ),
+                self.assertRaisesRegex(RuntimeError, "capture failed") as caught,
+            ):
+                benchmark.measure_backend(
+                    "cutile",
+                    call,
+                    inputs,
+                    references,
+                    args,
+                    None,
+                    1,
+                    Mock(),
+                    evidence,
+                    lambda row: benchmark.persist_latency_case(output, rows, row),
+                )
+            benchmark.report_failure(
+                evidence, caught.exception, distributed_worker=False
+            )
+            saved = json.loads((output / "latency.json").read_text())
+            self.assertFalse(saved["complete"])
+            self.assertEqual(len(saved["cases"]), 1)
+            row = saved["cases"][0]
+            self.assertEqual(row["execution"], "eager")
+            self.assertEqual(len(row["gpu"]["samples_ms"]), 100)
+            self.assertEqual(len(row["repeat_checks"]), 20)
+            self.assertEqual(row["repeat_max_relative_l2"], 0.0)
+            failed = json.loads(evidence.path.read_text())
+            self.assertFalse(failed["complete"])
+            self.assertEqual(failed["execution"], "graph")
+            self.assertEqual(failed["phase"], "capture")
 
     def test_real_weights_need_revision_provenance(self):
         args = self.arguments()

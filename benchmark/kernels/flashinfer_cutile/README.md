@@ -62,12 +62,20 @@ SGLANG_TEST_CUTILE_LARGE_BATCH=1 \
   python test/manual/layers/moe/test_flashinfer_cutile_nvfp4.py -v
 ```
 
-The matched W4A4 reference uses unpacked weights, NVFP4 activation round trips,
-and FP32 GEMMs. The separate BF16-activation reference exposes intentional
+The matched W4A4 reference uses unpacked weights, cuTile's NVFP4 activation
+midpoint rule, FP32 GEMM accumulation, and BF16 rounding at the cuTile GEMM
+output boundaries. The separate BF16-activation reference exposes intentional
 activation quantization loss. Neither reference implies bit identity with
-Marlin W4A16. The initial relative-L2 gate is 0.05; it is a predeclared bound,
-not a GPU-calibrated result. Investigate failures before changing it and disclose
-any threshold change.
+Marlin W4A16. The relative-L2 gate remains 0.05. Investigate failures before
+changing it and disclose any threshold change.
+
+The stream test warms each execution before interleaving repeated calls and
+retains independent output snapshots. This exercises isolation but does not
+prove physical overlap without profiling. The context-reset tests distinguish
+new execution/warmup state from reclamation of the old execution object after
+Graph teardown. The weak-reference assertion does not quantify reclaimed GPU
+bytes; allocator-reserved memory is not required to return to zero.
+New GPU assertions must be run on hardware before they are reported as passing.
 
 ## 2. Layer latency and real tensor parallelism
 
@@ -104,7 +112,13 @@ NCCL_DEBUG=INFO torchrun --standalone --nproc-per-node=2 \
 Repeat with four processes for TP4 and with 128 experts for the full expert
 count. Every rank retains all selected experts; TP partitions the intermediate
 dimension (3072 / TP), not the expert dimension. A sequential single-GPU sum
-is not evidence of distributed TP support.
+is not evidence of distributed TP support. `--distributed-timeout` sets the
+process-group timeout in seconds (default 600); it must be finite and positive.
+After output setup, a distributed worker that fails records its stage and exits
+nonzero without entering collective cleanup. Initialization failures before
+output setup remain in the launcher log. Launch TP cases with `torchrun`, which
+terminates the other workers on failure. CPU tests of this path do not establish a bound
+for real CUDA/NCCL failures; a GPU fault-injection check remains necessary.
 
 Each latency result includes at least 100 measured calls, p50/p95, per-rank raw
 samples, synchronized host timing, both numerical references, repeatability,
@@ -116,6 +130,17 @@ outside the timed region. FP32 references
 default to the first 64 tokens of each input set; increase
 `--reference-tokens` when broader numerical coverage is required. Full-tensor
 repeatability and Graph checks are separate from that sampled reference.
+Full output shape and finiteness checks also run outside the timed region,
+including tokens beyond the reference prefix. Completed execution modes are
+saved incrementally, so a later Graph failure preserves earlier eager samples.
+The invocation still fails; partial results must not be reported as a passing run.
+
+Marlin repetition/replay keeps its original relative-L2 limit of 0.001; cuTile
+continues to require bit identity. Record measured repeat/replay errors as well
+as identity flags. Preserve the existing 1-token Marlin failure. To keep one
+known failure from preventing unrelated experiments, run token cases in separate
+processes and new result directories, then report every pass and failure. Do not
+silently skip a failed case or reuse an uncertain distributed process group.
 
 The baseline calls SGLang's Marlin preparation and runner explicitly.
 It does not claim the default SM12x model dispatcher selects Marlin.
@@ -174,12 +199,22 @@ passes. Raw JSONL/logs and `serving-summary.csv` retain TTFT, TPOT, and throughp
 For a first smoke, select `--input-lens 128 --output-lens 128 --concurrencies 1`.
 The metadata distinguishes the benchmark client from the model server; attach
 the server's dependency versions and source diff as well.
+`--case-timeout` limits each pilot and measured client process separately
+(default 1800 seconds). It is distinct from `--http-timeout`, which controls
+the wrapper's own HTTP requests. On timeout the driver retains the case/stage
+and client log, fails the invocation, and stops further cases. It terminates
+the benchmark client, not the model server; inspect pending server requests
+before starting another run.
 
 On a dedicated server started with **both** `--enable-memory-saver` and
 `--enable-weights-cpu-backup`, run a separate `--mode lifecycle` invocation.
 It verifies deterministic cold-cache outputs before releasing weights and
 KV cache, attempts resume even after an ambiguous release failure, then checks
-fresh token IDs and output logprobs after restoration. Inspect the resource-cycle
+fresh token IDs and output logprobs after restoration. Each generation must
+finish normally with the requested 64 tokens; completion-token counts, token
+IDs, and logprob counts must agree. Aborted or truncated outputs cannot pass
+merely because they repeat, and the default logprob tolerance remains zero.
+Inspect the resource-cycle
 record and failed status if either endpoint fails; do not continue reporting
 throughput from an uncertain server state. The server-info memory fields
 are startup accounting, not a measurement of physically released GPU memory.
