@@ -48,6 +48,7 @@ Multi-modal:
       - '**/*multimodal*'
       - '**/*vision*'
       - '**/*vlm*'
+      - 'rust/sglang-mm/**/*'
 
 # Diffusion
 diffusion:
@@ -211,3 +212,8 @@ rust-processor:
   - changed-files:
     - any-glob-to-any-file:
       - 'rust/sglang-processor/**/*'
+
+rust-server:
+  - changed-files:
+    - any-glob-to-any-file:
+      - 'rust/sglang-server/**/*'
