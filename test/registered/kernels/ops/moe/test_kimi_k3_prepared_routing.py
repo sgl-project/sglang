@@ -167,6 +167,7 @@ class TestKimiK3PreparedRouting(CustomTestCase):
             )
         )
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_prepared_body_matches_routed_call(self):
         from flashinfer.autotuner import autotune
 

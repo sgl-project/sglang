@@ -21,6 +21,10 @@ import itertools
 import pytest
 import torch
 
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
+
 from sglang.kernels.jit.utils import get_ci_test_range, should_run_full_tests
 from sglang.kernels.ops.activation.activation import silu_and_mul
 from sglang.kernels.ops.quantization.fp8_kernel import (

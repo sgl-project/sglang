@@ -75,6 +75,7 @@ def _assert_close(out, ref):
     torch.testing.assert_close(out.float(), ref.float(), rtol=2**-7, atol=2**-7)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize(
     "hidden,top_k",
     [
@@ -97,6 +98,7 @@ def test_matches_reference(hidden, top_k, num_tokens, weight_dtype):
     _assert_close(out, _reference(*args, top_k))
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("top_k", [6, 16])
 @pytest.mark.parametrize("shared", [True, False])
 @pytest.mark.parametrize("pad", [0, 128])
@@ -114,6 +116,7 @@ def test_skipped_rows_padding_and_pdl(top_k, shared, pad, enable_pdl, routing_re
     _assert_close(out, _reference(*args, top_k))
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("top_k", [6, 16])
 def test_into_caller_buffer(top_k):
     # A row-strided view stands in for a caller-owned (e.g. symmetric-memory) buffer.
@@ -127,6 +130,7 @@ def test_into_caller_buffer(top_k):
     assert torch.all(buf[:, 3584:] == 7.0)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_all_slots_skipped_and_nonfinite():
     gemm2_out, idx, weights, shared = _inputs(16, 7168, 8, torch.float32)
     idx[:8] = -1  # every slot of token 0 skipped: its output is its shared row
@@ -141,6 +145,7 @@ def test_all_slots_skipped_and_nonfinite():
     _assert_close(out.nan_to_num(0, 0, 0), ref.nan_to_num(0, 0, 0))
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_many_tokens_per_cta_and_empty():
     # Past one resident wave each CTA walks several tokens.
     for top_k in (8, 16):
@@ -150,6 +155,7 @@ def test_many_tokens_per_cta_and_empty():
     assert moe_finalize_fuse_shared(*empty, 8).shape == (0, 7168)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_deterministic():
     args = _inputs(64, 7168, 8, torch.float32, skip=0.1)
     assert torch.equal(

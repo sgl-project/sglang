@@ -343,6 +343,7 @@ class TestKDAPrefillGraph(CustomTestCase):
         self.assertLessEqual(chunks, meta.max_chunks)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestFlashInferKDAPrefillGraph(TestKDAPrefillGraph):
     prefill_backend = LinearAttnKernelBackend.FLASHINFER
 

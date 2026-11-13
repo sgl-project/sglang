@@ -58,6 +58,8 @@ def _inputs(dtype=torch.bfloat16, hidden=768, device="cuda"):
 )
 def test_unsupported_inputs_take_the_eager_path(case: str):
     """Inputs the kernel rejects must take the eager unpartition + add."""
+    if case != "cpu" and not torch.cuda.is_available():
+        pytest.skip("Test requires CUDA")
     if case == "fp16":
         windows, shortcut = _inputs(dtype=torch.float16)
     elif case == "fp32":

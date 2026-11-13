@@ -68,8 +68,10 @@ def _misaligned_rel_w():
     ],
     ids=["fp16", "fp32", "cpu", "key_width_12", "strided_rel_w", "misaligned_rel_w"],
 )
-def test_unsupported_inputs_take_the_eager_path(make):
+def test_unsupported_inputs_take_the_eager_path(make, request):
     """Inputs the kernel rejects (or would misread) must take the eager sum."""
+    if request.node.callspec.id != "cpu" and not torch.cuda.is_available():
+        pytest.skip("Test requires CUDA")
     rel_h, rel_w = make()
     assert not can_use_sam_rel_pos_bias(rel_h, rel_w)
 

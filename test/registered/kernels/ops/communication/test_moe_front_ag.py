@@ -112,6 +112,7 @@ def _assert_gathered(out: torch.Tensor, ref: torch.Tensor) -> None:
     assert torch.equal(out[~zeros].view(torch.int32), ref[~zeros].view(torch.int32))
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("num_tokens", TOKENS)
 @torch.inference_mode()
 def test_moe_front_all_gather(num_tokens: int):
@@ -129,6 +130,7 @@ def test_moe_front_all_gather(num_tokens: int):
     _assert_gathered(out, _nccl_ref(block.contiguous()))
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @torch.inference_mode()
 def test_moe_front_all_gather_stress_with_push_all_reduce():
     # both use the one push workspace's phase double-buffering
@@ -150,6 +152,7 @@ def test_moe_front_all_gather_stress_with_push_all_reduce():
         torch.testing.assert_close(x, ref_x, atol=0, rtol=0)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @torch.inference_mode()
 def test_moe_front_all_gather_graph_capture():
     comm = _init_comm()

@@ -51,6 +51,7 @@ def _dense(weights, ids):
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize(
     "num_tokens, renormalize, num_routers",
     [(1, True, 2), (3000, False, 3), (3000, True, 2)],
@@ -74,6 +75,7 @@ def test_multi_router_topk_matches_reference(num_tokens, renormalize, num_router
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_router_sigmoid_matches_torch_on_every_bf16_input():
     bits = torch.arange(-(1 << 15), 1 << 15, dtype=torch.int32, device="cuda")
     x = bits.to(torch.int16).view(torch.bfloat16)
@@ -84,6 +86,7 @@ def test_router_sigmoid_matches_torch_on_every_bf16_input():
     assert torch.equal(out[finite].view(torch.int32), ref[finite].view(torch.int32))
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_multi_router_topk_empty():
     from sglang.kernels.ops.moe.multi_router import multi_router_topk
 

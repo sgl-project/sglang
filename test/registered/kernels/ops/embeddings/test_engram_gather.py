@@ -87,6 +87,7 @@ def test_engram_gather_peer_decodes_packed_mxfp4() -> None:
         _assert_bits_equal(out, expected)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("rows_per_program", [2, 8, 16])
 @pytest.mark.parametrize("mxfp4", [False, True])
 @pytest.mark.parametrize("sort_ids", [False, True])

@@ -66,6 +66,7 @@ def _run(inputs, *, split):
     return predicts, accepted, lengths
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.skipif(DEVICE == "cpu", reason="needs CUDA")
 @pytest.mark.parametrize("batch", [1, 2, 7, 64])
 @pytest.mark.parametrize("slots", [2, 4, 6])
@@ -98,6 +99,7 @@ def test_non_cuda_devices_take_the_stock_path():
         )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.skipif(DEVICE == "cpu", reason="needs CUDA")
 def test_scratch_is_never_replaced_and_counters_return_to_zero(monkeypatch):
     """Graphs keep the scratch pointers they captured, so every batch the gate splits

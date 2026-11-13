@@ -273,6 +273,7 @@ def test_concat_mla_absorb_q_jit_vs_aot(dim_0: int, dim_1: int) -> None:
     triton.testing.assert_close(out_jit, out_aot, atol=0, rtol=0)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("dim_0", [1, 7, 64])
 def test_concat_mla_absorb_q_jit_into_padded_heads(dim_0: int) -> None:
     """`out` as the real heads of a zero-padded head buffer (a strided view):

@@ -74,6 +74,7 @@ class TestRouteQuant(CustomTestCase):
         self.assertIs(moe_topk_sum(x, out), out)
         self.assertTrue(torch.equal(out, x.float().sum(1).to(torch.bfloat16)))
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_moe_topk_sum_scale_and_block_width(self):
         """Routed scaling lands before the bf16 store, and a narrower block (the decode width,
         grid = ceil(K/8/threads) x M) sums in the same order."""

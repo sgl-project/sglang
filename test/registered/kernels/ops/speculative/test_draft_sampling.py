@@ -73,6 +73,7 @@ class TestGumbelArgmax(CustomTestCase):
         fused_torch_rule = div_argmax(p, q, divisor_min=_TINY)
         self.assertTrue(torch.equal(fused_torch_rule, torch.argmax(scores, dim=-1)))
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_div_argmax_options_match_reference(self):
         gen = torch.Generator(device="cuda").manual_seed(0)
         shapes = [(1, 4096), (7, 151936), (64, 151936), (5, 248320), (300, 32000)]
@@ -85,6 +86,7 @@ class TestGumbelArgmax(CustomTestCase):
         for vocab in (4096, 248320):
             self._check(*_edge_rows(vocab))
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_div_argmax_default_unchanged(self):
         gen = torch.Generator(device="cuda").manual_seed(3)
         x = torch.randn((9, 151936), generator=gen, device="cuda")
@@ -92,6 +94,7 @@ class TestGumbelArgmax(CustomTestCase):
         d = torch.rand((9, 151936), generator=gen, device="cuda") + 0.5
         self.assertTrue(torch.equal(div_argmax(x, d), torch.argmax(x / d, dim=-1)))
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_fast_sample_matches_reference(self):
         gen = torch.Generator(device="cuda").manual_seed(1)
         # Below 2**23 elements and for 4097 (not a whole number of vectors) both
@@ -111,6 +114,7 @@ class TestGumbelArgmax(CustomTestCase):
             self.assertTrue(torch.equal(index, ref_index))
             self.assertTrue(torch.equal(_bits(p), _bits(ref_p)))
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_fast_sample_matches_reference_on_a_step_view(self):
         # The multi-layer EAGLE single-graph draft samples from
         # draft_probs[:bs, step] of a [max_bs, num_steps, vocab] buffer.
@@ -132,6 +136,7 @@ class TestGumbelArgmax(CustomTestCase):
             self.assertTrue(torch.equal(index, ref_index))
             self.assertTrue(torch.equal(_bits(p), _bits(ref_p)))
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_draft_proposal_cuda_graph_replay(self):
         rows, vocab = 64, 151936
         logits = torch.zeros((rows, vocab), device="cuda")
