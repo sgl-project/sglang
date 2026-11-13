@@ -199,7 +199,10 @@ class ExaoneMoESparseMoEBlock(nn.Module):
                 prefix=add_prefix("shared_experts", prefix),
                 **(
                     dict(parallel_group="replicated")
-                    if get_moe_a2a_backend().is_deepep()
+                    if (
+                        get_moe_a2a_backend().is_deepep()
+                        or get_moe_a2a_backend().is_ascend_ops()
+                    )
                     else {}
                 ),
             )
@@ -271,7 +274,7 @@ class ExaoneMoESparseMoEBlock(nn.Module):
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
-        if get_moe_a2a_backend().is_deepep():
+        if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_ascend_ops():
             return self._forward_deepep(hidden_states, forward_batch)
 
         if (
