@@ -100,6 +100,7 @@ def sampling_accept_commit_lens(
         verify_num_draft_tokens=stride,
         block_verification=block_verification,
         rejection_noise=rejection_noise,
+        fly=epilogue.fly,
     )
     bonus_logits = io.logits
     if epilogue.simulated_correct_len is not None:
