@@ -1558,6 +1558,9 @@ class UnifiedRadixCache(BasePrefixCache):
 
     @rank_consensus(same_params=["req.rid", "checkpointed"])
     def on_release(self, req: Req, *, checkpointed: bool) -> None:
+        from sglang.srt.mem_cache.gdn_kv_reuse import release_full_kv_pin
+
+        release_full_kv_pin(self, req)
         if checkpointed:
             return
         for comp in self._components_tuple:
@@ -1708,9 +1711,12 @@ class UnifiedRadixCache(BasePrefixCache):
         new_last_node = result.last_device_node
         new_indices = self.path_device_indices(new_last_node)
         new_prefix_len = result.prefix_len
-        assert req.kv.cache_protected_len <= len(new_indices) + self.page_size - 1, (
-            f"{req.kv.cache_protected_len=}, {len(new_indices)=}, {page_aligned_len=}"
-        )
+        if req.full_kv_replay_node is None:
+            assert (
+                req.kv.cache_protected_len <= len(new_indices) + self.page_size - 1
+            ), (
+                f"{req.kv.cache_protected_len=}, {len(new_indices)=}, {page_aligned_len=}"
+            )
         assert (
             new_prefix_len <= len(new_indices) and len(new_indices) == page_aligned_len
         ), f"{new_prefix_len=}, {len(new_indices)=}, {page_aligned_len=}"
@@ -1736,9 +1742,16 @@ class UnifiedRadixCache(BasePrefixCache):
             ),
         )
 
-        # Update req fields
-        req.kv.protect_prefix(len(new_indices))
+        # An interior GDN snapshot can stop before borrowed Full KV. Keep that
+        # suffix tree-owned and pinned until a later checkpoint covers it.
+        protected_len = len(new_indices)
+        if req.full_kv_replay_node is not None:
+            protected_len = max(protected_len, req.kv.cache_protected_len)
+        req.kv.protect_prefix(protected_len)
         req.last_node = new_last_node
+        from sglang.srt.mem_cache.gdn_kv_reuse import release_full_kv_pin
+
+        release_full_kv_pin(self, req, covered_prefix_len=len(new_indices))
 
         # cleanup
         for comp in self._components_tuple:

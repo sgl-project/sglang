@@ -1,0 +1,1006 @@
+{
+  "run_date": "2026-11-10",
+  "parent_commit": "28bea65d4235c8978db716b84936519de493e2b9",
+  "source_sha256": {
+    "python/sglang/srt/mem_cache/gdn_kv_reuse.py": "7dcc897830f1a3c5b516817c052b581e30c33583329e4bcbbe544248ec276806",
+    "python/sglang/srt/mem_cache/unified_radix_cache.py": "8cebbb6bf3257798919d2a3eb942ac62b853faefb33f8f434750d2e3986ca647",
+    "python/sglang/srt/mem_cache/allocation.py": "f612360806be72823ac68db0b57184752ef1f6903eaa296114df1217b3ccaf82",
+    "python/sglang/srt/models/qwen3_5.py": "457c4c46d0a1d7daa864bd1d1849b4c31e512ac6fb8bac1fa2dbe0addc1c4fbe",
+    "python/sglang/srt/layers/attention/flashinfer_backend.py": "bc00d59574b9337e85ff3b2d4901e1cc7cfbfbcb1ad8ea8d1d6fe1d73e7fc45a",
+    "python/sglang/srt/managers/schedule_batch.py": "73e95c6d3e2f47cc2ffca8d04d3cd8e5bed42873bbc0ee245e262655d4b282d8",
+    "python/sglang/srt/model_executor/forward_batch_info.py": "546d852bab489b033527c8068e9ef67b1a2c110a74e956b7a8028327d23fd415",
+    "python/sglang/srt/layers/attention/linear/gdn_backend.py": "81f86d7d1272819277e08826dba1cd29a75b9ce0350b692f0b1cfa4fcd91f747",
+    "benchmark/gdn_kv_reuse/bench_pure_replay.py": "dca5992abea369a2d0ed16b8a535a94f622be6e796d5ea7a4398f9980065fe73",
+    "benchmark/gdn_kv_reuse/launch_server.sh": "942a2720a61117b0c0b347b85e094ac83a675c8017b7894750adcf6b7b6e4bea",
+    "test/registered/unit/mem_cache/test_gdn_kv_reuse.py": "1d861db87a52c6e96d0fead4cafcd56036a0356a82dcb5268795532762a01c42"
+  },
+  "protocol": {
+    "input_tokens": 8192,
+    "common_cached_prefix": 4096,
+    "full_kv_cached_prefix": 8192,
+    "chunk": 4096,
+    "concurrency": [
+      1,
+      8,
+      16
+    ],
+    "pure_output_tokens": 1,
+    "decode_output_tokens": 4,
+    "appended_input_suffix": false,
+    "seed_prepare_length": 8449,
+    "seed_extension_length": 8705,
+    "oracle": "BF16 weights, FP32 SSM, fixed-order Triton MM, overlap enabled, TP/PP=1",
+    "smoke": "BF16 weights/SSM, ordinary CUDA MM, overlap disabled, TP/PP=1",
+    "variants_model": "Qwen3.5-4B",
+    "variants_ssm": "float32",
+    "fp16_variant": "ordinary CUDA MM with SGLANG_MAMBA_CONV_DTYPE=float16",
+    "other_variants": "BF16 weights, fixed-order Triton MM",
+    "prefill_graph": false,
+    "decode_graph": false,
+    "performance_benchmark": false
+  },
+  "unit_regressions": {
+    "replay_admission_ownership": 30,
+    "native_release_after_forward": 45,
+    "mamba_path_state_cap": 10,
+    "mamba_state_dtype_routing": 5
+  },
+  "exact_fp32_fixed_mm_overlap": {
+    "Qwen3.5-4B": {
+      "pure1": {
+        "requests": 1,
+        "input_tokens": 8192,
+        "output_tokens": 1,
+        "cached_tokens": [
+          4096
+        ],
+        "reused_token_rows": 4096,
+        "kv_reuse_fraction": 1.0,
+        "exact_tokens": 1,
+        "exact_selected_logprobs": 1,
+        "exact_top5": 1
+      },
+      "pure8": {
+        "requests": 8,
+        "input_tokens": 8192,
+        "output_tokens": 1,
+        "cached_tokens": [
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096
+        ],
+        "reused_token_rows": 32768,
+        "kv_reuse_fraction": 1.0,
+        "exact_tokens": 8,
+        "exact_selected_logprobs": 8,
+        "exact_top5": 8
+      },
+      "pure16": {
+        "requests": 16,
+        "input_tokens": 8192,
+        "output_tokens": 1,
+        "cached_tokens": [
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096
+        ],
+        "reused_token_rows": 65536,
+        "kv_reuse_fraction": 1.0,
+        "exact_tokens": 16,
+        "exact_selected_logprobs": 16,
+        "exact_top5": 16
+      },
+      "decode": {
+        "requests": 16,
+        "input_tokens": 8192,
+        "output_tokens": 4,
+        "cached_tokens": [
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096
+        ],
+        "reused_token_rows": 65536,
+        "kv_reuse_fraction": 1.0,
+        "exact_tokens": 16,
+        "exact_selected_logprobs": 16,
+        "exact_top5": 16
+      },
+      "cold": {
+        "requests": 1,
+        "input_tokens": 8192,
+        "output_tokens": 1,
+        "cached_tokens": [
+          0
+        ],
+        "reused_token_rows": 8192,
+        "kv_reuse_fraction": 1.0,
+        "exact_tokens": 1,
+        "exact_selected_logprobs": 1,
+        "exact_top5": 1
+      }
+    },
+    "Qwen3.5-9B": {
+      "pure1": {
+        "requests": 1,
+        "input_tokens": 8192,
+        "output_tokens": 1,
+        "cached_tokens": [
+          4096
+        ],
+        "reused_token_rows": 4096,
+        "kv_reuse_fraction": 1.0,
+        "exact_tokens": 1,
+        "exact_selected_logprobs": 1,
+        "exact_top5": 1
+      },
+      "pure8": {
+        "requests": 8,
+        "input_tokens": 8192,
+        "output_tokens": 1,
+        "cached_tokens": [
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096
+        ],
+        "reused_token_rows": 32768,
+        "kv_reuse_fraction": 1.0,
+        "exact_tokens": 8,
+        "exact_selected_logprobs": 8,
+        "exact_top5": 8
+      },
+      "pure16": {
+        "requests": 16,
+        "input_tokens": 8192,
+        "output_tokens": 1,
+        "cached_tokens": [
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096
+        ],
+        "reused_token_rows": 65536,
+        "kv_reuse_fraction": 1.0,
+        "exact_tokens": 16,
+        "exact_selected_logprobs": 16,
+        "exact_top5": 16
+      },
+      "decode": {
+        "requests": 16,
+        "input_tokens": 8192,
+        "output_tokens": 4,
+        "cached_tokens": [
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096
+        ],
+        "reused_token_rows": 65536,
+        "kv_reuse_fraction": 1.0,
+        "exact_tokens": 16,
+        "exact_selected_logprobs": 16,
+        "exact_top5": 16
+      },
+      "cold": {
+        "requests": 1,
+        "input_tokens": 8192,
+        "output_tokens": 1,
+        "cached_tokens": [
+          0
+        ],
+        "reused_token_rows": 8192,
+        "kv_reuse_fraction": 1.0,
+        "exact_tokens": 1,
+        "exact_selected_logprobs": 1,
+        "exact_top5": 1
+      }
+    },
+    "Olmo-Hybrid-7B": {
+      "pure1": {
+        "requests": 1,
+        "input_tokens": 8192,
+        "output_tokens": 1,
+        "cached_tokens": [
+          4096
+        ],
+        "reused_token_rows": 4096,
+        "kv_reuse_fraction": 1.0,
+        "exact_tokens": 1,
+        "exact_selected_logprobs": 1,
+        "exact_top5": 1
+      },
+      "pure8": {
+        "requests": 8,
+        "input_tokens": 8192,
+        "output_tokens": 1,
+        "cached_tokens": [
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096
+        ],
+        "reused_token_rows": 32768,
+        "kv_reuse_fraction": 1.0,
+        "exact_tokens": 8,
+        "exact_selected_logprobs": 8,
+        "exact_top5": 8
+      },
+      "pure16": {
+        "requests": 16,
+        "input_tokens": 8192,
+        "output_tokens": 1,
+        "cached_tokens": [
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096
+        ],
+        "reused_token_rows": 65536,
+        "kv_reuse_fraction": 1.0,
+        "exact_tokens": 16,
+        "exact_selected_logprobs": 16,
+        "exact_top5": 16
+      },
+      "decode": {
+        "requests": 16,
+        "input_tokens": 8192,
+        "output_tokens": 4,
+        "cached_tokens": [
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096
+        ],
+        "reused_token_rows": 65536,
+        "kv_reuse_fraction": 1.0,
+        "exact_tokens": 16,
+        "exact_selected_logprobs": 16,
+        "exact_top5": 16
+      },
+      "cold": {
+        "requests": 1,
+        "input_tokens": 8192,
+        "output_tokens": 1,
+        "cached_tokens": [
+          0
+        ],
+        "reused_token_rows": 8192,
+        "kv_reuse_fraction": 1.0,
+        "exact_tokens": 1,
+        "exact_selected_logprobs": 1,
+        "exact_top5": 1
+      }
+    }
+  },
+  "ordinary_cuda_bf16_smoke": {
+    "Qwen3.5-4B": {
+      "pure1": {
+        "requests": 1,
+        "input_tokens": 8192,
+        "output_tokens": 1,
+        "cached_tokens": [
+          4096
+        ],
+        "reused_token_rows": 4096,
+        "kv_reuse_fraction": 1.0
+      },
+      "pure8": {
+        "requests": 8,
+        "input_tokens": 8192,
+        "output_tokens": 1,
+        "cached_tokens": [
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096
+        ],
+        "reused_token_rows": 32768,
+        "kv_reuse_fraction": 1.0
+      },
+      "pure16": {
+        "requests": 16,
+        "input_tokens": 8192,
+        "output_tokens": 1,
+        "cached_tokens": [
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096
+        ],
+        "reused_token_rows": 65536,
+        "kv_reuse_fraction": 1.0
+      },
+      "decode": {
+        "requests": 16,
+        "input_tokens": 8192,
+        "output_tokens": 4,
+        "cached_tokens": [
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096
+        ],
+        "reused_token_rows": 65536,
+        "kv_reuse_fraction": 1.0
+      },
+      "cold": {
+        "requests": 1,
+        "input_tokens": 8192,
+        "output_tokens": 1,
+        "cached_tokens": [
+          0
+        ],
+        "reused_token_rows": 8192,
+        "kv_reuse_fraction": 1.0
+      }
+    },
+    "Qwen3.5-9B": {
+      "pure1": {
+        "requests": 1,
+        "input_tokens": 8192,
+        "output_tokens": 1,
+        "cached_tokens": [
+          4096
+        ],
+        "reused_token_rows": 4096,
+        "kv_reuse_fraction": 1.0
+      },
+      "pure8": {
+        "requests": 8,
+        "input_tokens": 8192,
+        "output_tokens": 1,
+        "cached_tokens": [
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096
+        ],
+        "reused_token_rows": 32768,
+        "kv_reuse_fraction": 1.0
+      },
+      "pure16": {
+        "requests": 16,
+        "input_tokens": 8192,
+        "output_tokens": 1,
+        "cached_tokens": [
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096
+        ],
+        "reused_token_rows": 65536,
+        "kv_reuse_fraction": 1.0
+      },
+      "decode": {
+        "requests": 16,
+        "input_tokens": 8192,
+        "output_tokens": 4,
+        "cached_tokens": [
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096
+        ],
+        "reused_token_rows": 65536,
+        "kv_reuse_fraction": 1.0
+      },
+      "cold": {
+        "requests": 1,
+        "input_tokens": 8192,
+        "output_tokens": 1,
+        "cached_tokens": [
+          0
+        ],
+        "reused_token_rows": 8192,
+        "kv_reuse_fraction": 1.0
+      }
+    },
+    "Olmo-Hybrid-7B": {
+      "pure1": {
+        "requests": 1,
+        "input_tokens": 8192,
+        "output_tokens": 1,
+        "cached_tokens": [
+          4096
+        ],
+        "reused_token_rows": 4096,
+        "kv_reuse_fraction": 1.0
+      },
+      "pure8": {
+        "requests": 8,
+        "input_tokens": 8192,
+        "output_tokens": 1,
+        "cached_tokens": [
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096
+        ],
+        "reused_token_rows": 32768,
+        "kv_reuse_fraction": 1.0
+      },
+      "pure16": {
+        "requests": 16,
+        "input_tokens": 8192,
+        "output_tokens": 1,
+        "cached_tokens": [
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096
+        ],
+        "reused_token_rows": 65536,
+        "kv_reuse_fraction": 1.0
+      },
+      "decode": {
+        "requests": 16,
+        "input_tokens": 8192,
+        "output_tokens": 4,
+        "cached_tokens": [
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096,
+          4096
+        ],
+        "reused_token_rows": 65536,
+        "kv_reuse_fraction": 1.0
+      },
+      "cold": {
+        "requests": 1,
+        "input_tokens": 8192,
+        "output_tokens": 1,
+        "cached_tokens": [
+          0
+        ],
+        "reused_token_rows": 8192,
+        "kv_reuse_fraction": 1.0
+      }
+    }
+  },
+  "compatibility_variants": {
+    "fp16": {
+      "1": {
+        "requests": 8,
+        "input_tokens": 8192,
+        "output_tokens": 1,
+        "server_args": [
+          "--dtype",
+          "float16"
+        ],
+        "kv_reuse_fraction": 1.0,
+        "logged_reuse_events": 8,
+        "warm_cached_tokens": [
+          [
+            7936,
+            7936,
+            7936,
+            7936,
+            7936,
+            7936,
+            7936,
+            7936
+          ],
+          [
+            7936,
+            7936,
+            7936,
+            7936,
+            7936,
+            7936,
+            7936,
+            7936
+          ],
+          [
+            7936,
+            7936,
+            7936,
+            7936,
+            7936,
+            7936,
+            7936,
+            7936
+          ]
+        ]
+      }
+    },
+    "no-buffer": {
+      "1": {
+        "requests": 8,
+        "input_tokens": 8192,
+        "output_tokens": 1,
+        "server_args": [
+          "--page-size",
+          "1",
+          "--mamba-radix-cache-strategy",
+          "no_buffer"
+        ],
+        "kv_reuse_fraction": 1.0,
+        "logged_reuse_events": 8,
+        "warm_cached_tokens": [
+          [
+            4096,
+            4096,
+            4096,
+            4096,
+            4096,
+            4096,
+            4096,
+            4096
+          ],
+          [
+            4096,
+            4096,
+            4096,
+            4096,
+            4096,
+            4096,
+            4096,
+            4096
+          ],
+          [
+            4096,
+            4096,
+            4096,
+            4096,
+            4096,
+            4096,
+            4096,
+            4096
+          ]
+        ]
+      }
+    },
+    "inactive-lora": {
+      "1": {
+        "requests": 8,
+        "input_tokens": 8192,
+        "output_tokens": 1,
+        "server_args": [
+          "--enable-lora",
+          "--max-lora-rank",
+          "8",
+          "--lora-target-modules",
+          "q_proj"
+        ],
+        "kv_reuse_fraction": 1.0,
+        "logged_reuse_events": 8,
+        "warm_cached_tokens": [
+          [
+            7936,
+            7936,
+            7936,
+            7936,
+            7936,
+            7936,
+            7936,
+            7936
+          ],
+          [
+            7936,
+            7936,
+            7936,
+            7936,
+            7936,
+            7936,
+            7936,
+            7936
+          ],
+          [
+            7936,
+            7936,
+            7936,
+            7936,
+            7936,
+            7936,
+            7936,
+            7936
+          ]
+        ]
+      }
+    },
+    "inactive-session": {
+      "1": {
+        "requests": 8,
+        "input_tokens": 8192,
+        "output_tokens": 1,
+        "server_args": [
+          "--enable-session-radix-cache"
+        ],
+        "kv_reuse_fraction": 1.0,
+        "logged_reuse_events": 8,
+        "warm_cached_tokens": [
+          [
+            7936,
+            7936,
+            7936,
+            7936,
+            7936,
+            7936,
+            7936,
+            7936
+          ],
+          [
+            7936,
+            7936,
+            7936,
+            7936,
+            7936,
+            7936,
+            7936,
+            7936
+          ],
+          [
+            7936,
+            7936,
+            7936,
+            7936,
+            7936,
+            7936,
+            7936,
+            7936
+          ]
+        ]
+      }
+    }
+  },
+  "parallel_comparisons": {
+    "tp2": {
+      "0": {
+        "requests": 8,
+        "input_tokens": 8192,
+        "output_tokens": 1,
+        "server_args": [
+          "--tp-size",
+          "2"
+        ],
+        "warm_cached_tokens": [
+          [
+            7936,
+            7936,
+            7936,
+            7936,
+            7936,
+            7936,
+            7936,
+            7936
+          ],
+          [
+            7936,
+            7936,
+            7936,
+            7936,
+            7936,
+            7936,
+            7936,
+            7936
+          ],
+          [
+            7936,
+            7936,
+            7936,
+            7936,
+            7936,
+            7936,
+            7936,
+            7936
+          ]
+        ]
+      },
+      "1": {
+        "requests": 8,
+        "input_tokens": 8192,
+        "output_tokens": 1,
+        "server_args": [
+          "--tp-size",
+          "2"
+        ],
+        "kv_reuse_fraction": 1.0,
+        "logged_reuse_events": 16,
+        "exact_tokens": 8,
+        "exact_selected_logprobs": 8,
+        "exact_top5": 8,
+        "warm_cached_tokens": [
+          [
+            7936,
+            7936,
+            7936,
+            7936,
+            7936,
+            7936,
+            7936,
+            7936
+          ],
+          [
+            7936,
+            7936,
+            7936,
+            7936,
+            7936,
+            7936,
+            7936,
+            7936
+          ],
+          [
+            7936,
+            7936,
+            7936,
+            7936,
+            7936,
+            7936,
+            7936,
+            7936
+          ]
+        ]
+      }
+    },
+    "pp2": {
+      "0": {
+        "requests": 8,
+        "input_tokens": 8192,
+        "output_tokens": 1,
+        "server_args": [
+          "--pp-size",
+          "2"
+        ],
+        "warm_cached_tokens": [
+          [
+            7936,
+            7936,
+            7936,
+            7936,
+            7936,
+            7936,
+            7936,
+            7936
+          ],
+          [
+            7936,
+            7936,
+            7936,
+            7936,
+            7936,
+            7936,
+            7936,
+            7936
+          ],
+          [
+            7936,
+            7936,
+            7936,
+            7936,
+            7936,
+            7936,
+            7936,
+            7936
+          ]
+        ]
+      },
+      "1": {
+        "requests": 8,
+        "input_tokens": 8192,
+        "output_tokens": 1,
+        "server_args": [
+          "--pp-size",
+          "2"
+        ],
+        "kv_reuse_fraction": 1.0,
+        "logged_reuse_events": 16,
+        "exact_tokens": 8,
+        "exact_selected_logprobs": 8,
+        "exact_top5": 8,
+        "warm_cached_tokens": [
+          [
+            7936,
+            7936,
+            7936,
+            7936,
+            7936,
+            7936,
+            7936,
+            7936
+          ],
+          [
+            7936,
+            7936,
+            7936,
+            7936,
+            7936,
+            7936,
+            7936,
+            7936
+          ],
+          [
+            7936,
+            7936,
+            7936,
+            7936,
+            7936,
+            7936,
+            7936,
+            7936
+          ]
+        ]
+      }
+    }
+  },
+  "notes": [
+    "Cold case has C=0 and reuses all 8192 KV rows.",
+    "Selected-token logprobs and top-5 are compared; no full-vocabulary logits claim.",
+    "FP16 compatibility uses the native matching convolution-state dtype; a fixed-MM FP16 attempt exceeded SM120 shared memory before inference and was excluded.",
+    "The initial full native path-cap test lacked ninja in PATH; it passed with the normal runtime PATH/CPATH.",
+    "Ordinary CUDA BF16 smoke tests establish functioning reuse, not bitwise output equivalence.",
+    "Olmo remains an external experimental fixture with TP/PP=1.",
+    "Historical 8201-token latency measurements are separate from these pure-8192 functional regressions."
+  ]
+}
