@@ -25,7 +25,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.fp8 import (
     Fp8LinearMethod,
 )
 from sglang.srt.environ import envs
-from sglang.srt.utils.common import is_gfx1250_supported
+from sglang.srt.utils.device import is_gfx1250_supported
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 

@@ -1,6 +1,6 @@
 // bf16 all-gather of the [M, K / world] pre-expert projection slices, fused with the pre-expert RMS norm and the
 // static-scale NVFP4 quantization of the gathered rows. The exchange is all_gather.cuh's (multicast push into the
-// CustomAllReduceV2 push workspace, Lamport poll, same phase counters); each gathered row then goes through the
+// CustomAllReduceV2 push workspace, Lamport poll, same epoch word); each gathered row then goes through the
 // row computation of norm_fp4_quant.cuh under its thread map, so fp4 / sf are bitwise those of all_gather followed by
 // fused_norm_fp4_quant_static. The gathered bf16 rows are written only when kWriteRows.
 
@@ -25,15 +25,14 @@ namespace sglang {
 
 namespace muse_ag_quant {
 
-using device::distributed::Counter;
+using device::distributed::EpochCounter;
 
 constexpr uint32_t kVec = 8;  // bf16 per 16-byte vector
 
 struct Params {
   uint8_t* ws_local;      // local VA of the push workspace (poll + reset)
   uint8_t* ws_mc;         // multicast VA of the push workspace (push)
-  Counter* counter;       // per-block phase counters
-  uint32_t num_counters;  // PushPlane::num_blocks
+  EpochCounter* counter;  // the push plane's phase word
   uint32_t half_bytes;    // world_size * slot_bytes
   uint32_t rank;
   const bf16_t* local;        // [M, K / world]
@@ -134,15 +133,8 @@ __global__ void __launch_bounds__(kNumThreads) all_gather_norm_fp4_quant_kernel(
   const float encode_scale = p.global_scale[0];  // static, like the weight
   // Wait for the projection GEMM that writes `local`.
   PDLWaitPrimary<kUsePDL>();
-  const uint32_t phase = p.counter[bx].get() & 1;
+  const uint32_t phase = p.counter->load();
   const uint32_t half_off = phase * p.half_bytes;
-  // Block 0 advances the counters no block of this grid owns. Every earlier push-plane kernel has finished once the
-  // PDL wait returns, and the next one reads them only after its own wait, i.e. after this grid has finished.
-  if (bx == 0) {
-#pragma unroll 1
-    for (uint32_t i = gridDim.x + threadIdx.x; i < p.num_counters; i += kNumThreads)
-      p.counter[i].set(phase ^ 1);
-  }
   const uint32_t work_blocks = gridDim.x;
   // Push every row this block owns before polling any, so no block waits on a row it has not pushed.
   for (uint32_t row = bx; row < p.num_rows; row += work_blocks)
@@ -224,9 +216,9 @@ __global__ void __launch_bounds__(kNumThreads) all_gather_norm_fp4_quant_kernel(
       p.sf[static_cast<int64_t>(row) * (kHidden / kBlock) + blk] = static_cast<uint8_t>(fp8);
     }
   }
-  // Every slot this block consumed is re-armed: publish the next phase.
+  // Every slot this block consumed is re-armed: commit this block to the next phase.
   __syncthreads();
-  if (threadIdx.x == 0) p.counter[bx].set(phase ^ 1);
+  if (threadIdx.x == 0) p.counter->commit();
 }
 
 }  // namespace muse_ag_quant
@@ -263,12 +255,10 @@ struct MuseSparkAllGatherNormFp4Quant {
     CHECK_HOST(push.world_size == kWorld) << "the kernel is compiled for TP" << kWorld;
     CHECK_HOST(int64_t(num_tokens) * kHidden * 2 <= push.slot_bytes) << "gathered rows exceed the push slot";
     CHECK_HOST(push.mc_workspace != nullptr) << "requires a multicast-capable push plane";
-    CHECK_HOST(push.num_blocks >= 1);
     const muse_ag_quant::Params params{
         .ws_local = push.workspaces[push.rank],
         .ws_mc = push.mc_workspace,
         .counter = push.counter,
-        .num_counters = push.num_blocks,
         .half_bytes = static_cast<uint32_t>(push.slot_bytes * push.world_size),
         .rank = push.rank,
         .local = static_cast<const bf16_t*>(local.data_ptr()),
@@ -280,7 +270,7 @@ struct MuseSparkAllGatherNormFp4Quant {
         .sf = static_cast<uint8_t*>(sf.data_ptr()),
         .num_rows = num_tokens,
     };
-    const uint32_t num_blocks = std::min(num_tokens, push.num_blocks);
+    const uint32_t num_blocks = std::min(num_tokens, push.default_blocks);
     using namespace muse_ag_quant;
     const auto kernel =
         weight.has_value()

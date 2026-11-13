@@ -7,6 +7,7 @@ import triton.language as tl
 from einops import rearrange
 from torch.nn.parameter import Parameter
 
+from sglang.srt.layers.utils.common import set_weight_attrs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.models.inkling_common.kernels.sconv import (
@@ -21,7 +22,7 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
 )
-from sglang.srt.utils import is_cuda, set_weight_attrs
+from sglang.srt.utils import is_cuda
 
 
 class SconvType(IntEnum):

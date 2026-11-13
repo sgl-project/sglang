@@ -32,6 +32,7 @@ if TYPE_CHECKING:
     )
 
 SMALL_PROJECTION_MAX_TOKENS = 8
+B200_PROJECTION_MAX_TOKENS = 128
 MAX_TOKENS = 512
 _VEC = 8
 
@@ -60,7 +61,8 @@ def gemm_ag_supported(
     pooler: bool = False,
 ) -> bool:
     """``pooler`` selects the pre-expert projection's rule: TP4/TP8 on SM103 or SM107 (the
-    unpooler measured faster on the gather path on SM103 only) and up to POOLER_TP4_MAX_TOKENS at TP4."""
+    unpooler measured faster on the gather path on SM103 only) and up to POOLER_TP4_MAX_TOKENS at TP4;
+    both keep the B200 TP8 rule up to B200_PROJECTION_MAX_TOKENS."""
     from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
         CustomAllReduceV2,
     )
@@ -77,7 +79,9 @@ def gemm_ag_supported(
     m, k = x.shape
     n = weight.shape[0]
     sm_ok = current_arch().is_sm(10, 3) or (pooler and current_arch().is_sm(10, 7))
-    if pooler and (comm.world_size not in (4, 8) or not sm_ok):
+    capability = torch.cuda.get_device_capability(x.device)
+    b200_tp8 = comm.world_size == 8 and capability == (10, 0)
+    if pooler and (comm.world_size not in (4, 8) or not (sm_ok or b200_tp8)):
         return False
     max_tokens = (
         POOLER_TP4_MAX_TOKENS if pooler and comm.world_size == 4 else MAX_TOKENS
@@ -87,11 +91,11 @@ def gemm_ag_supported(
         and (
             m <= SMALL_PROJECTION_MAX_TOKENS
             or (comm.world_size in (4, 8) and n in (4096, 8192) and sm_ok)
+            or (b200_tp8 and n in (4096, 8192) and m <= B200_PROJECTION_MAX_TOKENS)
         )
         and weight.shape[1] == k
         and n % (comm.world_size * _VEC) == 0
         and m * n * 2 <= comm.max_push_size
-        and comm.config.num_push_blocks >= 2
         and weight.is_contiguous()
     )
 

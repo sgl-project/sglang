@@ -3,6 +3,7 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/quantization/modelopt.py
 from __future__ import annotations
 
+import copy
 import logging
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
@@ -66,14 +67,11 @@ from sglang.srt.layers.quantization.utils import (
 )
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.utils import alias_or_bind_derived_param, copy_or_rebind_param
+from sglang.srt.layers.utils.common import set_weight_attrs
 from sglang.srt.runtime_context import get_platform
-from sglang.srt.utils.common import (
-    get_device_capability,
-    is_cuda,
-    round_up,
-    set_weight_attrs,
-)
+from sglang.srt.utils.common import round_up
 from sglang.srt.utils.custom_op import register_custom_op
+from sglang.srt.utils.device import get_device_capability, is_cuda
 from sglang.srt.utils.patch_torch import register_fake_if_exists
 
 if TYPE_CHECKING:
@@ -819,14 +817,17 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
         nvfp4a16_config: ModelOptFp4Config,
         mxfp8_config: Fp8Config,
         fp8_block_config: Fp8Config,
+        mxfp8_linear_config: Optional[Fp8Config] = None,
     ) -> None:
         super().__init__(kv_cache_quant_algo, exclude_modules, packed_modules_mapping)
         self.quantized_layers = quantized_layers
         self.fp8_config = fp8_config
         self.mxfp8_config = mxfp8_config
+        self.mxfp8_linear_config = mxfp8_linear_config or mxfp8_config
         self.fp8_block_config = fp8_block_config
         self.nvfp4_config = nvfp4_config
         self.nvfp4a16_config = nvfp4a16_config
+        self.block_fp8_moe_online_config: Optional[QuantizationConfig] = None
 
     @classmethod
     def override_quantization_method(cls, hf_quant_config, user_quant):
@@ -933,6 +934,13 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
             packed_modules_mapping=packed_modules_mapping,
             use_mxfp8=True,
         )
+        # On CUDA GPUs other than Blackwell no dense GEMM takes 1x32 MXFP8 scales
+        # (DeepGEMM asserts on them on Hopper), so dense MXFP8 layers are
+        # converted to block-FP8 [128,128] at load. MoE keeps the MXFP8 config.
+        mxfp8_linear_config = mxfp8_config
+        if is_cuda() and not get_platform().is_blackwell:
+            mxfp8_linear_config = copy.copy(mxfp8_config)
+            mxfp8_linear_config.convert_mxfp8_to_block_fp8 = True
         # Block-FP8 (FP8_PB_WO / FP8_BLOCK_SCALES): fp8 weight with a per-block
         # weight_scale_inv; the block size comes from the checkpoint's
         # group_size (128 by default). One config serves Linear and FusedMoE.
@@ -966,6 +974,7 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
             fp8_config=fp8_config,
             mxfp8_config=mxfp8_config,
             fp8_block_config=fp8_block_config,
+            mxfp8_linear_config=mxfp8_linear_config,
             nvfp4_config=nvfp4_config,
             nvfp4a16_config=nvfp4a16_config,
         )
@@ -1035,6 +1044,25 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
     def resolve_quant_algo(self, prefix: str) -> Optional[str]:
         return self._resolve_quant_algo(prefix)
 
+    def convert_block_fp8_experts_to_nvfp4(self) -> None:
+        """Quantize block-FP8 MoE experts to NVFP4 while they load.
+
+        An explicit `modelopt_fp4` draft does this for the BF16 MTP experts of
+        NVFP4 checkpoints; MIXED_PRECISION exports that ship block-FP8 MTP
+        experts get the same NVFP4 draft experts.
+        """
+        from sglang.srt.layers.quantization.nvfp4_online import (
+            make_modelopt_fp4_online_config_from_fp8,
+        )
+
+        self.block_fp8_moe_online_config = make_modelopt_fp4_online_config_from_fp8(
+            {
+                "quant_method": "fp8",
+                "weight_block_size": self.fp8_block_config.weight_block_size,
+                "packed_modules_mapping": self.packed_modules_mapping,
+            }
+        )
+
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional[QuantizeMethodBase]:
@@ -1057,7 +1085,7 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
             if quant_algo in _BLOCK_FP8_ALGOS:
                 return Fp8LinearMethod(self.fp8_block_config)
             if quant_algo == "MXFP8":
-                return Fp8LinearMethod(self.mxfp8_config)
+                return Fp8LinearMethod(self.mxfp8_linear_config)
             if quant_algo == "NVFP4":
                 return ModelOptFp4LinearMethod(self.nvfp4_config)
             if quant_algo == "W4A16_NVFP4":
@@ -1086,6 +1114,10 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
             if quant_algo == "MXFP8":
                 return Fp8MoEMethod(self.mxfp8_config)
             if quant_algo in _BLOCK_FP8_ALGOS:
+                if self.block_fp8_moe_online_config is not None:
+                    return self.block_fp8_moe_online_config.get_quant_method(
+                        layer, prefix
+                    )
                 return Fp8MoEMethod(self.fp8_block_config)
             if quant_algo == "NVFP4":
                 return ModelOptNvFp4FusedMoEMethod(self.nvfp4_config)
@@ -2498,7 +2530,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         weight_loader = self.prepare_weight_loader(
             layer, extra_weight_attrs.get("weight_loader")
         )
-        if get_moe_runner_backend().is_flashinfer_megamoe():
+        moe_runner_backend = get_moe_runner_backend()
+        if moe_runner_backend.is_flashinfer_megamoe():
             from sglang.srt.layers.moe.flashinfer_megamoe import (
                 make_nvfp4_megamoe_weight_loader,
             )
@@ -2549,13 +2582,16 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         )
         layer.register_parameter("w13_weight_scale", w13_weight_scale)
 
-        # TRTLLM replaces blockscale_swizzled with an alias to weight_scale
-        # during process_weights_after_loading, so skip the expensive
-        # swizzle+allocate here to avoid GPU memory fragmentation
-        if (
+        # AUTO is resolved later in create_moe_runner(); process_weights_after_loading()
+        # rebinds the swizzled scales for every backend that reads them.
+        skip_swizzled_blockscales = (
             self.enable_flashinfer_trtllm_moe
-            or get_moe_runner_backend().is_flashinfer_megamoe()
-        ):
+            or moe_runner_backend.is_flashinfer_megamoe()
+            or moe_runner_backend.is_marlin()
+            or moe_runner_backend.is_lora_marlin()
+            or moe_runner_backend.is_auto()
+        )
+        if skip_swizzled_blockscales:
             layer.w13_blockscale_swizzled = None
         else:
             layer.w13_blockscale_swizzled = Parameter(
@@ -2575,10 +2611,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         )
         layer.register_parameter("w2_weight_scale", w2_weight_scale)
 
-        if (
-            self.enable_flashinfer_trtllm_moe
-            or get_moe_runner_backend().is_flashinfer_megamoe()
-        ):
+        if skip_swizzled_blockscales:
             layer.w2_blockscale_swizzled = None
         else:
             layer.w2_blockscale_swizzled = Parameter(
