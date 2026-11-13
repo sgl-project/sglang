@@ -37,14 +37,6 @@ def _flexkv_factory(ctx):
         raise ValueError("FlexKV cannot be combined with --enable-hierarchical-cache")
     if ctx.is_hybrid_ssm:
         raise NotImplementedError("FlexKV does not support Mamba/SSM pools yet")
-    if ctx.params.is_eagle:
-        # N bigram KV slots depend on N+1 raw tokens. The connector's token-only
-        # key uses N tokens and would drop the distinguishing boundary token.
-        raise ValueError(
-            "FlexKV does not support EAGLE-style bigram cache keys yet: "
-            "the connector cannot preserve the extra boundary token. "
-            "Disable FlexKV or use a speculative mode without bigram cache keys."
-        )
 
     if ctx.disable_radix_cache:
         raise ValueError(
@@ -68,6 +60,16 @@ def _flexkv_factory(ctx):
         raise RuntimeError(
             f"FlexKV is installed but incompatible version: {exc}."
         ) from exc
+
+    draft_pools = getattr(ctx.params, "mtp_draft_device_pools", ()) or getattr(
+        ctx.params, "sidecar_draft_device_pools", ()
+    )
+    if (ctx.params.is_eagle or draft_pools) and getattr(
+        FlexKVConnector, "supports_draft_cache", False
+    ) is not True:
+        raise ValueError(
+            "FlexKV speculative decoding requires a draft-aware connector with bigram key support"
+        )
 
     from sglang.srt.mem_cache.storage.flexkv.flexkv_radix_cache import (
         FlexKVRadixCache,

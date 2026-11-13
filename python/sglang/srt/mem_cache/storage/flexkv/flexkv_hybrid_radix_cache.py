@@ -35,6 +35,8 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage.flexkv.flexkv_cache_lifecycle import (
     FlexKVCacheLifecycleMixin,
+    _draft_pool_kwargs,
+    _flexkv_token_ids,
     _namespace_kwargs,
     _request_key,
 )
@@ -121,6 +123,7 @@ class FlexKVHybridRadixCache(FlexKVCacheLifecycleMixin, BasePrefixCache):
             pp_group=pp_group,
             attn_tp_group=attn_tp_group if attn_tp_group is not None else tp_group,
             attn_cp_group=attn_cp_group,
+            **_draft_pool_kwargs(params),
         )
         if self.flexkv_connector.enable_layerwise:
             self.flexkv_connector.register_layer_transfer_counter(kvcache)
@@ -180,7 +183,7 @@ class FlexKVHybridRadixCache(FlexKVCacheLifecycleMixin, BasePrefixCache):
         )
         if namespace_kwargs is None:
             return result
-        token_ids = key.raw_token_ids()
+        token_ids = _flexkv_token_ids(key)
         device_length = result.device_prefix_len
         if not token_ids or device_length >= len(token_ids):
             return result
@@ -460,23 +463,20 @@ class FlexKVHybridRadixCache(FlexKVCacheLifecycleMixin, BasePrefixCache):
         )
         if namespace_kwargs is None:
             return
-        aligned_length = len(token_ids) // self.page_size * self.page_size
-        if aligned_length <= 0:
-            return
-        token_ids = list(token_ids[:aligned_length])
         key = RadixKey(
             array("q", token_ids),
             req.extra_key,
             is_bigram=bool(getattr(self._inner_cache, "is_eagle", False)),
             cache_salt=req.cache_salt,
-        )
+        ).page_aligned(self.page_size)
+        if not key:
+            return
         match = self._inner_cache.match_prefix(MatchPrefixParams(key=key))
         node = match.last_device_node
         indices = self._inner_cache.path_device_indices(match.last_device_node)
         if self._inner_cache.is_root(node) or indices.numel() == 0:
             return
-        if indices.numel() < len(token_ids):
-            token_ids = token_ids[: indices.numel()]
+        token_ids = list(_flexkv_token_ids(key[: indices.numel()]))
         if not token_ids or len(token_ids) != indices.numel():
             return
 

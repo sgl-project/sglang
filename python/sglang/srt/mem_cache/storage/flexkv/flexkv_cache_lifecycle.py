@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+from array import array
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
@@ -33,17 +34,41 @@ def _namespace_kwargs(connector, extra_key, cache_salt) -> Optional[dict]:
     separators without depending on FlexKV's namespace component delimiter.
     Unscoped requests keep their historical hash and connector call signature.
     """
+    cache_format = getattr(connector, "cache_format_namespace", None)
+    namespace = [cache_format] if isinstance(cache_format, str) else []
     if extra_key is None and cache_salt is None:
-        return {}
+        return {"namespace": namespace} if namespace else {}
     if getattr(connector, "supports_cache_namespace", False) is not True:
         return None
     return {
-        "namespace": [
+        "namespace": namespace
+        + [
             json.dumps(
                 ["sglang-cache-v1", extra_key, cache_salt], separators=(",", ":")
             )
         ]
     }
+
+
+def _flexkv_token_ids(key):
+    """Encode N bigrams as N int64 values without dropping the N+1 boundary.
+
+    Token IDs fit uint32. The pair is injective and still fits signed int64
+    for the supported vocabularies (first token < 2**31).
+    """
+    raw = key.raw_token_ids()
+    if not key.is_bigram:
+        return raw
+    if any(not 0 <= token < 2**31 for token in raw):
+        raise ValueError("FlexKV bigram token IDs must fit nonnegative int31")
+    return array("q", ((left << 32) | right for left, right in zip(raw, raw[1:])))
+
+
+def _draft_pool_kwargs(params):
+    pools = getattr(params, "mtp_draft_device_pools", ()) or getattr(
+        params, "sidecar_draft_device_pools", ()
+    )
+    return {"draft_kv_pools": tuple(pools)} if pools else {}
 
 
 @dataclass
@@ -99,18 +124,20 @@ class FlexKVCacheLifecycleMixin:
                     key = RadixKey(
                         tokens,
                         req.extra_key,
+                        is_bigram=bool(getattr(self, "is_eagle", False)),
                         limit=end,
                         cache_salt=req.cache_salt,
                     )
                     gpu = connector.sync_prefix_length(peek(MatchPrefixParams(key=key)))
-                    aligned = end // self.page_size * self.page_size
+                    aligned = len(key) // self.page_size * self.page_size
                     if gpu >= aligned:
                         count = min(gpu, end)
                     else:
                         mask = torch.ones(aligned, dtype=torch.bool)
                         mask[:gpu] = False
+                        logical_key = key.page_aligned(self.page_size)
                         host = connector.peek_cpu_prefix_tokens(
-                            tokens[:aligned], mask, **namespace
+                            _flexkv_token_ids(logical_key), mask, **namespace
                         )
                         if host is not None:
                             count = min(end, gpu + host)
@@ -253,6 +280,9 @@ class FlexKVCacheLifecycleMixin:
         if not fill_ids:
             return
         match_end = req._compute_max_prefix_len(len(fill_ids))
+        tail_fn = getattr(self, "window_reprefill_tail_tokens", None)
+        if callable(tail_fn):
+            match_end = min(match_end, len(fill_ids) - tail_fn(req))
         self.prefetch_from_storage(
             req.cache_request_handle,
             None,
@@ -282,16 +312,30 @@ class FlexKVCacheLifecycleMixin:
         if namespace_kwargs is None or not token_ids:
             return
         prefix = [] if matched_prefix_tokens is None else list(matched_prefix_tokens)
-        ids = prefix + list(token_ids)
-        ids = ids[: len(ids) // self.page_size * self.page_size]
-        if len(ids) <= len(prefix):
+        is_eagle = bool(getattr(self, "is_eagle", False))
+        if is_eagle:
+            from array import array
+
+            from sglang.srt.mem_cache.radix_cache import RadixKey
+            from sglang.srt.mem_cache.storage.flexkv.flexkv_cache_lifecycle import (
+                _flexkv_token_ids,
+            )
+
+            key = RadixKey(array("q", prefix + list(token_ids)), is_bigram=True)
+            ids = _flexkv_token_ids(key.page_aligned(self.page_size))
+            prefix_length = max(0, len(prefix) - 1)
+        else:
+            ids = prefix + list(token_ids)
+            ids = ids[: len(ids) // self.page_size * self.page_size]
+            prefix_length = len(prefix)
+        if len(ids) <= prefix_length:
             return
         if getattr(self.flexkv_connector, "_chunked_prefetch", False):
             self.flexkv_connector.prefetch_async(
                 rid,
                 ids,
                 sglang_req_id=handle.rid,
-                candidate_start_token=len(prefix),
+                candidate_start_token=prefix_length,
                 **namespace_kwargs,
             )
         else:
