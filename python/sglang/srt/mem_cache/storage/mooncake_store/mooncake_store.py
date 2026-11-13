@@ -1310,7 +1310,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 all_group_ids.extend(
                     self._expand_group_ids(tagged_keys, key_multiplier)
                 )
-            prepared.append((transfer.name, key_multiplier, start, len(all_key_strs)))
+            prepared.append(
+                (transfer.name, key_multiplier, start, len(all_key_strs), keys)
+            )
 
         if not prepared:
             return {}
@@ -1345,6 +1347,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             io_results = [0 if state == 1 else -1 for state in exist_result]
             missing_idx = [i for i, state in enumerate(exist_result) if state != 1]
             if missing_idx:
+                start_time = time.perf_counter()
                 put_results = self._put_batch_zero_copy_impl(
                     [all_key_strs[i] for i in missing_idx],
                     [all_ptrs[i] for i in missing_idx],
@@ -1358,21 +1361,89 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                         else None
                     ),
                 )
+                end_time = time.perf_counter()
+                if self.enable_storage_metrics:
+                    self._record_v2_io_metrics(
+                        num_pages=self._count_v2_missing_pages(prepared, missing_idx),
+                        num_bytes=self._sum_v2_io_bytes(
+                            [all_sizes[i] for i in missing_idx]
+                        ),
+                        elapsed=end_time - start_time,
+                        is_set=True,
+                    )
                 for i, res in zip(missing_idx, put_results):
                     io_results[i] = res
         else:
+            start_time = time.perf_counter()
             io_results = self._get_batch_zero_copy_impl(
                 all_key_strs, all_ptrs, all_sizes
             )
+            end_time = time.perf_counter()
+            if self.enable_storage_metrics:
+                self._record_v2_io_metrics(
+                    # One logical page fetched through several pools counts
+                    # once, matching the v1 pages metric.
+                    num_pages=len(
+                        {key for _, _, _, _, page_keys in prepared for key in page_keys}
+                    ),
+                    num_bytes=self._sum_v2_io_bytes(all_sizes),
+                    elapsed=end_time - start_time,
+                    is_set=False,
+                )
 
         results: dict = {}
-        for name, key_multiplier, start, end in prepared:
+        for name, key_multiplier, start, end, _ in prepared:
             results[name] = self._batch_postprocess(
                 io_results[start:end],
                 is_set_operate=is_set,
                 key_multiplier=key_multiplier,
             )
         return results
+
+    @staticmethod
+    def _sum_v2_io_bytes(sizes: List[Any]) -> int:
+        # Entries are either per-object byte counts or, after multi-buffer
+        # packing, per-object lists of element sizes; set-path placeholders
+        # for already-existing objects are scalar zeros.
+        total = 0
+        for size in sizes:
+            if isinstance(size, Sequence):
+                total += sum(size)
+            else:
+                total += size
+        return total
+
+    @staticmethod
+    def _count_v2_missing_pages(prepared, missing_idx) -> int:
+        # The put list is filtered per object, so a partly-stored page puts
+        # only its missing components; a page counts as backed up when any
+        # of its component objects was put. The same logical page in several
+        # pools counts once, matching the v1 pages metric.
+        missing = set(missing_idx)
+        pages = set()
+        for _, key_multiplier, start, end, page_keys in prepared:
+            for page_idx, page_start in enumerate(range(start, end, key_multiplier)):
+                if any(
+                    i in missing
+                    for i in range(page_start, min(page_start + key_multiplier, end))
+                ):
+                    pages.add(page_keys[page_idx])
+        return len(pages)
+
+    def _record_v2_io_metrics(
+        self, num_pages: int, num_bytes: int, elapsed: float, is_set: bool
+    ):
+        # Same units as the v1 path: logical pages per batch (deduped across
+        # pools) and GB/s of bytes moved.
+        if elapsed <= 0 or num_bytes <= 0:
+            return
+        bandwidth_gbps = num_bytes / elapsed / (1 << 30)
+        if is_set:
+            self.backup_pgs.append(num_pages)
+            self.backup_bandwidth.append(bandwidth_gbps)
+        else:
+            self.prefetch_pgs.append(num_pages)
+            self.prefetch_bandwidth.append(bandwidth_gbps)
 
     def _build_pool_buffer_meta(
         self,
