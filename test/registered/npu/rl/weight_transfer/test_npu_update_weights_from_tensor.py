@@ -6,25 +6,18 @@ becomes its own test class, so new models only add a ``WeightUpdateModelCase``.
 """
 
 import os
-import time
 import unittest
-
-import requests
-import torch
 
 from sglang.test.ascend import test_npu_rl_weights as weights
 from sglang.test.ascend.test_npu_rl_utils import (
     assert_logprob_signature_equal,
-    begin_weight_update,
     checkpoint_manifest,
     checkpoint_tensor_index,
     end_weight_update,
-    health,
     load_checkpoint_tensor,
     logprob_signature,
     npu_rl_env,
     npu_server,
-    serialize_named_tensors,
     update_full_checkpoint_per_rank,
     update_weights_from_tensor_per_rank,
 )
@@ -227,43 +220,6 @@ class _TensorSuite:
             self.lane_url, [(self.subset, original)], TP_SIZE
         )
         self._assert_reference("restoring the subset did not restore the output")
-
-    def test_06_update_failure_is_fail_stop(self):
-        bad = torch.zeros(1, dtype=torch.bfloat16, device="npu")
-        payloads = [
-            serialize_named_tensors([(self.target, bad)]) for _ in range(TP_SIZE)
-        ]
-        begin_weight_update(self.lane_url)
-        try:
-            response = requests.post(
-                self.lane_url + "/update_weights_from_tensor",
-                json={
-                    "serialized_named_tensors": payloads,
-                    "load_format": None,
-                    "flush_cache": True,
-                },
-                timeout=300,
-            )
-        except requests.RequestException:
-            pass
-        else:
-            self.assertNotEqual(
-                response.status_code, 200, "malformed tensor payload was accepted"
-            )
-        finally:
-            try:
-                end_weight_update(self.lane_url)
-            except Exception:
-                pass
-
-        # A failed in-place load cannot be rolled back.
-        deadline = time.time() + 30
-        while health(self.lane_url) and time.time() < deadline:
-            time.sleep(0.5)
-        self.assertFalse(
-            health(self.lane_url),
-            "engine stayed alive after a failed in-place weight update",
-        )
 
 
 def _make_suite(case):

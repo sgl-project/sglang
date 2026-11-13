@@ -85,24 +85,6 @@ def _config_dict(case: WeightUpdateModelCase) -> Dict[str, Any]:
     return json.loads(_raw_config(case.id, model_path(case)))
 
 
-def _deep_merge(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
-    merged = copy.deepcopy(base)
-    for key, value in override.items():
-        if isinstance(value, dict) and isinstance(merged.get(key), dict):
-            merged[key] = _deep_merge(merged[key], value)
-        else:
-            merged[key] = copy.deepcopy(value)
-    return merged
-
-
-def _slice_per_layer_lists(config: Dict[str, Any], layers: Optional[int]) -> None:
-    for key, value in list(config.items()):
-        if isinstance(value, dict):
-            _slice_per_layer_lists(value, value.get("num_hidden_layers", layers))
-        elif key in PER_LAYER_CONFIG_LISTS and isinstance(value, list) and layers:
-            config[key] = value[:layers]
-
-
 def _fill_and_slice_overrides(
     raw_config: Dict[str, Any], overrides: Dict[str, Any]
 ) -> None:
@@ -127,10 +109,6 @@ def resolved_overrides(case: WeightUpdateModelCase) -> Dict[str, Any]:
     overrides = copy.deepcopy(case.hf_overrides)
     _fill_and_slice_overrides(_config_dict(case), overrides)
     return overrides
-
-
-def server_override_args(case: WeightUpdateModelCase) -> Tuple[str, ...]:
-    return ("--json-model-override-args", json.dumps(resolved_overrides(case)))
 
 
 def reduced_config(case: WeightUpdateModelCase):
