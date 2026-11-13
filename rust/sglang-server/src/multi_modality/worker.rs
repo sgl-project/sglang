@@ -154,6 +154,21 @@ pub trait MmProcessor: Send + Sync {
     /// waiting for the scheduler to drain the request. The default does
     /// nothing.
     fn processed(&self, _request: MmRequestInfo<'_>, _output: &MmProcessOutput) {}
+
+    /// [`processed`](Self::processed), able to fail the request: `Err`
+    /// rejects it with the error's class, as a [`process`](Self::process)
+    /// error does, instead of queuing it for the scheduler. For an
+    /// implementation that hands the result on and must not leave the request
+    /// running when it cannot. The default observes the result with
+    /// `processed` and queues the request.
+    fn try_processed(
+        &self,
+        request: MmRequestInfo<'_>,
+        output: &MmProcessOutput,
+    ) -> Result<(), MediaError> {
+        self.processed(request, output);
+        Ok(())
+    }
 }
 
 /// The built-in path: SGLang's image pipeline (`sglang_processor::mm`) over the
@@ -416,7 +431,9 @@ fn process(
         .as_ref()
         .is_none_or(|limits| fit_input(&mut output.input_ids, limits).is_ok());
     if fits {
-        ctx.processor.processed(request, &output);
+        ctx.processor
+            .try_processed(request, &output)
+            .map_err(Error::Encode)?;
     }
     let buffers = make_buffers(output.result, ctx.feature_shm).map_err(Error::Internal)?;
     Ok((output.input_ids, buffers))
@@ -1016,8 +1033,9 @@ mod tests {
         assert!(find(&g.mm_buffers, "mm.meta").is_some());
 
         // The processor's own failure and a malformed result (span past the
-        // prompt) fail the request in place as the server's fault; a refusal
-        // as the client's. Intake logs the failure, so the worker does not.
+        // prompt) fail the request in place as the server's fault; a refusal,
+        // in processing or once processed, as the client's. Intake logs the
+        // failure, so the worker does not.
         let failing: Arc<dyn MmProcessor> = Arc::new(FailingProcessor(MediaError::Server(
             "audio decode: Cannot allocate memory".into(),
         )));
@@ -1027,7 +1045,13 @@ mod tests {
         });
         let refusing: Arc<dyn MmProcessor> =
             Arc::new(FailingProcessor(MediaError::Client("bad image".into())));
-        for (processor, server_fault) in [(failing, true), (malformed, true), (refusing, false)] {
+        let refusing_processed: Arc<dyn MmProcessor> = Arc::new(RefusingProcessed);
+        for (processor, server_fault) in [
+            (failing, true),
+            (malformed, true),
+            (refusing, false),
+            (refusing_processed, false),
+        ] {
             let (mm_tx, mm_rx) = flume::unbounded::<Request>();
             let (tm_tx, tm_rx) = flume::unbounded::<TmEvent>();
             let ctx = Arc::new(MmContext::with_processor(processor, false));
@@ -1056,6 +1080,27 @@ mod tests {
             _mm: MmData,
         ) -> Result<MmProcessOutput, MediaError> {
             Err(self.0.clone())
+        }
+    }
+
+    /// A processor that refuses each valid result once processed.
+    struct RefusingProcessed;
+
+    impl MmProcessor for RefusingProcessed {
+        fn process(&self, input_ids: TokenIds, mm: MmData) -> Result<MmProcessOutput, MediaError> {
+            ExternalProcessor {
+                shape: vec![1],
+                offsets: vec![(1, 1)],
+            }
+            .process(input_ids, mm)
+        }
+
+        fn try_processed(
+            &self,
+            _request: MmRequestInfo<'_>,
+            _output: &MmProcessOutput,
+        ) -> Result<(), MediaError> {
+            Err(MediaError::Client("cannot hand the result on".into()))
         }
     }
 
