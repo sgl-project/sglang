@@ -32,6 +32,12 @@ class Schedule(msgspec.Struct):
         Optional[int],
         "The maximum number of running requests.",
     ] = None
+    # Recorded by the cache hook from the raw input: a value resolved for the model
+    # (DeepSeek-V4's default) leaves it False.
+    _max_running_requests_explicitly_set: A[
+        Optional[bool],
+        Arg(no_cli=True),
+    ] = None
     max_queued_requests: A[
         Optional[int],
         "The maximum number of queued requests. This option is ignored when using disaggregation-mode.",

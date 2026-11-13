@@ -23,7 +23,7 @@ SGLang Diffusion has the following features:
 
 ### AMD/ROCm Support
 
-SGLang Diffusion supports AMD Instinct GPUs through ROCm. On AMD platforms, we use the Triton attention backend and leverage AITER kernels for optimized layernorm and other operations. See the [installation guide](https://docs.sglang.io/docs/sglang-diffusion/installation) for setup instructions.
+SGLang Diffusion supports AMD Instinct GPUs through ROCm. On AMD Instinct GPUs, the default attention backend is AITER (`aiter`), and with `SGLANG_USE_AITER=1` (set in the ROCm images) AITER kernels are also used for layernorm and other operations. `--attention-backend torch_sdpa` is also available; use it on Strix Halo / gfx1151, where AITER is not supported. See the [installation guide](https://docs.sglang.io/docs/sglang-diffusion/installation) for setup instructions.
 
 ### Moore Threads/MUSA Support
 

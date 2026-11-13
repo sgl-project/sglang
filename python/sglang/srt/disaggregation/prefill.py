@@ -119,6 +119,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.utils import GenerationBatchResult
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
     from sglang.srt.mem_cache.memory_pool import KVCache
+    from sglang.srt.speculative.dflash_draft_ring import DFlashDraftKVRing
 
 logger = logging.getLogger(__name__)
 
@@ -206,9 +207,9 @@ def _rows_on_device(payload):
 
 
 def max_bootstrap_input_len(*, capacity: int, page_size: int, shard_size: int) -> int:
-    """Bootstrap prompt limit; sharded admission never fits a longer prompt."""
-    if shard_size == 1:
-        return capacity
+    """Bootstrap prompt limit: the longest prompt admission can ever fit on an
+    empty pool. Nothing downstream drops a longer one; it would wait at the
+    head of the queue forever."""
     # Strictest path, add_one_req_ignore_eos: page-rounded prompt, one page per
     # shard, 1 new token and 1 spare token must stay below capacity.
     return (capacity - shard_size * page_size - 3) // page_size * page_size
@@ -281,10 +282,12 @@ class PrefillBootstrapQueue:
         scheduler: Scheduler,
         scheduler_stage_metrics: SchedulerStageMetricsRecorder,
         transfer_backend: TransferBackend,
+        draft_kv_ring: Optional[DFlashDraftKVRing],
     ):
         parallel = get_parallel()
         self.token_to_kv_pool = token_to_kv_pool
         self.draft_token_to_kv_pool = draft_token_to_kv_pool
+        self.draft_kv_ring = draft_kv_ring
         self.is_mla_backend = is_mla_backend(token_to_kv_pool)
         self.metadata_buffers = metadata_buffers
         self.req_to_metadata_buffer_idx_allocator = req_to_metadata_buffer_idx_allocator
@@ -340,12 +343,8 @@ class PrefillBootstrapQueue:
         if get_disagg().disaggregation_enable_kv_checksum:
             kv_args = self.kv_manager.kv_args
             self.kv_checksum_signature = kv_layout_signature(kv_args)
-            self.scheduler.kv_checksum_computer = KvChecksumComputer(
-                device=torch.device(f"cuda:{get_device().gpu_id}"),
-                kv_data_ptrs=kv_args.kv_data_ptrs,
-                kv_item_lens=kv_args.kv_item_lens,
-                state_data_ptrs=kv_args.state_data_ptrs,
-                state_item_lens=kv_args.state_item_lens,
+            self.scheduler.kv_checksum_computer = KvChecksumComputer.for_kv_args(
+                kv_args, torch.device(f"cuda:{get_device().gpu_id}")
             )
         else:
             self.scheduler.kv_checksum_computer = None
@@ -455,6 +454,7 @@ class PrefillBootstrapQueue:
             self.draft_token_to_kv_pool if transfer_draft_cache else None,
             self.scheduler.model_config.num_hidden_layers,
             window_tails=storage.retained_window_lengths(),
+            draft_kv_ring=self.draft_kv_ring,
         )
 
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
@@ -1575,7 +1575,11 @@ class SchedulerDisaggregationPrefillMixin:
         reqs_to_exclude = set()
         if (req := self.chunked_req) is not None:
             reqs_to_exclude.add(req)
-            self.checkpoint_disagg_prefill(req)
+            # A parked chunk (add_chunked_req found no budget) leaves extend_end
+            # at prefix_len: it computed no new KV to checkpoint or send.
+            computed = req.extend_end > req.prefix_len
+            if computed:
+                self.checkpoint_disagg_prefill(req)
 
             if not self.check_bootstrap(req):
                 # A failed bootstrap released the request, emptying the slot.
@@ -1591,13 +1595,13 @@ class SchedulerDisaggregationPrefillMixin:
                     if req.inflight_steps == 0:
                         self.optimistic_release_and_requeue(req)
                 # else: still bootstrapping, keep computing without sending
-            elif self.enable_overlap:
+            elif computed and self.enable_overlap:
                 # Delay KV transfer to process_batch_result_disagg_prefill when overlap is enabled to ensure results are resolved
                 req.tmp_end_idx = min(
                     req.extend_end,
                     len(req.origin_input_ids),
                 )
-            else:
+            elif computed:
                 self.send_kv_chunk(req)
 
             if self.chunked_req is not None:
@@ -1855,6 +1859,10 @@ class SchedulerDisaggregationPrefillMixin:
                     int(req.kv.req_pool_idx), c128_seq_len
                 )
 
+            def _draft_ring_payload():
+                ring = self.disagg_prefill_bootstrap_queue.draft_kv_ring
+                return ring.transfer_rows(int(req.kv.req_pool_idx), seq_len)
+
             def _request_row_payload():
                 return np.array([req.kv.req_pool_idx], dtype=np.int32)
 
@@ -1871,6 +1879,7 @@ class SchedulerDisaggregationPrefillMixin:
                 StateType.MINIMAX_INDEX_K: _minimax_payload,
                 StateType.MINIMAX_DENSE_KV: _full_kv_pages_payload,
                 StateType.SWA_RING: _swa_ring_payload,
+                StateType.DRAFT_RING: _draft_ring_payload,
                 StateType.DSV4_REQUEST_STATE: _request_state_payload,
                 StateType.REQUEST_ROW: _request_row_payload,
                 StateType.BLOCK_SCALE: _full_kv_pages_payload,

@@ -41,6 +41,9 @@ class TestAdminEndpointAuthLevels(CustomTestCase):
                 self.assertFalse(self._decide(path, None).allowed)
                 self.assertTrue(self._decide(path, "Bearer admin-secret").allowed)
 
+    def test_api_key_middleware_is_outermost_on_the_module_level_app(self):
+        self.assertEqual(app.user_middleware[0].cls.__name__, "_ApiKeyASGIMiddleware")
+
 
 if __name__ == "__main__":
     unittest.main()

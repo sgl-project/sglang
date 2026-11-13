@@ -104,7 +104,6 @@ from sglang.srt.managers.req_types import (
     MultimodalInputs,
     ReturnHiddenStatesMode,
     SamplingLogprobsMode,
-    get_request_return_hidden_states_mode,
     get_return_hidden_states_mode,
 )
 from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
@@ -178,12 +177,6 @@ def get_batch_return_hidden_states_mode(reqs: List[Req]) -> CaptureHiddenMode:
     for req in reqs:
         mode = max(mode, req.return_hidden_states_mode)
     return mode
-
-
-def need_return_hidden_states(
-    return_hidden_states: Union[List[ReturnHiddenStatesMode], ReturnHiddenStatesMode],
-) -> bool:
-    return get_request_return_hidden_states_mode(return_hidden_states).need_capture()
 
 
 @lru_cache(maxsize=1)

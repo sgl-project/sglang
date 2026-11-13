@@ -2,9 +2,14 @@
 
 import unittest
 
+from fastapi import FastAPI, WebSocket
+from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
+
 from sglang.srt.utils.auth import (
     AuthDecision,
     AuthLevel,
+    add_api_key_middleware,
     auth_level,
     decide_request_auth,
 )
@@ -313,6 +318,61 @@ class TestDecideRequestAuth(CustomTestCase):
             auth_level=AuthLevel.NORMAL,
         )
         self.assertTrue(decision.allowed)
+
+
+class TestApiKeyMiddleware(CustomTestCase):
+    def setUp(self):
+        app = FastAPI()
+        self.keys = (None, None)
+
+        @app.get("/normal")
+        async def normal():
+            return {}
+
+        @app.post("/force")
+        @auth_level(AuthLevel.ADMIN_FORCE)
+        async def force():
+            return {}
+
+        @app.post("/force/{name}")
+        @auth_level(AuthLevel.ADMIN_FORCE)
+        async def force_by_name(name: str):
+            return {}
+
+        @app.post("/force/shadowed")
+        async def shadowed():
+            return {}
+
+        @app.websocket("/ws")
+        async def ws(websocket: WebSocket):
+            await websocket.accept()
+            await websocket.close()
+
+        add_api_key_middleware(app, get_keys=lambda: self.keys)
+        self.client = TestClient(app)
+
+    def test_keys_are_read_per_request(self):
+        self.assertEqual(self.client.get("/normal").status_code, 200)
+        self.assertEqual(self.client.post("/force").status_code, 403)
+        self.assertEqual(self.client.post("/force/shadowed").status_code, 403)
+        self.keys = ("user", "admin")
+        admin = {"Authorization": "Bearer admin"}
+        user = {"Authorization": "Bearer user"}
+        self.assertEqual(self.client.get("/normal").status_code, 401)
+        self.assertEqual(self.client.get("/normal", headers=user).status_code, 200)
+        for path in ("/force", "/force/x"):
+            self.assertEqual(self.client.post(path, headers=user).status_code, 401)
+            self.assertEqual(self.client.post(path, headers=admin).status_code, 200)
+
+    def test_websocket_requires_the_api_key(self):
+        self.keys = ("user", None)
+        with self.assertRaises(WebSocketDisconnect):
+            with self.client.websocket_connect("/ws"):
+                pass
+        with self.client.websocket_connect(
+            "/ws", headers={"Authorization": "Bearer user"}
+        ):
+            pass
 
 
 if __name__ == "__main__":
