@@ -11,6 +11,7 @@ import sys
 import tempfile
 import threading
 import unittest
+import wave
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -30,6 +31,11 @@ from sglang.benchmark.datasets import DATASET_MAPPING, get_dataset
 from sglang.benchmark.datasets.agentic_trace import (
     DEFAULT_AGENTIC_OUTPUT_LEN,
     AgenticTraceDataset,
+)
+from sglang.benchmark.datasets.audio import (
+    AudioDataset,
+    gen_audio_data_uri,
+    sample_audio_requests,
 )
 from sglang.benchmark.datasets.common import DatasetRow, gen_mm_prompt
 from sglang.benchmark.datasets.custom import sample_custom_requests
@@ -273,6 +279,15 @@ class KimiK3Processor(DummyProcessor):
         return {"input_ids": _DummyTokenTensor(text_len + 4 * len(medias))}
 
 
+class DummyAudioProcessor(DummyProcessor):
+    """Audio-aware processor: each clip deterministically costs 100 tokens."""
+
+    def __call__(self, text, images=None, audio=None, **kwargs):
+        text_len = len(self.tokenizer.encode(text[0]))
+        audio_tokens = 100 * len(audio) if audio else 0
+        return {"input_ids": _DummyTokenTensor(text_len + audio_tokens)}
+
+
 class _FakeMMMUDataset:
     def __init__(self, records):
         self.records = records
@@ -307,6 +322,11 @@ def make_args(**overrides):
         "image_format": "png",
         "image_content": "blank",
         "image_resolution": "8x8",
+        "audio_count": 1,
+        "random_audio_count": False,
+        "audio_duration": 0.02,
+        "audio_sample_rate": 16000,
+        "audio_content": "random",
         "backend": "sglang",
         "gsp_num_groups": 2,
         "gsp_prompts_per_group": 2,
@@ -713,6 +733,157 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
             ],
         )
 
+    # ------------------------------------------------------------------
+    # Audio dataset
+    # ------------------------------------------------------------------
+
+    def test_audio_sampler(self):
+        rows = sample_audio_requests(
+            num_requests=2,
+            audio_count=1,
+            input_len=8,
+            output_len=4,
+            range_ratio=0.0,
+            processor=DummyAudioProcessor(self.tokenizer),
+            audio_content="random",
+            audio_duration=0.02,
+            sample_rate=16000,
+            backend="sglang",
+        )
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(all(isinstance(row, DatasetRow) for row in rows))
+        for row in rows:
+            self.assertEqual(len(row.audio_data), 1)
+            uri = row.audio_data[0]
+            self.assertTrue(uri.startswith("data:audio/wav;base64,"))
+            with wave.open(io.BytesIO(base64.b64decode(uri.split(",", 1)[1]))) as wf:
+                self.assertEqual(wf.getnchannels(), 1)
+                self.assertEqual(wf.getsampwidth(), 2)
+                self.assertEqual(wf.getframerate(), 16000)
+                self.assertEqual(wf.getnframes(), int(0.02 * 16000))
+            # Audio tokens counted on top of the text-only count.
+            self.assertGreater(row.prompt_len, row.text_prompt_len)
+
+    def test_audio_data_uri_content_modes(self):
+        for content in ("silence", "random"):
+            samples, uri, num_bytes = gen_audio_data_uri(content, 0.01, 8000)
+            self.assertEqual(len(samples), 80)
+            self.assertTrue(uri.startswith("data:audio/wav;base64,"))
+            self.assertGreater(num_bytes, 0)
+            pcm = np.frombuffer(
+                base64.b64decode(uri.split(",", 1)[1])[44:], dtype=np.int16
+            )
+            self.assertEqual(len(pcm), 80)
+            if content == "silence":
+                self.assertTrue((pcm == 0).all())
+            else:
+                self.assertTrue((pcm != 0).any())
+
+        # Random clips must differ between calls.
+        _, uri_a, _ = gen_audio_data_uri("random", 0.01, 8000)
+        _, uri_b, _ = gen_audio_data_uri("random", 0.01, 8000)
+        self.assertNotEqual(uri_a, uri_b)
+
+    def test_audio_sampler_chat_backend_uses_raw_prompt(self):
+        rows = sample_audio_requests(
+            num_requests=1,
+            audio_count=1,
+            input_len=8,
+            output_len=4,
+            range_ratio=0.0,
+            processor=DummyAudioProcessor(self.tokenizer),
+            audio_content="random",
+            audio_duration=0.02,
+            sample_rate=16000,
+            backend="sglang-oai-chat",
+        )
+        self.assertEqual(len(rows), 1)
+        self.assertTrue(rows[0].audio_data)
+        for marker in ("user:", "assistant:", "[IMAGE]"):
+            self.assertNotIn(marker, rows[0].prompt)
+
+    def test_audio_sampler_rejects_unsupported_backend(self):
+        with self.assertRaisesRegex(ValueError, "Audio dataset only supports backends"):
+            sample_audio_requests(
+                num_requests=1,
+                audio_count=1,
+                input_len=8,
+                output_len=4,
+                range_ratio=0.0,
+                processor=DummyAudioProcessor(self.tokenizer),
+                audio_content="random",
+                audio_duration=0.02,
+                sample_rate=16000,
+                backend="vllm-chat",
+            )
+
+    def test_audio_sampler_random_audio_count(self):
+        np.random.seed(7)
+        rows = sample_audio_requests(
+            num_requests=4,
+            audio_count=2,
+            input_len=8,
+            output_len=4,
+            range_ratio=0.0,
+            processor=DummyAudioProcessor(self.tokenizer),
+            audio_content="random",
+            audio_duration=0.02,
+            sample_rate=16000,
+            backend="sglang",
+            random_audio_count=True,
+        )
+        counts = [len(row.audio_data) for row in rows]
+        self.assertTrue(all(1 <= count <= 2 for count in counts))
+
+    def test_audio_sampler_zero_audio_count_degrades_to_text(self):
+        rows = sample_audio_requests(
+            num_requests=2,
+            audio_count=0,
+            input_len=8,
+            output_len=4,
+            range_ratio=0.0,
+            processor=DummyAudioProcessor(self.tokenizer),
+            audio_content="random",
+            audio_duration=0.02,
+            sample_rate=16000,
+            backend="sglang",
+        )
+        self.assertEqual(len(rows), 2)
+        for row in rows:
+            self.assertEqual(row.audio_data, [])
+            self.assertEqual(row.prompt_len, row.text_prompt_len)
+
+    def test_audio_dataset_seed_is_independent_of_processor_initialization(self):
+        dataset = AudioDataset.from_args(make_args(num_prompts=3, seed=20260717))
+        processor_init_count = 0
+
+        def get_processor_with_rng_side_effects(_model_id):
+            nonlocal processor_init_count
+            processor_init_count += 1
+            random.random()
+            np.random.random(processor_init_count)
+            return DummyAudioProcessor(self.tokenizer)
+
+        with patch(
+            "sglang.benchmark.datasets.audio.get_processor",
+            side_effect=get_processor_with_rng_side_effects,
+        ):
+            first = dataset.load(model_id="test-model")
+            random.seed(999)
+            np.random.seed(999)
+            second = dataset.load(model_id="test-model")
+
+        self.assertEqual(
+            [
+                (row.prompt, row.prompt_len, row.output_len, row.audio_data)
+                for row in first
+            ],
+            [
+                (row.prompt, row.prompt_len, row.output_len, row.audio_data)
+                for row in second
+            ],
+        )
+
     def test_parse_random_image_resolution(self):
         self.assertEqual(
             parse_random_image_resolution("random:256x384-1024x1536"),
@@ -968,6 +1139,8 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
             "generated-shared-prefix",
             "mmmu",
             "image",
+            "audio",
+            "random-audio",
             "mooncake",
             "speed-bench",
         }
@@ -1005,6 +1178,15 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
             image_args = make_args(dataset_name="image")
             image_rows = get_dataset(image_args, self.tokenizer, model_id="dummy-model")
         self.assertEqual(len(image_rows), image_args.num_prompts)
+
+        with patch(
+            "sglang.benchmark.datasets.audio.get_processor",
+            return_value=DummyAudioProcessor(self.tokenizer),
+        ):
+            audio_args = make_args(dataset_name="audio", num_prompts=1)
+            audio_rows = get_dataset(audio_args, self.tokenizer, model_id="dummy-model")
+        self.assertEqual(len(audio_rows), 1)
+        self.assertEqual(len(audio_rows[0].audio_data), 1)
 
         fake_mmmu_dataset = _FakeMMMUDataset(
             [{"image_1": Image.new("RGB", (4, 4), color="white"), "question": "q"}]
