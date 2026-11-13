@@ -135,6 +135,12 @@ fn response_timeout(secs: u64) -> Duration {
     Duration::from_secs(secs)
 }
 
+fn openai_unimplemented() -> Status {
+    Status::unimplemented(
+        "the OpenAI API is served over HTTP only until its adapter moves onto the api.v1 schema",
+    )
+}
+
 /// A group operation's merged outcome as the gRPC reply; a frontend-side
 /// failure (bad request, unreachable rank) is a status instead.
 fn group_response(
@@ -1176,6 +1182,38 @@ impl SglangService for GrpcService {
 
     // The OpenAI interface: the schema is in place for the adapter
     // refactor; the gRPC methods answer UNIMPLEMENTED until it lands.
+    async fn open_ai_completions(
+        &self,
+        _request: Request<api::OpenAiCompletionRequest>,
+    ) -> Result<Response<api::OpenAiCompletionResponse>, Status> {
+        Err(openai_unimplemented())
+    }
+
+    async fn open_ai_chat_completions(
+        &self,
+        _request: Request<api::OpenAiChatCompletionRequest>,
+    ) -> Result<Response<api::OpenAiChatCompletionResponse>, Status> {
+        Err(openai_unimplemented())
+    }
+
+    type OpenAiStreamCompletionsStream = ResponseStream<api::OpenAiCompletionStreamResponse>;
+
+    async fn open_ai_stream_completions(
+        &self,
+        _request: Request<api::OpenAiCompletionRequest>,
+    ) -> Result<Response<Self::OpenAiStreamCompletionsStream>, Status> {
+        Err(openai_unimplemented())
+    }
+
+    type OpenAiStreamChatCompletionsStream =
+        ResponseStream<api::OpenAiChatCompletionStreamResponse>;
+
+    async fn open_ai_stream_chat_completions(
+        &self,
+        _request: Request<api::OpenAiChatCompletionRequest>,
+    ) -> Result<Response<Self::OpenAiStreamChatCompletionsStream>, Status> {
+        Err(openai_unimplemented())
+    }
 }
 
 /// `--grpc-port` refuses `--admin-api-key` at startup, so a gRPC server never

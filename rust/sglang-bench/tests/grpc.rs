@@ -312,6 +312,38 @@ impl SglangService for Mock {
         unimplemented!()
     }
 
+    async fn open_ai_completions(
+        &self,
+        _: Request<api::OpenAiCompletionRequest>,
+    ) -> Result<Response<api::OpenAiCompletionResponse>, Status> {
+        unimplemented!()
+    }
+
+    async fn open_ai_chat_completions(
+        &self,
+        _: Request<api::OpenAiChatCompletionRequest>,
+    ) -> Result<Response<api::OpenAiChatCompletionResponse>, Status> {
+        unimplemented!()
+    }
+
+    type OpenAiStreamCompletionsStream = ItemStreamOf<api::OpenAiCompletionStreamResponse>;
+
+    async fn open_ai_stream_completions(
+        &self,
+        _: Request<api::OpenAiCompletionRequest>,
+    ) -> Result<Response<Self::OpenAiStreamCompletionsStream>, Status> {
+        unimplemented!()
+    }
+
+    type OpenAiStreamChatCompletionsStream = ItemStreamOf<api::OpenAiChatCompletionStreamResponse>;
+
+    async fn open_ai_stream_chat_completions(
+        &self,
+        _: Request<api::OpenAiChatCompletionRequest>,
+    ) -> Result<Response<Self::OpenAiStreamChatCompletionsStream>, Status> {
+        unimplemented!()
+    }
+
     async fn separate_reasoning(
         &self,
         _: Request<api::SeparateReasoningRequest>,
