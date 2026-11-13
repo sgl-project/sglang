@@ -110,13 +110,13 @@ _GFX950_HIPBLASLT_ROWS = range(33, 129)
 logger = logging.getLogger(__name__)
 
 
-
 def _rocm_decode_gemm_tuned() -> bool:
     """Tuned K3 decode GEMMs (ROCm + AITER only)."""
     from sglang.srt.environ import envs
     from sglang.srt.utils import is_hip
 
     return is_hip() and envs.SGLANG_USE_AITER.get()
+
 
 def _logical_linear_weight_shape(
     param: torch.Tensor,
