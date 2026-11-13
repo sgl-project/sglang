@@ -228,6 +228,18 @@ impl SglangService for Mock {
     ) -> Result<Response<api::GenerationPauseResponse>, Status> {
         Err(Status::unimplemented("continue_generation"))
     }
+    async fn pd_role_switch(
+        &self,
+        _: Request<api::PdRoleSwitchRequest>,
+    ) -> Result<Response<api::PdRoleSwitchResponse>, Status> {
+        Err(Status::unimplemented("pd_role_switch"))
+    }
+    async fn update_weight_version(
+        &self,
+        _: Request<api::UpdateWeightVersionRequest>,
+    ) -> Result<Response<api::UpdateWeightVersionResponse>, Status> {
+        Err(Status::unimplemented("update_weight_version"))
+    }
 }
 
 /// Bind on a free port and serve the mock on its own runtime thread, so the

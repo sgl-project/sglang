@@ -101,7 +101,6 @@ RUST_SERVER_IGNORED_BY_DESIGN: Dict[str, str] = {
     "engine_info_bootstrap_url": "/get_remote_instance_transfer_engine_info is not served.",
     "chunked_prefill_size": "/v1/score is not served.",
     "dp_size": "Only asserted by the weight-update and LoRA routes, which are not served.",
-    "enable_pd_role_switch": "/pd_role_switch is not served.",
     "enable_streaming_session": "/open_session is not served.",
     "speculative_ngram_external_corpus_max_tokens": "/add_external_corpus is not served.",
     # Settings of features Rust-server mode refuses.

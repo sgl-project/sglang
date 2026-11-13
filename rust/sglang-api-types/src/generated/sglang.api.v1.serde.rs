@@ -1444,6 +1444,327 @@ impl<'de> ::serde::Deserialize<'de> for GenerationPauseResponse {
     }
 }
 
+impl PdRoleSwitchRequest {
+    /// The schema default when unset (protobuf arrival).
+    pub fn new_role_or_default(&self) -> ::prost::alloc::string::String {
+        self.new_role.clone().unwrap_or_else(|| "".to_string())
+    }
+    /// Protobuf arrival: unset defaulted fields become their schema
+    /// defaults (JSON arrival already baked them at deserialization).
+    pub fn apply_absent_defaults(&mut self) {
+        if self.new_role.is_none() {
+            self.new_role = Some("".to_string());
+        }
+    }
+}
+
+impl ::serde::Serialize for PdRoleSwitchRequest {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        if let Some(v) = &self.new_role {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "new_role", v)?;
+        }
+        if let Some(v) = &self.decode_cuda_graph_bs {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "decode_cuda_graph_bs", v)?;
+        }
+        if let Some(v) = &self.decode_cuda_graph_memory_gb {
+            ::serde::ser::SerializeMap::serialize_entry(
+                &mut map,
+                "decode_cuda_graph_memory_gb",
+                v,
+            )?;
+        }
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "prepare_only", &self.prepare_only)?;
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for PdRoleSwitchRequest {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = PdRoleSwitchRequest;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct PdRoleSwitchRequest")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_new_role = None;
+                let mut f_decode_cuda_graph_bs = None;
+                let mut f_decode_cuda_graph_memory_gb = None;
+                let mut f_prepare_only = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "new_role" => {
+                            if f_new_role.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("new_role"));
+                            }
+                            f_new_role = Some(Some(
+                                map.next_value::<Option<::prost::alloc::string::String>>()?
+                                    .unwrap_or_else(|| "".to_string()),
+                            ));
+                        }
+                        "decode_cuda_graph_bs" => {
+                            if f_decode_cuda_graph_bs.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "decode_cuda_graph_bs",
+                                ));
+                            }
+                            f_decode_cuda_graph_bs = Some(map.next_value::<Option<Int64List>>()?);
+                        }
+                        "decode_cuda_graph_memory_gb" => {
+                            if f_decode_cuda_graph_memory_gb.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "decode_cuda_graph_memory_gb",
+                                ));
+                            }
+                            f_decode_cuda_graph_memory_gb = Some(map.next_value::<Option<f64>>()?);
+                        }
+                        "prepare_only" => {
+                            if f_prepare_only.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("prepare_only"));
+                            }
+                            f_prepare_only = Some(map.next_value::<bool>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(PdRoleSwitchRequest {
+                    new_role: f_new_role.unwrap_or_else(|| Some("".to_string())),
+                    decode_cuda_graph_bs: f_decode_cuda_graph_bs.flatten(),
+                    decode_cuda_graph_memory_gb: f_decode_cuda_graph_memory_gb.flatten(),
+                    prepare_only: f_prepare_only.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for PdRoleSwitchResponse {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "success", &self.success)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "message", &self.message)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "old_role", &self.old_role)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "new_role", &self.new_role)?;
+        ::serde::ser::SerializeMap::serialize_entry(
+            &mut map,
+            "safe_to_restore",
+            &self.safe_to_restore,
+        )?;
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for PdRoleSwitchResponse {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = PdRoleSwitchResponse;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct PdRoleSwitchResponse")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_success = None;
+                let mut f_message = None;
+                let mut f_old_role = None;
+                let mut f_new_role = None;
+                let mut f_safe_to_restore = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "success" => {
+                            if f_success.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("success"));
+                            }
+                            f_success = Some(map.next_value::<bool>()?);
+                        }
+                        "message" => {
+                            if f_message.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("message"));
+                            }
+                            f_message = Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        "old_role" => {
+                            if f_old_role.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("old_role"));
+                            }
+                            f_old_role = Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        "new_role" => {
+                            if f_new_role.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("new_role"));
+                            }
+                            f_new_role = Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        "safe_to_restore" => {
+                            if f_safe_to_restore.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("safe_to_restore"));
+                            }
+                            f_safe_to_restore = Some(map.next_value::<bool>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(PdRoleSwitchResponse {
+                    success: f_success.unwrap_or_default(),
+                    message: f_message.unwrap_or_default(),
+                    old_role: f_old_role.unwrap_or_default(),
+                    new_role: f_new_role.unwrap_or_default(),
+                    safe_to_restore: f_safe_to_restore.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl UpdateWeightVersionRequest {
+    /// The schema default when unset (protobuf arrival).
+    pub fn abort_all_requests_or_default(&self) -> bool {
+        self.abort_all_requests.clone().unwrap_or_else(|| true)
+    }
+    /// Protobuf arrival: unset defaulted fields become their schema
+    /// defaults (JSON arrival already baked them at deserialization).
+    pub fn apply_absent_defaults(&mut self) {
+        if self.abort_all_requests.is_none() {
+            self.abort_all_requests = Some(true);
+        }
+    }
+}
+
+impl ::serde::Serialize for UpdateWeightVersionRequest {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "new_version", &self.new_version)?;
+        if let Some(v) = &self.abort_all_requests {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "abort_all_requests", v)?;
+        }
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for UpdateWeightVersionRequest {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = UpdateWeightVersionRequest;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct UpdateWeightVersionRequest")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_new_version = None;
+                let mut f_abort_all_requests = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "new_version" => {
+                            if f_new_version.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("new_version"));
+                            }
+                            f_new_version =
+                                Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        "abort_all_requests" => {
+                            if f_abort_all_requests.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "abort_all_requests",
+                                ));
+                            }
+                            f_abort_all_requests = Some(Some(
+                                map.next_value::<Option<bool>>()?.unwrap_or_else(|| true),
+                            ));
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(UpdateWeightVersionRequest {
+                    new_version: f_new_version.unwrap_or_default(),
+                    abort_all_requests: f_abort_all_requests.unwrap_or_else(|| Some(true)),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for UpdateWeightVersionResponse {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "success", &self.success)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "message", &self.message)?;
+        if let Some(v) = &self.new_version {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "new_version", v)?;
+        }
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for UpdateWeightVersionResponse {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = UpdateWeightVersionResponse;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct UpdateWeightVersionResponse")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_success = None;
+                let mut f_message = None;
+                let mut f_new_version = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "success" => {
+                            if f_success.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("success"));
+                            }
+                            f_success = Some(map.next_value::<bool>()?);
+                        }
+                        "message" => {
+                            if f_message.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("message"));
+                            }
+                            f_message = Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        "new_version" => {
+                            if f_new_version.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("new_version"));
+                            }
+                            f_new_version =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(UpdateWeightVersionResponse {
+                    success: f_success.unwrap_or_default(),
+                    message: f_message.unwrap_or_default(),
+                    new_version: f_new_version.flatten(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
 impl ::serde::Serialize for Matched {
     fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         match &self.value {

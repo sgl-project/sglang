@@ -581,6 +581,8 @@ pub struct DeploymentInfo {
     pub speculative_algorithm: Option<String>,
     /// `--gc-threshold`, which `/freeze_gc` forwards to every scheduler.
     pub gc_threshold: Option<Vec<i64>>,
+    /// `--enable-pd-role-switch`.
+    pub enable_pd_role_switch: bool,
     pub enable_hierarchical_cache: bool,
     pub hicache_ratio: Option<f64>,
     pub hicache_size: u64,
