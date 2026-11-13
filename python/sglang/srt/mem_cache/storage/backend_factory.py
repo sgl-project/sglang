@@ -180,6 +180,8 @@ class StorageBackendFactory:
         """Create built-in backend with original initialization logic."""
         if backend_name in ("file", "sim"):
             return backend_class(storage_config)
+        elif backend_name == "fast_file":
+            return backend_class(storage_config, mem_pool_host)
         elif backend_name == "nixl":
             return backend_class(storage_config)
         elif backend_name == "mooncake":
@@ -200,6 +202,12 @@ class StorageBackendFactory:
             elif mem_pool_host.layout == "layer_first":
                 bytes_per_page = (
                     mem_pool_host.get_size_per_token() * mem_pool_host.page_size
+                )
+            else:
+                raise ValueError(
+                    "The hf3fs storage backend does not support "
+                    f"--hicache-mem-layout {mem_pool_host.layout!r}; supported "
+                    "layouts: page_first, page_first_direct, layer_first."
                 )
 
             dtype = mem_pool_host.dtype
@@ -223,6 +231,12 @@ class StorageBackendFactory:
 # Register built-in storage backends
 StorageBackendFactory.register_backend(
     "file", "sglang.srt.mem_cache.hicache_storage", "HiCacheFile"
+)
+
+StorageBackendFactory.register_backend(
+    "fast_file",
+    "sglang.srt.mem_cache.storage.fast_file.fast_file_store",
+    "HiCacheFastFile",
 )
 
 StorageBackendFactory.register_backend(

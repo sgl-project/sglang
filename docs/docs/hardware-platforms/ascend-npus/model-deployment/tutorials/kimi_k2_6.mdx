@@ -40,7 +40,7 @@ covered by this document and may introduce breaking changes.
 <Note>
 The values in the **Example usage** column are for illustration only. Adjust them according to your hardware, deployment
 mode, and workload. For parameter details, see
-[Feature descriptions](/docs/hardware-platforms/ascend-npus/optimization/parameter_tuning#feature-descriptions); for
+[Parameter Reference](/docs/hardware-platforms/ascend-npus/optimization/parameter_tuning#parameter-reference); for
 recommended configurations for each deployment scenario, see [Best practices](#best-practices).
 </Note>
 
@@ -144,7 +144,7 @@ deployment commands and benchmark data, see
 
 ### Multi-node online deployment
 
-Multi-node deployment distributes the model across multiple Ascend A3 Series nodes using tensor parallelism while keeping
+Multi-node deployment distributes the model across multiple A3 Series nodes using tensor parallelism while keeping
 prefill and decode on the same nodes (PD mixed mode), suitable for scenarios that need more device memory than a single
 node can provide. This scenario is already covered in the best practice. For the complete, optimized
 deployment commands and benchmark data, see

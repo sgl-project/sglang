@@ -22,7 +22,7 @@ from sglang.srt.beam_search.output import (
     beam_completion_tokens,
     pack_beam_search_output,
 )
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.managers.incremental_detokenize import build_detokenize_header
 from sglang.srt.managers.io_struct import (
@@ -33,10 +33,9 @@ from sglang.srt.managers.io_struct import (
     RequestOutputStats,
     wrap_as_pickle,
 )
-from sglang.srt.managers.schedule_batch import (
-    BaseFinishReason,
-    Req,
-)
+from sglang.srt.managers.req_types import BaseFinishReason
+from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.scheduler_components.exit_ledger import record_send
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.runtime_context import (
     get_observability,
@@ -53,6 +52,9 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.weight_versions import compute_weight_version_spans
 
 if TYPE_CHECKING:
+    from sglang.srt.models.unlimited_ocr_v2_support.scheduler_runtime import (
+        UocrSchedulerRuntime,
+    )
     from sglang.srt.observability.req_time_stats import SchedulerReqTimeStats
     from sglang.srt.rust_server.server import RustServer
 
@@ -101,6 +103,7 @@ class SchedulerOutputStreamer:
     rust_server: Optional[RustServer] = None
     # Set when the scheduler first defers a response; see deferred_output.
     defer_outputs: bool = False
+    uocr_runtime: Optional[UocrSchedulerRuntime] = None
     _test_stream_output_count: int = 0
     output_sink: OutputSink = field(init=False)
     enable_metrics: bool = field(init=False)
@@ -291,6 +294,7 @@ class SchedulerOutputStreamer:
             ),
             output_sink=self.output_sink,
             current_weight_version=get_serving().weight_version,
+            uocr_runtime=self.uocr_runtime,
             cached_tokens_split=(
                 [] if self._rust_frames_split_cached_tokens() else None
             ),
@@ -301,9 +305,9 @@ class SchedulerOutputStreamer:
         for req in reqs:
             if req is skip_req:
                 continue
+            # Kept for the PD decode queue paths, which stream requests that are
+            # not in any step's batch yet.
             if req.finished() and req.finished_output:
-                # With the overlap schedule, a request will try to output twice and hit this line twice
-                # because of the one additional delayed token. This "continue" prevented the dummy output.
                 continue
 
             acc.accept(req=req)
@@ -387,6 +391,7 @@ class SchedulerOutputStreamer:
         has_phs = False
         for req in reqs:
             if req.finished():
+                record_send(req, "stream")
                 rids.append(req.rid)
                 http_worker_ipcs.append(req.http_worker_ipc)
                 finished_reasons.append(req.finished_reason.to_json())
@@ -486,6 +491,9 @@ class _GenerationStreamAccumulator:
     spec_num_cap_tokens: list = field(default_factory=list)
     spec_correct_drafts_histogram: list = field(default_factory=list)
     spec_cap_lens_histogram: list = field(default_factory=list)
+    # Spliced document-overlap tokens per request (Unlimited-OCR v2 only).
+    uocr_forced_tokens: list = field(default_factory=list)
+    uocr_runtime: Optional[UocrSchedulerRuntime] = None
     weight_versions: list = field(default_factory=list)
     prefill_weight_versions: list = field(default_factory=list)
     output_hidden_states: Optional[list] = None
@@ -571,6 +579,7 @@ class _GenerationStreamAccumulator:
         if req.finished():
             assert not req.finished_output
             req.finished_output = True
+            record_send(req, "stream")
             if req.finished_len is None:
                 req.finished_len = len(req.output_ids)
             should_output = True
@@ -627,7 +636,9 @@ class _GenerationStreamAccumulator:
 
         if self.output_sink is OutputSink.DETOKENIZER:
             if req.take_detokenize_header_due():
-                self.detokenize_headers.append(build_detokenize_header(req))
+                self.detokenize_headers.append(
+                    build_detokenize_header(req, output_prefix_len=send_token_offset)
+                )
                 self.has_detokenize_header = True
             else:
                 self.detokenize_headers.append(None)
@@ -638,6 +649,11 @@ class _GenerationStreamAccumulator:
             self.has_http_worker_ipc = self.has_http_worker_ipc or ipc is not None
         elif self.output_sink is OutputSink.TOKENIZER:
             self.http_worker_ipcs.append(req.http_worker_ipc)
+
+        forced_tokens = 0
+        if self.uocr_runtime is not None:
+            forced_tokens = self.uocr_runtime.forced_tokens(req)
+            self.uocr_forced_tokens.append(forced_tokens)
 
         if self.output_sink is OutputSink.RUST:
             # Per-step header columns of `push_generation`.
@@ -661,7 +677,8 @@ class _GenerationStreamAccumulator:
             self.completion_tokens.append(
                 beam_completion_tokens(beam_output)
                 if beam_output is not None
-                else len(output_ids_)
+                # copied document-overlap text was not generated by this request
+                else len(output_ids_) - forced_tokens
             )
 
             if req.take_request_stats_due():
@@ -862,6 +879,11 @@ class _GenerationStreamAccumulator:
     ) -> Optional[BatchTokenIDOutput]:
         if not (self.rids or is_idle_batch):
             return None
+        customized_info = self.customized_info
+        if self.uocr_runtime is not None:
+            customized_info = self.uocr_runtime.with_forced_tokens(
+                customized_info, self.uocr_forced_tokens
+            )
         dp_ranks = [dp_rank] * len(self.rids) if self.rids else None
         return BatchTokenIDOutput(
             rids=self.rids,
@@ -929,11 +951,11 @@ class _GenerationStreamAccumulator:
             # The Rust egress encodes the per-token lists itself.
             customized_info=(
                 (
-                    self.customized_info
+                    customized_info
                     if self.output_sink is OutputSink.RUST
-                    else wrap_as_pickle(self.customized_info)
+                    else wrap_as_pickle(customized_info)
                 )
-                if self.customized_info
+                if customized_info
                 else None
             ),
             placeholder_tokens_idx=None,

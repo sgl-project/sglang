@@ -17,17 +17,20 @@
 
 
 import collections
+import logging
 import math
 import os
 from array import array
-from dataclasses import field
+from dataclasses import dataclass, field
 from enum import Enum
 from functools import partial
 from itertools import repeat
 from typing import (
     Callable,
+    Dict,
     Final,
     Iterable,
+    List,
     Literal,
     Optional,
     Sequence,
@@ -40,11 +43,11 @@ from typing import (
 import torch
 import torch.nn.functional as F
 from einops import rearrange
-from torch import Tensor, _assert, nn
+from torch import _assert, nn
 from torch.nn.init import trunc_normal_
 from transformers import AutoModel, PreTrainedModel
 
-from sglang.srt.configs.janus_pro import *
+from sglang.srt.configs.janus_pro import MultiModalityConfig, SigLIPVisionCfg
 from sglang.srt.layers.attention.vision import VisionAttention
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization import QuantizationConfig
@@ -52,11 +55,10 @@ from sglang.srt.managers.mm_utils import (
     general_mm_embed_routine,
     pad_mm_token_pairs,
 )
-from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.llama import LlamaForCausalLM
-from sglang.utils import logger
 
 #################################################################################
 #                              VQ Model Configs                                 #
@@ -114,6 +116,8 @@ def VQ_16(**kwargs):
 VQ_models = {"VQ-16": VQ_16}
 
 import collections.abc
+
+logger = logging.getLogger(__name__)
 
 
 # From PyTorch internals
@@ -1093,45 +1097,6 @@ def create_siglip_vit(
     return model
 
 
-class Normalize(torch.nn.Module):
-    """Normalize a tensor image with mean and standard deviation.
-    This transform does not support PIL Image.
-    Given mean: ``(mean[1],...,mean[n])`` and std: ``(std[1],..,std[n])`` for ``n``
-    channels, this transform will normalize each channel of the input
-    ``torch.*Tensor`` i.e.,
-    ``output[channel] = (input[channel] - mean[channel]) / std[channel]``
-
-    .. note::
-        This transform acts out of place, i.e., it does not mutate the input tensor.
-
-    Args:
-        mean (sequence): Sequence of means for each channel.
-        std (sequence): Sequence of standard deviations for each channel.
-        inplace(bool,optional): Bool to make this operation in-place.
-
-    """
-
-    def __init__(self, mean, std, inplace=False):
-        super().__init__()
-        # _log_api_usage_once(self)
-        self.mean = mean
-        self.std = std
-        self.inplace = inplace
-
-    def forward(self, tensor: Tensor) -> Tensor:
-        """
-        Args:
-            tensor (Tensor): Tensor image to be normalized.
-
-        Returns:
-            Tensor: Normalized Tensor image.
-        """
-        return F.normalize(tensor, self.mean, self.std, self.inplace)
-
-    def __repr__(self) -> str:
-        return f"{self.__class__.__name__}(mean={self.mean}, std={self.std})"
-
-
 class CLIPVisionTower(nn.Module):
     def __init__(
         self,
@@ -1164,7 +1129,11 @@ class CLIPVisionTower(nn.Module):
         )
 
         if pixel_mean is not None and pixel_std is not None:
-            image_norm = Normalize(mean=pixel_mean, std=pixel_std)
+            import torchvision.transforms
+
+            image_norm = torchvision.transforms.Normalize(
+                mean=pixel_mean, std=pixel_std
+            )
         else:
             image_norm = None
 
@@ -1185,8 +1154,9 @@ class CLIPVisionTower(nn.Module):
             forward_kwargs = dict()
 
         elif self.model_name.startswith("sam"):
-            # vision_tower = create_sam_vit(**vision_tower_params)
-            forward_kwargs = dict()
+            raise NotImplementedError(
+                f"SAM vision tower {self.model_name!r} is not supported"
+            )
 
         else:  # huggingface
             from transformers import CLIPVisionModel

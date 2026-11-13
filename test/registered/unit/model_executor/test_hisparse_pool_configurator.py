@@ -41,6 +41,7 @@ class TestHiSparsePoolConfigurator(CustomTestCase):
 
         kvc = MagicMock(
             use_mla_backend=True,
+            modelslim_cache_layout=None,
             kv_cache_dtype=kv_cache_dtype,
             is_draft_worker=False,
             model_config=SimpleNamespace(
