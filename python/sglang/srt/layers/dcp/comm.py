@@ -550,8 +550,9 @@ _PUSH_COMBINE_COMM = None
 
 
 def init_dcp_push_combine(cp_group: "GroupCoordinator", num_heads: int) -> None:
-    """Allocate the push plane of the one-kernel DCP reduce (see
-    dcp_push_combine_reduce). Call once per process before CUDA-graph capture."""
+    """Declare the push slots of the one-kernel DCP reduce (see
+    dcp_push_combine_reduce) on the CP group's symmetric workspace. Call once
+    per process during model construction, before CUDA-graph capture."""
     global _PUSH_COMBINE_COMM
     from sglang.srt.environ import envs
 
@@ -560,8 +561,12 @@ def init_dcp_push_combine(cp_group: "GroupCoordinator", num_heads: int) -> None:
     if not envs.SGLANG_ENABLE_DCP_PUSH_COMBINE.get() or num_heads % cp_group.world_size:
         return
     from sglang.kernels.ops.attention import dcp_push_combine as pc
-    from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
-        CustomAllReduceV2,
+    from sglang.srt.distributed.device_communicators.configs.custom_all_reduce_v2 import (
+        get_all_reduce_config,
+    )
+    from sglang.srt.distributed.device_communicators.symm_workspace import (
+        WorkspaceRequest,
+        request_group_workspace,
     )
 
     slot_bytes = (
@@ -569,19 +574,22 @@ def init_dcp_push_combine(cp_group: "GroupCoordinator", num_heads: int) -> None:
         * (num_heads // cp_group.world_size)
         * pc.SLOT_BYTES_PER_ROW
     )
-    comm = CustomAllReduceV2(
-        cp_group.cpu_group,
-        torch.device("cuda", torch.cuda.current_device()),
-        max_pull_size=0,
-        max_push_size=slot_bytes,
+    lease = request_group_workspace(
+        cp_group, WorkspaceRequest(owner="dcp_push_combine", push_slot_bytes=slot_bytes)
     )
-    if comm.disabled:
+    if lease is None:
         logger.warning(
-            "DCP push-combine: CustomAllReduceV2 unavailable, keeping the a2a reduce"
+            "DCP push-combine: no symmetric workspace on the CP group, keeping the "
+            "a2a reduce"
         )
         return
-    pc.register_comm(comm.obj)
-    _PUSH_COMBINE_COMM = comm
+    # the grid cap the tuned custom all-reduce config gives this world size
+    push_blocks = get_all_reduce_config(cp_group.world_size).num_push_blocks
+    pc.register_comm(
+        lambda: lease.get_communicator(push_blocks=push_blocks),
+        world_size=lease.world_size,
+    )
+    _PUSH_COMBINE_COMM = lease
 
 
 def dcp_push_combine_fits(rows: int) -> bool:
@@ -591,7 +599,7 @@ def dcp_push_combine_fits(rows: int) -> bool:
 
     return (
         _PUSH_COMBINE_COMM is not None
-        and rows * pc.SLOT_BYTES_PER_ROW <= _PUSH_COMBINE_COMM.max_push_size
+        and rows * pc.SLOT_BYTES_PER_ROW <= _PUSH_COMBINE_COMM.request.push_slot_bytes
     )
 
 

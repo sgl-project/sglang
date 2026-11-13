@@ -877,6 +877,7 @@ class PrefillAdder:
             extend_input_len=extend_input_len,
             total_tokens=total_tokens,
             state_slots=state_slots,
+            request_rows=self._request_rows_for_req(req),
             max_new_tokens=self._swa_new_tokens(req),
             input_tokens=len(req.full_untruncated_fill_ids),
             chunk_limit=chunk_limit,
@@ -986,6 +987,9 @@ class PrefillAdder:
             slots += req.mamba_host_hit_length
         return slots
 
+    def _request_rows_for_req(self, req: Req) -> int:
+        return self.memory_budget.request_rows(req)
+
     def _request_slot_reserve_for_req(
         self, req: Req, *, extend_input_len: Optional[int] = None
     ) -> int:
@@ -1053,6 +1057,7 @@ class PrefillAdder:
         max_new_tokens: int,
         retracted_stain: bool,
         state_slots: int = 0,
+        request_rows: int = 0,
         request_slot_reserve: int = 0,
         is_chunked_continuation: bool = False,
         replay_len: int = 0,
@@ -1099,6 +1104,7 @@ class PrefillAdder:
             ),
             # Debit only working/tracking state that still awaits allocation.
             state_slots=state_slots,
+            request_rows=request_rows,
             chunk_limit=self.rem_chunk_tokens,
             is_chunked_continuation=is_chunked_continuation,
             unfinished_input_len=unfinished_input_len,
@@ -1267,6 +1273,7 @@ class PrefillAdder:
             0,
             req.retracted_stain,
             state_slots=self._state_slots_for_req(req),
+            request_rows=self._request_rows_for_req(req),
             replay_len=self._replay_len(req, prefix_len),
         )
         self._account_prefill_cache_admission(req, prefix_len)
@@ -1375,6 +1382,7 @@ class PrefillAdder:
             max_new_tokens,
             req.retracted_stain,
             state_slots=self._state_slots_for_req(req),
+            request_rows=self._request_rows_for_req(req),
             reuses_kv=reuses_kv,
         )
 
@@ -1406,12 +1414,17 @@ class PrefillAdder:
                 return req
             if self.kv_shard_granule:
                 # Align the absolute boundary to keep pages within one scratch region.
-                # If no budget remains, use a full chunk to make progress.
                 prefix_len = req.prefix_len
                 floored = (
                     prefix_len + _rem_tokens
                 ) // self.kv_shard_granule * self.kv_shard_granule - prefix_len
-                _rem_tokens = floored if floored > 0 else self.rem_chunk_tokens
+                if floored > 0:
+                    _rem_tokens = floored
+                elif _rem_tokens < self.rem_chunk_tokens:
+                    # Memory holds less than one aligned step: wait for it.
+                    return req
+                # Otherwise the chunk itself is shorter than one aligned step;
+                # take it unaligned to make progress.
 
         # A mid-chunk rank prefills this pass regardless of the delayer
         # verdict, so report prefillable=True and ignore the result.
@@ -1459,6 +1472,7 @@ class PrefillAdder:
         # slot reserve, which it does not see, is checked again.
         if request_slot_reserve and not self.memory_budget.can_allocate_prefill(
             state_slots=self._state_slots_for_req(req),
+            request_rows=self._request_rows_for_req(req),
             paged_input=(
                 self.ceil_paged_tokens(new_len)
                 + self.per_req_token_overhead
@@ -1489,6 +1503,7 @@ class PrefillAdder:
             ),
             req.retracted_stain,
             state_slots=self._state_slots_for_req(req),
+            request_rows=self._request_rows_for_req(req),
             request_slot_reserve=request_slot_reserve,
             is_chunked_continuation=True,
             # Its window rows behind the chunk are held, as its shape check
@@ -1563,6 +1578,7 @@ class PrefillAdder:
                 return self._refused()
         fits = self.memory_budget.can_allocate_prefill(
             state_slots=self._state_slots_for_req(req),
+            request_rows=self._request_rows_for_req(req),
             paged_input=paged_input,
             extend_input_len=cand_extend_input_len,
             max_new_tokens=self._swa_new_tokens(req),
@@ -1616,6 +1632,7 @@ class PrefillAdder:
             max_new_tokens=self._swa_new_tokens(req),
             chunk_limit=chunk_limit,
             state_slots=self._state_slots_for_req(req),
+            request_rows=self._request_rows_for_req(req),
             cached_tokens=req.prefix_len,
         ):
             return AddReqResult.NO_TOKEN
@@ -1664,6 +1681,7 @@ class PrefillAdder:
                 min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS),
                 req.retracted_stain,
                 state_slots=self._state_slots_for_req(req),
+                request_rows=self._request_rows_for_req(req),
                 request_slot_reserve=self._request_slot_reserve_for_req(req),
                 admitted_chunk_limit=chunk_limit,
                 cached_tokens=req.prefix_len,
@@ -1692,6 +1710,7 @@ class PrefillAdder:
                 0,
                 req.retracted_stain,
                 state_slots=self._state_slots_for_req(req),
+                request_rows=self._request_rows_for_req(req),
                 request_slot_reserve=self._request_slot_reserve_for_req(
                     req, extend_input_len=trunc_len
                 ),
@@ -1825,6 +1844,7 @@ class PrefillAdder:
                         )
                     load_budget = dict(
                         state_slots=state_slots,
+                        request_rows=self._request_rows_for_req(req),
                         full_tokens=(
                             full_load_tokens
                             + admission.extend_len
@@ -2042,6 +2062,7 @@ class PrefillAdder:
                 max_new_tokens=0 if is_chunked else self._swa_new_tokens(req),
                 chunk_limit=chunk_limit,
                 state_slots=state_slots,
+                request_rows=self._request_rows_for_req(req),
                 window_host_hit_lengths=window_host_hit_lengths,
                 admitted_chunk_limit=chunk_tokens_limit,
                 cached_tokens=prefix_len,
@@ -2076,6 +2097,7 @@ class PrefillAdder:
             admission.max_new_tokens,
             req.retracted_stain,
             state_slots=state_slots,
+            request_rows=self._request_rows_for_req(req),
             request_slot_reserve=self._request_slot_reserve_for_req(
                 req, extend_input_len=admission.extend_len
             ),
