@@ -1,0 +1,127 @@
+---
+title: "Performance baselines"
+description: "Published Ascend NPU performance baselines, the comparisons they support, and the benchmark procedure needed to reproduce them."
+keywords:
+  - performance baseline
+  - 性能基线
+  - benchmark
+  - 基准测试
+  - TPOT
+  - TTFT
+  - throughput
+  - 吞吐
+  - DeepSeek-R1
+  - Qwen3-8B
+  - DeepSeek-V3.2
+  - Qwen3-32B
+  - A2
+  - A3
+---
+
+This page collects the performance numbers published in the Ascend NPU best-practice pages and shows what they can and cannot be compared against. It is a reference for capacity planning, not a leaderboard: every row belongs to one model, one card count, one dataset shape, and one image tag.
+
+## How to read these numbers
+
+- A TPOT value in a best-practice table is the decode latency target that the configuration is tuned to. The configuration is described as meeting that target; it is not the mean of every request you will see.
+- Numbers are comparable only when the model, the hardware series, the card count, the input/output lengths, and the image tag all match. A 3.5k+1.5k row and a 6k+1.5k row answer different questions.
+- The baseline pages referenced here were validated with `quay.io/ascend/sglang:v0.5.18-cann9.0.0-a3` and benchmarked with `sglang.benchmark.serving` on the random dataset with `--random-range-ratio 1`.
+- On the A3 Series each card has two dies. A row with `Cards: 1` runs `--tp-size 2`; see [Glossary](/docs/hardware-platforms/ascend-npus/reference/glossary#hardware).
+
+## Precision changes the card budget
+
+<Frame caption="DeepSeek-R1 on A3 Series: cards needed to reach a 50 ms TPOT target at 3.5k input + 1.5k output.">
+  <img src="/images/ascend-npus/kb-deepseek-r1-cards.svg" alt="Bar chart comparing 8 cards with W4A8 PD mixed, 16 cards with W4A8 PD disaggregation, and 32 cards with W8A8 PD disaggregation for DeepSeek-R1 at a 50 ms TPOT target." />
+</Frame>
+
+| Precision | Cards | Deploy mode | Dataset | TPOT target | Configuration |
+| --- | --- | --- | --- | --- | --- |
+| W4A8 INT8 | 8 | PD mixed | 3.5k+1.5k | 50 ms | [DeepSeek-R1 best practice](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/deepseek_r1) |
+| W4A8 INT8 | 16 | PD disaggregation | 3.5k+1.5k | 50 ms | [DeepSeek-R1 best practice](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/deepseek_r1) |
+| W8A8 INT8 | 32 | PD disaggregation | 3.5k+1.5k | 50 ms | [DeepSeek-R1 best practice](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/deepseek_r1) |
+
+The same latency target needs twice the cards when the model runs in W8A8 instead of W4A8 in PD disaggregation, and four times the cards compared with the 8-card W4A8 PD mixed configuration. Decode is memory-bandwidth bound, so halving the weight width is the largest single lever on card count for a large MoE. Validate accuracy before you take the saving; see [Quantization selection](/docs/hardware-platforms/ascend-npus/knowledge-base/quantization-selection).
+
+## Concurrency trades against per-token latency
+
+<Frame caption="Qwen3-8B on one A3 card: the low-latency profile and the throughput profile of the same model and precision.">
+  <img src="/images/ascend-npus/kb-qwen3-8b-concurrency.svg" alt="Bar chart comparing 5 ms TPOT at 1 concurrent request with 37 ms TPOT at 64 concurrent requests for Qwen3-8B on one A3 card." />
+</Frame>
+
+| Profile | Cards | Max running requests | Benchmark concurrency | Dataset | TPOT target |
+| --- | --- | --- | --- | --- | --- |
+| Low latency | 1 | 1 | 1 | 3.5k+1.5k | 5 ms |
+| Throughput | 1 | 70 | 64 | 3.5k+1.5k | 37 ms |
+| Throughput, longer input | 1 | 16 | 16 | 6k+1.5k | 11.79 ms |
+
+One 8B model on one card covers more than seven times the per-token latency depending on how many requests it holds at once. Both profiles use W8A8 INT8 and EAGLE3 speculative decoding; they differ in `--max-running-requests`, `--cuda-graph-bs-decode`, and the number of speculative steps. Choose the profile from your latency SLO, then tune the batch window with [Parameter tuning](/docs/hardware-platforms/ascend-npus/optimization/parameter_tuning).
+
+## Long context multiplies decode cost
+
+<Frame caption="DeepSeek-V3.2 on 32 A3 cards at 128k input: decode cost at the batch size used by each profile.">
+  <img src="/images/ascend-npus/kb-deepseek-v32-batch.svg" alt="Bar chart comparing a 26 ms TPOT target at batch 8 with a 107 ms TPOT target at batch 16 for DeepSeek-V3.2 at 128k context." />
+</Frame>
+
+| Profile | Cards | Batch size | Dataset | TPOT target |
+| --- | --- | --- | --- | --- |
+| Low latency | 32 | 8 | 128k+1k | 26 ms |
+| High throughput | 32 | 16 | 128k+1k | 107 ms |
+
+At 128k input, doubling the batch size takes the TPOT target from 26 ms to 107 ms. Long-context decode spends its time on KV cache traffic, so the batch cost is not linear. Capacity plans for long-context traffic should be sized from the high-throughput row, not from the short-context numbers.
+
+## Hardware series at equal configuration
+
+<Frame caption="Qwen3-32B, W8A8 INT8, 2 cards, 3.5k input + 1.5k output: the only published A2/A3 pair with identical settings.">
+  <img src="/images/ascend-npus/kb-qwen3-32b-a2-a3.svg" alt="Bar chart comparing a 50 ms TPOT target on A3 Series with 55 ms on A2 Series for Qwen3-32B on 2 cards." />
+</Frame>
+
+| Hardware | Cards | Precision | Dataset | TPOT target |
+| --- | --- | --- | --- | --- |
+| A3 Series | 2 | W8A8 INT8 | 3.5k+1.5k | 50 ms |
+| A2 Series | 2 | W8A8 INT8 | 3.5k+1.5k | 55 ms |
+
+With everything else held fixed, the A2 pair reaches 55 ms where the A3 pair reaches 50 ms. This is the only published baseline where a generation-to-generation comparison is possible without changing another variable; do not extrapolate the ratio to other models.
+
+## Reproduce a baseline
+
+Run the benchmark against a server started from the matching best-practice configuration. This command reproduces the Qwen3-8B low-latency row; only the port differs from that page's example.
+
+```shell Command
+python -m sglang.benchmark.serving \
+    --dataset-name random \
+    --backend sglang \
+    --host 127.0.0.1 \
+    --port 30000 \
+    --max-concurrency 1 \
+    --num-prompts 4 \
+    --random-input-len 3500 \
+    --random-output-len 1500 \
+    --random-range-ratio 1 \
+    --seed 1
+```
+
+For a throughput row, raise `--max-concurrency` and `--num-prompts` to the values in that configuration's benchmark section. Record the following with the result:
+
+```shell Command
+npu-smi info
+npu-smi info -l
+pip show sglang
+echo $IMAGE
+```
+
+`npu-smi info -l` reports `Chip Count: 2` per NPU on the A3 Series, which is how you confirm the die layout before comparing card counts. If `npu-smi` is missing, the driver is not installed; see [Installation](/docs/hardware-platforms/ascend-npus/getting-started/installation).
+
+## Limits of this data
+
+- Only one comparison in this section isolates the hardware series. Model, precision, card count, and dataset usually change together between rows.
+- Quantization accuracy is not measured here. A W4A8 row tells you the memory and latency cost, not the quality cost.
+- Values come from a fixed image tag. A newer or older image can change both latency and supported features.
+- The dataset is fixed-length random tokens, which removes variance but also removes the length distribution of real traffic.
+
+If you publish a new baseline, add the summary row to the model's best-practice page first, then add the comparison here only when it shares model, precision, cards, dataset, and image tag with an existing row.
+
+## See also
+
+- [Performance testing](/docs/hardware-platforms/ascend-npus/evaluation/performance_testing): full benchmark tooling, including Evalscope and AISBench
+- [Best practices](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/qwen3_8b): per-model launch scripts and benchmark commands
+- [Parameter tuning](/docs/hardware-platforms/ascend-npus/optimization/parameter_tuning): the flags that move TPOT and TTFT
+- [Accuracy evaluation](/docs/hardware-platforms/ascend-npus/evaluation/accuracy_evaluation): validating a quantized model

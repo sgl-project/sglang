@@ -1,0 +1,108 @@
+---
+title: "Quantization selection"
+description: "Choose a quantization scheme for Ascend NPUs by hardware series, model type, and deployment goal, with the precision trade-offs each scheme implies."
+keywords:
+  - quantization
+  - 量化
+  - 量化选型
+  - W8A8
+  - W4A8
+  - W4A16
+  - MXFP8
+  - MXFP4
+  - ModelSlim
+  - AWQ
+  - GPTQ
+  - AutoRound
+  - GGUF
+  - Ascend NPU
+---
+
+Quantization on Ascend is a hardware decision before it is an accuracy decision. The A2 and A3 Series run INT8 and INT4 schemes through msModelSlim and the AWQ, GPTQ, AutoRound, compressed-tensors, and GGUF loaders; MXFP8 and MXFP4 need the 950PR/DT Series because the block-scaled matmul kernels do not exist on A2/A3.
+
+This page helps you choose. The full support matrices, kernel notes, and per-scheme commands stay in [Quantization on Ascend](/docs/hardware-platforms/ascend-npus/optimization/quantization).
+
+## Choose by hardware
+
+| Hardware series | Schemes available | Typical starting point |
+| --- | --- | --- |
+| A3 Series | W8A8 INT8 (static and dynamic), W4A8 dynamic MoE, W4A4 dynamic Linear and MoE, AWQ, GPTQ, AutoRound, compressed-tensors, GGUF | W8A8 INT8 |
+| A2 Series | Same INT8/INT4 and loader set as A3; MXFP schemes are not available | W8A8 INT8 |
+| 950PR/DT Series | MXFP8 for Linear and MoE, MXFP4 W4A8 for Linear and MoE, MXFP4 W4A4 for MoE (Linear WIP); INT8/INT4 ModelSlim paths are still marked TBD | MXFP8 |
+
+Most published A2/A3 best practices use W8A8 INT8. The 950PR/DT Series is the only series where MXFP8 and MXFP4 are validated end to end.
+
+## Choose by goal
+
+| Goal | Recommended scheme | Why |
+| --- | --- | --- |
+| Highest accuracy for a first bring-up | BF16 or FP16, no `--quantization` flag | Removes quantization from the list of variables while you validate the deployment |
+| Fit a large MoE into a fixed card budget | W4A8 INT8 | 4-bit weights cut the weight traffic that dominates decode; Qwen3.5-397B-A17B runs on 8 cards this way |
+| Keep accuracy close to BF16 while saving memory | W8A8 INT8 | 8-bit activations limit accuracy loss, and the scheme is validated across the model set |
+| Lowest weight traffic on 950PR/DT | MXFP8 or MXFP4 | Block-scaled FP8/FP4 matmul kernels are native to that series |
+| Reuse a checkpoint that is already quantized | No flag; load the checkpoint | The scheme is read from `quant_model_description.json` or `config.json` |
+| Run community GGUF weights | GGUF | Weights are dequantized to BF16 during load and then sharded by `--tp-size` |
+
+<Note>
+The best-practice scripts pass `--quantization modelslim` explicitly for msModelSlim checkpoints. Omitting the flag also works when `quant_model_description.json` is present, because the scheme is auto-detected.
+</Note>
+
+## Scheme comparison
+
+| Scheme | Weights | Activations | A2/A3 | 950PR/DT | Where to use it |
+| --- | --- | --- | --- | --- | --- |
+| W8A8 INT8 (ModelSlim, static or dynamic) | 8-bit | 8-bit | Supported | TBD | Default for A2/A3 dense and MoE models |
+| W4A8 dynamic (ModelSlim) | 4-bit | 8-bit | Supported (MoE) | TBD | Large MoE models where card count matters |
+| W4A4 dynamic (ModelSlim) | 4-bit | 4-bit | Supported (Linear and MoE) | TBD | Tight memory budgets; validate accuracy first |
+| AWQ W4A16 / W8A16 | 4 or 8-bit | 16-bit | Supported | TBD | Community checkpoints with AWQ scales |
+| GPTQ W4A16 / W8A16 | 4 or 8-bit | 16-bit | Supported | TBD | Community checkpoints with GPTQ scales |
+| AutoRound W4A16 / W8A16 | 4 or 8-bit | 16-bit | Supported | TBD | Checkpoints produced by Intel AutoRound |
+| compressed-tensors | 8 or 4-bit | 8 or 16-bit | Supported | TBD | LLM Compressor exports |
+| GGUF | Various | Dequantized | Supported | TBD | GGUF community weights |
+| MXFP8 (W8A8) | 8-bit FP8 | 8-bit FP8 | Not available | Supported | 950PR/DT default for Linear and MoE |
+| MXFP4 W4A8 | 4-bit FP4 | 8-bit FP8 | Not available | Supported | 950PR/DT dense and MoE |
+| MXFP4 W4A4 | 4-bit FP4 | 4-bit FP4 | Not available | MoE supported, Linear WIP | 950PR/DT MoE with the tightest memory budget |
+
+## Load a quantized model
+
+Offline checkpoints produced by msModelSlim carry their scheme in `quant_model_description.json`, so the server loads them without a quantization flag:
+
+```shell Command
+python3 -m sglang.launch_server \
+    --model-path /path/to/Qwen3-8B-w8a8 \
+    --device npu --attention-backend ascend \
+    --host 0.0.0.0 --port 30000 \
+    --tp-size 1 --mem-fraction-static 0.8
+```
+
+Online MXFP8 on the 950PR/DT Series quantizes BF16 or FP16 weights at load time:
+
+```shell Command
+python3 -m sglang.launch_server \
+    --model-path Qwen/Qwen3-8B \
+    --quantization mxfp8 \
+    --device npu --attention-backend ascend \
+    --host 0.0.0.0 --port 30000 \
+    --tp-size 1 --mem-fraction-static 0.8
+```
+
+For a diffusion model such as Wan2.2, the same choice applies: MXFP8 requires the 950PR/DT Series, while ModelSlim W8A8 and W4A4 work on A2/A3.
+
+<Warning>
+SGLang does not support quantized embeddings. Disable embedding quantization when you export a checkpoint with msModelSlim.
+</Warning>
+
+## Validate before rollout
+
+1. Run the accuracy evaluation described in [Accuracy evaluation](/docs/hardware-platforms/ascend-npus/evaluation/accuracy_evaluation). At minimum, compare the quantized model against the BF16 release on your own task prompts.
+2. Check the layers that are easy to get wrong. In MXFP8 MoE checkpoints the router gate may also be quantized; loading it as BF16 without its block scales changes routing and produces unusable output.
+3. Measure both directions of latency with [Performance testing](/docs/hardware-platforms/ascend-npus/evaluation/performance_testing): prefill (TTFT) and decode (TPOT). Quantization changes them differently.
+4. Watch memory with `npu-smi info`. A 4-bit checkpoint that still triggers an out-of-memory error usually needs a lower `--mem-fraction-static` or more cards, not a different scheme.
+5. Record the scheme, the checkpoint path, and the msModelSlim version next to the image tag, so the result can be reproduced.
+
+## See also
+
+- [Quantization on Ascend](/docs/hardware-platforms/ascend-npus/optimization/quantization): full support matrices, kernel and dispatch notes
+- [Parameter tuning](/docs/hardware-platforms/ascend-npus/optimization/parameter_tuning): `--mem-fraction-static`, `--tp-size`, graph capture, speculative decoding
+- [Performance baselines](/docs/hardware-platforms/ascend-npus/knowledge-base/performance-baselines): published configurations and what their numbers mean
+- [Supported models](/docs/hardware-platforms/ascend-npus/reference/support_models): model checkpoints that are validated on each series
