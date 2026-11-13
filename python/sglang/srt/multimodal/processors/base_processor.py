@@ -239,7 +239,7 @@ def _init_cpu_worker(media_url_policy: tuple) -> None:
 
 class BaseMultimodalProcessor(ABC):
     models = []
-    gpu_image_decode = True  # Enable GPU decoding by default
+    gpu_image_decode = True  # Enable device image decoding by default
     smart_rgb_conversion = False
     video_preprocessing_device = None
     # Redo preprocessing on CPU when the GPU runs out of memory (the tokenizer
@@ -850,6 +850,9 @@ class BaseMultimodalProcessor(ABC):
 
             npu_apply_glm46v_image_preprocess_patch()
             return "npu"
+        if processor.__class__.__name__ == "Glm4vProcessor":
+            # GLM-4V patch extraction exceeds the NPU tensor dimension limit.
+            return "cpu"
         return None
 
     @contextmanager
@@ -1010,7 +1013,7 @@ class BaseMultimodalProcessor(ABC):
             if modality == Modality.IMAGE:
                 img, _ = load_image(data, cls.gpu_image_decode)
                 if isinstance(img, torch.Tensor):
-                    return img  # JPEG already decoded on GPU by nvJPEG
+                    return img  # JPEG already decoded to a device tensor
                 # PIL decodes lazily; do it here in the io worker so the decode
                 # doesn't run later on the event-loop thread.
                 if discard_alpha_channel:

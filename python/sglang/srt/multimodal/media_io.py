@@ -36,7 +36,7 @@ import torch
 from PIL import Image, ImageOps, UnidentifiedImageError
 from typing_extensions import Literal
 
-from sglang.srt.utils.device import is_cuda
+from sglang.srt.utils.device import is_cuda, is_npu
 from sglang.srt.utils.video_decoder import _BACKEND, VideoDecoderWrapper
 
 logger = logging.getLogger(__name__)
@@ -545,6 +545,20 @@ def is_jpeg_with_cuda(
     return False
 
 
+def is_jpeg_with_npu(
+    image_bytes: bytes = b"", gpu_image_decode: GPUImageDecodeMode = True
+) -> bool:
+    """Check NPU JPEG eligibility under the shared image decoding policy."""
+    if not is_npu() or not gpu_image_decode:
+        return False
+    # Preserve PIL fidelity until NPU fancy upsampling is implemented.
+    if gpu_image_decode == "nvjpeg_fancy":
+        return False
+    if image_bytes != b"":
+        return image_bytes.startswith(b"\xff\xd8") and image_bytes.endswith(b"\xff\xd9")
+    return False
+
+
 @lru_cache(maxsize=16)
 def _warn_fancy_jpeg_fallback(error: str) -> None:
     logger.warning(
@@ -560,7 +574,7 @@ def _load_image(
     gpu_image_decode: GPUImageDecodeMode = True,
 ) -> Union[torch.Tensor, Image.Image]:
     """
-    Try to decode JPEG with nvJPEG on GPU and return a torch device tensor,
+    Try device JPEG decoding and return a torch device tensor,
     otherwise fallback to decode with PIL on CPU and return a PIL Image.
     Keep the fallback path since nvJPEG may fail on some JPEG images that are not strictly compliant with the standard, while PIL is more tolerant.
     """
@@ -587,6 +601,14 @@ def _load_image(
                     "Failed to decode JPEG on GPU, falling back to CPU. Error: %s",
                     e,
                 )
+    elif is_jpeg_with_npu(image_bytes, gpu_image_decode):
+        from sglang.srt.hardware_backend.npu.jpeg import decode_jpeg
+
+        encoded_image = torch.frombuffer(image_bytes, dtype=torch.uint8)
+        image_tensor = decode_jpeg(encoded_image, device="npu")
+        if image_tensor is not None:
+            return image_tensor
+        # Unsupported devices/images return None; execution errors propagate.
     try:
         image = Image.open(BytesIO(image_bytes))
     except (OSError, SyntaxError) as e:

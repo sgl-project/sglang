@@ -328,10 +328,10 @@ def _patch_image_processor_kwargs():
 
 
 def _patch_image_process_cuda_tensor():
-    """Handle CUDA tensors and grayscale tensor RGB conversion in PIL processing.
+    """Handle CUDA/NPU tensors and grayscale RGB conversion in PIL processing.
 
     Transformers v5.4's PIL image processing backend calls
-    ``image.numpy()`` on torch tensors, which fails for CUDA tensors.
+    ``image.numpy()`` on torch tensors, which fails for CUDA/NPU tensors.
     Move them to CPU before processing. Its RGB conversion handles PIL images
     but leaves tensors unchanged: a grayscale JPEG decoded as a [1, H, W]
     tensor stays single-channel even when ``do_convert_rgb`` is requested.
@@ -352,7 +352,7 @@ def _patch_image_process_cuda_tensor():
             def patched_process_image(
                 self, image, *args, _orig=original, _Tensor=torch.Tensor, **kwargs
             ):
-                if isinstance(image, _Tensor) and image.is_cuda:
+                if isinstance(image, _Tensor) and image.device.type in ("cuda", "npu"):
                     image = image.cpu()
                 result = _orig(self, image, *args, **kwargs)
                 # Check channels after process_image converts the layout to CHW.
