@@ -732,8 +732,11 @@ class TestAttachAdditionalStopTokenIds(CustomTestCase):
     (documented by the Inkling GSM8K test)."""
 
     @staticmethod
-    def _tokenizer(added):
-        return SimpleNamespace(get_added_vocab=lambda: added)
+    def _tokenizer(added, chat_template=None):
+        return SimpleNamespace(
+            get_added_vocab=lambda: added,
+            chat_template=chat_template,
+        )
 
     def test_inkling_end_sampling_registers_as_stop(self):
         tok = self._tokenizer({"<|content_model_end_sampling|>": 200006})
@@ -749,6 +752,24 @@ class TestAttachAdditionalStopTokenIds(CustomTestCase):
         tok = self._tokenizer({"<|ifm|im_end|>": 64019})
         attach_additional_stop_token_ids(tok)
         self.assertEqual(tok.additional_stop_token_ids, {64019})
+
+    def test_glm53_assistant_marker_registers_as_stop(self):
+        glm53_template = (
+            "[gMASK]<sop>Reasoning Effort: {{ reasoning_effort }}"
+            "<tool_call><arg_key><arg_value>"
+        )
+        tok = self._tokenizer({"<|assistant|>": 154828}, chat_template=glm53_template)
+        attach_additional_stop_token_ids(tok)
+        self.assertEqual(tok.additional_stop_token_ids, {154828})
+
+    def test_non_glm53_assistant_marker_not_registered_as_stop(self):
+        glm45_template = (
+            "[gMASK]<sop>{% if enable_thinking %}{% endif %}"
+            "<tool_call><arg_key><arg_value>"
+        )
+        tok = self._tokenizer({"<|assistant|>": 154828}, chat_template=glm45_template)
+        attach_additional_stop_token_ids(tok)
+        self.assertIsNone(tok.additional_stop_token_ids)
 
     def test_no_known_marker_yields_none(self):
         tok = self._tokenizer({"<|other|>": 7})
