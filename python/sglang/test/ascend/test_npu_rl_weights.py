@@ -305,13 +305,6 @@ def make_tensor(name: str, shape: Tuple[int, ...], dtype: torch.dtype) -> torch.
     return tensor.to(dtype)
 
 
-def iter_payload(
-    case: WeightUpdateModelCase,
-) -> Iterator[Tuple[str, torch.Tensor]]:
-    for name, shape, dtype in payload_metadata(case):
-        yield name, make_tensor(name, shape, dtype)
-
-
 class FixedRandomWeightSource:
     """Deterministic payload for one case, in the shape of vLLM's weight source."""
 
