@@ -26,7 +26,6 @@ from sglang.test.ascend.test_npu_rl_utils import (
     health,
     load_checkpoint_tensor,
     logprob_signature,
-    npu_device_count,
     npu_rl_env,
     npu_server,
 )
@@ -76,7 +75,6 @@ def _pick_norm(manifest):
     raise AssertionError("no norm tensor found")
 
 
-@unittest.skipUnless(npu_device_count() >= 2, "requires at least 2 Ascend NPUs")
 class TestNpuUpdateWeightsFromDistributed(CustomTestCase):
     @classmethod
     def setUpClass(cls):

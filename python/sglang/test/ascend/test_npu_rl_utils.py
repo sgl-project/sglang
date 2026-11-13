@@ -20,10 +20,8 @@ import torch
 
 try:
     import torch_npu  # noqa: F401
-
-    _NPU_IMPORT_ERROR: Optional[Exception] = None
-except Exception as exc:  # pragma: no cover - exercised only off NPU hosts
-    _NPU_IMPORT_ERROR = exc
+except Exception:  # pragma: no cover - exercised only off NPU hosts
+    torch_npu = None
 
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -50,21 +48,12 @@ def _torch_mem(device: int = 0) -> Tuple[int, int]:
     return int(free), int(total)
 
 
-def npu_available() -> bool:
-    if _NPU_IMPORT_ERROR is not None:
-        return False
-    try:
-        return torch.npu.is_available() and torch.npu.device_count() > 0
-    except Exception:
-        return False
-
-
 def _is_ascend_950() -> bool:
     """Return whether the current NPU is an Ascend 950 (A5).
 
     SOC versions 250-256 are A3; Ascend 950 reports 260.
     """
-    if not npu_available():
+    if torch_npu is None:
         return False
     try:
         return int(torch_npu.npu.get_soc_version()) >= 260
@@ -75,19 +64,6 @@ def _is_ascend_950() -> bool:
 def npu_rl_env() -> Dict[str, str]:
     """Return the extra server env required by the RL lifecycle tests."""
     return dict(A5_SPEC_ENV) if _is_ascend_950() else {}
-
-
-def npu_device_count() -> int:
-    """Number of devices visible to this process."""
-    if _NPU_IMPORT_ERROR is not None:
-        return 0
-    visible = os.environ.get("ASCEND_RT_VISIBLE_DEVICES")
-    if visible:
-        return len([item for item in visible.split(",") if item.strip()])
-    try:
-        return int(torch.npu.device_count())
-    except Exception:
-        return 0
 
 
 def npu_free_bytes(device: int = 0) -> int:
@@ -134,8 +110,6 @@ def _wait_for_hbm_baseline(
     not race that cleanup. Teardown must not fail the test, so a timeout is
     ignored.
     """
-    if not npu_available():
-        return
     deadline = time.time() + timeout
     while time.time() < deadline:
         if npu_free_bytes(device) >= baseline_free:
@@ -172,19 +146,17 @@ def npu_server(
     """
     port = port or find_available_port(30000)
     base_url = f"http://127.0.0.1:{port}"
-    baseline_free = 0
-    if npu_available():
-        # Warm the test process's NPU context while the card is idle; the first
-        # in-process mem_get_info() call is otherwise paid while the server is
-        # starting. Then wait for the previous server to hand HBM back, using
-        # the memory fraction this server will reserve plus a fixed margin.
-        npu_free_bytes(0)
-        mem_fraction = float(_server_arg(extra_args, "--mem-fraction-static", "0.9"))
-        tp_size = max(1, int(_server_arg(extra_args, "--tp-size", "1")))
-        min_free = int(mem_fraction * npu_total_bytes(0)) + MEMORY_WAIT_MARGIN_BYTES
-        for device in range(tp_size):
-            wait_for_free_memory(device, min_free, timeout=300)
-        baseline_free = npu_free_bytes(0)
+    # Warm the test process's NPU context while the card is idle; the first
+    # in-process mem_get_info() call is otherwise paid while the server is
+    # starting. Then wait for the previous server to hand HBM back, using the
+    # memory fraction this server will reserve plus a fixed margin.
+    npu_free_bytes(0)
+    mem_fraction = float(_server_arg(extra_args, "--mem-fraction-static", "0.9"))
+    tp_size = max(1, int(_server_arg(extra_args, "--tp-size", "1")))
+    min_free = int(mem_fraction * npu_total_bytes(0)) + MEMORY_WAIT_MARGIN_BYTES
+    for device in range(tp_size):
+        wait_for_free_memory(device, min_free, timeout=300)
+    baseline_free = npu_free_bytes(0)
     process = popen_launch_server(
         model_path,
         base_url,
