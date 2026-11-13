@@ -108,9 +108,10 @@ Adding one = a `MmFamilyProcessor` impl in `src/<model>/mod.rs` plus a
 `common::fetch` matches the Python `get_image_bytes` semantics
 (`REQUEST_TIMEOUT` env, `HTTP(S)_PROXY` / `ALL_PROXY` / `NO_PROXY` including
 IPv4-CIDR and `host:port` entries) with deliberate safety bounds: every media
-source contributes to a shared 64-item / 1.25 GiB request budget, and each
-remote I/O stream has an additional 64 MiB cap. `file://` URLs also work (the
-Python helper passes the un-stripped URL to `open()`).
+source contributes to a shared 1.25 GiB request budget, and each remote I/O
+stream has an additional 64 MiB cap. As in Python, there is no fixed item-count
+cap. `file://` URLs also work (the Python helper passes the un-stripped URL to
+`open()`).
 
 ## Python API
 
@@ -190,8 +191,9 @@ impl ImageProcessorSpec for MyModelProcessor {
 
 - All fan-out goes through `common::par`, so whether this crate owns threads is
   decided by the `parallel` feature alone. With it on: CPU pool capped at
-  `min(8, cores)` (override `SGL_MM_RS_THREADS`). With it off: no rayon, no
-  threads, everything inline. Output is bit-identical either way — the fan-outs
+  `min(8, cores)` (override `SGLANG_MM_RS_THREADS`; the deprecated
+  `SGL_MM_RS_THREADS` is still read). With it off: no rayon, no threads,
+  everything inline. Output is bit-identical either way — the fan-outs
   are order-preserving maps and writes into disjoint slices, never reductions.
   Note that sizing a pool to 1 is *not* the same as off: `install` blocks the
   caller and would serialize every concurrent request in the process.

@@ -4,6 +4,7 @@
 //! `TokenizerManager._create_tokenized_object` does).
 
 use std::collections::BTreeMap;
+use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
@@ -88,6 +89,27 @@ defaulted! {
 /// going through [`defaulted`].
 fn max_new_tokens_default() -> Option<i64> {
     Some(128)
+}
+
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WatermarkRequestConfig {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub key: Option<String>,
+    #[serde(default)]
+    pub context_window: Option<i64>,
+}
+
+impl fmt::Debug for WatermarkRequestConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WatermarkRequestConfig")
+            .field("enabled", &self.enabled)
+            .field("key", &"<redacted>")
+            .field("context_window", &self.context_window)
+            .finish()
+    }
 }
 
 /// The sampling parameters of one `/generate` request. Deserialized from the
@@ -209,6 +231,8 @@ pub struct SamplingParams {
     /// Python's `CustomParamValue` exactly.
     #[serde(default)]
     pub custom_params: Option<BTreeMap<String, CustomParamValue>>,
+    #[serde(default)]
+    pub watermark: Option<WatermarkRequestConfig>,
 
     // Normalized internal fields.
     //
@@ -270,6 +294,7 @@ impl Default for SamplingParams {
             spaces_between_special_tokens: bool_true::default(),
             no_stop_trim: bool_false::default(),
             custom_params: None,
+            watermark: None,
             stream_interval: None,
             logit_bias: None,
             sampling_seed: None,
@@ -294,6 +319,19 @@ impl SamplingParams {
         self.verify(vocab_size)
     }
 
+    /// `temperature` and `top_k` as the scheduler samples with them, which
+    /// [`normalize`](Self::normalize) settles: a greedy temperature samples at
+    /// 1.0 from the top token, and `top_k = -1` is the whole vocabulary.
+    pub fn sampled_temperature_top_k(&self) -> (f64, i64) {
+        if (0.0..SAMPLING_EPS).contains(&self.temperature) {
+            (1.0, 1)
+        } else if self.top_k == -1 {
+            (self.temperature, TOP_K_ALL)
+        } else {
+            (self.temperature, self.top_k)
+        }
+    }
+
     /// Python `__post_init__` (minus the null-to-default coercions, which the
     /// null-tolerant deserializers above already did): copy the API aliases into
     /// the internal fields and apply the greedy / `top_k` special cases.
@@ -312,14 +350,7 @@ impl SamplingParams {
         if self.stop_token_ids.as_ref().is_some_and(|v| v.is_empty()) {
             self.stop_token_ids = None;
         }
-        if (0.0..SAMPLING_EPS).contains(&self.temperature) {
-            // Greedy: temperature ~0 → temperature=1.0, top_k=1.
-            self.temperature = 1.0;
-            self.top_k = 1;
-        }
-        if self.top_k == -1 {
-            self.top_k = TOP_K_ALL; // -1 disables top_k → whole vocabulary
-        }
+        (self.temperature, self.top_k) = self.sampled_temperature_top_k();
         for constraint in [
             &mut self.json_schema,
             &mut self.regex,
@@ -724,6 +755,7 @@ mod tests {
         "logit_bias",
         "sampling_seed",
         "custom_params",
+        "watermark",
         "stop_strs",
         "stop_regex_strs",
         "stop_str_max_len",
@@ -803,10 +835,28 @@ mod tests {
         assert!(arr[at("stop")].is_nil());
         assert!(arr[at("logit_bias")].is_nil());
         assert!(arr[at("custom_params")].is_nil());
+        assert!(arr[at("watermark")].is_nil());
         // `normalize` outputs occupy the tail.
         assert!(arr[at("stop_strs")].is_array());
         assert_eq!(arr[at("is_normalized")].as_bool(), Some(false));
         assert_eq!(arr[at("ebnf_full_assistant")].as_bool(), Some(false));
+    }
+
+    #[test]
+    fn watermark_key_is_typed_and_debug_redacted() {
+        let key = "0123456789abcdef";
+        let sampling = norm(
+            &serde_json::json!({
+                "watermark": {"enabled": true, "key": key, "context_window": 4}
+            })
+            .to_string(),
+        );
+        let watermark = sampling.watermark.as_ref().expect("watermark parsed");
+
+        assert_eq!(watermark.key.as_deref(), Some(key));
+        assert_eq!(watermark.context_window, Some(4));
+        assert_eq!(watermark.enabled, Some(true));
+        assert!(!format!("{sampling:?}").contains(key));
     }
 
     #[test]

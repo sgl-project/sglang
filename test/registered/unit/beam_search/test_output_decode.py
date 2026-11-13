@@ -6,6 +6,7 @@ token into a matched one.
 """
 
 import unittest
+from array import array
 from types import SimpleNamespace
 
 import torch
@@ -16,6 +17,7 @@ from sglang.srt.beam_search.output import (
     pack_beam_search_output,
 )
 from sglang.srt.managers.detokenizer_manager import DetokenizerManager
+from sglang.srt.managers.incremental_detokenize import DetokenizeHeader
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -25,9 +27,21 @@ STOP_ID = 99
 
 
 def _trim(output, finished_reason, no_stop_trim):
-    stub = SimpleNamespace(is_tool_call_parser_gpt_oss=False)
+    stub = SimpleNamespace(
+        is_tool_call_parser_gpt_oss=False, tool_close_token_ids=frozenset()
+    )
     return DetokenizerManager.trim_matched_stop(
         stub, output, finished_reason, no_stop_trim
+    )
+
+
+def _header(*, no_stop_trim):
+    return DetokenizeHeader(
+        prompt_tail_ids=array("q"),
+        skip_special_tokens=True,
+        spaces_between_special_tokens=True,
+        no_stop_trim=no_stop_trim,
+        http_worker_ipc=None,
     )
 
 
@@ -90,12 +104,10 @@ def _decode(group, *, disable_batch_decode):
         beam_search_output=[packed],
         # The leader's reason, which the trim must not consult.
         finished_reasons=[{"type": "stop", "matched": STOP_ID}],
-        no_stop_trim=[False],
-        skip_special_tokens=[True],
-        spaces_between_special_tokens=[True],
     )
     decode_beam_search_output(
         recv_obj,
+        [_header(no_stop_trim=False)],
         tokenizer=_IdTokenizer(),
         disable_batch_decode=disable_batch_decode,
         trim_matched_stop=_trim,
@@ -140,12 +152,10 @@ class TestDecodeBeamSearchOutput(CustomTestCase):
         recv_obj = SimpleNamespace(
             beam_search_output=[packed],
             finished_reasons=[{"type": "stop", "matched": STOP_ID}],
-            no_stop_trim=[True],
-            skip_special_tokens=[True],
-            spaces_between_special_tokens=[True],
         )
         decode_beam_search_output(
             recv_obj,
+            [_header(no_stop_trim=True)],
             tokenizer=_IdTokenizer(),
             disable_batch_decode=True,
             trim_matched_stop=_trim,
@@ -159,17 +169,34 @@ class TestDecodeBeamSearchOutput(CustomTestCase):
         recv_obj = SimpleNamespace(
             beam_search_output=[None, packed],
             finished_reasons=[None, {"type": "stop", "matched": STOP_ID}],
-            no_stop_trim=[False, False],
-            skip_special_tokens=[True, True],
-            spaces_between_special_tokens=[True, True],
         )
         decode_beam_search_output(
             recv_obj,
+            [_header(no_stop_trim=False), _header(no_stop_trim=False)],
             tokenizer=_IdTokenizer(),
             disable_batch_decode=False,
             trim_matched_stop=_trim,
         )
         self.assertTrue(all(s.text is not None for s in packed.sequences))
+
+    def test_beam_row_without_detokenize_state_is_skipped(self):
+        """A row with no header gets no beam text instead of failing the whole batch."""
+        for disable_batch_decode in (True, False):
+            with self.subTest(disable_batch_decode=disable_batch_decode):
+                group = _mixed_group(stop_wins=True)
+                packed = pack_beam_search_output(SimpleNamespace(beam_group=group))
+                recv_obj = SimpleNamespace(
+                    beam_search_output=[packed],
+                    finished_reasons=[{"type": "stop", "matched": STOP_ID}],
+                )
+                decode_beam_search_output(
+                    recv_obj,
+                    [None],
+                    tokenizer=_IdTokenizer(),
+                    disable_batch_decode=disable_batch_decode,
+                    trim_matched_stop=_trim,
+                )
+                self.assertTrue(all(s.text is None for s in packed.sequences))
 
 
 if __name__ == "__main__":

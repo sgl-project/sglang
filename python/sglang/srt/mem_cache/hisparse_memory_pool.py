@@ -5,10 +5,14 @@ from typing import Optional
 
 import torch
 
+from sglang.kernels.ops.kvcache.cache_move import copy_all_layer_kv_cache_func
 from sglang.kernels.ops.kvcache.hisparse_slot_mapping import (
     translate_padded_hisparse_locations,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.mem_cache.base_hisparse_memory_pool import (
+    HiSparseDevicePoolMappingMixin,
+)
 from sglang.srt.mem_cache.memory_pool import (
     DSATokenToKVPool,
     MHATokenToKVPool,
@@ -33,7 +37,7 @@ else:
         )
 
 
-class HiSparseDSATokenToKVPool(DSATokenToKVPool):
+class HiSparseDSATokenToKVPool(HiSparseDevicePoolMappingMixin, DSATokenToKVPool):
     def __init__(
         self,
         size: int,
@@ -54,6 +58,8 @@ class HiSparseDSATokenToKVPool(DSATokenToKVPool):
         max_running_requests: Optional[int] = None,
         skip_topk_layers: Optional[list[bool]] = None,
         host_to_device_ratio: int = 2,
+        kv_scale_ue8m0: bool = False,
+        use_fp4_indexer: bool = False,
     ):
         super().__init__(
             size=size,
@@ -74,13 +80,11 @@ class HiSparseDSATokenToKVPool(DSATokenToKVPool):
             tail_extra_slots=tail_extra_slots,
             max_running_requests=max_running_requests,
             skip_topk_layers=skip_topk_layers,
+            kv_scale_ue8m0=kv_scale_ue8m0,
+            use_fp4_indexer=use_fp4_indexer,
         )
         self.bytes_per_token = self.kv_cache_dim * self.dtype.itemsize
-
-    def register_mapping(self, full_to_hisparse_device_index_mapping: torch.Tensor):
-        self.full_to_hisparse_device_index_mapping = (
-            full_to_hisparse_device_index_mapping
-        )
+        self.data_strides = torch.full_like(self.data_ptrs, self.bytes_per_token)
 
     def translate_loc_to_hisparse_device(
         self, compressed_indices: torch.Tensor
@@ -94,13 +98,7 @@ class HiSparseDSATokenToKVPool(DSATokenToKVPool):
             return translate_padded_hisparse_locations(
                 self.full_to_hisparse_device_index_mapping, compressed_indices
             )
-        return self.full_to_hisparse_device_index_mapping[compressed_indices]
-
-    def _translate_loc_to_hisparse_device(self, compressed_indices: torch.Tensor):
-        return self.full_to_hisparse_device_index_mapping[compressed_indices]
-
-    def translate_loc_from_full_to_hisparse_device(self, full_indices: torch.Tensor):
-        return self._translate_loc_to_hisparse_device(full_indices)
+        return super().translate_loc_to_hisparse_device(compressed_indices)
 
     def translate_loc_from_full_to_compressed(self, full_indices: torch.Tensor):
         return full_indices
@@ -122,19 +120,53 @@ class HiSparseDSATokenToKVPool(DSATokenToKVPool):
         loc_info,
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
+        layer_id_override: Optional[int] = None,
     ):
         loc, _, _ = unwrap_write_loc(loc_info)
         loc = self.translate_loc_to_hisparse_device(loc)
-        super().set_mla_kv_buffer(layer, loc, cache_k_nope, cache_k_rope)
+        super().set_mla_kv_buffer(
+            layer,
+            loc,
+            cache_k_nope,
+            cache_k_rope,
+            layer_id_override=layer_id_override,
+        )
 
     def get_mla_kv_buffer(
         self,
         layer: RadixAttention,
         loc: torch.Tensor,
         dst_dtype: Optional[torch.dtype] = None,
+        layer_id_override: Optional[int] = None,
     ):
         loc = self.translate_loc_to_hisparse_device(loc)
-        return super().get_mla_kv_buffer(layer, loc, dst_dtype)
+        return super().get_mla_kv_buffer(
+            layer, loc, dst_dtype, layer_id_override=layer_id_override
+        )
+
+    def transfer_values_on_device(
+        self, dst_indices: torch.Tensor, src_indices: torch.Tensor
+    ) -> None:
+        """Copy target MLA KV between physical slots, without remapping IDs."""
+        if src_indices.numel() == 0:
+            return
+        config = {
+            "bytes_per_tile": 128,
+            "byte_tiles": (self.bytes_per_token + 127) // 128,
+            "num_warps": 4,
+        }
+        for start in range(0, src_indices.numel(), 256):
+            src = src_indices[start : start + 256].contiguous()
+            dst = dst_indices[start : start + 256].contiguous()
+            copy_all_layer_kv_cache_func(
+                self.data_ptrs,
+                self.data_strides,
+                dst,
+                src,
+                src.numel(),
+                1 << (src.numel() - 1).bit_length(),
+                config,
+            )
 
     def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
         raise NotImplementedError("HiSparseDevicePool does not support get_cpu_copy")
@@ -145,7 +177,7 @@ class HiSparseDSATokenToKVPool(DSATokenToKVPool):
         raise NotImplementedError("HiSparseDevicePool does not support load_cpu_copy")
 
 
-class HiSparseMHAMainPool(MHATokenToKVPool):
+class HiSparseMHAMainPool(HiSparseDevicePoolMappingMixin, MHATokenToKVPool):
     """MHA KV pool with HiSparse logical-to-device mapping.
 
     Used by MiniMax M3 HiSparse. The index pools (index_kv_pool, index_k_pool)
@@ -181,26 +213,9 @@ class HiSparseMHAMainPool(MHATokenToKVPool):
         self.bytes_per_token_k = head_num * head_dim * self.store_dtype.itemsize
         self.bytes_per_token_v = head_num * self.v_head_dim * self.store_dtype.itemsize
 
-    def register_mapping(
-        self, full_to_hisparse_device_index_mapping: torch.Tensor
-    ) -> None:
-        self.full_to_hisparse_device_index_mapping = (
-            full_to_hisparse_device_index_mapping
-        )
-
-    def translate_loc_to_hisparse_device(self, indices: torch.Tensor) -> torch.Tensor:
-        assert self.full_to_hisparse_device_index_mapping is not None
-        return self.full_to_hisparse_device_index_mapping[indices]
-
     def _translate_loc_to_hisparse_device(self, indices: torch.Tensor) -> torch.Tensor:
         assert self.full_to_hisparse_device_index_mapping is not None
-        return self.full_to_hisparse_device_index_mapping[indices]
-
-    def translate_loc_from_full_to_hisparse_device(
-        self, full_indices: torch.Tensor
-    ) -> torch.Tensor:
-        assert self.full_to_hisparse_device_index_mapping is not None
-        return self.full_to_hisparse_device_index_mapping[full_indices]
+        return super()._translate_loc_to_hisparse_device(indices)
 
     def translate_loc_from_full_to_compressed(
         self, full_indices: torch.Tensor

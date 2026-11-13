@@ -9,7 +9,7 @@ from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
 from sglang.test.server_fixtures.mmmu_fixture import MMMUServerBase
 from sglang.test.vlm_utils import AUDIO_TRUMP_SPEECH_URL
 
-register_cuda_ci(est_time=317, stage="extra-b", runner_config="8-gpu-h200")
+register_cuda_ci(est_time=298, stage="nightly", runner_config="8-gpu-h200")
 
 MIMO_V2_MODEL = os.environ.get("SGLANG_TEST_MIMO_V2_MODEL", "XiaomiMiMo/MiMo-V2.5")
 MIMO_V2_OTHER_ARGS = [
