@@ -22,6 +22,7 @@ DKV = 256
 SENTINEL = 7.0
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("num_pad", [1, 8])
 def test_extend_prologue_skips_padded_tokens(num_pad):
     torch.manual_seed(1234)

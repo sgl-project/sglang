@@ -39,6 +39,7 @@ def _precompile(num_gpus):
                 _module(world, 5120, cluster, topk)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestBeamAllReduce(CustomTestCase):
     @classmethod
     def setUpClass(cls):

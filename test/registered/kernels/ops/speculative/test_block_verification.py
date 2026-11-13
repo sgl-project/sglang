@@ -391,6 +391,7 @@ def test_dflash_family_accept_uses_block_verification(any_greedy):
     assert (token_correct_len[sampled] == 0).any()
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("block", [False, True])
 def test_ragged_cutoff_preserves_distribution(block):
     """DSpark compact verify: rows past a request's verify window are point-mass

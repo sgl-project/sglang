@@ -715,6 +715,7 @@ class TestCompactedTritonCalls(CustomTestCase):
         )
         return fused_experts(x, w1, w2, topk, config, **quant)
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_compacted_calls_equal_the_full_call_bitwise(self):
         """bf16 and block-wise FP8 experts, 300 tokens x top-4 over 8 experts: the entries of
         experts 0-3 (one wave), run in calls of at most 6 rows inside

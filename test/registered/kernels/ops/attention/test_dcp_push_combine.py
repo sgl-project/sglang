@@ -85,6 +85,7 @@ def _reference(coord, v, lse):
     return out.reshape(v.shape[0], -1)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("batch", [1, 7, 64, 384, MAX_ROWS])
 @pytest.mark.parametrize("calls", [3])
 def test_matches_gather_and_combine(batch, calls):
@@ -106,6 +107,7 @@ def test_matches_gather_and_combine(batch, calls):
         torch.testing.assert_close(out, ref, rtol=2e-2, atol=2e-2)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_strided_inputs():
     """Decode hands over the W_UV projection head-major and the LSE as a slice
     of the padded-head buffer; neither is contiguous."""
@@ -121,6 +123,7 @@ def test_strided_inputs():
     torch.testing.assert_close(out, ref, rtol=2e-2, atol=2e-2)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_cuda_graph_replay():
     coord = _setup()
     n, rank = coord.world_size, coord.rank_in_group

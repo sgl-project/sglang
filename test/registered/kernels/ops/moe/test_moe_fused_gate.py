@@ -536,6 +536,7 @@ def test_grouped_dispatch_flag_matches_default(
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("strided_bias", [False, True])
 def test_grouped_tied_group_max_through_biased_grouped_topk_gpu(
     strided_bias: bool,

@@ -9,7 +9,12 @@ import itertools
 import unittest
 from types import SimpleNamespace
 
+import pytest
 import torch
+
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
 
 from sglang.kernels.ops.quantization.gptq_triton import (
     GPTQ_TRITON_SUPPORTED_GROUP_SIZES,

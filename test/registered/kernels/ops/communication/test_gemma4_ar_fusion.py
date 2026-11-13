@@ -125,6 +125,7 @@ def _inputs(rows: int, hidden: int, seed: int):
     return residual, w_a, w_b, scalar
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("hidden", HIDDENS)
 @pytest.mark.parametrize("rows", ROWS)
 @pytest.mark.parametrize("round_a", [True, False])
@@ -177,6 +178,7 @@ def test_site(hidden: int, rows: int, round_a: bool):
             assert torch.equal(other, t), f"{name} differs on rank {i}"
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("hidden", HIDDENS[:1])
 @pytest.mark.parametrize("rows", ROWS)
 def test_final(hidden: int, rows: int):

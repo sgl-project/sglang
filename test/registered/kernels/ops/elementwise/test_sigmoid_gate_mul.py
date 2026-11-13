@@ -81,6 +81,7 @@ def test_sigmoid_gate_mul_contiguous_output():
     assert out.is_contiguous()
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_sigmoid_gate_mul_strided_gate_round_sigmoid_is_bit_exact():
     num_tokens = 300
     # The gate is the tail columns of a merged [q_up | gate] GEMM output.

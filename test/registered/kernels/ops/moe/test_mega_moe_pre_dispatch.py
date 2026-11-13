@@ -159,6 +159,7 @@ def test_hidden_5120_two_chunk_matches_one_chunk() -> None:
     assert torch.equal(sf_two_chunk, sf_one_chunk)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("hidden", [2304, 3584])
 def test_live_rows_change_on_graph_replay(hidden: int) -> None:
     """Padded NaNs must be masked on device, including after a full replay."""

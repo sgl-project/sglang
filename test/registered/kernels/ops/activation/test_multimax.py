@@ -32,6 +32,7 @@ def _reference(x, r, t):
     return out
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("shape", [(1, 50304), (37, 201216), (3, 5)])
 def test_multimax_matches_eager_bit_for_bit(shape):
     from sglang.kernels.ops.activation.multimax import multimax
@@ -43,6 +44,7 @@ def test_multimax_matches_eager_bit_for_bit(shape):
     assert torch.equal(multimax(x, r, t), _reference(x, r, t))
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_multimax_keeps_non_finite_logits():
     from sglang.kernels.ops.activation.multimax import multimax
 
