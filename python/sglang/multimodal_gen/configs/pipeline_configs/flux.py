@@ -736,7 +736,23 @@ class Flux2PipelineConfig(FluxPipelineConfig):
         }
 
     def prepare_neg_cond_kwargs(self, batch, device, rotary_emb, dtype):
-        return {}
+        txt_seq_lens = self.require_text_seq_lens(
+            batch,
+            0,
+            negative=True,
+            expected_batch_size=batch.negative_prompt_embeds[0].shape[0],
+        )
+        return {
+            "freqs_cis": self.get_freqs_cis(
+                batch.negative_prompt_embeds[0],
+                batch.width,
+                batch.height,
+                device,
+                rotary_emb,
+                batch,
+                txt_seq_lens,
+            )
+        }
 
     def maybe_pack_latents(self, latents, batch_size, batch):
         return flux2_pack_latents(latents)
