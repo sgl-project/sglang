@@ -130,6 +130,66 @@ mod rate_limiting_tests {
         ctx.shutdown().await;
     }
 
+    /// Test that explicit zero refill rate is preserved as strict concurrency limiting.
+    #[tokio::test]
+    async fn test_rate_limit_zero_does_not_fall_back_to_refill() {
+        let config = RouterConfig::builder()
+            .regular_mode(vec![])
+            .random_policy()
+            .host("127.0.0.1")
+            .port(3404)
+            .max_payload_size(256 * 1024 * 1024)
+            .request_timeout_secs(600)
+            .worker_startup_timeout_secs(5)
+            .worker_startup_check_interval_secs(1)
+            .max_concurrent_requests(1)
+            .rate_limit_tokens_per_second(0)
+            .queue_size(10)
+            .queue_timeout_secs(2)
+            .build_unchecked();
+
+        let ctx =
+            AppTestContext::new_with_config(config, vec![TestWorkerConfig::slow(19304, 3000)])
+                .await;
+
+        let app = ctx.create_app().await;
+
+        let mut handles = Vec::new();
+        for i in 0..2 {
+            let app_clone = app.clone();
+            let handle = tokio::spawn(async move {
+                let payload = json!({
+                    "text": format!("Zero refill request {}", i),
+                    "stream": false
+                });
+
+                let req = Request::builder()
+                    .method("POST")
+                    .uri("/generate")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_string(&payload).unwrap()))
+                    .unwrap();
+
+                app_clone.oneshot(req).await.unwrap().status()
+            });
+            handles.push(handle);
+        }
+
+        let mut statuses = Vec::new();
+        for handle in handles {
+            statuses.push(handle.await.unwrap());
+        }
+
+        statuses.sort();
+        assert_eq!(
+            statuses,
+            vec![StatusCode::OK, StatusCode::REQUEST_TIMEOUT],
+            "explicit zero refill rate should not fall back to refill behavior"
+        );
+
+        ctx.shutdown().await;
+    }
+
     /// Test unlimited concurrent requests when set to 0
     #[tokio::test]
     async fn test_unlimited_concurrent_requests() {
