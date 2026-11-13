@@ -272,6 +272,18 @@ The wheel is cp312 Linux only (x86_64 and aarch64); selecting the backend withou
 
 Both quantization paths work: `--quantization mxfp8` on a BF16 checkpoint (quantized at load), and a pre-quantized MXFP8 checkpoint, whose uint8 UE8M0 weight scales are used as they are.
 
+### Tuned tiles for per-token x per-channel FP8
+
+Per-token activation x per-channel weight FP8 (for example `compressed-tensors`
+W8A8 checkpoints) runs through `triton_scaled_mm`, which can take a tile tuned
+per weight shape and M bucket instead of the fixed dispatch. The tables are
+plain JSON under `python/sglang/kernels/ops/gemm/configs/`, named
+`N={N},K={K},device_name={DEVICE},dtype=fp8_w8a8_channelwise.json`; a bucket set
+to `null` keeps the default dispatch. The lookup only matches the exact device
+name, so any other GPU, or a shape with no table, keeps the default dispatch
+unchanged. The file format is documented in
+`python/sglang/kernels/ops/gemm/configs/README.md`.
+
 ### `--fp4-gemm-backend` (NVFP4 GEMM)
 
 <table>
