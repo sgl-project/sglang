@@ -2757,6 +2757,12 @@ class ServingChatTestCase(CustomTestCase):
                 ('{"word": "banana"}', True),
                 ("The word is banana.", False),
                 ('{"other": "banana"}', False),
+                # A prose answer must not be able to end in a forced call.
+                (
+                    "The word is banana.<tool_call>read_file<arg_key>path"
+                    "</arg_key><arg_value>note.txt</arg_value></tool_call>",
+                    False,
+                ),
             ):
                 with self.subTest(enable_thinking=enable_thinking, output=output):
                     self.assertEqual(

@@ -1022,7 +1022,9 @@ def test_answer_tag_admits_calls_or_a_schema_answer(strict_arguments, thinking_m
     call = _tools_section(_valid_weather_call())
 
     assert _token_accepts(tag, prefix + call + MESSAGE_CLOSE)
-    assert _token_accepts(tag, prefix + response.format("Checking.") + call)
+    assert _token_accepts(tag, prefix + response.format("") + call)
+    # A prose answer must not be able to end in a forced call.
+    assert not _token_accepts(tag, prefix + response.format("The word is hi.") + call)
     assert _token_accepts(
         tag, prefix + response.format('{"word": "hi"}') + MESSAGE_CLOSE
     )

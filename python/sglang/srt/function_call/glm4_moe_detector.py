@@ -1073,6 +1073,7 @@ def generate_glm_grammar(
     root_name: str = "root",
     required: bool = False,
     parallel_tool_calls: bool = True,
+    allow_text_before_tool_calls: bool = True,
 ) -> str:
     ebnf_lines = [
         f'{root_name} ::= assistant_turn ( "{special_tokens.assistant_token}" assistant_turn )*'
@@ -1106,6 +1107,8 @@ def generate_glm_grammar(
 
     ebnf_lines.append(
         f"text_block ::= ( {extra_seperator} text_without_special_tokens )?"
+        if allow_text_before_tool_calls
+        else "text_block ::= [ \\t\\r\\n]*"
     )
 
     if functions:
@@ -1134,6 +1137,8 @@ def generate_glm_answer_grammar(
 ) -> str:
     """A glm47 assistant turn that either calls at least one tool or answers
     with JSON matching `answer_json_schema` after the thinking block."""
+    # Text before the calls would let the model write a free-form answer and
+    # then be forced into a call to end the turn.
     tool_turn = generate_glm_grammar(
         enable_thinking=enable_thinking,
         functions=functions,
@@ -1143,6 +1148,7 @@ def generate_glm_answer_grammar(
         allow_multiple_assistant_turns=False,
         required=True,
         parallel_tool_calls=parallel_tool_calls,
+        allow_text_before_tool_calls=False,
     )
     answer_prefix = _glm_join_rules(
         [

@@ -701,7 +701,9 @@ def get_kimik3_answer_structural_tag(
         elements=[
             SequenceFormat(
                 elements=[
-                    OptionalFormat(content=_RESPONSE),
+                    # Prose before the calls would let the model answer freely
+                    # and then be forced into a call to end the turn.
+                    OptionalFormat(content=_response(RegexFormat(pattern=r"\s*"))),
                     tools_tag,
                     _OPTIONAL_MESSAGE_CLOSE,
                 ]
