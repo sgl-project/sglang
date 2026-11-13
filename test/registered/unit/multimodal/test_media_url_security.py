@@ -235,6 +235,10 @@ class TestMediaURLAddresses(unittest.TestCase):
             ("[fe80::1]", "fe80::1"),
             ("[::ffff:127.0.0.1]", "::ffff:127.0.0.1"),
             ("[::127.0.0.1]", "::127.0.0.1"),
+            ("nat64.example", "64:ff9b::7f00:1"),
+            ("nat64.example", "64:ff9b::a00:1"),
+            ("multicast.example", "239.1.1.1"),
+            ("multicast.example", "ff0e::1"),
         ]:
             with (
                 self.subTest(host=host, address=address),
@@ -250,7 +254,9 @@ class TestMediaURLAddresses(unittest.TestCase):
     def test_public_destinations_are_allowed(self):
         with patch(
             "sglang.srt.multimodal.media_io.socket.getaddrinfo",
-            return_value=self._addresses("8.8.8.8", "2001:4860:4860::8888"),
+            return_value=self._addresses(
+                "8.8.8.8", "2001:4860:4860::8888", "64:ff9b::808:808"
+            ),
         ):
             self.assertEqual(
                 download_remote_media("https://media.example/media", timeout=5),

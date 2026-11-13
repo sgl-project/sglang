@@ -5,7 +5,6 @@
 import os
 import tempfile
 from collections.abc import Callable
-from contextlib import closing
 from io import BytesIO
 from urllib.parse import unquote, urlparse
 
@@ -13,12 +12,12 @@ import imageio
 import numpy as np
 import PIL.Image
 import PIL.ImageOps
-import requests
 import torch
 from packaging import version
 
 from sglang.kernels import get_kernel
 from sglang.srt.environ import envs
+from sglang.srt.multimodal.media_io import download_remote_media
 from sglang.srt.multimodal.media_io import get_image_bytes as srt_get_image_bytes
 
 if version.parse(version.parse(PIL.__version__).base_version) >= version.parse("9.1.0"):
@@ -215,16 +214,9 @@ def load_video(
         suffix = os.path.splitext(file_name)[1] or ".mp4"
         with tempfile.TemporaryDirectory() as temp_dir:
             video_path = os.path.join(temp_dir, f"video{suffix}")
-            with closing(
-                requests.get(video, stream=True, timeout=_VIDEO_DOWNLOAD_TIMEOUT_S)
-            ) as response:
-                if response.status_code != 200:
-                    raise ValueError(
-                        f"Failed to download video. Status code: {response.status_code}"
-                    )
-                with open(video_path, "wb") as temp_file:
-                    for chunk in response.iter_content(chunk_size=8192):
-                        temp_file.write(chunk)
+            data = download_remote_media(video, timeout=_VIDEO_DOWNLOAD_TIMEOUT_S)
+            with open(video_path, "wb") as temp_file:
+                temp_file.write(data)
             pil_images = _read_video_frames(video_path, max_frames)
     else:
         pil_images = _read_video_frames(video, max_frames)

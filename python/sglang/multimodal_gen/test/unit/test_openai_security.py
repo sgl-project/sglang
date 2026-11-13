@@ -4,6 +4,7 @@ import asyncio
 import errno
 import io
 import os
+import socket
 import threading
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, wait
@@ -44,6 +45,13 @@ from sglang.multimodal_gen.runtime.postprocess.bounded_cache import (
 )
 from sglang.multimodal_gen.runtime.utils import image_io
 from sglang.multimodal_gen.runtime.utils.image_io import ensure_path_within_root
+from sglang.srt.multimodal import media_io
+
+
+@pytest.fixture(autouse=True)
+def _allow_unresolvable_test_hosts(monkeypatch):
+    # Test URLs use hosts like x.test that do not resolve.
+    monkeypatch.setenv("SGLANG_ALLOW_PRIVATE_MEDIA_URLS", "1")
 
 
 @pytest.mark.parametrize("api,kind", [(video_api, "video"), (mesh_api, "mesh")])
@@ -536,6 +544,50 @@ def _chunked_png(request):
             yield b"x" * 512
 
     return httpx.Response(200, content=body(), headers={"content-type": "image/png"})
+
+
+def _resolve_to(*hosts):
+    addresses = {
+        host: [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", (ip, 443))]
+        for host, ip in hosts
+    }
+    return lambda host, *args, **kwargs: addresses[host]
+
+
+@pytest.mark.parametrize(
+    "url, hosts_reached",
+    [
+        ("https://internal.test/a.png", []),
+        ("https://public.test/a.png", ["public.test"]),
+    ],
+    ids=["direct", "redirect"],
+)
+def test_image_download_to_private_address_is_rejected(
+    monkeypatch, tmp_path, url, hosts_reached
+):
+    """Every hop of a remote image download goes through the media URL policy."""
+    monkeypatch.setenv("SGLANG_ALLOW_PRIVATE_MEDIA_URLS", "0")
+    monkeypatch.setattr(
+        media_io.socket,
+        "getaddrinfo",
+        _resolve_to(("public.test", "8.8.8.8"), ("internal.test", "10.0.0.1")),
+    )
+    reached = []
+
+    def handler(request):
+        reached.append(request.url.host)
+        if request.url.host == "public.test":
+            return httpx.Response(
+                302, headers={"location": "https://internal.test/a.png"}
+            )
+        return httpx.Response(200, content=b"x", headers={"content-type": "image/png"})
+
+    _patch_download(monkeypatch, tmp_path, handler)
+    target = tmp_path / "in" / "img.png"
+    with pytest.raises(Exception, match="local or private"):
+        asyncio.run(utils._save_url_image_to_path(url, str(target)))
+    assert reached == hosts_reached
+    assert not target.exists()
 
 
 @pytest.mark.parametrize(
