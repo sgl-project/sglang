@@ -1,4 +1,6 @@
 import logging
+import re
+from collections import defaultdict
 from functools import partial
 from typing import Iterable, List, Optional, Tuple, Union
 
@@ -500,6 +502,13 @@ class NanbeigeForCausalLM(nn.Module):
         ]
 
         params_dict = dict(self.named_parameters())
+        # A layer's checkpoint KV-cache scale applies to the RadixAttention of
+        # every loop of that layer.
+        loop_scales = defaultdict(list)
+        for param_name in params_dict:
+            m = re.fullmatch(r"(.*)\.attn\.\d+\.([kv]_scale)", param_name)
+            if m is not None:
+                loop_scales[f"{m.group(1)}.{m.group(2)}"].append(param_name)
         for name, loaded_weight in weights:
             layer_id = get_layer_id(name)
             if (
@@ -524,6 +533,18 @@ class NanbeigeForCausalLM(nn.Module):
                     loaded_weight = embed_token_weights
                 else:
                     continue
+
+            if name.endswith((".k_scale", ".v_scale")) and name not in params_dict:
+                # compressed-tensors: <attn>.k_scale; ModelOpt: <attn>.k_proj.k_scale
+                stem, scale = name.rsplit(".", 1)
+                stem = stem.removesuffix(f".{scale[0]}_proj")
+                for param_name in loop_scales.get(f"{stem}.{scale}", ()):
+                    param = params_dict[param_name]
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
+                    weight_loader(param, loaded_weight)
+                continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:

@@ -44,7 +44,10 @@ from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer
 from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.weight_utils import (
+    default_weight_loader,
+    maybe_remap_kv_scale_name,
+)
 from sglang.srt.models.glm4 import Glm4Model
 from sglang.srt.models.glm4v import (
     Glm4vForConditionalGeneration,
@@ -410,6 +413,12 @@ class GlmOcrForConditionalGeneration(Glm4vForConditionalGeneration):
                 # For decoder layer weights
                 if is_decoder:
                     name = name.replace(nextn_layer_prefix, "model.decoder")
+
+            # Remap KV-cache scale names before the q/k/v_proj -> qkv_proj rename.
+            if "scale" in name:
+                name = maybe_remap_kv_scale_name(name, params_dict)
+                if name is None:
+                    continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:

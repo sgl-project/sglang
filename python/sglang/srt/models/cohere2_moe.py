@@ -32,7 +32,10 @@ from sglang.srt.layers.utils.layer_list import make_layers
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.runner import get_is_capture_mode
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.weight_utils import (
+    default_weight_loader,
+    maybe_remap_kv_scale_name,
+)
 from sglang.srt.runtime_context import get_parallel, get_stream
 from sglang.srt.utils import get_compiler_backend, is_cuda
 
@@ -577,6 +580,12 @@ class Cohere2MoeForCausalLM(nn.Module):
             # Skip all-zero bias tensors that the checkpoint carries for
             # bias-free Cohere layers (input_layernorm.bias, norm.bias,
             # o_proj.bias, mlp.gate.bias, experts.*.[gate|up|down]_proj.bias).
+            # Remap KV-cache scale names before the q/k/v_proj -> qkv_proj rename.
+            if "scale" in name:
+                name = maybe_remap_kv_scale_name(name, params_dict)
+                if name is None:
+                    continue
+
             if (name.endswith(".bias") or name.endswith("_bias")) and (
                 name not in params_dict
                 and name.replace("q_proj", "qkv_proj") not in params_dict

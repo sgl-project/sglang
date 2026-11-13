@@ -24,7 +24,10 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.weight_utils import (
+    default_weight_loader,
+    maybe_remap_kv_scale_name,
+)
 from sglang.srt.runtime_context import get_parallel
 
 
@@ -277,7 +280,15 @@ class PhiForCausalLM(nn.Module):
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         params_dict = dict(self.named_parameters())
-        weights = dict(weights)
+        checkpoint = {}
+        for name, loaded_weight in weights:
+            # Map KV-cache scale names to the attention's k_scale/v_scale.
+            if "scale" in name:
+                name = maybe_remap_kv_scale_name(name, params_dict)
+                if name is None:
+                    continue
+            checkpoint[name] = loaded_weight
+        weights = checkpoint
         loaded_keys = set()
 
         for name, param in params_dict.items():

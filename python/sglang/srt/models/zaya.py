@@ -83,7 +83,10 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.forward_context import get_attn_backend
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.weight_utils import (
+    default_weight_loader,
+    maybe_remap_kv_scale_name,
+)
 from sglang.srt.runtime_context import get_parallel
 
 logger = logging.getLogger(__name__)
@@ -1680,6 +1683,12 @@ class ZayaForCausalLM(nn.Module):
 
             # HF stores CCA tensors under ``self_attn.qkv.*``, which already
             # matches our submodule registration, so no rename is needed.
+            # Map KV-cache scale names to the attention's k_scale/v_scale.
+            if "scale" in ckpt_name:
+                ckpt_name = maybe_remap_kv_scale_name(ckpt_name, params_dict)
+                if ckpt_name is None:
+                    continue
+
             if ckpt_name not in params_dict:
                 # ``conv_qk`` is an ``nn.Sequential`` of two ``nn.Conv1d``,
                 # whose keys end in ``.0.{weight,bias}`` / ``.1.{weight,bias}``
