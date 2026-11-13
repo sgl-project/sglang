@@ -61,7 +61,7 @@ Before following this tutorial, complete the environment setup in the documents 
 Before downloading model weights, check the model size to reserve enough disk space.
 
 - [MiniMax-M2.5-w8a8-QuaRot](https://www.modelscope.cn/models/Eco-Tech/MiniMax-M2.5-w8a8-QuaRot) (W8A8 quantized version, 230.82GB)
-- [MiniMax-M2.5-eagle-model](https://www.modelscope.cn/models/sgl-npu/MiniMax-M2.5-eagel-model-0318) (EAGLE3 draft model for speculative decoding)
+- [MiniMax-M2.5-eagel-model](https://www.modelscope.cn/models/sgl-npu/MiniMax-M2.5-eagel-model-0318) (EAGLE3 draft model for speculative decoding)
 
 <Info>
 The W8A8 variant (230.82GB) can be deployed on 8 × 64GB of device memory (`--tp-size 8`), which corresponds to
@@ -87,6 +87,7 @@ The following command is based on the stable release tag `v0.5.18-cann9.0.0-a3`.
 For details, see [Docker image versions](/docs/hardware-platforms/ascend-npus/faq#8-docker-image-versions-stable-release-vs-daily-build).
 
 {/* NOTE(agent): The image version and scripts in this file are frozen (validated best practice). Skip this file in batch image-version updates and when deprecating or renaming parameters/flags. */}
+
 ```bash Command
 docker pull quay.io/ascend/sglang:v0.5.18-cann9.0.0-a3
 

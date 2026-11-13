@@ -95,6 +95,7 @@ The following command is based on the stable release tag `v0.5.18-cann9.0.0-a3`.
 For details, see [Docker image versions](/docs/hardware-platforms/ascend-npus/faq#8-docker-image-versions-stable-release-vs-daily-build).
 
 {/* NOTE(agent): The image version and scripts in this file are frozen (validated best practice). Skip this file in batch image-version updates and when deprecating or renaming parameters/flags. */}
+
 ```bash Command
 docker pull quay.io/ascend/sglang:v0.5.18-cann9.0.0-a3
 
@@ -151,113 +152,113 @@ The following command is based on the **W8A8** quantized model.
 
 1. Set the shared environment variables on both prefill and decode nodes:
 
-```bash Shared environment
-#============================================================
-# Before running, update the following variables:
-#   MODEL_PATH: path to the model weights directory
-#   PREFILL_HOST_IP: prefill node IP address
-#   HCCL_SOCKET_IFNAME: network interface name for HCCL (use ifconfig to find)
-#   GLOO_SOCKET_IFNAME: network interface name for Gloo (use ifconfig to find)
-#============================================================
+    ```bash Shared environment
+    #============================================================
+    # Before running, update the following variables:
+    #   MODEL_PATH: path to the model weights directory
+    #   PREFILL_HOST_IP: prefill node IP address
+    #   HCCL_SOCKET_IFNAME: network interface name for HCCL (use ifconfig to find)
+    #   GLOO_SOCKET_IFNAME: network interface name for Gloo (use ifconfig to find)
+    #============================================================
 
-export ASCEND_USE_FIA=1
-export SGLANG_SET_CPU_AFFINITY=1
-export ASCEND_MF_STORE_URL="tcp://<PREFILL_HOST_IP>:12345"
-export HCCL_SOCKET_IFNAME=<network-interface>
-export GLOO_SOCKET_IFNAME=<network-interface>
+    export ASCEND_USE_FIA=1
+    export SGLANG_SET_CPU_AFFINITY=1
+    export ASCEND_MF_STORE_URL="tcp://<PREFILL_HOST_IP>:12345"
+    export HCCL_SOCKET_IFNAME=<network-interface>
+    export GLOO_SOCKET_IFNAME=<network-interface>
 
-MODEL_PATH=/path/to/model-weights
-```
+    MODEL_PATH=/path/to/model-weights
+    ```
 
 2. Run on the **prefill node**:
 
-```bash Prefill node
-#============================================================
-# Before running, update the following variable:
-#   PREFILL_HOST_IP: prefill node IP address
-#============================================================
+    ```bash Prefill node
+    #============================================================
+    # Before running, update the following variable:
+    #   PREFILL_HOST_IP: prefill node IP address
+    #============================================================
 
-export ASCEND_LAUNCH_BLOCKING=1
-export HCCL_BUFFSIZE=1500
-export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=1024
-export DEEPEP_NORMAL_LONG_SEQ_ROUND=128
-export DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ=1
-export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
+    export ASCEND_LAUNCH_BLOCKING=1
+    export HCCL_BUFFSIZE=1500
+    export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=1024
+    export DEEPEP_NORMAL_LONG_SEQ_ROUND=128
+    export DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ=1
+    export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
 
-python3 -m sglang.launch_server \
-    --model-path ${MODEL_PATH} \
-    --disaggregation-mode prefill \
-    --disaggregation-transfer-backend ascend \
-    --disaggregation-bootstrap-port 8995 \
-    --attention-backend ascend \
-    --disable-radix-cache \
-    --chunked-prefill-size -1 \
-    --skip-server-warmup \
-    --device npu \
-    --quantization modelslim \
-    --tp-size 16 \
-    --mem-fraction-static 0.45 \
-    --max-running-requests 1 \
-    --host <PREFILL_HOST_IP> \
-    --port 8000 \
-    --dist-init-addr <PREFILL_HOST_IP>:5000 \
-    --nnodes 1 \
-    --node-rank 0 \
-    --moe-a2a-backend deepep \
-    --deepep-mode normal
-```
+    python3 -m sglang.launch_server \
+        --model-path ${MODEL_PATH} \
+        --disaggregation-mode prefill \
+        --disaggregation-transfer-backend ascend \
+        --disaggregation-bootstrap-port 8995 \
+        --attention-backend ascend \
+        --disable-radix-cache \
+        --chunked-prefill-size -1 \
+        --skip-server-warmup \
+        --device npu \
+        --quantization modelslim \
+        --tp-size 16 \
+        --mem-fraction-static 0.45 \
+        --max-running-requests 1 \
+        --host <PREFILL_HOST_IP> \
+        --port 8000 \
+        --dist-init-addr <PREFILL_HOST_IP>:5000 \
+        --nnodes 1 \
+        --node-rank 0 \
+        --moe-a2a-backend deepep \
+        --deepep-mode normal
+    ```
 
 3. Run on the **decode node**:
 
-```bash Decode node
-#============================================================
-# Before running, update the following variable:
-#   DECODE_HOST_IP: decode node IP address
-#============================================================
+    ```bash Decode node
+    #============================================================
+    # Before running, update the following variable:
+    #   DECODE_HOST_IP: decode node IP address
+    #============================================================
 
-export HCCL_BUFFSIZE=4000
-export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=4096
-export DEEPEP_NORMAL_LONG_SEQ_ROUND=16
+    export HCCL_BUFFSIZE=4000
+    export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=4096
+    export DEEPEP_NORMAL_LONG_SEQ_ROUND=16
 
-python3 -m sglang.launch_server \
-    --model-path ${MODEL_PATH} \
-    --disaggregation-mode decode \
-    --disaggregation-transfer-backend ascend \
-    --attention-backend ascend \
-    --mem-fraction-static 0.8 \
-    --disable-cuda-graph \
-    --device npu \
-    --quantization modelslim \
-    --disable-radix-cache \
-    --chunked-prefill-size 8192 \
-    --skip-server-warmup \
-    --tp-size 16 \
-    --max-running-requests 1 \
-    --host <DECODE_HOST_IP> \
-    --port 8232 \
-    --moe-a2a-backend deepep \
-    --deepep-mode low_latency \
-    --disable-overlap-schedule
-```
+    python3 -m sglang.launch_server \
+        --model-path ${MODEL_PATH} \
+        --disaggregation-mode decode \
+        --disaggregation-transfer-backend ascend \
+        --attention-backend ascend \
+        --mem-fraction-static 0.8 \
+        --disable-cuda-graph \
+        --device npu \
+        --quantization modelslim \
+        --disable-radix-cache \
+        --chunked-prefill-size 8192 \
+        --skip-server-warmup \
+        --tp-size 16 \
+        --max-running-requests 1 \
+        --host <DECODE_HOST_IP> \
+        --port 8232 \
+        --moe-a2a-backend deepep \
+        --deepep-mode low_latency \
+        --disable-overlap-schedule
+    ```
 
 4. Launch the SGLang Router (on any reachable node):
 
-```bash Router
-#============================================================
-# Before running, update the following variables:
-#   PREFILL_HOST_IP: prefill node IP address
-#   DECODE_HOST_IP: decode node IP address
-#   ROUTER_HOST_IP: router node IP address
-#============================================================
+    ```bash Router
+    #============================================================
+    # Before running, update the following variables:
+    #   PREFILL_HOST_IP: prefill node IP address
+    #   DECODE_HOST_IP: decode node IP address
+    #   ROUTER_HOST_IP: router node IP address
+    #============================================================
 
-python3 -m sglang_router.launch_router \
-    --pd-disaggregation \
-    --policy cache_aware \
-    --prefill http://<PREFILL_HOST_IP>:8000 8995 \
-    --decode http://<DECODE_HOST_IP>:8232 \
-    --host <ROUTER_HOST_IP> \
-    --port 6689
-```
+    python3 -m sglang_router.launch_router \
+        --pd-disaggregation \
+        --policy cache_aware \
+        --prefill http://<PREFILL_HOST_IP>:8000 8995 \
+        --decode http://<DECODE_HOST_IP>:8232 \
+        --host <ROUTER_HOST_IP> \
+        --port 6689
+    ```
 
 #### Prefill Context Parallel (PCP) on 2 x A3 Series nodes
 
@@ -274,107 +275,107 @@ PD disaggregation is required. The following command is based on the **W8A8** qu
 
 1. Run on the **prefill node**:
 
-```bash Prefill node
-#============================================================
-# Before running, update the following variables:
-#   MODEL_PATH: path to the model weights directory
-#   PREFILL_HOST_IP: prefill node IP address
-#============================================================
+    ```bash Prefill node
+    #============================================================
+    # Before running, update the following variables:
+    #   MODEL_PATH: path to the model weights directory
+    #   PREFILL_HOST_IP: prefill node IP address
+    #============================================================
 
-export SGLANG_SET_CPU_AFFINITY=1
-export ASCEND_MF_STORE_URL="tcp://<PREFILL_HOST_IP>:23456"
-export ASCEND_USE_FIA=True
+    export SGLANG_SET_CPU_AFFINITY=1
+    export ASCEND_MF_STORE_URL="tcp://<PREFILL_HOST_IP>:23456"
+    export ASCEND_USE_FIA=True
 
-python3 -m sglang.launch_server \
-    --model-path ${MODEL_PATH} \
-    --trust-remote-code \
-    --disaggregation-mode prefill \
-    --disaggregation-transfer-backend ascend \
-    --disaggregation-bootstrap-port 8995 \
-    --quantization modelslim \
-    --attention-backend ascend \
-    --skip-server-warmup \
-    --mem-fraction-static 0.7 \
-    --chunked-prefill-size 32768 \
-    --device npu \
-    --base-gpu-id 0 \
-    --tp-size 16 \
-    --enable-prefill-cp \
-    --cp-strategy zigzag \
-    --attn-cp-size 2 \
-    --moe-dp-size 2 \
-    --max-running-requests 1 \
-    --host <PREFILL_HOST_IP> \
-    --port 8000 \
-    --nnodes 1 \
-    --node-rank 0 \
-    --dist-init-addr <PREFILL_HOST_IP>:6688
-```
+    python3 -m sglang.launch_server \
+        --model-path ${MODEL_PATH} \
+        --trust-remote-code \
+        --disaggregation-mode prefill \
+        --disaggregation-transfer-backend ascend \
+        --disaggregation-bootstrap-port 8995 \
+        --quantization modelslim \
+        --attention-backend ascend \
+        --skip-server-warmup \
+        --mem-fraction-static 0.7 \
+        --chunked-prefill-size 32768 \
+        --device npu \
+        --base-gpu-id 0 \
+        --tp-size 16 \
+        --enable-prefill-cp \
+        --cp-strategy zigzag \
+        --attn-cp-size 2 \
+        --moe-dp-size 2 \
+        --max-running-requests 1 \
+        --host <PREFILL_HOST_IP> \
+        --port 8000 \
+        --nnodes 1 \
+        --node-rank 0 \
+        --dist-init-addr <PREFILL_HOST_IP>:6688
+    ```
 
-Key parameters for PCP:
+    Key parameters for PCP:
 
-| Parameter | Value | Description |
-|-----------|-------|-------------|
-| `--enable-prefill-cp` | flag | Enable PCP feature |
-| `--cp-strategy` | zigzag | Context sharding layout (required with `--enable-prefill-cp`) |
-| `--attn-cp-size` | 2 | Split context across 2 CP ranks (each rank handles half the sequence) |
-| `--moe-dp-size` | 2 | MoE DP size, should match `--attn-cp-size` |
-| `--max-running-requests` | 1 | Required by PCP (batch_size=1 constraint) |
+    | Parameter | Value | Description |
+    |-----------|-------|-------------|
+    | `--enable-prefill-cp` | flag | Enable PCP feature |
+    | `--cp-strategy` | zigzag | Context sharding layout (required with `--enable-prefill-cp`) |
+    | `--attn-cp-size` | 2 | Split context across 2 CP ranks (each rank handles half the sequence) |
+    | `--moe-dp-size` | 2 | MoE DP size, should match `--attn-cp-size` |
+    | `--max-running-requests` | 1 | Required by PCP (batch_size=1 constraint) |
 
 2. Run on the **decode node**:
 
-```bash Decode node
-#============================================================
-# Before running, update the following variables:
-#   MODEL_PATH: path to the model weights directory
-#   DECODE_HOST_IP: decode node IP address
-#   PREFILL_HOST_IP: prefill node IP address (for ASCEND_MF_STORE_URL)
-#============================================================
+    ```bash Decode node
+    #============================================================
+    # Before running, update the following variables:
+    #   MODEL_PATH: path to the model weights directory
+    #   DECODE_HOST_IP: decode node IP address
+    #   PREFILL_HOST_IP: prefill node IP address (for ASCEND_MF_STORE_URL)
+    #============================================================
 
-export ASCEND_MF_STORE_URL="tcp://<PREFILL_HOST_IP>:23456"
-export ASCEND_USE_FIA=True
+    export ASCEND_MF_STORE_URL="tcp://<PREFILL_HOST_IP>:23456"
+    export ASCEND_USE_FIA=True
 
-python3 -m sglang.launch_server \
-    --model-path ${MODEL_PATH} \
-    --trust-remote-code \
-    --disaggregation-mode decode \
-    --disaggregation-transfer-backend ascend \
-    --quantization modelslim \
-    --attention-backend ascend \
-    --disable-radix-cache \
-    --disable-cuda-graph \
-    --mem-fraction-static 0.7 \
-    --chunked-prefill-size 32768 \
-    --skip-server-warmup \
-    --device npu \
-    --base-gpu-id 0 \
-    --tp-size 8 \
-    --max-running-requests 32 \
-    --host <DECODE_HOST_IP> \
-    --port 8001 \
-    --nnodes 1 \
-    --node-rank 0 \
-    --dist-init-addr <DECODE_HOST_IP>:6688
-```
+    python3 -m sglang.launch_server \
+        --model-path ${MODEL_PATH} \
+        --trust-remote-code \
+        --disaggregation-mode decode \
+        --disaggregation-transfer-backend ascend \
+        --quantization modelslim \
+        --attention-backend ascend \
+        --disable-radix-cache \
+        --disable-cuda-graph \
+        --mem-fraction-static 0.7 \
+        --chunked-prefill-size 32768 \
+        --skip-server-warmup \
+        --device npu \
+        --base-gpu-id 0 \
+        --tp-size 8 \
+        --max-running-requests 32 \
+        --host <DECODE_HOST_IP> \
+        --port 8001 \
+        --nnodes 1 \
+        --node-rank 0 \
+        --dist-init-addr <DECODE_HOST_IP>:6688
+    ```
 
 3. Launch the SGLang Router (on any reachable node):
 
-```bash Router
-#============================================================
-# Before running, update the following variables:
-#   PREFILL_HOST_IP: prefill node IP address
-#   DECODE_HOST_IP: decode node IP address
-#   ROUTER_HOST_IP: router node IP address
-#============================================================
+    ```bash Router
+    #============================================================
+    # Before running, update the following variables:
+    #   PREFILL_HOST_IP: prefill node IP address
+    #   DECODE_HOST_IP: decode node IP address
+    #   ROUTER_HOST_IP: router node IP address
+    #============================================================
 
-python3 -m sglang_router.launch_router \
-    --pd-disaggregation \
-    --policy cache_aware \
-    --prefill http://<PREFILL_HOST_IP>:8000 8995 \
-    --decode http://<DECODE_HOST_IP>:8001 \
-    --host <ROUTER_HOST_IP> \
-    --port 6689
-```
+    python3 -m sglang_router.launch_router \
+        --pd-disaggregation \
+        --policy cache_aware \
+        --prefill http://<PREFILL_HOST_IP>:8000 8995 \
+        --decode http://<DECODE_HOST_IP>:8001 \
+        --host <ROUTER_HOST_IP> \
+        --port 6689
+    ```
 
 <Tip>
 `ASCEND_MF_STORE_URL` on both nodes must point to the same KV store (typically the prefill node IP).

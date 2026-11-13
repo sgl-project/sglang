@@ -208,6 +208,7 @@ When using EvalScope commands without specifying a dataset or model path, it wil
 requests.exceptions.SSLError: HTTPSConnectionPool(host='www.modelscope.cn', port=443): Max retries exceeded with url: /api/v1/datasets/AI-ModelScope/ceval (Caused by SSLError(SSLCertVerificationError(1, '[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: self-signed certificate in certificate chain (_ssl.c:1016)')))
 [ERROR] 2026-05-13-02:20:01 (PID:876, Device:-1, RankID:-1) ERR99999 UNKNOWN application exception
 ```
+
 **Temporary workaround (test only):**
 Navigate to `/usr/local/python3.11.14/lib/python3.11/site-packages/requests/sessions.py`, find the `class Session` definition, and set `self.verify = False`.
 
@@ -233,13 +234,16 @@ If you cannot obtain the CA certificate, download datasets manually as shown in 
 ### EvalScope Request Retry Timeout
 
 If EvalScope keeps retrying requests with errors like:
-```
+
+```output
 2026-06-22 03:09:03 - evalscope - WARNING: Attempt 4 / 5 failed: ....... Retrying...
 2026-06-22 03:09:14 - evalscope - INFO: Evaluating[ceval]   0%| 0/520 [Elapsed: 02:00 < Remaining: ?, ?it/s]
 2026-06-22 03:09:19,557 - openai._base_client - INFO: Retrying request to /chat/completions in 0.447260 seconds
 2026-06-22 03:09:26,088 - openai._base_client - INFO: Retrying request to /chat/completions in 0.992551 seconds
 ```
+
 This is usually caused by the HTTP proxy intercepting requests to the local SGLang server. Disable the proxy with:
+
 ```shell Command
 unset http_proxy
 unset https_proxy
