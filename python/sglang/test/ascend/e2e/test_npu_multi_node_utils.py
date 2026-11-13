@@ -166,21 +166,16 @@ def get_host_ip():
 def resolve_local_ip():
     """Resolve the current node's IP for the memfabric metadata RPC server.
 
-    Prefers the k8s-injected ``POD_IP``; falls back to the primary outbound
-    address for non-k8s single-machine runs (e.g. GitHub Actions-allocated
-    pods that do not set ``POD_IP``). The UDP connect only consults the
-    routing table and sends no packets, so it also works offline.
+    Multi-node cases run on k8s where ``POD_IP`` is injected via the downward
+    API. Single-machine cases run on GitHub Actions-allocated pods that do not
+    set ``POD_IP``; all participants then share one network namespace, so the
+    loopback address is reachable by every process.
     """
     host_ip = os.getenv("POD_IP")
     if host_ip:
         return host_ip
-    logger.info("POD_IP is not set, resolving local IP via the routing table")
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-            sock.connect(("8.8.8.8", 80))
-            return sock.getsockname()[0]
-    except OSError as e:
-        raise RuntimeError(f"Failed to resolve local IP without POD_IP: {e}")
+    logger.info("POD_IP is not set, using the loopback address (single-machine case)")
+    return "127.0.0.1"
 
 
 def get_k8s_api():
@@ -328,8 +323,7 @@ def set_environment_variables(env_vars):
 # Mooncake + TENT + MemFabric KV transfer config. With ``metadata_type``
 # ``p2p`` every node runs its own metadata RPC server and must advertise its
 # own IP, so ``rpc_server_hostname`` is filled per node via
-# ``resolve_local_ip()`` (``POD_IP`` when present, otherwise the detected
-# outbound address).
+# ``resolve_local_ip()`` (``POD_IP`` on k8s, loopback for single-machine runs).
 MEMFABRIC_TENT_CONF_TEMPLATE = {
     "metadata_type": "p2p",
     "rpc_server_hostname": "",
@@ -360,10 +354,10 @@ MEMFABRIC_TENT_CONF_TEMPLATE = {
 def write_memfabric_tent_conf(path="/tmp/memfabric_tent.json"):
     """Write the Mooncake TENT/MemFabric config for the current node.
 
-    The IP comes from ``resolve_local_ip()`` (``POD_IP`` when present, else
-    the detected outbound address), so the same test works on every node of a
-    multi-node PD deployment and on non-k8s single-machine runs without
-    manually editing the file per node.
+    The IP comes from ``resolve_local_ip()`` (``POD_IP`` on k8s, loopback for
+    single-machine runs), so the same test works on every node of a multi-node
+    PD deployment and on non-k8s single-machine runs without manually editing
+    the file per node.
 
     Returns:
         str: Path of the generated config file.
