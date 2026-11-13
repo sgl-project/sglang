@@ -1,0 +1,6 @@
+# The pinned sglang-kernel and sgl-deep-ep releases still require torch==2.14.1.
+# CI installs torch 2.15 over that pin until their torch 2.15 / cu134 builds ship.
+# TODO: delete this file and its --override uses once the pyproject pins resolve.
+torch==2.15.0
+torchaudio==2.11.1
+torchvision==0.29.2
