@@ -1672,7 +1672,9 @@ class TestPrefillAdder(CustomTestCase):
         )
         budget.checkpoint_interval = 0
         # 48 owner tokens free; nothing else holds memory to give back.
-        budget._fits = lambda full, windows, state_slots, **kwargs: full <= 48
+        budget._fits = lambda full, windows, state_slots, request_rows=0, **kwargs: (
+            full <= 48
+        )
         budget._others_hold_memory = lambda req: False
         adder.memory_budget = budget
         adder.mamba_chunk_grid = 64
