@@ -83,7 +83,8 @@ curl http://localhost:30000/v1/chat/completions \
   -d '{"model": "qwen3", "messages": [{"role": "user", "content": "Hello"}]}'
 ```
 
-`--model-id` is required. `--model-alias` (repeatable) serves another `model`
+`--model-id` is required. Any `model` name is served as `--model-id`, and the
+engine receives it as sent. `--model-alias` (repeatable) forwards another `model`
 name as `--model-id`, for example a gateway that sends the engine's
 `--model-path`. Aliases are forwarded as `--model-id`, preserving an optional
 `:adapter` LoRA suffix; names containing colons, such as `s3://bucket/model`,
@@ -104,8 +105,9 @@ every flag.
 | `POST /v1/embeddings`, `/v1/classify`, `/v1/rerank` | [Embeddings, classify and rerank](#embeddings-classify-and-rerank) |
 | `POST /v1/tokenize`, `/v1/detokenize` | Tokenize with the router's tokenizer |
 | `GET /v1/models` | The served model |
-| `POST /flush_cache` | Fan out a cache flush to every worker |
-| `GET /server_info`, `/model_info`, `/health_generate` | Answered by one healthy worker (a prefill worker under P/D; `/health_generate` also runs on one of its decode peers and returns the decode's answer when both pass); `/get_server_info` and `/get_model_info` are aliases |
+| `POST /flush_cache` | Fan out a cache flush to every worker, with the caller's `timeout` |
+| `GET /server_info` | Answered by one healthy worker (a decode worker under P/D, which reports decode's state); `/get_server_info` is an alias |
+| `GET /model_info`, `/health_generate` | Answered by one healthy worker (a prefill worker under P/D; `/health_generate` also runs on one of its decode peers and returns the decode's answer when both pass); `/get_model_info` is an alias |
 | `GET /healthz`, `/readyz` | Liveness and readiness; `/health`, `/liveness`, and `/readiness` are aliases |
 | `GET /metrics` | Prometheus metrics, see [monitoring/README.md](monitoring/README.md) |
 
@@ -351,6 +353,10 @@ unset fields inherit the CLI flags. See
 - **PD version groups**: `--pd-version-group-label <key>` pairs prefill and
   decode only within the same engine version; see
   [PD version groups](REFERENCE.md#pd-version-groups).
+- **Request body size**: inference routes answer `413` past 32 MiB;
+  `SGLANG_ROUTER_MAX_BODY_BYTES=<bytes>` raises the cap for large multimodal
+  requests, at the cost of more router memory per in-flight request; see
+  [request body size](REFERENCE.md#request-body-size).
 - **Engine API key**: `--worker-api-key` for engines launched with `--api-key`;
   see [engines with `--api-key`](REFERENCE.md#engines-with---api-key).
 - **Sampling contract**: `--override-sampling-params '<json>'` pins sampling
