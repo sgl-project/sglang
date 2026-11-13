@@ -80,3 +80,87 @@ Data parallelism is better for throughput. When there is enough GPU memory, alwa
 - Try other quantization (e.g. FP8 quantization with `--quantization fp8`)
 - Try other parallelism strategies (e.g. [expert parallelism](https://lmsys.org/blog/2025-05-05-large-scale-ep/)) or DP attention for deepseek models (with `--attn-dp-size 8`).
 - If the workload has many shared prefixes, try `--schedule-policy lpm`. Here, `lpm` stands for longest prefix match. It reorders requests to encourage more cache hits but introduces more scheduling overhead.
+
+## Reducing decode stalls for online serving
+
+The tuning above targets throughput. In online serving, users also notice pauses while
+tokens are streaming. This section explains why long prompts cause these pauses and how
+to reduce them.
+
+The numbers below come from one workload: SGLang 0.5.23 on a single A40 serving
+Qwen2.5-7B-Instruct, with 32 concurrent requests (128 input and 1024 output tokens each)
+decoding in the background, while three 16K-token prompts arrive 5 seconds apart. Chunked
+prefill uses the default size of 4096.
+
+| Configuration | Max ITL | P99 ITL | Mean TPOT | Mean TTFT |
+| --- | --- | --- | --- | --- |
+| Default | 3047 ms | 33.8 ms | 33.9 ms | 496 ms |
+| `--enable-mixed-chunk` | 1173 ms | 38.0 ms | 33.9 ms | 433 ms |
+| `--prefill-decode-interval 4` | 803 ms | 40.4 ms | 33.8 ms | 647 ms |
+| Both | 836 ms | 41.6 ms | 33.7 ms | 662 ms |
+
+### Why long prompts stall decoding
+
+When a long prompt arrives while other requests are decoding, those requests can pause
+for seconds before emitting their next token. This shows up as a spike in the maximum
+inter-token latency (max ITL), while mean and P99 ITL barely change. In the default
+configuration above, each 16K-token prompt paused all 32 running requests for about
+3 seconds, while P99 ITL stayed at 33.8 ms.
+
+This comes from two scheduling behaviors:
+
+- **Prefill-first scheduling.** When new requests can be admitted, the scheduler runs a
+  prefill batch before the next decode step. This keeps TTFT low for new requests, at
+  the cost of pausing requests that are already decoding.
+- **Chunks of a long prompt run back-to-back.** Chunked prefill (`--chunked-prefill-size`)
+  splits a long prompt into chunks, but by default the scheduler runs these chunks
+  consecutively, with no decode steps in between. Running requests therefore wait for
+  the entire prompt, not just one chunk. Chunking bounds the GPU memory used by each
+  forward pass; on its own it does not shorten decode stalls. In an earlier run on
+  SGLang 0.5.22, lowering `--chunked-prefill-size` from 4096 to 512 made the stall
+  longer (2893 ms to 3217 ms), because each extra chunk adds scheduling overhead.
+
+### Option 1: `--enable-mixed-chunk`
+
+With `--enable-mixed-chunk`, each prefill step also runs one decode step for all running
+requests. The decode tokens count toward the chunk budget, so each step still processes
+at most `--chunked-prefill-size` tokens. Running requests keep emitting tokens while the
+long prompt is being prefilled, instead of waiting for the whole prompt.
+
+In the test above, it reduced max ITL from 3047 ms to 1173 ms without increasing TTFT
+or mean TPOT. The cost is that one long stall becomes several shorter ones, so P99 ITL
+rose from 33.8 ms to 38.0 ms.
+
+Mixed chunking is skipped for some requests and disabled by some features, such as
+requests that return logprobs, `input_embeds`, beam search, and some speculative
+decoding modes.
+
+### Option 2: `--prefill-decode-interval`
+
+`--prefill-decode-interval N` makes the scheduler run N decode steps after each
+prefill batch before it schedules the next one. Between the chunks of a long prompt,
+running requests therefore advance N tokens instead of none.
+
+In the test above, N = 4 reduced max ITL from 3047 ms to 803 ms, while mean TPOT
+stayed at about 34 ms.
+
+The interval applies after every prefill batch, not only between chunks of a long
+prompt, so newly arrived requests also wait before their prefill runs. Mean TTFT rose
+from 496 ms to 647 ms, and P99 ITL rose from 33.8 ms to 40.4 ms because the single long
+stall was split into several shorter ones.
+
+### Choosing between them
+
+Both options shorten decode stalls, at different costs:
+
+- Use `--enable-mixed-chunk` when TTFT matters most, for example when new requests
+  arrive frequently. It did not increase TTFT in this test, but it is unavailable
+  for some features listed above.
+- Use `--prefill-decode-interval` when max ITL matters most, for example for
+  long-document workloads where running requests should not stall. It gave the shortest
+  stalls, but delays the prefill of every new request.
+- Enabling both behaved like `--prefill-decode-interval` alone in this test, so there
+  was no additional benefit.
+
+These numbers come from a single workload on one GPU. Benchmark with your own prompt
+lengths, concurrency, and latency targets before changing the defaults.
