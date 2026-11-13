@@ -20,8 +20,7 @@ struct FusedStoreCacheParam {
   const void* __restrict__ input;
   void* __restrict__ cache;
   const void* __restrict__ indices;
-  // bytes between consecutive pages of `cache` (>= the page blob, e.g. when
-  // pages are slices of larger per-page entries)
+  // Bytes between consecutive pages of `cache`.
   int64_t page_stride;
   uint32_t num_tokens;
   // DCP: indices are widened slots; this rank stores slot / dcp_size of the

@@ -356,8 +356,7 @@ class CuteDSLPagedMQALogitsRunner:
         else:
             w_2d = weights.reshape(B, N).t()
 
-        # Flatten fused KV to [num_phys_blocks, block_bytes]; a view, so strided
-        # blocks are read in place.
+        # [num_phys_blocks, block_bytes]; .view keeps strided blocks in place.
         kv_flat = kv_fused.view(num_phys_blocks, -1)
 
         # Allocate output with alignment padding
