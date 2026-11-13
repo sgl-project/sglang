@@ -61,10 +61,10 @@ def create_cuda_capture_profile(options: CaptureProfileOptions):
 
         profile_context = profile(
             activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
-            # Schedule: wait=2 (skip 2 dummy runs), warmup=0, active=1
+            # Schedule: wait=1 (skip the warmup run), warmup=0, active=1
             # (capture run); repeat=0 repeats the cycle so each captured
             # shape gets its own trace.
-            schedule=torch.profiler.schedule(wait=2, warmup=0, active=1, repeat=0),
+            schedule=torch.profiler.schedule(wait=1, warmup=0, active=1, repeat=0),
             record_shapes=True,
             with_stack=True,
             with_flops=True,

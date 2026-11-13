@@ -149,8 +149,8 @@ class FullCudaGraphBackend(BaseGraphBackend):
     ) -> None:
         # When per-bs capture traces are enabled (--enable-profile-cuda-graph +
         # SGLANG_GRAPH_BATCH_CAPTURE), the runner created a scheduled
-        # torch profiler (wait=2, active=1) and exposed it as _profiler. We step()
-        # past the two warmup runs so only the capture run is recorded, and each
+        # torch profiler (wait=1, active=1) and exposed it as _profiler. We step()
+        # past the warmup run so only the capture run is recorded, and each
         # captured shape produces its own trace via the profiler's on_trace_ready.
         # With --enable-profile-cuda-graph alone the runner leaves _profiler None
         # (its unscheduled profiler records the whole capture in one pass), so no
@@ -162,21 +162,18 @@ class FullCudaGraphBackend(BaseGraphBackend):
             else None
         )
 
-        # Two warmups so kernels are loaded and one-time setup is paid before capture.
+        # One warmup pays this shape's JIT, autotune and lazy allocation before capture.
         # post_warmup_hook lets the attention backend reset state that warmup mutated.
-        warmup_output = None
-        for warmup_step in range(2):
-            self._device_module.synchronize()
-            self._tp_group.barrier()
-            with self._precarve.measure():
-                output = forward_fn()
-            if self._reuse_output_buffer and warmup_step == 1:
-                warmup_output = output
-            del output
-            if profiler is not None:
-                profiler.step()
-            if post_warmup_hook is not None:
-                post_warmup_hook()
+        self._device_module.synchronize()
+        self._tp_group.barrier()
+        with self._precarve.measure():
+            output = forward_fn()
+        warmup_output = output if self._reuse_output_buffer else None
+        del output
+        if profiler is not None:
+            profiler.step()
+        if post_warmup_hook is not None:
+            post_warmup_hook()
 
         if self._reuse_output_buffer and self._output_buffer is None:
             # Prefill captures the largest shape first and replays one shape at

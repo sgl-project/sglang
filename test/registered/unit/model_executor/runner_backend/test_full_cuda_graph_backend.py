@@ -3,12 +3,12 @@
 These cover the changes from the "cuda graph profile traces" PR that wire the
 runner's torch profiler into the capture loop:
 
-  * When profiling is disabled, ``capture_one`` runs exactly two warmups + one
-    capture and never touches a profiler (behavior-identical to before the PR).
+  * When profiling is disabled, ``capture_one`` runs exactly one warmup + one
+    capture and never touches a profiler.
   * When the runner exposes an active ``_profiler`` (per-bs capture profiling,
     ``--enable-profile-cuda-graph`` + ``SGLANG_GRAPH_BATCH_CAPTURE``),
-    ``capture_one`` calls ``profiler.step()`` past the two warmups and once after
-    the capture (schedule ``wait=2, warmup=0, active=1``). The captured forward is
+    ``capture_one`` calls ``profiler.step()`` past the warmup and once after
+    the capture (schedule ``wait=1, warmup=0, active=1``). The captured forward is
     NOT wrapped in a ``record_function``; per-bs trace naming is handled by the
     profiler's ``on_trace_ready`` callback instead.
   * The ``getattr`` guards mean a runner that sets the flag but has no
@@ -106,7 +106,7 @@ class TestCaptureOneNoProfiling(CustomTestCase):
         backend.cleanup()
         self.assertIsNone(reference())
 
-    def test_runs_two_warmups_and_capture_without_stepping(self):
+    def test_runs_one_warmup_and_capture_without_stepping(self):
         runner = _make_runner(enable_profile=False, profiler=None)
         backend = _make_backend(runner)
 
@@ -120,10 +120,10 @@ class TestCaptureOneNoProfiling(CustomTestCase):
                 shape_key, forward_fn, post_warmup_hook=post_warmup_hook
             )
 
-        # 2 warmups + 1 capture.
-        self.assertEqual(forward_fn.call_count, 3)
-        # post_warmup_hook only runs in the two warmup iterations.
-        self.assertEqual(post_warmup_hook.call_count, 2)
+        # 1 warmup + 1 capture.
+        self.assertEqual(forward_fn.call_count, 2)
+        # post_warmup_hook only runs after the warmup.
+        self.assertEqual(post_warmup_hook.call_count, 1)
         # Graph + output are recorded against the shape key.
         self.assertEqual(backend._graphs[shape_key], "GRAPH")
         self.assertIs(backend._outputs[shape_key], sentinel_out)
@@ -137,8 +137,6 @@ class TestCaptureOneNoProfiling(CustomTestCase):
             [
                 torch.ones((4, 2)),
                 torch.ones((4, 2)),
-                torch.ones((4, 2)),
-                torch.ones((2, 2)),
                 torch.ones((2, 2)),
                 torch.ones((2, 2)),
             ]
@@ -165,7 +163,7 @@ class TestCaptureOneNoProfiling(CustomTestCase):
         large_out = (torch.ones((4, 2)), torch.ones((4, 3)))
         small_out = (torch.full((2, 2), 2.0), torch.full((2, 3), 3.0))
         plain_out = torch.full((1, 2), 7.0)
-        outputs = iter([large_out] * 3 + [small_out] * 3 + [plain_out] * 3)
+        outputs = iter([large_out] * 2 + [small_out] * 2 + [plain_out] * 2)
         with mock.patch("torch.cuda.CUDAGraph", side_effect=["G4", "G2", "G1"]):
             backend.capture_one(ShapeKey(size=4), lambda: next(outputs))
             backend.capture_one(ShapeKey(size=2), lambda: next(outputs))
@@ -198,7 +196,7 @@ class TestCaptureOneNoProfiling(CustomTestCase):
 
         first_out = (torch.ones((4, 2)), torch.tensor(0.0))
         second_out = (torch.ones((2, 2)), torch.tensor(1.0))
-        outputs = iter([first_out] * 3 + [second_out] * 3)
+        outputs = iter([first_out] * 2 + [second_out] * 2)
         with mock.patch("torch.cuda.CUDAGraph", side_effect=["G4", "G2"]):
             backend.capture_one(ShapeKey(size=4), lambda: next(outputs))
             backend.capture_one(ShapeKey(size=2), lambda: next(outputs))
@@ -219,7 +217,7 @@ class TestCaptureOneNoProfiling(CustomTestCase):
         with mock.patch("torch.cuda.CUDAGraph", return_value="GRAPH"):
             backend.capture_one(ShapeKey(size=2), forward_fn)
 
-        self.assertEqual(forward_fn.call_count, 3)
+        self.assertEqual(forward_fn.call_count, 2)
 
 
 class TestCaptureOneWithProfiling(CustomTestCase):
@@ -240,13 +238,13 @@ class TestCaptureOneWithProfiling(CustomTestCase):
 
         return profiler, forward_fn
 
-    def test_steps_twice_in_warmup_and_once_after_capture(self):
+    def test_steps_once_in_warmup_and_once_after_capture(self):
         profiler, forward_fn = self._run(
             size=4, num_tokens_per_bs=1, mode_name="DECODE"
         )
-        # Schedule wait=2 + active=1 => one step per warmup (x2) + one post-capture.
-        self.assertEqual(profiler.step.call_count, 3)
-        self.assertEqual(forward_fn.call_count, 3)
+        # Schedule wait=1 + active=1 => one step after the warmup + one post-capture.
+        self.assertEqual(profiler.step.call_count, 2)
+        self.assertEqual(forward_fn.call_count, 2)
 
 
 class TestCleanup(CustomTestCase):
