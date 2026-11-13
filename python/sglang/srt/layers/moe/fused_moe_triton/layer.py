@@ -89,11 +89,13 @@ from sglang.srt.utils import (
     is_cpu,
     is_hip,
     is_npu,
+    is_sail,
     round_up,
 )
 from sglang.srt.utils.custom_op import register_custom_op
 
 _is_hip = is_hip()
+_is_sail = is_sail()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_npu = is_npu()
@@ -238,6 +240,8 @@ def create_moe_dispatcher(
         or a2a_backend.is_nixl()
         or a2a_backend.is_pplx()
     ):
+        # A SAIL-only knob; every other platform keeps the upstream default.
+        use_recv_hook = envs.SGLANG_SAIL_DEEPEP_RECV_HOOK.get() if _is_sail else True
         return MaybeTboDeepEPDispatcher(
             runner_backend=moe_runner_config.runner_backend,
             group=_get_deepep_comm_group(a2a_backend),
@@ -249,7 +253,7 @@ def create_moe_dispatcher(
             params_dtype=moe_runner_config.params_dtype,
             deepep_mode=get_deepep_mode(),
             async_finish=True,
-            return_recv_hook=True,
+            return_recv_hook=use_recv_hook,
         )
     elif a2a_backend.is_deepep_v2():
         output_dtype = get_deepep_v2_dispatcher_output_dtype(
@@ -674,6 +678,17 @@ class FusedMoE(torch.nn.Module):
 
         if self.use_flashinfer_trtllm_moe:
             self.moe_runner_config.inplace = False
+
+        # SAIL's DeepEP needs its wire format before the weights are loaded;
+        # elsewhere the quant method configures the dispatcher itself once the
+        # checkpoint dtype is final. Writing a still-empty dict back here would
+        # build MORI EPv2's op with the wrong format.
+        if _is_sail:
+            from sglang.srt.hardware_backend.sail.moe.dispatcher_quant import (
+                build_early_dispatcher_quant_config,
+            )
+
+            self.dispatcher.set_quant_config(build_early_dispatcher_quant_config(self))
 
         self.should_fuse_routed_scaling_factor_in_topk = (
             _fuses_routed_scaling_factor_in_topk(self.quant_method, self.runner_backend)
@@ -1408,6 +1423,7 @@ class FusedMoE(torch.nn.Module):
                     "CompressedTensorsWNA16MarlinMoE",
                     "CompressedTensorsWNA16MoE",
                     "CompressedTensorsWNA16TritonMoE",
+                    "CompressedTensorsWNA16DeepGemmMoE",
                 ]
             )
             and "zero" not in weight_name
@@ -1660,6 +1676,7 @@ class FusedMoE(torch.nn.Module):
                 in [
                     "CompressedTensorsWNA16MoE",
                     "CompressedTensorsWNA16TritonMoE",
+                    "CompressedTensorsWNA16DeepGemmMoE",
                 ]
             )
             and "zero" not in weight_name

@@ -14,6 +14,7 @@ from torch.nn.parameter import Parameter
 from sglang.kernels.fused_op import BaseFusedOp
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.environ import envs
+from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.amx_utils import (
     CPUQuantMethod,
     _amx_process_weight_after_loading,
@@ -55,6 +56,7 @@ from sglang.srt.utils import (
     is_gfx115_supported,
     is_hip,
     is_npu,
+    is_sail,
     is_xpu,
     use_intel_amx_backend,
 )
@@ -1562,7 +1564,39 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
-        if self.use_flashinfer_trtllm_moe:
+        # SAIL's DeepGEMM MoE engines only implement gated SiLU and SiTU. A gelu
+        # or ungated checkpoint routed there trips the runner's assertion during
+        # construction, far from the cause, so decide that here instead; which
+        # layers the engines take -- the DeepEP-family rule and the opt-in one --
+        # is their own knowledge and stays in the SAIL package.
+        use_sail_deepgemm_for_a2a = False
+        use_sail_deepgemm_for_auto = False
+        if is_sail() and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
+            from sglang.srt.hardware_backend.sail.moe.deepgemm_moe import (
+                deepgemm_moe_selected_for_a2a,
+                deepgemm_moe_selected_for_auto,
+                sail_deepgemm_moe_unsupported_reason,
+            )
+
+            reason = sail_deepgemm_moe_unsupported_reason(moe_runner_config)
+            if reason is None:
+                use_sail_deepgemm_for_a2a = deepgemm_moe_selected_for_a2a()
+                use_sail_deepgemm_for_auto = deepgemm_moe_selected_for_auto()
+            else:
+                message = f"SAIL DeepGEMM MoE cannot run this layer: {reason}"
+                if (
+                    get_moe_runner_backend().is_deep_gemm()
+                    or get_moe_a2a_backend().is_deepep()
+                    or get_moe_a2a_backend().is_mooncake()
+                ):
+                    raise ValueError(
+                        f"{message}; use --moe-runner-backend triton or a gated "
+                        "SiLU/SiTU checkpoint."
+                    )
+                logger.warning_once(f"{message}; using the triton MoE runner.")
+        if use_sail_deepgemm_for_a2a:
+            backend = MoeRunnerBackend.DEEP_GEMM
+        elif self.use_flashinfer_trtllm_moe:
             backend = (
                 MoeRunnerBackend.FLASHINFER_TRTLLM_ROUTED
                 if get_moe_runner_backend().is_flashinfer_trtllm_routed()
@@ -1579,6 +1613,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             layer.w2_kernel = NPUUnquantMoEMethod()
             moe_runner_config.layer = layer
             backend = MoeRunnerBackend.ASCEND
+        elif use_sail_deepgemm_for_auto and get_moe_runner_backend().is_auto():
+            backend = MoeRunnerBackend.DEEP_GEMM
         else:
             backend = MoeRunnerBackend.TRITON
         self.runner = MoeRunner(backend, moe_runner_config)

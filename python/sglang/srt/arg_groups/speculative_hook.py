@@ -695,6 +695,10 @@ def _handle_dspark(server_args: ServerArgs) -> None:
         allowed_a2a_backends = dspark_dp_a2a_backends(
             model_config_of(server_args).hf_config.architectures[0]
         )
+        # DeepEP under dp attention is only wired through the SAIL DeepGEMM MoE
+        # stack; every other platform keeps the per-model upstream allowlist.
+        if get_platform().is_sail and "deepep" not in allowed_a2a_backends:
+            allowed_a2a_backends += ("deepep",)
         if not _is_npu and cfg.moe_a2a_backend not in allowed_a2a_backends:
             raise ValueError(
                 "DSpark with dp attention supports moe_a2a_backend "

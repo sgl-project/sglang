@@ -12,33 +12,42 @@ from sglang.srt.layers.deep_gemm_wrapper.configurer import (  # noqa: F401
     DEEPGEMM_SCALE_UE8M0,
     ENABLE_JIT_DEEPGEMM,
 )
+from sglang.srt.utils import is_sail
 
 logger = logging.getLogger(__name__)
 
+_is_sail = is_sail()
+
 if ENABLE_JIT_DEEPGEMM:
     import deep_gemm
-    from deep_gemm.utils.layout import (
-        get_mn_major_tma_aligned_tensor as _get_mn_major_tma_aligned_tensor,
-    )
 
-    def get_mn_major_tma_aligned_tensor(sf: torch.Tensor) -> torch.Tensor:
-        """Transform ``sf`` into an MN-major, TMA-aligned layout for DeepGEMM.
+    # Only the SAIL build lacks this helper: it applies the layout inside its
+    # GEMMs. Everywhere else the wrapper must stay importable -- MUSA and
+    # Blackwell with UE8M0 scales also report
+    # DEEPGEMM_NEED_TMA_ALIGNED_SCALES as False while still calling it.
+    if not _is_sail:
+        from deep_gemm.utils.layout import (
+            get_mn_major_tma_aligned_tensor as _get_mn_major_tma_aligned_tensor,
+        )
 
-        When ``sf`` is already in that layout, sgl-deep-gemm's fast path
-        (<= 0.1.4.post1) returns a NON-OWNING ``torch::from_blob`` alias of
-        ``sf`` across the TVM-FFI boundary. Callers rebind the result over
-        their only reference (``x = get_mn_major_tma_aligned_tensor(x)``),
-        which frees the storage while the GEMM still reads through the alias
-        -- a use-after-free that surfaces as NaN logits or "pointer resides
-        on host memory" during CUDA graph capture once the allocator reuses
-        the block. Hand back ``sf`` itself in that case so ownership is
-        preserved.
-        """
-        out = _get_mn_major_tma_aligned_tensor(sf)
-        if out.data_ptr() == sf.data_ptr():
-            assert out.shape == sf.shape and out.stride() == sf.stride()
-            return sf
-        return out
+        def get_mn_major_tma_aligned_tensor(sf: torch.Tensor) -> torch.Tensor:
+            """Transform ``sf`` into an MN-major, TMA-aligned layout for DeepGEMM.
+
+            When ``sf`` is already in that layout, sgl-deep-gemm's fast path
+            (<= 0.1.4.post1) returns a NON-OWNING ``torch::from_blob`` alias of
+            ``sf`` across the TVM-FFI boundary. Callers rebind the result over
+            their only reference (``x = get_mn_major_tma_aligned_tensor(x)``),
+            which frees the storage while the GEMM still reads through the alias
+            -- a use-after-free that surfaces as NaN logits or "pointer resides
+            on host memory" during CUDA graph capture once the allocator reuses
+            the block. Hand back ``sf`` itself in that case so ownership is
+            preserved.
+            """
+            out = _get_mn_major_tma_aligned_tensor(sf)
+            if out.data_ptr() == sf.data_ptr():
+                assert out.shape == sf.shape and out.stride() == sf.stride()
+                return sf
+            return out
 
 
 _SANITY_CHECK = envs.SGLANG_DEEPGEMM_SANITY_CHECK.get()
@@ -171,9 +180,7 @@ def grouped_gemm_nt_bf16_contig(
 
 
 def get_contiguous_layout_alignment(expected_m: int, num_groups: int) -> int:
-    alignment = deep_gemm.get_mk_alignment_for_contiguous_layout()
-    if isinstance(alignment, tuple):
-        alignment = alignment[0]
+    alignment = compile_utils.contiguous_m_alignment()
 
     theoretical_alignment = getattr(
         deep_gemm, "get_theoretical_mk_alignment_for_contiguous_layout", None
@@ -230,6 +237,13 @@ def gemm_nt_f8f8bf16(
         if recipe == (1, 32, 32)
         else compile_utils.DeepGemmKernelType.GEMM_NT_F8F8BF16
     )
+    if _is_sail and recipe is None and lhs[1].shape[-1] == rhs[1].shape[-1] == 1:
+        # The vendor build is the only one that reads per-channel weight scales.
+        from sglang.srt.hardware_backend.sail.deep_gemm.kernel_types import (
+            SailDeepGemmKernelType,
+        )
+
+        kernel_type = SailDeepGemmKernelType.GEMM_NT_F8F8BF16_CHANNEL
 
     _sanity_check_input(lhs)
     _sanity_check_input(rhs)
@@ -292,6 +306,11 @@ def tf32_hc_prenorm_gemm(
 ):
     if x.shape[0] == 0:
         return
+    if _is_sail:
+        raise NotImplementedError(
+            "This SAIL adaptation does not enable the DeepGEMM TF32 MHC contract; "
+            "please use the existing TileLang/PyTorch MHC path."
+        )
     deep_gemm.tf32_hc_prenorm_gemm(x, fn, out, sqrsum, num_splits=num_splits)
 
 

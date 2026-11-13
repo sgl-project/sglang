@@ -153,22 +153,21 @@ class FlashKDAKernel(LinearAttnKernelBase):
                 track_chunk_idx=kwargs.get("track_chunk_idx"),
             )
 
-        return (
-            self._flashkda_extend(
-                q,
-                k,
-                v,
-                g,
-                beta,
-                ssm_states=ssm_states,
-                cache_indices=cache_indices,
-                query_start_loc=query_start_loc,
-                A_log=A_log,
-                dt_bias=dt_bias,
-                lower_bound=lower_bound,
-                beta_is_raw=beta_is_raw,
-            ),
-            None,
+        # return_intermediate_states is False here, so the contract is just
+        # the output tensor; kda_nvidia and kda_ptx return the same.
+        return self._flashkda_extend(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            ssm_states=ssm_states,
+            cache_indices=cache_indices,
+            query_start_loc=query_start_loc,
+            A_log=A_log,
+            dt_bias=dt_bias,
+            lower_bound=lower_bound,
+            beta_is_raw=beta_is_raw,
         )
 
     @staticmethod
@@ -223,8 +222,6 @@ class FlashKDAKernel(LinearAttnKernelBase):
         lower_bound: Optional[float] = None,
         beta_is_raw: bool = False,
     ) -> torch.Tensor:
-        flash_kda = _load_flash_kda()
-
         # Input shapes (varlen, B == 1, matching chunk_kda's contract):
         #   q, k = [1, packed_seq, H, K]   v = [1, packed_seq, HV, V]
         #   g    = [1, packed_seq, HV, K]  beta = [1, packed_seq, H]
@@ -262,6 +259,45 @@ class FlashKDAKernel(LinearAttnKernelBase):
         out_buf = torch.empty_like(v)
         final_state = torch.empty_like(initial_state)
 
+        self._launch_fused(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            out_buf,
+            A_log,
+            dt_bias,
+            scale,
+            lower_bound,
+            initial_state,
+            final_state,
+            cu_seqlens,
+        )
+
+        ssm_states[cache_indices] = final_state
+
+        # out_buf is already [1, packed_seq, HV, V].
+        return out_buf
+
+    def _launch_fused(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        g: torch.Tensor,
+        beta: torch.Tensor,
+        out_buf: torch.Tensor,
+        A_log: torch.Tensor,
+        dt_bias: Optional[torch.Tensor],
+        scale: float,
+        lower_bound: Optional[float],
+        initial_state: torch.Tensor,
+        final_state: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+    ) -> None:
+        """Run the fused extend kernel into ``out_buf``/``final_state``."""
+        flash_kda = _load_flash_kda()
         flash_kda.fwd(
             q,
             k,
@@ -277,8 +313,3 @@ class FlashKDAKernel(LinearAttnKernelBase):
             final_state=final_state,
             cu_seqlens=cu_seqlens,
         )
-
-        ssm_states[cache_indices] = final_state
-
-        # out_buf is already [1, packed_seq, HV, V].
-        return out_buf

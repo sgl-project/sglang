@@ -11,7 +11,7 @@ from sglang.srt.arg_groups.model_override_base import (
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.runtime_context import get_platform
-from sglang.srt.utils.device import is_cpu, is_mps
+from sglang.srt.utils.device import get_device_sm, is_cpu, is_mps, is_sail
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +24,7 @@ def _gpt_oss_overrides(server_args: Any, hf_config: Any) -> dict:
     if is_attention_backend_not_set(cfg):
         if get_platform().is_sm100:
             overrides["attention_backend"] = "trtllm_mha"
-        elif get_platform().is_sm90:
+        elif get_platform().is_sm90 or is_sail():
             overrides["attention_backend"] = "fa3"
         elif is_cpu() and get_platform().has_amx:
             overrides["attention_backend"] = "intel_amx"
@@ -73,6 +73,17 @@ def _gpt_oss_overrides(server_args: Any, hf_config: Any) -> dict:
             logger.warning(
                 "Detected SM90 and MXFP4 quantization format for GPT-OSS model, "
                 "enabling FlashInfer CUTLASS MXFP4 MOE kernel."
+            )
+        elif (
+            is_sail()
+            and get_device_sm() >= 89
+            and envs.SGLANG_SAIL_DEEPGEMM_MOE.get()
+            and is_mxfp4_quant_format
+        ):
+            # SAIL MXFP4 uses the DeepGEMM MoE runner.
+            overrides["moe_runner_backend"] = "deep_gemm"
+            logger.warning(
+                "Detected SAIL and GPT-OSS MXFP4 format, enabling DeepGEMM MoE kernel."
             )
         elif (
             get_platform().is_hip and envs.SGLANG_USE_AITER.get()

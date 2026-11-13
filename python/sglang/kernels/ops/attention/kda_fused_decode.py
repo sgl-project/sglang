@@ -21,7 +21,7 @@ Everything else falls back to the unfused chain.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, AbstractSet, Optional
 
 import torch
 
@@ -59,15 +59,19 @@ def covered(
     ssm_states: torch.Tensor,
     cache_indices: torch.Tensor,
     onorm_g: torch.Tensor,
+    supported_heads: AbstractSet[int] = SUPPORTED_HEADS,
 ) -> bool:
     """The kernel is compiled for the K3 KDA decode regime: H heads of 128,
     packed [T, 3*H*128] qkv rows, transposed [slots, 3, 3*H*128] conv pool, fp32
     [slots, H, 128, 128] ssm pool (inner-contiguous, any slot pitch — the
-    kernel reads the real slot stride), one token per request."""
+    kernel reads the real slot stride), one token per request.
+
+    ``supported_heads`` lets a kernel with the same layout contract but other
+    head instantiations reuse this check."""
     if ssm_states.ndim < 4:
         return False
     H, V, K = ssm_states.shape[-3:]
-    if H not in SUPPORTED_HEADS:
+    if H not in supported_heads:
         return False
     seg = H * 128
     conv_dim = 3 * seg

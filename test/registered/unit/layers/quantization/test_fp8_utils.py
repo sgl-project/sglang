@@ -4,6 +4,7 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.quantization import fp8_utils
 from sglang.srt.layers.quantization.fp8 import (
     Fp8MoEMethod,
@@ -567,6 +568,68 @@ class TestApplyFp8LinearBmmFlashinferBias(CustomTestCase):
                 torch.testing.assert_close(
                     out.float(), ref.float() + bias.float(), rtol=1.6e-2, atol=0.5
                 )
+
+
+class TestSailDeepGemmPrequantOutputDtype(CustomTestCase):
+    """The SAIL channelwise branch runs DeepGEMM into a bf16 workspace and casts
+    the result back to ``pre_quant_output_dtype``; without that cast every layer
+    of an FP16 model came back as bf16. Pin both activation dtypes plus the bf16
+    fallback, since the CUDA test above never enters this branch."""
+
+    FP8_DTYPE = torch.float8_e4m3fn
+
+    def _run(self, output_dtype):
+        M, K, N = 4, 128, 64
+        qinput = torch.zeros(M, K, dtype=self.FP8_DTYPE, device="cpu")
+        # apply_fp8_linear takes the weight as [K, N] and hands its transpose to
+        # the NT GEMM.
+        weight = torch.zeros(K, N, dtype=self.FP8_DTYPE, device="cpu")
+        # A per-output-channel weight scale is what selects the SAIL branch.
+        weight_scale = torch.ones(N, dtype=torch.float32, device="cpu")
+        input_scale = torch.tensor([1.0], dtype=torch.float32, device="cpu")
+
+        gemm_calls = []
+
+        def fake_gemm_nt_f8f8bf16(a, a_scale, b, b_scale, out):
+            gemm_calls.append((a, b, out))
+            out.fill_(1.0)
+
+        with (
+            patch.object(fp8_utils, "_is_sail", True),
+            patch.object(fp8_utils.deep_gemm_wrapper, "ENABLE_JIT_DEEPGEMM", True),
+            patch.object(fp8_utils, "get_device_sm", lambda: 90),
+            patch.object(
+                fp8_utils,
+                "get_platform",
+                lambda: SimpleNamespace(is_sm90=False, is_sm100=False, is_sm120=False),
+            ),
+            patch.object(fp8_utils, "gemm_nt_f8f8bf16", fake_gemm_nt_f8f8bf16),
+            envs.SGLANG_SAIL_DEEPGEMM_DENSE.override(True),
+        ):
+            out = fp8_utils.apply_fp8_linear(
+                input=qinput,
+                weight=weight,
+                weight_scale=weight_scale,
+                input_scale=input_scale,
+                cutlass_fp8_supported=True,
+                pre_quant_output_dtype=output_dtype,
+            )
+
+        expected_dtype = output_dtype if output_dtype is not None else torch.bfloat16
+        self.assertEqual(out.dtype, expected_dtype)
+        self.assertEqual(tuple(out.shape), (M, N))
+
+        self.assertEqual(len(gemm_calls), 1)
+        gemm_a, gemm_b, gemm_out = gemm_calls[0]
+        self.assertEqual(tuple(gemm_a.shape), (M, K))
+        self.assertEqual(tuple(gemm_b.shape), (N, K))
+        # DeepGEMM always accumulates into bf16; only the return is cast.
+        self.assertEqual(gemm_out.dtype, torch.bfloat16)
+
+    def test_prequant_output_dtype(self):
+        for dtype in (torch.bfloat16, torch.float16, None):
+            with self.subTest(dtype=dtype):
+                self._run(dtype)
 
 
 if __name__ == "__main__":

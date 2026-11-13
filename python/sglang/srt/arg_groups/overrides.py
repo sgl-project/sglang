@@ -437,10 +437,17 @@ def supports_mamba_cache_extra_buffer(view: Any, hf_config: Any) -> bool:
     from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_spec
 
     spec = get_linear_attn_spec(hf_config)
-    if hf_config.architectures[0] in _MAMBA_EXTRA_BUFFER_ARCHS or (
+    model_arch = hf_config.architectures[0]
+    if model_arch in _MAMBA_EXTRA_BUFFER_ARCHS or (
         spec is not None and spec.support_mamba_cache_extra_buffer
     ):
-        return view.linear_attn_backend == "triton"
+        return view.linear_attn_backend == "triton" or (
+            # SAIL's Kimi-K3 FlashKDA prefill writes tracked states through
+            # Triton, so its ping-pong snapshots stay valid there.
+            get_platform().is_sail
+            and model_arch == "KimiK3ForConditionalGeneration"
+            and view.linear_attn_backend == "flashkda"
+        )
     return False
 
 
@@ -470,7 +477,13 @@ def _mamba_radix_cache_resolution(view: Any) -> dict:
     declared: Dict[str, Any] = {"uses_mamba_radix_cache": True}
     if view.mamba_radix_cache_strategy == "auto":
         wants_overlap = not view.disable_overlap_schedule
-        wants_paging = view.page_size is not None and view.page_size > 1
+        wants_paging = (
+            (view.page_size is not None and view.page_size > 1)
+            # FlashMLA snaps page_size to 64 later in the pass chain, so a
+            # page-1 request still lands on a paged cache.
+            or view.attention_backend == "flashmla"
+            or view.decode_attention_backend == "flashmla"
+        )
         if (wants_overlap or wants_paging) and supports_mamba_cache_extra_buffer(
             view, hf_config
         ):

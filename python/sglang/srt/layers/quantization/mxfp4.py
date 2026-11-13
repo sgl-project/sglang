@@ -20,7 +20,7 @@ from __future__ import annotations
 import os
 from dataclasses import replace
 from functools import lru_cache
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 from torch.nn.parameter import Parameter
@@ -59,6 +59,7 @@ from sglang.srt.utils import (
     is_flashinfer_available,
     is_gfx95_supported,
     is_hip,
+    is_sail,
     is_xpu,
     round_up,
     use_intel_amx_backend,
@@ -204,6 +205,7 @@ if TYPE_CHECKING:
 _is_cpu = is_cpu()
 _is_hip = is_hip()
 _is_xpu = is_xpu()
+_is_sail = is_sail()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _aiter_k3_opt = _use_aiter and get_bool_env_var("SGLANG_AITER_K3_OPT")
 _is_shuffle_moe_mxfp4 = is_gfx95_supported()
@@ -297,10 +299,12 @@ class Mxfp4Config(QuantizationConfig):
         self,
         ignored_layers: Optional[list[str]] = None,
         is_checkpoint_mxfp4_serialized: bool = False,
+        fp8_channelwise_layers: Optional[list[str]] = None,
     ):
         super().__init__()
         self.is_checkpoint_mxfp4_serialized = is_checkpoint_mxfp4_serialized
         self.ignored_layers = ignored_layers
+        self.fp8_channelwise_layers = fp8_channelwise_layers
 
     @classmethod
     def from_config(cls, config):
@@ -319,6 +323,20 @@ class Mxfp4Config(QuantizationConfig):
                     f"Current platform {platform} not support mxfp4 computation"
                 )
 
+        if _is_sail:
+            # Only SAIL's dense MXFP4 path honors the checkpoint's skip lists;
+            # elsewhere they keep being ignored, as upstream always did.
+            return cls(
+                ignored_layers=cls.get_from_keys_or(
+                    config,
+                    ["ignore", "ignored_layers", "modules_to_not_convert"],
+                    None,
+                ),
+                is_checkpoint_mxfp4_serialized=is_checkpoint_mxfp4_serialized,
+                fp8_channelwise_layers=cls.get_from_keys_or(
+                    config, ["fp8_channelwise_layers"], None
+                ),
+            )
         return cls(is_checkpoint_mxfp4_serialized=is_checkpoint_mxfp4_serialized)
 
     @classmethod
@@ -348,6 +366,18 @@ class Mxfp4Config(QuantizationConfig):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
         from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 
+        # fp8 channelwise
+        if self.fp8_channelwise_layers and is_layer_skipped(
+            prefix=prefix,
+            ignored_layers=self.fp8_channelwise_layers,
+            fused_mapping=self.packed_modules_mapping,
+        ):
+            from sglang.srt.layers.quantization.w8a8_fp8 import W8A8Fp8Config
+
+            return W8A8Fp8Config(is_checkpoint_fp8_serialized=True).get_quant_method(
+                layer, prefix
+            )
+
         if isinstance(layer, LinearBase):
             if self.ignored_layers and is_layer_skipped(
                 prefix=prefix,
@@ -357,6 +387,15 @@ class Mxfp4Config(QuantizationConfig):
                 return UnquantizedLinearMethod()
             elif _is_hip:
                 return UnquantizedLinearMethod()
+            # SAIL DeepGEMM supports serialized MXFP4 dense weights.
+            elif self.is_checkpoint_mxfp4_serialized and _is_sail:
+                from sglang.srt.hardware_backend.sail.quantization.mxfp4 import (
+                    Mxfp4LinearMethod,
+                )
+
+                return Mxfp4LinearMethod(prefix=prefix)
+            else:
+                raise NotImplementedError
         elif isinstance(layer, FusedMoE):
             if self.is_checkpoint_mxfp4_serialized:
                 return Mxfp4MoEMethod(prefix=prefix)
@@ -372,6 +411,11 @@ class Mxfp4Config(QuantizationConfig):
 
 
 class Mxfp4MoEMethod(FusedMoEMethodBase):
+    # SAIL-only W4A16 modes. Class defaults keep instances built without
+    # __init__ (e.g. via __new__ in tests) on the upstream paths.
+    use_deepgemm_mxfp4_w4a16_valu = False
+    use_deepgemm_mxfp4_w4a16_mma = False
+
     def __init__(
         self,
         prefix: str,
@@ -393,11 +437,21 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         # True W4A8: DeepGEMM fp8_fp4 grouped GEMM (SM100 MXF8F6F4 UMMA).
         # Weights stay MXFP4 (e2m1 + ue8m0 g32, zero requantization);
         # activations are quantized to fp8 per-token-group-128.
-        self.use_deep_gemm = get_moe_runner_backend().is_deep_gemm()
+        # The DeepGEMM runner serves SAIL too (FP4xFF4, plus the BF16xFP4
+        # W4A16 modes), and SAIL resolves `auto` to DeepGEMM, so ask the same
+        # predicate create_moe_runner uses instead of the backend flag alone.
+        self.use_deep_gemm = (
+            get_moe_runner_backend().is_deep_gemm()
+            or self.is_sail_deepgemm_moe_runner_backend_enabled()
+        )
         # MegaMoE calls DeepGEMM directly instead of going through the selected
         # MoE runner, so it needs the same unpadded checkpoint layout and
         # DeepGEMM scale preparation even when the runner is flashinfer_mxfp4.
         self.use_mega_moe = get_moe_a2a_backend().is_megamoe()
+        (
+            self.use_deepgemm_mxfp4_w4a16_valu,
+            self.use_deepgemm_mxfp4_w4a16_mma,
+        ) = self._sail_w4a16_modes()
         self.flashinfer_mxfp4_moe_precision = (
             get_exec().moe.flashinfer_mxfp4_moe_precision
         )
@@ -434,6 +488,36 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     "or SM120."
                 )
 
+    @staticmethod
+    def _sail_w4a16_modes() -> Tuple[bool, bool]:
+        """The W4A16 modes this platform resolved; both stay off elsewhere."""
+        if not _is_sail:
+            return False, False
+        from sglang.srt.hardware_backend.sail.quantization.mxfp4 import (
+            resolved_w4a16_modes,
+        )
+
+        return resolved_w4a16_modes()
+
+    @staticmethod
+    def is_sail_deepgemm_moe_runner_backend_enabled() -> bool:
+        """Only select SAIL FP4xFP4; the NVIDIA W4A8 backend is left unchanged."""
+        if not _is_sail:
+            return False
+        from sglang.srt.hardware_backend.sail.quantization.mxfp4 import (
+            deepgemm_moe_runner_backend_enabled,
+        )
+
+        return deepgemm_moe_runner_backend_enabled()
+
+    @property
+    def use_deep_gemm_w4a8(self) -> bool:
+        """NVIDIA's W4A8 (FP8 x FP4) recipe: DeepGEMM rewrites the MXFP4
+        scales into its SM100 TMA layout and reads the checkpoint shapes as is.
+        SAIL's FP4xFF4 GEMM takes the checkpoint layout straight from the
+        loader instead."""
+        return self.use_deep_gemm and not _is_sail
+
     def create_weights(
         self,
         layer: torch.nn.Module,
@@ -448,6 +532,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         weight_dtype = torch.uint8
         scale_dtype = torch.uint8
         self.with_bias = with_bias
+        if self.use_deepgemm_mxfp4_w4a16_mma and with_bias:
+            raise ValueError("SAIL MXFP4 W4A16 MMA does not support expert bias.")
         mxfp4_block = 32
         # The bf16-dequant fallback (Triton runner) pads the intermediate to 64,
         # which also covers gpt_oss.py's whole-block intermediate sharding.
@@ -456,7 +542,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         # pad the intermediate size to be a multiple of 2 * mxfp4_block
         # for to hold non-uniform sharded tensor as well as swizzling
         intermediate_size_per_partition_after_pad = intermediate_size_per_partition
-        if self.use_marlin and not self.use_mega_moe:
+        if (self.use_marlin and not self.use_mega_moe) or (
+            self.use_deepgemm_mxfp4_w4a16_valu
+        ):
             intermediate_size_per_partition_after_pad = round_up(
                 intermediate_size_per_partition, 128
             )
@@ -466,9 +554,20 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 intermediate_size_per_partition_after_pad
                 - layer.intermediate_size_per_partition
             )
+        elif self.use_deepgemm_mxfp4_w4a16_mma:
+            intermediate_size_per_partition_after_pad = round_up(
+                intermediate_size_per_partition, 64
+            )
+            hidden_size = round_up(hidden_size, 64)
+            self.hidden_pad = hidden_size - layer.hidden_size
+            self.intermediate_pad = (
+                intermediate_size_per_partition_after_pad
+                - layer.intermediate_size_per_partition
+            )
         elif self.use_deep_gemm or self.use_mega_moe:
-            # DeepGEMM fp8_fp4 grouped GEMM consumes the checkpoint layout
-            # directly (packed e2m1 K-major + ue8m0 g32 scales); no padding.
+            # Every DeepGEMM flavor consumes the checkpoint layout directly
+            # (packed e2m1 K-major + ue8m0 g32 scales); SAIL's grouped GEMM is
+            # the "nopad" variant, so padding here would shift its N and K.
             pass
         elif get_platform().is_sm100:
             if self.use_flashinfer:
@@ -577,7 +676,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         set_weight_attrs(w13_weight_scale, extra_weight_attrs)
         w13_weight_scale.quant_method = "group"
 
-        create_bias = with_bias or not _is_hip
+        create_bias = (
+            with_bias or not _is_hip
+        ) and not self.use_deepgemm_mxfp4_w4a16_mma
         if create_bias:
             w13_weight_bias = torch.nn.Parameter(
                 torch.zeros(
@@ -619,6 +720,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         set_weight_attrs(w2_weight_scale, extra_weight_attrs)
         w2_weight_scale.quant_method = "group"
 
+        create_bias = (
+            with_bias or not _is_hip
+        ) and not self.use_deepgemm_mxfp4_w4a16_mma
         if create_bias:
             w2_weight_bias = torch.nn.Parameter(
                 torch.zeros(layer.num_local_experts, hidden_size, dtype=torch.bfloat16),
@@ -633,7 +737,34 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             # sizing. No weight_dtype keeps bf16 dispatch, the validated default here.
             layer.dispatcher.set_quant_config({})
 
-        if self.use_marlin and not self.use_mega_moe:
+        if self.use_deepgemm_mxfp4_w4a16_mma:
+            from sglang.kernels.ops.quantization.sail_mxfp4 import (
+                preprocess_mxfp4_w4a16_mma_scales,
+            )
+
+            for weight_name in ("w13_weight", "w2_weight"):
+                weight = getattr(layer, weight_name)
+                if weight.dtype != torch.uint8 or weight.ndim != 3:
+                    raise ValueError(
+                        f"W4A16 MMA requires direct uint8 3-D weights: {weight_name}."
+                    )
+            for scale_name in ("w13_weight_scale", "w2_weight_scale"):
+                scale = getattr(layer, scale_name)
+                setattr(
+                    layer,
+                    scale_name,
+                    Parameter(
+                        preprocess_mxfp4_w4a16_mma_scales(scale), requires_grad=False
+                    ),
+                )
+            del scale, weight
+            layer._mxfp4_backend = "deep_gemm"
+            torch.cuda.empty_cache()
+            return
+
+        if (self.use_marlin and not self.use_mega_moe) or (
+            self.use_deepgemm_mxfp4_w4a16_valu
+        ):
             from sglang.srt.layers.quantization.marlin_utils import (
                 check_moe_marlin_supports_layer,
             )
@@ -642,7 +773,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 prepare_moe_mxfp4_layer_for_marlin,
             )
 
-            if (
+            if self.use_marlin and (
                 not get_platform().is_sm90
                 and not get_platform().is_sm100
                 and not get_platform().is_sm120
@@ -658,10 +789,23 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             ):
                 deinterleave_moe_mxfp4_w13_for_marlin(layer)
             prepare_moe_mxfp4_layer_for_marlin(layer)
+            if self.use_deepgemm_mxfp4_w4a16_valu:
+                # Preserve the E8M0 bit pattern: uint8 scales mark DeepGEMM's
+                # MXFP4/E2M1 path.
+                for scale_name in ("w13_weight_scale", "w2_weight_scale"):
+                    scale = getattr(layer, scale_name)
+                    setattr(
+                        layer,
+                        scale_name,
+                        Parameter(scale.view(torch.uint8), requires_grad=False),
+                    )
+                del scale
+                # Release the load/repack caches before KV-cache capacity is measured.
+                torch.cuda.empty_cache()
             layer._mxfp4_backend = "marlin"
             return
 
-        if self.use_deep_gemm or self.use_mega_moe:
+        if self.use_deep_gemm_w4a8 or self.use_mega_moe:
             from deep_gemm import transform_sf_into_required_layout
 
             # Packed fp4 (e2m1 x2 per byte) weights: DeepGEMM expects int8.
@@ -1089,6 +1233,35 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             # the kernel accumulates them). Crucially there is no bf16 upcast of
             # the weights -- the whole point of MXFP4 on XPU.
             return
+        elif self.is_sail_deepgemm_moe_runner_backend_enabled():
+            from sglang.srt.hardware_backend.sail.quantization.mxfp4 import (
+                preprocess_sail_mxfp4_scales,
+            )
+
+            if self.with_bias:
+                w13_weight_bias = layer.w13_weight_bias.to(torch.float32)
+                w2_weight_bias = layer.w2_weight_bias.to(torch.float32)
+                layer.w13_weight_bias = Parameter(w13_weight_bias, requires_grad=False)
+                layer.w2_weight_bias = Parameter(w2_weight_bias, requires_grad=False)
+
+            w13_weight_scale = layer.w13_weight_scale
+            w2_weight_scale = layer.w2_weight_scale
+            processed_w13_scale = []
+            for idx, scale_uint8 in enumerate(w13_weight_scale):
+                processed_w13_scale.append(scale_uint8)
+            processed_w2_scale = []
+            for idx, scale_uint8 in enumerate(w2_weight_scale):
+                processed_w2_scale.append(scale_uint8)
+
+            w13_scale = preprocess_sail_mxfp4_scales(
+                torch.stack(processed_w13_scale, dim=0)
+            )
+            layer.w13_weight_scale = Parameter(w13_scale, requires_grad=False)
+            w2_scale = preprocess_sail_mxfp4_scales(
+                torch.stack(processed_w2_scale, dim=0)
+            )
+            layer.w2_weight_scale = Parameter(w2_scale, requires_grad=False)
+            layer._mxfp4_backend = "deep_gemm"
         else:
             w13_weight = _dequant_mxfp4_to_bf16(
                 layer.w13_weight, layer.w13_weight_scale
@@ -1411,8 +1584,15 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             # Must match apply() priority: aiter first.
             if self.use_aiter_moe:
                 moe_runner_backend = MoeRunnerBackend.AITER
+            elif self.is_sail_deepgemm_moe_runner_backend_enabled():
+                moe_runner_backend = MoeRunnerBackend.DEEP_GEMM
             else:
                 moe_runner_backend = MoeRunnerBackend.TRITON
+
+        if _is_sail and moe_runner_backend.is_deep_gemm():
+            # The shared expert's side stream still reads the input, so combine must
+            # not overwrite that buffer.
+            moe_runner_config.inplace = False
 
         if moe_runner_backend.is_aiter():
             # MXFP4 hard-codes Swiglu in the AITER kernel path, so the
@@ -1565,21 +1745,49 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         from sglang.srt.layers.moe.topk import TopKOutputChecker
 
         if self.use_deep_gemm:
-            # Handles standard AND deepep_ll/deepep_normal dispatch formats via
-            # the runner's registered pre/post-permute functions. Must run
-            # before the `.topk_output` unpack below: deepep dispatch outputs
-            # carry topk_ids/topk_weights directly and have no `.topk_output`.
+            # Covers every DeepGEMM flavor: NVIDIA's W4A8 and SAIL's W4A16 /
+            # FP4xFF4. Handles standard AND deepep_ll/deepep_normal dispatch
+            # formats via the runner's registered pre/post-permute functions.
+            # Must run before the `.topk_output` unpack below: deepep dispatch
+            # outputs carry topk_ids/topk_weights directly and have no
+            # `.topk_output`.
             from sglang.srt.layers.moe.moe_runner.deep_gemm import DeepGemmMoeQuantInfo
 
-            quant_info = DeepGemmMoeQuantInfo(
-                w13_weight=layer.w13_weight,
-                w2_weight=layer.w2_weight,
-                use_fp8=True,
-                w13_scale=layer.w13_weight_scale,
-                w2_scale=layer.w2_weight_scale,
-                block_shape=[128, 128],
-                is_fp4_experts=True,
-            )
+            if self.use_deepgemm_mxfp4_w4a16_valu or self.use_deepgemm_mxfp4_w4a16_mma:
+                # BF16 activations against MXFP4 weights.
+                quant_info = DeepGemmMoeQuantInfo(
+                    w13_weight=layer.w13_weight,
+                    w2_weight=layer.w2_weight,
+                    use_mxfp4_w4a16=True,
+                    w13_scale=layer.w13_weight_scale,
+                    w2_scale=layer.w2_weight_scale,
+                    block_shape=[0, 32],
+                )
+            elif _is_sail:
+                # FP4xFF4: both operands stay MXFP4 and the GEMM applies the
+                # bias, so the scales keep their checkpoint layout.
+                quant_info = DeepGemmMoeQuantInfo(
+                    w13_weight=layer.w13_weight,
+                    w2_weight=layer.w2_weight,
+                    b13=layer.w13_weight_bias if self.with_bias else None,
+                    b2=layer.w2_weight_bias if self.with_bias else None,
+                    use_mxfp4=True,
+                    w13_scale=layer.w13_weight_scale,
+                    w2_scale=layer.w2_weight_scale,
+                    block_shape=[0, 16],
+                )
+            else:
+                # NVIDIA W4A8: MXFP4 weights with fp8 per-token-group-128
+                # activations, hence the FP4-expert scale recipes.
+                quant_info = DeepGemmMoeQuantInfo(
+                    w13_weight=layer.w13_weight,
+                    w2_weight=layer.w2_weight,
+                    use_fp8=True,
+                    w13_scale=layer.w13_weight_scale,
+                    w2_scale=layer.w2_weight_scale,
+                    block_shape=[128, 128],
+                    is_fp4_experts=True,
+                )
             return self.runner.run(dispatch_output, quant_info)
 
         # Same constraint as the deep_gemm branch above: the AITER runner also
