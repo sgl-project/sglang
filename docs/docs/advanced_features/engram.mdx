@@ -99,8 +99,9 @@ sglang serve --model-path deepseek-ai/DeepSeek-V4.1-Flash --tp-size 8 \
   --engram-config '{"placement": "cpu", "replication": "none", "lookup": "all_to_all"}'
 ```
 
-The CP and TP groups must have the same members in the same order, and the hash-column
-count must divide the TP size. The path reuses the DP column lookup, exchange, and
+The CP and TP groups must have the same members in the same order.
+The number of hash columns must be divisible by the TP size.
+The path reuses the DP column lookup, exchange, and
 result reordering. It applies to uniform batches with at least 64 token rows per rank
 and no CP padding. Smaller batches, padded tails, empty batches, speculative steps,
 and CUDA graph execution retain the existing lookup. Shared tables, peer reads, and

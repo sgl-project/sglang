@@ -18,6 +18,8 @@ from sglang.kernels.ops.embeddings.engram_gather import (
 from sglang.srt.arg_groups.engram_config import EngramConfig
 from sglang.srt.distributed import init_distributed_environment
 from sglang.srt.distributed.parallel_state import initialize_model_parallel
+from sglang.srt.layers.cp.interleave import InterleaveCPStrategy
+from sglang.srt.layers.cp.padding import pad_logical_token_to_physical
 from sglang.srt.layers.dp_attention import DpPaddingMode, set_dp_buffer_len
 from sglang.srt.layers.engram import EngramEmbedding
 from sglang.srt.model_executor.forward_mode import ForwardMode
@@ -183,6 +185,34 @@ def main():
         embed.lookup = "all_to_all"
         equal(a, embed(ids, batch, cp_all_tokens=True))
         checks += 1
+        # Use production metadata and padding: physical counts become uniform,
+        # so the fallback must not rely only on uneven counts or the <64 guard.
+        strategy = InterleaveCPStrategy(world)
+        for total in [128 * world - 1, 129 * world]:
+            metadata = strategy.build_metadata(total, [total])
+            logical = list(metadata.per_rank_actual_token)
+            pad_logical_token_to_physical(metadata)
+            counts = metadata.per_rank_actual_token
+            assert min(logical) >= 64
+            assert counts == [counts[0]] * world == metadata.max_rank_len
+            assert sum(counts) > metadata.total_seq_lens == total
+            batch = SimpleNamespace(
+                forward_mode=ForwardMode.EXTEND,
+                extend_seq_lens_cpu=[total],
+                attn_cp_metadata=metadata,
+            )
+            global_ids = lo + torch.arange(total, device=device)[:, None] % lengths
+            ids = strategy.shard_hidden_states(global_ids, batch)
+            assert ids.shape[0] == counts[rank]
+            assert torch.count_nonzero(ids[logical[rank] :]).item() == 0
+            embed.lookup = "all_reduce"
+            expected = embed(ids, batch, cp_all_tokens=True)
+            embed.lookup = "all_to_all"
+            assert not embed._cp_all_to_all_enabled(batch)
+            actual = embed(ids, batch, cp_all_tokens=True)
+            equal(actual, expected)
+            equal(actual, ref_table[ids.cpu()].to(device))
+            checks += 1
         # Real graph capture takes the old collective; changed replay inputs
         # must not reuse stale lookup results or enter the eager A2A path.
         n = 64
