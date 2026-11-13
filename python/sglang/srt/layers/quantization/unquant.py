@@ -1247,10 +1247,15 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
             copy_or_rebind_param(
                 layer, "w13_weight", shuffle_weight(layer.w13_weight.data, (16, 16))
             )
+            # copy_or_rebind_param copies the shuffled data into the existing
+            # Parameter, which drops the is_shuffled marker set by shuffle_weight.
+            # aiter.fused_moe uses it to select the preshuffled MoE kernels.
+            layer.w13_weight.is_shuffled = True
             torch.cuda.empty_cache()
             copy_or_rebind_param(
                 layer, "w2_weight", shuffle_weight(layer.w2_weight.data, (16, 16))
             )
+            layer.w2_weight.is_shuffled = True
             torch.cuda.empty_cache()
 
         # Pack weight for get better performance on CPU

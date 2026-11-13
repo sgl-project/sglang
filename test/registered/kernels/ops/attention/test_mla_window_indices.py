@@ -5,6 +5,7 @@ req_to_token[pos] // N, page through v2p when given). The union over ranks
 must be exactly the window, each key once."""
 
 import sys
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -112,6 +113,9 @@ def test_ring_window_reads_the_rows_the_ring_writes(dcp):
         dcp_size=dcp,
         req_to_token_rows=req_to_token_rows,
         device="cuda",
+        window_left=window_left,
+        dcp_rank=0,
+        pool=SimpleNamespace(maybe_get_custom_mem_pool=lambda: None),
     )
     pool_rows = draft_kv_ring_pool_rows(
         req_to_token_rows=req_to_token_rows,
