@@ -22,7 +22,6 @@ class XpuPlatform(Platform):
     device_name: str = "xpu"
     device_type: str = "xpu"
     dispatch_key: str = "XPU"
-    device_control_env_var: str = "ZE_AFFINITY_MASK"
 
     @classmethod
     def get_local_torch_device(cls) -> torch.device:
