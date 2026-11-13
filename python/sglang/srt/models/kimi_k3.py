@@ -3471,7 +3471,7 @@ class KimiK3LinearForCausalLM(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        if not _is_hip:
+        if not _is_hip and not _is_npu:
             # The CuTe DSL GEMM module imports cuda.bindings and cutlass at
             # module level; neither ships on ROCm.
             from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import (
