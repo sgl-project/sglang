@@ -567,7 +567,7 @@ def forward_dsa_core_npu(
         topk_indices=topk_indices,
     )
 
-    attn_bmm_output = batch_matmul_transpose(attn_output, m.w_vc, is_dsa=True)
+    attn_bmm_output = batch_matmul_transpose(attn_output, m.w_vc, impl="torch_npu")
 
     attn_bmm_output = attn_bmm_output.reshape(-1, m.num_local_heads * m.v_head_dim)
 
