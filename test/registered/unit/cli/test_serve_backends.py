@@ -485,32 +485,38 @@ def _launch_argv(argv):
     return [sys.executable, "-m", "sglang.cli.main", "serve", *argv]
 
 
-# Cookbook hardware the Guide does not detect from a device name yet: CPU, Apple,
-# TPU, Ascend NPU, and Vera Rubin, whose device name no cell has recorded. Their
-# commands target other builds (sglang-jax, the NPU image), so nothing here checks them.
-UNDETECTED_HARDWARE = {"xeon", "mac", "tpu7x", "a3", "a5", "vera-rubin"}
 # Cookbook pages whose model runs only in an image built from a branch.
 NOT_IN_MAIN = {"stepfun-ai/Step-5-Preview"}
 
 
 def _launchable():
-    """(model, entry) for every command the Guide can pick and this build can run."""
-    detected = {hw for _, hardware in interactive._HARDWARE for hw in hardware}
+    """(model, entry) for every exported command this build can run."""
     return [
         (model, entry)
         for model, entries in _exported().items()
         if model not in NOT_IN_MAIN
         for entry in entries
-        if entry["hw"] in detected
     ]
 
 
 class TestExportedCookbookCommands(CustomTestCase):
-    def test_every_hardware_is_detected_or_known_undetected(self):
-        """A hardware id new to the Cookbook must not leave its commands unreachable."""
+    def test_every_hardware_is_detected(self):
+        """A Cookbook hardware id the Guide cannot detect ships commands it never
+        picks; add its device name to _HARDWARE or skip it in export_commands.mjs."""
         detected = {hw for _, hardware in interactive._HARDWARE for hw in hardware}
         exported = {e["hw"] for entries in _exported().values() for e in entries}
-        self.assertEqual(exported - detected - UNDETECTED_HARDWARE, set())
+        self.assertLessEqual(exported, detected)
+
+    def test_guide_sees_one_command_per_pick(self):
+        """Two spellings of one GPU (rtx6000, rtx-pro-6000) must not give the Guide
+        two commands for one pick, of which it would silently run the first."""
+        device = {
+            hw: name for name, hardware in interactive._HARDWARE for hw in hardware
+        }
+        for model, entries in _exported().items():
+            picks = [(device[e["hw"]], e["gpus"], e["mode"]) for e in entries]
+            with self.subTest(model):
+                self.assertEqual(len(picks), len(set(picks)))
 
     def test_models_not_in_main_still_fail_to_parse(self):
         """Once main runs a NOT_IN_MAIN model, drop it so its commands get checked."""
@@ -530,11 +536,8 @@ class TestExportedCookbookCommands(CustomTestCase):
             with self.subTest(entry["url"]):
                 server_args = prepare_server_args(command_argv(entry["command"]))
                 self.assertEqual(server_args.model_path, model)
-                # The deprecated --dp N --enable-dp-attention resolves to
-                # --attn-dp-size N, which adds no GPUs.
-                dp_size = 1 if server_args.enable_dp_attention else server_args.dp_size
                 gpus = compute_world_size(
-                    dp_size=dp_size,
+                    dp_size=server_args.dp_size,
                     tp_size=server_args.tp_size,
                     pp_size=server_args.pp_size,
                 )

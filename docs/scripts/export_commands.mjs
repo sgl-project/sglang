@@ -12,6 +12,9 @@ const outputDir = join(root, "python/sglang/cli/_commands");
 const MODES = ["balanced", "low-latency", "high-throughput"];
 // Every config a Deployment renders on an LLM/VLM page; diffusion pages come later.
 const EXPORTED_PAGES = join(docs, "cookbook/autoregressive");
+// Hardware the CLI Guide cannot detect from a device name: CPU, Apple, TPU and Ascend NPU, whose
+// commands target other builds, and Vera Rubin, whose device name no cell has recorded yet.
+const UNDETECTED_HARDWARE = new Set(["xeon", "mac", "tpu7x", "a3", "a5", "vera-rubin"]);
 
 const engineSource = readFileSync(join(docs, "src/snippets/_deployment.jsx"), "utf8");
 const start = engineSource.indexOf("// ==== COMMAND ENGINE ====");
@@ -20,7 +23,7 @@ if (start < 0 || end < start) throw new Error("_deployment.jsx is missing the CO
 const createEngine = new Function(
   "config",
   `${engineSource.slice(start, end)}
-  return { renderCommand, findCell, findBenchmark, effectiveAccuracy, cellNnodes, cellVerifyStatus, resolveModelName, validateSelection, matchDimSpecs, overlayDimSpecs };`,
+  return { renderCommand, findCell, cellNnodes, cellVerifyStatus, resolveModelName, validateSelection, matchDimSpecs, overlayDimSpecs };`,
 );
 
 const walk = (dir) =>
@@ -42,34 +45,28 @@ const exportedConfigs = [...pagesByConfig]
   .filter(([, paths]) => paths.some((path) => path.startsWith(`${EXPORTED_PAGES}/`)))
   .map(([name, paths]) => {
     if (paths.length !== 1) throw new Error(`${name}: expected one Cookbook page rendering it, found ${paths.length}`);
-    return {
-      name,
-      url: `https://docs.sglang.io/${relative(docs, paths[0]).replace(/\.mdx$/, "")}`,
-      benchmarks: imported(readFileSync(paths[0], "utf8"), "benchmarks"),
-    };
+    return { name, url: `https://docs.sglang.io/${relative(docs, paths[0]).replace(/\.mdx$/, "")}` };
   })
   .sort((a, b) => a.name.localeCompare(b.name));
 
 // `sglang serve <org>/<name>` keys the Guide; a local directory or a single GGUF file does not.
 const HF_MODEL = /^[\w.-]+\/[\w.-]+$/;
 
-// GPUs one replica of `command` takes; test_serve_backends.py cross-checks it against ServerArgs.
-const gpuCount = (command) => {
-  const size = (...flags) => {
-    for (const flag of flags) {
-      const value = command.match(new RegExp(`(?:^|\\s)--${flag}[ =](\\d+)`))?.[1];
+// GPUs one replica takes, from the flags after `sglang serve`; test_serve_backends.py
+// cross-checks it against ServerArgs.
+const gpuCount = (flags) => {
+  const size = (...names) => {
+    for (const name of names) {
+      const value = flags.match(new RegExp(`(?:^|\\s)--${name}[ =](\\d+)`))?.[1];
       if (value) return Number(value);
     }
     return 1;
   };
-  // Attention DP runs inside the TP group, so it adds no GPUs.
-  const dp = /--enable-dp-attention(?=\s|$)/.test(command) ? 1 : size("dp", "dp-size", "data-parallel-size");
-  return size("tp", "tp-size", "tensor-parallel-size") * size("pp", "pp-size", "pipeline-parallel-size") * dp;
+  return size("tp", "tp-size", "tensor-parallel-size") * size("pp", "pp-size", "pipeline-parallel-size") * size("dp", "dp-size", "data-parallel-size");
 };
 
-const exportConfig = async ({ name, url, benchmarks }) => {
+const exportConfig = async ({ name, url }) => {
   const { config } = await load(name);
-  const measured = benchmarks ? (await load(benchmarks)).benchmarks : [];
   const engine = createEngine(config);
   const isModeDim = (spec) => (spec.options || []).some((option) => MODES.includes(option.id));
   const modeDim = [...engine.matchDimSpecs, ...engine.overlayDimSpecs].find(isModeDim);
@@ -77,13 +74,6 @@ const exportConfig = async ({ name, url, benchmarks }) => {
   const placeholders = Object.fromEntries(
     Object.entries(config.placeholders || {}).map(([key, spec]) => [key, spec.default ?? ""]),
   );
-  // Each match row's options in the order the page lists them; the first one is that row's default.
-  const rows = engine.matchDimSpecs.filter((spec) => spec !== modeDim);
-  const rank = (sel) => rows.map((spec) => spec.options.findIndex((option) => option.id === sel[spec.id]));
-  const listedBefore = (a, b) => {
-    const i = a.findIndex((index, row) => index !== b[row]);
-    return i >= 0 && a[i] < b[i];
-  };
   const byRecipe = new Map();
   let skipped = 0;
   for (const base of config.cells) {
@@ -94,52 +84,52 @@ const exportConfig = async ({ name, url, benchmarks }) => {
       const cell = engine.findCell(config.cells, sel);
       const runModes = (typeof config.runModes === "function" ? config.runModes(sel) : config.runModes) || ["python"];
       const command = engine.renderCommand(cell, sel, placeholders, "python");
+      // Hint comments may name a flag or a placeholder without needing it.
+      const uncommented = command.replace(/^#.*$/gm, "");
       const model = engine.resolveModelName(sel);
       if (
         !HF_MODEL.test(model) ||
+        UNDETECTED_HARDWARE.has(sel.hw) ||
         // A "Not offered" banner in place of a command.
         cell.redirect ||
         cell.pd ||
         /--disaggregation-mode\b/.test(command) ||
         engine.cellNnodes(cell, sel) > 1 ||
         !runModes.includes("python") ||
-        // Placeholders left to fill; hint comments may name one without needing it.
-        /<[\w-]+>|{{/.test(command.replace(/^#.*$/gm, ""))
+        // Placeholders left to fill.
+        /<[\w-]+>|{{/.test(uncommented)
       ) {
         skipped++;
         continue;
       }
-      const [prefix] = command.split(/^sglang serve/m);
+      const [prefix, flags] = uncommented.split(/^sglang serve/m);
       const env = Object.fromEntries(
         prefix
           .split("\n")
           .map((line) => line.replace(/\s*\\$/, "").trim())
-          .filter((line) => line && !line.startsWith("#"))
+          .filter(Boolean)
           .map((line) => line.split(/=(.*)/s).slice(0, 2)),
       );
+      const quoted = Object.keys(env).find((key) => /["']/.test(env[key]));
+      if (quoted) throw new Error(`${name}: ${quoted} is quoted, but the CLI Guide passes env values verbatim`);
       const recipe = {
         model,
         hw: sel.hw,
         mode: modeDim ? sel[modeDim.id] : null,
         verified: engine.cellVerifyStatus(cell, sel),
-        gpus: gpuCount(command),
-        // The page's measured GSM8K; the nightly CLI Guide regression gates on it.
-        gsm8k_pct: engine.effectiveAccuracy(engine.findBenchmark(measured, sel), sel).gsm8k_pct ?? null,
+        gpus: gpuCount(flags),
         env,
         url: `${url}#${new URLSearchParams(sel).toString()}`,
         command,
       };
-      // The CLI Guide picks by hardware, GPU count and mode. When the page offers more than one
-      // command for those (another speculative algorithm, another parallelism), keep the one its
-      // other rows default to, as the page shows it before the reader changes them.
+      // The Guide picks by hardware, GPU count and mode; when the page has several commands for one
+      // pick, keep the first cell's, as the page seeds from its first cell and falls back to the first match.
       const key = `${recipe.model} ${recipe.gpus}x ${recipe.hw} ${recipe.mode ?? "(no mode)"}`;
-      const kept = byRecipe.get(key);
-      if (!kept || listedBefore(rank(sel), kept.rank)) byRecipe.set(key, { recipe, rank: rank(sel) });
-      else if (!listedBefore(kept.rank, rank(sel))) throw new Error(`${name}: two commands for ${key}`);
+      if (!byRecipe.has(key)) byRecipe.set(key, recipe);
     }
   }
-  console.log(`${name}: ${byRecipe.size} commands, ${skipped} not-offered, local-path, multi-node, PD, docker-only or placeholder cells skipped`);
-  return [...byRecipe.values()].map(({ recipe }) => recipe);
+  console.log(`${name}: ${byRecipe.size} commands, ${skipped} not-offered, local-path, undetected-hardware, multi-node, PD, docker-only or placeholder cells skipped`);
+  return [...byRecipe.values()];
 };
 
 // "Qwen/Qwen3-8B" -> "Qwen--Qwen3-8B.json"; Hugging Face names never contain "--".
