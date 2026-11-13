@@ -1183,13 +1183,14 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         keys: List[str],
         pool_transfers: Optional[List[PoolTransfer]] = None,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
+        probe_only: bool = False,
     ) -> PoolTransferResult:
         if self.mem_pool_host.kv_buffer is None:
             # Logical anchor: no physical KV object exists in Mooncake, so the
             # usable prefix is determined entirely by required sidecar objects.
             kv_pages = len(keys)
         else:
-            kv_pages = self.batch_exists(keys, extra_info)
+            kv_pages = self.batch_exists(keys, extra_info, probe_only=probe_only)
 
         hit_count: dict = {PoolName.KV: kv_pages} if kv_pages else {}
         # Start from every KV prefix and let each pool remove the stop points it
@@ -1214,7 +1215,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
         with self.request_context(**self._request_context_from_extra_info(extra_info)):
             all_exists = (
-                self._batch_exist(all_component_keys) if all_component_keys else []
+                self._batch_exist(all_component_keys, probe_only=probe_only)
+                if all_component_keys
+                else []
             )
         for transfer, key_multiplier, start, end in prepared:
             if not restorable:
@@ -1762,7 +1765,10 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         return exist_result[0] == 1
 
     def batch_exists(
-        self, keys, extra_info: Optional[HiCacheStorageExtraInfo] = None
+        self,
+        keys,
+        extra_info: Optional[HiCacheStorageExtraInfo] = None,
+        probe_only: bool = False,
     ) -> int:
         # Apply config prefix if available.
         keys = self._tag_keys(keys)
@@ -1785,7 +1791,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 key_multiplier = 2
 
         with self.request_context(**self._request_context_from_extra_info(extra_info)):
-            exist_result = self._batch_exist(query_keys)
+            exist_result = self._batch_exist(query_keys, probe_only=probe_only)
         for i in range(len(query_keys)):
             if exist_result[i] != 1:
                 return i // key_multiplier
@@ -1841,7 +1847,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             )
         return self.store.batch_get_into(key_strs, buffer_ptrs, buffer_sizes)
 
-    def _batch_exist(self, key_strs: List[str]) -> List[int]:
+    def _batch_exist(self, key_strs: List[str], probe_only: bool = False) -> List[int]:
+        if probe_only:
+            return self.store.batch_probe_key(key_strs)
         return self.store.batch_is_exist(key_strs)
 
     def get_stats(self):
