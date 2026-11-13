@@ -15,6 +15,7 @@ ARGUMENT_CLOSE = "<|close|>argument<|sep|>"
 _PARTIAL_MARKER_SUFFIXES = (
     "<|open|>",
     "<|close|>",
+    THINK_OPEN.removesuffix("<|sep|>"),
     THINK_CLOSE.removesuffix("<|sep|>"),
     RESPONSE_OPEN.removesuffix("<|sep|>"),
     RESPONSE_CLOSE.removesuffix("<|sep|>"),
