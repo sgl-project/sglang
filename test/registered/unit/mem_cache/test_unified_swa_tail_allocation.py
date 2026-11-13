@@ -1,5 +1,6 @@
 import unittest
-from importlib import import_module
+from importlib.util import module_from_spec, spec_from_file_location
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
@@ -33,10 +34,18 @@ class TestUnifiedSWATailAllocation(CustomTestCase):
         connector = ModuleType("flexkv.integration.sglang.connector")
         connector.FlexKVConnector = object
         connector.FlexKVHostReleaseShim = object
-        with patch.dict("sys.modules", {connector.__name__: connector}):
-            cache_type = import_module(
-                "sglang.srt.mem_cache.storage.flexkv.flexkv_hybrid_radix_cache"
-            ).FlexKVHybridRadixCache
+        module_name = "_flexkv_hybrid_allocation_cuda"
+        path = (
+            Path(__file__).resolve().parents[4]
+            / "python/sglang/srt/mem_cache/storage/flexkv/flexkv_hybrid_radix_cache.py"
+        )
+        spec = spec_from_file_location(module_name, path)
+        module = module_from_spec(spec)
+        with patch.dict(
+            "sys.modules", {connector.__name__: connector, module_name: module}
+        ):
+            spec.loader.exec_module(module)
+        cache_type = module.FlexKVHybridRadixCache
 
         for prefix_len in (0, 18):
             for pressure in (False, True):
