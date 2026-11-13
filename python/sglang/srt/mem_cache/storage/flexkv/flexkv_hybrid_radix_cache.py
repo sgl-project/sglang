@@ -20,6 +20,7 @@ from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
 )
+from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     CacheRequestHandle,
@@ -288,6 +289,14 @@ class FlexKVHybridRadixCache(FlexKVCacheLifecycleMixin, BasePrefixCache):
         req._flexkv_restore_tree_owned_len = marker.device_length
         return int(device_indices.numel()), req.last_node
 
+    def _restore_tail_lengths(self, host_hit_length: int) -> int | dict[str, int]:
+        tail_length = min(self.page_size, host_hit_length)
+        # Both allocators are active: DSv4's separate buffers take one scalar;
+        # the unified chain takes a length for each named window sub-pool.
+        if isinstance(self.token_to_kv_pool_allocator, SWATokenToKVPoolAllocator):
+            return tail_length
+        return {name: tail_length for name, _ in self.window_sub_pools()}
+
     def _alloc_restore_slots(
         self, req: Req, host_hit_length: int
     ) -> Optional[torch.Tensor]:
@@ -314,7 +323,6 @@ class FlexKVHybridRadixCache(FlexKVCacheLifecycleMixin, BasePrefixCache):
             )
             if hasattr(allocator, "alloc_extend_swa_tail") and self.supports_swa():
                 # FlexKV stores one page of SWA/state sidecars for a full-prefix hit.
-                swa_tail_length = min(self.page_size, host_hit_length)
                 slots = allocator.alloc_extend_swa_tail(
                     prefix_lengths,
                     prefix_lengths_cpu,
@@ -322,9 +330,7 @@ class FlexKVHybridRadixCache(FlexKVCacheLifecycleMixin, BasePrefixCache):
                     sequence_lengths_cpu,
                     last_location,
                     host_hit_length,
-                    window_tail_lens={
-                        name: swa_tail_length for name, _ in self.window_sub_pools()
-                    },
+                    self._restore_tail_lengths(host_hit_length),
                 )
             else:
                 slots = allocator.alloc_extend(
@@ -390,10 +396,7 @@ class FlexKVHybridRadixCache(FlexKVCacheLifecycleMixin, BasePrefixCache):
                 sequence_lengths_cpu,
                 last_location,
                 host_hit_length,
-                window_tail_lens={
-                    name: min(self.page_size, host_hit_length)
-                    for name, _ in self.window_sub_pools()
-                },
+                self._restore_tail_lengths(host_hit_length),
             )
         return allocator.alloc_extend(
             prefix_lengths,

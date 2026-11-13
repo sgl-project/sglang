@@ -6,6 +6,8 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
@@ -17,6 +19,30 @@ from sglang.test.unified_allocator_fixtures import build_test_unified_pools
 register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 
+class _AllocationOnlySWAPool(BaseSWAKVPool):
+    full_kv_pool = None
+    swa_kv_pool = None
+
+    def __init__(self):
+        pass
+
+    def register_mapping(self, mapping):
+        self.full_to_swa_index_mapping = mapping
+
+    def translate_loc_from_full_to_swa(self, indices):
+        return self.full_to_swa_index_mapping[indices]
+
+    def get_state_buf_infos(self):
+        return [], [], []
+
+    def get_key_buffer(self, *args, **kwargs):
+        raise AssertionError("Allocation must not access KV contents")
+
+    get_value_buffer = get_key_buffer
+    get_kv_buffer = get_key_buffer
+    set_kv_buffer = get_key_buffer
+
+
 class TestUnifiedSWATailAllocation(CustomTestCase):
     def setUp(self):
         reset_context()
@@ -25,10 +51,10 @@ class TestUnifiedSWATailAllocation(CustomTestCase):
             ServerArgs(model_path="dummy", enable_unified_memory=True), role="tokenizer"
         )
 
-    def test_flexkv_restore_allocates_named_window_tail_after_eviction(self):
+    def test_flexkv_restore_allocates_window_tail_after_eviction(self):
         """A host restore must bind only its trailing SWA page, including after
-        eviction. Passing the old scalar tail to the real allocator raises
-        before any restored slots can be returned.
+        eviction. The unified and separate-buffer allocators accept different
+        tail contracts; either mismatch raises before slots can be returned.
         """
         # The external transfer package is not needed to allocate destinations.
         connector = ModuleType("flexkv.integration.sglang.connector")
@@ -47,9 +73,14 @@ class TestUnifiedSWATailAllocation(CustomTestCase):
             spec.loader.exec_module(module)
         cache_type = module.FlexKVHybridRadixCache
 
-        for prefix_len in (0, 18):
+        for kind, prefix_len in (
+            ("unified", 0),
+            ("unified", 18),
+            ("separate", 0),
+            ("separate", 16),
+        ):
             for pressure in (False, True):
-                with self.subTest(prefix_len=prefix_len, pressure=pressure):
+                with self.subTest(kind=kind, prefix_len=prefix_len, pressure=pressure):
                     page_size = 16
                     bundle = build_test_unified_pools(
                         device="cuda",
@@ -65,15 +96,44 @@ class TestUnifiedSWATailAllocation(CustomTestCase):
                         swa_attention_layer_ids=[1],
                         total_bytes=1 << 14,
                     )
-                    allocator = bundle.token_to_kv_pool_allocator
+                    allocator = (
+                        bundle.token_to_kv_pool_allocator
+                        if kind == "unified"
+                        else SWATokenToKVPoolAllocator(
+                            size=128,
+                            size_swa=128,
+                            page_size=page_size,
+                            dtype=torch.float16,
+                            device="cuda",
+                            kvcache=_AllocationOnlySWAPool(),
+                            need_sort=False,
+                        )
+                    )
+                    full_available = allocator.full_available_size()
+                    swa_available = allocator.swa_available_size()
+
+                    def allocate(count):
+                        if not count:
+                            return torch.empty(0, dtype=torch.int64, device="cuda")
+                        prefix_cpu = torch.tensor([0], dtype=torch.int64)
+                        seq_cpu = torch.tensor([count], dtype=torch.int64)
+                        return allocator.alloc_extend(
+                            prefix_cpu.cuda(),
+                            prefix_cpu,
+                            seq_cpu.cuda(),
+                            seq_cpu,
+                            torch.tensor([-1], dtype=torch.int64, device="cuda"),
+                            count,
+                        )
+
                     prefix_capacity = -(-prefix_len // page_size) * page_size
-                    prefix = allocator.alloc(prefix_capacity)[:prefix_len]
+                    prefix = allocate(prefix_capacity)[:prefix_len]
                     prefix_swa = allocator.translate_swa_indices_for_transfer(
                         prefix
                     ).clone()
                     blockers = []
                     if pressure:
-                        while (block := allocator.alloc(page_size)) is not None:
+                        while (block := allocate(page_size)) is not None:
                             blockers.append(block)
                         self.assertTrue(blockers)
 
@@ -118,8 +178,8 @@ class TestUnifiedSWATailAllocation(CustomTestCase):
                             )
                         )
                     allocator.free(torch.cat((prefix, restored)))
-                    self.assertEqual(allocator.full_attn_allocator.allocated_count(), 0)
-                    self.assertEqual(allocator.swa_attn_allocator.allocated_count(), 0)
+                    self.assertEqual(allocator.full_available_size(), full_available)
+                    self.assertEqual(allocator.swa_available_size(), swa_available)
 
     def test_extend_binds_only_new_tail_pages(self):
         """PD tail allocation must leave new FULL-only pages unbound in SWA,
