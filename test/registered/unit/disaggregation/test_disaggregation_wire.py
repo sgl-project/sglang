@@ -545,6 +545,44 @@ class TestDisaggregationWire(unittest.TestCase):
                     self.assertFalse(fully_checked)
                     self.assertIn("same physical TP size", reason)
 
+    def test_mooncake_dflash_tp_mismatch_allows_a_draft_kv_ring(self):
+        manager = object.__new__(MooncakeKVManager)
+        manager.kv_args = SimpleNamespace(
+            state_types=[StateType.DRAFT_RING, StateType.REQUEST_ROW],
+            state_data_ptrs=[[1000], [1100]],
+            state_item_lens=[[576], [4]],
+            state_layer_ids=[[], []],
+            num_draft_entries=0,
+            kv_layer_ids=[],
+            kv_item_lens=[],
+        )
+        manager.is_mla_backend = True
+        manager.is_hybrid_mla_backend = False
+        manager.pp_size = 1
+        manager.state_tp_size = 2
+        manager.attn_tp_size = 1
+        registration_info = SimpleNamespace(
+            mooncake_session_id="decode",
+            dst_attn_tp_size=8,
+            dst_draft_rows_dcp_collapsed=False,
+            dst_kv_layer_ids=[],
+            dst_kv_item_lens=[],
+            dst_state_data_ptrs=[[2000], [3000]],
+            dst_state_item_lens=[[576], [4]],
+            dst_state_layer_ids=[[], []],
+            dst_dcp_size=1,
+            requires_dcp_relayout=False,
+        )
+        with get_context().override_server_args(
+            enable_unified_memory=False,
+            speculative_algorithm="DFLASH",
+        ):
+            fully_checked, reason = manager._validate_peer_state_layout(
+                registration_info
+            )
+        self.assertTrue(fully_checked)
+        self.assertIsNone(reason)
+
     def test_mooncake_rejects_a_decode_kv_page_stride_at_registration(self):
         """A decode KV pool with another page stride is rejected at registration.
 
@@ -1246,6 +1284,39 @@ class TestDsaIndexKTokenBytes(unittest.TestCase):
                 self.assertEqual(kv_args.dsa_index_k_token_bytes, expected)
 
 
+class TestDFlashDraftKVRingRegistration(unittest.TestCase):
+    def _register(self, ring):
+        from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+
+        pool = object.__new__(DSATokenToKVPool)
+        pool.start_layer = 0
+        pool.layer_num = 1
+        pool.index_head_dim = 128
+        pool.use_fp4_indexer = False
+        pool.index_bytes_per_token = DSATokenToKVPool.index_bytes_per_token_for(
+            128, False
+        )
+        pool.index_kpool = 1
+        pool.get_state_buf_infos = lambda: ([0x1000], [4096], [64 * 132])
+        pool.get_compress_tail_buf_infos = lambda: ([], [], [])
+        kv_args = KVArgs()
+        setup_state_kv_args(kv_args, _static_storage(pool), draft_kv_ring=ring)
+        return kv_args
+
+    def test_a_ring_registers_its_rows_and_floor_last(self):
+        ring = SimpleNamespace(
+            ring_buf_infos=lambda: ([0x2000, 0x3000], [5760, 5760], [576, 576]),
+            floor_buf_infos=lambda: ([0x4000], [136], [4]),
+        )
+        kv_args = self._register(ring)
+        self.assertEqual(
+            kv_args.state_types,
+            [StateType.DSA, StateType.DRAFT_RING, StateType.REQUEST_ROW],
+        )
+        self.assertEqual(kv_args.state_data_ptrs[1:], [[0x2000, 0x3000], [0x4000]])
+        self.assertEqual(kv_args.state_item_lens[1:], [[576, 576], [4]])
+
+
 class TestCPReplicatedStateTransfer(unittest.TestCase):
     def test_only_nonzero_cp_ranks_without_layer_split_skip_state(self):
         # Under CP-TP group sharing each CP rank owns its own linear-attention
@@ -1568,6 +1639,41 @@ class TestQwen4StateWire(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(len(manager.sent), 1)
         self.assertEqual(manager.sent[0]["item_lens"], [16])
+
+    def test_draft_ring_sent_once_under_mixed_tp_on_non_mla(self):
+        req = SimpleNamespace(
+            room=42, mooncake_session_id="session", dst_state_indices=[[5, 6], [3]]
+        )
+        decode_info = SimpleNamespace(
+            dst_attn_tp_size=1,
+            dst_state_data_ptrs=[[2000], [3000]],
+            dst_state_item_lens=[[576], [4]],
+            dst_state_dim_per_tensor=[[], []],
+            dst_state_layer_ids=[[], []],
+        )
+        for engine_rank, expected in (
+            (0, [StateType.DRAFT_RING, StateType.REQUEST_ROW]),
+            (1, []),
+        ):
+            manager = self._qsa_compressed_manager(src_item_len=576)
+            manager.kv_args = SimpleNamespace(
+                engine_rank=engine_rank,
+                state_types=[StateType.DRAFT_RING, StateType.REQUEST_ROW],
+                state_data_ptrs=[[1000], [1100]],
+                state_item_lens=[[576], [4]],
+                state_dim_per_tensor=[[], []],
+                state_layer_ids=[[], []],
+            )
+            rc = MooncakeKVManager.maybe_send_extra(
+                manager,
+                req,
+                [[1, 2], [7]],
+                None,
+                target_rank_registration_info=decode_info,
+            )
+            self.assertEqual(rc, 0)
+            self.assertEqual([kw["state_type"] for kw in manager.sent], expected)
+            self.assertTrue(all(kw["force_flat"] for kw in manager.sent))
 
     def test_replicated_state_tp_policy(self):
         for src_tp, dst_tp, rank, expected in (

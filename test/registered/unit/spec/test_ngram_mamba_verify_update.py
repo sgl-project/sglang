@@ -251,6 +251,10 @@ class TestPPReplaySSMVerifySourceRows(CustomTestCase):
                 "sglang.kernels.ops.mamba.mamba_state_scatter_triton."
                 "fused_conv_window_scatter_with_mask"
             ) as scatter,
+            patch(
+                "sglang.srt.layers.attention.hybrid_linear_attn_backend."
+                "commit_ple_states_after_verify"
+            ),
         ):
             commit_mamba_states_after_verify(
                 target_worker,
