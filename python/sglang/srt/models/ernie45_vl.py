@@ -349,21 +349,6 @@ class VariableResolutionResamplerModel(nn.Module):
         return loaded_params
 
 
-class Ernie4_5_VisionRotaryEmbedding(nn.Module):
-    def __init__(self, dim: int, theta: float = 10000.0) -> None:
-        super().__init__()
-        self.inv_freq = 1.0 / theta ** (
-            torch.arange(start=0, end=dim, step=2, dtype=torch.float32) / dim
-        )
-
-    def forward(self, seqlen: int) -> torch.Tensor:
-        seq = torch.arange(
-            seqlen, device=self.inv_freq.device, dtype=self.inv_freq.dtype
-        )
-        freqs = torch.outer(input=seq, vec2=self.inv_freq)
-        return freqs
-
-
 class Ernie4_5_VisionTransformer(nn.Module):
     def __init__(
         self,

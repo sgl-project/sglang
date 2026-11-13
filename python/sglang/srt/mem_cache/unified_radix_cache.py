@@ -888,14 +888,21 @@ class UnifiedRadixCache(BasePrefixCache):
         return result
 
     def _units_demand(self, units: dict[str, int]) -> KVDemand:
-        """A demand in the allocator's units (pages, slots for state) as the
-        tokens and slots admission prices."""
-        page = self.token_to_kv_pool_allocator.page_size
+        """A demand in the allocator's units (pages, slots for state, units for
+        request sub-pools) as the tokens, slots and request rows admission
+        prices."""
+        allocator = self.token_to_kv_pool_allocator
+        page = allocator.page_size
         owner, windows, state = self._sub_pool_roles()
+        # Every request sub-pool takes a unit per request row the demand binds.
+        request_rows = max(
+            (units.get(name, 0) for name in allocator.request_allocators), default=0
+        )
         return KVDemand(
             units.get(owner, 0) * page,
             {name: units.get(name, 0) * page for name in windows},
             0 if state is None else units.get(state, 0),
+            request_rows,
         )
 
     def _reclaimable_units(self) -> dict[str, int]:

@@ -19,9 +19,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
 )
 
 
-def _supports_5120(dim: int, eps: float) -> bool:
+def _supports_5120(dim: int) -> bool:
     """Stand in for the kernel predicate so the tests run without FlyDSL."""
-    return dim == 5120 and eps == 1e-6
+    return dim == 5120
 
 
 @pytest.mark.parametrize(
@@ -146,7 +146,7 @@ def test_wan_quality_transitions_restore_native(
 
 
 @pytest.mark.parametrize(
-    "reason", ["disabled", "unaligned", "epsilon", "platform", "missing_backend"]
+    "reason", ["disabled", "unaligned", "platform", "missing_backend"]
 )
 def test_wan_fusion_is_all_or_nothing(monkeypatch, reason):
     monkeypatch.setattr(layernorm, "_use_rocm_flydsl", True)
@@ -163,8 +163,6 @@ def test_wan_fusion_is_all_or_nothing(monkeypatch, reason):
         monkeypatch.setattr(layernorm, "_use_rocm_flydsl", False)
     elif reason == "unaligned":
         WAN_ROCM_FLYDSL_NORM_SCALE_SHIFT.mark(model[1], 128)
-    elif reason == "epsilon":
-        model[1].eps = 1e-5
     elif reason == "missing_backend":
         monkeypatch.delitem(vars(diffusion), "flydsl_norm_supports")
         original = diffusion.__getattr__

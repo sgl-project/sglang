@@ -24,11 +24,11 @@ def _static_reject_reason(site: nn.Module) -> str | None:
         from sglang.kernels.ops.diffusion import flydsl_norm_supports
     except ImportError:
         return "FlyDSL unavailable"
-    # The kernels pick a block per hidden size and bake in their own epsilon,
-    # so they answer both questions through one predicate.
+    # The kernels pick a block per hidden size, so the dim they accept is the
+    # one whose tile divides it rather than a single alignment.
     hidden_size = WAN_ROCM_FLYDSL_NORM_SCALE_SHIFT.metadata(site)
-    if not flydsl_norm_supports(hidden_size, site.eps):
-        return "no FlyDSL norm kernel for this hidden size and epsilon"
+    if not flydsl_norm_supports(hidden_size):
+        return "no FlyDSL norm kernel for this hidden size"
     return None
 
 

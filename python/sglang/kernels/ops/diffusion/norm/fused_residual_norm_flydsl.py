@@ -53,19 +53,10 @@ def _pick_num_waves(dim: int) -> int | None:
     return None
 
 
-def flydsl_norm_supports(dim: int, eps: float) -> bool:
-    """Whether a FlyDSL norm kernel can serve this hidden size and epsilon.
+def flydsl_norm_supports(dim: int) -> bool:
+    """Whether a FlyDSL norm kernel can serve this hidden size."""
+    return _pick_num_waves(dim) is not None
 
-    The kernels bake in :data:`_EPS` rather than reading the caller's value, so
-    a norm configured with anything else must stay on the reference path or it
-    would silently normalize with the wrong epsilon.
-    """
-    return _pick_num_waves(dim) is not None and eps == _EPS
-
-
-# Kernel-side epsilon. The public `eps` argument is intentionally ignored, as it
-# was before the stable-API migration; changing that is a separate correctness fix.
-_EPS = 1e-6
 
 # 128-bit vector copies over bf16 elements.
 _ELEM_BITS = 16
@@ -187,7 +178,9 @@ def _bcast_row(row, stride):
     return (stride != 0).select(row, 0)
 
 
-def _build_fused_norm_module(D: int, is_rms: bool, has_gate: bool, has_weight: bool):
+def _build_fused_norm_module(
+    D: int, is_rms: bool, has_gate: bool, has_weight: bool, eps: float
+):
     VEC = _VEC
     NUM_WAVES = _pick_num_waves(D)
     assert NUM_WAVES is not None, (
@@ -301,11 +294,11 @@ def _build_fused_norm_module(D: int, is_rms: bool, has_gate: bool, has_weight: b
         total_sq = fx.memref_load(s_final, 1)
 
         if const_expr(is_rms):
-            rstd = fx.math.rsqrt(total_sq / n_float + _EPS)
+            rstd = fx.math.rsqrt(total_sq / n_float + eps)
         else:
             mean = fx.memref_load(s_final, 0) / n_float
             var = total_sq / n_float - mean * mean
-            rstd = fx.math.rsqrt(var + _EPS)
+            rstd = fx.math.rsqrt(var + eps)
 
         # Phase 2: normalize from the register cache (no HBM re-read).
         for it in range_constexpr(NUM_ITERS):
@@ -367,10 +360,10 @@ def _build_fused_norm_module(D: int, is_rms: bool, has_gate: bool, has_weight: b
 _COMPILE_CACHE = {}
 
 
-def _get_or_compile(D, is_rms, has_gate, has_weight, args):
-    key = (D, is_rms, has_gate, has_weight)
+def _get_or_compile(D, is_rms, has_gate, has_weight, eps, args):
+    key = (D, is_rms, has_gate, has_weight, eps)
     if key not in _COMPILE_CACHE:
-        launcher = _build_fused_norm_module(D, is_rms, has_gate, has_weight)
+        launcher = _build_fused_norm_module(D, is_rms, has_gate, has_weight, eps)
         cf = flyc.compile(launcher, *args)
         _COMPILE_CACHE[key] = cf
     return _COMPILE_CACHE[key]
@@ -491,7 +484,7 @@ def flydsl_fused_residual_norm_scale_shift(
         sh_stride,
         stream,
     )
-    cf = _get_or_compile(C, is_rms, has_gate, has_weight, dummy_args)
+    cf = _get_or_compile(C, is_rms, has_gate, has_weight, float(eps), dummy_args)
 
     for b in range(B):
         s, e = b * L, (b + 1) * L
@@ -539,7 +532,7 @@ def _fake_flydsl_fused_residual_norm(
 ###############################################################################
 
 
-def _build_norm_scale_shift_module(D: int, is_rms: bool, has_weight: bool):
+def _build_norm_scale_shift_module(D: int, is_rms: bool, has_weight: bool, eps: float):
     VEC = _VEC
     NUM_WAVES = _pick_num_waves(D)
     assert NUM_WAVES is not None, (
@@ -635,11 +628,11 @@ def _build_norm_scale_shift_module(D: int, is_rms: bool, has_weight: bool):
         total_sq = fx.memref_load(s_final, 1)
 
         if const_expr(is_rms):
-            rstd = fx.math.rsqrt(total_sq / n_float + _EPS)
+            rstd = fx.math.rsqrt(total_sq / n_float + eps)
         else:
             mean = fx.memref_load(s_final, 0) / n_float
             var = total_sq / n_float - mean * mean
-            rstd = fx.math.rsqrt(var + _EPS)
+            rstd = fx.math.rsqrt(var + eps)
 
         # Phase 2: normalize from the register cache + scale_shift.
         for it in range_constexpr(NUM_ITERS):
@@ -693,10 +686,10 @@ def _build_norm_scale_shift_module(D: int, is_rms: bool, has_weight: bool):
 _NSS_COMPILE_CACHE = {}
 
 
-def _get_or_compile_nss(D, is_rms, has_weight, args):
-    key = ("nss", D, is_rms, has_weight)
+def _get_or_compile_nss(D, is_rms, has_weight, eps, args):
+    key = ("nss", D, is_rms, has_weight, eps)
     if key not in _NSS_COMPILE_CACHE:
-        launcher = _build_norm_scale_shift_module(D, is_rms, has_weight)
+        launcher = _build_norm_scale_shift_module(D, is_rms, has_weight, eps)
         cf = flyc.compile(launcher, *args)
         _NSS_COMPILE_CACHE[key] = cf
     return _NSS_COMPILE_CACHE[key]
@@ -749,7 +742,7 @@ def flydsl_norm_scale_shift(
         sh_stride,
         stream,
     )
-    cf = _get_or_compile_nss(C, is_rms, has_weight, dummy_args)
+    cf = _get_or_compile_nss(C, is_rms, has_weight, float(eps), dummy_args)
 
     for b in range(B):
         s, e = b * L, (b + 1) * L

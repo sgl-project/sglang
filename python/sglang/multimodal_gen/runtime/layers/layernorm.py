@@ -616,6 +616,19 @@ def _try_npu_fused_scale_shift(
     return fused_scale_shift(x, scale.contiguous(), shift.contiguous())
 
 
+def _expand_npu_modulation(
+    x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    # Per-frame [B, F, 1, C] modulation has to broadcast to [B, L, C], the way
+    # fuse_scale_shift_kernel does it; a plain multiply gives [B, F, L, C] and
+    # applies every frame's modulation to every token.
+    if shift.dim() == 4:
+        shift = expand_scale_shift_cpu_param(shift, x)
+    if scale.dim() == 4:
+        scale = expand_scale_shift_cpu_param(scale, x)
+    return shift, scale
+
+
 class _ScaleResidualNormScaleShift(CustomOp):
     """
     Fused kernel that combines:
@@ -711,7 +724,7 @@ class _ScaleResidualNormScaleShift(CustomOp):
         except ImportError:
             return self.forward_native(residual, x, gate, shift, scale)
 
-        if not flydsl_norm_supports(x.shape[-1], self.eps):
+        if not flydsl_norm_supports(x.shape[-1]):
             return self.forward_native(residual, x, gate, shift, scale)
 
         return flydsl_fused_residual_norm_scale_shift(
@@ -842,6 +855,7 @@ class _ScaleResidualNormScaleShift(CustomOp):
         normalized = self.norm(residual_output)
         modulated = _try_npu_fused_scale_shift(normalized, shift, scale)
         if modulated is None:
+            shift, scale = _expand_npu_modulation(normalized, shift, scale)
             modulated = normalized * (1 + scale) + shift
         return modulated, residual_output
 
@@ -962,7 +976,7 @@ class _NormScaleShift(CustomOp):
         except ImportError:
             return self.forward_native(x, shift, scale)
 
-        if not flydsl_norm_supports(x.shape[-1], self.eps):
+        if not flydsl_norm_supports(x.shape[-1]):
             return self.forward_native(x, shift, scale)
 
         result = flydsl_norm_scale_shift(
@@ -1013,6 +1027,7 @@ class _NormScaleShift(CustomOp):
         if modulated is not None:
             return modulated.to(x.dtype)
 
+        shift, scale = _expand_npu_modulation(normalized, shift, scale)
         return (normalized * (1 + scale) + shift).to(x.dtype)
 
     def forward_cpu(

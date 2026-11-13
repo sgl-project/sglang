@@ -251,13 +251,16 @@ response_stream = client.chat.completions.create(
 
 texts = ""
 tool_calls = []
-name = ""
-arguments = ""
+finish_reason = None
 for chunk in response_stream:
-    if chunk.choices[0].delta.content:
-        texts += chunk.choices[0].delta.content
-    if chunk.choices[0].delta.tool_calls:
-        tool_calls.append(chunk.choices[0].delta.tool_calls[0])
+    if not chunk.choices:
+        continue
+    choice = chunk.choices[0]
+    if choice.finish_reason is not None:
+        finish_reason = choice.finish_reason
+    if choice.delta.content:
+        texts += choice.delta.content
+    tool_calls.extend(choice.delta.tool_calls or [])
 print_highlight("==== Text ====")
 print_highlight(texts)
 
@@ -267,23 +270,35 @@ for tool_call in tool_calls:
 ```
 
 #### Handle Tools
-When the engine determines it should call a particular tool, it will return arguments or partial arguments through the response. You can parse these arguments and later invoke the tool accordingly.
+Collect argument fragments by tool call `index` within each choice. Wait for the choice's final `finish_reason` before using the assembled arguments, even if a later tool call index has already appeared.
 
+If the choice ends with `finish_reason="length"`, the last tool call may still have partial arguments even when the assembled JSON parses and passes schema validation.
 
+`finish_reason="tool_calls"` means generation ended without reaching a limit, but most tool parsers do not check that the model closed each call. A custom `stop` sequence that matches inside a tool argument still ends a streamed choice with `tool_calls`, with arguments that parse as valid JSON but are cut off. Avoid `stop` sequences that can appear in tool arguments.
 
 ```python Example
-# Parse and combine function call arguments
-arguments = []
+arguments_by_index = {}
 for tool_call in tool_calls:
     if tool_call.function.name:
-        print_highlight(f"Streamed function call name: {tool_call.function.name}")
-
+        print_highlight(
+            f"Streamed function call {tool_call.index} name: {tool_call.function.name}"
+        )
     if tool_call.function.arguments:
-        arguments.append(tool_call.function.arguments)
+        arguments_by_index.setdefault(tool_call.index, []).append(
+            tool_call.function.arguments
+        )
 
-# Combine all fragments into a single JSON string
-full_arguments = "".join(arguments)
-print_highlight(f"streamed function call arguments: {full_arguments}")
+if finish_reason == "tool_calls":
+    for index, fragments in arguments_by_index.items():
+        full_arguments = "".join(fragments)
+        print_highlight(f"Streamed function call {index} arguments: {full_arguments}")
+elif finish_reason == "length":
+    print_highlight("The response reached its token limit. Tool arguments may be incomplete.")
+elif arguments_by_index:
+    print_highlight(
+        f"The response ended with finish_reason={finish_reason!r}. "
+        "Do not treat its tool calls as complete."
+    )
 ```
 
 ### Define a Tool Function
