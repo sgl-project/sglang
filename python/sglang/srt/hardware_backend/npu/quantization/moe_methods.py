@@ -287,6 +287,9 @@ class NPUW4A8MXFP4MoEMethod(_NPUMoEMethodBase):
     def process_weights_after_loading(
         self, layer: torch.nn.Module, weight_prefix: str
     ) -> None:
+        if self.maybe_process_fuseep_weights(layer):
+            return
+
         self._validate_weight_prefix(layer, weight_prefix)
 
         weight = getattr(layer, f"{weight_prefix}_weight")
@@ -424,6 +427,9 @@ class NPUW4A4MXFP4MoEMethod(_NPUMoEMethodBase):
     def process_weights_after_loading(
         self, layer: torch.nn.Module, weight_prefix: str
     ) -> None:
+        if self.maybe_process_fuseep_weights(layer):
+            return
+
         self._validate_weight_prefix(layer, weight_prefix)
 
         weight = getattr(layer, f"{weight_prefix}_weight")
@@ -1102,6 +1108,9 @@ class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
     def process_weights_after_loading(
         self, layer: torch.nn.Module, weight_prefix: str
     ) -> None:
+        if self.maybe_process_fuseep_weights(layer):
+            return
+
         self._validate_weight_prefix(layer, weight_prefix)
 
         weight: torch.Tensor = getattr(layer, f"{weight_prefix}_weight").data

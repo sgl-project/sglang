@@ -51,7 +51,7 @@ def forward_fuseep(
 ) -> torch.Tensor:
     mode = get_exec().moe.fuseep_mode
     if mode == 3:
-        capacity = _mega_moe_capacity()
+        capacity = _mega_moe_capacity(getattr(layer, "_mega_moe_platform", "a3"))
         _log_mega_moe_geometry(
             hidden_states.shape[0],
             hidden_states.shape[1],
@@ -108,7 +108,7 @@ def forward_fuseep(
 @lru_cache(maxsize=128)
 def _log_mega_moe_geometry(rows: int, hidden: int, capacity: int, ep: int, tp: int):
     logging.getLogger(__name__).info(
-        "A3 MegaMoE input_shape=(%d, %d) dispatch_capacity=%d ep_size=%d moe_tp_size=%d",
+        "MegaMoE input_shape=(%d, %d) dispatch_capacity=%d ep_size=%d moe_tp_size=%d",
         rows,
         hidden,
         capacity,
@@ -117,12 +117,11 @@ def _log_mega_moe_geometry(rows: int, hidden: int, capacity: int, ep: int, tp: i
     )
 
 
-def _mega_moe_capacity() -> int:
+def _mega_moe_capacity(platform="a3") -> int:
     capacity = envs.SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK.get()
-    if not 1 <= capacity <= 4096:
+    if capacity < 1 or (platform == "a3" and capacity > 4096):
         raise ValueError(
-            "A3 FuseEP mode 3 requires "
-            "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK in [1, 4096]"
+            "FuseEP mode 3 requires positive dispatch capacity; A3 supports at most 4096"
         )
     return capacity
 
@@ -170,8 +169,8 @@ def _mega_moe_activation(config):
     )
 
 
-def _check_mega_moe_operator(operator):
-    # Validate the A3 invocation, independent of DeepEP's optional MXFP kwargs.
+def _check_mega_moe_operator(operator, *, mxfp=False):
+    # Validate only the keywords used by the selected platform.
     arguments = dict.fromkeys(
         (
             "x",
@@ -188,19 +187,21 @@ def _check_mega_moe_operator(operator):
         )
     )
     arguments.update(activation="swiglu", activation_params=None)
+    if mxfp:
+        arguments.update(weight1_type=None, weight2_type=None)
     try:
         inspect.signature(operator).bind(**arguments)
     except TypeError as exc:
         raise RuntimeError(
-            "DeepEP's MegaMoE loader returned an incompatible A3 operator; "
+            "DeepEP's MegaMoE loader returned an incompatible operator; "
             "upgrade to matching CANN toolkit/operator packages exposing "
             f"activation_params and use a compatible DeepEP build: {exc}"
         ) from exc
     return sorted(arguments)
 
 
-@lru_cache(maxsize=1)
-def _check_mega_moe_support():
+@lru_cache(maxsize=2)
+def _check_mega_moe_support(platform="a3"):
     try:
         import cann_ops_transformer
         import deep_ep
@@ -244,7 +245,7 @@ def _check_mega_moe_support():
         get_symm_buffer_for_mega_moe, compatible_operator = (
             fused_strategy.MegaMoeStrategy._load_mega_moe_ops()
         )
-        keywords = _check_mega_moe_operator(compatible_operator)
+        keywords = _check_mega_moe_operator(compatible_operator, mxfp=platform == "a5")
         diagnostic = {
             "deep_ep": {
                 "path": deep_ep.__file__,
@@ -257,6 +258,7 @@ def _check_mega_moe_support():
             "fused_deep_moe_signature": str(inspect.signature(Buffer.fused_deep_moe)),
             "mega_moe_signature": str(operator_signature),
             "strategy_path": fused_strategy.__file__,
+            "platform": platform,
             "operator_keywords": sorted(keywords),
             "legacy_swiglu_adapter": compatible_operator is not mega_moe,
         }
@@ -278,14 +280,155 @@ def _check_mega_moe_support():
             f"arguments; dependency check failed: {exc}"
         ) from exc
     soc = torch.npu.get_device_name()
-    if not soc.startswith("Ascend910_93"):
-        raise ValueError(f"FuseEP mode 3 currently supports Ascend A3, got {soc}")
+    expected = "Ascend950" if platform == "a5" else "Ascend910_93"
+    if not soc.startswith(expected):
+        raise ValueError(
+            f"MegaMoE {platform} expert format requires {expected}, got {soc}"
+        )
     return get_symm_buffer_for_mega_moe, compatible_operator
+
+
+def _process_a5_mega_moe_weights(layer: torch.nn.Module) -> None:
+    from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
+        NPUMXFP8MoEMethod,
+        NPUW4A4MXFP4MoEMethod,
+        NPUW4A8MXFP4MoEMethod,
+    )
+
+    modes = {
+        NPUMXFP8MoEMethod: "mx_fp8_e4m3",
+        NPUW4A8MXFP4MoEMethod: "mx_fp8_e4m3_w4",
+        NPUW4A4MXFP4MoEMethod: "mx_fp4_e2m1",
+    }
+    kernel_type = type(layer.w13_kernel)
+    if type(layer.w2_kernel) is not kernel_type:
+        raise ValueError("A5 MegaMoE requires homogeneous W13/W2 MXFP formats")
+    mode = modes[kernel_type]
+    activation_params = _mega_moe_activation(layer.moe_runner_config)
+    if layer.num_fused_shared_experts or layer.moe_tp_size != 1:
+        raise ValueError("A5 MegaMoE requires separate shared experts and MoE TP=1")
+    ep, experts = layer.moe_ep_size, layer.num_local_experts
+    hidden, intermediate = layer.hidden_size, layer.intermediate_size_per_partition
+    if (
+        ep < 2
+        or experts < 1
+        or layer.num_experts != ep * experts
+        or hidden < 64
+        or hidden % 64
+        or intermediate < 64
+        or intermediate % 64
+        or not 1 <= layer.moe_runner_config.top_k <= layer.num_experts
+    ):
+        raise ValueError("Invalid A5 MegaMoE expert geometry; H and I must align to 64")
+    _mega_moe_capacity("a5")
+    _check_mega_moe_support("a5")
+    scale_dtype = getattr(torch, "float8_e8m0fnu", None)
+    if scale_dtype is None:
+        raise RuntimeError("A5 MegaMoE requires torch.float8_e8m0fnu")
+    fp4 = kernel_type is not NPUMXFP8MoEMethod
+    fp4_type = None
+    if fp4:
+        import torch_npu
+
+        fp4_type = getattr(torch_npu, "float4_e2m1fn_x2", None)
+        if type(fp4_type) is not int:
+            raise RuntimeError("A5 MegaMoE requires torch_npu.float4_e2m1fn_x2")
+        if envs.SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT.get():
+            raise ValueError("A5 FP4 MegaMoE requires NZ weight format conversion")
+
+    source = {}
+    for prefix, channels, inputs in (
+        ("w13", 2 * intermediate, hidden),
+        ("w2", hidden, intermediate),
+    ):
+        weight = getattr(layer, f"{prefix}_weight").data
+        scale = getattr(layer, f"{prefix}_weight_scale", None)
+        if any(
+            getattr(layer, f"{prefix}_{suffix}", None) is not None
+            for suffix in (
+                "bias",
+                "weight_bias",
+                "scale_bias",
+                "weight_offset",
+                "weight_scale_second",
+            )
+        ):
+            raise ValueError(
+                "A5 MegaMoE does not support expert biases, offsets or secondary scales"
+            )
+        dtype = torch.uint8 if fp4 else torch.float8_e4m3fn
+        online = not fp4 and weight.dtype in (torch.bfloat16, torch.float16)
+        shape = (experts, channels, inputs // (2 if fp4 else 1))
+        if tuple(weight.shape) != shape or (not online and weight.dtype != dtype):
+            raise ValueError(
+                f"Invalid {prefix} A5 MegaMoE weight: expected {dtype} {shape}"
+            )
+        if online:
+            if scale is not None:
+                raise ValueError(
+                    "Online MXFP8 weights must not carry checkpoint scales"
+                )
+        elif (
+            scale is None
+            or scale.dtype not in (torch.uint8, scale_dtype)
+            or tuple(scale.shape)
+            not in (
+                (experts, channels, inputs // 32),
+                (experts, channels, inputs // 64, 2),
+            )
+            or scale.device != weight.device
+        ):
+            raise ValueError(f"Invalid {prefix} E8M0 block scales")
+        source[prefix] = weight, scale, online
+
+    converted = {}
+    for prefix, (weight, scale, online) in source.items():
+        if online:
+            kernel = getattr(layer, f"{prefix}_kernel")
+            weight, scale = kernel._quantize_weight_online(weight, prefix)
+        else:
+            scale = scale.data
+        # MegaMoE consumes [E,N,K], unlike the ordinary GMM transpose views.
+        scale = (
+            scale.contiguous()
+            .view(scale_dtype)
+            .reshape(experts, weight.shape[1], -1, 2)
+        )
+        cast_args = {}
+        if fp4 and (prefix == "w2" or mode == "mx_fp8_e4m3_w4"):
+            cast_args = dict(customize_dtype=torch.float8_e4m3fn, input_dtype=fp4_type)
+        # E4M3 accepts ND. FP4 requires these projection-specific NZ casts.
+        prepared = (
+            npu_format_cast(weight.contiguous(), **cast_args)
+            if fp4
+            else weight.contiguous()
+        )
+        if fp4:
+            actual_format = torch_npu.get_npu_format(prepared)
+            actual_format = int(getattr(actual_format, "value", actual_format))
+            expected = (29, 50, 51) if cast_args else (29,)
+            if actual_format not in expected:
+                raise RuntimeError(
+                    f"A5 {mode} {prefix} requires NZ format {expected}, got {actual_format}"
+                )
+        converted[f"{prefix}_weight"] = [prepared]
+        converted[f"{prefix}_weight_scale"] = [scale]
+    for name, value in converted.items():
+        if hasattr(layer, name):
+            delattr(layer, name)
+        setattr(layer, name, value)
+    layer._mega_moe_platform = "a5"
+    layer._mega_moe_quant_mode = mode
+    layer._mega_moe_activation_params = activation_params
+    layer._mega_moe_weights_processed = True
 
 
 def _process_mega_moe_weights(layer: torch.nn.Module) -> None:
     from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
+        NPUMXFP8MoEMethod,
         NPUUnquantMoEMethod,
+        NPUW4A4MXFP4MoEMethod,
+        NPUW4A8MXFP4MoEMethod,
         NPUW4A8Int8MoEMethod,
         NPUW8A8Int8MoEMethod,
     )
@@ -293,6 +436,12 @@ def _process_mega_moe_weights(layer: torch.nn.Module) -> None:
     if getattr(layer, "_mega_moe_weights_processed", False):
         return
     kernels = (layer.w13_kernel, layer.w2_kernel)
+    if type(kernels[0]) in (
+        NPUMXFP8MoEMethod,
+        NPUW4A8MXFP4MoEMethod,
+        NPUW4A4MXFP4MoEMethod,
+    ):
+        return _process_a5_mega_moe_weights(layer)
     if type(kernels[0]) is not type(kernels[1]) or type(kernels[0]) not in (
         NPUW4A8Int8MoEMethod,
         NPUW8A8Int8MoEMethod,
@@ -423,6 +572,7 @@ def _process_mega_moe_weights(layer: torch.nn.Module) -> None:
         delattr(layer, name)
         setattr(layer, name, value)
     layer._mega_moe_activation_params = activation_params
+    layer._mega_moe_platform = "a3"
     layer._mega_moe_quant_mode = 0 if unquantized else 1
     layer._mega_moe_weights_processed = True
 
