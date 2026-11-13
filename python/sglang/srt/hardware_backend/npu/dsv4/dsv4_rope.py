@@ -25,10 +25,6 @@ class Dsv4NpuRoPE:
         self.freqs_cis = freqs_cis
         # cos/sin registered as buffers on this module (None -> fall back to _tables).
         self.rotary_emb = rotary_emb
-        # contiguous real/imag halves of complex freqs_cis [max_pos, rope_dim/2];
-        # .real/.imag are strided views, materialize once to avoid per-call
-        # StridedSlice from aclnnIndex over the strided views.
-        self._real_imag: Optional[tuple[torch.Tensor, torch.Tensor]] = None
         self._tables: dict[
             tuple[torch.dtype, torch.device], tuple[torch.Tensor, torch.Tensor]
         ] = {}
@@ -43,14 +39,6 @@ class Dsv4NpuRoPE:
             inst = cls(freqs_cis, rotary_emb)
             cls._instances[id(freqs_cis)] = inst
         return inst
-
-    def _contig_real_imag(self) -> tuple[torch.Tensor, torch.Tensor]:
-        if self._real_imag is None:
-            self._real_imag = (
-                self.freqs_cis.real.contiguous(),
-                self.freqs_cis.imag.contiguous(),
-            )
-        return self._real_imag
 
     @staticmethod
     def _buffer_names(dtype: torch.dtype) -> tuple[str, str]:
@@ -108,7 +96,10 @@ class Dsv4NpuRoPE:
                 "Initialize it before forward to keep decode free of repeat_interleave."
             )
 
-        real_contig, imag_contig = self._contig_real_imag()
+        # These copies are only needed while building the interleaved tables.
+        # Retaining them would keep another full FP32 pair for the model lifetime.
+        real_contig = self.freqs_cis.real.contiguous()
+        imag_contig = self.freqs_cis.imag.contiguous()
         cos = real_contig.repeat_interleave(2, dim=-1).to(dtype=dtype).contiguous()
         sin = imag_contig.repeat_interleave(2, dim=-1).to(dtype=dtype).contiguous()
 
