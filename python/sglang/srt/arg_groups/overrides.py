@@ -1841,6 +1841,7 @@ _A2A_EP_SPANNING_BACKENDS = frozenset(
         "flashinfer_nvlink_one_sided",
         "flashinfer_megamoe",
         "mori",
+        "mscclpp",
         "pplx",
         "ascend_ops",
         "deepep_v2",
