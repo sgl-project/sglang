@@ -77,6 +77,26 @@ def _saturate_to_fp8_range(val, FP8_MAX: tl.constexpr, DTYPE: tl.constexpr):
 
 
 @triton.jit
+def _quantize_kv_fp8(
+    val,
+    scale,
+    SCALE_IS_TENSOR: tl.constexpr,
+    SRC_DTYPE: tl.constexpr,
+    DST_DTYPE: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+):
+    val = val.to(tl.float32)
+    if SCALE_IS_TENSOR:
+        # Tensor division rounds the divisor first and uses correctly rounded division.
+        val = tl.div_rn(val, scale.to(SRC_DTYPE).to(tl.float32))
+    else:
+        # Eager host-scalar division multiplies by a rounded FP32 reciprocal.
+        val = val * tl.div_rn(1.0, scale)
+    val = val.to(SRC_DTYPE)
+    return _saturate_to_fp8_range(val, FP8_MAX, SRC_DTYPE).to(DST_DTYPE)
+
+
+@triton.jit
 def set_kv_buffer_prefix_valid_tiled_fp8(
     src_k_ptr,
     src_v_ptr,
@@ -116,30 +136,83 @@ def set_kv_buffer_prefix_valid_tiled_fp8(
     dst_k_row_ptr = dst_k_ptr + loc * dst_k_row_stride + elem_off
     dst_v_row_ptr = dst_v_ptr + loc * dst_v_row_stride + elem_off
 
-    # Tensor division rounds the divisor first and uses correctly rounded division.
-    k_val = tl.load(src_k_row_ptr, mask=mask_elem, other=0).to(tl.float32)
-    if K_SCALE_IS_TENSOR:
-        k_scale = k_scale.to(src_k_ptr.dtype.element_ty).to(tl.float32)
-        k_val = tl.div_rn(k_val, k_scale)
-    else:
-        # Eager host-scalar division multiplies by a rounded FP32 reciprocal.
-        k_val = k_val * tl.div_rn(1.0, k_scale)
-    k_val = k_val.to(src_k_ptr.dtype.element_ty)
-    k_val = _saturate_to_fp8_range(k_val, FP8_MAX, src_k_ptr.dtype.element_ty)
-    k_val = k_val.to(dst_k_ptr.dtype.element_ty)
-
-    v_val = tl.load(src_v_row_ptr, mask=mask_elem, other=0).to(tl.float32)
-    if V_SCALE_IS_TENSOR:
-        v_scale = v_scale.to(src_v_ptr.dtype.element_ty).to(tl.float32)
-        v_val = tl.div_rn(v_val, v_scale)
-    else:
-        v_val = v_val * tl.div_rn(1.0, v_scale)
-    v_val = v_val.to(src_v_ptr.dtype.element_ty)
-    v_val = _saturate_to_fp8_range(v_val, FP8_MAX, src_v_ptr.dtype.element_ty)
-    v_val = v_val.to(dst_v_ptr.dtype.element_ty)
+    k_val = _quantize_kv_fp8(
+        tl.load(src_k_row_ptr, mask=mask_elem, other=0),
+        k_scale,
+        K_SCALE_IS_TENSOR,
+        src_k_ptr.dtype.element_ty,
+        dst_k_ptr.dtype.element_ty,
+        FP8_MAX,
+    )
+    v_val = _quantize_kv_fp8(
+        tl.load(src_v_row_ptr, mask=mask_elem, other=0),
+        v_scale,
+        V_SCALE_IS_TENSOR,
+        src_v_ptr.dtype.element_ty,
+        dst_v_ptr.dtype.element_ty,
+        FP8_MAX,
+    )
 
     tl.store(dst_k_row_ptr, k_val, mask=mask_elem)
     tl.store(dst_v_row_ptr, v_val, mask=mask_elem)
+
+
+@triton.jit
+def set_kv_buffer_tiled_fp8(
+    src_k_ptr,
+    src_v_ptr,
+    dst_k_ptr,
+    dst_v_ptr,
+    loc_ptr,
+    k_scale,
+    v_scale,
+    src_k_row_stride,
+    src_v_row_stride,
+    dst_k_row_stride,
+    dst_v_row_stride,
+    size_limit,
+    ROW_ELEMS: tl.constexpr,
+    ELEMS_PER_TILE: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+    K_SCALE_IS_PTR: tl.constexpr = False,
+    V_SCALE_IS_PTR: tl.constexpr = False,
+):
+    row = tl.program_id(0).to(tl.int64)
+    loc = tl.load(loc_ptr + row).to(tl.int64)
+    tl.device_assert((loc >= 0) & (loc < size_limit), "KV slot out of range")
+    # Slot 0 is the reserved padding slot (store_cache's reserved_skip_index):
+    # padded tokens point there, and their source rows may be garbage.
+    if loc == 0:
+        return
+
+    elem_off = tl.program_id(1) * ELEMS_PER_TILE + tl.arange(0, ELEMS_PER_TILE)
+    mask_elem = elem_off < ROW_ELEMS
+
+    # A device scale is read here, so a captured CUDA graph needs no host copy.
+    if K_SCALE_IS_PTR:
+        k_scale = tl.load(k_scale)
+    if V_SCALE_IS_PTR:
+        v_scale = tl.load(v_scale)
+
+    k_val = _quantize_kv_fp8(
+        tl.load(src_k_ptr + row * src_k_row_stride + elem_off, mask=mask_elem, other=0),
+        k_scale,
+        K_SCALE_IS_PTR,
+        src_k_ptr.dtype.element_ty,
+        dst_k_ptr.dtype.element_ty,
+        FP8_MAX,
+    )
+    v_val = _quantize_kv_fp8(
+        tl.load(src_v_ptr + row * src_v_row_stride + elem_off, mask=mask_elem, other=0),
+        v_scale,
+        V_SCALE_IS_PTR,
+        src_v_ptr.dtype.element_ty,
+        dst_v_ptr.dtype.element_ty,
+        FP8_MAX,
+    )
+
+    tl.store(dst_k_ptr + loc * dst_k_row_stride + elem_off, k_val, mask=mask_elem)
+    tl.store(dst_v_ptr + loc * dst_v_row_stride + elem_off, v_val, mask=mask_elem)
 
 
 @triton.jit
