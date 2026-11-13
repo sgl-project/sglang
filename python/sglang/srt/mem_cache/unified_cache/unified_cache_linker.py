@@ -191,8 +191,17 @@ class UnifiedCacheLinker(ABC):
     def submit_lookup(
         self, rid: str, transfers: list[PoolTransfer]
     ) -> Future[list[int]] | None:
-        """Submit a non-blocking lookup for prefetch mode."""
-        return None
+        """Submit a non-blocking lookup."""
+        logger.warning_once(
+            "External linker %s.%s is using the default submit_lookup() "
+            "implementation, which calls synchronous lookup(). Override "
+            "submit_lookup() to implement actual asynchronous lookup.",
+            type(self).__module__,
+            type(self).__name__,
+        )
+        future = Future()
+        future.set_result(self.lookup(rid, transfers))
+        return future
 
     @abstractmethod
     def lookup(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
