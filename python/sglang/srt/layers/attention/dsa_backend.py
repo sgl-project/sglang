@@ -88,6 +88,10 @@ from sglang.srt.layers.attention.dsa.kpool_plan import (
     KPoolExtendPlan,
     KPoolWritePlan,
 )
+from sglang.srt.layers.attention.dsa.prims_ts import (
+    PrimsTSSparseMLA,
+    check_prims_ts_sparse_mla_support,
+)
 from sglang.srt.layers.attention.dsa.utils import (
     can_dsa_prefill_cp_interleave,
     compute_dsa_seqlens,
@@ -134,6 +138,8 @@ from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 _IS_GFX95 = is_gfx95_supported()
 
 if TYPE_CHECKING:
+    from flash_mla.flash_mla_interface import FlashMLASchedMeta
+
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.spec_info import SpecInput
@@ -298,6 +304,21 @@ def _restore_live_rows(output: torch.Tensor, plan: Optional[_RowPlan]) -> torch.
     return output
 
 
+def _flashmla_kv_padded_heads(num_heads: int) -> int:
+    """Use native head counts when the installed SM100 kernel supports them."""
+    if _is_cuda and get_platform().is_sm100 and 1 <= num_heads <= 128:
+        from sglang.kernels.ops.attention import flash_mla_interface
+
+        if flash_mla_interface.supports_native_heads():
+            return num_heads
+    if num_heads <= 64:
+        return 64
+    if num_heads <= 128:
+        return 128
+    # Keep original head count if it exceeds current padded variants.
+    return num_heads
+
+
 @dataclass(frozen=True)
 class DSAFlashMLAMetadata:
     """Metadata only needed by FlashMLA"""
@@ -430,8 +451,14 @@ _DSA_IMPL_T: TypeAlias = Literal[
     "tilelang",
     "triton",
     "trtllm",
+    "prims_ts",
     "intel_xpu",
 ]
+
+
+def uses_raw_fp8_dsa_kv_layout(backend: Optional[str]) -> bool:
+    # The raw FP8 MLA cache layout: 576 B/token, no fp8_ds_mla tile scales.
+    return backend in ("trtllm", "prims_ts")
 
 
 # Largest head count the kernel has been measured at. Above it BLOCK_H=64/128
@@ -482,6 +509,17 @@ def _validate_triton_sparse_mla_backend(
                 f"num_q_heads={num_q_heads}, i.e. {rows} rows. Use a different "
                 "group size or disable union."
             )
+
+
+def _validate_prims_ts_dcp(*, dcp_size: int, shards_index_k: bool) -> None:
+    # Prims-TS partials carry a natural-log LSE, but the DCP combine merges DSA
+    # partials base e only under sharded index-K (is_mla_dcp_lse_base_on_e).
+    if dcp_size > 1 and not shards_index_k:
+        raise ValueError(
+            "--dsa-*-backend prims_ts supports --dcp-size > 1 only with sharded "
+            "index-K DCP (Kimi-K3.1); this model keeps index-K replicated, whose "
+            "DCP combine merges base-2 LSE partials. Use trtllm, or --dcp-size 1."
+        )
 
 
 def _resolve_dsa_triton_union(*, union: int, deterministic: bool) -> int:
@@ -713,19 +751,28 @@ class DeepseekSparseAttnBackend(
             deterministic=get_exec().deterministic.enable_deterministic_inference,
         )
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend.resolve(model_runner)
-        if self.num_q_heads <= 64:
-            self.flashmla_kv_num_q_heads = 64
-        elif self.num_q_heads <= 128:
-            self.flashmla_kv_num_q_heads = 128
-        else:
-            # Keep original head count if it exceeds current padded variants.
-            self.flashmla_kv_num_q_heads = self.num_q_heads
-        if self.local_num_q_heads <= 64:
-            self.flashmla_kv_num_q_heads_prefill = 64
-        elif self.local_num_q_heads <= 128:
-            self.flashmla_kv_num_q_heads_prefill = 128
-        else:
-            self.flashmla_kv_num_q_heads_prefill = self.local_num_q_heads
+        self.flashmla_kv_num_q_heads = _flashmla_kv_padded_heads(self.num_q_heads)
+        # prims_ts: the trtllm route with Prims-TS as the kernel
+        self._prims_ts: Optional[PrimsTSSparseMLA] = None
+        if "prims_ts" in (self.dsa_prefill_impl, self.dsa_decode_impl):
+            if model_runner.kv_cache_dtype != torch.float8_e4m3fn:
+                raise ValueError(
+                    "--dsa-*-backend prims_ts needs --kv-cache-dtype fp8_e4m3."
+                )
+            _validate_prims_ts_dcp(
+                dcp_size=get_parallel().attn_dcp_size,
+                shards_index_k=self.dsa_shards_index_k,
+            )
+            check_prims_ts_sparse_mla_support(
+                device=torch.device(self.device),
+                num_heads=self.num_q_heads,
+                kv_lora_rank=self.kv_lora_rank,
+                qk_rope_head_dim=self.qk_rope_head_dim,
+            )
+            self._prims_ts = PrimsTSSparseMLA(torch.device(self.device))
+        self.flashmla_kv_num_q_heads_prefill = _flashmla_kv_padded_heads(
+            self.local_num_q_heads
+        )
         self.enable_auto_select_prefill_impl = self.dsa_prefill_impl == "flashmla_auto"
         self._sink_pad_cache: dict[tuple[int, int], torch.Tensor] = {}
         # Keep graph-captured buffers alive per stream.
@@ -2408,7 +2455,7 @@ class DeepseekSparseAttnBackend(
         dsa_impl = self._resolve_kpool_tail_backend(topk_indices, dsa_impl)
         self._check_kpool_tail_backend(topk_indices, dsa_impl, phase)
 
-        if dsa_impl == "trtllm" and not self.use_mha:
+        if uses_raw_fp8_dsa_kv_layout(dsa_impl) and not self.use_mha:
             return self._forward_trtllm(
                 q,
                 k,
@@ -2424,6 +2471,7 @@ class DeepseekSparseAttnBackend(
                 is_neox,
                 llama_4_scaling,
                 is_prefill=True,
+                use_prims_ts=dsa_impl == "prims_ts",
             )
 
         if k is not None:
@@ -2797,7 +2845,7 @@ class DeepseekSparseAttnBackend(
                 f"Learnable attention sinks require flashmla_sparse, got {dsa_impl}"
             )
 
-        if dsa_impl == "trtllm":
+        if uses_raw_fp8_dsa_kv_layout(dsa_impl):
             return self._forward_trtllm(
                 q,
                 k,
@@ -2812,6 +2860,7 @@ class DeepseekSparseAttnBackend(
                 cos_sin_cache,
                 is_neox,
                 llama_4_scaling,
+                use_prims_ts=dsa_impl == "prims_ts",
             )
 
         if k is not None:
@@ -3637,7 +3686,9 @@ class DeepseekSparseAttnBackend(
             indices.shape[-1] == self.dsa_index_topk
         )  # requirement of FlashMLA decode kernel
         if dcp_partial:
-            tile_scheduler_metadata = self._call_get_mla_metadata()[0]
+            tile_scheduler_metadata = self._dcp_flashmla_sched_meta(
+                q_input, indices, topk_length
+            )
 
         plan = None
         if not dcp_partial:
@@ -3674,6 +3725,30 @@ class DeepseekSparseAttnBackend(
         o = o.view(-1, num_q_heads, v_head_dim)
         lse = lse.view(-1, lse.shape[1])[:, :num_q_heads]
         return o, lse
+
+    def _dcp_flashmla_sched_meta(
+        self,
+        q: torch.Tensor,
+        indices: torch.Tensor,
+        topk_length: Optional[torch.Tensor],
+    ) -> FlashMLASchedMeta:
+        # Depends on topk_length, so it is built per call; left empty where the
+        # scheduler kernel does not apply, and FlashMLA then schedules itself.
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            _maybe_precompute_flashmla_sched_meta,
+        )
+
+        sched_meta = self._call_get_mla_metadata()[0]
+        _maybe_precompute_flashmla_sched_meta(
+            sched_meta,
+            q=q,
+            indices=indices,
+            topk_length=topk_length,
+            extra_indices=None,
+            extra_topk_length=None,
+            schedule="windowed",
+        )
+        return sched_meta
 
     def _forward_standard_mha(
         self,
@@ -4200,8 +4275,9 @@ class DeepseekSparseAttnBackend(
         is_neox: Optional[bool] = False,
         llama_4_scaling: Optional[torch.Tensor] = None,
         is_prefill: bool = False,
+        use_prims_ts: bool = False,
     ) -> torch.Tensor:
-        """Forward using TRT-LLM sparse MLA kernel."""
+        """Forward using TRT-LLM sparse MLA kernel, or Prims-TS with use_prims_ts."""
         cp_store_cache_loc = None
         import flashinfer.decode
 
@@ -4401,6 +4477,21 @@ class DeepseekSparseAttnBackend(
 
         batch_size, num_heads, head_dim = q_all.shape
 
+        if use_prims_ts:
+            return self._forward_prims_ts(
+                q_all=q_all,
+                kv_cache=kv_cache,
+                page_table_1=page_table_1,
+                seq_lens=seq_lens,
+                metadata=metadata,
+                layer=layer,
+                k_scale=k_scale,
+                is_prefill=is_prefill,
+                partial=replicated_dcp or dcp_partial,
+                clamp_lengths=not dcp_partial,
+                row_plan=row_plan,
+            )
+
         multi_ctas_kv_counter_buffer = self._multi_ctas_kv_counter_for(batch_size)
 
         kernel_heads = trtllm_padded_heads(num_heads)
@@ -4467,6 +4558,55 @@ class DeepseekSparseAttnBackend(
         if kernel_heads != layer.tp_q_head_num:
             out = out[..., : layer.tp_q_head_num, :].contiguous()
         return _restore_live_rows(out, row_plan)
+
+    def _forward_prims_ts(
+        self,
+        *,
+        q_all: torch.Tensor,
+        kv_cache: torch.Tensor,
+        page_table_1: torch.Tensor,
+        seq_lens: Optional[torch.Tensor],
+        metadata: DSAMetadata,
+        layer: RadixAttention,
+        k_scale: float,
+        is_prefill: bool,
+        partial: bool,
+        clamp_lengths: bool,
+        row_plan: _RowPlan,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        assert self._prims_ts is not None
+        if k_scale != 1.0:
+            # The raw FP8 store casts K/V unscaled (quant_scale_kv=1.0), and
+            # trtllm-gen applies the scale to the logits only.
+            raise ValueError(
+                "--dsa-*-backend prims_ts does not support a checkpoint KV scale "
+                f"(k_scale={k_scale}); the raw FP8 MLA cache is stored unscaled."
+            )
+        rows = q_all.shape[0]
+        assert q_all.shape[1] == layer.tp_q_head_num
+        lengths = metadata.cache_seqlens_int32 if seq_lens is None else seq_lens
+        if is_prefill:
+            lengths = lengths[:rows]
+        if clamp_lengths:
+            # Decode passes the full KV length; only the first top-k width
+            # slots of a row hold its selected keys.
+            lengths = torch.clamp(lengths, max=page_table_1.shape[1])
+        out, lse = self._prims_ts.forward(
+            q=q_all,
+            kv_cache=kv_cache,
+            indices=page_table_1,
+            lengths=lengths,
+            sm_scale=layer.scaling,
+            kv_scale=k_scale,
+        )
+        out = _restore_live_rows(out, row_plan)
+        if not partial:
+            return out
+        if row_plan.q_pad_rows:
+            lse = torch.cat(
+                [lse, lse.new_full((row_plan.q_pad_rows, lse.shape[1]), -torch.inf)]
+            )
+        return out, lse
 
     def _pad_topk_indices(
         self, topk_indices: torch.Tensor, num_tokens: int
