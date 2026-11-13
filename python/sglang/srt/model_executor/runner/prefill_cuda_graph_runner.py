@@ -1559,7 +1559,10 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         if num_tokens > self.max_num_tokens:
             return False
         padded_num_tokens = self._pad_to_bucket(num_tokens, self.capture_num_tokens)
-        if self._requires_exact_prefill_bucket and padded_num_tokens != num_tokens:
+        if (
+            self._requires_exact_prefill_bucket is True
+            and padded_num_tokens != num_tokens
+        ):
             return False
         if padded_num_tokens > num_tokens * _MAX_PREFILL_CUDA_GRAPH_PADDING_FACTOR:
             return False
