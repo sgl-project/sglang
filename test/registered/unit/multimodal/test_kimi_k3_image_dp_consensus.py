@@ -2,9 +2,9 @@
 
 import datetime
 import json
-import socket
 import tempfile
 import unittest
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -12,6 +12,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from sglang.srt.distributed.utils import all_gather_single
 from sglang.srt.managers import mm_schedule
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
 from sglang.srt.multimodal.image_dp_consensus import ImageDPCoordinationError
@@ -38,6 +39,7 @@ CASES = [
     "projector",
     "grid",
     "padding",
+    "receive_allocation",
     "split",
     "split_memory",
     "by_item",
@@ -51,6 +53,7 @@ FAILURES = {
     "projector",
     "grid",
     "padding",
+    "receive_allocation",
     "split_memory",
 }
 
@@ -59,35 +62,46 @@ def _key(item):
     return getattr(item, "cache_key", item.hash)
 
 
-def _worker(rank, port, output):
+def _worker(rank, rendezvous, output):
     import sglang.srt.multimodal.mm_utils as helpers
 
     torch.set_num_threads(1)
     dist.init_process_group(
         "gloo",
-        init_method=f"tcp://127.0.0.1:{port}",
+        init_method=f"file://{rendezvous}",
         rank=rank,
         world_size=2,
-        timeout=datetime.timedelta(seconds=10),
+        timeout=datetime.timedelta(seconds=30),
+    )
+    payload_group = dist.new_group(
+        backend="gloo", timeout=datetime.timedelta(seconds=10)
     )
 
     class Group:
         world_size = 2
         rank_in_group = rank
         cpu_group = dist.group.WORLD
+        use_symmetric_memory = staticmethod(lambda *_args, **_kwargs: nullcontext())
+        is_allocation_symmetric = staticmethod(lambda: False)
 
         def __init__(self):
             self.payloads = 0
 
         def broadcast(self, tensor, src):
             self.payloads += 1
-            dist.broadcast(tensor, src)
+            dist.broadcast(tensor, src, group=payload_group)
 
         def all_gather(self, tensor, dim):
+            assert dim == 0
+            result = torch.empty(
+                (2 * tensor.shape[0], *tensor.shape[1:]), dtype=tensor.dtype
+            )
+            self.all_gather_into_tensor(result, tensor)
+            return result
+
+        def all_gather_into_tensor(self, output, tensor):
             self.payloads += 1
-            values = [torch.empty_like(tensor) for _ in range(2)]
-            dist.all_gather(values, tensor)
-            return torch.cat(values, dim)
+            all_gather_single(output, tensor, group=payload_group)
 
     class Tower:
         device = torch.device("cpu")
@@ -138,6 +152,7 @@ def _worker(rank, port, output):
     group, owner = Group(), Owner()
     rows = []
     original_pad = helpers._pad_mrope_vision_embeddings_for_tp_gather
+    original_empty = torch.empty
     try:
         with get_parallel().override(attn_tp_size=1, attn_tp_rank=0):
             for case in CASES:
@@ -190,6 +205,16 @@ def _worker(rank, port, output):
                         raise MemoryError("injected gather allocation failure")
 
                     helpers._pad_mrope_vision_embeddings_for_tp_gather = fail_pad
+                if case == "receive_allocation" and rank == 0:
+
+                    def fail_receive(*size, **kwargs):
+                        if size == ((8, 1, 1),):
+                            raise torch.OutOfMemoryError(
+                                "injected receive allocation failure"
+                            )
+                        return original_empty(*size, **kwargs)
+
+                    torch.empty = fail_receive
                 error = None
                 try:
                     if case == "by_item":
@@ -222,6 +247,7 @@ def _worker(rank, port, output):
                     error = str(exc)
                 finally:
                     helpers._pad_mrope_vision_embeddings_for_tp_gather = original_pad
+                    torch.empty = original_empty
                 assert bool(error) == (case in FAILURES), (case, rank, error)
                 if case in FAILURES - {"projector", "split_memory"}:
                     assert group.payloads == 0, (case, group.payloads)
@@ -243,16 +269,15 @@ def _worker(rank, port, output):
                 )
         (Path(output) / f"rank{rank}.json").write_text(json.dumps(rows, indent=2))
     finally:
+        dist.destroy_process_group(payload_group)
         dist.destroy_process_group()
 
 
 class TestImageDPConsensus(CustomTestCase):
     def test_real_gloo_cache_drift_and_failures(self):
         with tempfile.TemporaryDirectory() as output:
-            with socket.socket() as sock:
-                sock.bind(("127.0.0.1", 0))
-                port = sock.getsockname()[1]
-            mp.spawn(_worker, args=(port, output), nprocs=2, join=True)
+            rendezvous = Path(output) / "rdzv"
+            mp.spawn(_worker, args=(rendezvous, output), nprocs=2, join=True)
             rows = [
                 json.loads((Path(output) / f"rank{r}.json").read_text()) for r in [0, 1]
             ]

@@ -656,6 +656,8 @@ def run_dp_sharded_mrope_vision_model(
             return image_embeds
         return vision_model(pixel_values, grid_thw=grid_thw)
 
+    preallocate_gather = parallel_group is not None
+    gathered_embeds = None
     with image_dp_local_stage(
         parallel_group,
         lambda: (grid_thw_list, tuple(payload.shape), str(payload.dtype)),
@@ -817,6 +819,20 @@ def run_dp_sharded_mrope_vision_model(
             image_embeds_local_padded = _pad_mrope_vision_embeddings_for_tp_gather(
                 image_embeds_local, max_len_per_rank
             )
+            if preallocate_gather:
+                # Allocate the receive buffer before peers enter the payload collective.
+                with parallel_group.use_symmetric_memory(
+                    parallel_group,
+                    disabled=not parallel_group.is_allocation_symmetric(),
+                ):
+                    gathered_embeds = torch.empty(
+                        (
+                            tp_size * max_len_per_rank,
+                            *image_embeds_local_padded.shape[1:],
+                        ),
+                        dtype=image_embeds_local_padded.dtype,
+                        device=image_embeds_local_padded.device,
+                    )
         payload = (
             out_embeddings if len(grid_thw_list) == 1 else image_embeds_local_padded
         )
@@ -826,7 +842,12 @@ def run_dp_sharded_mrope_vision_model(
         return out_embeddings
 
     # Do all_gather to collect embeddings from all ranks
-    gathered_embeds = parallel_group.all_gather(image_embeds_local_padded, dim=0)
+    if gathered_embeds is None:
+        gathered_embeds = parallel_group.all_gather(image_embeds_local_padded, dim=0)
+    else:
+        parallel_group.all_gather_into_tensor(
+            gathered_embeds, image_embeds_local_padded
+        )
 
     # Remove padding and reconstruct per-rank embeddings
     rank_embeddings = list[torch.Tensor]()
