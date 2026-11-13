@@ -82,7 +82,7 @@ from sglang.srt.utils.device import get_compiler_backend
 _is_cuda = is_cuda()
 _is_npu = is_npu()
 if _is_npu:
-    from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
+    from sgl_kernel_npu.operators.norm import split_qkv_rmsnorm_rope
 _is_gfx95 = is_hip() and is_gfx95_supported()
 if _is_gfx95:
     from sglang.kernels.ops.gemm.bf16_tiled_small_m_gemm import (

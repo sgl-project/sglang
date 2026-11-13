@@ -498,7 +498,8 @@ class CompressorAscendBackendMixin:
             allow_build=False,
         )
 
-        compressor_op = torch.ops.npu.compressor
+        from sgl_kernel_npu.operators.attention import compressor as compressor_op
+
         cmp_kv = compressor_op(
             x,
             compressor._fused_wkv_w,

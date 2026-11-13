@@ -6,26 +6,42 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
     AttentionMetadata,
 )
 from sglang.multimodal_gen.runtime.layers.attention.backends.sdpa import SDPABackend
-from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
-# Import to use torch.ops.attentions, install package with sgl_kernel_npu
-try:
-    import attentions  # noqa: F401
-except ImportError as e:
-    logger.warning_once(
-        "The 'attentions' library is not installed. Laser Attention is unavailable. "
-        "Installing this library may improve performance on NPU. "
-        "See: sgl-project/sgl-kernel-npu"
-    )
-    raise ImportError(
-        (
-            "The required 'attentions' package is not installed. "
-            "Install it from sgl-project/sgl-kernel-npu."
+_is_npu = current_platform.is_npu()
+
+if _is_npu:
+    try:
+        from sgl_kernel_npu.operators.attention import la
+    except ImportError as e:
+        logger.warning_once(
+            "The Laser Attention kernel library is not installed. Laser Attention is "
+            "unavailable. Installing this library may improve performance on NPU. "
+            "See: sgl-project/sgl-kernel-npu"
         )
-    ) from e
+        raise ImportError(
+            (
+                "The required Laser Attention kernel library is not installed: "
+                "'sgl_kernel_npu' (operator attention.laser_attention) on NPU. "
+                "Install it from sgl-project/sgl-kernel-npu."
+            )
+        ) from e
+
+
+def _laser_attention_op(**kwargs):
+    if not _is_npu:
+        raise RuntimeError(
+            "Laser Attention is only supported on NPU and requires the "
+            "'attentions' module shipped with sgl_kernel_npu."
+        )
+    return la(**kwargs)
+
 
 # The current NPU kernel stores QK scores and V in FP16 even for BF16 inputs.
 _BF16_LASER_SCALE = 256.0
@@ -165,7 +181,7 @@ class LaserAttentionImpl(AttentionImpl):
         pre_tokens: int,
         scale_value: float,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        return torch.ops.attentions.la(
+        return _laser_attention_op(
             query=query,
             key=key,
             value=value,

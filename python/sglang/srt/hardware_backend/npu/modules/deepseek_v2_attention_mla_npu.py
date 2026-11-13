@@ -2,7 +2,8 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 import torch_npu
-from sgl_kernel_npu.norm.fused_split_qk_norm import fused_split_qk_norm
+from sgl_kernel_npu.operators.matmul import batch_matmul_transpose
+from sgl_kernel_npu.operators.norm import fused_split_qk_norm
 
 import sglang.srt.layers.dcp.comm as dcp_comm
 import sglang.srt.layers.dcp.layout as dcp_layout
@@ -18,7 +19,6 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_fia_nz,
     is_mla_preprocess_enabled,
 )
-from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers.attention.dsa.dsa_npu_indexer import scattered_to_tp_attn_full
 from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
@@ -33,7 +33,6 @@ if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
     from sglang.srt.utils import BumpAllocator
 _use_ag_after_qlora = envs.SGLANG_USE_AG_AFTER_QLORA.get()
-_is_npu_arch35 = is_npu_arch35()
 
 
 def init_modelslim_mla_kv(m: "DeepseekV2AttentionMLA", prefix: str):
@@ -352,28 +351,7 @@ def forward_mla_core_npu(
         **attn_kwargs,
     )
 
-    attn_output = attn_output.contiguous()
-    if (
-        attn_output.shape[0] >= 65536
-        or attn_output.shape[-1] * attn_output.shape[-2] >= 65536
-        or m.w_vc.shape[-1] >= 65536
-    ):
-        # npu_transpose_batchmatmul does not support dimensions >= 65536.
-        attn_bmm_output = torch.empty(
-            (attn_output.shape[0], m.num_local_heads, m.v_head_dim),
-            dtype=attn_output.dtype,
-            device=attn_output.device,
-        )
-        torch.ops.npu.batch_matmul_transpose(attn_output, m.w_vc, attn_bmm_output)
-    else:
-        # Use the numerically validated torch_npu implementation when supported.
-        attn_bmm_output = torch_npu.npu_transpose_batchmatmul(
-            attn_output,
-            m.w_vc,
-            perm_x1=(1, 0, 2),
-            perm_x2=(0, 1, 2),
-            perm_y=(1, 0, 2),
-        )
+    attn_bmm_output = batch_matmul_transpose(attn_output.contiguous(), m.w_vc)
 
     attn_bmm_output = attn_bmm_output.reshape(-1, m.num_local_heads * m.v_head_dim)
     if gate is not None:
@@ -497,13 +475,7 @@ def forward_dsa_prepare_npu(
 
         q_nope, q_pe = q.split([m.qk_nope_head_dim, m.qk_rope_head_dim], dim=-1)
 
-        q_nope_out = torch_npu.npu_transpose_batchmatmul(
-            q_nope,
-            m.w_kc,
-            perm_x1=(1, 0, 2),
-            perm_x2=(0, 1, 2),
-            perm_y=(1, 0, 2),
-        )
+        q_nope_out = batch_matmul_transpose(q_nope, m.w_kc, impl="torch_npu")
 
         if is_mla_preprocess_enabled() and not m.rotary_emb.is_neox_style:
             # Match the half-layout RoPE outputs used by MLA preprocessing.
@@ -595,18 +567,7 @@ def forward_dsa_core_npu(
         topk_indices=topk_indices,
     )
 
-    perm_x1 = (1, 0, 2)
-    if not _is_npu_arch35 and m.num_local_heads * m.kv_lora_rank >= 65536:
-        # A2/A3's fused input transpose requires heads * kv_lora_rank < 65536.
-        attn_output = attn_output.transpose(0, 1).contiguous()
-        perm_x1 = (0, 1, 2)
-    attn_bmm_output = torch_npu.npu_transpose_batchmatmul(
-        attn_output,
-        m.w_vc,
-        perm_x1=perm_x1,
-        perm_x2=(0, 1, 2),
-        perm_y=(1, 0, 2),
-    )
+    attn_bmm_output = batch_matmul_transpose(attn_output, m.w_vc, impl="torch_npu")
 
     attn_bmm_output = attn_bmm_output.reshape(-1, m.num_local_heads * m.v_head_dim)
 

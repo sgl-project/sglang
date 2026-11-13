@@ -280,13 +280,15 @@ if _is_cpu:
     )
 
 if _is_npu:
-    from sgl_kernel_npu.activation.fused_sigmoid_mul import (
+    from sgl_kernel_npu.operators.activation import (
         fused_sigmoid_mul as npu_fused_sigmoid_mul,
     )
 
     # NPU uses the Ascend-tuned implementation; other backends keep the
     # original Triton kernel.
-    from sgl_kernel_npu.fla.utils import fused_qkvzba_split_reshape_cat_contiguous
+    from sgl_kernel_npu.operators.attention.gdn import (
+        fused_qkvzba_split_reshape_cat_contiguous,
+    )
 
 
 def _linear_accepts_fp8_tuple(linear: nn.Module) -> bool:
@@ -332,9 +334,7 @@ if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_mrope import (
         triton_split_qkv_rmsnorm_mrope,
     )
-    from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import (
-        split_qkvgate_gemma_rmsnorm_rope,
-    )
+    from sgl_kernel_npu.operators.norm import split_qkvgate_gemma_rmsnorm_rope
 
 
 class Qwen3_5GatedDeltaNet(nn.Module):

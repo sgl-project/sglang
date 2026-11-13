@@ -745,7 +745,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
             # Fused prefill topk already appended the causal local block ([..., topk+1]); decode/verify still need the append.
             if topk_idx.shape[2] == self.topk_blocks + 1:
                 return topk_idx
-            from sgl_kernel_npu.indexer.flash_block_score_decode import (
+            from sgl_kernel_npu.operators.indexer import (
                 append_local_block_to_topk_idx,
             )
 
@@ -792,10 +792,10 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         NHD paged KV reshapes to [pages, block_size, H, D]; block table from
         req_to_token.
         """
-        from sgl_kernel_npu.attention.gqa_share_sparse_attention import (
+        from sgl_kernel_npu.operators.attention import (
             flash_decode_bnsd_with_gqa_share_sparse,
         )
-        from sgl_kernel_npu.indexer.flash_block_score_decode import (
+        from sgl_kernel_npu.operators.indexer import (
             flash_decode_bnsd_with_topk_idx,
         )
 
@@ -925,10 +925,10 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         ndt queries per request, each causal (j attends KV[0:prefix+j+1]). Flatten
         to per-query rows, reuse the decode kernels (device ops only, no .item()).
         """
-        from sgl_kernel_npu.attention.gqa_share_sparse_attention import (
+        from sgl_kernel_npu.operators.attention import (
             flash_decode_bnsd_with_gqa_share_sparse,
         )
-        from sgl_kernel_npu.indexer.flash_block_score_decode import (
+        from sgl_kernel_npu.operators.indexer import (
             flash_decode_bnsd_with_topk_idx,
         )
 
@@ -1206,7 +1206,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         Generalizes verify to variable per-request extend lengths: each token becomes
         a per-query row with a causal seq_len; decode kernels attend selected blocks.
         """
-        from sgl_kernel_npu.attention.gqa_share_sparse_attention import (
+        from sgl_kernel_npu.operators.attention import (
             flash_decode_bnsd_with_gqa_share_sparse,
         )
 
@@ -1251,10 +1251,10 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
         # scores every query-block x kv-block in one 2D dot. Fused topk +
         # causal-local append yields [..., topk+1]; the prepare helper skips
         # the duplicate append.
-        from sgl_kernel_npu.indexer.flash_block_score_prefill import (
+        from sgl_kernel_npu.operators.indexer import (
             flash_prefill_bnsd_indexer,
         )
-        from sgl_kernel_npu.indexer.flash_block_score_prefill import (
+        from sgl_kernel_npu.operators.indexer import (
             flash_prefill_bnsd_with_topk_idx as _flash_prefill_score_topk,
         )
 

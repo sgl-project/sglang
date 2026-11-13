@@ -93,9 +93,7 @@ class NPUSwigluDeepEPKernel(BaseActivation):
         self.limit = limit
         self._use_oai = alpha is not None and limit is not None
         if self._use_oai:
-            from sgl_kernel_npu.activation.swiglu_oai_quant import (
-                swiglu_oai_quant,
-            )
+            from sgl_kernel_npu.operators.activation import swiglu_oai_quant
 
             self._kernel = swiglu_oai_quant
         else:
@@ -164,7 +162,7 @@ class NPUSituMXFP8Quant(BaseActivation):
     """Ascend 950 AscendC grouped SiTU with valid-row MXFP8 quantization."""
 
     def __init__(self, *, beta: float = 4.0, linear_beta: float = 25.0):
-        from sgl_kernel_npu.activation.situ_mxfp8_quant import situ_mxfp8_quant
+        from sgl_kernel_npu.operators.activation import situ_mxfp8_quant
 
         self.situ_mxfp8_quant = situ_mxfp8_quant
         self.beta = float(beta)
@@ -259,7 +257,9 @@ class NPUSwigluMxfp8Quant(BaseActivation):
                 "swiglu_group_quant takes a per-expert count group list, got "
                 f"group_list_type={group_list_type}"
             )
-        out, scale, _ = torch.ops.npu.swiglu_group_quant(
+        from sgl_kernel_npu.operators.activation import swiglu_group_quant
+
+        out, scale, _ = swiglu_group_quant(
             x=hidden_states,
             group_index=group_list,
             quant_mode=2,  # MX: one e8m0 scale per 32-element block

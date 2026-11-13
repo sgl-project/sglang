@@ -28,8 +28,8 @@ _is_npu = is_npu()
 _is_xpu = is_xpu()
 # XPU ops only when no CUDA/ROCm backend is present, matching the imports below.
 _use_xpu_mamba_ops = _is_xpu and not (_is_cuda or _is_hip)
-transfer_state_per_layer_direct_pf_lf = None
-transfer_state_all_layer_direct_lf_pf = None
+transfer_kv_per_layer_direct_pf_lf = None
+transfer_kv_all_layer_direct_lf_pf = None
 transfer_mamba_state = None
 if _is_cuda or _is_hip:
     from sgl_kernel.kvcacheio import (
@@ -49,16 +49,16 @@ elif _is_xpu:
         transfer_kv_per_layer_direct_pf_lf,
     )
 if _is_npu:
-    from sgl_kernel_npu.kvcacheio import TransferDirection
+    from sgl_kernel_npu.operators.data_move import TransferDirection
 
     try:
-        from sgl_kernel_npu.kvcacheio import transfer_mamba_state
+        from sgl_kernel_npu.operators.data_move import transfer_mamba_state
     except ImportError:
         transfer_mamba_state = None
     try:
-        from sgl_kernel_npu.kvcacheio import (
-            transfer_state_all_layer_direct_lf_pf,
-            transfer_state_per_layer_direct_pf_lf,
+        from sgl_kernel_npu.operators.data_move import (
+            transfer_kv_all_layer_direct_lf_pf,
+            transfer_kv_per_layer_direct_pf_lf,
         )
     except ImportError:
         pass
@@ -250,8 +250,8 @@ class MambaPoolHost(HostKVCache):
             return
 
         required_ops = (
-            transfer_state_per_layer_direct_pf_lf,
-            transfer_state_all_layer_direct_lf_pf,
+            transfer_kv_per_layer_direct_pf_lf,
+            transfer_kv_all_layer_direct_lf_pf,
         )
         required_torch_ops = (
             "transfer_state_per_layer_direct_pf_lf",
@@ -536,7 +536,7 @@ class MambaPoolHost(HostKVCache):
             )
         elif io_backend == "kernel_ascend":
             if _npu_hicache_mamba_io_mode() == "async":
-                transfer_state_per_layer_direct_pf_lf(
+                transfer_kv_per_layer_direct_pf_lf(
                     src=src,
                     dst=dst,
                     src_indices=src_indices,
@@ -679,7 +679,7 @@ class MambaPoolHost(HostKVCache):
                     values = src.index_select(0, device_indices).to(device=dst.device)
                     dst[:, layer_id, 0].index_copy_(0, host_indices, values)
             elif _npu_hicache_mamba_io_mode() == "async":
-                transfer_state_all_layer_direct_lf_pf(
+                transfer_kv_all_layer_direct_lf_pf(
                     device_states=[src_layers],
                     host_states=[dst],
                     device_indices=src_indices,
