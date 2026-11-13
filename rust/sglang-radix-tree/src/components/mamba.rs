@@ -105,6 +105,7 @@ impl MambaComponent {
         }
         let tick = tree_core.arena.get_and_bump_access_counter();
         tree_core.arena.node_mut(node_id).last_access_counter = tick;
+        tree_core.requeue_accessed_device_leaf_(node_id);
         result.mamba_exist = false;
         self.emit_excess_path_states_eviction_(tree_core.arena.node(node_id).id, cache_actions);
     }
@@ -239,12 +240,14 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
             tree_core.set_component_device_value_(node_id, MAMBA, mamba_value.shallow_clone());
             let tick = tree_core.arena.get_and_bump_access_counter();
             tree_core.arena.node_mut(node_id).last_access_counter = tick;
+            tree_core.requeue_accessed_device_leaf_(node_id);
             self.emit_excess_path_states_eviction_(tree_core.arena.node(node_id).id, cache_actions);
             return;
         }
         tree_core.device_lru_list_mut(MAMBA).reset_node_mru(node_id);
         let tick = tree_core.arena.get_and_bump_access_counter();
         tree_core.arena.node_mut(node_id).last_access_counter = tick;
+        tree_core.requeue_accessed_device_leaf_(node_id);
         result.mamba_exist = true;
     }
 

@@ -122,6 +122,35 @@ fn evict_walk_pops_leaves_lowest_priority_first() {
 }
 
 #[test]
+fn evict_walk_sees_an_mru_access_made_after_the_queue_was_built() {
+    let mut tc = UnifiedTreeCore::new(
+        CacheInitParams {
+            eviction_policy: "mru".to_string(),
+            ..Default::default()
+        },
+        vec![FULL],
+    );
+    for (key, value) in [(vec![1], [10]), (vec![2], [20]), (vec![3], [30])] {
+        insert(&mut tc, &key, &value);
+    }
+    let first = tc.match_prefix(&match_params(&vec![1])).best_match_node_id;
+    tc.match_prefix(&match_params(&vec![2]));
+    tc.match_prefix(&match_params(&vec![3]));
+    // Build the persistent queue while [3] is the most recently used leaf.
+    tc.evict_device_start(FULL, /* request_cnt = */ 100);
+    tc.evict_device_end(FULL);
+    // The access lowers [1]'s MRU priority below every queued key.
+    tc.match_prefix(&match_params(&vec![1]));
+    tc.sanity_check(&[], &[]);
+    let (mut tr, mut df, mut hf) = (tracker(), frees(), frees());
+    tc.evict_device_start(FULL, /* request_cnt = */ 100);
+    let (node, step) = tc.evict_device_next_node(FULL, &tr);
+    accumulate_step(step, &mut tr, &mut df, &mut hf);
+    assert_eq!(node, Some(first));
+    tc.evict_device_end(FULL);
+}
+
+#[test]
 fn evict_walk_stops_at_the_token_budget() {
     let mut tc = core();
     let (_a, b, _c) = evict_walk_setup(&mut tc);

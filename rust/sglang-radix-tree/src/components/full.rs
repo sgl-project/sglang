@@ -143,15 +143,11 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
 
     fn evict_device_start(&self, tree_core: &mut UnifiedTreeCore<K>, request_cnt: usize) {
         tree_core.set_evict_device_start(FULL, request_cnt);
-        tree_core.full_evict_device_heap.clear();
         let arena = &tree_core.arena;
         let strategy = &tree_core.eviction_strategy;
-        tree_core.full_evict_device_heap.extend(
-            tree_core
-                .evictable_device_leaves
-                .iter()
-                .map(|id| Reverse((strategy.get_priority(arena.node(id)), id))),
-        );
+        tree_core
+            .evictable_device_leaves
+            .begin_walk(|id| strategy.get_priority(arena.node(id)));
     }
 
     fn evict_device_next_node(
@@ -177,8 +173,8 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
                 .eviction_strategy
                 .get_priority(tree_core.arena.node(last_node_parent));
             tree_core
-                .full_evict_device_heap
-                .push(Reverse((key, last_node_parent)));
+                .evictable_device_leaves
+                .push_walk_parent(key, last_node_parent);
         }
         tree_core.component_state_mut(FULL).evict_device_cursor = None;
         // The budget only advances between calls (the driver's evictions fill
@@ -186,20 +182,26 @@ impl<K: ChildKeyType> TreeComponent<K> for FullComponent {
         if tracker[&ct] >= tree_core.component_state(FULL).evict_device_request_cnt {
             return None;
         }
-        while let Some(Reverse((_, x))) = tree_core.full_evict_device_heap.pop() {
+        loop {
+            let arena = &tree_core.arena;
+            let strategy = &tree_core.eviction_strategy;
+            let x = tree_core
+                .evictable_device_leaves
+                .pop_next(|id| strategy.get_priority(arena.node(id)))?;
             if !tree_core.is_device_walk_candidate_(x) {
+                // A queued write-back victim stays a D-leaf; `pop_next` already
+                // re-admitted it, so it is offered again next walk.
                 continue;
             }
             let last_node_parent = tree_core.arena.node(x).try_parent();
             tree_core.component_state_mut(FULL).evict_device_cursor = last_node_parent;
             return Some(x);
         }
-        None
     }
 
     fn evict_device_end(&self, tree_core: &mut UnifiedTreeCore<K>) {
         tree_core.set_evict_device_end(FULL);
-        tree_core.full_evict_device_heap.clear();
+        tree_core.evictable_device_leaves.end_walk();
     }
 
     fn reclaim_coexisting_host_values(
