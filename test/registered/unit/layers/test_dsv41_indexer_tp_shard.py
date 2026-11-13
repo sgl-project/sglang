@@ -40,6 +40,9 @@ class TestIndexerRowShardDispatch(CustomTestCase):
         sink = IndexerInputSink()
         backend.full_topk_indexer = backend.prefill_candidates = sink
         backend.mega_attn = True
+        backend.token_to_kv_pool = SimpleNamespace(
+            get_extra_key_layout=lambda _: SimpleNamespace(is_packed_main_kv=False)
+        )
         out = torch.full((rows, 4), -1, dtype=torch.int32)
         backend.forward_metadata = SimpleNamespace(
             core_metadata=SimpleNamespace(
