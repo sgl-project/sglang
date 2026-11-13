@@ -2419,9 +2419,18 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 " quantization with the selected MoE backend. Please use "
                 "Blackwell and above, or use moe_runner_backend=marlin on SM80+."
             )
+        # Resolve ``auto`` once, here, with the same rule create_moe_runner
+        # applies. create_weights and process_weights_after_loading read the
+        # flags below, while apply dispatches on the backend cached by
+        # create_moe_runner; deriving all of them from one resolution keeps
+        # the weight layout and the kernel path in agreement. With ``auto``
+        # on Blackwell the flags used to say "not TRT-LLM" while the runner
+        # resolved to TRT-LLM, so the layer never got g1_scale_c and the first
+        # forward failed with AttributeError.
+        self._moe_runner_backend = self._resolve_moe_runner_backend(moe_runner_backend)
         self.enable_flashinfer_trtllm_moe = (
-            get_moe_runner_backend().is_flashinfer_trtllm()
-            or get_moe_runner_backend().is_flashinfer_trtllm_routed()
+            self._moe_runner_backend.is_flashinfer_trtllm()
+            or self._moe_runner_backend.is_flashinfer_trtllm_routed()
         )
         # MegaMoE consumes canonical W13 directly, regardless of the nominal
         # runner.
@@ -2429,6 +2438,21 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             self.enable_flashinfer_trtllm_moe and not get_moe_a2a_backend().is_megamoe()
         )
         self._cache_permute_indices = {}
+
+    @staticmethod
+    def _resolve_moe_runner_backend(
+        moe_runner_backend: MoeRunnerBackend,
+    ) -> MoeRunnerBackend:
+        """The backend ``auto`` stands for on this device.
+
+        TRT-LLM is the most performant and tested FP4 MoE backend, so it is the
+        default on Blackwell; Hopper and Ampere fall back to Marlin.
+        """
+        if not moe_runner_backend.is_auto():
+            return moe_runner_backend
+        if is_cuda() and (8, 0) <= get_device_capability() < (10, 0):
+            return MoeRunnerBackend.MARLIN
+        return MoeRunnerBackend.FLASHINFER_TRTLLM
 
     @property
     def enable_flashinfer_cutlass_moe(self) -> bool:
@@ -3147,16 +3171,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
-        moe_runner_backend = get_moe_runner_backend()
-
-        if moe_runner_backend.is_auto():
-            if is_cuda() and (8, 0) <= get_device_capability() < (10, 0):
-                moe_runner_backend = MoeRunnerBackend.MARLIN
-            else:
-                # TRTLLM is currently the most performant and tested FP4 MoE
-                # backend, so use it as the default.
-                moe_runner_backend = MoeRunnerBackend.FLASHINFER_TRTLLM
-
+        # Same resolution as __init__, so the runner matches the weight layout
+        # the flags there selected.
+        moe_runner_backend = self._resolve_moe_runner_backend(get_moe_runner_backend())
         self._moe_runner_backend = moe_runner_backend
 
         if get_moe_a2a_backend().is_megamoe():
