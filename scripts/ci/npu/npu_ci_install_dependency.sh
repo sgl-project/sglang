@@ -16,20 +16,6 @@ export LD_LIBRARY_PATH="${ASCEND_HOME_PATH}/lib64:${ASCEND_HOME_PATH}/lib:${ASCE
 
 GITHUB_PROXY_URL="${GITHUB_PROXY_URL:-}"
 
-source_env() {
-    if [ -f "$1" ]; then
-        # Vendor set_env scripts (e.g. opp/vendors/*/bin/set_env.bash) append to
-        # variables like ASCEND_CUSTOM_OPP_PATH via ${VAR} without a default, which
-        # aborts under `set -u`. Relax nounset only while sourcing them.
-        set +u
-        # shellcheck disable=SC1090
-        source "$1"
-        set -u
-    else
-        echo "[skip] set_env not found: $1"
-    fi
-}
-
 apt update -y && apt install -y \
     unzip \
     build-essential \
@@ -108,7 +94,4 @@ rm -rf sgl-kernel-npu
 
 rm -f python/pyproject.toml
 mv python/pyproject_npu.toml python/pyproject.toml
-${UV_PIP_INSTALL} -v -e "python[dev_npu]" "pyarrow==${PYARROW_VERSION}"
-
-rm -rf python/pyproject.toml && mv python/pyproject_npu.toml python/pyproject.toml
 ${UV_PIP_INSTALL} -v -e "python[dev_npu]" "pyarrow==${PYARROW_VERSION}"
