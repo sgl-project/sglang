@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 
 from sglang.srt.managers.io_struct import AbortReq
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.request_list import move
 from sglang.srt.managers.utils import make_abort_req
 from sglang.srt.utils.weight_versions import (
     WeightVersionEvent,
@@ -298,9 +299,10 @@ class TestSchedulerRecordWeightVersionChange(CustomTestCase):
     def _scheduler(self, version, running=(), waiting=(), chunked=None):
         scheduler = Scheduler.__new__(Scheduler)
         empty_request_lists(scheduler)
-        scheduler.running_reqs.join(running)
+        move(running, scheduler.running_reqs)
         scheduler.waiting_queue = list(waiting)
-        scheduler.chunked_req = chunked
+        if chunked is not None:
+            move([chunked], scheduler.chunked_reqs)
         scheduler.serving = _ServingStub(version)
         for name, value in (
             ("get_serving", scheduler.serving),
@@ -322,8 +324,8 @@ class TestSchedulerRecordWeightVersionChange(CustomTestCase):
         scheduler = self._scheduler(
             "v1", [running_req], [waiting_req], chunked=chunked_req
         )
-        scheduler.grammar_manager.grammar_queue.join([grammar_req])
-        scheduler.disagg_prefill_transfer_queue.join([sending_req])
+        move([grammar_req], scheduler.grammar_manager.grammar_queue)
+        move([sending_req], scheduler.disagg_prefill_transfer_queue)
 
         Scheduler.record_weight_version_change(scheduler, new_version="v2")
 
