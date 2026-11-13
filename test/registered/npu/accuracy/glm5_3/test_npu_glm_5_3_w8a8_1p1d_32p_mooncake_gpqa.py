@@ -3,8 +3,8 @@ import unittest
 from sglang.test.ascend.e2e.test_npu_accuracy_utils import (
     TestNpuAccuracyMultiNodePdSepTestCaseBase,
 )
-from sglang.test.ascend.e2e.test_npu_multi_node_utils import (
-    NIC_NAME,
+from sglang.test.ascend.e2e.test_npu_multi_node_utils import NIC_NAME
+from sglang.test.ascend.test_ascend_utils import (
     get_mooncake_ld_library_path,
     write_memfabric_tent_conf,
 )
