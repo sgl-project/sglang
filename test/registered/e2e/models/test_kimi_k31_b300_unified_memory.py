@@ -13,7 +13,7 @@ from sglang.test.test_utils import (
     terminate_and_kill_process_tree,
 )
 
-register_cuda_ci(est_time=900, stage="nightly", runner_config="8-gpu-b300")
+register_cuda_ci(est_time=900, stage="weekly", runner_config="8-gpu-b300")
 
 MODEL_PATH = "moonshotai/Kimi-K3.1-Pro"
 MODEL_LOADER_EXTRA_CONFIG = '{"enable_multithread_load": true, "num_threads": 12}'
