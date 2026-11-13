@@ -147,7 +147,7 @@ struct CliArgs {
 
     // ==================== Routing Policy ====================
     /// Load balancing policy to use
-    #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "prefix_hash", "manual"], help_heading = "Routing Policy")]
+    #[arg(long, default_value = "cache_aware", value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "bucket", "prefix_hash", "manual"], help_heading = "Routing Policy")]
     policy: String,
 
     /// Cache threshold (0.0-1.0) for cache-aware routing
@@ -161,6 +161,10 @@ struct CliArgs {
     /// Relative threshold for load balancing trigger
     #[arg(long, default_value_t = 1.5, help_heading = "Routing Policy")]
     balance_rel_threshold: f32,
+
+    /// Interval in seconds between bucket boundary adjustments (bucket policy)
+    #[arg(long, default_value_t = 5, help_heading = "Routing Policy")]
+    bucket_adjust_interval_secs: usize,
 
     /// Interval in seconds between cache eviction operations
     #[arg(long, default_value_t = 120, help_heading = "Routing Policy")]
@@ -204,11 +208,11 @@ struct CliArgs {
     decode: Vec<String>,
 
     /// Specific policy for prefill nodes in PD mode
-    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "prefix_hash", "manual"], help_heading = "PD Disaggregation")]
+    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "bucket", "prefix_hash", "manual"], help_heading = "PD Disaggregation")]
     prefill_policy: Option<String>,
 
     /// Specific policy for decode nodes in PD mode
-    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "prefix_hash", "manual"], help_heading = "PD Disaggregation")]
+    #[arg(long, value_parser = ["random", "round_robin", "cache_aware", "power_of_two", "bucket", "prefix_hash", "manual"], help_heading = "PD Disaggregation")]
     decode_policy: Option<String>,
 
     /// Max requests per prefill worker in flight to decode; the rest pick their decode worker when sent
@@ -774,6 +778,11 @@ impl CliArgs {
             "power_of_two" => PolicyConfig::PowerOfTwo {
                 load_check_interval_secs: 5,
             },
+            "bucket" => PolicyConfig::Bucket {
+                balance_abs_threshold: self.balance_abs_threshold,
+                balance_rel_threshold: self.balance_rel_threshold,
+                bucket_adjust_interval_secs: self.bucket_adjust_interval_secs,
+            },
             "prefix_hash" => PolicyConfig::PrefixHash {
                 prefix_token_count: self.prefix_token_count,
                 load_factor: self.prefix_hash_load_factor,
@@ -1282,4 +1291,29 @@ Provide --worker-urls or PD flags as usual.",
         shutdown_otel();
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_prefill_policy_bucket_takes_the_cli_interval() {
+        let args = CliArgs::try_parse_from([
+            "smg",
+            "--pd-disaggregation",
+            "--prefill-policy",
+            "bucket",
+            "--bucket-adjust-interval-secs",
+            "7",
+        ])
+        .unwrap();
+        match args.parse_policy(args.prefill_policy.as_deref().unwrap()) {
+            PolicyConfig::Bucket {
+                bucket_adjust_interval_secs,
+                ..
+            } => assert_eq!(bucket_adjust_interval_secs, 7),
+            other => panic!("expected bucket, got {other:?}"),
+        }
+    }
 }
