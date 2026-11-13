@@ -713,7 +713,9 @@ class TestSideStreamCommitWritesTheForwardSlots(CustomTestCase):
         # The verify forward's metadata: a per-forward buffer it refills.
         forward_slots = torch.zeros(rows, dtype=torch.int32, device=device)
         linear.forward_metadata = SimpleNamespace(
-            mamba_cache_indices=forward_slots, mamba_track_indices=None
+            mamba_cache_indices=forward_slots,
+            mamba_track_indices=None,
+            replayssm_ring_indices=None,
         )
         graphs = EaglePostVerifyGraphs(
             target_worker=SimpleNamespace(
