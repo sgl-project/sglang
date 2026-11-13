@@ -103,7 +103,8 @@ class Step(msgspec.Struct, frozen=True):
     mode is one of:
       "decode"        – autoregressive single-token decode; runs in a CUDA graph.
       "target_verify" – speculative-decoding target verify; runs in a CUDA graph.
-      "prefill"       – context prefill; runs eagerly (never captured in a graph).
+      "prefill"       – context prefill; runs eagerly. With prefill_graph its
+                        transformer body may be captured (SupportsPrefillBody).
     """
 
     mode: str
@@ -454,6 +455,22 @@ GRAPH_VARIANT_RUNNERS = ("target_verify", "draft_loop", "draft_extend")
 
 
 @runtime_checkable
+class SupportsPrefillBody(Protocol):
+    """A build running a prefill's transformer body (the layer module's forward),
+    which breakable prefill graphs capture per token bucket. plan_body is host-only
+    like plan; forward_body takes and returns what the layer module's forward does.
+    """
+
+    def plan_body(
+        self, input_ids: Any, forward_batch: Any, *args: Any, **kwargs: Any
+    ) -> Optional[Step]: ...
+
+    def forward_body(
+        self, step: Step, original: Callable, *args: Any, **kwargs: Any
+    ) -> Any: ...
+
+
+@runtime_checkable
 class SupportsDraftAux(Protocol):
     """A DFlash draft spec that writes the target's context into the draft KV cache.
 
@@ -613,6 +630,8 @@ class MegakernelSpec(msgspec.Struct, frozen=True):
     prepare: Optional[Callable[[BuiltMegakernel, PreparationView], None]] = None
     # A key of binding.BINDING_KINDS; empty picks the binding by architecture.
     binding: str = ""
+    # The build offers SupportsPrefillBody.
+    prefill_graph: bool = False
 
 
 # HF architecture -> the "module:attribute" path of its spec

@@ -499,6 +499,18 @@ class TestEagleBinding(CustomTestCase):
             view = binding.prefill_view()
         self.assertIs(view.state.temporal, state.temporal)
         self.assertIs(view.state_indices, meta.mamba_cache_indices)
+        self.assertEqual((view.is_graph, view.prefill_graph_metadata), (False, None))
+        linear.prefill_graph_metadata = SimpleNamespace()  # a graph bucket's tables
+        with patch.object(eb, "get_attn_backend", return_value=backend):
+            view = binding.prefill_view()
+        self.assertIs(view.prefill_graph_metadata, linear.prefill_graph_metadata)
+        runner = SimpleNamespace(
+            attn_backend=backend,
+            req_to_token_pool=SimpleNamespace(req_to_token=torch.zeros(9, 4)),
+        )
+        prepared = binding.preparation_view(runner)
+        self.assertEqual(prepared.num_request_rows, 9)
+        self.assertIs(prepared.mamba, _view(binding, backend).mamba)
 
     def test_existing_forward_wrapper_selects_the_prefill_data_view(self):
         views = SimpleNamespace(
@@ -666,6 +678,7 @@ class TestEagleEntries(CustomTestCase):
                     max_rows=4,
                     numerics=SimpleNamespace(kind=SimpleNamespace(value="exact")),
                     binding="",
+                    prefill_graph=False,
                 )
                 hooks = []
                 refused = (

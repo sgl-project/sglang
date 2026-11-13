@@ -37,6 +37,7 @@ from sglang.kernels.plugin_kernels.nvidia.spec import (
     PostVerifyStrategy,
     SpeculativeRuntimeHooks,
     Step,
+    SupportsPrefillBody,
     SupportsStateSlotReset,
     find_spec,
     registered_architectures,
@@ -1316,6 +1317,8 @@ def install_megakernel(
     )
     dispatch = _Dispatch(built=built, original=model.forward, binding=binding)
     model.forward = dispatch.wrapped()
+    if spec.prefill_graph:
+        _install_prefill_body(model, spec=spec, dispatch=dispatch)
     if _decode_graphs_enabled():
         capture_tail_hooks.append(_CaptureCheck(spec=spec, dispatch=dispatch))
 
@@ -1632,6 +1635,42 @@ class _Dispatch:
             )
 
         return forward
+
+    def wrapped_body(self, original: Callable) -> Callable:
+        # The prefill graph runner inspects the layer module's forward signature.
+        @functools.wraps(original)
+        def forward(input_ids, positions, forward_batch, *args, **kwargs):
+            step = self.built.plan_body(input_ids, forward_batch, *args, **kwargs)
+            if step is None:
+                return original(input_ids, positions, forward_batch, *args, **kwargs)
+            return self.built.forward_body(
+                msgspec.structs.replace(step, view=self.binding.prefill_view()),
+                original,
+                input_ids,
+                positions,
+                forward_batch,
+                *args,
+                **kwargs,
+            )
+
+        return forward
+
+
+def _install_prefill_body(
+    model: torch.nn.Module, *, spec: MegakernelSpec, dispatch: _Dispatch
+) -> None:
+    """Route the layer module's forward, as the prefill graph runner resolves it."""
+    from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
+        _resolve_transformer_layer_model,
+        set_external_prefill_body,
+    )
+
+    if not isinstance(dispatch.built, SupportsPrefillBody):
+        _refuse([f"{spec.name} sets prefill_graph without SupportsPrefillBody"])
+    layer_model = _resolve_transformer_layer_model(model)
+    layer_model.forward = dispatch.wrapped_body(layer_model.forward)
+    set_external_prefill_body(model, dispatch.built)
+    logger.info("NVIDIA megakernel: %s plans the prefill body", spec.name)
 
 
 class _CaptureCheck:
