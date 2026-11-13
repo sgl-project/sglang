@@ -29,6 +29,7 @@ from sglang.test.test_utils import (
     CustomTestCase,
     is_rust_server_built,
     popen_launch_server,
+    terminate_and_kill_process_tree,
 )
 
 register_cuda_ci(est_time=353, stage="base-b", runner_config="1-gpu-small")
@@ -36,6 +37,8 @@ register_amd_ci(est_time=280, suite="stage-b-test-1-gpu-small-amd")
 
 
 class TestOpenAIServer(CustomTestCase, AnthropicMessagesMixin):
+    process = None
+
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
@@ -48,11 +51,13 @@ class TestOpenAIServer(CustomTestCase, AnthropicMessagesMixin):
             api_key=cls.api_key,
         )
         cls.base_url += "/v1"
+        cls.score_url = cls.base_url + "/score"
         cls.tokenizer = get_tokenizer(DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
 
     @classmethod
     def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
+        if cls.process is not None:
+            terminate_and_kill_process_tree(cls.process)
 
     def test_ignore_eos(self):
         """ignore_eos=True must keep generating past EOS up to max_tokens."""
@@ -758,7 +763,7 @@ class TestOpenAIServerv1Responses(CustomTestCase):
             final_usage_ok,
         )
 
-    def run_chat_completion_stream(self, logprobs=None, parallel_sample_num=1):
+    def run_response_chat_completion_stream(self, logprobs=None, parallel_sample_num=1):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
         generator = client.chat.completions.create(
             model=self.model,
@@ -836,7 +841,7 @@ class TestOpenAIServerv1Responses(CustomTestCase):
         assert saw_completed
         assert final_usage_ok or True  # final_usage's stats are not done for now
 
-    def test_regex(self):
+    def test_response_regex(self):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
 
         regex = (
@@ -885,7 +890,7 @@ class TestOpenAIServerv1Responses(CustomTestCase):
         self.assertIn("type", body["error"])
         self.assertIn("code", body["error"])
 
-    def test_penalty(self):
+    def test_response_penalty(self):
         url = f"{self.base_url}/responses"
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -909,7 +914,7 @@ class TestOpenAIServerv1Responses(CustomTestCase):
         self.assertIn("output_tokens", body["usage"])
         self.assertIn("total_tokens", body["usage"])
 
-    def test_response_prefill(self):
+    def test_response_api_prefill(self):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
 
         response = client.chat.completions.create(
@@ -941,7 +946,7 @@ The SmartHome Mini is a compact smart home assistant available in black or white
             .startswith('"name": "SmartHome Mini",')
         )
 
-    def test_model_list(self):
+    def test_response_model_list(self):
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
         models = list(client.models.list())
         assert len(models) == 1
@@ -1121,6 +1126,7 @@ class TestOpenAIV1Score(CustomTestCase):
             api_key=cls.api_key,
         )
         cls.base_url += "/v1/score"
+        cls.score_url = cls.base_url
         cls.tokenizer = get_tokenizer(DEFAULT_SMALL_MODEL_NAME_FOR_TEST)
 
     @classmethod
@@ -1131,7 +1137,7 @@ class TestOpenAIV1Score(CustomTestCase):
         self, query, items, label_token_ids, apply_softmax=False, item_first=False
     ):
         response = requests.post(
-            self.base_url,
+            self.score_url,
             headers={
                 "Authorization": f"Bearer {self.api_key}",
                 "Content-Type": "application/json",
@@ -1275,7 +1281,7 @@ class TestOpenAIV1Score(CustomTestCase):
 
         # Test with invalid token ID
         response = requests.post(
-            self.base_url,
+            self.score_url,
             headers={
                 "Authorization": f"Bearer {self.api_key}",
                 "Content-Type": "application/json",
