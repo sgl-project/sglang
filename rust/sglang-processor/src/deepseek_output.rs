@@ -273,17 +273,48 @@ impl DeepSeekOutputParser {
     }
 
     fn release_pending_ids(&mut self) -> Vec<u32> {
-        if self.stop_hold_chars == 0 {
-            return std::mem::take(&mut self.pending_ids);
-        }
         let mut held = self.pending_ids.len();
         while held > 0
+            && self.stop_hold_chars > 0
             && self.stop_hold_chars > self.decode(&self.pending_ids[held..]).chars().count()
         {
             held -= 1;
         }
+        let held = self.char_boundary(&self.pending_ids, held);
         let pending = self.pending_ids.split_off(held);
         std::mem::replace(&mut self.pending_ids, pending)
+    }
+
+    fn char_boundary(&self, ids: &[u32], end: usize) -> usize {
+        (1..=end)
+            .rev()
+            .find(|&cut| {
+                !self
+                    .decode(&ids[cut.saturating_sub(MAX_UTF8_BYTES)..cut])
+                    .ends_with('\u{fffd}')
+            })
+            .unwrap_or(0)
+    }
+
+    fn without_split_char(&self, mut ids: Vec<u32>) -> Vec<u32> {
+        let cut = self.char_boundary(&ids, ids.len());
+        if cut == ids.len() {
+            return ids;
+        }
+        let text = self.decode(&ids[cut..]);
+        match self
+            .tokenizer
+            .encode_fast(text.trim_end_matches('\u{fffd}'), false)
+        {
+            Ok(encoding) => {
+                ids.truncate(cut);
+                ids.extend_from_slice(encoding.get_ids());
+            }
+            Err(error) => {
+                tracing::warn!(%error, "deepseek-recipe output: split character re-encode failed")
+            }
+        }
+        ids
     }
 
     /// The last engine chunk: its ids, less the matched stop, and its reason.
@@ -306,6 +337,7 @@ impl DeepSeekOutputParser {
             }
             _ => {}
         }
+        let ids = self.without_split_char(ids);
         let mut chunks = Vec::new();
         if !ids.is_empty() {
             chunks = self.push(InferenceChunk::Tokens {
