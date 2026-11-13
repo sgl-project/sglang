@@ -265,6 +265,7 @@ def _inc_lock_ref_result_from_binding(result, ids: _CoreIds) -> IncLockRefResult
         component_host_lock_uuids={
             ids.tree(ct): uuid for ct, uuid in result.component_host_lock_uuids.items()
         },
+        cache_actions=_cache_actions_from_tagged(result.cache_actions),
     )
 
 
@@ -1005,6 +1006,9 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
 
     def set_host_memory_buffer_only(self) -> None:
         self._binding.set_host_memory_buffer_only()
+
+    def set_buffer_backup_pending(self, node_id: NodeId, pending: bool) -> None:
+        self._binding.set_buffer_backup_pending(node_id, pending)
 
     @property
     def is_host_memory_buffer_only(self) -> bool:

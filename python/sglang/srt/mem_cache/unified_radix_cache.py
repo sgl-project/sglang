@@ -1435,7 +1435,12 @@ class UnifiedRadixCache(BasePrefixCache):
     ) -> IncLockRefResult:
         if self.disable:
             return IncLockRefResult()
-        return self.tree_core.inc_lock_ref(node_id, skip_lock_components)
+        result = self.tree_core.inc_lock_ref(node_id, skip_lock_components)
+        # A window-only lock walk can split a live node; the core returns the
+        # split's action instead of applying it. Apply before callers use the
+        # receipt, matching the Python component's immediate apply.
+        self._apply_cache_actions(result.cache_actions)
+        return result
 
     def dec_lock_ref(
         self,

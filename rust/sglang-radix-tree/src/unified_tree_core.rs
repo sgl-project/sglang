@@ -81,6 +81,9 @@ pub struct IncLockRefResult {
     /// A recorded None means the segment reaches the root; absence means no receipt.
     pub component_lock_uuids: HashMap<u8, Option<i64>>,
     pub component_host_lock_uuids: HashMap<u8, Option<i64>>,
+    /// Actions produced by a lock-walk split; the cache applies them after the
+    /// receipt is returned, matching the Python component's immediate apply.
+    pub cache_actions: CacheActions,
 }
 
 impl IncLockRefResult {
@@ -4434,6 +4437,18 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     pub fn node_backuped(&self, node_id: NodeId) -> Result<bool, NodeAccessError> {
         let node_id = self.arena.resolve(node_id)?;
         Ok(self.arena.node(node_id).backuped())
+    }
+
+    /// Mark or clear the buffer-mode backup-pending flag the SWA window lock
+    /// consults before splitting the node a lock walk would pin. Mirrors the
+    /// `buffer_backup_pending` term of Python `_maybe_split_for_window_lock`;
+    /// the set itself lives in the Python pipeline, which pushes it here. An
+    /// unknown id is ignored: a freed node already dropped the flag with its
+    /// slot, and slot reuse mints a fresh id.
+    pub fn set_buffer_backup_pending(&mut self, node_id: NodeId, pending: bool) {
+        if let Ok(idx) = self.arena.resolve(node_id) {
+            self.arena.node_mut(idx).buffer_backup_pending = pending;
+        }
     }
 
     /// Whether the node is a (default or named) root.
