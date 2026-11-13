@@ -4894,6 +4894,30 @@ class TestKvCacheShardingCompatibility(CustomTestCase):
                 with self.assertRaisesRegex(ValueError, error):
                     validate_kv_shard_attention_backend(args, view)
 
+    def test_xpu_admits_only_intel_xpu_plain_tp_mla(self):
+        # (prefill backend, is_mla, attn_cp_size, expected error or None)
+        cases = (
+            ("intel_xpu", True, 1, None),
+            ("intel_xpu", False, 1, "supports MLA models only"),
+            ("intel_xpu", True, 2, "supports plain-TP MLA only"),
+            ("fa3", True, 1, "requires the intel_xpu prefill"),
+        )
+        for backend, is_mla, attn_cp_size, error in cases:
+            with self.subTest(backend=backend, is_mla=is_mla, cp=attn_cp_size):
+                args = self._args(attention_backend=backend, device="xpu")
+                args._model_config.attention_arch = (
+                    AttentionArch.MLA if is_mla else AttentionArch.MHA
+                )
+                view = SimpleNamespace(
+                    attn_cp_size=attn_cp_size,
+                    disable_chunked_prefix_cache=False,
+                )
+                if error is None:
+                    validate_kv_shard_attention_backend(args, view)
+                else:
+                    with self.assertRaisesRegex(ValueError, error):
+                        validate_kv_shard_attention_backend(args, view)
+
     def test_hisparse_allocator_is_rejected(self):
         args = self._args(enable_hisparse=True)
 

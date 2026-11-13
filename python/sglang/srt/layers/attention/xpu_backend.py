@@ -155,6 +155,9 @@ class XPUAttentionBackend(AttentionBackend):
     - XPU Graph support, see https://github.com/pytorch/pytorch/issues/162143
     """
 
+    # Set in __init__; the class default covers instances built without it.
+    _kv_shard_pool = None
+
     def __init__(
         self,
         model_runner: ModelRunner,
@@ -189,6 +192,15 @@ class XPUAttentionBackend(AttentionBackend):
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.runner_ids = model_runner.runner_ids
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
+        # Imported only when sharding is on: the pool module pulls in the
+        # CUDA gather stack, which the plain XPU path must not depend on.
+        self._kv_shard_pool = None
+        if get_parallel().enable_kv_cache_sharding:
+            from sglang.srt.layers.attention.kv_shard_hooks import get_kv_shard_pool
+
+            self._kv_shard_pool = get_kv_shard_pool(self.token_to_kv_pool)
+        # begin_shard_extend plans the prefix gather from host-side lengths.
+        self.needs_cpu_seq_lens = self._kv_shard_pool is not None
         self.kv_cache_dtype = model_runner.kv_cache_dtype
         self.kv_cache_dtype_str = model_runner.kv_cache_dtype_str
         self.page_size = model_runner.page_size
@@ -727,6 +739,20 @@ class XPUAttentionBackend(AttentionBackend):
                 self.workspace_prefill = torch.empty(
                     workspace_prefill_size, device=self.device, dtype=torch.uint8
                 )
+
+        # Sharded extend: attention reads the gathered scratch, not the pool.
+        # Must run before the `// page_size` reduction below, as in FA3.
+        if self._kv_shard_pool is not None:
+            from sglang.srt.layers.attention.kv_shard_hooks import (
+                prepare_kv_shard_forward,
+            )
+
+            if prepare_kv_shard_forward(
+                self._kv_shard_pool, self.req_to_token, forward_batch
+            ):
+                metadata.page_table = self._kv_shard_pool.translate_loc_to_scratch(
+                    metadata.page_table
+                ).to(torch.int32)
 
         # Convert the page table to a strided format which is needed by FA3 API.
         # Encoder-decoder page_table holds token-slot indices for the varlen

@@ -129,7 +129,7 @@ from sglang.test.mem_cache_utils import finish_req
 from sglang.test.test_utils import CustomTestCase, enter_scope
 from sglang.test.tree_slots import tree_slots_of
 
-register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_cpu_ci(est_time=25, suite="base-a-test-cpu")
 
 N = 4  # shard size
 PS = 16  # physical page size
@@ -2411,6 +2411,81 @@ class TestGatherWaitsForLayerLoad(CustomTestCase):
         )
         self.assertIs(PageInterleaveKVPoolMixin._acquire_slot_for_read(pool, 3), slot)
         self.assertEqual(events, [("wait", 7, current), ("prefetch", 4)])
+
+
+def _xccl_fallback_gather_worker(rank, init_file, results):
+    """One rank of a 2-rank gloo world gathering the way the pool does."""
+    import datetime
+
+    import torch.distributed as dist
+
+    from sglang.srt.mem_cache.page_interleave_pool import _TorchDistributedAllGather
+
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=2,
+        timeout=datetime.timedelta(seconds=60),
+    )
+    try:
+        gather = _TorchDistributedAllGather(
+            SimpleNamespace(ranks=[0, 1], device_group=dist.group.WORLD)
+        )
+        block = 3
+        output = torch.zeros(2 * block, 4)
+        # As in _prefetch_layer: send is this rank's own block of the output.
+        send = output[rank * block : (rank + 1) * block]
+        send.fill_(rank + 1)
+        with gather.change_state(enable=True):
+            gather.all_gather(output, send)
+        results.put(
+            (
+                rank,
+                output[:, 0].tolist(),
+                dist.get_backend(gather.group),
+                gather.group is not dist.group.WORLD,
+            )
+        )
+    finally:
+        dist.destroy_process_group()
+
+
+class TestTorchDistributedGatherFallback(CustomTestCase):
+    def test_in_place_gather_on_a_dedicated_group(self):
+        """The XPU gather (no PyNccl) must fill every rank's block in place,
+        on its own group so it does not queue behind the model's collectives."""
+        import tempfile
+
+        import torch.multiprocessing as mp
+
+        ctx = mp.get_context("spawn")
+        results = ctx.Queue()
+        with tempfile.TemporaryDirectory() as tmp:
+            procs = [
+                ctx.Process(
+                    target=_xccl_fallback_gather_worker,
+                    args=(rank, f"{tmp}/init", results),
+                )
+                for rank in range(2)
+            ]
+            try:
+                for proc in procs:
+                    proc.start()
+                # Drain before join: a child exits only once its queue items flush.
+                got = sorted(results.get(timeout=120) for _ in procs)
+                for proc in procs:
+                    proc.join(30)
+                self.assertEqual([proc.exitcode for proc in procs], [0, 0])
+            finally:
+                for proc in procs:
+                    if proc.is_alive():
+                        proc.terminate()
+                        proc.join(5)
+        for _, gathered, backend, dedicated in got:
+            self.assertEqual(gathered, [1.0] * 3 + [2.0] * 3)
+            self.assertEqual(backend, "gloo")
+            self.assertTrue(dedicated)
 
 
 if __name__ == "__main__":

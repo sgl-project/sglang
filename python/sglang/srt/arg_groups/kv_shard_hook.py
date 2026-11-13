@@ -59,6 +59,28 @@ def kv_shard_storage_backend_supported(name: Optional[str]) -> bool:
     return name in _KV_SHARD_STORAGE_BACKENDS
 
 
+def _validate_kv_shard_xpu_backend(server_args: Any, cfg: Any, prefill_backend) -> None:
+    """XPU shards MLA latent KV over attention TP, read through intel_xpu."""
+    if prefill_backend != "intel_xpu":
+        raise ValueError(
+            "--enable-kv-cache-sharding on XPU requires the intel_xpu prefill "
+            f"attention backend; got {prefill_backend!r}."
+        )
+    if is_deepseek_dsa(model_config_of(server_args).hf_config):
+        raise ValueError("DSA KV sharding is not supported on XPU.")
+    if not use_mla_backend(server_args):
+        raise ValueError(
+            "--enable-kv-cache-sharding on XPU supports MLA models only: GQA "
+            "sharding needs prefill context parallelism, which intel_xpu does "
+            "not support."
+        )
+    if cfg.attn_cp_size > 1:
+        raise ValueError(
+            "--enable-kv-cache-sharding on XPU supports plain-TP MLA only "
+            "(attn_cp_size must be 1)."
+        )
+
+
 def validate_kv_shard_attention_backend(server_args: Any, cfg: Any = None) -> None:
     cfg = cfg or resolving_view(server_args)
     if is_qwen_qsa(model_config_of(server_args).hf_config):
@@ -73,6 +95,9 @@ def validate_kv_shard_attention_backend(server_args: Any, cfg: Any = None) -> No
             )
         return
     prefill_backend, _ = attention_backends_of(resolved_view(server_args))
+    if resolved_view(server_args).device == "xpu":
+        _validate_kv_shard_xpu_backend(server_args, cfg, prefill_backend)
+        return
     if prefill_backend == "dsa":
         hf_config = model_config_of(server_args).hf_config
         if (
