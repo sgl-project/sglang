@@ -6,11 +6,18 @@ import torch
 import triton
 
 from sglang.kernels.jit.utils import get_ci_test_range
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.srt.utils import is_hip
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=37, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 # Nightly is not redundant here: it sets SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1 to expand get_ci_test_range sweeps.
 register_cuda_ci(est_time=130, stage="nightly", runner_config="1-gpu-small")
+register_amd_ci(est_time=60, suite="jit-kernel-unit-test-amd")
+
+
+def _torch_rmsnorm_(x: torch.Tensor, weight: torch.Tensor, eps: float = 1e-6) -> None:
+    rms = (x.float().pow(2).mean(dim=-1, keepdim=True) + eps).rsqrt()
+    x.copy_(x.float() * rms * weight.float())
 
 
 def sglang_aot_qknorm(
@@ -19,11 +26,17 @@ def sglang_aot_qknorm(
     q_weight: torch.Tensor,
     k_weight: torch.Tensor,
 ) -> None:
-    from sgl_kernel import rmsnorm
-
     head_dim = q.shape[-1]
     q = q.view(-1, head_dim)
     k = k.view(-1, head_dim)
+    if is_hip():
+        # sgl_kernel ships no rmsnorm op on ROCm.
+        _torch_rmsnorm_(q, q_weight)
+        _torch_rmsnorm_(k, k_weight)
+        return
+
+    from sgl_kernel import rmsnorm
+
     rmsnorm(q, q_weight, out=q)
     rmsnorm(k, k_weight, out=k)
 
