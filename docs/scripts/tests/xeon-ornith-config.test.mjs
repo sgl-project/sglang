@@ -33,10 +33,10 @@ for (const [vendor, name, model] of [
       HOST_IP: "127.0.0.1", PORT: "31001",
     });
     for (const flag of [
-      `--model ${vendor}/${model}`, "--device cpu", "--tp 6", "--port 31001",
+      `--model ${vendor}/${model}`, "--device cpu", "--disable-overlap-schedule", "--tp 6", "--port 31001",
     ]) assert.ok(command.includes(flag), flag);
     assert.match(command, /^sglang serve/);
-    assert.doesNotMatch(command, /--revision|--dtype|--max-total-tokens|--served-model-name|--disable-overlap-schedule|docker|--gpus|--context-length|--reasoning-parser|--tool-call-parser/);
+    assert.doesNotMatch(command, /--revision|--dtype|--max-total-tokens|--served-model-name|docker|--gpus|--context-length|--reasoning-parser|--tool-call-parser/);
     assert.match(cell.warn, /Only basic text generation.*full context.*unverified/);
   });
 
@@ -74,7 +74,7 @@ test("Ornith 1.0 35B uses its independent BF16 TP6 record, not its FP8 sibling",
   const cell = config.cells.find((candidate) => candidate.match.hw === "xeon" && candidate.match.variant === "35b");
   const command = engine(config).renderCommand(cell, cell.match, {});
   for (const flag of [
-    "--model deepreinforce-ai/Ornith-1.0-35B", "--device cpu", "--tp 6",
+    "--model deepreinforce-ai/Ornith-1.0-35B", "--device cpu", "--disable-overlap-schedule", "--tp 6",
   ]) assert.ok(command.includes(flag), flag);
   assert.doesNotMatch(command, /-FP8|--revision|--served-model-name|--reasoning-parser|--tool-call-parser|--speculative/);
 });
@@ -85,7 +85,7 @@ test("Ornith 1.5 35B-A3B uses its independent BF16 TP6 record, not its FP8 sibli
   const cell = config.cells.find((candidate) => candidate.match.hw === "xeon" && candidate.match.variant === "35b");
   const command = engine(config).renderCommand(cell, cell.match, {});
   for (const flag of [
-    "--model ornith-ai/Ornith-1.5-35B-A3B", "--device cpu", "--tp 6",
+    "--model ornith-ai/Ornith-1.5-35B-A3B", "--device cpu", "--disable-overlap-schedule", "--tp 6",
   ]) assert.ok(command.includes(flag), flag);
   assert.doesNotMatch(command, /-FP8|--revision|--served-model-name|--reasoning-parser|--tool-call-parser|--speculative/);
 });

@@ -12,10 +12,10 @@ const cell = config.cells.find((candidate) => candidate.match.hw === "xeon");
 test("Laguna XS2.1 CPU emits exactly its validated BF16 command shape", () => {
   const command = api.renderCommand(cell, cell.match, { HOST_IP: "0.0.0.0", PORT: "30000" });
   for (const flag of [
-    "--model poolside/Laguna-XS-2.1", "--device cpu", "--tp 4", "--host 0.0.0.0",
+    "--model poolside/Laguna-XS-2.1", "--device cpu", "--disable-overlap-schedule", "--tp 4", "--host 0.0.0.0",
   ]) assert.ok(command.includes(flag), flag);
   assert.match(command, /^sglang serve/);
-  assert.doesNotMatch(command, /--revision|--dtype|--max-total-tokens|--port|--trust-remote-code|--disable-overlap-schedule|--reasoning-parser|--tool-call-parser|--speculative|--ep-size|--attention-backend|docker/);
+  assert.doesNotMatch(command, /--revision|--dtype|--max-total-tokens|--port|--trust-remote-code|--reasoning-parser|--tool-call-parser|--speculative|--ep-size|--attention-backend|docker/);
   assert.deepEqual(config.runModes(cell.match), ["python"]);
   assert.deepEqual(config.runModes({ hw: "gb300" }), ["python", "docker"]);
 });

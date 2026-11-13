@@ -41,10 +41,10 @@ test(`${name} exposes only validated Python-only Xeon recipes`, () => {
     HOST_IP: "127.0.0.1", PORT: "31000",
   });
   for (const flag of [
-    `--model ${vendor}/${checkpoint}`, "--device cpu", "--tp 6", "--port 31000",
+    `--model ${vendor}/${checkpoint}`, "--device cpu", "--disable-overlap-schedule", "--tp 6", "--port 31000",
   ]) assert.ok(command.includes(flag), flag);
   assert.match(command, /^sglang serve/);
-  assert.doesNotMatch(command, /--revision|--dtype|--max-total-tokens|--disable-overlap-schedule|docker|--gpus|fa3|--ep |--nnodes|--reasoning-parser|--speculative/);
+  assert.doesNotMatch(command, /--revision|--dtype|--max-total-tokens|docker|--gpus|fa3|--ep |--nnodes|--reasoning-parser|--speculative/);
   assert.match(cell.warn, /Only basic text generation.*full context.*unverified/);
   const defaults = api.renderCommand(cell, cell.match, { HOST_IP: "127.0.0.1", PORT: "30000" });
   assert.doesNotMatch(defaults, /--host|--port/);
@@ -100,9 +100,9 @@ test(`${checkpoint} emits its model and CPU topology without redundant flags`, a
   });
   for (const flag of [
     `--model ${vendor}/${checkpoint}`,
-    "--device cpu", "--tp 6",
+    "--device cpu", "--disable-overlap-schedule", "--tp 6",
   ]) assert.ok(command.includes(flag), flag);
   assert.match(command, /^sglang serve/);
-  assert.doesNotMatch(command, /--revision|--dtype|--max-total-tokens|--disable-overlap-schedule|docker|--gpus|fa3|--ep |--nnodes|--reasoning-parser|--speculative/);
+  assert.doesNotMatch(command, /--revision|--dtype|--max-total-tokens|docker|--gpus|fa3|--ep |--nnodes|--reasoning-parser|--speculative/);
 });
 }

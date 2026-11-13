@@ -11,10 +11,10 @@ test("Intern-S2-Preview Xeon command keeps only the model and CPU topology", () 
   const command = load(source, { hardware: "xeon", reasoning: "enabled", toolcall: "enabled", mtp: "enabled" }).generateCommand();
   for (const flag of [
     "sglang serve", "--model internLM/Intern-S2-Preview",
-    "--device cpu", "--tp 4", "--host 0.0.0.0",
+    "--device cpu", "--disable-overlap-schedule", "--tp 4", "--host 0.0.0.0",
   ]) assert.ok(command.includes(flag), flag);
   assert.match(command, /^sglang serve/);
-  assert.doesNotMatch(command, /--revision|--dtype|--max-total-tokens|--port|--trust-remote-code|--disable-overlap-schedule|--reasoning-parser|--tool-call-parser|--speculative|--mamba-radix|docker/);
+  assert.doesNotMatch(command, /--revision|--dtype|--max-total-tokens|--port|--trust-remote-code|--reasoning-parser|--tool-call-parser|--speculative|--mamba-radix|docker/);
 });
 
 test("Intern-S2-Preview hardware switches reset and lock unvalidated axes", () => {

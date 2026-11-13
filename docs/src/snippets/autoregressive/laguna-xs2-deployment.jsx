@@ -130,6 +130,7 @@ export const LagunaXS2Deployment = () => {
         'sglang serve \\',
         '  --model poolside/Laguna-XS.2 \\',
         '  --device cpu \\',
+        '  --disable-overlap-schedule \\',
         '  --tp 4 \\',
         '  --host 0.0.0.0'
       ].join('\n');

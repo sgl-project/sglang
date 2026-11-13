@@ -1057,6 +1057,7 @@ export const config = {
       flags: [
         "--model {{MODEL_NAME}}",
         "--device cpu",
+        "--disable-overlap-schedule",
         "--tp 6",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",

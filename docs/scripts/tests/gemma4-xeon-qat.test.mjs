@@ -22,10 +22,10 @@ for (const [modelSize, checkpoint] of [
     const command = load().generateCommand({ ...base, modelSize });
     for (const flag of [
       `--model google/gemma-4-${checkpoint}-it-qat-q4_0-unquantized`,
-      "--device cpu", "--tp 4", "--mem-fraction-static 0.9", "--host 0.0.0.0",
+      "--device cpu", "--disable-overlap-schedule", "--tp 4", "--mem-fraction-static 0.9", "--host 0.0.0.0",
     ]) assert.ok(command.includes(flag), flag);
     assert.match(command, /^sglang serve/);
-    assert.doesNotMatch(command, /--revision|--dtype|--max-total-tokens|--port|--disable-overlap-schedule|--reasoning-parser|--tool-call-parser|--speculative|docker|--gpus/);
+    assert.doesNotMatch(command, /--revision|--dtype|--max-total-tokens|--port|--reasoning-parser|--tool-call-parser|--speculative|docker|--gpus/);
   });
 }
 
@@ -63,9 +63,9 @@ test("Gemma 4 standard 12B is selectable and emits its independently validated C
   const command = generateCommand(values);
   for (const flag of [
     "--model google/gemma-4-12B-it",
-    "--device cpu", "--tp 6", "--mem-fraction-static 0.9", "--host 0.0.0.0",
+    "--device cpu", "--disable-overlap-schedule", "--tp 6", "--mem-fraction-static 0.9", "--host 0.0.0.0",
   ]) assert.ok(command.includes(flag), flag);
-  assert.doesNotMatch(command, /qat|--revision|--dtype|--max-total-tokens|--port|--disable-overlap-schedule|--reasoning-parser|--tool-call-parser|--speculative/);
+  assert.doesNotMatch(command, /qat|--revision|--dtype|--max-total-tokens|--port|--reasoning-parser|--tool-call-parser|--speculative/);
   for (const axis of ["reasoning", "toolcall", "speculative"]) {
     assert.equal(options[axis].condition(values), false);
     assert.equal(options[axis].condition({ ...values, hardware: "h200" }), true);

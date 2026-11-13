@@ -195,6 +195,7 @@ sgl-eval run aime25 \\
       flags: [
         "--model {{MODEL_NAME}}",
         "--device cpu",
+        "--disable-overlap-schedule",
         "--tp 4",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",

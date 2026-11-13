@@ -96,6 +96,7 @@ export const config = {
       flags: [
         "--model deepreinforce-ai/Ornith-1.0-9B",
         "--device cpu",
+        "--disable-overlap-schedule",
         "--tp 6",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
@@ -110,6 +111,7 @@ export const config = {
       flags: [
         "--model deepreinforce-ai/Ornith-1.0-35B",
         "--device cpu",
+        "--disable-overlap-schedule",
         "--tp 6",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",

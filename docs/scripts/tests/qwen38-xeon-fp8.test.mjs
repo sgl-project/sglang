@@ -21,10 +21,10 @@ test("Qwen3.8 FP8 Xeon emits a concise TP6 text recipe", () => {
     ...selection, spec: "dflash", tier: "high-throughput", ssmDtype: "bfloat16",
   }, { HOST_IP: "127.0.0.1", PORT: "31001" });
   for (const flag of [
-    "--model Qwen/Qwen3.8-27B-FP8", "--device cpu", "--tp 6", "--port 31001",
+    "--model Qwen/Qwen3.8-27B-FP8", "--device cpu", "--disable-overlap-schedule", "--tp 6", "--port 31001",
   ]) assert.ok(command.includes(flag), flag);
   assert.match(command, /^sglang serve/);
-  assert.doesNotMatch(command, /--revision|--dtype|--max-total-tokens|--trust-remote-code|--disable-overlap-schedule|--speculative|--mamba-|--kv-cache|--mem-fraction|--reasoning-parser|--tool-call-parser|docker/);
+  assert.doesNotMatch(command, /--revision|--dtype|--max-total-tokens|--trust-remote-code|--speculative|--mamba-|--kv-cache|--mem-fraction|--reasoning-parser|--tool-call-parser|docker/);
   assert.deepEqual(config.runModes(selection), ["python"]);
   assert.match(cell.warn, /Only basic text generation.*unverified/);
 });
