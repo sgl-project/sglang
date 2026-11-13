@@ -16,16 +16,14 @@ from sglang.srt.arg_groups.arg_utils import (
     A,
     Arg,
     Derived,
+    json_list_type,
+    nullable_str,
 )
 from sglang.srt.arg_groups.choices import (
     LOAD_FORMAT_CHOICES,
     QUANTIZATION_CHOICES,
 )
-from sglang.srt.utils.common import (
-    human_readable_int,
-    json_list_type,
-    nullable_str,
-)
+from sglang.srt.utils.common import human_readable_int
 
 
 class Model(msgspec.Struct):
@@ -118,6 +116,13 @@ class Model(msgspec.Struct):
     is_embedding: A[
         bool,
         "Whether to use a CausalLM as an embedding model.",
+    ] = False
+    disable_normalize_embedding: A[
+        bool,
+        "Disable the L2 normalization the embedding Pooler applies after pooling, "
+        "returning the raw pooled vector. Only affects models whose Pooler is built "
+        "with normalize=True; custom poolers (cross-encoder, BERT pooler, vision "
+        "pooler) are unaffected.",
     ] = False
     revision: A[
         Optional[str],
@@ -404,10 +409,13 @@ class Model(msgspec.Struct):
     weight_cache_max_bytes: A[
         Optional[int],
         Arg(
-            help="Maximum GPU memory the weight cache daemon may use for cached "
-            "weights, in bytes. When set, the daemon rejects checkpoints estimated "
-            "above this cap before loading and refuses to serve if the measured "
-            "weights exceed this cap or the --mem-fraction-static budget. Unset "
-            "keeps the previous behavior.",
+            help="Admission limit in bytes for a newly started weight cache daemon. "
+            "The daemon rejects checkpoint estimates above the limit before loading "
+            "and checks measured GPU reservation and the static memory upper bound "
+            "before exporting weights. This is not a GPU peak-memory limit and "
+            "does not constrain an already-running daemon when connecting as a "
+            "client. The engine separately checks free memory and KV cache needs. "
+            "The cap cannot be combined with weight offloading. Unset keeps the "
+            "previous behavior.",
         ),
     ] = None

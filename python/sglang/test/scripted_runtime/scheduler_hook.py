@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Generator, List, Optional, Tuple
 
 import zmq
 
-from sglang.srt.arg_groups.overrides import resolving_view
+from sglang.srt.arg_groups.model_override_base import resolving_view
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import sock_recv, sock_send, wrap_as_pickle
 from sglang.srt.runtime_context import get_parallel
@@ -98,7 +98,7 @@ def _drive_engine_through_warmup(ctx: ScriptedContext) -> Generator:
 def _reset_engine_state(ctx: ScriptedContext) -> Generator:
     scheduler = ctx.scheduler
 
-    if scheduler._engine_paused:
+    if scheduler.pause_state.paused:
         ctx.continue_generation()
 
     ctx._release_exhausted_pools()

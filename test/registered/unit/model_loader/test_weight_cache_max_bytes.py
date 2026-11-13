@@ -22,9 +22,13 @@ def _bare_daemon(**overrides) -> WeightCacheDaemon:
     daemon.gpu_id = 0
     daemon.model = None
     daemon.model_path = "/models/demo"
+    daemon.load_format = "auto"
     daemon.revision = None
     daemon.preloaded_weights_bytes = 0
     daemon.weight_cache_max_bytes = None
+    daemon.cpu_offload_gb = 0
+    daemon.offload_group_size = 0
+    daemon.ple_offload_embedding = False
     for name, value in overrides.items():
         setattr(daemon, name, value)
     return daemon
@@ -48,9 +52,7 @@ class TestLoadBudget(CustomTestCase):
 
     def test_unset_cap_keeps_previous_behavior(self):
         daemon = _bare_daemon(preloaded_weights_bytes=10_000)
-        with mock.patch.object(daemon_mod, "get_schedule") as get_schedule:
-            daemon._validate_loaded_weights()
-        get_schedule.assert_not_called()
+        daemon._validate_loaded_weights()
 
     def test_cap_and_budget_accept_the_exact_boundary(self):
         daemon = _bare_daemon(preloaded_weights_bytes=800, weight_cache_max_bytes=800)
@@ -63,24 +65,26 @@ class TestLoadBudget(CustomTestCase):
         ):
             daemon._validate_loaded_weights()
 
-    def test_static_memory_budget_applies_under_the_cap(self):
-        daemon = _bare_daemon(
-            preloaded_weights_bytes=801, weight_cache_max_bytes=10_000
-        )
-        with self.assertRaisesRegex(
-            RuntimeError, r"mem-fraction-static budget.*800 bytes"
-        ):
+    def test_rejected_load_releases_model_before_export(self):
+        daemon = _bare_daemon(preloaded_weights_bytes=801, weight_cache_max_bytes=800)
+        daemon.model = object()
+        with mock.patch.object(
+            daemon_mod.current_platform, "empty_cache"
+        ) as empty_cache:
+            with self.assertRaisesRegex(RuntimeError, "weight-cache-max-bytes"):
+                daemon._admit_loaded_weights()
+        self.assertIsNone(daemon.model)
+        empty_cache.assert_called_once()
+
+    def test_static_upper_bound_rejects(self):
+        daemon = _bare_daemon(preloaded_weights_bytes=801, weight_cache_max_bytes=10000)
+        with self.assertRaisesRegex(RuntimeError, "static upper bound"):
             self._validate(daemon)
 
-    def test_unresolved_static_fraction_rejects(self):
-        daemon = _bare_daemon(preloaded_weights_bytes=1, weight_cache_max_bytes=10_000)
-        with mock.patch.object(
-            daemon_mod,
-            "get_schedule",
-            return_value=SimpleNamespace(mem_fraction_static=None),
-        ):
-            with self.assertRaisesRegex(RuntimeError, "mem-fraction-static"):
-                daemon._validate_loaded_weights()
+    def test_unresolved_fraction_rejects(self):
+        daemon = _bare_daemon(preloaded_weights_bytes=1, weight_cache_max_bytes=10000)
+        with self.assertRaisesRegex(RuntimeError, "unresolved"):
+            self._validate(daemon, fraction=None)
 
 
 def _write_safetensors(path: str, tensors: dict) -> None:
@@ -128,6 +132,47 @@ class TestCheckpointEstimate(CustomTestCase):
 
             self.assertEqual(estimate_checkpoint_bytes(tmp), 300)
 
+    def test_unrelated_index_cannot_hide_loaded_shards(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _write_safetensors(os.path.join(tmp, "consolidated.safetensors"), {"a": 4})
+            _write_safetensors(os.path.join(tmp, "model-00001.safetensors"), {"b": 200})
+            _write_safetensors(os.path.join(tmp, "model-00002.safetensors"), {"c": 200})
+            with open(
+                os.path.join(tmp, "consolidated.safetensors.index.json"), "w"
+            ) as f:
+                json.dump({"weight_map": {"a": "consolidated.safetensors"}}, f)
+            estimate = estimate_checkpoint_bytes(tmp)
+            # AUTO ignores the consolidated index and loads all three files.
+            self.assertTrue(estimate is None or estimate >= 404)
+
+    def test_unrecognized_load_format_defers_estimate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _write_safetensors(os.path.join(tmp, "model.safetensors"), {"a": 4})
+            self.assertIsNone(estimate_checkpoint_bytes(tmp, load_format="mistral"))
+
+    def test_missing_index_shard_defers_estimate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _write_safetensors(os.path.join(tmp, "one.safetensors"), {"a": 4})
+            with open(os.path.join(tmp, "model.safetensors.index.json"), "w") as f:
+                json.dump(
+                    {
+                        "weight_map": {
+                            "a": "one.safetensors",
+                            "b": "missing.safetensors",
+                        }
+                    },
+                    f,
+                )
+            self.assertIsNone(estimate_checkpoint_bytes(tmp))
+
+    def test_invalid_offsets_fall_back_to_file_size(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "model.safetensors")
+            header = json.dumps({"w": {"data_offsets": [10, 2]}}).encode()
+            with open(path, "wb") as f:
+                f.write(struct.pack("<Q", len(header)) + header)
+            self.assertEqual(estimate_checkpoint_bytes(tmp), os.path.getsize(path))
+
     def test_unreadable_header_falls_back_to_file_size(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "model.safetensors")
@@ -156,13 +201,28 @@ class TestCheckpointEstimate(CustomTestCase):
             daemon._enforce_estimated_cap()
         estimate.assert_not_called()
 
+    def test_capped_offloading_rejected_before_checkpoint_scan(self):
+        for option, value in (
+            ("cpu_offload_gb", 1),
+            ("offload_group_size", 1),
+            ("ple_offload_embedding", True),
+        ):
+            with self.subTest(option=option):
+                daemon = _bare_daemon(weight_cache_max_bytes=100, **{option: value})
+                with mock.patch.object(
+                    daemon_mod, "estimate_checkpoint_bytes"
+                ) as estimate:
+                    with self.assertRaisesRegex(ValueError, "offloading"):
+                        daemon._enforce_estimated_cap()
+                estimate.assert_not_called()
+
     def test_estimated_size_at_cap_is_accepted(self):
         daemon = _bare_daemon(weight_cache_max_bytes=100)
         with mock.patch.object(
             daemon_mod, "estimate_checkpoint_bytes", return_value=100
         ) as estimate:
             daemon._enforce_estimated_cap()
-        estimate.assert_called_once_with("/models/demo", None)
+        estimate.assert_called_once_with("/models/demo", None, "auto")
 
     def test_unestimable_checkpoint_defers_to_post_load(self):
         daemon = _bare_daemon(weight_cache_max_bytes=100)
@@ -199,18 +259,14 @@ class TestCheckpointEstimate(CustomTestCase):
                 daemon_mod, "estimate_checkpoint_bytes", return_value=101
             ) as estimate,
             mock.patch.object(daemon_mod.current_platform, "set_device") as set_device,
-            mock.patch(
-                "sglang.srt.model_loader.loader.get_model_loader"
-            ) as get_model_loader,
         ):
             with self.assertRaisesRegex(
                 RuntimeError, r"estimated checkpoint size.*101.*100"
             ):
                 daemon.load()
 
-        estimate.assert_called_once_with("/models/too-big", None)
+        estimate.assert_called_once_with("/models/too-big", None, "auto")
         set_device.assert_not_called()
-        get_model_loader.assert_not_called()
         self.assertIsNone(daemon.model)
 
 

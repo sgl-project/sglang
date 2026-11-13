@@ -37,6 +37,7 @@ Usage:
 import argparse
 import dataclasses
 import datetime
+import gc
 import glob
 import json
 import logging
@@ -51,7 +52,7 @@ from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
 import torch
 import torch.distributed as dist
 
-from sglang.srt.arg_groups.overrides import resolving_view
+from sglang.srt.arg_groups.model_override_base import resolving_view
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
@@ -111,10 +112,12 @@ def _safetensors_nbytes(path: str) -> Optional[int]:
 
         total = 0
         for name, meta in header.items():
-            if name == "__metadata__" or not isinstance(meta, dict):
+            if name == "__metadata__":
                 continue
+            if not isinstance(meta, dict):
+                return None
             nbytes = meta.get("nbytes")
-            if isinstance(nbytes, int) and not isinstance(nbytes, bool):
+            if isinstance(nbytes, int) and not isinstance(nbytes, bool) and nbytes >= 0:
                 total += nbytes
                 continue
             offsets = meta.get("data_offsets")
@@ -123,7 +126,11 @@ def _safetensors_nbytes(path: str) -> Optional[int]:
                 and len(offsets) == 2
                 and all(isinstance(o, int) and not isinstance(o, bool) for o in offsets)
             ):
+                if offsets[0] < 0 or offsets[1] < offsets[0]:
+                    return None
                 total += offsets[1] - offsets[0]
+            else:
+                return None
         return total
     except (OSError, ValueError, TypeError):
         return None
@@ -145,8 +152,13 @@ def _resolve_local_checkpoint_dir(
         return None
 
 
-def _checkpoint_weight_files(model_path: str, revision: Optional[str]) -> list:
-    """List checkpoint weight files, preferring the safetensors index when present."""
+def _checkpoint_weight_files(
+    model_path: str, revision: Optional[str], load_format: str = "auto"
+) -> list:
+    """List files only when the loader's checkpoint selection is recognizable."""
+    load_format = getattr(load_format, "value", load_format)
+    if load_format not in ("auto", "safetensors", "fastsafetensors", "instanttensor"):
+        return []
     if os.path.isfile(model_path):
         return [model_path]
 
@@ -154,8 +166,16 @@ def _checkpoint_weight_files(model_path: str, revision: Optional[str]) -> list:
     if not local_dir:
         return []
 
+    # Unknown index conventions can select a different set of weights. Do not
+    # let an unrelated index hide shards that AUTO would actually load.
+    index_paths = glob.glob(os.path.join(local_dir, "*.safetensors.index.json"))
+    if any(
+        os.path.basename(path) != "model.safetensors.index.json" for path in index_paths
+    ):
+        return []
+
     indexed = set()
-    for index_path in glob.glob(os.path.join(local_dir, "*.safetensors.index.json")):
+    for index_path in index_paths:
         try:
             with open(index_path) as f:
                 weight_map = json.load(f).get("weight_map", {})
@@ -167,8 +187,9 @@ def _checkpoint_weight_files(model_path: str, revision: Optional[str]) -> list:
             if not isinstance(shard, str):
                 continue
             shard_path = os.path.join(local_dir, shard)
-            if os.path.isfile(shard_path):
-                indexed.add(shard_path)
+            if not os.path.isfile(shard_path):
+                return []
+            indexed.add(shard_path)
     if indexed:
         return sorted(indexed)
 
@@ -184,15 +205,15 @@ def _checkpoint_weight_files(model_path: str, revision: Optional[str]) -> list:
 
 
 def estimate_checkpoint_bytes(
-    model_path: str, revision: Optional[str] = None
+    model_path: str, revision: Optional[str] = None, load_format: str = "auto"
 ) -> Optional[int]:
     """Estimate checkpoint payload bytes before any weights are loaded.
 
     Sums the tensor payload sizes in safetensors headers (falling back to file
     size when a header is unreadable or the format is not safetensors). Returns
-    None when no local checkpoint is available, e.g. an uncached Hub repo id.
+    None when no local checkpoint is available or selection is uncertain.
     """
-    files = _checkpoint_weight_files(model_path, revision)
+    files = _checkpoint_weight_files(model_path, revision, load_format)
     if not files:
         return None
 
@@ -298,6 +319,9 @@ class WeightCacheDaemon:
         self.trust_remote_code = cfg.trust_remote_code
         self.revision = cfg.revision
         self.weight_cache_max_bytes = cfg.weight_cache_max_bytes
+        self.cpu_offload_gb = cfg.cpu_offload_gb
+        self.offload_group_size = cfg.offload_group_size
+        self.ple_offload_embedding = cfg.ple_offload_embedding
         self.dist_init_method = dist_init_method
 
         device_uuid = current_platform.get_device_uuid(gpu_id)
@@ -373,15 +397,18 @@ class WeightCacheDaemon:
 
     def load(self):
         """Full loading pipeline: disk → TP shard → quantize → export IPC handles."""
-        # CUDA IPC weight sharing relies on torch's _share_cuda_ handle export,
-        # which only exists on CUDA-alike platforms (CUDA / ROCm). Fail loud here
-        # instead of dying deep inside the export with an opaque error.
-        if not current_platform.is_cuda_alike():
+        # Zero-copy IPC weight sharing requires a platform whose tensors can be
+        # exported through multiprocessing reduction: CUDA-alike platforms
+        # (CUDA / ROCm) via _share_cuda_, and NPU via native torch_npu reduction.
+        # Fail loud here instead of dying deep inside the export with an opaque
+        # error on anything else.
+        if not current_platform.is_cuda_alike() and not current_platform.is_npu():
             raise RuntimeError(
-                f"[WeightCacheDaemon] the weight cache daemon requires a CUDA-alike "
-                f"platform (CUDA or ROCm) for CUDA IPC weight sharing, but the "
-                f"active platform device type is {current_platform.device_type!r}. "
-                f"Disable the weight cache (--weight-cache-mode off)."
+                f"[WeightCacheDaemon] the weight cache daemon requires an "
+                f"IPC-capable platform (CUDA, ROCm, or NPU/Ascend) for zero-copy "
+                f"weight sharing, but the active platform device type is "
+                f"{current_platform.device_type!r}. Disable the weight cache "
+                f"(--weight-cache-mode off)."
             )
         # expandable_segments makes torch's caching allocator hand out memory
         # that cannot be exported via _share_cuda_, so the IPC export below would
@@ -516,7 +543,7 @@ class WeightCacheDaemon:
         self.preloaded_weights_bytes = max(
             0, torch.cuda.memory_reserved(self.gpu_id) - memory_before_load
         )
-        self._validate_loaded_weights()
+        self._admit_loaded_weights()
 
         # Export all parameters and buffers as IPC handles
         self._export_state()
@@ -526,12 +553,39 @@ class WeightCacheDaemon:
             f"Exported {len(self.state_entries)} tensors as IPC handles."
         )
 
+    def _admit_loaded_weights(self) -> None:
+        try:
+            self._validate_loaded_weights()
+        except Exception:
+            # No IPC handles have been exported yet. Release the failed load
+            # even if a caller catches the error and keeps this daemon alive.
+            self.model = None
+            try:
+                gc.collect()
+                current_platform.empty_cache()
+            except Exception:
+                logger.exception("Failed to release weights after admission failure")
+            raise
+
     def _enforce_estimated_cap(self) -> None:
         max_bytes = self.weight_cache_max_bytes
         if max_bytes is None:
             return
+        # The standalone daemon does not initialize the engine's offloader.
+        # Do not claim a GPU-only cap for a configuration whose resident
+        # weights may differ from the checkpoint estimate or engine state.
+        if (
+            self.cpu_offload_gb > 0
+            or self.offload_group_size > 0
+            or self.ple_offload_embedding
+        ):
+            raise ValueError(
+                "--weight-cache-max-bytes cannot be combined with weight offloading"
+            )
 
-        estimated_bytes = estimate_checkpoint_bytes(self.model_path, self.revision)
+        estimated_bytes = estimate_checkpoint_bytes(
+            self.model_path, self.revision, self.load_format
+        )
         if estimated_bytes is None:
             logger.warning(
                 f"[WeightCacheDaemon gpu={self.gpu_id}] cannot estimate the "
@@ -566,22 +620,20 @@ class WeightCacheDaemon:
                 f"a smaller model."
             )
 
-        mem_fraction_static = get_schedule().mem_fraction_static
-        if mem_fraction_static is None:
+        # This is only a necessary upper bound. The engine performs the
+        # authoritative admission check with actual free memory and KV needs.
+        fraction = get_schedule().mem_fraction_static
+        if fraction is None:
             raise RuntimeError(
-                f"[WeightCacheDaemon gpu={self.gpu_id}] --weight-cache-max-bytes "
-                f"is set, but --mem-fraction-static is unresolved; cannot verify "
-                f"the weight cache memory budget."
+                "--mem-fraction-static is unresolved; cannot check the weight cache budget"
             )
         total_bytes = current_platform.get_device_total_memory(self.gpu_id)
-        budget_bytes = int(total_bytes * mem_fraction_static)
+        budget_bytes = int(total_bytes * fraction)
         if loaded_bytes > budget_bytes:
             raise RuntimeError(
                 f"[WeightCacheDaemon gpu={self.gpu_id}] loaded weights "
-                f"({loaded_bytes} bytes) exceed the --mem-fraction-static budget "
-                f"({budget_bytes} bytes = {mem_fraction_static:.3f} of "
-                f"{total_bytes} bytes total GPU memory); refusing to serve. "
-                f"Reduce the weight footprint or raise --mem-fraction-static."
+                f"({loaded_bytes} bytes) exceed the --mem-fraction-static upper "
+                f"bound ({budget_bytes} bytes); refusing to serve."
             )
 
     @staticmethod

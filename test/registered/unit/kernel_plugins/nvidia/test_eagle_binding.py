@@ -13,21 +13,24 @@ from unittest.mock import MagicMock, call, patch
 import msgspec
 import torch
 
+from sglang.kernels.plugin_kernels.nvidia import spec
+from sglang.kernels.plugin_kernels.nvidia.spec import Step
+from sglang.srt.environ import envs
 from sglang.srt.kernel_plugins.nvidia import binding as runtime
 from sglang.srt.kernel_plugins.nvidia import eagle_binding as eb
+from sglang.srt.kernel_plugins.nvidia import speculative_runtime
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
 )
 from sglang.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
 from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.managers import overlap_utils
 from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.mem_cache.kv.router import STATE_PART, KVLayerRouter, PlainPoolRouter
-from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
-    ForwardBatch,
-    ForwardMode,
-)
+from sglang.srt.mem_cache.kv.decl import STATE_PART
+from sglang.srt.mem_cache.kv.router import KVLayerRouter, PlainPoolRouter
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative import eagle_megakernel, eagle_worker_v2
@@ -137,9 +140,12 @@ def _model(**entries):
         "draft_extend": None,
         "begin_draft_round": None,
         "graph_variants": None,
+        "speculative_runtime_hooks": None,
         **entries,
     }
-    model.__dict__["_megakernel"] = SimpleNamespace(widths=(), **offered)
+    model.__dict__["_megakernel"] = runtime._InstalledMegakernel(
+        built=SimpleNamespace(widths=(), **offered), binding=None, prepare=None
+    )
     return model
 
 
@@ -147,10 +153,11 @@ def _megakernel(**entries):
     """SGLang's side of a draft offering these entries."""
     return EagleMegakernel(
         draft_worker=SimpleNamespace(
+            cuda_graph_runner=None,
             draft_runner=SimpleNamespace(
                 model=_model(**entries),
                 model_config=SimpleNamespace(hidden_size=4, dtype=torch.float32),
-            )
+            ),
         ),
     )
 
@@ -276,6 +283,48 @@ def _leaves(hint):
 
 
 class TestEagleBinding(CustomTestCase):
+    def test_real_eagle_binding_runs_covered_dispatch_and_capture_tail(self):
+        for arch, backend in (
+            ("Qwen3_5ForCausalLM", _hybrid()),
+            ("Qwen3_5ForCausalLMMTP", _trtllm(KvPool())),
+        ):
+            with self.subTest(architecture=arch):
+                binding = runtime._binding_class([arch])(model=torch.nn.Module())
+                self.assertIsInstance(binding, eb.EagleBinding)
+                built = SimpleNamespace(
+                    plan=MagicMock(return_value=Step(mode="decode", rows=2)),
+                    forward=lambda step, *args, **kwargs: step.view,
+                )
+                original = MagicMock(return_value="standard")
+                dispatch = runtime._Dispatch(
+                    built=built, original=original, binding=binding
+                )
+                forward = dispatch.wrapped()
+                batch = SimpleNamespace(batch_size=2)
+                ids = torch.zeros(2, dtype=torch.int64)
+                check = runtime._CaptureCheck(
+                    spec=SimpleNamespace(name="eagle"), dispatch=dispatch
+                )
+                runner = SimpleNamespace(capture_bs=(2,))
+                with patch.object(eb, "get_attn_backend", return_value=backend):
+                    for capturing in (False, True):
+                        with patch.object(
+                            torch.cuda,
+                            "is_current_stream_capturing",
+                            return_value=capturing,
+                        ):
+                            view = forward(ids, None, batch)
+                        self.assertIsInstance(view, eb.EagleForwardView)
+                    original.assert_not_called()
+                    check(runner, None, batch, 2)
+                    self.assertTrue(check.is_done)
+                    backend.token_to_kv_pool.k[3] = torch.zeros(4, 2)
+                    check = runtime._CaptureCheck(
+                        spec=SimpleNamespace(name="eagle"), dispatch=dispatch
+                    )
+                    with self.assertRaisesRegex(RuntimeError, "kv was reallocated"):
+                        check(runner, None, batch, 2)
+
     def test_a_qwen3_5_view_is_the_running_forward_and_tolerated_members_exist(self):
         """A covered step is captured once and replays SGLang's refills of the
         backends' metadata, so the view must hold those very tensors."""
@@ -318,7 +367,8 @@ class TestEagleBinding(CustomTestCase):
         # a plugin pins these names: a rename here must fail first
         members = {
             "EagleBinding": set(dir(eb.EagleBinding)),
-            "ForwardBatch": set(ForwardBatch.__dataclass_fields__),
+            "ForwardBatch": set(ForwardBatch.__dataclass_fields__)
+            | set(dir(ForwardBatch)),
         }
         for name in eb.TOLERATED_CALLABLES + eb.TOLERATED_READS:
             owner, _, attr = name.partition(".")
@@ -362,6 +412,72 @@ class TestEagleBinding(CustomTestCase):
                     self.assertIs(view.k[index], expected_keys[layer_id])
                     self.assertIs(view.v[index], expected_values[layer_id])
 
+    def test_prefill_view_uses_committed_state_without_speculative_buffers(self):
+        from sglang.srt.layers.attention.linear.kernels.gdn_triton import (
+            TritonGDNKernel,
+        )
+        from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
+
+        backend = _hybrid()
+        linear = backend.linear_attn_backend
+        state = SimpleNamespace(
+            conv=[torch.zeros(2, 4, 3)], temporal=torch.zeros(2, 4, 8)
+        )
+        backend.req_to_token_pool = SimpleNamespace(
+            mamba_map={4: 0, 6: 1},
+            mamba_pool=SimpleNamespace(mamba_cache=state),
+            get_speculative_mamba2_params_all_layers=MagicMock(
+                side_effect=AssertionError("prefill must not read speculative scratch")
+            ),
+        )
+        meta = ForwardMetadata(
+            query_start_loc=torch.tensor([0, 3, 5], dtype=torch.int32),
+            mamba_cache_indices=torch.tensor([1, 2], dtype=torch.int32),
+        )
+        linear.forward_metadata = meta
+        linear.kernel_dispatcher = SimpleNamespace(extend_kernel=TritonGDNKernel())
+        linear.requires_contiguous_prefill_state = True
+        binding = eb.EagleBinding(model=torch.nn.Module())
+        with patch.object(eb, "get_attn_backend", return_value=backend):
+            view = binding.prefill_view()
+        self.assertIs(view.state.temporal, state.temporal)
+        self.assertIs(view.state_indices, meta.mamba_cache_indices)
+
+    def test_existing_forward_wrapper_selects_the_prefill_data_view(self):
+        views = SimpleNamespace(
+            forward_view=MagicMock(), prefill_view=MagicMock(return_value="prefill")
+        )
+        built = SimpleNamespace(
+            plan=lambda *a, **k: Step(mode="prefill", rows=5),
+            forward=lambda step, original, *a, **k: step.view,
+        )
+        wrapped = runtime._Dispatch(
+            built=built, original=MagicMock(), binding=views
+        ).wrapped()
+        with patch.object(torch.cuda, "is_current_stream_capturing", return_value=True):
+            self.assertEqual(
+                wrapped(torch.zeros(5), None, SimpleNamespace(batch_size=5)), "prefill"
+            )
+        views.prefill_view.assert_called_once_with()
+        views.forward_view.assert_not_called()
+
+    def test_prefill_without_an_offered_plan_uses_stock(self):
+        original = MagicMock(return_value="stock")
+        views = SimpleNamespace(prefill_view=MagicMock(), forward_view=MagicMock())
+        wrapped = runtime._Dispatch(
+            built=SimpleNamespace(plan=lambda *a, **k: None),
+            original=original,
+            binding=views,
+        ).wrapped()
+        args = (torch.zeros(5), None, SimpleNamespace(batch_size=5))
+        with patch.object(
+            torch.cuda, "is_current_stream_capturing", return_value=False
+        ):
+            self.assertEqual(wrapped(*args), "stock")
+        original.assert_called_once_with(*args)
+        views.prefill_view.assert_not_called()
+        views.forward_view.assert_not_called()
+
     def test_a_reallocated_pool_fails_assert_live_by_name(self):
         backend = _hybrid()
         binding = eb.EagleBinding(model=torch.nn.Module())
@@ -404,6 +520,28 @@ class TestEagleBinding(CustomTestCase):
 
 
 class TestEagleEntries(CustomTestCase):
+    def test_always_present_dispatch_preserves_the_stock_path(self):
+        stock_result = object()
+        with patch.object(eagle_megakernel, "init_eagle_megakernel", return_value=None):
+            dispatch = eagle_megakernel.init_eagle_draft_runtime(draft_worker=object())
+        self.assertIs(dispatch, eagle_megakernel.STOCK_EAGLE_DRAFT_RUNTIME)
+        self.assertIs(
+            dispatch.run_draft_loop(
+                runner=object(),
+                forward_batch=object(),
+                stock=lambda: stock_result,
+            ),
+            stock_result,
+        )
+        self.assertIs(
+            _megakernel().run_draft_loop(
+                runner=object(),
+                forward_batch=SimpleNamespace(batch_size=1),
+                stock=lambda: stock_result,
+            ),
+            stock_result,
+        )
+
     def test_without_the_flag_or_an_offered_entry_sglang_keeps_its_own_path(self):
         self.assertIsNone(_init())
         self.assertIsNone(_init(draft={"draft_loop": print}, enabled=False))
@@ -484,7 +622,7 @@ class TestEagleEntries(CustomTestCase):
                 call.init_eagle_megakernel(draft_worker=worker),
             ],
         )
-        self.assertIs(worker.megakernel, order.init_eagle_megakernel.return_value)
+        self.assertIs(worker.draft_runtime, order.init_eagle_megakernel.return_value)
 
     def test_each_factory_runs_once_and_serves_only_what_every_rank_serves(self):
         """A rank on SGLang's code at a batch size would wait in collectives the
@@ -520,7 +658,7 @@ class TestEagleEntries(CustomTestCase):
         """The megakernel may reuse what its draft extend left behind only when that
         extend produced this round's input: not after another extend, not for other
         requests (a PD decode instance's first round), and only once. The extend's
-        tokens are SGLang's own copy, which the next replay leaves alone."""
+        tokens remain graph-owned until the unchanged next round consumes them."""
         rounds, outs = [], {}
 
         def draft_extend(**buffers):
@@ -549,7 +687,11 @@ class TestEagleEntries(CustomTestCase):
         def served_extend(*rids):
             mk.note_draft_extend()
             extend_runner.bs = extend_runner.raw_bs = len(rids)
-            return mk.extend_tokens(runner=extend_runner, batch=_batch(*rids))
+            return mk.extend_tokens(
+                runner=extend_runner,
+                batch=_batch(*rids),
+                stock=lambda: (None, None, None),
+            )
 
         def begin(*rids):
             mk.begin_draft_round(
@@ -558,10 +700,14 @@ class TestEagleEntries(CustomTestCase):
             return rounds[-1].from_served_extend
 
         outs["topk_index"][0] = 5  # what the extend's replay wrote
-        _, topk_index = served_extend("a")
-        outs["topk_index"].zero_()  # the next replay rewrites it
+        _, _, topk_index = served_extend("a")
+        self.assertEqual(topk_index.data_ptr(), outs["topk_index"].data_ptr())
         self.assertEqual(topk_index.tolist(), [[5]])
+        draft_input.topk_index = topk_index
         self.assertTrue(begin("a"))
+        self.assertIs(rounds[-1].topk_index, topk_index)
+        outs["topk_index"].zero_()  # a later replay rewrites the shared view
+        self.assertEqual(topk_index.tolist(), [[0]])
         self.assertFalse(begin("a"))
         served_extend("a")
         mk.note_draft_extend()  # an extend the megakernel did not serve
@@ -571,7 +717,216 @@ class TestEagleEntries(CustomTestCase):
         calls = len(rounds)
         begin("a", "b")
         self.assertEqual(len(rounds), calls)  # batch size 2 is not served
-        self.assertIsNone(served_extend("a", "b"))  # SGLang's top-1 there
+        self.assertEqual(
+            served_extend("a", "b"), (None, None, None)
+        )  # SGLang's stock sampler there
+
+
+class TestSpeculativeRuntimeContract(CustomTestCase):
+    def test_strategy_passes_the_local_policy_to_runtime(self):
+        output = spec.PostVerifyOutput(
+            token_ids=torch.tensor([1]),
+            accepted_lengths=torch.tensor([1]),
+            accepted_indices=torch.tensor([0]),
+        )
+        local_keys = lambda view: view.values.argmax(-1)
+        calls = []
+
+        def run(io, policy):
+            calls.append((io, policy))
+            return output
+
+        io = object()
+        strategy = spec.PostVerifyStrategy(run=run, local_keys=local_keys)
+        self.assertIs(strategy(io), output)
+        self.assertEqual(calls, [(io, local_keys)])
+
+
+def _defaults() -> spec.SpeculativeRuntimeHooks:
+    return speculative_runtime.default_speculative_runtime_hooks()
+
+
+class TestSpeculativeRuntimeHooks(CustomTestCase):
+    def test_switch_off_returns_stock_identity_without_provider_work(self):
+        defaults = _defaults()
+        model = _model(
+            speculative_runtime_hooks=lambda _: (_ for _ in ()).throw(
+                AssertionError("factory must not run")
+            )
+        )
+        with (
+            envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(False),
+            patch.object(
+                runtime,
+                "built_megakernel",
+                side_effect=AssertionError("off must not inspect a provider"),
+            ),
+            patch.object(runtime, "megakernel_agree") as agree,
+        ):
+            selected = runtime.bind_speculative_runtime_hooks(model, defaults)
+        self.assertIs(selected, defaults)
+        agree.assert_not_called()
+
+    def test_missing_provider_keeps_exact_defaults(self):
+        defaults = _defaults()
+        models = (torch.nn.Module(), _model())
+        for model in models:
+            with (
+                self.subTest(has_built=runtime.built_megakernel(model) is not None),
+                envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True),
+                patch.object(runtime, "_gather_tp", return_value=[False]),
+            ):
+                selected = runtime.bind_speculative_runtime_hooks(model, defaults)
+            self.assertIs(selected, defaults)
+
+    def test_factory_wraps_defaults_and_changes_only_local_keys(self):
+        defaults = _defaults()
+        custom_keys = lambda view: torch.zeros(
+            view.values.shape[0], dtype=torch.int64, device=view.values.device
+        )
+
+        def factory(stock):
+            return spec.SpeculativeRuntimeHooks(
+                post_verify=spec.PostVerifyStrategy(
+                    run=stock.post_verify.run,
+                    local_keys=custom_keys,
+                )
+            )
+
+        model = _model(speculative_runtime_hooks=factory)
+        with (
+            envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True),
+            patch.object(runtime, "_gather_tp", return_value=[True]),
+        ):
+            selected = runtime.bind_speculative_runtime_hooks(model, defaults)
+        self.assertIs(selected.post_verify.run, defaults.post_verify.run)
+        self.assertIs(selected.post_verify.local_keys, custom_keys)
+
+    def test_default_post_verify_uses_the_stock_signature(self):
+        io = SimpleNamespace(
+            device=torch.device("cpu"),
+            is_idle=False,
+            seq_lens=torch.tensor([3]),
+            sampling_info=SimpleNamespace(),
+            req_pool_indices=torch.tensor([0]),
+            return_logprob=False,
+            verify_tree=object(),
+            logits=object(),
+            grammar_mask=None,
+            sparse_target_max_top_k=None,
+            watermark=None,
+            watermark_full_mask=True,
+            simulated_accept_length=None,
+            simulated_accept_length_rng=None,
+            sparse_bonus_argmax=False,
+        )
+        expected = (
+            torch.tensor([1]),
+            torch.tensor([0]),
+            torch.tensor([0]),
+        )
+        with (
+            patch(
+                "sglang.srt.speculative.eagle_utils.LOCAL_KEYS_SUPPORTED",
+                False,
+                create=True,
+            ),
+            patch(
+                "sglang.srt.speculative.eagle_utils.eagle_sample",
+                return_value=expected,
+            ) as sample,
+        ):
+            output = speculative_runtime.default_post_verify(io, lambda view: None)
+        self.assertEqual(
+            sample.call_args.kwargs,
+            {
+                "uno_target_max_top_k": None,
+                "watermark_state": None,
+                "watermark_full_mask": True,
+                "simulated_acc_len": None,
+                "simulated_acc_len_rng": None,
+                "sparse_bonus_argmax": False,
+            },
+        )
+        self.assertTrue(torch.equal(output.token_ids, expected[0]))
+        batch = sample.call_args.args[1]
+        self.assertIsInstance(batch, speculative_runtime.StockVerifyBatch)
+        self.assertIs(batch.forward_mode, ForwardMode.TARGET_VERIFY)
+        self.assertIs(batch.sampling_info, io.sampling_info)
+        self.assertIs(batch.req_pool_indices, io.req_pool_indices)
+
+
+class TestSpecRelayBypass(CustomTestCase):
+    @staticmethod
+    def _future_map():
+        future_map = overlap_utils.FutureMap.__new__(overlap_utils.FutureMap)
+        future_map._deferred_relay = None
+        future_map.output_tokens_buf = torch.empty(8, dtype=torch.int64)
+        future_map.spec_algo = SimpleNamespace(is_ngram=lambda: False)
+        return future_map
+
+    @staticmethod
+    def _draft_input(indices):
+        return SimpleNamespace(
+            future_indices=indices,
+            bonus_tokens=torch.tensor([7, 8], dtype=torch.int32),
+            topk_p=torch.tensor([[0.7], [0.8]]),
+            topk_index=torch.tensor([[3], [4]]),
+            hidden_states=torch.arange(8, dtype=torch.float32).view(2, 4),
+            draft_probs=None,
+            dsa_topk_indices=None,
+            future_dsa_topk_indices_available=False,
+        )
+
+    def test_unchanged_batch_consumes_the_draft_input_in_place(self):
+        future_map = self._future_map()
+        future_map._stash = MagicMock()
+        indices = torch.tensor([2, 5])
+        draft_input = self._draft_input(indices)
+        payload = overlap_utils.RelayPayload.from_draft_input(draft_input)
+        topk_p, topk_index, hidden = (
+            draft_input.topk_p,
+            draft_input.topk_index,
+            draft_input.hidden_states,
+        )
+        future_map.defer_relay(indices, payload, draft_input)
+        batch = SimpleNamespace(
+            spec_info=draft_input,
+            prefill_input_ids_cpu=None,
+            input_ids=torch.tensor([0]),
+            enable_overlap=True,
+            spec_algorithm=SimpleNamespace(is_none=lambda: False),
+        )
+
+        overlap_utils.resolve_forward_inputs(batch, future_map)
+
+        future_map._stash.assert_not_called()
+        self.assertIsNone(future_map._deferred_relay)
+        self.assertIs(draft_input.topk_p, topk_p)
+        self.assertIs(draft_input.topk_index, topk_index)
+        self.assertIs(draft_input.hidden_states, hidden)
+        self.assertEqual(draft_input.bonus_tokens.dtype, torch.int64)
+        self.assertEqual(draft_input.bonus_tokens.tolist(), [7, 8])
+
+    def test_changed_batch_flushes_before_it_can_overwrite_the_outputs(self):
+        future_map = self._future_map()
+        future_map._stash = MagicMock()
+        indices = torch.tensor([2, 5])
+        draft_input = self._draft_input(indices)
+        payload = overlap_utils.RelayPayload.from_draft_input(draft_input)
+        future_map.defer_relay(indices, payload, draft_input)
+        other = self._draft_input(indices.clone())
+        batch = SimpleNamespace(
+            spec_info=other,
+            prefill_input_ids_cpu=None,
+            input_ids=torch.tensor([0]),
+            enable_overlap=False,
+        )
+
+        overlap_utils.resolve_forward_inputs(batch, future_map)
+
+        future_map._stash.assert_called_once_with(indices, payload)
+        self.assertIsNone(future_map._deferred_relay)
 
 
 if __name__ == "__main__":

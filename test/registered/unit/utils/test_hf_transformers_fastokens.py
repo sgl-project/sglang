@@ -31,7 +31,7 @@ class TestFastokensBackend(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         # The patch is process-global; later tests in this process load with plain HF.
-        from sglang.srt.utils.hf_transformers import tokenizer
+        from sglang.srt.hf_transformers import tokenizer
 
         fastokens.unpatch_transformers()
         tokenizer._fastokens_patched = False
@@ -45,7 +45,7 @@ class TestFastokensBackend(CustomTestCase):
         # SGLang that depends on the same private name.
         from fastokens._compat import _TokenizerShim
 
-        from sglang.srt.utils.hf_transformers.tokenizer import get_tokenizer
+        from sglang.srt.hf_transformers.tokenizer import get_tokenizer
 
         tokenizer = get_tokenizer(
             TOKENIZER_MODEL,
@@ -60,7 +60,7 @@ class TestFastokensBackend(CustomTestCase):
         )
 
     def test_encode_decode_roundtrip(self):
-        from sglang.srt.utils.hf_transformers.tokenizer import get_tokenizer
+        from sglang.srt.hf_transformers.tokenizer import get_tokenizer
 
         tokenizer = get_tokenizer(
             TOKENIZER_MODEL,
@@ -79,7 +79,7 @@ class TestFastokensBackend(CustomTestCase):
         """
         from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers
 
-        from sglang.srt.utils.hf_transformers.tokenizer import get_tokenizer
+        from sglang.srt.hf_transformers.tokenizer import get_tokenizer
 
         raw = Tokenizer(models.BPE())
         raw.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
