@@ -8,6 +8,7 @@ mod loads;
 mod metrics;
 mod native_api;
 mod openai;
+mod parsers;
 pub(crate) mod pre_generate;
 mod request_decompression;
 mod request_headers;

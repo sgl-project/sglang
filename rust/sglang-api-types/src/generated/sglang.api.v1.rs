@@ -1000,6 +1000,77 @@ pub struct HiCacheStorageResponse {
     #[prost(string, tag = "2")]
     pub message: ::prost::alloc::string::String,
 }
+/// `/parse_function_call`.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ParseFunctionCallRequest {
+    #[prost(string, tag = "1")]
+    pub text: ::prost::alloc::string::String,
+    /// The tools the text may call; `tool_index` in the reply indexes this list.
+    #[prost(message, repeated, tag = "2")]
+    pub tools: ::prost::alloc::vec::Vec<ToolSpec>,
+    /// e.g. "llama3", "qwen25", "mistral"; required.
+    #[prost(string, optional, tag = "3")]
+    pub tool_call_parser: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// An OpenAI-shaped tool definition, as Python's `io_struct.Tool`.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ToolSpec {
+    #[prost(message, optional, tag = "1")]
+    pub function: ::core::option::Option<ToolFunctionSpec>,
+    #[prost(string, optional, tag = "2")]
+    pub r#type: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ToolFunctionSpec {
+    #[prost(string, optional, tag = "1")]
+    pub name: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "2")]
+    pub description: ::core::option::Option<::prost::alloc::string::String>,
+    /// The JSON Schema of the arguments, passed through as JSON text.
+    #[prost(string, optional, tag = "3")]
+    pub parameters: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// Python's `ToolCallItem`: `parameters` is the arguments as a JSON string.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ParsedToolCall {
+    #[prost(int64, tag = "1")]
+    pub tool_index: i64,
+    #[prost(string, optional, tag = "2")]
+    pub name: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, tag = "3")]
+    pub parameters: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ParseFunctionCallResponse {
+    #[prost(string, tag = "1")]
+    pub normal_text: ::prost::alloc::string::String,
+    #[prost(message, repeated, tag = "2")]
+    pub calls: ::prost::alloc::vec::Vec<ParsedToolCall>,
+}
+/// `/separate_reasoning`.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SeparateReasoningRequest {
+    #[prost(string, tag = "1")]
+    pub text: ::prost::alloc::string::String,
+    /// e.g. "deepseek-r1", "qwen3"; required.
+    #[prost(string, tag = "2")]
+    pub reasoning_parser: ::prost::alloc::string::String,
+    /// Also return the segments as blocks.
+    #[prost(bool, tag = "3")]
+    pub return_blocks: bool,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SeparateReasoningResponse {
+    #[prost(string, tag = "1")]
+    pub reasoning_text: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub text: ::prost::alloc::string::String,
+    /// Only with `return_blocks`.
+    #[prost(message, optional, tag = "3")]
+    pub reasoning_blocks: ::core::option::Option<StringList>,
+    #[prost(message, optional, tag = "4")]
+    pub text_blocks: ::core::option::Option<StringList>,
+}
 /// `/get_weights_by_name`: read one parameter, truncated, from every DP rank.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct GetWeightsByNameRequest {

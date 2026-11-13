@@ -5157,6 +5157,503 @@ impl<'de> ::serde::Deserialize<'de> for HiCacheStorageResponse {
     }
 }
 
+impl ::serde::Serialize for ParseFunctionCallRequest {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "text", &self.text)?;
+        if !self.tools.is_empty() {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "tools", &self.tools)?;
+        }
+        if let Some(v) = &self.tool_call_parser {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "tool_call_parser", v)?;
+        }
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for ParseFunctionCallRequest {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = ParseFunctionCallRequest;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct ParseFunctionCallRequest")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_text = None;
+                let mut f_tools = None;
+                let mut f_tool_call_parser = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "text" => {
+                            if f_text.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("text"));
+                            }
+                            f_text = Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        "tools" => {
+                            if f_tools.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("tools"));
+                            }
+                            f_tools = Some(
+                                map.next_value::<Option<Vec<ToolSpec>>>()?
+                                    .unwrap_or_default(),
+                            );
+                        }
+                        "tool_call_parser" => {
+                            if f_tool_call_parser.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "tool_call_parser",
+                                ));
+                            }
+                            f_tool_call_parser =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(ParseFunctionCallRequest {
+                    text: f_text.unwrap_or_default(),
+                    tools: f_tools.unwrap_or_default(),
+                    tool_call_parser: f_tool_call_parser.flatten(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ToolSpec {
+    /// The schema default when unset (protobuf arrival).
+    pub fn type_or_default(&self) -> ::prost::alloc::string::String {
+        self.r#type
+            .clone()
+            .unwrap_or_else(|| "function".to_string())
+    }
+    /// Protobuf arrival: unset defaulted fields become their schema
+    /// defaults (JSON arrival already baked them at deserialization).
+    pub fn apply_absent_defaults(&mut self) {
+        if self.r#type.is_none() {
+            self.r#type = Some("function".to_string());
+        }
+    }
+}
+
+impl ::serde::Serialize for ToolSpec {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        if let Some(v) = &self.function {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "function", v)?;
+        }
+        if let Some(v) = &self.r#type {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "type", v)?;
+        }
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for ToolSpec {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = ToolSpec;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct ToolSpec")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_function = None;
+                let mut f_type = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "function" => {
+                            if f_function.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("function"));
+                            }
+                            f_function = Some(map.next_value::<Option<ToolFunctionSpec>>()?);
+                        }
+                        "type" => {
+                            if f_type.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("type"));
+                            }
+                            f_type = Some(Some(
+                                map.next_value::<Option<::prost::alloc::string::String>>()?
+                                    .unwrap_or_else(|| "function".to_string()),
+                            ));
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(ToolSpec {
+                    function: f_function.flatten(),
+                    r#type: f_type.unwrap_or_else(|| Some("function".to_string())),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for ToolFunctionSpec {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        if let Some(v) = &self.name {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "name", v)?;
+        }
+        if let Some(v) = &self.description {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "description", v)?;
+        }
+        if let Some(v) = &self.parameters {
+            ::serde::ser::SerializeMap::serialize_entry(
+                &mut map,
+                "parameters",
+                &::serde_json::from_str::<::serde_json::Value>(v)
+                    .unwrap_or(::serde_json::Value::Null),
+            )?;
+        }
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for ToolFunctionSpec {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = ToolFunctionSpec;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct ToolFunctionSpec")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_name = None;
+                let mut f_description = None;
+                let mut f_parameters = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "name" => {
+                            if f_name.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("name"));
+                            }
+                            f_name =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        "description" => {
+                            if f_description.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("description"));
+                            }
+                            f_description =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        "parameters" => {
+                            if f_parameters.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("parameters"));
+                            }
+                            f_parameters = Some(
+                                map.next_value::<Option<::serde_json::Value>>()?
+                                    .map(|v| v.to_string()),
+                            );
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(ToolFunctionSpec {
+                    name: f_name.flatten(),
+                    description: f_description.flatten(),
+                    parameters: f_parameters.flatten(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for ParsedToolCall {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "tool_index", &self.tool_index)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "name", &self.name)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "parameters", &self.parameters)?;
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for ParsedToolCall {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = ParsedToolCall;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct ParsedToolCall")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_tool_index = None;
+                let mut f_name = None;
+                let mut f_parameters = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "tool_index" => {
+                            if f_tool_index.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("tool_index"));
+                            }
+                            f_tool_index = Some(map.next_value::<i64>()?);
+                        }
+                        "name" => {
+                            if f_name.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("name"));
+                            }
+                            f_name =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        "parameters" => {
+                            if f_parameters.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("parameters"));
+                            }
+                            f_parameters =
+                                Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(ParsedToolCall {
+                    tool_index: f_tool_index.unwrap_or_default(),
+                    name: f_name.flatten(),
+                    parameters: f_parameters.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for ParseFunctionCallResponse {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "normal_text", &self.normal_text)?;
+        if !self.calls.is_empty() {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "calls", &self.calls)?;
+        }
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for ParseFunctionCallResponse {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = ParseFunctionCallResponse;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct ParseFunctionCallResponse")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_normal_text = None;
+                let mut f_calls = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "normal_text" => {
+                            if f_normal_text.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("normal_text"));
+                            }
+                            f_normal_text =
+                                Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        "calls" => {
+                            if f_calls.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("calls"));
+                            }
+                            f_calls = Some(
+                                map.next_value::<Option<Vec<ParsedToolCall>>>()?
+                                    .unwrap_or_default(),
+                            );
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(ParseFunctionCallResponse {
+                    normal_text: f_normal_text.unwrap_or_default(),
+                    calls: f_calls.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for SeparateReasoningRequest {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "text", &self.text)?;
+        ::serde::ser::SerializeMap::serialize_entry(
+            &mut map,
+            "reasoning_parser",
+            &self.reasoning_parser,
+        )?;
+        ::serde::ser::SerializeMap::serialize_entry(
+            &mut map,
+            "return_blocks",
+            &self.return_blocks,
+        )?;
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for SeparateReasoningRequest {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = SeparateReasoningRequest;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct SeparateReasoningRequest")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_text = None;
+                let mut f_reasoning_parser = None;
+                let mut f_return_blocks = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "text" => {
+                            if f_text.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("text"));
+                            }
+                            f_text = Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        "reasoning_parser" => {
+                            if f_reasoning_parser.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "reasoning_parser",
+                                ));
+                            }
+                            f_reasoning_parser =
+                                Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        "return_blocks" => {
+                            if f_return_blocks.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("return_blocks"));
+                            }
+                            f_return_blocks = Some(map.next_value::<bool>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(SeparateReasoningRequest {
+                    text: f_text.unwrap_or_default(),
+                    reasoning_parser: f_reasoning_parser.unwrap_or_default(),
+                    return_blocks: f_return_blocks.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for SeparateReasoningResponse {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::serialize_entry(
+            &mut map,
+            "reasoning_text",
+            &self.reasoning_text,
+        )?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "text", &self.text)?;
+        if let Some(v) = &self.reasoning_blocks {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "reasoning_blocks", v)?;
+        }
+        if let Some(v) = &self.text_blocks {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "text_blocks", v)?;
+        }
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for SeparateReasoningResponse {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = SeparateReasoningResponse;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct SeparateReasoningResponse")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_reasoning_text = None;
+                let mut f_text = None;
+                let mut f_reasoning_blocks = None;
+                let mut f_text_blocks = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "reasoning_text" => {
+                            if f_reasoning_text.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("reasoning_text"));
+                            }
+                            f_reasoning_text =
+                                Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        "text" => {
+                            if f_text.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("text"));
+                            }
+                            f_text = Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        "reasoning_blocks" => {
+                            if f_reasoning_blocks.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "reasoning_blocks",
+                                ));
+                            }
+                            f_reasoning_blocks = Some(map.next_value::<Option<StringList>>()?);
+                        }
+                        "text_blocks" => {
+                            if f_text_blocks.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("text_blocks"));
+                            }
+                            f_text_blocks = Some(map.next_value::<Option<StringList>>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(SeparateReasoningResponse {
+                    reasoning_text: f_reasoning_text.unwrap_or_default(),
+                    text: f_text.unwrap_or_default(),
+                    reasoning_blocks: f_reasoning_blocks.flatten(),
+                    text_blocks: f_text_blocks.flatten(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
 impl GetWeightsByNameRequest {
     /// The schema default when unset (protobuf arrival).
     pub fn truncate_size_or_default(&self) -> i64 {

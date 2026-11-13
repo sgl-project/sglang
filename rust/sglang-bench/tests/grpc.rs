@@ -250,6 +250,18 @@ impl SglangService for Mock {
             "get_remote_instance_transfer_engine_info",
         ))
     }
+    async fn parse_function_call(
+        &self,
+        _: Request<api::ParseFunctionCallRequest>,
+    ) -> Result<Response<api::ParseFunctionCallResponse>, Status> {
+        Err(Status::unimplemented("parse_function_call"))
+    }
+    async fn separate_reasoning(
+        &self,
+        _: Request<api::SeparateReasoningRequest>,
+    ) -> Result<Response<api::SeparateReasoningResponse>, Status> {
+        Err(Status::unimplemented("separate_reasoning"))
+    }
     async fn update_weights_from_disk(
         &self,
         _: Request<api::UpdateWeightsFromDiskRequest>,

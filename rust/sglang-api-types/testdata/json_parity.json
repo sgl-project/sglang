@@ -723,6 +723,44 @@
       "canonical": "{\"master_address\":\"10.0.0.2\",\"ports\":\"9000,9001\",\"group_name\":\"g\"}"
     },
     {
+      "type": "ParseFunctionCallRequest",
+      "name": "tool parameters pass through as a JSON schema object and type defaults to function",
+      "input": {
+        "text": "t",
+        "tools": [
+          {
+            "function": {
+              "name": "f",
+              "parameters": {
+                "type": "object",
+                "properties": {
+                  "x": {
+                    "type": "integer"
+                  }
+                }
+              }
+            }
+          }
+        ],
+        "tool_call_parser": "qwen25"
+      },
+      "canonical": "{\"text\":\"t\",\"tools\":[{\"function\":{\"name\":\"f\",\"parameters\":{\"type\":\"object\",\"properties\":{\"x\":{\"type\":\"integer\"}}}},\"type\":\"function\"}],\"tool_call_parser\":\"qwen25\"}"
+    },
+    {
+      "type": "ParseFunctionCallResponse",
+      "name": "a call with no name is emitted as null",
+      "input": {
+        "normal_text": "",
+        "calls": [
+          {
+            "tool_index": -1,
+            "parameters": "{}"
+          }
+        ]
+      },
+      "canonical": "{\"normal_text\":\"\",\"calls\":[{\"tool_index\":-1,\"name\":null,\"parameters\":\"{}\"}]}"
+    },
+    {
       "type": "PauseGenerationRequest",
       "name": "mode defaults to abort as in Python",
       "input": {},
