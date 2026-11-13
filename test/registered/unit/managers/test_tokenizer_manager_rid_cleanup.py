@@ -689,6 +689,41 @@ class TestRequestTpotGating(CustomTestCase):
                     self.assertIsNone(tpot)
 
 
+class TestCacheMissTokens(CustomTestCase):
+    def test_the_split_reaches_meta_info_and_metrics_only_when_set(self):
+        """A prompt's uncached tokens by cause (--enable-cache-miss-attribution)
+        reach meta_info and the finished-request metrics; without them,
+        meta_info has no such key."""
+        split = {"new": 3, "placement": 1, "dependency": 0, "capacity": 2}
+        for cache_miss_tokens in (None, split):
+            with self.subTest(cache_miss_tokens=cache_miss_tokens):
+                tm = _make_tokenizer_manager(self)
+                tm.enable_metrics = True
+                tm.enable_priority_scheduling = False
+                tm.metrics_collector = MagicMock(labels={})
+                rid = "cache_miss_rid"
+                state = _make_req_state(rid)
+                state.obj.log_metrics = True
+                state.obj.sampling_params = {}
+                state.obj.custom_labels = None
+                tm.rid_to_state[rid] = state
+                batch_output = _make_batch_str_output(rid)
+                batch_output.request_stats = [
+                    _request_stats(cache_miss_tokens=cache_miss_tokens)
+                ]
+                asyncio.run(tm._handle_batch_output(batch_output))
+
+                meta_info = state.out_list[-1]["meta_info"]
+                self.assertEqual(meta_info.get("cache_miss_tokens"), cache_miss_tokens)
+                self.assertEqual(
+                    "cache_miss_tokens" in meta_info, cache_miss_tokens is not None
+                )
+                (call,) = (
+                    tm.metrics_collector.observe_one_finished_request.call_args_list
+                )
+                self.assertEqual(call.kwargs["cache_miss_tokens"], cache_miss_tokens)
+
+
 class TestNonStreamingFirstTokenTime(CustomTestCase):
     def _run(self, *, stream: bool, prefill_finished_time: float):
         tm = _make_tokenizer_manager(self)

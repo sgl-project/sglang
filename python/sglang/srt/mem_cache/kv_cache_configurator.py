@@ -2801,7 +2801,12 @@ class KVCacheConfigurator:
             device=self.device,
             mamba_pool=state_pool,
             enable_memory_saver=get_exec().features.enable_memory_saver,
-            enable_kv_cache_copy=(get_spec().speculative_algorithm is not None),
+            # Spec decoding moves accepted rows; an exact Mamba checkpoint's
+            # page is copied for each request resuming inside it.
+            enable_kv_cache_copy=(
+                get_spec().speculative_algorithm is not None
+                or get_exec().mamba.enable_mamba_exact_checkpoint
+            ),
             start_layer=self.layer_info.start_layer,
             full_kv_pool_class=full_pool_class,
             quant_method=quant_method,

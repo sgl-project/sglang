@@ -196,6 +196,7 @@ class SchedulerOutputStreamer:
                 if self.enable_metrics and self.is_generation
                 else None
             ),
+            cache_miss_tokens=req.cache_miss_tokens,
         )
 
     def release_detokenize_state(self, req: Req) -> None:

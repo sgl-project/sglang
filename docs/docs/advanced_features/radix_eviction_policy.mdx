@@ -26,6 +26,7 @@ Select one with `--radix-eviction-policy`. All of them fall back to least-recent
 | `priority` | The prefix belonging to the lowest-priority request, then the least recent. | You run [priority scheduling](/docs/advanced_features/server_arguments) and want cache retention to follow the same ranking as admission. |
 | `tlru` | The tail of a conversation beyond what its next prefill needs to meet the TTFT budget ("TEL-safe" tokens), then the least recent. | Agentic / multi-turn workloads where tail TTFT matters more than raw hit rate. See [`tlru` parameters](#tlru-parameters). Requires the unified radix cache (the default tree). |
 | `joint_lru` | The least recent of the full-attention and SWA KV, ranked in one shared order. | Full/SWA hybrid models with `--enable-unified-memory` on the unified radix cache (the default tree), where both kinds of KV share one byte buffer; there it rejects `--enable-session-radix-cache` and tree cores without the joint walk, such as the `rust` tree core. Elsewhere it acts as `lru`. |
+| `gds` | KV that no cached state can serve, then the cached state (with the KV only it serves) whose hits save the least prefill time per byte it holds, aged by GreedyDual-Size. | Hybrid models (Mamba, gated delta rule, KDA) on multi-turn or agentic traffic, where a prefix is only reusable up to its deepest cached state and a state's worth grows with the prefix behind it. See [`gds` parameters](#gds-parameters). It switches the radix tree core from the default Rust one to the slower Python one, needs the built-in radix cache (no `--radix-cache-backend` or `--disable-radix-cache`), and does not support HiCache or `--enable-session-radix-cache` yet. |
 
 Notes on the scoring inputs:
 
@@ -53,7 +54,7 @@ TypeError: SLRUStrategy.__init__() got an unexpected keyword argument 'protected
 
 ### Policy parameters
 
-`slru` and `tlru` take parameters. `lru`, `joint_lru`, `lfu`, and `priority` take none, so `--radix-eviction-policy-config` has no effect with them and any key is an error.
+`slru`, `tlru` and `gds` take parameters. `lru`, `joint_lru`, `lfu`, and `priority` take none, so `--radix-eviction-policy-config` has no effect with them and any key is an error.
 
 #### `slru` parameters
 
@@ -82,6 +83,24 @@ python3 -m sglang.launch_server \
   --radix-eviction-policy tlru \
   --radix-eviction-policy-config '{"threshold": 4096, "next_prompt_estimate": 512}'
 ```
+
+#### `gds` parameters
+
+A hybrid model resumes a cached prefix only at a node that holds a recurrent state, so `gds` evicts **units**: a state together with the full-attention KV that only it can serve (a state with no other state below it holds its own KV and that of its stateless ancestors up to the nearest state). KV that no state can serve goes first. Each unit then scores `L + gain / size`, lowest first, where `gain` is the prefill time a hit on it saves over resuming at the nearest state above it, `size` is its state slot plus its exclusive KV in KV tokens (a state slot counts as the KV tokens of the same bytes), and `L` is the score of the last unit evicted when the unit was last cached or hit.
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `prefill_cost` | `[d, e]` | `[1, 0]` | Prefilling positions `[a, b)` takes `d (b - a) + e (b² - a²) / 200,000` seconds: `d` per token, `e` per token per 100,000 tokens of context. Only `e / d` changes the order; the default ranks a unit by the tokens a hit saves per token it holds. Fit both by least squares to measured prefill times of `n` tokens after `c` tokens of context at a few context lengths. |
+| `leaf_last` | bool | `false` | Evict every interior state (one with exactly one deeper branch holding a state) before any leaf, so a conversation's latest state outlasts the earlier states on its path. A state where two cached continuations diverge counts as a leaf. |
+
+```bash Command
+python3 -m sglang.launch_server \
+  --model-path MODEL_PATH \
+  --radix-eviction-policy gds \
+  --radix-eviction-policy-config '{"prefill_cost": [1.862e-5, 3.33e-6], "leaf_last": true}'
+```
+
+`gds` also turns on the release that `--enable-mamba-unit-eviction` describes: a state that goes takes the KV no state needs any more with it. It needs a hybrid model with Mamba states and a tree of full-attention KV and Mamba states only.
 
 ## Which policy to pick
 

@@ -2046,6 +2046,23 @@ class ModelRunner:
         forward_batch.mamba_cow_src_indices = None
         forward_batch.mamba_cow_dst_indices = None
 
+    def _maybe_copy_deferred_kv_pages(self, forward_batch: ForwardBatch) -> None:
+        """Copy the cached pages that requests resuming inside them start from
+        (--enable-mamba-exact-checkpoint) into their own pages, on the forward
+        stream, before any layer reads them. The copies leave this forward
+        batch only, which never copies again over what the requests wrote
+        since: a draft runner's forward batch, built from the same scheduled
+        batch (one copy of it per layer in a multi-layer draft), still carries
+        them, and the runner copies into its own pool."""
+        src = forward_batch.kv_copy_src_locs
+        if src is None:
+            return
+        dst = forward_batch.kv_copy_dst_locs
+        forward_batch.kv_copy_src_locs = forward_batch.kv_copy_dst_locs = None
+        kv_storage_of(
+            self.req_to_token_pool, self.token_to_kv_pool_allocator
+        ).copy_token_pages(self.token_to_kv_pool, dst, src, draft=self.is_draft_worker)
+
     def _forward_raw(
         self,
         forward_batch: ForwardBatch,
@@ -2112,6 +2129,7 @@ class ModelRunner:
             # Deferred mamba COW/clear on the forward stream, before the extend
             # dispatch below reads the pool.
             self._maybe_execute_deferred_mamba_cow_and_clear(forward_batch)
+            self._maybe_copy_deferred_kv_pages(forward_batch)
 
             dwdp_mgr = get_global_dwdp_manager()
             if dwdp_mgr is not None:

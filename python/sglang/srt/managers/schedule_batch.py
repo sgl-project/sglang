@@ -298,6 +298,10 @@ class ReqKvInfo:
     mamba_cow_src_index: Optional[torch.Tensor] = None
     # Deferred clear: newly allocated mamba slot needs zeroing on forward stream
     mamba_needs_clear: bool = False
+    # Deferred page copy: a prefix ending inside a cached page resumes on the
+    # request's own copy of it (src -> dst slots, copied on forward stream).
+    kv_copy_src: Optional[torch.Tensor] = None
+    kv_copy_dst: Optional[torch.Tensor] = None
 
     def window_dead_lo(self, page_size: int) -> int:
         # Lowest position this request may free itself in any window: above the
@@ -417,6 +421,8 @@ class ReqKvInfo:
         self.mamba_prev_track_seqlen = None
         self.mamba_cow_src_index = None
         self.mamba_needs_clear = False
+        self.kv_copy_src = None
+        self.kv_copy_dst = None
         self.kv_committed_len = 0
 
 
@@ -756,6 +762,10 @@ class Req(ReqDllmMixin):
         self._cache_breakdown_computed = (
             False  # Track if breakdown was already computed
         )
+        # Cached full-attention KV the last match found, beyond what it served.
+        self.full_kv_hit_length = 0
+        # Uncached prompt tokens by cause (--enable-cache-miss-attribution).
+        self.cache_miss_tokens: Optional[Dict[str, int]] = None
 
         # Per-request count of verification forward passes.
         self.spec_verify_ct = 0
@@ -2059,6 +2069,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     mamba_cow_src_indices: torch.Tensor = None
     mamba_cow_dst_indices: torch.Tensor = None
     mamba_clear_indices: torch.Tensor = None
+    # Deferred KV page copies of requests resuming inside a cached page
+    kv_copy_src_locs: Optional[torch.Tensor] = None
+    kv_copy_dst_locs: Optional[torch.Tensor] = None
 
     # Encoder-decoder device tensors (host fields in the host metadata group)
     encoder_lens: Optional[torch.Tensor] = None
@@ -2487,6 +2500,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                         host_hit_is_storage=req.host_hit_is_storage,
                     )
                     req._cache_breakdown_computed = True
+                    attribution = self.tree_cache.miss_attribution
+                    if attribution is not None:
+                        req.cache_miss_tokens = attribution.attribute(
+                            req.origin_input_ids,
+                            prompt_len=len(req.origin_input_ids),
+                            hit_len=pre_len,
+                            kv_len=req.full_kv_hit_length,
+                        )
 
                 req.already_computed = seq_len
             req.is_retracted = False
@@ -2620,6 +2641,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # Collect mamba init info for deferred ops on forward stream
         if any(req.kv.holds_mamba for req in reqs):
             self._collect_deferred_mamba_cow_and_clear(reqs)
+            if self.tree_cache.exact_checkpoint:
+                self._collect_deferred_kv_page_copies(reqs)
 
         if self.model_config.is_encoder_decoder:
             self.prepare_encoder_info_extend(input_ids, seq_lens)
@@ -2676,6 +2699,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             boundary = prefill_checkpoint_boundary(
                 prefix_len, req.extend_len, checkpoint_grid
             )
+            if (
+                boundary is not None
+                and boundary % self.tree_cache.page_size
+                and self.tree_cache.exact_checkpoint
+            ):
+                # Resumed inside a page (an exact checkpoint), every boundary
+                # relative to the prefix is off the page grid, where the tree
+                # cannot key a state: track none. Decode tracks on the grid.
+                boundary = None
             mask = boundary is not None
             mamba_track_seqlen_aligned = prefix_len if boundary is None else boundary
         track_position = req.kv.mamba_next_track_idx
@@ -2755,6 +2787,18 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             torch.cat(cow_dst_tensors) if cow_dst_tensors else None
         )
         self.mamba_clear_indices = torch.cat(clear_tensors) if clear_tensors else None
+
+    def _collect_deferred_kv_page_copies(self, reqs):
+        """Collect the cached pages that requests resuming inside them copy."""
+        src_tensors = []
+        dst_tensors = []
+        for req in reqs:
+            if req.kv.kv_copy_src is not None:
+                src_tensors.append(req.kv.kv_copy_src)
+                dst_tensors.append(req.kv.kv_copy_dst)
+                req.kv.kv_copy_src = req.kv.kv_copy_dst = None
+        self.kv_copy_src_locs = torch.cat(src_tensors) if src_tensors else None
+        self.kv_copy_dst_locs = torch.cat(dst_tensors) if dst_tensors else None
 
     def mix_with_running(self, running_batch: ScheduleBatch):
         self.forward_mode = ForwardMode.MIXED
@@ -3245,6 +3289,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.mamba_cow_src_indices = None
         self.mamba_cow_dst_indices = None
         self.mamba_clear_indices = None
+        self.kv_copy_src_locs = None
+        self.kv_copy_dst_locs = None
 
         # Clear context parallel metadata - CP is only for prefill, not decode
         if hasattr(self, "attn_cp_metadata") and self.attn_cp_metadata is not None:
@@ -3401,6 +3447,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.mamba_cow_src_indices = None
         self.mamba_cow_dst_indices = None
         self.mamba_clear_indices = None
+        self.kv_copy_src_locs = None
+        self.kv_copy_dst_locs = None
         self.return_logprob = any(req.return_logprob for req in self.reqs)
         if self.return_logprob:
             self.top_logprobs_nums = [self.top_logprobs_nums[i] for i in keep_indices]

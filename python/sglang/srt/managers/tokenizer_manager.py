@@ -2838,6 +2838,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         prefill_spans
                     )
                 meta_info["cached_tokens_details"] = request_stats.cached_tokens_details
+                if request_stats.cache_miss_tokens is not None:
+                    meta_info["cache_miss_tokens"] = request_stats.cache_miss_tokens
                 if customized_info is not None:
                     self.update_request_meta_info(
                         meta_info,
@@ -3522,6 +3524,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 spec_verify_ct=spec_verify_ct,
                 is_streaming=getattr(state.obj, "stream", False),
                 time_per_output_token=time_per_output_token,
+                cache_miss_tokens=request_stats.cache_miss_tokens,
             )
 
     def dump_requests(self, state: ReqState, out_dict: dict):

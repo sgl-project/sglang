@@ -623,12 +623,21 @@ class StaticKVStorage:
         self._allocator.state.pool.copy_from(ids.ids(src), ids.ids(dst))
 
     def release_state(
-        self, sub_pool: str, req: Req, *, keep: Optional[int] = None
+        self,
+        sub_pool: str,
+        req: Req,
+        *,
+        keep: Optional[int] = None,
+        keep_state_slot: bool = False,
     ) -> None:
         """Give back a finished request's state slots, keeping its tracking
-        slot ``keep`` when the tree took that one."""
+        slot ``keep``, or its state slot (``keep_state_slot``), when the tree
+        took that one."""
         self._allocator.state.release(
-            self.requests, req, mamba_ping_pong_track_buffer_to_keep=keep
+            self.requests,
+            req,
+            mamba_ping_pong_track_buffer_to_keep=keep,
+            keep_state_slot=keep_state_slot,
         )
 
     def donate_tracking_slot(
@@ -637,6 +646,14 @@ class StaticKVStorage:
         """Hand the tree the request's kept tracking slot, giving the request
         ``new_slot`` in its place."""
         return self.requests.donate_mamba_ping_pong_slot(req, new_slot)
+
+    def copy_token_pages(
+        self, pool, dst: torch.Tensor, src: torch.Tensor, *, draft: bool = False
+    ) -> None:
+        """Copy whole pages of token rows ``src`` -> ``dst`` (every slot of each
+        page, in order) in ``pool``, on the current stream. Each runner copies
+        into its own pool, a draft runner too."""
+        pool.move_kv_pages(dst, src)
 
     def quantizes_checkpoints(self, sub_pool: str) -> bool:
         """Whether the tree's state checkpoints live in a quantized pool of

@@ -35,6 +35,7 @@ class CacheInitParams:
     eviction_policy_config: Optional[dict[str, Any]] = None
 
     enable_metrics: bool = False
+    enable_cache_miss_attribution: bool = False
     enable_kv_cache_events: bool = False
     dynamo_kv_event_format: bool = False
     # LoRA names for KV events; the scheduler registers requests in it.
@@ -45,6 +46,11 @@ class CacheInitParams:
 
     enable_mamba_extra_buffer: bool = False
     enable_mamba_extra_buffer_lazy: bool = False
+    # Evict a Mamba state together with the full KV that only it can serve.
+    enable_mamba_unit_eviction: bool = False
+    # Cache a finished request's live Mamba state at its exact end (see
+    # UnifiedTreeCore.insert_exact_leaf).
+    enable_mamba_exact_checkpoint: bool = False
 
     pp_rank: int = 0
     pp_size: int = 1

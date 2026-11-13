@@ -1052,6 +1052,25 @@ def handle_mamba_radix_cache(server_args: Any, hf_config: Any):
 
     run_post_process_pass(server_args, _mamba_radix_cache_resolution)
     view = resolved_view(server_args)
+    if view.enable_mamba_unit_eviction and not view.uses_mamba_radix_cache:
+        raise ValueError(
+            "--enable-mamba-unit-eviction evicts a hybrid model's cached Mamba "
+            f"states with their KV; {hf_config.architectures[0]} keeps none."
+        )
+    if view.radix_eviction_policy == "gds" and not view.uses_mamba_radix_cache:
+        raise ValueError(
+            "--radix-eviction-policy gds ranks a hybrid model's cached Mamba "
+            f"states; {hf_config.architectures[0]} keeps none."
+        )
+    if view.enable_mamba_exact_checkpoint and not (
+        view.uses_mamba_radix_cache and mamba_extra_buffer_of(view)
+    ):
+        raise ValueError(
+            "--enable-mamba-exact-checkpoint caches a hybrid model's live Mamba "
+            "state next to the checkpoints tracked by --mamba-radix-cache-strategy "
+            f"extra_buffer; got {hf_config.architectures[0]} with "
+            f"--mamba-radix-cache-strategy {view.mamba_radix_cache_strategy}."
+        )
     if not view.uses_mamba_radix_cache:
         # auto is arch-gated, so only an explicit strategy reaches a non-mamba
         # arch here, where it would arm the mamba paths and crash at prefill.

@@ -571,5 +571,8 @@ POSITIONAL_FIELD_ORDER = (
     "paged_experts_host_memory_gb",
     "_max_running_requests_explicitly_set",
     "hybrid_cache_checkpoints_level",
+    "enable_mamba_unit_eviction",
+    "enable_cache_miss_attribution",
+    "enable_mamba_exact_checkpoint",
 )
 # fmt: on

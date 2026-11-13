@@ -40,6 +40,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     _dfs_weight_order,
 )
 from sglang.srt.mem_cache.events import KVCacheEventRecorder
+from sglang.srt.mem_cache.evict_policy import GreedyDualSizeStrategy
 from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
@@ -71,6 +72,7 @@ from sglang.srt.mem_cache.unified_cache.components import (
     node_component_records,
     windows_stand_alone,
 )
+from sglang.srt.mem_cache.unified_cache.gds import GreedyDualSizeUnits
 from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     BufferBackupSnapshot,
     BufferBackupState,
@@ -87,6 +89,7 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     UnifiedTreeCoreInterface,
     uses_joint_lru,
 )
+from sglang.srt.mem_cache.unified_cache.unit_eviction import StateUnits
 from sglang.srt.mem_cache.utils import (
     compute_node_hash_values,
     get_eviction_strategy,
@@ -117,6 +120,13 @@ class StorageBackupSpec(NamedTuple):
 
 class UnifiedTreeNode:
     counter = 0
+    # Unit eviction only (StateUnits), class defaults so that no node pays for
+    # them otherwise: whether this node's state is counted, the nodes at or
+    # below it holding a state on either tier, and its children whose subtrees
+    # hold one.
+    _unit_holds_state = False
+    _unit_states_below = 0
+    _unit_state_branches = 0
 
     def __init__(self, tree_components: tuple[ComponentType, ...], priority: int = 0):
         # Plain dict (not defaultdict): a missing-key read must raise, never
@@ -511,6 +521,21 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         # The node _tlru_* lens are read only by TLRUStrategy.get_priority;
         # every other policy skips the per-insert bookkeeping entirely.
         self.tlru_bookkeeping = params.eviction_policy.lower() == "tlru"
+        self.gds: Optional[GreedyDualSizeUnits] = None
+        if isinstance(self.eviction_strategy, GreedyDualSizeStrategy):
+            if TREE_STATE not in self._family_slot_ids:
+                raise ValueError(
+                    "--radix-eviction-policy gds ranks a hybrid model's cached "
+                    "states; this model's radix tree keeps none."
+                )
+            self.gds = GreedyDualSizeUnits(self, self.eviction_strategy)
+        # GreedyDual-Size evicts a state with the KV only it serves.
+        self.state_units: Optional[StateUnits] = (
+            StateUnits(self)
+            if (params.enable_mamba_unit_eviction or self.gds is not None)
+            and TREE_STATE in self._family_slot_ids
+            else None
+        )
 
         # ``device`` is derived from the construction-time allocator; the
         # allocator/pool themselves are owned by the cache, not the tree.
@@ -563,8 +588,14 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 component.evict_device_end()
         # Internal victims awaiting the controller's backup and finish call.
         self._pending_internal_evictions: dict[ComponentType, NodeId] = {}
+        if self.state_units is not None:
+            self.state_units.reset()
+        if self.gds is not None:
+            self.gds.reset()
         # Maintains the NodeId -> active tree node mapping.
         self._node_arena: dict[NodeId, UnifiedTreeNode] = {}
+        # Leaves whose key ends inside a page (insert_exact_leaf), by parent.
+        self._exact_leaves: dict[UnifiedTreeNode, list[UnifiedTreeNode]] = {}
         self.joint_lru = JointLRU() if self._keeps_joint_lru else None
         # Its component walks ended above, so a suspended joint walk ends too.
         self._joint_walk: Optional[_JointEvictionWalk] = None
@@ -807,6 +838,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self._node_arena.pop(node.id, None)
         if self.joint_lru is not None:
             self.joint_lru.drop_swa(node)
+        if self.gds is not None:
+            self.gds.forget(node)
 
     def inc_lock_ref(
         self, node_id: NodeId, skip_lock_components: Sequence[ComponentType] = ()
@@ -1076,7 +1109,23 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             if key_offset < len(key):
                 child_key = key.child_key_at(key_offset, self.page_size)
 
-        return self._match_post_processor(
+        page_end = full_kv_hit_length
+        exact_leaf = None
+        if self._exact_leaves:
+            exact_leaf = self._match_exact_leaf(
+                node, params.key, page_end, device_validators
+            )
+        if exact_leaf is not None:
+            # Its state covers the whole walked path, so the hit runs to its end.
+            leaf_len = len(exact_leaf.key)
+            value.append(
+                exact_leaf.component_data[BASE_COMPONENT_TYPE].value[:leaf_len]
+            )
+            best_match_node = best_match_device_node = node = exact_leaf
+            best_match_device_value_len = len(value)
+            full_kv_hit_length += leaf_len
+
+        result = self._match_post_processor(
             params,
             value,
             best_match_node,
@@ -1087,6 +1136,37 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             last_visited_node_id=node.id if node is not self.root_node else None,
             device_validators=device_validators,
         )
+        if exact_leaf is not None:
+            # The leaf keeps its page; a request resuming there copies it
+            # (UnifiedRadixCache.prefix_device_indices) and owns the copy.
+            result = result._replace(cache_protected_len=page_end)
+        return result
+
+    def _match_exact_leaf(
+        self,
+        node: UnifiedTreeNode,
+        key: RadixKey,
+        node_end: int,
+        validators: tuple[Callable[[UnifiedTreeNode], bool], ...],
+    ) -> Optional[UnifiedTreeNode]:
+        """The longest leaf ending inside a page under ``node``, which ends
+        ``node_end`` tokens into ``key``, that ``key`` continues within its
+        length."""
+        best = None
+        for leaf in self._exact_leaves.get(node, ()):
+            leaf_len = len(leaf.key)
+            if (
+                node_end + leaf_len > len(key)
+                or (best is not None and leaf_len <= len(best.key))
+                or leaf.key.extra_key != key.extra_key
+                or leaf.key.cache_salt != key.cache_salt
+            ):
+                continue
+            if leaf.key.match_at(key, node_end) == leaf_len and all(
+                validator(leaf) for validator in validators
+            ):
+                best = leaf
+        return best
 
     def _device_prefix_covered_by_match(
         self, best_match_node: UnifiedTreeNode
@@ -1737,6 +1817,63 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self.kv_events.record_store(new_node, session_id=session_id)
         return new_node
 
+    def insert_exact_leaf(
+        self,
+        node_id: NodeId,
+        key: RadixKey,
+        value: torch.Tensor,
+        mamba_value: torch.Tensor,
+        priority: int = 0,
+    ) -> tuple[InsertResult, list[CacheAction | ComponentAction]]:
+        """Cache a state that ends inside a page as a leaf under ``node_id``,
+        the node ending where that page starts.
+
+        ``key`` holds the tokens from the page start to the state, ``value``
+        the slots of the whole page (the leaf owns the page) and
+        ``mamba_value`` the state. The leaf's child key is its own tokens,
+        fewer than a page, which no page-aligned walk produces; only
+        ``_match_exact_leaf`` finds it. An equal leaf already cached is
+        refreshed and comes back with ``mamba_exist`` set: the caller keeps
+        ``value`` and ``mamba_value``."""
+        parent = self.node_by_id(node_id)
+        assert 0 < len(key) < self.page_size and len(value) == self.page_size, (
+            f"an exact leaf ends inside one page: {len(key)=}, {len(value)=}"
+        )
+        child_key = key.child_key_at(0, len(key))
+        leaf = parent.children.get(child_key)
+        is_new_leaf = leaf is None
+        if is_new_leaf:
+            leaf = self._new_node(priority=priority)
+            leaf.parent = parent
+            leaf.key = key
+            if self.tlru_bookkeeping:
+                _set_tlru_lens_and_raise_history(leaf, parent)
+            leaf.rotation_base = parent.rotation_base
+            leaf.component_data[BASE_COMPONENT_TYPE].value = value.clone()
+            parent.children[child_key] = leaf
+            self._exact_leaves.setdefault(parent, []).append(leaf)
+            self.component_evictable_size_[BASE_COMPONENT_TYPE] += (
+                self.components_by_type[BASE_COMPONENT_TYPE].reclaimable_value_len(leaf)
+            )
+            self._update_evictable_leaf_sets(leaf)
+            self._update_evictable_leaf_sets(parent)
+        else:
+            self._touch_node(leaf)
+        params = InsertParams(
+            key=key, value=value, mamba_value=mamba_value, priority=priority
+        )
+        result = InsertResult(prefix_len=0, last_device_node=leaf.id)
+        actions: list[CacheAction | ComponentAction] = []
+        for component in self.components:
+            component.commit_insert_component_data(
+                node=leaf,
+                is_new_leaf=is_new_leaf,
+                params=params,
+                result=result,
+                cache_actions=actions,
+            )
+        return result, actions
+
     def _unevict_node_on_insert(
         self,
         node: UnifiedTreeNode,
@@ -1769,6 +1906,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         """Update both device and host leaf sets for a node."""
         if self._is_device_leaf(node):
             self.evictable_device_leaves.add(node)
+            units = self.state_units
+            if units is not None:
+                units.evictable_leaf(node)
         else:
             self.evictable_device_leaves.discard(node)
 
@@ -1889,6 +2029,66 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         assert self._joint_walk is not None, "joint eviction not started"
         self.evict_device_end(self.joint_window_type)
         self._joint_walk = None
+
+    supports_gds_eviction = True
+
+    def next_gds_victim(self, kv_only: bool = False) -> Optional[NodeId]:
+        """The next node to evict whole: KV that no state serves, least recent
+        first (unit eviction's queue), then the state units by score; with
+        ``kv_only``, one that frees KV."""
+        node = self.state_units.next_dead_leaf()
+        if node is None:
+            node = self.gds.next_victim(kv_only=kv_only, evictable=self._gds_evictable)
+        return None if node is None else node.id
+
+    def _gds_evictable(self, node: UnifiedTreeNode) -> bool:
+        cd = node.component_data[self.slot_id(TREE_STATE)]
+        return (
+            cd.lock_ref == 0
+            and cd.session_ref == 0
+            and node.load_back_pending_id is None
+            and node.write_through_pending_id is None
+        )
+
+    def evict_gds_victim(self, node_id: NodeId) -> EvictDeviceLeafResult:
+        """Evict a node ``next_gds_victim`` chose: a device leaf whole, else
+        its state, each with the KV no state needs any more."""
+        node = self.node_by_id(node_id)
+        if node in self.evictable_device_leaves:
+            survivor = node.parent
+            result = self.evict_device_leaf(node_id, is_write_back=False)
+        else:
+            survivor = node
+            result = EvictDeviceLeafResult()
+            state = self.component_of(TREE_STATE)
+            self._begin_tracking_unbacked_tokens()
+            try:
+                self._evict_component_and_detach_lru(
+                    node,
+                    state,
+                    target=EvictLayer.DEVICE,
+                    tracker=result.tracker,
+                    device_frees=result.device_frees,
+                    host_frees=result.host_frees,
+                    cache_actions=result.cache_actions,
+                )
+                self._cascade_evict(
+                    node,
+                    state,
+                    result.tracker,
+                    device_frees=result.device_frees,
+                    host_frees=result.host_frees,
+                    cache_actions=result.cache_actions,
+                )
+            finally:
+                result.unbacked_tokens = self._finish_tracking_unbacked_tokens()
+        while survivor is not self.root_node and survivor.id not in self._node_arena:
+            survivor = survivor.parent
+        self.gds.after_eviction(survivor)
+        return result
+
+    def end_gds_eviction(self) -> None:
+        self.gds.end_walk()
 
     def evict_device_start(
         self, component_type: ComponentType, request_cnt: int
@@ -2463,6 +2663,17 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
         self._update_evictable_leaf_sets(node)
 
+        units = self.state_units
+        if (
+            units is not None
+            and target is EvictLayer.DEVICE
+            and trigger.component_type == units.state_component
+            and not units.holds(node)
+        ):
+            units.release(
+                node, tracker, device_frees, host_frees, cache_actions=cache_actions
+            )
+
     def _is_cascade_evict_leaf(self, node: UnifiedTreeNode, target: EvictLayer) -> bool:
         if target == EvictLayer.DEVICE:
             return node in self.evictable_device_leaves
@@ -2512,7 +2723,15 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         for component in self.components:
             component.discard_deleted_session_leaf(node)
 
-        key = node.key.child_key(self.page_size)
+        # Only an exact leaf is shorter than a page.
+        if self._exact_leaves and len(node.key) < self.page_size:
+            key = node.key.child_key_at(0, len(node.key))
+            leaves = self._exact_leaves[node.parent]
+            leaves.remove(node)
+            if not leaves:
+                del self._exact_leaves[node.parent]
+        else:
+            key = node.key.child_key(self.page_size)
         v = node.parent.children.pop(key, None)
         assert v == node
         # Deleted nodes must not linger in duplicate tracking as ghosts.
@@ -2609,6 +2828,17 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
 
             has_device = cur.component_data[ct].value is not None
             has_host = cur.component_data[ct].host_value is not None
+
+            units = self.state_units
+            if units is not None and not units.holds(cur) and not units.pinned(cur):
+                # A childless node without a state: KV no request resumes from.
+                parent = cur.parent
+                units.delete_dead(
+                    cur, tracker, device_frees, host_frees, cache_actions=cache_actions
+                )
+                self._update_evictable_leaf_sets(parent)
+                cur = parent
+                continue
 
             if has_device:
                 self._update_evictable_leaf_sets(cur)
@@ -3330,6 +3560,11 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             self.component_protected_size_[component_type] += ledger
         else:
             self.component_evictable_size_[component_type] += ledger
+        units = self.state_units
+        if units is not None and component_type == units.state_component:
+            units.state_changed(node)
+        if self.gds is not None and component_type == self.slot_id(TREE_STATE):
+            self.gds.added(node)
 
     def adjust_component_size(
         self, node_id: NodeId, component_type: ComponentType, delta: int
@@ -3620,6 +3855,12 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                     f"[Ongoing] node {node.id} load_back_pending_id="
                     f"{node.load_back_pending_id} has no live load-back"
                 )
+
+        # -- PART 6: Eviction bookkeeping of hybrid-model states --
+        if self.state_units is not None:
+            self.state_units.check(E)
+        if self.gds is not None:
+            self.gds.check(E)
 
         if errors:
             msg = (

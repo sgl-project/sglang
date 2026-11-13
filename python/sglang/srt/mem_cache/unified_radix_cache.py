@@ -84,6 +84,7 @@ from sglang.srt.mem_cache.kv.plan import (
     TREE_WINDOW,
 )
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+from sglang.srt.mem_cache.miss_attribution import CacheMissAttribution
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
 from sglang.srt.mem_cache.unified_cache.cache_action import (
@@ -223,6 +224,8 @@ class UnifiedRadixCache(BasePrefixCache):
     # Whether eviction walks every component in one joint LRU order; set from the
     # eviction policy at construction (a cache built piecemeal walks per component).
     evicts_by_joint_lru: bool = False
+    # Whether eviction takes state units by GreedyDual-Size score; likewise.
+    evicts_by_gds: bool = False
 
     def __init__(
         self,
@@ -280,6 +283,14 @@ class UnifiedRadixCache(BasePrefixCache):
         self.enable_mamba_extra_buffer = (
             params.enable_mamba_extra_buffer if self.is_mamba_enabled else False
         )
+        self.miss_attribution: Optional[CacheMissAttribution] = (
+            CacheMissAttribution(
+                page_size=self.logical_page_size,
+                records_states=self.is_mamba_enabled,
+            )
+            if params.enable_cache_miss_attribution and not self.disable
+            else None
+        )
         self.decoder_swa_bounded_replay = params.decoder_swa_bounded_replay
         # The TreeCore owns the tree member-var state (structure, LRUs, sizes,
         # evictable leaves) and drives the components' tree-level hooks.
@@ -328,6 +339,50 @@ class UnifiedRadixCache(BasePrefixCache):
                 "joint Full/SWA eviction walk; "
                 f"SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND={self._tree_core_backend!r} "
                 "has none."
+            )
+        self.evicts_by_gds = (
+            not self.disable and tree_params.eviction_policy.lower() == "gds"
+        )
+        if self.evicts_by_gds:
+            if not self.tree_core.supports_gds_eviction:
+                raise ValueError(
+                    "--radix-eviction-policy gds requires a tree core that ranks "
+                    "state units; "
+                    f"SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND={self._tree_core_backend!r} "
+                    "does not."
+                )
+            if set(self.components) != {BASE_COMPONENT_TYPE, ComponentType.MAMBA}:
+                raise ValueError(
+                    "--radix-eviction-policy gds ranks trees of full attention "
+                    "and Mamba states only, got "
+                    f"{sorted(ct.name for ct in self.components)}."
+                )
+            self.tree_core.gds.state_tokens = self._state_slot_kv_tokens()
+        # A finished request's state at its exact end (MambaComponent and
+        # insert_exact_leaf); a request resuming inside a page copies it.
+        self.exact_checkpoint = (
+            not self.disable
+            and self.enable_mamba_extra_buffer
+            and params.enable_mamba_exact_checkpoint
+        )
+        if self.exact_checkpoint and set(self.components) != {
+            BASE_COMPONENT_TYPE,
+            ComponentType.MAMBA,
+        }:
+            raise ValueError(
+                "--enable-mamba-exact-checkpoint supports trees of full "
+                "attention and Mamba states only, got "
+                f"{sorted(ct.name for ct in self.components)}."
+            )
+        if (
+            self.exact_checkpoint
+            and self.token_to_kv_pool_allocator.page_size != self.page_size
+        ):
+            # A leaf ending inside a page owns the request's page holding it.
+            raise ValueError(
+                "--enable-mamba-exact-checkpoint needs the allocator's page to be "
+                f"the tree's, got {self.token_to_kv_pool_allocator.page_size} "
+                f"and {self.page_size}."
             )
 
         # Session ref tracking (--enable-session-radix-cache).
@@ -762,6 +817,13 @@ class UnifiedRadixCache(BasePrefixCache):
                 if step.result is not None:
                     # Walk actions flow through the steps; the result is action-free.
                     assert not step.result.cache_actions
+                    if self.miss_attribution is not None and (
+                        params.mamba_value is not None
+                        or params.mamba_host_value is not None
+                    ):
+                        self.miss_attribution.record_state(
+                            params.key.raw_token_ids(), len(params.key)
+                        )
                     return step.result
                 step = self.tree_core.resume_insert()
         finally:
@@ -1036,6 +1098,8 @@ class UnifiedRadixCache(BasePrefixCache):
             self._evict_by_joint_lru(
                 params, tracker, allocation_reclaim_satisfied=satisfied
             )
+        elif self.evicts_by_gds:
+            self._evict_by_gds(params, tracker, demand=demand, satisfied=satisfied)
         else:
             request_by_type = self._evict_request_by_type(params)
             self._evict_components(
@@ -1389,6 +1453,72 @@ class UnifiedRadixCache(BasePrefixCache):
         finally:
             self.tree_core.end_joint_eviction()
 
+    def _evict_by_gds(
+        self,
+        params: EvictParams,
+        tracker: dict[ComponentType, int],
+        *,
+        demand: Optional[dict[ComponentType, int]] = None,
+        satisfied: Optional[Callable[[], bool]] = None,
+    ) -> None:
+        """Evict units whole, lowest GreedyDual-Size score first, until
+        ``satisfied`` holds or every component's request is met. A request
+        for tokens alone takes only units that free KV."""
+        requested = self._evict_request_by_type(params)
+        state = self.slot_id(TREE_STATE)
+
+        def short(ct: ComponentType) -> bool:
+            if requested.get(ct, 0) <= 0:
+                return False
+            if demand is not None and ct in demand:
+                return self._pool_available(ct) < demand[ct]
+            return tracker[ct] < requested[ct]
+
+        try:
+            while True:
+                if satisfied is not None:
+                    if satisfied():
+                        break
+                    kv_only = False
+                else:
+                    short_token, short_state = short(BASE_COMPONENT_TYPE), short(state)
+                    if not (short_token or short_state):
+                        break
+                    kv_only = not short_state
+                node_id = self.tree_core.next_gds_victim(kv_only=kv_only)
+                if node_id is None:
+                    break
+                result = self.tree_core.evict_gds_victim(node_id)
+                self._apply_eviction_result(result)
+                self._accumulate_tracker(tracker, result.tracker)
+        finally:
+            self.tree_core.end_gds_eviction()
+
+    def _state_slot_kv_tokens(self) -> float:
+        """A state slot's bytes as KV tokens of the token sub-pool: what
+        GreedyDual-Size counts a unit's state as."""
+        from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator
+
+        allocator = self.token_to_kv_pool_allocator
+        if isinstance(allocator, ChainAllocator):
+            from sglang.srt.mem_cache.kv.decl import StateLifetime
+
+            plan = allocator.plan
+            state = plan.of_lifetime(StateLifetime)
+            return state.spec.entry_bytes() / plan.owner().spec.entry_bytes()
+        kv_pool = allocator.get_kvcache()
+        kv_bytes = kv_pool.get_kv_size_bytes()
+        if isinstance(kv_bytes, tuple):
+            kv_bytes = sum(kv_bytes)
+        mamba_pool = self.req_to_token_pool.mamba_pool
+        state_bytes = mamba_pool.get_kv_size_bytes()
+        if not (kv_bytes > 0 and state_bytes > 0):
+            raise ValueError(
+                "--radix-eviction-policy gds cannot size a state slot from these "
+                f"pools: {kv_bytes} KV bytes and {state_bytes} state bytes."
+            )
+        return (state_bytes / mamba_pool.size) / (kv_bytes / kv_pool.size)
+
     def _evict_leaf_with_backup(
         self, node_id: NodeId, tracker: dict[ComponentType, int]
     ) -> None:
@@ -1558,6 +1688,8 @@ class UnifiedRadixCache(BasePrefixCache):
 
     @rank_consensus(same_params=["req.rid", "checkpointed"])
     def on_release(self, req: Req, *, checkpointed: bool) -> None:
+        if self.miss_attribution is not None:
+            self.miss_attribution.forget_request(req.rid)
         if checkpointed:
             return
         for comp in self._components_tuple:
@@ -1582,6 +1714,11 @@ class UnifiedRadixCache(BasePrefixCache):
                 for comp in self._components_tuple:
                     comp.cleanup_after_caching_req(req, is_finished=True)
             return
+
+        if self.miss_attribution is not None:
+            self.miss_attribution.record_computed(
+                token_ids, len(token_ids), request_id=req.rid, finished=is_finished
+            )
 
         kv_indices_orig = self.req_to_token_pool.req_to_token[
             req.kv.req_pool_idx, : len(token_ids)
@@ -1637,12 +1774,24 @@ class UnifiedRadixCache(BasePrefixCache):
 
         kv_indices = kv_indices_orig[:effective_cache_len]
 
+        # An exact state that ends inside a page hangs below the page-aligned
+        # insert as a leaf of its own (_insert_exact_leaf).
+        exact_key = (
+            radix_key
+            if insert_params.mamba_from_live_slot
+            and effective_cache_len % self.page_size
+            else None
+        )
         radix_key = radix_key.page_aligned(self.page_size)
         page_aligned_len = len(radix_key)
         values = kv_indices[:page_aligned_len].to(dtype=torch.int64, copy=True)
 
         insert_params.key = radix_key
         insert_params.value = values
+        exact_state = None
+        if exact_key is not None:
+            exact_state, insert_params.mamba_value = insert_params.mamba_value, None
+            insert_params.allow_missing_mamba = True
         reuse_existing_mamba = False
         if self._mamba_host_only_checkpoint():
             mamba = self.components.get(ComponentType.MAMBA)
@@ -1718,6 +1867,20 @@ class UnifiedRadixCache(BasePrefixCache):
             (req.kv.req_pool_idx, slice(req.kv.cache_protected_len, len(new_indices))),
             new_indices[req.kv.cache_protected_len :],
         )
+        protected_len = len(new_indices)
+        if exact_key is not None:
+            result = self._insert_exact_leaf(
+                new_last_node,
+                exact_key[page_aligned_len:],
+                kv_indices[page_aligned_len : page_aligned_len + 1],
+                exact_state,
+                insert_params.priority,
+                token_ids,
+            )
+            if not result.mamba_exist:
+                # The leaf took the request's page holding these tokens.
+                new_last_node = result.last_device_node
+                protected_len = effective_cache_len
 
         self.unlock(req.lock)
         # Opt-in: leave the matched-prefix mamba evictable during decode (it is
@@ -1737,7 +1900,7 @@ class UnifiedRadixCache(BasePrefixCache):
         )
 
         # Update req fields
-        req.kv.protect_prefix(len(new_indices))
+        req.kv.protect_prefix(protected_len)
         req.last_node = new_last_node
 
         # cleanup
@@ -1756,6 +1919,30 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.session_refs.register_session_ref(
                     req, leaf=result.last_device_node
                 )
+
+    def _insert_exact_leaf(
+        self,
+        parent: NodeId,
+        key: RadixKey,
+        first_slot: torch.Tensor,
+        mamba_value: torch.Tensor,
+        priority: int,
+        token_ids: array,
+    ) -> InsertResult:
+        """Cache a finished request's state that ends inside a page under
+        ``parent``: the leaf takes the state slot and the request's whole page
+        holding ``key``, which starts at ``first_slot`` (a slot keeps its
+        token's offset in the page)."""
+        value = first_slot.to(torch.int64) + torch.arange(
+            self.page_size, dtype=torch.int64, device=first_slot.device
+        )
+        result, actions = self.tree_core.insert_exact_leaf(
+            parent, key, value, mamba_value, priority=priority
+        )
+        self._apply_cache_actions(actions)
+        if not result.mamba_exist and self.miss_attribution is not None:
+            self.miss_attribution.record_state(token_ids, len(token_ids))
+        return result
 
     @rank_consensus(same_params=["req.rid"])
     def advance_unpublished_req(self, req: Req) -> None:
@@ -4886,7 +5073,40 @@ class UnifiedRadixCache(BasePrefixCache):
             if tail is not None:
                 path = torch.cat([path, tail])
         assert len(path) >= req.prefix_len, (req.rid, len(path), req.prefix_len)
+        if self.exact_checkpoint and req.kv.kv_copy_dst is not None:
+            # The page take_resume_page gave the request replaces the cached one.
+            start = req.kv.cache_protected_len
+            own = req.kv.kv_copy_dst[: req.prefix_len - start].to(path.dtype)
+            return torch.cat([path[:start], own])
         return path[: req.prefix_len]
+
+    def resume_copy_tokens(self, req: Req) -> int:
+        """The tokens of the page a request whose prefix ends inside a cached
+        page (an exact leaf's) takes to copy that page into; 0 for any other."""
+        if (
+            self.exact_checkpoint
+            and not req.kv.holds_kv
+            and req.prefix_len % self.page_size
+            and req.prefix_len > req.kv.cache_protected_len
+        ):
+            return self.page_size
+        return 0
+
+    def take_resume_page(self, req: Req) -> None:
+        """A request resuming inside a cached page (an exact leaf's) takes a
+        page of its own, allocated here (which may evict) and given a copy of
+        the cached page before its first forward. Its prefix then maps the
+        tree's path up to that page and the first slots of its own, so its
+        writes past the prefix never land in the cached page."""
+        if req.kv.kv_copy_dst is not None or not self.resume_copy_tokens(req):
+            return
+        from sglang.srt.mem_cache.allocation import alloc_token_slots
+
+        start = req.kv.cache_protected_len
+        root = self.root_node_handle(req.extra_key)
+        path = self.tree_core.collect_full_device_indices(req.last_node, root)
+        req.kv.kv_copy_src = path[start : start + self.page_size].to(torch.int64)
+        req.kv.kv_copy_dst = alloc_token_slots(self, self.page_size).to(torch.int64)
 
     def path_device_indices(self, node: NodeId) -> torch.Tensor:
         return self.tree_core.collect_full_device_indices(node, self.root_node_handle())

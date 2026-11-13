@@ -23,6 +23,8 @@ class CacheConfig:
     decoder_swa_bounded_replay: bool = False
 
     enable_mamba_extra_buffer: bool = False
+    enable_mamba_unit_eviction: bool = False
+    enable_mamba_exact_checkpoint: bool = False
     mamba_cache_size: int = 20
     mamba_intermediate_size: int = 256
     mamba_n_groups: int = 1
@@ -40,6 +42,7 @@ class CacheConfig:
     head_dim: int = 64
     dtype: torch.dtype = torch.bfloat16
     eviction_policy: str = "lru"
+    eviction_policy_config: Optional[dict] = None
     is_eagle: bool = False
 
     @property

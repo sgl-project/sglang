@@ -389,10 +389,32 @@ def handle_cache_compatibility(server_args: Any) -> None:
                 "ever TEL-safe and T-LRU is exactly LRU."
             )
 
+    if cfg.radix_eviction_policy == "gds":
+        from sglang.srt.mem_cache.utils import get_eviction_strategy
+
+        # Fail on a missing or malformed parameter before any model loads.
+        get_eviction_strategy("gds", cfg.radix_eviction_policy_config)
+        for refused, flag in (
+            (cfg.disable_radix_cache, "--disable-radix-cache"),
+            (cfg.radix_cache_backend is not None, "--radix-cache-backend"),
+            (cfg.enable_hierarchical_cache, "--enable-hierarchical-cache"),
+            (cfg.enable_session_radix_cache, "--enable-session-radix-cache"),
+        ):
+            if refused:
+                raise ValueError(
+                    "--radix-eviction-policy gds ranks the device states of the "
+                    f"built-in radix cache and does not support {flag} yet."
+                )
+
     if cfg.enable_hierarchical_cache and cfg.disable_radix_cache:
         raise ValueError(
             "The arguments enable-hierarchical-cache and disable-radix-cache are mutually exclusive "
             "and cannot be used at the same time. Please use only one of them."
+        )
+    if cfg.enable_cache_miss_attribution and cfg.disable_radix_cache:
+        raise ValueError(
+            "--enable-cache-miss-attribution explains prefix cache misses; it "
+            "cannot be combined with --disable-radix-cache."
         )
 
     if cfg.enable_prefill_weight_versions:

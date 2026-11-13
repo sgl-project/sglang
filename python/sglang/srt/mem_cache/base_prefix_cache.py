@@ -39,6 +39,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import HiCacheController
     from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
     from sglang.srt.mem_cache.buffer_mode.pipeline import BufferModePipeline
+    from sglang.srt.mem_cache.miss_attribution import CacheMissAttribution
     from sglang.srt.mem_cache.radix_cache import RadixKey
     from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
     from sglang.srt.mem_cache.unified_cache.cache_action import (
@@ -104,6 +105,9 @@ class InsertParams:
     # Prepare held the running request's state back from the tree; the request
     # keeps its tracked checkpoint for a later insert.
     mamba_checkpoint_deferred: bool = False
+    # mamba_value is the finished request's own state slot, at the exact end
+    # (--enable-mamba-exact-checkpoint); cleanup keeps it once inserted.
+    mamba_from_live_slot: bool = False
 
     # DSV4 NPU C128 sidecar pages, one page id per physical C128 page group.
     c128_value: Optional[torch.Tensor] = None
@@ -487,6 +491,12 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     storage_prefetch_retries: Optional[StoragePrefetchRetries] = None
     # Set by caches that publish KV placement events; None means they don't.
     kv_events: Optional[KVCacheEventRecorder] = None
+    # Set by caches that split prompt cache misses by cause
+    # (--enable-cache-miss-attribution); None means they don't.
+    miss_attribution: Optional[CacheMissAttribution] = None
+    # Whether a finished request's state is cached at its exact end, so a
+    # request can resume inside a page (--enable-mamba-exact-checkpoint).
+    exact_checkpoint: bool = False
 
     def init_metrics_collector(self):
         from sglang.srt.layers.dp_attention import is_dp_attention_enabled
@@ -722,6 +732,16 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         path = self.path_device_indices(req.last_node)
         assert len(path) >= req.prefix_len, (req.rid, len(path), req.prefix_len)
         return path[: req.prefix_len]
+
+    def resume_copy_tokens(self, req: Req) -> int:
+        """Tokens admission adds for ``req`` because its prefix ends inside a
+        cached page that it copies into a page of its own (0 here)."""
+        return 0
+
+    def take_resume_page(self, req: Req) -> None:
+        """Before a new request's prefix is read (``prefix_device_indices``),
+        take the page of its own that a request resuming inside a cached page
+        copies into; allocating it may evict. Nothing here."""
 
     def maybe_hand_to_session(self, req: Req) -> None:
         """A cache that keeps records across requests (a streaming session) takes

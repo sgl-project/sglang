@@ -377,6 +377,29 @@ class UnifiedTreeCoreInterface(ABC):
 
     # ==== Device eviction (driven step-wise by the Controller's evict()) ====
 
+    # Unit eviction (--enable-mamba-unit-eviction): which subtrees still hold a
+    # state, on a core that evicts a state with the KV only it serves; None on
+    # any other.
+    state_units = None
+
+    # GreedyDual-Size: whether this core ranks state units (gds policy), and the
+    # units it ranks while the policy is on. UnifiedRadixCache.__init__ rejects
+    # gds on a core without them.
+    supports_gds_eviction: bool = False
+    gds = None
+
+    def next_gds_victim(self, kv_only: bool = False) -> Optional[NodeId]:
+        """The next node to evict whole, or None when none is left. A TreeCore
+        without a GreedyDual-Size walk raises."""
+        raise NotImplementedError(f"{type(self).__name__} has no GreedyDual-Size walk")
+
+    def evict_gds_victim(self, node_id: NodeId) -> EvictDeviceLeafResult:
+        """Evict a node ``next_gds_victim`` chose."""
+        raise NotImplementedError(f"{type(self).__name__} has no GreedyDual-Size walk")
+
+    def end_gds_eviction(self) -> None:
+        raise NotImplementedError(f"{type(self).__name__} has no GreedyDual-Size walk")
+
     # Joint LRU: whether this core has the joint Full/SWA eviction walk below.
     # UnifiedRadixCache.__init__ rejects joint_lru on a core without it.
     supports_joint_eviction: bool = False
@@ -603,6 +626,18 @@ class UnifiedTreeCoreInterface(ABC):
     def end_insert(self) -> list[CacheAction | ComponentAction]:
         """Finish the insert (idempotent); returns still-pending actions to drain."""
         ...
+
+    def insert_exact_leaf(
+        self,
+        node_id: NodeId,
+        key: RadixKey,
+        value: torch.Tensor,
+        mamba_value: torch.Tensor,
+        priority: int = 0,
+    ) -> tuple[InsertResult, list[CacheAction | ComponentAction]]:
+        """Cache a state that ends inside a page as a leaf under ``node_id``
+        (--enable-mamba-exact-checkpoint, which selects the Python core)."""
+        raise NotImplementedError(f"{type(self).__name__} has no exact leaves")
 
     @abstractmethod
     def drive_host_eviction(
