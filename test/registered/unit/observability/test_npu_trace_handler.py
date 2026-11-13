@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Shared NPU trace policy and both SRT callers, with real CPU profiling."""
 
+import importlib.util
 import multiprocessing
 import tempfile
 import unittest
@@ -9,6 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
+from torch.profiler import profiler as torch_profiler
 
 from sglang.srt.managers.scheduler_components import profiler_manager
 from sglang.srt.model_executor.forward_mode import ForwardMode
@@ -17,7 +19,8 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
-TORCH_PROFILE = torch.profiler.profile
+# The public torch.profiler alias may already be replaced by torch_npu.
+TORCH_PROFILE = torch_profiler.profile
 
 
 class TestNPUTraceHandler(unittest.TestCase):
@@ -228,6 +231,17 @@ class TestSRTNPUTraceHandler(unittest.TestCase):
                 )
                 self.native_analysis.assert_not_called()
                 self.assertEqual(self.events, ["submit analysis", "barrier"])
+
+    def test_cpu_fixture_ignores_prepatched_public_profile(self):
+        spec = importlib.util.spec_from_file_location("srt_profiler_tests", __file__)
+        module = importlib.util.module_from_spec(spec)
+        with patch.object(torch.profiler, "profile", object()):
+            spec.loader.exec_module(module)
+            with module.TORCH_PROFILE(
+                activities=[torch.profiler.ProfilerActivity.CPU]
+            ) as profiler:
+                torch.ones(1).add_(1)
+        self.assertTrue(profiler.events())
 
     def test_non_npu_srt_paths_keep_chrome_trace_export(self):
         with (

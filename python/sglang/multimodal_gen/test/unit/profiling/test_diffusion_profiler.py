@@ -11,12 +11,14 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
+from torch.profiler import profiler as torch_profiler
 
 from sglang.multimodal_gen.runtime.utils import profiler as profiler_module
 from sglang.srt.observability import profile_analysis_npu
 
-TORCH_PROFILE = torch.profiler.profile
-TORCH_SCHEDULE = torch.profiler.schedule
+# The public torch.profiler aliases may already be replaced by torch_npu.
+TORCH_PROFILE = torch_profiler.profile
+TORCH_SCHEDULE = torch_profiler.schedule
 
 
 class FakeNPUProfile(TORCH_PROFILE):
@@ -140,6 +142,24 @@ class TestDiffusionProfiler(unittest.TestCase):
         )
         self.addCleanup(wrapper.stop, export_trace=False)
         return wrapper
+
+    def test_cpu_fixture_ignores_prepatched_public_profiler(self):
+        spec = importlib.util.spec_from_file_location(
+            "diffusion_profiler_tests", __file__
+        )
+        module = importlib.util.module_from_spec(spec)
+        with (
+            patch.object(torch.profiler, "profile", object()),
+            patch.object(torch.profiler, "schedule", object()),
+        ):
+            spec.loader.exec_module(module)
+            schedule = module.TORCH_SCHEDULE(wait=0, warmup=1, active=1, repeat=1)
+            with module.FakeNPUProfile(schedule=schedule) as profiler:
+                profiler.step()
+                torch.ones(1).add_(1)
+                profiler.step()
+        profiler.prof_if.analyse.assert_not_called()
+        self.assertTrue(profiler.events())
 
     def test_npu_scheduled_callback_at_seventh_step(self):
         wrapper = self.make_profiler()
