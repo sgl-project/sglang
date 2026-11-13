@@ -196,7 +196,10 @@ class DocPrefetch:
         self._device = device
         self._forward_stream = forward_stream
         # Vision runs on every TP rank in lockstep; it is not encoded out of step.
-        self._encode_ahead = early is not None and tp_size == 1
+        # MPS has no side stream to encode on, so its pages encode at prefill.
+        self._encode_ahead = (
+            early is not None and tp_size == 1 and torch.device(device).type != "mps"
+        )
         # Follow-ups waiting for their predecessor.
         self._parked = IndexedReqList(
             ListKind.UOCR_PARKED, abort=lambda r: self._abort(self._parked, r)
