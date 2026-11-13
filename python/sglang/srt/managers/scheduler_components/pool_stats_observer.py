@@ -93,8 +93,10 @@ class PoolStats:
 
     # HiSparse device/host breakdown for decode logs (plain KV pool only)
     hisparse_device_tokens: Optional[int] = None
+    hisparse_device_capacity: Optional[int] = None
     hisparse_device_token_usage: Optional[float] = None
     hisparse_host_tokens: Optional[int] = None
+    hisparse_host_capacity: Optional[int] = None
     hisparse_host_token_usage: Optional[float] = None
 
     def window(self, name: str) -> Optional[WindowPoolStats]:
@@ -190,6 +192,19 @@ class PoolStats:
             stats.mamba_available_tokens = self.mamba_available_size
             stats.mamba_evictable_tokens = self.mamba_evictable_size
             stats.mamba_used_tokens = self.mamba_num_used
+        if self.is_hisparse:
+            assert self.hisparse_device_tokens is not None
+            assert self.hisparse_device_capacity is not None
+            assert self.hisparse_device_token_usage is not None
+            assert self.hisparse_host_tokens is not None
+            assert self.hisparse_host_capacity is not None
+            assert self.hisparse_host_token_usage is not None
+            stats.hisparse_device_used_tokens = self.hisparse_device_tokens
+            stats.hisparse_device_total_tokens = self.hisparse_device_capacity
+            stats.hisparse_device_token_usage = self.hisparse_device_token_usage
+            stats.hisparse_host_used_tokens = self.hisparse_host_tokens
+            stats.hisparse_host_total_tokens = self.hisparse_host_capacity
+            stats.hisparse_host_token_usage = self.hisparse_host_token_usage
         stats.kv_available_tokens = self.full_available_size
         stats.kv_evictable_tokens = self.full_evictable_size
         stats.kv_used_tokens = self.full_num_used
@@ -291,8 +306,10 @@ class SchedulerPoolStatsObserver:
                 pool_stats,
                 is_hisparse=True,
                 hisparse_device_tokens=h.device_tokens,
+                hisparse_device_capacity=h.device_capacity,
                 hisparse_device_token_usage=h.device_token_usage,
                 hisparse_host_tokens=h.host_tokens,
+                hisparse_host_capacity=h.host_capacity,
                 hisparse_host_token_usage=h.host_token_usage,
             )
         return pool_stats
