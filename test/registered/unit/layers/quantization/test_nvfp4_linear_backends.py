@@ -8,7 +8,12 @@ two-shard case guards the per-partition scale gathering of fused layers.
 import unittest
 from unittest import mock
 
+import pytest
 import torch
+
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
 from flashinfer import fp4_quantize
 
 from sglang.srt.layers.quantization import fp4_utils

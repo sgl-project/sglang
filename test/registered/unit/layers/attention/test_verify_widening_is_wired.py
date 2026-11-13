@@ -28,7 +28,12 @@ kernel reads: every row translated, and filled through the draft tail.
 import unittest
 from types import SimpleNamespace
 
+import pytest
 import torch
+
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
 
 from sglang.srt.layers.attention.flashattention_backend import (
     FlashAttentionBackend,

@@ -9,6 +9,13 @@ regime is covered by test_spec_eagle_fa3.py page256 on the Hopper runner.
 
 import unittest
 
+import pytest
+import torch
+
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
+
 from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.spec_server_kits import (

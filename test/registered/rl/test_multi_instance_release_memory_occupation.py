@@ -6,9 +6,14 @@ import unittest
 from multiprocessing import Process
 from typing import Iterable, Tuple
 
+import pytest
 import torch
 import torch.distributed as dist
 from torch.distributed.device_mesh import init_device_mesh
+
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
 from transformers import AutoModelForCausalLM
 
 from sglang.srt.entrypoints.engine import Engine as SglangEngine

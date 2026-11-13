@@ -4,6 +4,13 @@ import logging
 import unittest
 from typing import List
 
+import pytest
+import torch
+
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
+
 import aiohttp
 import numpy as np
 import requests

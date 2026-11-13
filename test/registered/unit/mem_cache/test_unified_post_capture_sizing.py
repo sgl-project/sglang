@@ -28,7 +28,12 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 import torch
+
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
 
 from sglang.srt.mem_cache.kv.layout.mha import DraftMHAView
 from sglang.srt.mem_cache.kv.sizing import KVSizingInputs, size_plan

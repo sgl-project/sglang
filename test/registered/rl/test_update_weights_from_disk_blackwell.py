@@ -1,3 +1,5 @@
+import torch
+
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=745, stage="nightly", runner_config="4-gpu-b200")
@@ -198,6 +200,7 @@ class UpdateWeightsFromDiskBase:
                     kill_process_tree(process.pid, wait_timeout=60)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestServerUpdateWeightsFromDiskMXFP8(UpdateWeightsFromDiskBase, CustomTestCase):
     model = "zianglih/JoyAI-LLM-Flash-MXFP8-last-6-BF16"
     decode_payload = {**UpdateWeightsFromDiskBase.decode_payload, "routed_dp_rank": 0}
@@ -219,6 +222,7 @@ class TestServerUpdateWeightsFromDiskMXFP8(UpdateWeightsFromDiskBase, CustomTest
     )
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestServerUpdateWeightsFromDiskNVFP4(UpdateWeightsFromDiskBase, CustomTestCase):
     model = "nvidia/Qwen3-30B-A3B-NVFP4"
     backend_test_suites = (
@@ -236,6 +240,7 @@ class TestServerUpdateWeightsFromDiskNVFP4(UpdateWeightsFromDiskBase, CustomTest
     )
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestServerUpdateWeightsFromDiskNVFP4CuteDSL(
     UpdateWeightsFromDiskBase, CustomTestCase
 ):
@@ -268,6 +273,7 @@ class TestServerUpdateWeightsFromDiskNVFP4CuteDSL(
     )
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestServerUpdateWeightsFromDiskNVFP4W4A16CuteDSL(
     UpdateWeightsFromDiskBase, CustomTestCase
 ):
@@ -299,6 +305,7 @@ class TestServerUpdateWeightsFromDiskNVFP4W4A16CuteDSL(
     )
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestServerUpdateWeightsFromDiskNVFP4W4A16MegaMoE(
     UpdateWeightsFromDiskBase, CustomTestCase
 ):

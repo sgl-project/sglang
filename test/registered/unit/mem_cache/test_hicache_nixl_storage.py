@@ -1,5 +1,12 @@
 """Unit tests for the NIXL HiCache storage backend -- no server, no model loading."""
 
+import pytest
+import torch
+
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
+
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=13, stage="base-b", runner_config="1-gpu-small")

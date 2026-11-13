@@ -17,6 +17,8 @@ Example usage:
 import os
 import unittest
 
+import torch
+
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.nightly_bench_utils import generate_simple_markdown_report
 from sglang.test.nightly_utils import NightlyBenchmarkRunner
@@ -69,6 +71,7 @@ class TestNightlyGptOssPerformanceAMD(unittest.TestCase):
         cls.runner.setup_result_directory()
         cls.runner.full_report = f"## {cls.__name__}\n"
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_bench_one_batch(self):
         """Benchmark every GPT-OSS size."""
         failures = []

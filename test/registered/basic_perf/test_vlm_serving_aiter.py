@@ -2,6 +2,13 @@
 
 import unittest
 
+import pytest
+import torch
+
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
+
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.kits.vlm_perf_kit import check_vlm_serving_perf
 from sglang.test.test_utils import CustomTestCase

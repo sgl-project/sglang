@@ -48,6 +48,13 @@ Registry: nightly-amd-8-gpu-mi35x-glm53-flash suite
 import unittest
 from types import SimpleNamespace
 
+import pytest
+import torch
+
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
+
 from sglang.srt.utils import kill_process_tree
 from sglang.test.accuracy_test_runner import (
     AccuracyTestResult,

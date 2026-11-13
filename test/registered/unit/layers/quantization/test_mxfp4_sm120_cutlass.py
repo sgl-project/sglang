@@ -91,6 +91,7 @@ def test_cutlass_adapter_import_does_not_require_flashinfer(monkeypatch):
             sys.modules[module_name] = cached_module
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_dsv4_sm120_load_contract(monkeypatch, request):
     import sglang.srt.layers.quantization.mxfp4_flashinfer_cutlass_moe as adapter_module
     from sglang.srt.runtime_context import get_context

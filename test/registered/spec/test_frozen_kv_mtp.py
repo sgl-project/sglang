@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from typing import Optional
 
 import requests
+import torch
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
@@ -40,6 +41,7 @@ def get_avg_spec_accept_length(base_url: str) -> Optional[float]:
     return float(value)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestFrozenKVMTP(CustomTestCase):
     base_url = DEFAULT_URL_FOR_TEST
 

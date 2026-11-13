@@ -2,7 +2,12 @@ import unittest
 from types import MethodType, SimpleNamespace
 from unittest import mock
 
+import pytest
 import torch
+
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
 
 from sglang.kernels.ops.speculative.dspark.dspark_draft_model import (
     MarkovGreedyStep,

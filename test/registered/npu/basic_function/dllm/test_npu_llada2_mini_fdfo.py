@@ -1,5 +1,12 @@
 import unittest
 
+import pytest
+import torch
+
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
+
 from sglang.test.ascend.test_ascend_utils import (
     LLaDA2_0_MINI_WEIGHTS_PATH,
     run_bench_serving,

@@ -2,7 +2,12 @@
 import math
 import unittest
 
+import pytest
 import torch
+
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
 
 from sglang.srt.batch_invariant_ops import batch_invariant_ops
 from sglang.srt.batch_invariant_ops.batch_invariant_ops import set_batch_invariant_mode

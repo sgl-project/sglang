@@ -10,6 +10,8 @@ Registry: nightly-amd-8-gpu-mi35x suite
 import ast
 import os
 
+import torch
+
 # Set HF cache for MI35x
 os.environ.setdefault("HF_HOME", "/data2/models/huggingface")
 os.environ.setdefault("HF_HUB_CACHE", "/data2/models/huggingface/hub")
@@ -167,6 +169,7 @@ def run_gsm8k_benchmark(
     return float(acc), float(invalid), float(latency)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestGptOssW4A8Mxfp4EvalMI35x(unittest.TestCase):
     """GPT-OSS W4A8 MXFP4-FP8 GSM8K Completion Evaluation Test for AMD MI35x."""
 

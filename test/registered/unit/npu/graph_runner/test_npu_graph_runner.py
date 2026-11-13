@@ -7,6 +7,10 @@ from unittest import mock
 import pytest
 import torch
 
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
+
 from sglang.srt.hardware_backend.npu.graph_runner import npu_cudagraph_backend as mod
 from sglang.srt.model_executor.runner import decode_cuda_graph_runner as runner_mod
 from sglang.test.ci.ci_register import register_npu_ci
