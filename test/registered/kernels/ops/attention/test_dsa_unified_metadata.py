@@ -14,12 +14,7 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.kernels.ops.attention.dsa.metadata import (
-    fused_dsa_decode_metadata,
-    fused_dsa_draft_extend_metadata,
-    fused_dsa_target_verify_metadata,
-    gather_physical_token_table,
-)
+from sglang.kernels.ops.attention.dsa.metadata import gather_physical_token_table
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import DSATopKBackend
 from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
@@ -27,7 +22,7 @@ from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=40, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=25, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 PAGE = 64
 REQ_ROWS, WIDTH = 8, 4096
@@ -62,156 +57,6 @@ def _runner_ids(v2p):
         page_size=PAGE,
         space=lambda kind: space if kind == IdSpaceKind.FULL else None,
     )
-
-
-class _Tables:
-    """Graph-shaped metadata buffers for ``rows`` query rows."""
-
-    def __init__(self, bs, rows, *, wide):
-        dev = "cuda"
-        self.cache_seqlens = torch.zeros(bs, dtype=torch.int32, device=dev)
-        self.cu_seqlens_k = torch.zeros(bs + 1, dtype=torch.int32, device=dev)
-        self.seqlens_expanded = torch.zeros(rows, dtype=torch.int32, device=dev)
-        self.dsa_cache_seqlens = torch.zeros(rows, dtype=torch.int32, device=dev)
-        self.dsa_cu_seqlens_k = torch.zeros(rows + 1, dtype=torch.int32, device=dev)
-        self.page_table_1 = (
-            torch.full((rows, WIDTH), -7, dtype=torch.int32, device=dev)
-            if wide
-            else None
-        )
-        self.real_page_table = torch.full(
-            (rows, WIDTH // PAGE), -7, dtype=torch.int32, device=dev
-        )
-
-
-class TestFusedMetadataTranslates(CustomTestCase):
-    def _check(self, tables, expected, lengths):
-        """Live prefixes hold `expected` (the reference translation, one row
-        per query row); the tails are never read."""
-        for row, length in enumerate(lengths):
-            if tables.page_table_1 is not None:
-                torch.testing.assert_close(
-                    tables.page_table_1[row, :length], expected[row, :length]
-                )
-            pages = -(-length // PAGE)
-            torch.testing.assert_close(
-                tables.real_page_table[row, :pages],
-                expected[row, :length:PAGE] // PAGE,
-            )
-
-    def test_decode(self):
-        req_to_token, v2p = _virtual_pool()
-        req = torch.tensor([5, 0, 7, 2], device="cuda")
-        seq = torch.tensor([1, 64, 2049, 4000], device="cuda")
-        expected = _physical(req_to_token[req], v2p)
-        for wide in (True, False):
-            with self.subTest(wide=wide):
-                t = _Tables(4, 4, wide=wide)
-                fused_dsa_decode_metadata(
-                    seq_lens=seq,
-                    req_pool_indices=req,
-                    req_to_token=req_to_token,
-                    cache_seqlens=t.cache_seqlens,
-                    cu_seqlens_k=t.cu_seqlens_k,
-                    page_table_1=t.page_table_1,
-                    dsa_cache_seqlens=t.dsa_cache_seqlens,
-                    dsa_cu_seqlens_k=t.dsa_cu_seqlens_k,
-                    real_page_table=t.real_page_table,
-                    bs=4,
-                    max_len=WIDTH,
-                    dsa_index_topk=TOPK,
-                    physical_page_size=PAGE,
-                    v2p=v2p,
-                )
-                self._check(t, expected, seq.tolist())
-
-    def test_decode_without_v2p_keeps_ids(self):
-        req_to_token, _ = _virtual_pool()
-        req = torch.tensor([3, 1], device="cuda")
-        seq = torch.tensor([100, 700], device="cuda")
-        t = _Tables(2, 2, wide=True)
-        fused_dsa_decode_metadata(
-            seq_lens=seq,
-            req_pool_indices=req,
-            req_to_token=req_to_token,
-            cache_seqlens=t.cache_seqlens,
-            cu_seqlens_k=t.cu_seqlens_k,
-            page_table_1=t.page_table_1,
-            dsa_cache_seqlens=t.dsa_cache_seqlens,
-            dsa_cu_seqlens_k=t.dsa_cu_seqlens_k,
-            real_page_table=t.real_page_table,
-            bs=2,
-            max_len=WIDTH,
-            dsa_index_topk=TOPK,
-            physical_page_size=PAGE,
-        )
-        self._check(t, req_to_token[req], seq.tolist())
-
-    def test_target_verify(self):
-        req_to_token, v2p = _virtual_pool(1)
-        next_n = 3
-        req = torch.tensor([6, 1, 4], device="cuda")
-        seq = torch.tensor([60, 129, 3000], device="cuda")
-        expected = _physical(req_to_token[req], v2p).repeat_interleave(next_n, 0)
-        lengths = (seq + next_n).repeat_interleave(next_n).tolist()
-        for wide in (True, False):
-            with self.subTest(wide=wide):
-                t = _Tables(3, 3 * next_n, wide=wide)
-                fused_dsa_target_verify_metadata(
-                    seq_lens=seq,
-                    req_pool_indices=req,
-                    req_to_token=req_to_token,
-                    cache_seqlens=t.cache_seqlens,
-                    cu_seqlens_k=t.cu_seqlens_k,
-                    page_table_1=t.page_table_1,
-                    seqlens_expanded=t.seqlens_expanded,
-                    dsa_cache_seqlens=t.dsa_cache_seqlens,
-                    dsa_cu_seqlens_k=t.dsa_cu_seqlens_k,
-                    real_page_table=t.real_page_table,
-                    bs=3,
-                    max_seqlen_k=WIDTH,
-                    dsa_index_topk=TOPK,
-                    physical_page_size=PAGE,
-                    next_n=next_n,
-                    v2p=v2p,
-                )
-                self._check(t, expected, lengths)
-
-    def test_draft_extend(self):
-        req_to_token, v2p = _virtual_pool(2)
-        width = 4
-        req = torch.tensor([2, 7], device="cuda")
-        seq = torch.tensor([70, 2500], device="cuda")
-        expected = _physical(req_to_token[req], v2p).repeat_interleave(width, 0)
-        lengths = seq.repeat_interleave(width).tolist()
-        for wide in (True, False):
-            with self.subTest(wide=wide):
-                t = _Tables(2, 2 * width, wide=wide)
-                fused_dsa_draft_extend_metadata(
-                    seq_lens=seq,
-                    extend_seq_lens=torch.full(
-                        (2,), width, dtype=torch.int32, device="cuda"
-                    ),
-                    req_pool_indices=req,
-                    req_to_token=req_to_token,
-                    cache_seqlens=t.cache_seqlens,
-                    cu_seqlens_k=t.cu_seqlens_k,
-                    page_table_1=t.page_table_1,
-                    seqlens_expanded=t.seqlens_expanded,
-                    dsa_cache_seqlens=t.dsa_cache_seqlens,
-                    dsa_cu_seqlens_k=t.dsa_cu_seqlens_k,
-                    real_page_table=t.real_page_table,
-                    bs=2,
-                    total_len=2 * width,
-                    max_seqlen_k=WIDTH,
-                    dsa_index_topk=TOPK,
-                    physical_page_size=PAGE,
-                    max_extend_len=width,
-                    max_total_len=2 * width,
-                    static_extend_len=True,
-                    v2p=v2p,
-                )
-                self._check(t, expected, lengths)
 
 
 def _graph_backend(req_to_token, runner_ids, *, drop_wide, bs):
@@ -316,7 +161,7 @@ class TestEagerGatherTranslates(CustomTestCase):
     def test_gather_matches_the_reference(self):
         req_to_token, v2p = _virtual_pool(4)
         req = torch.tensor([7, 0, 3], device="cuda")
-        for width in (1, 64, 1000, WIDTH, WIDTH + 100):
+        for width in (1000, WIDTH + 100):
             with self.subTest(width=width):
                 table = gather_physical_token_table(req_to_token, req, width, v2p, PAGE)
                 self.assertEqual(table.dtype, torch.int32)

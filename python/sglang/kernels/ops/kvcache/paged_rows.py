@@ -1,16 +1,9 @@
 """Addressing a per-layer KV buffer's rows by token id when its pages are not
-packed back to back.
-
-A layer's rows are usually a flat run of rows, where token ``t``'s row is row
-``t``. A paged buffer ``(pages, page_size, 1, row)`` whose pages lie further
-apart than ``page_size`` rows (each page entry also holds other layers' rows
-and other parts) keeps token ``t``'s row at
+packed: a paged ``(pages, page_size, 1, row)`` buffer keeps token ``t``'s row at
 
     (t // page_size) * page_stride + (t % page_size) * row_stride
 
-Kernels that read or write rows by token id take ``PAGE_SIZE`` (1 for a flat
-run) and the two strides; with ``PAGE_SIZE`` 1 the offset is ``t * row_stride``,
-the address and the code a flat run always had.
+Kernels take ``PAGE_SIZE`` (1 for a flat run of rows) and both strides.
 """
 
 from typing import Optional, Tuple
@@ -21,9 +14,8 @@ import triton.language as tl
 
 
 def paged_layout(buffer: torch.Tensor) -> Optional[Tuple[int, int, int]]:
-    """``(page_size, page_stride, row_stride)`` in ``buffer``'s elements when
-    it is a paged buffer whose pages are not packed, else None (a flat run of
-    rows, addressed by its row stride as before)."""
+    """``(page_size, page_stride, row_stride)`` in elements when ``buffer`` is
+    a paged buffer whose pages are not packed, else None."""
     if buffer.dim() != 4:
         return None
     pages, page_size, heads, _ = buffer.shape

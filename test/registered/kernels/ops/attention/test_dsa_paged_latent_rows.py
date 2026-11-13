@@ -1,17 +1,8 @@
-"""Paged latent rows of the unified memory pool, on GPU.
-
-The unified pool lays a sparse-attention page out layer by layer, so a layer's
-latent rows are a paged buffer ``(pages, 64, 1, 656)`` whose pages lie a page
-entry apart. The latent writers, the prefix dequant gathers and FlashMLA's
-sparse decode address token ``t``'s row through the buffer's page and row
-strides, with the token id itself:
-
-  - each kernel writes and reads the same bytes on the paged buffer as on a
-    static pool's flat run of rows, and touches nothing else of the page;
-  - on a flat run of rows the kernels write exactly what they always did;
-  - a decode step launches no more kernels on the unified pool than on a
-    static one: metadata (eager and graph replay) and every layer's latent
-    write, index-key write and attention.
+"""Paged latent rows of the unified pool, on GPU: a layer's rows are a
+``(pages, 64, 1, 656)`` buffer whose pages lie a page entry apart. The writers,
+the dequant gathers and FlashMLA sparse decode must touch the same bytes as on a
+flat run of rows and nothing else, and must launch no more kernels than on a
+static pool.
 """
 
 import unittest
@@ -361,15 +352,9 @@ class TestDecodeLaunchCounts(CustomTestCase):
         )
         self.req = torch.tensor([3, 0, 2, 1], device="cuda")
         self.seq = torch.tensor([200, 17, 256, 64], device="cuda")
-        self.counts = {}
-
-    def tearDown(self):
-        for phase, (static, unified) in self.counts.items():
-            print(f"{phase}: static {len(static)} GPU ops, unified {len(unified)}")
 
     def _compare(self, phase, static_fn, unified_fn):
         static, unified = _gpu_ops(static_fn), _gpu_ops(unified_fn)
-        self.counts[phase] = (static, unified)
         self.assertLessEqual(len(unified), len(static), (phase, static, unified))
 
     def test_eager_metadata(self):

@@ -20,11 +20,9 @@ def _infer_dsa_dims(dim_quant: int, tile_size: int = 128) -> tuple[int, int]:
 
 
 def _split_packed_rows(quant_k_cache: torch.Tensor, dim_nope: int, num_tiles: int):
-    """The NoPE bytes, per-group FP32 scales and BF16 RoPE of each packed row,
-    and how to address token ``t``'s row in each: ``(PAGE_SIZE, [(page_stride,
-    row_stride)] * 3)``. A flat run of rows is viewed as ``(-1, dim_quant)``
-    and addressed by its row stride, as it always was; a paged buffer
-    (`paged_layout`) keeps its pages."""
+    """NoPE bytes, FP32 scales and BF16 RoPE of each packed row, with
+    ``(PAGE_SIZE, [(page_stride, row_stride)] * 3)``; PAGE_SIZE is 1 for a flat
+    run of rows."""
     dim_quant = quant_k_cache.shape[-1]
     paged = paged_layout(quant_k_cache)
     rows = quant_k_cache if paged is not None else quant_k_cache.view((-1, dim_quant))

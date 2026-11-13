@@ -523,16 +523,10 @@ class MLAView(MLAKVView):
 
 
 class LayerMajorMLAView(MLAView):
-    """The latent rows of a composite sub-pool laid out layer by layer: per
-    layer a paged ``(pages, page_size, 1, row_bytes)`` buffer whose pages lie a
-    unit apart, addressed by the physical token id through its page and row
-    strides (FlashMLA's sparse kernel and the paged row writers and gathers
-    take them). Rows are stored in the ``fp8_ds_mla`` row format: quantized to
-    FP8 with per-block scales on write, and read only by the kernels that
-    dequantize them. Plain latent rows have no layer-major reader yet.
-
-    Its pages also hold the unit's other parts, so retraction, host transfers
-    and PD move whole units (the page envelope)."""
+    """Per layer, a paged ``(pages, page_size, 1, row_bytes)`` view of a
+    composite sub-pool's ``fp8_ds_mla`` latent rows, pages a unit apart;
+    written quantized and read only by the dequantizing kernels. Pages also
+    hold the unit's other parts, so transfers move whole units."""
 
     def __init__(
         self,

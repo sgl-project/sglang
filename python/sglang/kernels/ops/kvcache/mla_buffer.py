@@ -172,7 +172,6 @@ def set_mla_kv_buffer_naive(
     if dcp_world_size > 1:
         is_valid &= loc % dcp_world_size == dcp_rank
     dst = loc[is_valid] // dcp_world_size
-    # A paged buffer's row of token t is [t // page_size, t % page_size].
     at = dst if page_size == 1 else (dst // page_size, dst % page_size)
 
     nope_rows = nope[is_valid]
@@ -247,8 +246,6 @@ def _set_mla_kv_buffer_impl(
     has_rope = cache_k_rope is not None and cache_k_rope.numel() > 0
     n_loc = loc.numel()
     nope_dim = cache_k_nope.shape[-1]
-    # A paged buffer addresses token t's row through its page and row strides;
-    # a flat run of rows keeps its row stride and its kernels as they were.
     paged = paged_layout(kv_buffer)
     if paged is None:
         page_size, page_stride, row_stride = 1, 0, kv_buffer.stride(0)
