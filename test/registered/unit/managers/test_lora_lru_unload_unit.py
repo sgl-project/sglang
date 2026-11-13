@@ -35,7 +35,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.tokenizer_control_mixin import TokenizerControlMixin
-from sglang.srt.runtime_context import get_context
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -201,6 +201,9 @@ class TestLoRALRUUnload(CustomTestCase):
 
 
 class TestSchedulerLoRAUnload(CustomTestCase):
+    def setUp(self):
+        self.enterContext(get_parallel().override(tp_size=1, pp_size=1))
+
     def test_overlap_unload_waits_for_launched_forward(self):
         events = []
         scheduler = Scheduler.__new__(Scheduler)
