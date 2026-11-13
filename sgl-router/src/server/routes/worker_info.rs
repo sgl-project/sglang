@@ -4,8 +4,9 @@
 //! Engine endpoints answered by one worker: `/server_info`, `/model_info`
 //! (and their `/get_` aliases) and `/health_generate`, as SGLang engines
 //! serve them. The worker is a healthy one that chat can route to (under P/D
-//! a prefill with a decode peer), picked at random. The worker's status and
-//! body pass through; only a transport failure becomes a router error.
+//! a prefill with a decode peer, or for `/server_info` that decode peer),
+//! picked at random. The worker's status and body pass through; only a
+//! transport failure becomes a router error.
 
 use crate::buckets_reorg::ReadyPools;
 use crate::discovery::{ModelId, WorkerMode};
@@ -21,8 +22,16 @@ use axum::response::{IntoResponse, Response};
 use rand::seq::{IteratorRandom, SliceRandom};
 use std::sync::Arc;
 
+/// Under P/D a decode worker answers: only decode reports decoding state, such
+/// as the speculative accept length in `internal_states`.
 pub async fn server_info(State(ctx): State<Arc<AppContext>>, headers: HeaderMap) -> Response {
-    forward_to_first_stage(&ctx, &headers, "/server_info").await
+    let worker = match select(&ctx) {
+        Ok((first, decode)) => decode.unwrap_or(first),
+        Err(e) => return e.into_response(),
+    };
+    forward(&ctx, &headers, &worker, "/server_info")
+        .await
+        .unwrap_or_else(IntoResponse::into_response)
 }
 
 pub async fn model_info(State(ctx): State<Arc<AppContext>>, headers: HeaderMap) -> Response {
@@ -94,7 +103,8 @@ fn pools(ctx: &AppContext, model: &ModelId) -> Result<ReadyPools, ApiError> {
             let firsts = resolver
                 .prefill_candidates(model)
                 .map_err(|e| pool_error(e, model))?;
-            // Decoders matter only to `/health_generate`, which reports their absence.
+            // No decoders is not an error here: `/model_info` needs none, and
+            // `select` reports their absence.
             let decoders = resolver
                 .decode_candidates(model)
                 .unwrap_or_default()
@@ -266,16 +276,23 @@ mod tests {
         }
     }
 
+    /// Under P/D, `/server_info` reports decode's state, and `/model_info` a prefill's.
     #[tokio::test]
-    async fn info_paths_use_a_prefill_worker_under_pd() {
+    async fn info_paths_under_pd() {
         let prefill = spawn_engine("prefill", StatusCode::OK).await;
         let decode = spawn_engine("decode", StatusCode::OK).await;
         let ctx = ctx_with(&[
             (&decode, WorkerMode::Decode),
             (&prefill, WorkerMode::Prefill),
         ]);
-        let (_, body) = get_json(ctx, "/server_info").await;
-        assert_eq!(body["worker"], "prefill");
+        for (uri, worker) in [
+            ("/server_info", "decode"),
+            ("/get_server_info", "decode"),
+            ("/model_info", "prefill"),
+        ] {
+            let (_, body) = get_json(Arc::clone(&ctx), uri).await;
+            assert_eq!(body["worker"], worker, "{uri}");
+        }
     }
 
     #[tokio::test]
