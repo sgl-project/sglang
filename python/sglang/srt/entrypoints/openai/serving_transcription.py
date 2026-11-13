@@ -97,7 +97,7 @@ class OpenAIServingTranscription(OpenAIServingBase):
         else:
             sampling_params = self._adapter.build_sampling_params(request)
         adapted_request = GenerateReqInput(
-            text="",  # Empty text — the multimodal processor sets proper decoder/prompt tokens
+            text=self._render_prompt(request),
             audio_data=request.audio_data,
             sampling_params=sampling_params,
             stream=request.stream,
@@ -106,6 +106,25 @@ class OpenAIServingTranscription(OpenAIServingBase):
         )
 
         return adapted_request, request
+
+    def _render_prompt(self, request: TranscriptionRequest) -> str:
+        """The ASR prompt to send as the request text.
+
+        Speech LMs get their chat turn rendered here with the model's own chat
+        template, so the multimodal processor sees an ordinary audio prompt.
+        Adapters without one (Whisper, Qwen3-ASR) keep the text empty and the
+        processor builds the decoder prompt.
+        """
+        prompt = self._adapter.build_prompt(request)
+        if prompt is None:
+            return ""
+        mm_processor = self.tokenizer_manager.mm_processor
+        if mm_processor is None:
+            raise ValueError(
+                "Transcription needs the multimodal processor; launch the "
+                "server with multimodal enabled."
+            )
+        return mm_processor.render_transcription_prompt(prompt)
 
     @staticmethod
     def _get_audio_duration(audio_data: bytes) -> float:
@@ -336,7 +355,7 @@ class OpenAIServingTranscription(OpenAIServingBase):
         sampling_params = adapted_request.sampling_params
         assert isinstance(sampling_params, dict)
         chunk_request = GenerateReqInput(
-            text="",
+            text=adapted_request.text,
             audio_data=chunk_audio,
             sampling_params=dict(sampling_params),
             stream=stream,
