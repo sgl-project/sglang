@@ -19,6 +19,7 @@ import multiprocessing as mp
 import signal
 import threading
 import time
+import traceback
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum, auto
@@ -75,20 +76,18 @@ from sglang.srt.server_args import (
     ServerArgs,
 )
 from sglang.srt.utils import numa_utils
-from sglang.srt.utils.common import (
-    configure_logger,
-    kill_itself_when_parent_died,
-    maybe_reindex_device_id,
-)
+from sglang.srt.utils.common import TypeBasedDispatcher
+from sglang.srt.utils.device import maybe_reindex_device_id
+from sglang.srt.utils.log_utils import configure_logger
 from sglang.srt.utils.network import (
     NetworkAddress,
     bind_port,
     get_zmq_socket,
     get_zmq_socket_on_host,
 )
+from sglang.srt.utils.process import kill_itself_when_parent_died
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils.watchdog import Watchdog
-from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 logger = logging.getLogger(__name__)
 
@@ -278,21 +277,6 @@ class DataParallelController:
                 sock_send(worker, obj)
 
     def update_active_ranks(self, ranks: ActiveRanksOutput):
-        if get_exec().moe.elastic_ep_backend is not None:
-            if len(ranks.status) != self.max_dp_size:
-                logger.warning(
-                    "[Elastic EP][DPC] active rank status len=%d != max_dp_size=%d; "
-                    "ignoring update",
-                    len(ranks.status),
-                    self.max_dp_size,
-                )
-                return
-            self.status = [
-                self.dp_active[i] and bool(ranks.status[i])
-                for i in range(self.max_dp_size)
-            ]
-            self._refresh_active_workers()
-            return
         if len(ranks.status) != self.max_dp_size:
             logger.warning(
                 "[DPC] update_active_ranks: status len=%d != max_dp_size=%d; "
@@ -301,7 +285,11 @@ class DataParallelController:
                 self.max_dp_size,
             )
             return
-        self.status = list(ranks.status)
+
+        self.status = [
+            self.dp_active[i] and bool(ranks.status[i]) for i in range(self.max_dp_size)
+        ]
+        self._refresh_active_workers()
 
     def add_elastic_workers(self, slot_offset: int, slot_count: int):
         """Activate a range of pre-bound worker slots."""
@@ -884,19 +872,11 @@ class DataParallelController:
         active = self._active_workers
         if not active:
             raise RuntimeError("No active DP workers are available for routing.")
-        attempts = 0
-        while attempts < len(active):
-            slot = active[self.round_robin_counter % len(active)]
-            self.round_robin_counter = (self.round_robin_counter + 1) % len(active)
-            if self.status[slot]:
-                logger.debug(f"Choose worker {slot}")
-                sock_send(self.workers[slot], req)
-                return
-            attempts += 1
-        raise RuntimeError(
-            f"Cannot route request: all {len(active)} active DP workers "
-            "are unavailable."
-        )
+
+        slot = active[self.round_robin_counter % len(active)]
+        self.round_robin_counter = (self.round_robin_counter + 1) % len(active)
+        logger.debug(f"Choose worker {slot}")
+        sock_send(self.workers[slot], req)
 
     def follow_bootstrap_room_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):
@@ -918,7 +898,10 @@ class DataParallelController:
     def total_tokens_scheduler(self, req: Req):
         if self.maybe_external_dp_rank_routing(req):
             return
-        estimated_tokens = len(req.input_ids)
+        # input_embeds requests carry input_ids=None.
+        estimated_tokens = (
+            len(req.input_ids) if req.input_ids is not None else len(req.input_embeds)
+        )
         target_worker = self.dp_budget.dispatch(
             LoadBalanceMethod.TOTAL_TOKENS, estimated_tokens=estimated_tokens
         )
@@ -1007,6 +990,7 @@ def run_data_parallel_controller_process(
                 f"Scheduler or DataParallelController {proc.pid} terminated with {proc.exitcode}"
             )
     except Exception:
-        traceback = get_exception_traceback()
-        logger.error(f"DataParallelController hit an exception: {traceback}")
+        logger.error(
+            f"DataParallelController hit an exception: {traceback.format_exc()}"
+        )
         parent_process.send_signal(signal.SIGQUIT)

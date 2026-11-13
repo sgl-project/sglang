@@ -80,6 +80,8 @@ from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
     ModelOptFp8LinearMethod,
     apply_nvfp4_gemm_prequantized,
     apply_nvfp4_gemm_swiglu_quant,
+    shared_modelopt_fp8_scale,
+    valid_modelopt_fp8_linear,
 )
 from sglang.multimodal_gen.runtime.layers.rotary_embedding.mrope import (
     FluxPosEmbed as Flux2PosEmbed,
@@ -163,27 +165,6 @@ def _flux2_single_qk_rope(q, k, q_norm, k_norm, head_dim, cache, complex_freqs):
         ),
         logger=logger,
     )
-
-
-def _valid_modelopt_fp8_linear(linear: nn.Module) -> bool:
-    input_scale = getattr(linear, "input_scale", None)
-    return (
-        isinstance(getattr(linear, "quant_method", None), ModelOptFp8LinearMethod)
-        and isinstance(input_scale, torch.Tensor)
-        and input_scale.is_cuda
-        and input_scale.dtype == torch.float32
-        and input_scale.numel() == 1
-        and input_scale.is_contiguous()
-        and bool(torch.isfinite(input_scale).all().item())
-        and bool((input_scale > 0).all().item())
-    )
-
-
-def _shared_modelopt_fp8_scale(linears: list[nn.Module]) -> bool:
-    if not all(_valid_modelopt_fp8_linear(linear) for linear in linears):
-        return False
-    reference = linears[0].input_scale
-    return all(torch.equal(reference, linear.input_scale) for linear in linears[1:])
 
 
 def _try_flux2_norm_modulate_fp8(
@@ -328,29 +309,22 @@ def _xpu_gated_resnorm(
     shift: torch.Tensor,
 ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
     """Bit-exact single-kernel ``r = residual + update * gate; LN(r) * (1 + scale) + shift``."""
-    if (
-        torch.compiler.is_compiling()
-        or _FLUX2_XPU_GATED_RESNORM.disabled
-        or not can_use_xpu_layernorm_modulate(residual.dtype, residual.shape[-1])
+    if torch.compiler.is_compiling() or not can_use_xpu_layernorm_modulate(
+        residual.dtype, residual.shape[-1]
     ):
         return None
     # Exactness depends on the reduction width and row layouts, not on row count.
     sig = (residual.dtype, residual.device, residual.shape[-1], norm.eps)
-    verified = _FLUX2_XPU_GATED_RESNORM.is_verified(sig)
-    if not verified and torch.xpu.is_current_stream_capturing():
+    if not _FLUX2_XPU_GATED_RESNORM.can_attempt(sig):
         return None
-    try:
-        out = xpu_gated_resnorm(residual, update, gate, scale, shift, norm.eps)
-    except Exception as exc:
-        _FLUX2_XPU_GATED_RESNORM.on_exception(exc, logger=logger)
-        return None
-    if verified:
-        return out
-    ref_residual = residual_gate_add(residual, update, gate)
-    ref = (norm(ref_residual) * (1 + scale) + shift, ref_residual)
-    return _FLUX2_XPU_GATED_RESNORM.accept_or_fallback(
-        out,
-        ref,
+
+    def reference():
+        ref_residual = residual_gate_add(residual, update, gate)
+        return norm(ref_residual) * (1 + scale) + shift, ref_residual
+
+    return _FLUX2_XPU_GATED_RESNORM.run(
+        lambda: xpu_gated_resnorm(residual, update, gate, scale, shift, norm.eps),
+        reference,
         sig=sig,
         equal=tensors_equal,
         logger=logger,
@@ -1175,7 +1149,7 @@ class Flux2SingleTransformerBlock(nn.Module):
         self._fp8_norm_quant = False
 
     def configure_fp8_norm_quant(self) -> None:
-        self._fp8_norm_quant = _valid_modelopt_fp8_linear(self.attn.to_qkv_mlp_proj)
+        self._fp8_norm_quant = valid_modelopt_fp8_linear(self.attn.to_qkv_mlp_proj)
 
     def forward(
         self,
@@ -1295,18 +1269,18 @@ class Flux2TransformerBlock(nn.Module):
 
     def configure_fp8_norm_quant(self) -> None:
         if self.attn.use_fused_qkv:
-            self._fp8_img_attn_norm_quant = _valid_modelopt_fp8_linear(self.attn.to_qkv)
+            self._fp8_img_attn_norm_quant = valid_modelopt_fp8_linear(self.attn.to_qkv)
         else:
-            self._fp8_img_attn_norm_quant = _shared_modelopt_fp8_scale(
+            self._fp8_img_attn_norm_quant = shared_modelopt_fp8_scale(
                 [self.attn.to_q, self.attn.to_k, self.attn.to_v]
             )
 
         if self.attn.use_fused_added_qkv:
-            self._fp8_txt_attn_norm_quant = _valid_modelopt_fp8_linear(
+            self._fp8_txt_attn_norm_quant = valid_modelopt_fp8_linear(
                 self.attn.to_added_qkv
             )
         else:
-            self._fp8_txt_attn_norm_quant = _shared_modelopt_fp8_scale(
+            self._fp8_txt_attn_norm_quant = shared_modelopt_fp8_scale(
                 [
                     self.attn.add_q_proj,
                     self.attn.add_k_proj,
@@ -1314,8 +1288,8 @@ class Flux2TransformerBlock(nn.Module):
                 ]
             )
 
-        self._fp8_img_ff_norm_quant = _valid_modelopt_fp8_linear(self.ff.linear_in)
-        self._fp8_txt_ff_norm_quant = _valid_modelopt_fp8_linear(
+        self._fp8_img_ff_norm_quant = valid_modelopt_fp8_linear(self.ff.linear_in)
+        self._fp8_txt_ff_norm_quant = valid_modelopt_fp8_linear(
             self.ff_context.linear_in
         )
 
@@ -1573,6 +1547,8 @@ class Flux2Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         AttentionBackendEnum.FA,
         AttentionBackendEnum.AITER,
         AttentionBackendEnum.AITER_SAGE,
+        AttentionBackendEnum.AMX_ATTN,
+        AttentionBackendEnum.AITER_QUANT,
     }
 
     def post_load_weights(self) -> None:

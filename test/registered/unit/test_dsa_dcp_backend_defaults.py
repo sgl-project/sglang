@@ -36,30 +36,48 @@ def _backends(overrides):
 
 class TestDsaDcpBackendDefaults(CustomTestCase):
     def test_hip_defaults_to_triton(self):
-        with patch(_PLATFORM, return_value=SimpleNamespace(is_hip=True)):
+        with patch(_PLATFORM, return_value=SimpleNamespace(is_hip=True, is_npu=False)):
             self.assertEqual(
                 _backends(_dsa_dcp_overrides(_cfg())), ("triton", "triton")
             )
 
     def test_cuda_defaults_to_trtllm(self):
-        with patch(_PLATFORM, return_value=SimpleNamespace(is_hip=False)):
+        with patch(_PLATFORM, return_value=SimpleNamespace(is_hip=False, is_npu=False)):
             self.assertEqual(
                 _backends(_dsa_dcp_overrides(_cfg())), ("trtllm", "trtllm")
             )
 
     def test_explicit_backend_is_kept(self):
-        with patch(_PLATFORM, return_value=SimpleNamespace(is_hip=True)):
+        with patch(_PLATFORM, return_value=SimpleNamespace(is_hip=True, is_npu=False)):
             overrides = _dsa_dcp_overrides(_cfg(dsa_decode_backend="triton"))
         self.assertEqual(_backends(overrides), ("triton", None))
 
     def test_no_dcp_sets_nothing(self):
         self.assertEqual(_dsa_dcp_overrides(_cfg(dcp_size=1)), {})
 
+    def test_npu_pd_dcp_uses_native_backend(self):
+        platform = SimpleNamespace(is_hip=False, is_npu=True)
+        with patch(_PLATFORM, return_value=platform):
+            overrides = _dsa_dcp_overrides(
+                _cfg(
+                    disaggregation_mode="decode",
+                    disaggregation_transfer_backend="ascend",
+                )
+            )
+        self.assertNotIn("dsa_prefill_backend", overrides)
+        self.assertNotIn("dsa_decode_backend", overrides)
+
 
 class TestDsaDcpBackendConstraints(CustomTestCase):
     def test_hip_dcp_triton_allowed(self):
         _check_dsa_backend_constraints(
-            "fp8_e4m3", "triton", "triton", hip=True, dcp_size=4
+            "fp8_e4m3",
+            "triton",
+            "triton",
+            hip=True,
+            dcp_size=4,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
         )
 
     def test_hip_dcp_rejects_other_backends(self):
@@ -72,12 +90,24 @@ class TestDsaDcpBackendConstraints(CustomTestCase):
             with self.subTest(prefill=prefill, decode=decode):
                 with self.assertRaisesRegex(ValueError, "no DCP path on ROCm"):
                     _check_dsa_backend_constraints(
-                        "fp8_e4m3", prefill, decode, hip=True, dcp_size=4
+                        "fp8_e4m3",
+                        prefill,
+                        decode,
+                        hip=True,
+                        dcp_size=4,
+                        kv_lora_rank=512,
+                        qk_rope_head_dim=64,
                     )
 
     def test_hip_without_dcp_keeps_other_backends(self):
         _check_dsa_backend_constraints(
-            "fp8_e4m3", "tilelang", "tilelang", hip=True, dcp_size=1
+            "fp8_e4m3",
+            "tilelang",
+            "tilelang",
+            hip=True,
+            dcp_size=1,
+            kv_lora_rank=512,
+            qk_rope_head_dim=64,
         )
 
 

@@ -1,6 +1,8 @@
+import logging
+
 from transformers import PretrainedConfig
 
-from sglang.utils import logger
+logger = logging.getLogger(__name__)
 
 
 class Qwen3OmniMoeAudioEncoderConfig(PretrainedConfig):

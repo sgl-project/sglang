@@ -30,8 +30,9 @@ from sglang.srt.model_executor.cuda_graph_config import (
     CudaGraphConfig,
     PhaseConfig,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.kernels.deepseek_v4.k_cache_reference import (
@@ -281,6 +282,7 @@ class TinyDSV4ModelConfig:
             kv_lora_rank=DSV4_KV_LORA_RANK,
             v_head_dim=DSV4_V_HEAD_DIM,
             index_topk=DSV4_INDEX_TOPK,
+            index_n_heads=64,
             num_hidden_layers=len(compression_ratios),
             compress_ratios=list(compression_ratios),
             # Ratio 1/2 layers are their own kv_source (one-layer fixtures).
