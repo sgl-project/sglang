@@ -545,6 +545,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     spec_info: Optional[SpecInput] = None
     # Per-request target-verify geometry.
     ragged_verify_layout: Optional[RaggedVerifyLayout] = None
+    # Mixed DSPARK verification keeps the last prefill token and every
+    # verify token for the LM head. None for ordinary batches.
+    mixed_logits_select_index: Optional[torch.Tensor] = None
 
     # === Derived from ScheduleBatch.reqs ===
     # True for synthetic capture batches; init_new snapshots real request ranges.

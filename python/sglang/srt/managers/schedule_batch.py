@@ -1991,6 +1991,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     inner_idle_batch: Optional[ScheduleBatch] = None
     # Decode requests carried alongside a chunked-prefill batch
     decoding_reqs: List[Req] = None
+    # Verify-merged mixed step: rows [0, num_prefill_rows) prefill, the rest
+    # running DSPARK rows verifying W draft positions each. None otherwise.
+    num_prefill_rows: Optional[int] = None
 
     req_pool_indices_cpu: torch.Tensor = None  # shape: [b], int64
 
@@ -2080,6 +2083,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # Full-DP metadata from the existing scheduler gather.
     dp_spec_prefill_coordination_metadata: Optional[tuple] = None
+    dp_spec_prefill_mixed_decode_counts: Optional[List[int]] = None
     dp_spec_prefill_coordination_applied: bool = False
 
     # For DP attention
@@ -2763,7 +2767,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
         self.mamba_clear_indices = torch.cat(clear_tensors) if clear_tensors else None
 
-    def mix_with_running(self, running_batch: ScheduleBatch):
+    def mix_with_running(
+        self, running_batch: ScheduleBatch, verify_merged: bool = False
+    ):
+        if verify_merged:
+            return self._mix_with_running_verify(running_batch)
         self.forward_mode = ForwardMode.MIXED
         running_bs = running_batch.batch_size()
 
@@ -2866,6 +2874,36 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.extend_logprob_start_lens = (
             self.extend_logprob_start_lens + [0] * running_bs
         )
+        self.is_prefill_only = False
+
+    def _mix_with_running_verify(self, running_batch: ScheduleBatch):
+        """DSPARK verify-merged mixed step: running rows keep their draft state
+        and join as extend rows of W = speculative_num_draft_tokens positions
+        (bonus + drafts) at their committed length. The worker drafts and
+        appends their input_ids / out_cache_loc into the slots that
+        prepare_for_decode reserved."""
+        width = int(get_spec().speculative_num_draft_tokens)
+        num_prefill_rows = self.batch_size()
+        running_bs = running_batch.batch_size()
+        committed = [int(r.kv.kv_committed_len) for r in running_batch.reqs]
+        prefill_out_cache_loc = self.out_cache_loc
+        prefill_input_ids = self.input_ids
+        running_spec_info = running_batch.spec_info
+
+        self.merge_batch(running_batch)
+        self.forward_mode = ForwardMode.MIXED
+        self.out_cache_loc = prefill_out_cache_loc
+        self.input_ids = prefill_input_ids
+        if self.spec_info is None:
+            # A fresh prefill batch has no spec_info to merge into.
+            self.spec_info = running_spec_info
+        self.prefix_lens = self.prefix_lens + committed
+        self.extend_lens = self.extend_lens + [width] * running_bs
+        self.extend_num_tokens = self.extend_num_tokens + width * running_bs
+        self.extend_logprob_start_lens = (
+            self.extend_logprob_start_lens + [0] * running_bs
+        )
+        self.num_prefill_rows = num_prefill_rows
         self.is_prefill_only = False
 
     def convert_decode_to_extend(self):
@@ -3521,9 +3559,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             return_hidden_states=self.return_hidden_states,
             return_hidden_states_mode=self.return_hidden_states_mode,
             decoding_reqs=self.decoding_reqs,
+            num_prefill_rows=self.num_prefill_rows,
             spec_algorithm=self.spec_algorithm,
             spec_info=self.spec_info,
             dp_spec_prefill_coordination_metadata=self.dp_spec_prefill_coordination_metadata,
+            dp_spec_prefill_mixed_decode_counts=self.dp_spec_prefill_mixed_decode_counts,
             dp_spec_prefill_coordination_applied=self.dp_spec_prefill_coordination_applied,
             global_num_tokens=self.global_num_tokens,
             global_num_tokens_for_logprob=self.global_num_tokens_for_logprob,

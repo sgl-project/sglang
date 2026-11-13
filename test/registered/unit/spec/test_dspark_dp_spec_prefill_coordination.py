@@ -140,6 +140,7 @@ class TestDSparkDPSpecPrefillCoordination(CustomTestCase):
                 batch = SimpleNamespace(
                     forward_mode=mode,
                     is_extend_in_batch=extend,
+                    dp_spec_prefill_mixed_decode_counts=None,
                     dp_spec_prefill_coordination_metadata=(
                         counts,
                         counts,
@@ -153,6 +154,136 @@ class TestDSparkDPSpecPrefillCoordination(CustomTestCase):
                     ]
                     self.assertEqual(plan.draft_width, 6)
                     self.assertEqual(plan.verify_width, 7)
+
+    def test_mixed_rank_counts_draft_tail_and_keeps_target_logits(self):
+        # Rank 0: 1024 prefill tokens + two 6-token verify rows. Rank 1
+        # decodes three requests, rank 2 prefills, and rank 3 is idle.
+        plan = DPSpecPrefillCoordinationPlan(
+            [1036, 3, 512, 0],
+            [13, 3, 1, 0],
+            torch.tensor([1, 0, 1, 0]),
+            5,
+            6,
+            mixed_decode_counts=[2, 0, 0, 0],
+        )
+        self.assertTrue(plan.heterogeneous)
+        self.assertEqual(plan.phase_counts("draft"), ([10, 15, 0, 0],) * 2)
+        self.assertEqual(
+            plan.phase_counts("target"),
+            ([1036, 18, 512, 0], [13, 18, 1, 0]),
+        )
+        batch = SimpleNamespace()
+        plan.apply(batch, "draft", 0, local_only=True)
+        self.assertEqual(batch.global_num_tokens, [10])
+        plan.apply(batch, "target", 0, local_only=False)
+        self.assertEqual(batch.global_num_tokens, [1036, 18, 512, 0])
+        self.assertEqual(batch.global_num_tokens_for_logprob, [13, 18, 1, 0])
+
+    def test_mixed_and_idle_ranks_still_need_both_phases(self):
+        for counts, logprobs, tails in (
+            ([1030, 0], [7, 0], [1, 0]),
+            ([1030, 518], [7, 7], [1, 1]),
+        ):
+            with self.subTest(counts=counts):
+                plan = DPSpecPrefillCoordinationPlan(
+                    counts,
+                    logprobs,
+                    torch.tensor([1, counts[1] > 0]),
+                    5,
+                    6,
+                    mixed_decode_counts=tails,
+                )
+                self.assertTrue(plan.heterogeneous)
+                self.assertEqual(plan.phase_counts("draft")[0], [5 * t for t in tails])
+                self.assertEqual(plan.phase_counts("target"), (counts, logprobs))
+
+    def test_dispatch_mixed_rank_and_its_peers_share_one_plan(self):
+        counts, logprobs = [1036, 3, 512, 0], [13, 3, 1, 0]
+        prefills, tails = [1, 0, 1, 0], [2, 0, 0, 0]
+        for rank, mode in enumerate(
+            (
+                ForwardMode.MIXED,
+                ForwardMode.DECODE,
+                ForwardMode.EXTEND,
+                ForwardMode.IDLE,
+            )
+        ):
+            with self.subTest(rank=rank):
+                worker = object.__new__(DSparkWorkerV2)
+                worker._hosts_draft = True
+                worker.enable_dp_spec_prefill_coordination = True
+                worker.verify_num_draft_tokens = 6
+                worker._proposer = SimpleNamespace(query_token_num=5)
+                worker._verify_planner = MagicMock()
+                worker._observers = MagicMock()
+                worker._forward_mixed = MagicMock(return_value="mixed")
+                worker._forward_dp_spec_prefill_coordination = MagicMock(
+                    return_value="peer"
+                )
+                batch = SimpleNamespace(
+                    forward_mode=mode,
+                    is_extend_in_batch=True,
+                    num_prefill_rows=1 if rank == 0 else None,
+                    dp_spec_prefill_coordination_metadata=(
+                        counts,
+                        logprobs,
+                        torch.tensor(prefills),
+                    ),
+                    dp_spec_prefill_mixed_decode_counts=tails,
+                )
+                result = worker.forward_batch_generation(batch)
+                if rank == 0:
+                    self.assertEqual(result, "mixed")
+                    plan = worker._forward_mixed.call_args.kwargs["coordination_plan"]
+                else:
+                    self.assertEqual(result, "peer")
+                    plan = worker._forward_dp_spec_prefill_coordination.call_args.args[
+                        1
+                    ]
+                self.assertEqual(plan.phase_counts("draft")[0], [10, 15, 0, 0])
+                self.assertEqual(
+                    plan.phase_counts("target"), ([1036, 18, 512, 0], [13, 18, 1, 0])
+                )
+
+    def test_idle_peer_keeps_zero_local_rows_in_coordinated_verify(self):
+        plan = DPSpecPrefillCoordinationPlan(
+            [1036, 3, 512, 0],
+            [13, 3, 1, 0],
+            torch.tensor([1, 0, 1, 0]),
+            5,
+            6,
+            mixed_decode_counts=[2, 0, 0, 0],
+        )
+        worker = object.__new__(DSparkWorkerV2)
+        worker.device = "cpu"
+        worker.verify_num_draft_tokens = 6
+        worker._draft_is_moe = True
+        worker.draft_parallel_layout = SimpleNamespace(local_dp=True)
+        worker._proposer = MagicMock()
+        worker._observers = MagicMock()
+        worker._verify_executor = MagicMock()
+        worker._idle_verify_ragged_layout = MagicMock(
+            side_effect=AssertionError(
+                "Prefill token counts are not a compact verify tier"
+            )
+        )
+        batch = SimpleNamespace(
+            spec_info=None,
+            forward_mode=ForwardMode.IDLE,
+            global_num_tokens=plan.counts,
+        )
+        with patch(
+            f"{MODULE}.get_parallel",
+            return_value=SimpleNamespace(attn_dp_enabled=True, attn_dp_rank=3),
+        ):
+            result = worker._forward_decode(batch, None, coordination_plan=plan)
+        worker._idle_verify_ragged_layout.assert_not_called()
+        worker._verify_executor.run_idle_participation.assert_called_once_with(
+            batch=batch, idle_layout=None
+        )
+        self.assertEqual(result.next_token_ids.numel(), 0)
+        self.assertEqual(batch.global_num_tokens, [1036, 18, 512, 0])
+        self.assertEqual(batch.global_num_tokens_for_logprob, [13, 18, 1, 0])
 
 
 if __name__ == "__main__":
