@@ -132,12 +132,7 @@ class TestDisaggregationDecodeRadixLinker(PDDisaggregationServerBase):
 class TestDisaggregationDecodeRadixLinkerSharedEngine(
     TestDisaggregationDecodeRadixLinker
 ):
-    """The same flow with each store running on its server's PD transfer engine.
-
-    With the default P2P handshake and the PD IB device named for the store too,
-    as RDMA deployments configure it, the store reuses the PD transfer engine,
-    so the linker and PD transfer register the same GPU KV memory on it.
-    """
+    """PD and linker register the same KV buffers on a shared engine."""
 
     mooncake_p2p_handshake = True
     capture_per_side_logs = True
