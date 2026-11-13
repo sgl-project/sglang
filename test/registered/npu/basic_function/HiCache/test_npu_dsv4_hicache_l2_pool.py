@@ -73,7 +73,7 @@ class TestDSV4PoolAssembly(CustomTestCase):
             pp_cache_group=None,
         )
         memory = SimpleNamespace(
-            hicache_mem_layout="page_first_direct",
+            hicache_mem_layout="page_first",
             hicache_write_policy="write_through",
             hicache_io_backend="kernel_ascend",
             hicache_host_memory_mode="cache",
