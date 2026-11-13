@@ -1,7 +1,6 @@
-"""NPU scheduling delegates to sgl-kernel-npu; device coverage needs an NPU."""
+"""Preserve upstream scheduling dispatch; real NPU execution needs a device."""
 
-import sys
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
@@ -14,26 +13,21 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 
-@pytest.mark.parametrize("cuda_alias", [False, True])
-def test_npu_dispatch_uses_existing_kernel_with_or_without_cuda_alias(cuda_alias):
-    confidence = Mock(device=SimpleNamespace(type="npu"))
+def test_native_npu_dispatch_uses_torch_reference():
+    # Exercise the real inputs_on_cuda predicate without an NPU runtime. A
+    # native NPU tensor is a Tensor with is_cuda=False. CUDA-alias deployments
+    # intentionally retain upstream's dispatch rather than adding an override.
+    confidence = Mock(
+        spec=torch.Tensor, device=SimpleNamespace(type="npu"), is_cuda=False
+    )
     cfg = DSparkScheduleConfig(gamma=8)
     result = object()
-    kernel = Mock(return_value=result)
-    # Mock only the external kernel boundary, exercising execute() and triton().
-    sample = ModuleType("sgl_kernel_npu.operators.sample")
-    sample.schedule_verify_lens_topk_triton = kernel
-    modules = {
-        "sgl_kernel_npu": ModuleType("sgl_kernel_npu"),
-        "sgl_kernel_npu.operators": ModuleType("sgl_kernel_npu.operators"),
-        "sgl_kernel_npu.operators.sample": sample,
-    }
     with (
-        patch.dict(sys.modules, modules),
         patch.object(schedule, "_is_npu", True),
-        patch.object(schedule, "inputs_on_cuda", return_value=cuda_alias) as predicate,
-        patch.object(schedule, "schedule_verify_lens_topk_triton") as cuda_kernel,
-        patch.object(schedule.ScheduleVerifyLensTopk, "torch") as reference,
+        patch.object(schedule.ScheduleVerifyLensTopk, "triton") as kernel,
+        patch.object(
+            schedule.ScheduleVerifyLensTopk, "torch", return_value=result
+        ) as reference,
     ):
         assert (
             schedule.ScheduleVerifyLensTopk.execute(
@@ -41,10 +35,8 @@ def test_npu_dispatch_uses_existing_kernel_with_or_without_cuda_alias(cuda_alias
             )
             is result
         )
-        kernel.assert_called_once_with(confidence=confidence, budget=3, cfg=cfg)
-        predicate.assert_not_called()
-        cuda_kernel.assert_not_called()
-        reference.assert_not_called()
+        reference.assert_called_once_with(confidence=confidence, budget=3, cfg=cfg)
+        kernel.assert_not_called()
 
 
 @pytest.mark.parametrize("cuda", [False, True])
