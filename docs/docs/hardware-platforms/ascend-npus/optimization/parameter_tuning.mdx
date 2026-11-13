@@ -66,9 +66,9 @@ that switch's row.
 <Step title="Tune the knobs top-down, one at a time">
 
 Fix the topology first — parallelism, PD disaggregation, and the communication buffers that go with them — then the
-load-shape parameters that consume memory ([`--chunked-prefill-size`](#chunked-prefill-size),
-[`--cuda-graph-max-bs-decode`](#cuda-graph-max-bs-decode), speculative depth), and size
-[`--mem-fraction-static`](#mem-fraction-static) last, because activation and graph buffers come out of the same
+load-shape parameters that consume memory ([`--chunked-prefill-size`](#batching-graphs-and-memory),
+[`--cuda-graph-max-bs-decode`](#batching-graphs-and-memory), speculative depth), and size
+[`--mem-fraction-static`](#batching-graphs-and-memory) last, because activation and graph buffers come out of the same
 budget.
 
 Choices at one level bound what the levels below can reach: graph-level tuning cannot compensate for a wrong TP/EP
@@ -80,20 +80,20 @@ results stay comparable, and keep the previous one so you can roll back.
 
 ### Batch checklist
 
-The switches to add in step 2, each linking to its row in [Parameter Reference](#parameter-reference):
+The switches to add in step 2, each linking to its section in [Parameter Reference](#parameter-reference):
 
 | Switch | Applies when |
 | --- | --- |
-| [`SGLANG_NPU_USE_MLAPO=1`](#npu-use-mlapo) | DeepSeek-style MLA |
-| [`SGLANG_USE_FIA_NZ=1`](#use-fia-nz) | DeepSeek-style MLA |
-| [`SGLANG_NPU_USE_MULTI_STREAM=1`](#npu-use-multi-stream) | MoE models with shared experts — the DeepSeek, GLM, Qwen-MoE, and LongCat code paths all read it |
-| [`SGLANG_USE_AG_AFTER_QLORA=1`](#ag-after-qlora) + `--enable-attn-tp-input-scattered` | Model with `q_lora_rank`; practically prefill-only |
-| [`SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`](#overlap-plan-stream) | Speculative decoding on, no LoRA |
-| [`--enable-dp-lm-head`](#enable-dp-lm-head) | Attention DP on |
-| [`PYTORCH_NPU_ALLOC_CONF=expandable_segments:True`](#pytorch-npu-alloc-conf) | Always |
-| [Host OS settings](#host-os-settings): governor `performance`, `vm.swappiness=0`, `kernel.numa_balancing=0`, `kernel.sched_migration_cost_ns=50000` | Always (commands run as root) |
-| [`SGLANG_SET_CPU_AFFINITY=1`](#set-cpu-affinity) | Always |
-| [Speculative decoding](#speculative-algorithm) | Model ships an MTP head (`NEXTN`), or you supply an external draft model (`EAGLE3`); verify accuracy after enabling |
+| [`SGLANG_NPU_USE_MLAPO=1`](#model-specific-switches-and-host) | DeepSeek-style MLA |
+| [`SGLANG_USE_FIA_NZ=1`](#model-specific-switches-and-host) | DeepSeek-style MLA |
+| [`SGLANG_NPU_USE_MULTI_STREAM=1`](#model-specific-switches-and-host) | MoE models with shared experts — the DeepSeek, GLM, Qwen-MoE, and LongCat code paths all read it |
+| [`SGLANG_USE_AG_AFTER_QLORA=1`](#model-specific-switches-and-host) + `--enable-attn-tp-input-scattered` | Model with `q_lora_rank`; practically prefill-only |
+| [`SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`](#speculative-decoding-and-quantization) | Speculative decoding on, no LoRA |
+| [`--enable-dp-lm-head`](#parallelism) | Attention DP on |
+| [`PYTORCH_NPU_ALLOC_CONF=expandable_segments:True`](#batching-graphs-and-memory) | Always |
+| [Host OS settings](#model-specific-switches-and-host): governor `performance`, `vm.swappiness=0`, `kernel.numa_balancing=0`, `kernel.sched_migration_cost_ns=50000` | Always (commands run as root) |
+| [`SGLANG_SET_CPU_AFFINITY=1`](#model-specific-switches-and-host) | Always |
+| [Speculative decoding](#speculative-decoding-and-quantization) | Model ships an MTP head (`NEXTN`), or you supply an external draft model (`EAGLE3`); verify accuracy after enabling |
 
 <Tip>
 
@@ -115,12 +115,12 @@ condition and the failure are in the row's trade-offs.
 
 | Conditional switch | Enable when |
 | --- | --- |
-| [`SGLANG_SCHEDULER_SKIP_ALL_GATHER=1`](#scheduler-skip-all-gather) | DP load is balanced — uneven load desyncs silently |
-| [`--enable-eplb`](#enable-eplb) | Expert-load metrics show imbalance |
-| [`--disable-radix-cache`](#disable-radix-cache) | Requests share no prefixes |
-| [`--deepep-dispatcher-output-dtype int8`](#deepep-dispatcher-output-dtype) / [`DEEP_NORMAL_MODE_USE_INT8_QUANT=1`](#deep-normal-mode-use-int8-quant) | Prefill dispatch traffic dominates — typically multi-node; the accuracy budget allows a small loss |
-| [`TASK_QUEUE_ENABLE=2`](#task-queue-enable) | The role captures no graphs |
-| [`HCCL_OP_EXPANSION_MODE=AIV`](#hccl-op-expansion-mode) | Never on Atlas A2 systems with DeepEP |
+| [`SGLANG_SCHEDULER_SKIP_ALL_GATHER=1`](#parallelism) | DP load is balanced — uneven load desyncs silently |
+| [`--enable-eplb`](#moe-dispatch-and-communication) | Expert-load metrics show imbalance |
+| [`--disable-radix-cache`](#batching-graphs-and-memory) | Requests share no prefixes |
+| [`--deepep-dispatcher-output-dtype int8`](#moe-dispatch-and-communication) / [`DEEP_NORMAL_MODE_USE_INT8_QUANT=1`](#moe-dispatch-and-communication) | Prefill dispatch traffic dominates — typically multi-node; the accuracy budget allows a small loss |
+| [`TASK_QUEUE_ENABLE=2`](#batching-graphs-and-memory) | The role captures no graphs |
+| [`HCCL_OP_EXPANSION_MODE=AIV`](#moe-dispatch-and-communication) | Never on Atlas A2 systems with DeepEP |
 
 ## Parameter Reference
 
@@ -162,7 +162,7 @@ model, hardware series, or build: the `ZBAL_*` / `ZBCCL_*` KV-transfer switches,
   </thead>
   <tbody>
     <tr>
-      <td><a id="tp-size"></a>`--tp-size` (`--tp` in published scripts)</td>
+      <td>`--tp-size` (`--tp` in published scripts)</td>
       <td>Shards the model's weights across devices, which communicate via HCCL all-reduce. The primary way to fit
       models larger than a single device.</td>
       <td><strong>Discrete.</strong> Up: less weight per device, at more all-reduce per step. Down: less
@@ -171,14 +171,14 @@ model, hardware series, or build: the `ZBAL_*` / `ZBCCL_*` KV-transfer switches,
       <td>`32`</td>
     </tr>
     <tr>
-      <td><a id="dp-size"></a>`--dp-size`</td>
+      <td>`--dp-size`</td>
       <td>Replicates the model across device groups to serve more requests in parallel.</td>
       <td><strong>Discrete.</strong> Cannot be combined with attention DP, and model replication is single-node only;
       both are enforced at startup.</td>
       <td>— (attention DP is used instead)</td>
     </tr>
     <tr>
-      <td><a id="attn-dp-size"></a>`--attn-dp-size` / `--attention-data-parallel-size`</td>
+      <td>`--attn-dp-size` / `--attention-data-parallel-size`</td>
       <td>Runs attention data-parallel inside the TP group, the axes combining as
       `tp_size = attn_tp_size × attn_dp_size × attn_cp_size`. Each DP group serves its own requests with its own KV
       cache and attention weights, TP-sharded over the remaining `tp/attn_dp` ranks; FFN/MoE stay TP/EP-sharded. The
@@ -189,16 +189,16 @@ model, hardware series, or build: the `ZBAL_*` / `ZBCCL_*` KV-transfer switches,
       <td>Decode `8`</td>
     </tr>
     <tr>
-      <td><a id="attn-cp-size"></a>`--attn-cp-size`</td>
+      <td>`--attn-cp-size`</td>
       <td>Splits one long sequence across devices for the prefill phase, cutting per-rank prefill work on long inputs.
-      It only shards context when [`--enable-prefill-cp`](#enable-prefill-cp) is also set.</td>
+      It only shards context when `--enable-prefill-cp` is also set.</td>
       <td><strong>Discrete.</strong> Up: less prefill work per rank on long inputs, at more inter-device communication.
       Down: less communication, at more per-rank prefill work. Must divide `--tp-size`, and with attention DP
       `tp_size % (attn_dp_size × attn_cp_size)` must be `0` as well.</td>
       <td>Prefill `32`</td>
     </tr>
     <tr>
-      <td><a id="enable-prefill-cp"></a>`--enable-prefill-cp`</td>
+      <td>`--enable-prefill-cp`</td>
       <td>Enables context parallelism for the prefill phase.</td>
       <td><strong>Switch.</strong> On: long-context prefill, together with `--attn-cp-size` and `--cp-strategy` —
       without this flag `--attn-cp-size` shards nothing, and without a strategy startup fails with
@@ -207,7 +207,7 @@ model, hardware series, or build: the `ZBAL_*` / `ZBCCL_*` KV-transfer switches,
       <td>on (long-context prefill)</td>
     </tr>
     <tr>
-      <td><a id="cp-strategy"></a>`--cp-strategy`</td>
+      <td>`--cp-strategy`</td>
       <td>Sharding strategy for prefill CP. Mandatory whenever prefill CP is on.</td>
       <td><strong>Discrete.</strong> `zigzag` gives each rank early and late blocks; `interleave` assigns token indices
       modulo the CP size. Model-specific: V3.2 requires `interleave` and rejects `zigzag` at startup, MiMo V2 requires
@@ -216,7 +216,7 @@ model, hardware series, or build: the `ZBAL_*` / `ZBCCL_*` KV-transfer switches,
       <td>V3.2 `interleave`</td>
     </tr>
     <tr>
-      <td><a id="ep-size"></a>`--ep-size` / `--ep` / `--expert-parallel-size`</td>
+      <td>`--ep-size` / `--ep` / `--expert-parallel-size`</td>
       <td>Distributes MoE experts across devices and routes tokens via all-to-all dispatch. V3.2 has 256 routed
       experts at TP `32`, so each rank hosts `256 / 32 = 8`.</td>
       <td><strong>Discrete.</strong> Defaults to `1`. With any all-to-all backend available on Ascend (`deepep`,
@@ -225,7 +225,7 @@ model, hardware series, or build: the `ZBAL_*` / `ZBCCL_*` KV-transfer switches,
       <td>`32`</td>
     </tr>
     <tr>
-      <td><a id="moe-dense-tp-size"></a>`--moe-dense-tp-size`</td>
+      <td>`--moe-dense-tp-size`</td>
       <td>TP size for the dense FFN layers of MoE models (`first_k_dense_replace`).</td>
       <td><strong>Discrete.</strong> Unset, `1`, or the full TP size. Leave it unset for normal TP-sharded dense FFN;
       set `1` under attention DP, where each DP group already holds the full dense weights, or under prefill CP where
@@ -234,14 +234,14 @@ model, hardware series, or build: the `ZBAL_*` / `ZBCCL_*` KV-transfer switches,
       <td>`1`</td>
     </tr>
     <tr>
-      <td><a id="enable-dp-lm-head"></a>`--enable-dp-lm-head`</td>
+      <td>`--enable-dp-lm-head`</td>
       <td>Shards the LM head vocabulary across the attention-TP group inside each DP rank.</td>
       <td><strong>Switch.</strong> On: attention DP with `--attn-dp-size` above `1`, which it requires — it removes an
       all-gather of logits across DP ranks. Off: no effect without attention DP.</td>
       <td>on</td>
     </tr>
     <tr>
-      <td><a id="load-balance-method"></a>`--load-balance-method`</td>
+      <td>`--load-balance-method`</td>
       <td>Routes requests across DP ranks.</td>
       <td><strong>Discrete.</strong> `auto` resolves per role, to `follow_bootstrap_room` on PD prefill and
       `round_robin` on decode and non-PD; the explicit choices are `round_robin`, `total_tokens`, `total_requests`,
@@ -250,7 +250,7 @@ model, hardware series, or build: the `ZBAL_*` / `ZBCCL_*` KV-transfer switches,
       <td>`auto`</td>
     </tr>
     <tr>
-      <td><a id="scheduler-skip-all-gather"></a>`SGLANG_SCHEDULER_SKIP_ALL_GATHER=1`</td>
+      <td>`SGLANG_SCHEDULER_SKIP_ALL_GATHER=1`</td>
       <td>Skips the scheduler's cross-DP-rank metadata all-gather on every step — prefill, mixed, and decode.</td>
       <td><strong>Switch.</strong> On: every DP rank runs the same forward mode with the same token counts, as under
       balanced or round-robin load. Off: uneven load silently desyncs MoE dispatch and graph buckets, and there is no
@@ -273,7 +273,7 @@ model, hardware series, or build: the `ZBAL_*` / `ZBCCL_*` KV-transfer switches,
   </thead>
   <tbody>
     <tr>
-      <td><a id="chunked-prefill-size"></a>`--chunked-prefill-size`</td>
+      <td>`--chunked-prefill-size`</td>
       <td>Maximum tokens per prefill chunk. Chunking interleaves prefill with decode for better mixed-workload
       concurrency.</td>
       <td><strong>Range.</strong> Up: higher prefill throughput, but decode stalls longer between chunks. Down: fairer
@@ -283,7 +283,7 @@ model, hardware series, or build: the `ZBAL_*` / `ZBCCL_*` KV-transfer switches,
       <td>`-1`</td>
     </tr>
     <tr>
-      <td><a id="max-prefill-tokens"></a>`--max-prefill-tokens`</td>
+      <td>`--max-prefill-tokens`</td>
       <td>Maximum input tokens admitted into one prefill batch.</td>
       <td><strong>Range.</strong> Up: more concurrent long requests co-batch per forward, at activation memory — large
       values need an explicit `--mem-fraction-static`, since the heuristic otherwise reserves about 1.5 MB per token
@@ -294,7 +294,7 @@ model, hardware series, or build: the `ZBAL_*` / `ZBCCL_*` KV-transfer switches,
       <td>`68000`</td>
     </tr>
     <tr>
-      <td><a id="max-running-requests"></a>`--max-running-requests`</td>
+      <td>`--max-running-requests`</td>
       <td>Global concurrency cap.</td>
       <td><strong>Range.</strong> Up: more concurrent requests and higher throughput, but per-request latency rises and
       the KV pool must fit the concurrency. Down, as far as `1`: the whole node is dedicated to each request for
@@ -303,19 +303,19 @@ model, hardware series, or build: the `ZBAL_*` / `ZBCCL_*` KV-transfer switches,
       <td>Prefill `1` · Decode `32`</td>
     </tr>
     <tr>
-      <td><a id="min-free-slots-delay"></a>`--min-free-slots-delay`</td>
+      <td>`--min-free-slots-delay`</td>
       <td>Holds fresh prefill admissions until at least N running-request slots free up, so they are admitted as one
       batch instead of one at a time. Per-DP-rank local: a rank with free slots does not wait for a congested peer.
       Useful when a single admission is disproportionately expensive, as with speculative decoding plus a separate
       draft prefill pass.</td>
       <td><strong>Range.</strong> Up: fewer, larger admissions and fewer prefill/decode interleaves, at later TTFT for
-      the held requests. Down to `1`, which disables it. Capped by [`--max-running-requests`](#max-running-requests),
+      the held requests. Down to `1`, which disables it. Capped by `--max-running-requests`,
       and unsupported with pipeline parallelism. Unset, DFLASH speculative deployments auto-enable a formula — so
       admission changes with no flag at all, and setting the flag is how you take control of it.</td>
       <td>— (DFLASH auto-enables it; not set in the published configurations)</td>
     </tr>
     <tr>
-      <td><a id="enable-prefill-delayer"></a>`--enable-prefill-delayer`</td>
+      <td>`--enable-prefill-delayer`</td>
       <td>Delays admitting a prefill batch for a bounded number of forward passes so decode keeps making progress
       under attention DP, where prefill bursts otherwise stall decode. Sized by
       `--prefill-delayer-max-delay-passes` (`30`), `--prefill-delayer-queue-min-ratio`,
@@ -328,7 +328,7 @@ model, hardware series, or build: the `ZBAL_*` / `ZBCCL_*` KV-transfer switches,
       <td>off in V3.2 · `--prefill-delayer-max-delay-passes` `50`–`500` on Kimi K2.6, MiniMax M2.5, Qwen3.6</td>
     </tr>
     <tr>
-      <td><a id="disable-radix-cache"></a>`--disable-radix-cache`</td>
+      <td>`--disable-radix-cache`</td>
       <td>Turns off prefix caching, which otherwise reuses the KV of shared prompt prefixes.</td>
       <td><strong>Switch.</strong> On: requests share no prefixes, as on dedicated prefill nodes and random-input
       benchmark traffic. Off: chat workloads with shared system prompts, where prefix reuse cuts TTFT. PD decode
@@ -336,7 +336,7 @@ model, hardware series, or build: the `ZBAL_*` / `ZBCCL_*` KV-transfer switches,
       <td>on</td>
     </tr>
     <tr>
-      <td><a id="cuda-graph-bs-decode"></a>`--cuda-graph-bs-decode`</td>
+      <td>`--cuda-graph-bs-decode`</td>
       <td>Explicit list of decode batch sizes to capture with NPU Graph (Ascend's CUDA Graph equivalent, via
       `torch.npu.NPUGraph`), which captures and replays the decode step to remove kernel-launch overhead.</td>
       <td><strong>Discrete.</strong> The listed buckets still pass through the
@@ -344,7 +344,7 @@ model, hardware series, or build: the `ZBAL_*` / `ZBCCL_*` KV-transfer switches,
       <td>—</td>
     </tr>
     <tr>
-      <td><a id="cuda-graph-max-bs-decode"></a>`--cuda-graph-max-bs-decode`</td>
+      <td>`--cuda-graph-max-bs-decode`</td>
       <td>Largest decode batch size captured, per DP rank. Set it near the typical per-rank batch, not the peak — see
       [From an observed symptom](#from-an-observed-symptom) for where to read the observed value.</td>
       <td><strong>Range.</strong> Up: larger batches stay captured, at more capture time and memory. Down: batches
@@ -354,7 +354,7 @@ model, hardware series, or build: the `ZBAL_*` / `ZBCCL_*` KV-transfer switches,
       <td>`4`</td>
     </tr>
     <tr>
-      <td><a id="task-queue-enable"></a>`TASK_QUEUE_ENABLE`</td>
+      <td>`TASK_QUEUE_ENABLE`</td>
       <td>torch_npu host-side task-submission pipelining.</td>
       <td><strong>Discrete.</strong> `0` off · `1` submissions are queued to a dedicated thread (default) · `2`
       additionally spin-polls empty queues for lower launch latency. `ASCEND_LAUNCH_BLOCKING=1` silently forces the
@@ -364,21 +364,21 @@ model, hardware series, or build: the `ZBAL_*` / `ZBCCL_*` KV-transfer switches,
       <td>Prefill `2` · Decode `0` · Mixed node `1`</td>
     </tr>
     <tr>
-      <td><a id="disable-overlap-schedule"></a>`--disable-overlap-schedule`</td>
+      <td>`--disable-overlap-schedule`</td>
       <td>Turns off the overlap scheduler, enabled by default, which prepares the next batch on the CPU while the
       current one runs on the NPU.</td>
       <td><strong>Switch.</strong> On (disabling): rarely necessary; it is auto-disabled for pipeline parallelism.</td>
       <td>—</td>
     </tr>
     <tr>
-      <td><a id="streams-per-device"></a>`STREAMS_PER_DEVICE`</td>
+      <td>`STREAMS_PER_DEVICE`</td>
       <td>Size of the per-device stream pool.</td>
       <td><strong>Discrete.</strong> Only `8` and `32` are valid; other values are reset to `32`. Keep the default
       unless profiling indicates a need for `8`.</td>
       <td>`32`</td>
     </tr>
     <tr>
-      <td><a id="mem-fraction-static"></a>`--mem-fraction-static`</td>
+      <td>`--mem-fraction-static`</td>
       <td>Fraction of NPU memory reserved for model weights and the KV cache pool.</td>
       <td><strong>Range.</strong> Up: more KV cache and more concurrent requests, until out-of-memory errors return
       during serving or graph capture. Down: headroom for activations and graph buffers, at fewer concurrent
@@ -388,7 +388,7 @@ model, hardware series, or build: the `ZBAL_*` / `ZBCCL_*` KV-transfer switches,
       <td>Prefill `0.73` · Decode `0.79`</td>
     </tr>
     <tr>
-      <td><a id="pytorch-npu-alloc-conf"></a>`PYTORCH_NPU_ALLOC_CONF`</td>
+      <td>`PYTORCH_NPU_ALLOC_CONF`</td>
       <td>Allocator configuration. `expandable_segments:True` maps physical pages on demand instead of reserving the
       address space up front, resisting allocator fragmentation — the main defense against fragmentation-driven
       out-of-memory errors on MoE-scale models. `pin_memory_expandable_segments:True` does the same for pinned host
@@ -415,7 +415,7 @@ model, hardware series, or build: the `ZBAL_*` / `ZBCCL_*` KV-transfer switches,
   </thead>
   <tbody>
     <tr>
-      <td><a id="moe-a2a-backend"></a>`--moe-a2a-backend`</td>
+      <td>`--moe-a2a-backend`</td>
       <td>All-to-all backend for MoE dispatch/combine. `deepep` has separate prefill and decode dispatch paths;
       `ascend_fuseep` fuses dispatch, GEMM, and combine into one kernel; `ascend_ops` is the NPU-only MC2 and
       all-to-all path, configured with `--moe-ascend-ops-config`.</td>
@@ -425,14 +425,14 @@ model, hardware series, or build: the `ZBAL_*` / `ZBCCL_*` KV-transfer switches,
       <td>`deepep`</td>
     </tr>
     <tr>
-      <td><a id="deepep-mode"></a>`--deepep-mode`</td>
+      <td>`--deepep-mode`</td>
       <td>Selects the DeepEP dispatch path.</td>
       <td><strong>Discrete.</strong> `normal` favors high throughput and large token counts, so it suits prefill;
       `low_latency` suits small, graph-compatible decode batches; `auto` decides per batch.</td>
       <td>Prefill `normal` · Decode `low_latency`</td>
     </tr>
     <tr>
-      <td><a id="deepep-dispatch-buffer"></a>`SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK`</td>
+      <td>`SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK`</td>
       <td>Per-rank dispatch buffer capacity, in tokens, for DeepEP low-latency decode. Size it to the actual
       per-iteration maximum — see [Sizing the DeepEP dispatch buffer](#sizing-the-deepep-dispatch-buffer).</td>
       <td><strong>Range.</strong> Up: headroom against the runtime dispatch failure, but low-latency dispatch pads to
@@ -443,14 +443,14 @@ model, hardware series, or build: the `ZBAL_*` / `ZBCCL_*` KV-transfer switches,
       <td>Decode `8`</td>
     </tr>
     <tr>
-      <td><a id="deepep-dispatcher-output-dtype"></a>`--deepep-dispatcher-output-dtype int8`</td>
+      <td>`--deepep-dispatcher-output-dtype int8`</td>
       <td>Quantizes DeepEP normal-mode dispatch activations to INT8, reducing communication volume.</td>
       <td><strong>Switch.</strong> On: DeepEP normal-mode prefill, especially multi-node, when the accuracy budget
       allows the small loss the traffic saving costs. Prefer this flag over the legacy variable below.</td>
       <td>Prefill `int8`</td>
     </tr>
     <tr>
-      <td><a id="deep-normal-mode-use-int8-quant"></a>`DEEP_NORMAL_MODE_USE_INT8_QUANT=1`</td>
+      <td>`DEEP_NORMAL_MODE_USE_INT8_QUANT=1`</td>
       <td>Legacy spelling of the INT8 dispatch switch, consumed by the Ascend DeepEP library.</td>
       <td><strong>Switch.</strong> Set it when the legacy pybind dispatch-buffer path is in play: that path selects
       the dtype from this variable inside the DeepEP runtime. The published pinned-image scripts still set it; on
@@ -458,7 +458,7 @@ model, hardware series, or build: the `ZBAL_*` / `ZBCCL_*` KV-transfer switches,
       <td>Prefill `1` (legacy fallback)</td>
     </tr>
     <tr>
-      <td><a id="deepep-normal-long-seq"></a>`DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS` /
+      <td>`DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS` /
       `DEEPEP_NORMAL_LONG_SEQ_ROUND` (+ `DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ`)</td>
       <td>Pipelines DeepEP normal-mode dispatch on long sequences: a prefill round's tokens cross the wire in
       `DEEPEP_NORMAL_LONG_SEQ_ROUND` chunks of `DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS` each, overlapping
@@ -473,7 +473,7 @@ model, hardware series, or build: the `ZBAL_*` / `ZBCCL_*` KV-transfer switches,
       set in the V3.2 configuration)</td>
     </tr>
     <tr>
-      <td><a id="enable-eplb"></a>`--enable-eplb`</td>
+      <td>`--enable-eplb`</td>
       <td>Redistributes experts across devices from measured load: it records expert-load statistics on every forward
       pass and evaluates a rebalance every `--eplb-rebalance-num-iterations` iterations (default `1000`).</td>
       <td><strong>Switch.</strong> On: expert-distribution metrics show unbalanced load — see
@@ -485,7 +485,7 @@ model, hardware series, or build: the `ZBAL_*` / `ZBCCL_*` KV-transfer switches,
       <td>on (when expert load is uneven)</td>
     </tr>
     <tr>
-      <td><a id="deepep-hccl-buffsize"></a>`DEEPEP_HCCL_BUFFSIZE`</td>
+      <td>`DEEPEP_HCCL_BUFFSIZE`</td>
       <td>HCCL buffer size in MB for the default HCCL group and for the MoE groups that DeepEP dispatch/combine run
       on. Falls back to `HCCL_BUFFSIZE` when unset (built-in default `200`).</td>
       <td><strong>Range.</strong> Up: headroom for prefill bulk transfers, at HBM cost. Down: HBM saved — decode needs
@@ -493,10 +493,10 @@ model, hardware series, or build: the `ZBAL_*` / `ZBCCL_*` KV-transfer switches,
       <td>Prefill `1200` · Decode `400`</td>
     </tr>
     <tr>
-      <td><a id="hccl-buffsize"></a>`HCCL_BUFFSIZE`</td>
+      <td>`HCCL_BUFFSIZE`</td>
       <td>HCCL buffer size in MB for the default communication group — the collectives outside the MoE
       dispatch/combine path, such as the TP/DP all-reduce and all-gather volume. Built-in default `200`; the MoE
-      all-to-all buffer is sized separately by [`DEEPEP_HCCL_BUFFSIZE`](#deepep-hccl-buffsize), which falls back to
+      all-to-all buffer is sized separately by `DEEPEP_HCCL_BUFFSIZE`, which falls back to
       this value.</td>
       <td><strong>Range.</strong> Up: headroom for the default group's collectives, at HBM cost. Down: HBM reclaimed
       on a node whose bulk traffic runs on the MoE buffers anyway — published PD prefill roles shrink it to
@@ -505,7 +505,7 @@ model, hardware series, or build: the `ZBAL_*` / `ZBCCL_*` KV-transfer switches,
       `64`–`1200`</td>
     </tr>
     <tr>
-      <td><a id="hccl-op-expansion-mode"></a>`HCCL_OP_EXPANSION_MODE`</td>
+      <td>`HCCL_OP_EXPANSION_MODE`</td>
       <td>Where HCCL communication-algorithm expansion and scheduling run: `AIV` moves them onto AI Vector cores,
       keeping the AI Cores free for compute; `AI_CPU` (the default) leaves them on the AI CPU.</td>
       <td><strong>Discrete.</strong> `AIV` gains are workload-dependent. Never set it on Atlas A2 systems with
@@ -528,7 +528,7 @@ model, hardware series, or build: the `ZBAL_*` / `ZBCCL_*` KV-transfer switches,
   </thead>
   <tbody>
     <tr>
-      <td><a id="speculative-algorithm"></a>`--speculative-algorithm`</td>
+      <td>`--speculative-algorithm`</td>
       <td>Drafts several tokens per step so one target forward verifies them, reducing per-token latency.
       `NEXTN` (an alias of `EAGLE`) reuses the model's own MTP head; `EAGLE3` takes an external draft model via
       `--speculative-draft-model-path`.</td>
@@ -541,7 +541,7 @@ model, hardware series, or build: the `ZBAL_*` / `ZBCCL_*` KV-transfer switches,
       <td>`NEXTN`</td>
     </tr>
     <tr>
-      <td><a id="speculative-num-steps"></a>`--speculative-num-steps`</td>
+      <td>`--speculative-num-steps`</td>
       <td>Draft forward passes per iteration.</td>
       <td><strong>Range.</strong> Up: a longer acceptance length and more verified tokens per target forward, at more
       draft latency and compute per step. Down: cheaper steps, at less acceptance. The payoff depends on the
@@ -551,14 +551,14 @@ model, hardware series, or build: the `ZBAL_*` / `ZBCCL_*` KV-transfer switches,
       acceptance length)</td>
     </tr>
     <tr>
-      <td><a id="speculative-eagle-topk"></a>`--speculative-eagle-topk`</td>
+      <td>`--speculative-eagle-topk`</td>
       <td>Tree width of the draft. Not a tunable value on Ascend: the KV-cache page size is 128 and the `ascend`
       attention backend does not implement tree drafts, so a larger value is rejected.</td>
       <td><strong>Discrete.</strong> Keep it at `1`; rejection sampling requires `1` as well.</td>
       <td>`1`</td>
     </tr>
     <tr>
-      <td><a id="speculative-num-draft-tokens"></a>`--speculative-num-draft-tokens`</td>
+      <td>`--speculative-num-draft-tokens`</td>
       <td>Draft tokens verified per iteration.</td>
       <td><strong>Range.</strong> Up: a higher potential acceptance length and throughput, at higher compute cost per
       step. Down: cheaper steps, at less throughput. With `topk 1` it is forced to `num-steps + 1`, and a different
@@ -566,14 +566,14 @@ model, hardware series, or build: the `ZBAL_*` / `ZBCCL_*` KV-transfer switches,
       <td>Prefill `2` · Decode `4`</td>
     </tr>
     <tr>
-      <td><a id="speculative-draft-model-quantization"></a>`--speculative-draft-model-quantization`</td>
+      <td>`--speculative-draft-model-quantization`</td>
       <td>Quantization of the draft model when the target model is quantized.</td>
       <td><strong>Discrete.</strong> Unset: the draft inherits the target quantization. `unquant`: the draft stays in
       BF16.</td>
       <td>`unquant` (with a quantized target; not set in the published configuration)</td>
     </tr>
     <tr>
-      <td><a id="overlap-plan-stream"></a>`SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`</td>
+      <td>`SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`</td>
       <td>Runs speculative batch-preparation kernels (draft-extend metadata, KV-location planning) on a dedicated
       stream, overlapping them with other work instead of running them serially.</td>
       <td><strong>Switch.</strong> On: speculative decoding is on and LoRA is not — it is incompatible with LoRA under
@@ -581,7 +581,7 @@ model, hardware series, or build: the `ZBAL_*` / `ZBCCL_*` KV-transfer switches,
       <td>`1`</td>
     </tr>
     <tr>
-      <td><a id="quantization"></a>`--quantization modelslim`</td>
+      <td>`--quantization modelslim`</td>
       <td>Loads ModelSlim W4A4/W8A8/W4A8 (and MXFP8/MXFP4) pre-quantized weights, auto-detecting the method from the
       model's `quant_model_description.json`. Weight memory drops by approximately 50% (W8) or 75% (W4) versus BF16.</td>
       <td><strong>Switch.</strong> On: you have a pre-quantized checkpoint and the accuracy budget allows a small loss
@@ -607,7 +607,7 @@ model, hardware series, or build: the `ZBAL_*` / `ZBCCL_*` KV-transfer switches,
   </thead>
   <tbody>
     <tr>
-      <td><a id="npu-use-mlapo"></a>`SGLANG_NPU_USE_MLAPO=1`</td>
+      <td>`SGLANG_NPU_USE_MLAPO=1`</td>
       <td>Fuses MLA pre-processing (QKV-A/Q-B projections, RMSNorms, RoPE, KV-cache write, and the W_kc absorb) into
       one kernel, and repacks the weights once per layer on the first forward.</td>
       <td><strong>Switch.</strong> On: DeepSeek-style MLA and similar architectures — it reduces decode and
@@ -617,14 +617,14 @@ model, hardware series, or build: the `ZBAL_*` / `ZBCCL_*` KV-transfer switches,
       <td>`1` (DeepSeek R1, Kimi K2.6)</td>
     </tr>
     <tr>
-      <td><a id="use-fia-nz"></a>`SGLANG_USE_FIA_NZ=1`</td>
+      <td>`SGLANG_USE_FIA_NZ=1`</td>
       <td>Stores the KV cache in the FIA NZ layout for more efficient memory access.</td>
       <td><strong>Switch.</strong> On: DeepSeek-style MLA. Independent of `SGLANG_NPU_USE_MLAPO` — either can be used
       alone.</td>
       <td>`1` (DeepSeek R1)</td>
     </tr>
     <tr>
-      <td><a id="npu-use-multi-stream"></a>`SGLANG_NPU_USE_MULTI_STREAM=1`</td>
+      <td>`SGLANG_NPU_USE_MULTI_STREAM=1`</td>
       <td>Runs shared experts and routed experts concurrently on separate NPU streams, overlapping shared-expert
       compute with expert dispatch. Not DeepSeek-only: the GLM, Qwen-MoE, and LongCat code paths read it too.</td>
       <td><strong>Switch.</strong> On: MoE models with shared experts (`n_shared_experts`) — set by the DeepSeek R1,
@@ -633,7 +633,7 @@ model, hardware series, or build: the `ZBAL_*` / `ZBCCL_*` KV-transfer switches,
       <td>`1` (DeepSeek R1, DeepSeek V4-Flash, GLM-5.1/5.2, Kimi K2.6)</td>
     </tr>
     <tr>
-      <td><a id="ag-after-qlora"></a>`SGLANG_USE_AG_AFTER_QLORA=1` + `--enable-attn-tp-input-scattered`</td>
+      <td>`SGLANG_USE_AG_AFTER_QLORA=1` + `--enable-attn-tp-input-scattered`</td>
       <td>Delays the attention all-gather until after the low-rank Q projection (`q_lora_rank`), so fewer bytes are
       gathered.</td>
       <td><strong>Switch.</strong> On: models with `q_lora_rank`, practically prefill-only — it requires the
@@ -642,7 +642,7 @@ model, hardware series, or build: the `ZBAL_*` / `ZBCCL_*` KV-transfer switches,
       <td>`1` (DeepSeek R1 prefill)</td>
     </tr>
     <tr>
-      <td><a id="npu-disable-acl-format-weight"></a>`SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT`</td>
+      <td>`SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT`</td>
       <td>By default, linear, MoE, quantized, and MLA QKV weights are cast to the ACL FRACTAL_NZ format (enum 29);
       setting `1` keeps the ND layout when a feature requires it. The KV-cache NZ layout is controlled separately by
       `SGLANG_USE_FIA_NZ`.</td>
@@ -652,14 +652,14 @@ model, hardware series, or build: the `ZBAL_*` / `ZBCCL_*` KV-transfer switches,
       <td>— (keep the NZ layout)</td>
     </tr>
     <tr>
-      <td><a id="tokenizer-worker-num"></a>`--tokenizer-worker-num`</td>
+      <td>`--tokenizer-worker-num`</td>
       <td>Number of parallel tokenizer worker processes (default `1`).</td>
       <td><strong>Range.</strong> Up: tokenization parallelizes across worker processes. Down: keep `1` for native
       gRPC and elastic EP, which require it.</td>
       <td>`1`</td>
     </tr>
     <tr>
-      <td><a id="host-os-settings"></a>Host OS settings</td>
+      <td>Host OS settings</td>
       <td>CPU governor `performance`
       (`echo performance | sudo tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor`) locks all cores at the
       maximum frequency, removing DVFS-induced latency jitter; `vm.swappiness=0` reduces the chance of kernel swapping
@@ -670,7 +670,7 @@ model, hardware series, or build: the `ZBAL_*` / `ZBCCL_*` KV-transfer switches,
       <td>always set</td>
     </tr>
     <tr>
-      <td><a id="set-cpu-affinity"></a>`SGLANG_SET_CPU_AFFINITY=1`</td>
+      <td>`SGLANG_SET_CPU_AFFINITY=1`</td>
       <td>Binds each TP rank's scheduler process to dedicated CPU cores, avoiding cross-core migration overhead.</td>
       <td><strong>Switch.</strong> On: always, alongside the host OS settings.</td>
       <td>`1`</td>
@@ -689,7 +689,7 @@ decode tokens is a multiple of the alignment; with speculative decoding the draf
 multiple, so buckets below the alignment can survive. Buckets that miss the alignment are dropped, and startup aborts
 if none survive.
 
-In practice, set [`--cuda-graph-max-bs-decode`](#cuda-graph-max-bs-decode) to at least the alignment and to a
+In practice, set [`--cuda-graph-max-bs-decode`](#batching-graphs-and-memory) to at least the alignment and to a
 multiple of it whenever attention DP, an all-to-all backend, or `--moe-dense-tp-size` is in play. A dense model with
 plain TP has no such constraint.
 
@@ -700,7 +700,7 @@ may still carry it, as the published prefill scripts do; there it is redundant a
 
 ### Sizing the DeepEP dispatch buffer
 
-Size [`SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK`](#deepep-dispatch-buffer) to the maximum number of tokens one
+Size [`SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK`](#moe-dispatch-and-communication) to the maximum number of tokens one
 rank dispatches per decode iteration: running requests per rank × `--speculative-num-draft-tokens` with speculative
 decoding, or just the running requests per rank without it.
 
@@ -734,14 +734,14 @@ maximizing knob.
 On MLA and DeepSeek-style MoE models, enable the MLAPO and multistream-MoE switches from the
 [batch checklist](#batch-checklist) first; the knobs below come after them.
 
-1. [Speculative decoding](#speculative-algorithm) ([steps](#speculative-num-steps),
-   [draft tokens](#speculative-num-draft-tokens)) — one target forward verifies several draft tokens. Watch the
+1. [Speculative decoding](#speculative-decoding-and-quantization) (`--speculative-num-steps`,
+   `--speculative-num-draft-tokens`) — one target forward verifies several draft tokens. Watch the
    `accept len:` / `accept rate:` fields: acceptance drifts with output content, and at very high concurrency the
    verification overhead can cost throughput instead.
-2. [`--cuda-graph-max-bs-decode`](#cuda-graph-max-bs-decode) — remove kernel-launch overhead.
-3. [`--attn-dp-size`](#attn-dp-size) — more independent decode instances.
-4. [`SGLANG_SCHEDULER_SKIP_ALL_GATHER=1`](#scheduler-skip-all-gather) — further reduction, only with balanced DP load.
-5. [`--enable-prefill-delayer`](#enable-prefill-delayer) — on mixed workloads with attention DP, bounded prefill
+2. [`--cuda-graph-max-bs-decode`](#batching-graphs-and-memory) — remove kernel-launch overhead.
+3. [`--attn-dp-size`](#parallelism) — more independent decode instances.
+4. [`SGLANG_SCHEDULER_SKIP_ALL_GATHER=1`](#parallelism) — further reduction, only with balanced DP load.
+5. [`--enable-prefill-delayer`](#batching-graphs-and-memory) — on mixed workloads with attention DP, bounded prefill
    delays keep decode fed when it would otherwise stall behind prefill bursts (it pays TTFT for TPOT).
 
 **Cross-goal.** The delayer pays TTFT, a higher graph cap costs memory, and verification spends compute that high
@@ -750,10 +750,10 @@ concurrency cannot repay — the [TTFT](#lower-time-to-first-token-ttft), [OOM](
 
 ### Higher throughput
 
-1. [`--attn-dp-size`](#attn-dp-size) — more independent decode instances.
-2. [`--max-running-requests`](#max-running-requests) — more concurrent requests per node.
-3. [`--tokenizer-worker-num`](#tokenizer-worker-num) — parallelize tokenization across worker processes.
-4. [`--mem-fraction-static`](#mem-fraction-static) — more KV cache, while monitoring for out-of-memory errors.
+1. [`--attn-dp-size`](#parallelism) — more independent decode instances.
+2. [`--max-running-requests`](#batching-graphs-and-memory) — more concurrent requests per node.
+3. [`--tokenizer-worker-num`](#model-specific-switches-and-host) — parallelize tokenization across worker processes.
+4. [`--mem-fraction-static`](#batching-graphs-and-memory) — more KV cache, while monitoring for out-of-memory errors.
 
 Check the load supply before sizing server-side knobs. Client concurrency, `--max-running-requests`, and the batch the
 server actually forms are three different numbers: requests above the capacity cap only queue, and the effective batch
@@ -765,10 +765,10 @@ once the server saturates, more concurrency buys queueing and TTFT, not throughp
 
 ### Lower time to first token (TTFT)
 
-1. [`--chunked-prefill-size`](#chunked-prefill-size) on mixed workloads — short requests are not delayed behind a
+1. [`--chunked-prefill-size`](#batching-graphs-and-memory) on mixed workloads — short requests are not delayed behind a
    single long prefill.
-2. Prefix caching — leave [`--disable-radix-cache`](#disable-radix-cache) unset, so shared prompt prefixes reuse KV.
-3. [`--attn-cp-size`](#attn-cp-size) for long inputs — one sequence split across devices.
+2. Prefix caching — leave [`--disable-radix-cache`](#batching-graphs-and-memory) unset, so shared prompt prefixes reuse KV.
+3. [`--attn-cp-size`](#parallelism) for long inputs — one sequence split across devices.
 
 **Cross-goal.** A smaller chunk interleaves more fairly but lowers prefill throughput, and context parallelism adds
 inter-device traffic — the [throughput](#higher-throughput) and [TPOT](#lower-decode-latency-tpot) goals read the same
@@ -780,13 +780,13 @@ Decide first whether the hardware can hold the model at all: get the checkpoint'
 or run `du -sh` on the weights directory, and compare it against your total device memory. If the cards and machines
 should hold the weights with room to spare, the shortage is in the memory budget rather than the hardware.
 
-1. Lower [`--mem-fraction-static`](#mem-fraction-static) — leave room for activations and graph buffers, at less KV
+1. Lower [`--mem-fraction-static`](#batching-graphs-and-memory) — leave room for activations and graph buffers, at less KV
    cache and fewer concurrent requests.
-2. Add [`expandable_segments:True`](#pytorch-npu-alloc-conf) — mitigates the allocator fragmentation that drives
+2. Add [`expandable_segments:True`](#batching-graphs-and-memory) — mitigates the allocator fragmentation that drives
    out-of-memory errors on MoE-scale models.
-3. Load a [`--quantization modelslim`](#quantization) checkpoint — W8/W4 weights cut weight memory by approximately
+3. Load a [`--quantization modelslim`](#speculative-decoding-and-quantization) checkpoint — W8/W4 weights cut weight memory by approximately
    50%/75%, at a small accuracy loss.
-4. Scale out — a wider [`--tp-size`](#tp-size) or [`--ep-size`](#ep-size).
+4. Scale out — a wider [`--tp-size`](#parallelism) or [`--ep-size`](#parallelism).
 
 If startup instead fails with `Not enough memory … increase --mem-fraction-static`, the KV pool is too small: see
 [Troubleshooting](#troubleshooting).
@@ -796,10 +796,10 @@ bandwidth — every fix here is a cost booked under another goal.
 
 ### Serve long contexts
 
-1. [`--enable-prefill-cp`](#enable-prefill-cp) + [`--attn-cp-size`](#attn-cp-size) +
-   [`--cp-strategy`](#cp-strategy) — shard one sequence's KV and attention across devices.
-2. [`--max-prefill-tokens`](#max-prefill-tokens) — let concurrent long requests co-batch in one forward.
-3. [`--chunked-prefill-size -1`](#chunked-prefill-size) on a dedicated prefill group — the entire sequence prefilled
+1. [`--enable-prefill-cp`](#parallelism) + [`--attn-cp-size`](#parallelism) +
+   [`--cp-strategy`](#parallelism) — shard one sequence's KV and attention across devices.
+2. [`--max-prefill-tokens`](#batching-graphs-and-memory) — let concurrent long requests co-batch in one forward.
+3. [`--chunked-prefill-size -1`](#batching-graphs-and-memory) on a dedicated prefill group — the entire sequence prefilled
    in one pass.
 
 **Cross-goal.** Context parallelism adds inter-device traffic, and an unchunked prefill keeps decode waiting wherever
@@ -815,10 +815,10 @@ the row, not the section.
 
 | Observation | Inspect first |
 | --- | --- |
-| Batches smaller than expected, devices underutilized | Client concurrency (the benchmark's load supply), [`--max-running-requests`](#max-running-requests), admission gating ([`--min-free-slots-delay`](#min-free-slots-delay)) |
-| Long decode stalls adjacent to prefills | [`--chunked-prefill-size`](#chunked-prefill-size), admission timing ([`--enable-prefill-delayer`](#enable-prefill-delayer), [`--min-free-slots-delay`](#min-free-slots-delay)) |
-| Ranks unevenly busy | [`--load-balance-method`](#load-balance-method), the [Parallelism](#tp-size) rows, prefix-cache distribution across DP ranks |
-| Communication dominates while operators run small | Parallel granularity: [`--tp-size`](#tp-size), [`--moe-dense-tp-size`](#moe-dense-tp-size), [`--enable-dp-lm-head`](#enable-dp-lm-head) — confirm with a profile first |
+| Batches smaller than expected, devices underutilized | Client concurrency (the benchmark's load supply), [`--max-running-requests`](#batching-graphs-and-memory), admission gating ([`--min-free-slots-delay`](#batching-graphs-and-memory)) |
+| Long decode stalls adjacent to prefills | [`--chunked-prefill-size`](#batching-graphs-and-memory), admission timing ([`--enable-prefill-delayer`](#batching-graphs-and-memory), [`--min-free-slots-delay`](#batching-graphs-and-memory)) |
+| Ranks unevenly busy | [`--load-balance-method`](#parallelism), the [Parallelism](#parallelism) rows, prefix-cache distribution across DP ranks |
+| Communication dominates while operators run small | Parallel granularity: [`--tp-size`](#parallelism), [`--moe-dense-tp-size`](#parallelism), [`--enable-dp-lm-head`](#parallelism) — confirm with a profile first |
 | Long inputs run out of memory | The KV budget, temporary activation space, and graph capture range — see [Resolve out-of-memory errors](#resolve-out-of-memory-errors) |
 | Throughput improved but TTFT worsened | Queueing and admission delay — the trade-off the change was expected to pay. Re-read the row of the knob you moved. |
 
@@ -833,19 +833,19 @@ published V3.2 configuration splits them like this:
 
 | Knob | Prefill role | Decode role |
 | --- | --- | --- |
-| [`--mem-fraction-static`](#mem-fraction-static) | `0.73` | `0.79` |
-| [`TASK_QUEUE_ENABLE`](#task-queue-enable) | `2` (level 2 fails under graph capture, and this role captures none) | `0` |
-| [`--deepep-mode`](#deepep-mode) | `normal` | `low_latency` |
-| [`DEEPEP_HCCL_BUFFSIZE`](#deepep-hccl-buffsize) | `1200` | `400` |
-| [`SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK`](#deepep-dispatch-buffer) | — | `8` |
-| [`--deepep-dispatcher-output-dtype`](#deepep-dispatcher-output-dtype) | `int8` | — |
-| [`--speculative-num-steps`](#speculative-num-steps) / [`--speculative-num-draft-tokens`](#speculative-num-draft-tokens) | `1` / `2` | `3` / `4` |
-| NPU Graph capture | off (prefill graphs are off by default) | [`--cuda-graph-max-bs-decode 4`](#cuda-graph-max-bs-decode) |
-| [`--attn-dp-size`](#attn-dp-size) + [`--enable-dp-lm-head`](#enable-dp-lm-head) | — | `8` + on |
-| [`--moe-dense-tp-size`](#moe-dense-tp-size) | `1` (with `cp = tp`, attention is no longer TP-sharded, so the dense FFN can stay unsharded too) | `1` (each DP group already holds the full dense weights) |
-| Prefill CP ([`--enable-prefill-cp`](#enable-prefill-cp), [`--attn-cp-size`](#attn-cp-size), [`--cp-strategy`](#cp-strategy)) | on (`32`, `interleave`) | — |
-| [`--chunked-prefill-size`](#chunked-prefill-size) / [`--max-prefill-tokens`](#max-prefill-tokens) / [`--max-running-requests`](#max-running-requests) | `-1` / `68000` / `1` | — / — / `32` |
-| [`--disable-radix-cache`](#disable-radix-cache) | on (random-input benchmark traffic) | on (redundant: PD decode disables prefix caching anyway) |
+| [`--mem-fraction-static`](#batching-graphs-and-memory) | `0.73` | `0.79` |
+| [`TASK_QUEUE_ENABLE`](#batching-graphs-and-memory) | `2` (level 2 fails under graph capture, and this role captures none) | `0` |
+| [`--deepep-mode`](#moe-dispatch-and-communication) | `normal` | `low_latency` |
+| [`DEEPEP_HCCL_BUFFSIZE`](#moe-dispatch-and-communication) | `1200` | `400` |
+| [`SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK`](#moe-dispatch-and-communication) | — | `8` |
+| [`--deepep-dispatcher-output-dtype`](#moe-dispatch-and-communication) | `int8` | — |
+| [`--speculative-num-steps`](#speculative-decoding-and-quantization) / [`--speculative-num-draft-tokens`](#speculative-decoding-and-quantization) | `1` / `2` | `3` / `4` |
+| NPU Graph capture | off (prefill graphs are off by default) | [`--cuda-graph-max-bs-decode 4`](#batching-graphs-and-memory) |
+| [`--attn-dp-size`](#parallelism) + [`--enable-dp-lm-head`](#parallelism) | — | `8` + on |
+| [`--moe-dense-tp-size`](#parallelism) | `1` (with `cp = tp`, attention is no longer TP-sharded, so the dense FFN can stay unsharded too) | `1` (each DP group already holds the full dense weights) |
+| Prefill CP ([`--enable-prefill-cp`](#parallelism), [`--attn-cp-size`](#parallelism), [`--cp-strategy`](#parallelism)) | on (`32`, `interleave`) | — |
+| [`--chunked-prefill-size`](#batching-graphs-and-memory) / [`--max-prefill-tokens`](#batching-graphs-and-memory) / [`--max-running-requests`](#batching-graphs-and-memory) | `-1` / `68000` / `1` | — / — / `32` |
+| [`--disable-radix-cache`](#batching-graphs-and-memory) | on (random-input benchmark traffic) | on (redundant: PD decode disables prefix caching anyway) |
 
 The roles differ because their workloads differ: prefill is throughput-bound on large token counts (bulk dispatch
 buffers, un-chunked batches, no graphs worth capturing), while decode is latency-bound (small graph-captured batches,
@@ -854,12 +854,12 @@ each leaves for KV cache differs, which is why their memory fractions differ. De
 `SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1` and `SGLANG_SCHEDULER_SKIP_ALL_GATHER=1`, whose preconditions are in their rows.
 
 Roles also differ in knobs this configuration does not set: published prefill roles tune the DeepEP long-sequence
-dispatch pipeline ([its row](#deepep-normal-long-seq)) and shrink `HCCL_BUFFSIZE` ([its row](#hccl-buffsize)), and
-several models add [`--enable-prefill-delayer`](#enable-prefill-delayer) — those rows carry the per-role values.
+dispatch pipeline and shrink `HCCL_BUFFSIZE` (see [MoE dispatch and communication](#moe-dispatch-and-communication)), and
+several models add [`--enable-prefill-delayer`](#batching-graphs-and-memory) — those rows carry the per-role values.
 
 For a multi-node deployment that is not disaggregated, the extra knobs are the communication ones —
-[`DEEPEP_HCCL_BUFFSIZE`](#deepep-hccl-buffsize) and INT8 dispatch on prefill
-([`--deepep-dispatcher-output-dtype`](#deepep-dispatcher-output-dtype)).
+[`DEEPEP_HCCL_BUFFSIZE`](#moe-dispatch-and-communication) and INT8 dispatch on prefill
+([`--deepep-dispatcher-output-dtype`](#moe-dispatch-and-communication)).
 
 ## Feature Compatibility
 
@@ -871,24 +871,24 @@ For per-flag support status, see [Supported Features](/docs/hardware-platforms/a
 
 | Combination | Status | Consequence and fix |
 | --- | --- | --- |
-| [Attention DP](#attn-dp-size) + `--dp-size` greater than 1 | Blocked | Model replicas cannot be combined with attention DP, and `--dp-size` greater than 1 is single-node only. |
-| [EPLB](#enable-eplb) + `ascend_fuseep` backend | Blocked | EPLB requires `deepep`. There is no startup guard, so a wrong backend fails silently. |
-| [EPLB](#enable-eplb) + topology where TP, EP, and world size are not all equal | Blocked | Migration raises `NPU EPLB migration requires TP size = EP size = WORLD size.` |
-| [HCCL expansion mode](#hccl-op-expansion-mode) + `HCCL_OP_EXPANSION_MODE=AIV` on Atlas A2 systems with DeepEP | Blocked | Vendor docs report unknown-operator errors; leave it unset on that combination. |
-| LoRA + [`SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`](#overlap-plan-stream) | Blocked | The speculative plan stream is incompatible with LoRA under any LoRA-compatible speculative algorithm (EAGLE/NEXTN/EAGLE3, DFLASH, DSPARK). |
+| [Attention DP](#parallelism) + `--dp-size` greater than 1 | Blocked | Model replicas cannot be combined with attention DP, and `--dp-size` greater than 1 is single-node only. |
+| [EPLB](#moe-dispatch-and-communication) + `ascend_fuseep` backend | Blocked | EPLB requires `deepep`. There is no startup guard, so a wrong backend fails silently. |
+| [EPLB](#moe-dispatch-and-communication) + topology where TP, EP, and world size are not all equal | Blocked | Migration raises `NPU EPLB migration requires TP size = EP size = WORLD size.` |
+| [HCCL expansion mode](#moe-dispatch-and-communication) + `HCCL_OP_EXPANSION_MODE=AIV` on Atlas A2 systems with DeepEP | Blocked | Vendor docs report unknown-operator errors; leave it unset on that combination. |
+| LoRA + [`SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`](#speculative-decoding-and-quantization) | Blocked | The speculative plan stream is incompatible with LoRA under any LoRA-compatible speculative algorithm (EAGLE/NEXTN/EAGLE3, DFLASH, DSPARK). |
 
 ## Troubleshooting
 
 | Symptom | Likely Cause | Fix |
 | ------- | ------------ | --- |
-| Startup fails with `Not enough memory. Please try to increase --mem-fraction-static.` | The KV pool computed to zero (or negative) capacity once weights were loaded | Raise [`--mem-fraction-static`](#mem-fraction-static) in small steps. If the weights alone consume the budget (BF16), the hardware is the limit — scale out or load a ModelSlim checkpoint |
-| Out of memory during serving or graph capture | `--mem-fraction-static` leaves no headroom for activations or graph buffers, or the weights are BF16 | Lower [`--mem-fraction-static`](#mem-fraction-static). If the model is BF16, the hardware is the limit — load a ModelSlim W8A8/W4A4 checkpoint, or scale out (see [Quantization on Ascend](/docs/hardware-platforms/ascend-npus/optimization/quantization) to quantize your own) |
-| NPU Graph capture aborts with `Do not support TASK_QUEUE_ENABLE = 2 during NPU graph capture` | Level-2 task queue is incompatible with graph capture | Set [`TASK_QUEUE_ENABLE`](#task-queue-enable)=`0` (or `1`) on the role that captures graphs |
-| NPU Graph capture aborts with an `AssertionError` whose message is `capture_bs=[]` | Every decode bucket missed the batch-size alignment, so the capture list is empty | Raise [`--cuda-graph-max-bs-decode`](#cuda-graph-max-bs-decode) to at least the alignment and to a multiple of it, or narrow the alignment by removing attention DP or the MoE all-to-all backend — see [Graph batch-size alignment](#graph-batch-size-alignment) |
-| DeepEP dispatch fails at runtime | Per-rank dispatch tokens exceed the buffer | Size [`SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK`](#deepep-dispatch-buffer) to the actual per-iteration maximum — see [Sizing the DeepEP dispatch buffer](#sizing-the-deepep-dispatch-buffer) |
-| Intermittent pinned host memory allocation failures | Pinned host pool fragmentation | Append `pin_memory_expandable_segments:True` to [`PYTORCH_NPU_ALLOC_CONF`](#pytorch-npu-alloc-conf) — see its row for the CANN and driver requirement |
-| Expert hotspots or uneven load across NPUs | Static expert placement | Measure the imbalance with `--expert-balancedness-report-mode server_log` (or `prometheus`), or record the raw per-expert distribution with `--expert-distribution-recorder-mode` plus the `/start_expert_distribution_record` / `/dump_expert_distribution_record` endpoints; then enable [`--enable-eplb`](#enable-eplb). It requires the `deepep` backend and `TP = EP = world size`, and `--ep-num-redundant-experts` adds actual replication |
-| Startup fails with `--cp-strategy must be set when --enable-prefill-cp is enabled.` | Prefill CP enabled without a strategy | Add [`--cp-strategy`](#cp-strategy) `interleave` for DeepSeek V3.2, or `zigzag` for MiMo V2 |
+| Startup fails with `Not enough memory. Please try to increase --mem-fraction-static.` | The KV pool computed to zero (or negative) capacity once weights were loaded | Raise [`--mem-fraction-static`](#batching-graphs-and-memory) in small steps. If the weights alone consume the budget (BF16), the hardware is the limit — scale out or load a ModelSlim checkpoint |
+| Out of memory during serving or graph capture | `--mem-fraction-static` leaves no headroom for activations or graph buffers, or the weights are BF16 | Lower [`--mem-fraction-static`](#batching-graphs-and-memory). If the model is BF16, the hardware is the limit — load a ModelSlim W8A8/W4A4 checkpoint, or scale out (see [Quantization on Ascend](/docs/hardware-platforms/ascend-npus/optimization/quantization) to quantize your own) |
+| NPU Graph capture aborts with `Do not support TASK_QUEUE_ENABLE = 2 during NPU graph capture` | Level-2 task queue is incompatible with graph capture | Set [`TASK_QUEUE_ENABLE`](#batching-graphs-and-memory)=`0` (or `1`) on the role that captures graphs |
+| NPU Graph capture aborts with an `AssertionError` whose message is `capture_bs=[]` | Every decode bucket missed the batch-size alignment, so the capture list is empty | Raise [`--cuda-graph-max-bs-decode`](#batching-graphs-and-memory) to at least the alignment and to a multiple of it, or narrow the alignment by removing attention DP or the MoE all-to-all backend — see [Graph batch-size alignment](#graph-batch-size-alignment) |
+| DeepEP dispatch fails at runtime | Per-rank dispatch tokens exceed the buffer | Size [`SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK`](#moe-dispatch-and-communication) to the actual per-iteration maximum — see [Sizing the DeepEP dispatch buffer](#sizing-the-deepep-dispatch-buffer) |
+| Intermittent pinned host memory allocation failures | Pinned host pool fragmentation | Append `pin_memory_expandable_segments:True` to [`PYTORCH_NPU_ALLOC_CONF`](#batching-graphs-and-memory) — see its row for the CANN and driver requirement |
+| Expert hotspots or uneven load across NPUs | Static expert placement | Measure the imbalance with `--expert-balancedness-report-mode server_log` (or `prometheus`), or record the raw per-expert distribution with `--expert-distribution-recorder-mode` plus the `/start_expert_distribution_record` / `/dump_expert_distribution_record` endpoints; then enable [`--enable-eplb`](#moe-dispatch-and-communication). It requires the `deepep` backend and `TP = EP = world size`, and `--ep-num-redundant-experts` adds actual replication |
+| Startup fails with `--cp-strategy must be set when --enable-prefill-cp is enabled.` | Prefill CP enabled without a strategy | Add [`--cp-strategy`](#parallelism) `interleave` for DeepSeek V3.2, or `zigzag` for MiMo V2 |
 | A benchmarked change moved nothing | The flag did not take effect on this build, the target path stayed off, or the difference is inside the benchmark's noise floor | Confirm the change in the startup log (the launch echoes the resolved arguments, and feature switches log their own enable lines), confirm the path actually engaged (for speculative decoding, the `accept len:` field), and compare against the noise floor measured per [How to Tune](#how-to-tune) |
 
 ## See Also
