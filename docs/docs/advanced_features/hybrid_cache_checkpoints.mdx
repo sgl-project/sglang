@@ -31,4 +31,4 @@ Models with both sliding-window and linear-attention layers keep checkpointing e
 ## Related options
 
 - `--mamba-max-states-per-path N` is deprecated. When set, it still caps the checkpoints kept per path at either level (`-1` means unlimited).
-- The size of the state pool that holds the checkpoints is set by `--mamba-full-memory-ratio` or `--max-mamba-cache-size`; see [Hybrid Model Memory Pools](/docs/advanced_features/hybrid_model_memory).
+- The size of the state pool that holds the checkpoints is set by `--mamba-full-memory-ratio` or `--max-mamba-cache-size`; see [Mamba Cache](/docs/advanced_features/server_arguments#mamba-cache).
