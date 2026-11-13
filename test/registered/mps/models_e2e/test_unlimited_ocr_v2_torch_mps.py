@@ -10,7 +10,6 @@ import io
 import json
 import os
 import unittest
-from types import SimpleNamespace
 
 import requests
 import torch
@@ -95,8 +94,13 @@ class TestUnlimitedOcrV2TorchMps(CustomTestCase):
 
     def test_mps_default_sizes_the_kv_pool_in_windows(self):
         info = requests.get(f"{self.base_url}/server_info", timeout=30).json()
+        doc_cfg = UocrDocumentConfig(
+            uocr_doc_split=info["uocr_doc_split"],
+            uocr_doc_page_window=info["uocr_doc_page_window"],
+            uocr_max_page_tokens=info["uocr_max_page_tokens"],
+        )
         window = mps_window_tokens(
-            UocrDocumentConfig.from_args(SimpleNamespace(**info)),
+            doc_cfg,
             chunked_prefill_size=info["chunked_prefill_size"],
             page_size=info["page_size"],
         )
