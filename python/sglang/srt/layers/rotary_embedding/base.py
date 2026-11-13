@@ -437,8 +437,10 @@ class RotaryEmbedding(BaseFusedOp):
             "fused_set_kv_buffer_arg is not supported for cpu implementation"
         )
 
-        positions = torch.add(positions, offsets) if offsets is not None else positions
         if _is_cpu_amx_available:
+            positions = (
+                torch.add(positions, offsets) if offsets is not None else positions
+            )
             # rotary_embedding_cpu requires query and the cache to share a dtype;
             # forward_cuda/forward_xpu already align them, forward_cpu did not.
             self._match_cos_sin_cache_dtype(query)
