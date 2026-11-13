@@ -156,8 +156,7 @@ class WindowLayers(msgspec.Struct, frozen=True, kw_only=True):
 
 
 class FullLayerParts(msgspec.Struct, frozen=True, kw_only=True):
-    """A part some full-attention layers keep beside their KV, for the whole
-    request: its geometry and the layers that keep it."""
+    """A part some full-attention layers keep beside their KV."""
 
     layer_ids: Tuple[int, ...]
     geometry: PartGeometry

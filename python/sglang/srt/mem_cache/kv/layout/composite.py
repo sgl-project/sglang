@@ -167,10 +167,8 @@ class TokenRows(UnitPart):
 
 @runtime_checkable
 class UnitPartGeometry(Protocol):
-    """A part kind declared outside the built-in geometries that lays itself
-    out in a composite unit: the part name its layers are routed by, whether it
-    is laid out only in a unit (even alone), its bytes in the unit, and the
-    view its readers take over them."""
+    """A geometry declared outside decl.py that lays itself out in a composite
+    unit."""
 
     part_name: str
 
@@ -195,10 +193,6 @@ class CompositeSubPoolSpec(SubPoolSpec):
         super().__post_init__()
         names = [part.name for part in self.parts]
         assert len(set(names)) == len(names), f"duplicate unit parts {names}"
-        assert self.draft_region is None, (
-            f"sub-pool {self.name!r}: a fused draft region rides in a composite "
-            "unit as one of its per-token parts"
-        )
         if not self.uniform():
             flat = [part.name for part in self.parts if not part.page_addressable]
             if flat:
@@ -256,7 +250,10 @@ class CompositeSubPoolSpec(SubPoolSpec):
         return found
 
     def part(self, name: str) -> UnitPart:
-        return next(p for p in self.parts if p.name == name)
+        for part in self.parts:
+            if part.name == name:
+                return part
+        raise KeyError(f"sub-pool {self.name!r} holds no part {name!r}")
 
     def part_views(self, arena, name: str) -> List[torch.Tensor]:
         """Per layer, part ``name``'s data over this sub-pool's band of

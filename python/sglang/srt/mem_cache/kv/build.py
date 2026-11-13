@@ -181,8 +181,8 @@ def _build_token_view(
     plan: KVStoragePlan,
     ctx: UnifiedBuildContext,
 ):
-    """A token sub-pool's view in its layout: of a composite sub-pool, the
-    view of its token KV part (its other parts are bound by `_bind_unit_parts`)."""
+    """A token sub-pool's view in its layout; a composite's other parts are
+    bound by `_bind_unit_parts`."""
     if isinstance(sub_pool.spec, CompositeSubPoolSpec):
         kv = sub_pool.part(KV_PART)
         return _unit_view(kv, sub_pool, arena, plan)
@@ -221,8 +221,7 @@ def _unit_view(
 
 
 def _bind_unit_parts(router, plan: KVStoragePlan, arena: KVArena) -> None:
-    """Routes the parts composite sub-pools hold beside their token KV: each
-    layer that keeps one reaches its view by the part's name."""
+    """Routes each composite sub-pool's non-KV parts by part name."""
     for sub_pool in plan.sub_pools:
         for part in sub_pool.parts:
             if part.name == KV_PART:

@@ -44,8 +44,7 @@ class ArenaBand(msgspec.Struct, frozen=True, kw_only=True):
     grow_direction: str  # "up" | "down" | "float"
     # Units handed out zeroed, for layouts whose readers load whole pages.
     zero_on_handout: bool
-    # Units whose entries are not one token each (a page with per-page parts):
-    # copies of a request's tokens take their whole units.
+    # Copies of a request's tokens take their whole units.
     copies_whole_units: bool = False
 
     @property
