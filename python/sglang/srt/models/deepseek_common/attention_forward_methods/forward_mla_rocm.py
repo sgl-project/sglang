@@ -1070,8 +1070,19 @@ class DeepseekMLARocmForwardMixin:
                 **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
             )
         else:
-            if self._skip_rope_for_aiter_fused_mla() or self._fuse_rope_for_gfx1250_mla(
-                forward_batch
+            fused_q_cache = self._maybe_fused_q_cache(
+                q_nope_out=q_nope_out,
+                q_pe=q_pe,
+                k_nope=k_nope,
+                k_pe=k_pe,
+                forward_batch=forward_batch,
+            )
+            if fused_q_cache is not None:
+                q, k = fused_q_cache
+                save_kv_cache = False
+            elif (
+                self._skip_rope_for_aiter_fused_mla()
+                or self._fuse_rope_for_gfx1250_mla(forward_batch)
             ):
                 q, _, _, k = _fused_rope_cat_and_cache(
                     self,
@@ -1212,6 +1223,39 @@ class DeepseekMLARocmForwardMixin:
             return output, None
         else:
             return output, topk_indices
+
+    def _maybe_fused_q_cache(
+        self: DeepseekV2AttentionMLA,
+        *,
+        q_nope_out: torch.Tensor,
+        q_pe: torch.Tensor,
+        k_nope: torch.Tensor,
+        k_pe: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        mode = forward_batch.forward_mode
+        if (
+            self.rocm_mla_q_cache_writer is None
+            or get_parallel().dcp_enabled
+            or not (mode.is_decode() or mode.is_target_verify())
+        ):
+            return None
+        kv_layer = get_kv_layers().read(self.attn_mqa.layer_id)
+        # The writer scatters at out_cache_loc; KVLayer.store writes there only for
+        # the owner sub-pool, and at the batch's swa_loc for any other.
+        if not kv_layer.owner:
+            return None
+        return self.rocm_mla_q_cache_writer.write(
+            q_nope=q_nope_out,
+            q_pe=q_pe,
+            k_nope=k_nope,
+            k_pe=k_pe,
+            out_cache_loc=forward_batch.out_cache_loc,
+            kv_cache=kv_layer.key(),
+            k_scale_float=self.attn_mqa.k_scale_float,
+            attention_backend=self.current_attention_backend,
+            is_target_verify=mode.is_target_verify(),
+        )
 
     def _dcp_q_gather_dtype(self: DeepseekV2AttentionMLA) -> Optional[torch.dtype]:
         """FP8 KV dtype to gather q in, or None to gather it as computed.
