@@ -23,12 +23,18 @@ from sglang.kernels.ops.speculative.fly import (
     FlyGreedyPrepass,
     FlySamplingPrepass,
     compute_fly_entropy,
+    compute_fly_entropy_from_probs,
 )
 from sglang.kernels.ops.speculative.reject_sampling import (
     chain_speculative_sampling_triton,
 )
 from sglang.srt.speculative.dflash_utils import _get_or_create_chain_verify_buffers
-from sglang.srt.speculative.fly_config import FlyConfig, resolve_fly_config
+from sglang.srt.speculative.fly_config import (
+    MAX_FLY_ENTROPY_TOP_K,
+    MAX_FLY_GAMMA,
+    FlyConfig,
+    resolve_fly_config,
+)
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -42,7 +48,7 @@ NUM_ROWS = GAMMA + 1
 def _step(targets, drafts, uncertain=(), masked=()):
     """One request's verify step: ``targets`` the target argmax at each of the
     NUM_ROWS rows, ``drafts`` the GAMMA draft tokens. An ``uncertain`` draft row
-    puts its draft token second (top-3 entropy ~0.79); every other row is peaked
+    puts its draft token second (top-3 entropy ~0.81); every other row is peaked
     (entropy ~0). A ``masked`` row gives its draft token a -inf target logit."""
     logits = torch.zeros(NUM_ROWS, VOCAB)
     for row, target in enumerate(targets):
@@ -148,15 +154,40 @@ class TestFlyEntropy(CustomTestCase):
                 [5.0, -1e4, -1e4, -1e4],
             ]
         )
-        probs = logits.softmax(dim=-1)
-        expected = [
-            -sum(
-                p * math.log(p) for p in sorted(row.tolist(), reverse=True)[:3] if p > 0
-            )
-            for row in probs
-        ]
+        expected = []
+        for row in logits.softmax(dim=-1):
+            top = sorted(row.tolist(), reverse=True)[:3]
+            top = [p / sum(top) for p in top]
+            expected.append(-sum(p * math.log(p) for p in top if p > 0) / math.log(3))
+        expected = torch.tensor(expected)
         torch.testing.assert_close(
-            compute_fly_entropy(logits, 3), torch.tensor(expected), rtol=0, atol=1e-6
+            compute_fly_entropy(logits, 3), expected, rtol=0, atol=1e-6
+        )
+        torch.testing.assert_close(
+            compute_fly_entropy_from_probs(logits.softmax(dim=-1), 3),
+            expected,
+            rtol=0,
+            atol=1e-6,
+        )
+
+    def test_renormalizes_the_top_k(self):
+        # The top-3 values (0.8, 0.05, 0.01) and (0.06, 0.02, 0.01), as in vLLM main.
+        probs = torch.tensor([[0.8, 0.05, 0.01, 0.0], [0.06, 0.02, 0.01, 0.0]])
+        torch.testing.assert_close(
+            compute_fly_entropy_from_probs(probs, 3),
+            torch.tensor([0.2589, 0.7725]),
+            rtol=0,
+            atol=1e-4,
+        )
+
+    def test_top_1_is_zero(self):
+        logits = torch.randn(4, 16)
+        self.assertTrue(torch.equal(compute_fly_entropy(logits, 1), torch.zeros(4)))
+        self.assertTrue(
+            torch.equal(
+                compute_fly_entropy_from_probs(logits.softmax(dim=-1), 1),
+                torch.zeros(4),
+            )
         )
 
 
@@ -211,6 +242,24 @@ class TestFlyTritonParity(CustomTestCase):
                 self.assertTrue(torch.equal(actual, expected))
                 self.assertTrue(torch.equal(target_predict, logits.argmax(dim=-1)))
                 self.assertTrue(bool((actual != target_predict).any()))
+
+    def test_top_1_defers_only_at_threshold_zero(self):
+        generator = torch.Generator(device="cuda").manual_seed(3)
+        candidates, logits = self._random_step(64, 6, 1000, generator)
+        target_predict = logits.argmax(dim=-1)
+        for threshold, defers in ((0.0, True), (0.3, False)):
+            with self.subTest(threshold=threshold):
+                kwargs = dict(
+                    candidates=candidates,
+                    target_predict=target_predict,
+                    target_logits=logits,
+                    fly=FlyConfig(
+                        window_size=1, entropy_threshold=threshold, entropy_top_k=1
+                    ),
+                )
+                actual = FlyGreedyPrepass.triton(**kwargs)
+                self.assertTrue(torch.equal(actual, FlyGreedyPrepass.torch(**kwargs)))
+                self.assertEqual(bool((actual != target_predict).any()), defers)
 
 
 def _chain_accepts(p, q, u):
@@ -494,12 +543,19 @@ class TestResolveFlyConfig(CustomTestCase):
         self.assertEqual(resolve(5).window_size, 4)
         self.assertEqual(resolve(15).window_size, 6)
         self.assertEqual(resolve(5, window_size=2).window_size, 2)
+        self.assertEqual(resolve(MAX_FLY_GAMMA).window_size, 6)
+        top_k = resolve(5, entropy_top_k=MAX_FLY_ENTROPY_TOP_K).entropy_top_k
+        self.assertEqual(top_k, MAX_FLY_ENTROPY_TOP_K)
+        self.assertEqual(resolve(5, entropy_threshold=1.5).entropy_threshold, 1.5)
         for gamma, kwargs in [
             (1, {}),
+            (MAX_FLY_GAMMA + 1, {}),
             (5, {"window_size": 5}),
             (5, {"window_size": 0}),
             (5, {"entropy_top_k": 0}),
+            (5, {"entropy_top_k": MAX_FLY_ENTROPY_TOP_K + 1}),
             (5, {"entropy_threshold": -0.1}),
+            (5, {"entropy_threshold": float("nan")}),
         ]:
             with self.subTest(gamma=gamma, **kwargs):
                 with self.assertRaises(ValueError):

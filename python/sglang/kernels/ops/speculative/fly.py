@@ -5,9 +5,10 @@ that differs from the target argmax, for a sampled one a token whose draw fails 
 chain rule u * q(x) < p(x). FLy (https://arxiv.org/abs/2511.22972, vLLM #53987)
 accepts such a rejected draft token instead when all of these hold:
 
-* the target top-k entropy at that position, ``-sum(p * log p)`` over the
-  ``entropy_top_k`` largest processed target probabilities (not renormalized), is at
-  least ``entropy_threshold``;
+* the target top-k entropy at that position is at least ``entropy_threshold``: the
+  ``entropy_top_k`` largest processed target probabilities, renormalized over
+  themselves, give ``-sum(p * log p) / log(entropy_top_k)`` in [0, 1] (0 for a top-k
+  of 1), as in vLLM #66593;
 * the target does not mask the draft token (a finite logit, p(x) > 0) and, for a
   sampled request, the draft proposed it with q(x) > 0;
 * the next ``window_size`` draft tokens pass native verification, and all of them lie
@@ -23,6 +24,7 @@ deferred. FLy is lossy: it does not preserve the target distribution.
 
 from __future__ import annotations
 
+import math
 from typing import Optional
 
 import torch
@@ -35,29 +37,31 @@ from sglang.srt.speculative.fly_config import FlyConfig
 
 
 def compute_fly_entropy(logits: torch.Tensor, entropy_top_k: int) -> torch.Tensor:
-    """FLy's top-k entropy of each row of ``logits`` [N, V], as float32 [N]."""
-    values = logits.float()
-    top_k = min(entropy_top_k, values.shape[-1])
-    top_log_probs = torch.topk(values, k=top_k, dim=-1).values - torch.logsumexp(
-        values, dim=-1, keepdim=True
-    )
-    top_probs = top_log_probs.exp()
-    terms = torch.where(
-        top_probs > 0, top_probs * top_log_probs, torch.zeros_like(top_probs)
-    )
-    return -terms.sum(dim=-1)
+    """FLy's normalized top-k entropy of each ``logits`` [N, V] row, float32 [N]."""
+    top_k = min(entropy_top_k, logits.shape[-1])
+    if top_k <= 1:
+        return torch.zeros(logits.shape[0], dtype=torch.float32, device=logits.device)
+    top_values = torch.topk(logits.float(), k=top_k, dim=-1).values
+    return _normalized_entropy(torch.softmax(top_values, dim=-1))
 
 
 def compute_fly_entropy_from_probs(
     probs: torch.Tensor, entropy_top_k: int
 ) -> torch.Tensor:
-    """FLy's top-k entropy of each row of ``probs`` [N, V], as float32 [N]."""
+    """FLy's normalized top-k entropy of each ``probs`` [N, V] row, float32 [N]."""
     top_k = min(entropy_top_k, probs.shape[-1])
-    top_probs = torch.topk(probs.float(), k=top_k, dim=-1).values
+    if top_k <= 1:
+        return torch.zeros(probs.shape[0], dtype=torch.float32, device=probs.device)
+    top_values = torch.topk(probs.float(), k=top_k, dim=-1).values
+    mass = top_values.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+    return _normalized_entropy(top_values / mass)
+
+
+def _normalized_entropy(top_probs: torch.Tensor) -> torch.Tensor:
     terms = torch.where(
         top_probs > 0, top_probs * top_probs.log(), torch.zeros_like(top_probs)
     )
-    return -terms.sum(dim=-1)
+    return -terms.sum(dim=-1) / math.log(top_probs.shape[-1])
 
 
 class FlyGreedyPrepass:
@@ -150,13 +154,11 @@ def _row_topk_entropy(
     TOP_K_PAD: tl.constexpr,
     BLOCK_V: tl.constexpr,
 ):
-    """One pass over a logits row times ``scale`` (1 / temperature): online
-    logsumexp plus the running top-k values."""
+    """One pass over a logits row times ``scale`` (1 / temperature) for its running
+    top-k values, softmaxed over themselves for the normalized entropy."""
     kidx = tl.arange(0, TOP_K_PAD)
     # Pad slots hold +inf so the min-replacement below never picks them.
     top = tl.where(kidx < TOP_K, float("-inf"), float("inf"))
-    run_max = tl.full((), float("-inf"), tl.float32)
-    run_sum = tl.zeros((), tl.float32)
     voffs = tl.arange(0, BLOCK_V)
     for start in range(0, vocab, BLOCK_V):
         x = (
@@ -167,20 +169,20 @@ def _row_topk_entropy(
             ).to(tl.float32)
             * scale
         )
-        new_max = tl.maximum(run_max, tl.max(x, axis=0))
-        rescale = tl.where(run_max == float("-inf"), 0.0, tl.exp(run_max - new_max))
-        exps = tl.where(x == float("-inf"), 0.0, tl.exp(x - new_max))
-        run_sum = run_sum * rescale + tl.sum(exps, axis=0)
-        run_max = new_max
         for _ in tl.static_range(TOP_K):
             value, index = tl.max(x, axis=0, return_indices=True)
             x = tl.where(voffs == index, float("-inf"), x)
             lowest, slot = tl.min(top, axis=0, return_indices=True)
             top = tl.where((kidx == slot) & (value > lowest), value, top)
-    log_probs = top - (run_max + tl.log(run_sum))
-    probs = tl.exp(log_probs)
-    terms = tl.where((kidx < TOP_K) & (probs > 0), probs * log_probs, 0.0)
-    return -tl.sum(terms, axis=0)
+    if TOP_K == 1:
+        entropy = tl.zeros((), tl.float32)
+    else:
+        top = tl.where(kidx < TOP_K, top, float("-inf"))
+        exps = tl.where(top == float("-inf"), 0.0, tl.exp(top - tl.max(top, axis=0)))
+        probs = exps / tl.sum(exps, axis=0)
+        terms = tl.where(probs > 0, probs * tl.log(probs), 0.0)
+        entropy = -tl.sum(terms, axis=0) / tl.log(tl.full((), TOP_K, tl.float32))
+    return entropy
 
 
 @triton.jit
@@ -191,7 +193,8 @@ def _row_topk_prob_entropy(
     TOP_K_PAD: tl.constexpr,
     BLOCK_V: tl.constexpr,
 ):
-    """One pass over a probability row: the running top-k values."""
+    """One pass over a probability row for its running top-k values, renormalized
+    over themselves for the normalized entropy."""
     kidx = tl.arange(0, TOP_K_PAD)
     # Probabilities lie in [0, 1]: pad slots hold 2 so the min-replacement skips them.
     top = tl.where(kidx < TOP_K, -1.0, 2.0)
@@ -205,8 +208,14 @@ def _row_topk_prob_entropy(
             x = tl.where(voffs == index, -1.0, x)
             lowest, slot = tl.min(top, axis=0, return_indices=True)
             top = tl.where((kidx == slot) & (value > lowest), value, top)
-    terms = tl.where((kidx < TOP_K) & (top > 0), top * tl.log(top), 0.0)
-    return -tl.sum(terms, axis=0)
+    if TOP_K == 1:
+        entropy = tl.zeros((), tl.float32)
+    else:
+        top = tl.where((kidx < TOP_K) & (top > 0), top, 0.0)
+        probs = top / tl.maximum(tl.sum(top, axis=0), 1e-12)
+        terms = tl.where(probs > 0, probs * tl.log(probs), 0.0)
+        entropy = -tl.sum(terms, axis=0) / tl.log(tl.full((), TOP_K, tl.float32))
+    return entropy
 
 
 @triton.jit
@@ -288,6 +297,7 @@ def apply_fly_greedy_triton(
     """Same contract as apply_fly_greedy."""
     bs, num_rows = candidates.shape
     assert target_predict.numel() == bs * num_rows
+    assert target_logits.dim() == 2
     assert candidates.stride(1) == 1 and target_logits.stride(-1) == 1
     out = target_predict.clone(memory_format=torch.contiguous_format)
     vocab = target_logits.shape[-1]
@@ -443,6 +453,7 @@ def apply_fly_sampling_triton(
 ) -> torch.Tensor:
     """Same contract as apply_fly_sampling."""
     bs, num_rows = candidates.shape
+    assert target_probs.dim() == 3 and draft_probs.dim() == 3
     assert target_probs.stride(-1) == 1 and draft_probs.stride(-1) == 1
     out = uniform_samples.clone(memory_format=torch.contiguous_format)
     vocab = target_probs.shape[-1]

@@ -128,9 +128,10 @@ class Spec(msgspec.Struct):
         "a rejected draft token is accepted when the target top-k entropy there is "
         "at least --speculative-fly-entropy-threshold and the next "
         "--speculative-fly-window-size drafts all pass native verification. Applies "
-        "to greedy requests and to the chain-rule accept of sampled ones (not with "
-        "block verification or block-wise rejection). Lossy: it does not preserve "
-        "the target distribution.",
+        "to greedy requests and to the chain-rule accept of sampled ones. Needs 2 to "
+        "31 draft tokens per verify and does not support "
+        "--speculative-use-block-verification. Lossy: it does not preserve the "
+        "target distribution.",
     ] = False
     speculative_fly_window_size: A[
         Optional[int],
@@ -140,13 +141,14 @@ class Spec(msgspec.Struct):
     ] = None
     speculative_fly_entropy_threshold: A[
         float,
-        "FLy only. Minimum target top-k entropy at a rejected position for FLy to "
-        "accept it.",
+        "FLy only. Minimum target top-k entropy, normalized to [0, 1], at a rejected "
+        "position for FLy to accept it.",
     ] = 0.3
     speculative_fly_entropy_top_k: A[
         int,
-        "FLy only. Number of largest target probabilities in the entropy gate "
-        "(not renormalized).",
+        "FLy only. Number of largest target probabilities in the entropy gate, "
+        "renormalized over themselves; in [1, 16]. A top-k of 1 never defers unless "
+        "the threshold is 0.",
     ] = 3
     speculative_token_map: A[
         Optional[str],

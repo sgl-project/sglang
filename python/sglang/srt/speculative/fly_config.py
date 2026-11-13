@@ -6,6 +6,11 @@ from typing import Optional
 
 import msgspec
 
+# The sampling pre-passes keep one accept bit per draft in an int32, and the
+# entropy kernels unroll the top-k extraction once per walked draft position.
+MAX_FLY_GAMMA = 31
+MAX_FLY_ENTROPY_TOP_K = 16
+
 
 class FlyConfig(msgspec.Struct, frozen=True):
     window_size: int
@@ -22,9 +27,10 @@ def resolve_fly_config(
 ) -> FlyConfig:
     """Validate the FLy settings for ``gamma`` draft tokens per verify; an unset
     window defaults to ``min(6, gamma - 1)`` as in vLLM."""
-    if gamma < 2:
+    if not 2 <= gamma <= MAX_FLY_GAMMA:
         raise ValueError(
-            f"FLy requires at least 2 draft tokens per verify, got gamma={gamma}."
+            f"FLy requires 2 to {MAX_FLY_GAMMA} draft tokens per verify, "
+            f"got gamma={gamma}."
         )
     window = min(6, gamma - 1) if window_size is None else int(window_size)
     if not 1 <= window < gamma:
@@ -32,9 +38,12 @@ def resolve_fly_config(
             f"FLy window size must be in [1, gamma - 1] = [1, {gamma - 1}], "
             f"got {window}."
         )
-    if entropy_top_k < 1:
-        raise ValueError(f"FLy entropy top-k must be positive, got {entropy_top_k}.")
-    if entropy_threshold < 0:
+    if not 1 <= entropy_top_k <= MAX_FLY_ENTROPY_TOP_K:
+        raise ValueError(
+            f"FLy entropy top-k must be in [1, {MAX_FLY_ENTROPY_TOP_K}], "
+            f"got {entropy_top_k}."
+        )
+    if not entropy_threshold >= 0:
         raise ValueError(
             f"FLy entropy threshold must be non-negative, got {entropy_threshold}."
         )

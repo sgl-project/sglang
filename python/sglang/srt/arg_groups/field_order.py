@@ -569,5 +569,9 @@ POSITIONAL_FIELD_ORDER = (
     "allow_local_media_files",
     "paged_experts_host_memory_gb",
     "_max_running_requests_explicitly_set",
+    "speculative_use_fly",
+    "speculative_fly_window_size",
+    "speculative_fly_entropy_threshold",
+    "speculative_fly_entropy_top_k",
 )
 # fmt: on

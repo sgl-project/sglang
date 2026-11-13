@@ -129,9 +129,6 @@ def _accept_sampling_core(
     plain = (
         not sampling_info.need_top_k_sampling and not sampling_info.need_top_p_sampling
     )
-    # FLy rewrites per-token chain-rule draws, which block verification does not use.
-    if block_verification:
-        fly = None
     if (
         _SPLIT_ACCEPT
         and plain

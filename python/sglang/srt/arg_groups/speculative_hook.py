@@ -189,6 +189,11 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
         )
     if cfg.speculative_use_fly and not get_platform().is_hip:
         raise ValueError("--speculative-use-fly is only supported on ROCm.")
+    if cfg.speculative_use_fly and cfg.speculative_use_block_verification:
+        raise ValueError(
+            "--speculative-use-fly does not support "
+            "--speculative-use-block-verification."
+        )
 
     if cfg.speculative_use_block_verification:
         if cfg.speculative_algorithm not in ("EAGLE", "EAGLE3", "DFLASH", "DSPARK"):
