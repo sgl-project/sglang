@@ -56,7 +56,6 @@ PLE_OFFLOAD_BACKENDS = ("pinned", "file")
 _CUDA_DEV_ATTR_PAGEABLE_MEMORY_ACCESS = 88
 _CUDA_DEV_ATTR_PAGEABLE_MEMORY_ACCESS_USES_HOST_PAGE_TABLES = 100
 _MADV_RANDOM = 1
-_MADV_WILLNEED = 3
 _MADV_DONTNEED = 4
 _PAGE_SHIFT = 12
 # One MADV_DONTNEED call takes mmap_lock for its whole range; over the full
@@ -429,9 +428,10 @@ def _device_attribute(attribute: int, device_index: int) -> Optional[int]:
     return None
 
 
-def advise_rows_willneed(table: torch.Tensor, rows: torch.Tensor) -> int:
-    """Queue the page-cache reads of ``rows`` of a file-backed ``table`` and return once
-    they are queued: ``madvise(MADV_WILLNEED)``, one call per run of adjacent pages.
+def advise_rows_willneed(fd: int, rows: torch.Tensor, row_bytes: int) -> int:
+    """Queue the page-cache reads of ``rows`` of the file-backed table open as ``fd``
+    and return once they are queued: ``posix_fadvise(WILLNEED)``, one call per run
+    of adjacent pages.
 
     The host gather copies its rows on one thread (the server runs torch with one
     thread) from a ``MADV_RANDOM`` mapping, so without this each cold row is its own
@@ -442,11 +442,7 @@ def advise_rows_willneed(table: torch.Tensor, rows: torch.Tensor) -> int:
     global _WILLNEED_FAILED
     if rows.numel() == 0:
         return 0
-    libc = _libc()
-    if libc is None:
-        return 0
-    row_bytes = table.stride(0) * table.element_size()
-    first = table.data_ptr() + rows.to(torch.int64) * row_bytes
+    first = rows.to(torch.int64) * row_bytes
     pages = torch.cat(
         [first >> _PAGE_SHIFT, (first + row_bytes - 1) >> _PAGE_SHIFT]
     ).unique(sorted=True)
@@ -456,18 +452,17 @@ def advise_rows_willneed(table: torch.Tensor, rows: torch.Tensor) -> int:
     lengths = torch.diff(starts, append=starts.new_tensor([pages.numel()]))
     advised = 0
     for page, count in zip(pages[starts].tolist(), lengths.tolist()):
-        rc = libc.madvise(
-            ctypes.c_void_p(page << _PAGE_SHIFT),
-            ctypes.c_size_t(count << _PAGE_SHIFT),
-            ctypes.c_int(_MADV_WILLNEED),
-        )
-        if rc != 0:
+        try:
+            os.posix_fadvise(
+                fd, page << _PAGE_SHIFT, count << _PAGE_SHIFT, os.POSIX_FADV_WILLNEED
+            )
+        except OSError as exc:
             if not _WILLNEED_FAILED:
                 _WILLNEED_FAILED = True
                 logger.warning(
-                    "PLE table: madvise(MADV_WILLNEED) failed (errno %d); host gathers "
+                    "PLE table: posix_fadvise(WILLNEED) failed (%s); host gathers "
                     "read cold rows one at a time",
-                    ctypes.get_errno(),
+                    exc,
                 )
             break
         advised += count

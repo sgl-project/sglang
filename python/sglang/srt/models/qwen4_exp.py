@@ -1,6 +1,7 @@
 """Inference-only Qwen4-Exp (text + VL) on the Qwen3.5 backbone."""
 
 import math
+import os
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from functools import partial
@@ -1032,10 +1033,15 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         self._file_prefetcher = make_ple_file_prefetcher(host_table)
         # ... and only there does a prefill-sized gather read its rows on the host, on a
         # GPU that faults each row's page through the driver (see _gathers_on_host).
+        table_path = getattr(host_table, "_sglang_ple_file_path", None)
         self._stages_on_host = (
-            getattr(host_table, "_sglang_ple_file_path", None) is not None
+            table_path is not None
             and torch.cuda.is_available()
             and device_faults_pageable_pages(torch.cuda.current_device())
+        )
+        # The host copy advises its rows' pages through this descriptor first.
+        self._table_fd = (
+            os.open(table_path, os.O_RDONLY) if self._stages_on_host else None
         )
         # ... and only it needs its resident set bounded: a fault maps a whole
         # folio, so the mapping would otherwise creep towards the full table.
@@ -1132,7 +1138,7 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         # [rows, row bytes], whatever the dtype.
         table = self.weight.data.view(torch.uint8)
         # The copy below runs on one thread: queue every cold row's read first.
-        advise_rows_willneed(table, rows)
+        advise_rows_willneed(self._table_fd, rows, table.shape[1])
         staged = torch.empty(
             (rows.numel(), table.shape[1]), dtype=torch.uint8, pin_memory=True
         )

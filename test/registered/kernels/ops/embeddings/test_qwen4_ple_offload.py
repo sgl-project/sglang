@@ -344,8 +344,9 @@ def test_qwen4_ple_file_backend_gathers_prefill_rows_on_the_host(monkeypatch, dt
     monkeypatch.setattr(
         qwen4_exp_module,
         "advise_rows_willneed",
-        lambda table, rows: (
-            advised.append((rows.tolist(), advise(table, rows))) or advised[-1][1]
+        lambda fd, rows, row_bytes: (
+            advised.append((rows.tolist(), advise(fd, rows, row_bytes)))
+            or advised[-1][1]
         ),
     )
     with tempfile.TemporaryDirectory() as table_dir:

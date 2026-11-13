@@ -16,14 +16,12 @@ Triton gather kernel reading from the file-backed table matches a torch gather.
 """
 
 import os
-import sys
 import tempfile
 import unittest
 from unittest import mock
 
 import torch
 
-from sglang.srt.models import qwen4_exp_ple_table as ple_table
 from sglang.srt.models.qwen4_exp_ple_table import (
     PleFilePrefetcher,
     PleFileRssTrimmer,
@@ -167,60 +165,50 @@ class TestPleFilePrefetcher(CustomTestCase):
                 pf.close()
 
 
-class _RecordingLibc:
-    def __init__(self, rc=0):
-        self.calls = []
-        self._rc = rc
-
-    def madvise(self, addr, length, advice):
-        self.calls.append((addr.value, length.value, advice.value))
-        return self._rc
-
-
 class TestAdviseRowsWillneed(CustomTestCase):
-    """The host gather's synchronous WILLNEED: one madvise per run of adjacent pages."""
+    """The host gather's synchronous WILLNEED: one posix_fadvise per run of adjacent
+    pages of the table file."""
 
-    MADV_WILLNEED = 3
+    # 160-byte rows, as Qwen3.8-Flash-Next's fp8 table.
+    ROW_BYTES = 160
 
-    def _advise(self, rows, rc=0):
-        libc = _RecordingLibc(rc)
-        with tempfile.TemporaryDirectory() as d:
-            # 160-byte rows, as Qwen3.8-Flash-Next's fp8 table.
-            table = allocate_ple_host_table((1024, 160), torch.float8_e4m3fn, "file", d)
-            with mock.patch.object(ple_table, "_libc", return_value=libc):
-                advised = advise_rows_willneed(table.view(torch.uint8), rows)
-            return table.data_ptr(), advised, libc.calls
+    def _advise(self, rows, error=None):
+        with mock.patch("os.posix_fadvise", side_effect=error) as fadvise:
+            advised = advise_rows_willneed(7, rows, self.ROW_BYTES)
+        return advised, [c.args for c in fadvise.call_args_list]
 
     def test_merges_adjacent_pages_and_covers_rows_spanning_two(self):
         # Row 0: page 0; row 25 (bytes 4000-4159): pages 0-1; row 26: page 1;
         # row 100 (bytes 16000-16159): page 3.
-        base, advised, calls = self._advise(torch.tensor([25, 0, 26, 100, 0]))
-        self.assertEqual(base % 4096, 0)
+        advised, calls = self._advise(torch.tensor([25, 0, 26, 100, 0]))
         self.assertEqual(advised, 3)
         self.assertEqual(
             calls,
             [
-                (base, 2 * 4096, self.MADV_WILLNEED),
-                (base + 3 * 4096, 4096, self.MADV_WILLNEED),
+                (7, 0, 2 * 4096, os.POSIX_FADV_WILLNEED),
+                (7, 3 * 4096, 4096, os.POSIX_FADV_WILLNEED),
             ],
         )
 
     def test_no_rows_no_calls(self):
-        _, advised, calls = self._advise(torch.empty(0, dtype=torch.int64))
+        advised, calls = self._advise(torch.empty(0, dtype=torch.int64))
         self.assertEqual((advised, calls), (0, []))
 
     def test_stops_at_the_first_failed_call(self):
-        _, advised, calls = self._advise(torch.tensor([0, 100]), rc=-1)
+        advised, calls = self._advise(torch.tensor([0, 100]), error=OSError("EBADF"))
         self.assertEqual((advised, len(calls)), (0, 1))
 
-    @unittest.skipUnless(sys.platform.startswith("linux"), "madvise semantics")
-    def test_kernel_accepts_the_advice_on_the_mapping(self):
+    def test_kernel_accepts_the_advice_on_the_table_file(self):
         with tempfile.TemporaryDirectory() as d:
             table = allocate_ple_host_table((65536, 160), torch.uint8, "file", d)
             table[::7].fill_(3)  # some pages written, the rest sparse
-            rows = torch.tensor([0, 25, 100, 30000, 65535])
-            # pages 0-1, 3, 1171, 2559
-            self.assertEqual(advise_rows_willneed(table, rows), 5)
+            fd = os.open(table._sglang_ple_file_path, os.O_RDONLY)
+            try:
+                rows = torch.tensor([0, 25, 100, 30000, 65535])
+                # pages 0-1, 3, 1171, 2559
+                self.assertEqual(advise_rows_willneed(fd, rows, 160), 5)
+            finally:
+                os.close(fd)
 
 
 class TestSmapsParsing(CustomTestCase):
