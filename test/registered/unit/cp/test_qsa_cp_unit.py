@@ -387,6 +387,7 @@ def test_qsa_cp_cached_prefix_matches_full_context_attention(
         ),
         _cp_kv_pending=None,
     )
+    backend._store_kv_cache = QwenSparseAttnBackend._store_kv_cache.__get__(backend)
     # No req_pool_indices: reading them on the host would sync every layer.
     batch = SimpleNamespace(
         attn_cp_metadata=meta,

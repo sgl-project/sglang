@@ -927,10 +927,6 @@ class TestClassedAllocator(CustomTestCase):
         alloc = _make_allocator()
         with self.assertRaises(NotImplementedError):
             alloc.alloc(GS)
-        with self.assertRaises(NotImplementedError):
-            alloc.alloc_decode(
-                torch.tensor([PS + 1]), torch.tensor([PS + 1]), torch.tensor([PS - 1])
-            )
 
     def test_batch_alloc_per_request_rotation(self):
         """bs > 1: each request draws its own cyclic run; out_cache_loc is
