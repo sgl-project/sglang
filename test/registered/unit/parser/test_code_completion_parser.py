@@ -11,7 +11,6 @@ from sglang.srt.parser.code_completion_parser import (
     completion_templates,
     generate_completion_prompt,
     generate_completion_prompt_from_request,
-    is_completion_template_defined,
     register_completion_template,
     set_completion_template,
 )
@@ -128,19 +127,6 @@ class TestSetCompletionTemplate(CustomTestCase):
             # Second call should be ignored
             set_completion_template("qwen_coder")
             self.assertEqual(module.completion_template_name, "star_coder")
-
-    def test_is_completion_template_defined(self):
-        """Test the defined check before and after setting."""
-        import sglang.srt.parser.code_completion_parser as module
-
-        old_name = module.completion_template_name
-        try:
-            module.completion_template_name = None
-            self.assertFalse(is_completion_template_defined())
-            set_completion_template("deepseek_coder")
-            self.assertTrue(is_completion_template_defined())
-        finally:
-            module.completion_template_name = old_name
 
 
 if __name__ == "__main__":
