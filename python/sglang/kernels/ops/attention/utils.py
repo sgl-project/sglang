@@ -154,11 +154,12 @@ def mla_quantize_without_rope_for_fp8(
     return q, k_nope.to(attn_dtype), k_rope.to(attn_dtype)
 
 
-def concat_mla_absorb_q_general(q_nope, q_rope):
+def concat_mla_absorb_q_general(q_nope, q_rope, out=None):
     if _is_cuda and q_nope.shape[-1] == 512 and q_rope.shape[-1] == 64:
-        return concat_mla_absorb_q(q_nope, q_rope)
-    else:
+        return concat_mla_absorb_q(q_nope, q_rope, out=out)
+    if out is None:
         return torch.cat([q_nope, q_rope], dim=-1)
+    return out.copy_(torch.cat([q_nope, q_rope], dim=-1))
 
 
 def assert_buffer_fits(used: int, capacity: int, what: str, **context) -> None:

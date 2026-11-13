@@ -28,6 +28,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import msgspec
 import torch
 
 from sglang.srt.mem_cache.kv.layout.mha import DraftMHAView
@@ -43,6 +44,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.unified_allocator_fixtures import (
     build_test_unified_pools,
+    largest_take,
     setup_allocator_context,
 )
 
@@ -138,7 +140,7 @@ def _capacities(bundle) -> dict:
         ("full", allocator.full_attn_allocator, kvcache.layer_router.view("full")),
         ("swa", allocator.swa_attn_allocator, kvcache.layer_router.view("swa")),
     ):
-        out[f"{name}.max_slots"] = shared.num_entries(name)
+        out[f"{name}.max_slots"] = shared.num_entries(sub.sub_pool_name)
         out[f"{name}.sub.max_slots"] = sub.max_slots
         out[f"{name}.sub.num_pages"] = sub.num_pages
         out[f"{name}.sub.ids.num_virtual_ids"] = sub.ids.num_virtual_ids
@@ -207,7 +209,7 @@ def _mla_draft_bundle(
         max_num_reqs=2,
         model_context_len=512,
         fused_draft=placement,
-        lazy_compaction=False,
+        lazy_compaction=True,
         post_capture_active=post_capture_active,
     )
 
@@ -558,6 +560,7 @@ class TestUnifiedPostCaptureSizing(CustomTestCase):
                         write_and_read()
                     before = runner.ids_in("full", live)[rank].item()
                     alloc.free(first)
+                    alloc.full_attn_allocator.flush_for_allocation()
                     k.add_(7)
                     graph.replay()
                     torch.cuda.synchronize()
@@ -582,25 +585,32 @@ class TestUnifiedPostCaptureSizing(CustomTestCase):
 
         from sglang.srt.managers.schedule_batch import ReqKvInfo
         from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-        from sglang.srt.mem_cache.hicache_storage import PoolName
         from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
         from sglang.srt.runtime_context import get_memory
         from sglang.srt.server_args import ServerArgs
 
-        for draft_window in (32, 96):
-            with self.subTest(draft_window=draft_window):
+        # One or two draft windows beside the target's: two or three window
+        # sub-pools, each with a host pool of its own.
+        for draft_windows in (
+            {"window_32": 32},
+            {"window_96": 96},
+            {"window_96": 96, "window_16": 16},
+        ):
+            with self.subTest(draft_windows=draft_windows):
                 placement = FusedDraftPlacement.from_counts(
-                    counts={"draft_swa": [1]},
+                    counts={name: [1] for name in draft_windows},
                     regions={
-                        "draft_swa": DenseDraftRegion(
+                        name: DenseDraftRegion(
                             lane_num=1,
                             head_num=1,
                             head_dim=64,
                             store_dtype=torch.float16,
                         )
+                        for name in draft_windows
                     },
                     new_bands={
-                        "draft_swa": DraftBand(kind="window", window=draft_window)
+                        name: DraftBand(kind="window", window=window)
+                        for name, window in draft_windows.items()
                     },
                 )
                 bundle = _bundle(
@@ -644,9 +654,10 @@ class TestUnifiedPostCaptureSizing(CustomTestCase):
                     expected[band.sub_pool_name] = i + 11
                 backup = cache.backup_kv_cache(req)
                 self.assertIsNotNone(backup)
+                # Window host pools go by their sub-pools' names.
                 self.assertEqual(
                     {t.name for t in backup.pool_transfers},
-                    {PoolName.SWA, PoolName.AUXILIARY_SWA},
+                    {"window_64", *draft_windows},
                 )
                 a.free(source)
                 blocker = a.alloc(132)
@@ -659,7 +670,7 @@ class TestUnifiedPostCaptureSizing(CustomTestCase):
                 cache.restore_kv_cache(req, backup)
                 cache._finish_restore(req.kv)
                 for band in a.members:
-                    window = {"full": 132, "swa": 64, "draft_swa": draft_window}[
+                    window = {"full": 132, "window_64": 64, **draft_windows}[
                         band.sub_pool_name
                     ]
                     start = max(0, 129 - window) // 4 * 4
@@ -681,8 +692,9 @@ class TestUnifiedPostCaptureSizing(CustomTestCase):
                 a.free(destination)
                 self.assertEqual(bundle.storage.accounting_violations(), [])
 
-    def test_auxiliary_host_pool_attaches_to_its_own_cache_component(self):
-        """A separately retained draft window must survive final HiCache attachment."""
+    def test_every_window_host_pool_attaches_to_its_own_cache_component(self):
+        """Separately retained draft windows must survive final HiCache
+        attachment, each in a host pool named by its sub-pool."""
         from unittest.mock import patch
 
         from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -694,10 +706,14 @@ class TestUnifiedPostCaptureSizing(CustomTestCase):
         region = DenseDraftRegion(
             lane_num=1, head_num=1, head_dim=8, store_dtype=torch.float16
         )
+        draft_windows = {"window_32": 32, "window_16": 16}
         placement = FusedDraftPlacement.from_counts(
-            counts={"draft_swa": [1]},
-            regions={"draft_swa": region},
-            new_bands={"draft_swa": DraftBand(kind="window", window=32)},
+            counts={name: [1] for name in draft_windows},
+            regions={name: region for name in draft_windows},
+            new_bands={
+                name: DraftBand(kind="window", window=window)
+                for name, window in draft_windows.items()
+            },
         )
         bundle = _bundle(
             total_bytes=1 << 20,
@@ -728,21 +744,28 @@ class TestUnifiedPostCaptureSizing(CustomTestCase):
             host.attach_hybrid_pool_to_unified_cache(
                 cache, params, None, load_cache_event=None
             )
-        pools = (
-            cache.full_kv_pool_host,
-            cache.swa_kv_pool_host,
-            cache.auxiliary_swa_kv_pool_host,
+        windows = cache.window_slots()
+        self.assertEqual(len(windows), 3)
+        self.assertNotIn(ComponentType.SWA, windows)
+        pools = [cache.components[ct]._swa_kv_pool_host for ct in windows]
+        for pool in (cache.full_kv_pool_host, *pools):
+            self.addCleanup(pool.destroy)
+        # Each window's host pool lives on its own component; none is the
+        # cache's single-window pool.
+        self.assertFalse(hasattr(cache, "swa_kv_pool_host"))
+        self.assertEqual(len({id(pool) for pool in pools}), 3)
+        self.assertEqual(
+            [cache.components[ct].pool_name for ct in windows],
+            ["window_64", *draft_windows],
+        )
+        self.assertEqual(
+            {str(e.name) for e in cache.host_pool_group.entries},
+            {"kv", "window_64", *draft_windows},
         )
         for pool in pools:
-            self.addCleanup(pool.destroy)
-        self.assertIsNot(pools[1], pools[2])
-        self.assertIs(cache.components[ComponentType.SWA]._swa_kv_pool_host, pools[1])
-        self.assertIs(
-            cache.components[ComponentType.AUXILIARY_SWA]._swa_kv_pool_host, pools[2]
-        )
-        ids = pools[2].alloc(4)
-        self.assertIsNotNone(ids)
-        pools[2].free(ids)
+            ids = pool.alloc(4)
+            self.assertIsNotNone(ids)
+            pool.free(ids)
 
     def test_flashinfer_idle_spec_inputs_use_dummy_decode_metadata(self):
         """Padded idle target and draft ranks must plan without prepared draft CSR."""
@@ -913,6 +936,7 @@ class TestUnifiedPostCaptureSizing(CustomTestCase):
                         )
                     before = reader.translate_dcp_read_ids(table[1, :1]).clone()
                     alloc.free(gap)
+                    alloc.full_attn_allocator.flush_for_allocation()
                     self.assertFalse(
                         torch.equal(before, reader.translate_dcp_read_ids(table[1, :1]))
                     )
@@ -1008,6 +1032,97 @@ class TestUnifiedPostCaptureSizing(CustomTestCase):
 
     def _post_capture_bundle(self, total_bytes=_RESERVED_BYTES):
         return _bundle(total_bytes=total_bytes, post_capture_active=True)
+
+    def test_resize_keeps_the_request_sub_pool(self):
+        """Post-capture resizing reaches every band, the request sub-pool's too:
+        it has no view of its own and keeps its request-row id space, so rows
+        bound after the resize still take units."""
+        from sglang.srt.mem_cache.kv.build import UnifiedBuildContext, build_kv_storage
+        from sglang.srt.mem_cache.kv.decl import (
+            MHAGeometry,
+            StateGeometry,
+            StateReplay,
+            kv_layer_decls,
+            with_state_replay,
+        )
+        from sglang.srt.mem_cache.kv.plan import plan_kv_storage
+
+        setup_allocator_context()
+        state = with_state_replay(
+            StateGeometry(
+                conv_state_shapes=((8, 8),),
+                conv_dtype=torch.float16,
+                temporal_state_shape=(1, 4, 8),
+                temporal_dtype=torch.float32,
+            ),
+            StateReplay(
+                decode=False, speculative=True, is_kda=False, cache_len=16, key_heads=1
+            ),
+            layer_ids=(1,),
+            speculative_num_draft_tokens=3,
+        )
+        plan = plan_kv_storage(
+            kv_layer_decls(
+                full_layer_ids=(0,),
+                full_geometry=MHAGeometry(
+                    head_num=1, head_dim=8, v_head_dim=8, kv_cache_dtype=torch.float16
+                ),
+                state_layer_ids=(1,),
+                state_geometry=state,
+            ),
+            page_size=4,
+            speculative_num_draft_tokens=3,
+        )
+        (request,) = plan.requests()
+        inputs = KVSizingInputs(
+            budget_bytes=1 << 22,
+            max_running_requests=4,
+            radix_cache=False,
+            context_len=16,
+            alignment=1,
+        )
+        captured = size_plan(plan, inputs)
+        storage = build_kv_storage(
+            plan,
+            captured,
+            UnifiedBuildContext(
+                device="cuda",
+                start_layer=0,
+                end_layer=2,
+                enable_memory_saver=False,
+                need_sort=False,
+                max_num_reqs=4,
+                model_context_len=16,
+                state_cache_params=SimpleNamespace(layers=(1,)),
+                speculative_num_draft_tokens=3,
+                post_capture_active=True,
+            ),
+        )
+        a = storage.allocator
+        band = a.request_allocators[request.name]
+        rows = band.ids.num_virtual_ids
+        self.assertEqual(rows, captured.request_rows)
+        final = size_plan(
+            plan,
+            msgspec.structs.replace(inputs, budget_bytes=(1 << 22) - (1 << 20)),
+            frozen=captured,
+        )
+        config = SimpleNamespace(
+            unified_memory_pool_bytes=final.total_bytes,
+            unified_full_cap_tokens=final.full_cap_tokens,
+            full_max_total_num_tokens=final.full_tokens,
+            swa_max_total_num_tokens=final.window_tokens,
+        )
+        a.get_kvcache().finalize_backing(config)
+        a.resize(config)
+        self.assertEqual(band.ids.num_virtual_ids, rows)
+        taken = storage.take_rows(2)
+        self.assertIsNotNone(taken)
+        units = a.request_id_spaces()[request.name].ids(
+            torch.tensor(taken, device="cuda")
+        )
+        self.assertTrue(bool((units > 0).all()))
+        storage.release_rows(taken)
 
     def test_auto_state_shrink_preserves_captured_buffers(self):
         from sglang.srt.mem_cache.kv.build import UnifiedBuildContext, build_kv_storage
@@ -1170,10 +1285,10 @@ class TestUnifiedPostCaptureSizing(CustomTestCase):
         self.assertEqual(allocator.verify_byte_accounting(), [])
 
         # The resized capacity is fully allocatable and accounted.
-        n = allocator.available_size()
+        n = largest_take(allocator)
         self.assertGreater(n, 0)
         self.assertIsNotNone(allocator.alloc(n))
-        self.assertEqual(allocator.available_size(), 0)
+        self.assertEqual(largest_take(allocator), 0)
 
     def test_retraction_restores_complete_entries_at_new_dcp_coordinates(self):
         placement = FusedDraftPlacement.from_counts(
@@ -1426,6 +1541,7 @@ class TestUnifiedPostCaptureSizing(CustomTestCase):
                 pointer = space.read_v2p.data_ptr()
                 before = coords.write(live).clone()
                 alloc.free(first)
+                alloc.full_attn_allocator.flush_for_allocation()
                 k.add_(7)
                 v.add_(11)
                 graph.replay()
