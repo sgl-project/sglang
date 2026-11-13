@@ -137,16 +137,16 @@ enabling it anyway.
 
 </Tip>
 
-**Reading the table.** `—` means do not set the flag; a trailing condition narrows when a value applies, as in
-`on (DeepSeek R1)`. Raw defaults for most flags are in
-[Supported Features](/docs/hardware-platforms/ascend-npus/reference/support_features), and the environment variables
+**Reading the tables.** `—` means do not set the flag. A trailing parenthetical narrows when a value applies: a model
+list, as in `1` (DeepSeek R1), or a condition, as in `on (long-context prefill)`. Raw defaults for most flags are in
+[Supported Features](/docs/hardware-platforms/ascend-npus/reference/support_features), and most environment variables
 in [Ascend NPU Environment Variables](/docs/hardware-platforms/ascend-npus/reference/environment_variables).
 
-Two groups are deliberately omitted, and both are copied from your model's best-practice script rather than tuned
-here. Setup-only settings have no value to size: `HCCL_SOCKET_IFNAME` / `GLOO_SOCKET_IFNAME`, `--nnodes`,
-`--node-rank`, `--dist-init-addr` — a wrong rank or an unreachable interface hangs startup. The second group is what
-those pages pin per model or per build: the `ZBAL_*` / `ZBCCL_*` KV-transfer switches, `ASCEND_USE_FIA`,
-`GDN_ATTN_BACKEND_TRITON`, the DeepSeek V4 `SGLANG_OPT_*` group, and version-specific speculative spellings
+Two groups are omitted, and both are copied from your model's best-practice script rather than tuned here. Setup
+settings have nothing to size, and a wrong rank or an unreachable interface hangs startup: `HCCL_SOCKET_IFNAME` /
+`GLOO_SOCKET_IFNAME`, `--nnodes`, `--node-rank`, `--dist-init-addr`. The other group is what those scripts pin per
+model, hardware series, or build: the `ZBAL_*` / `ZBCCL_*` KV-transfer switches, `ASCEND_USE_FIA`,
+`GDN_ATTN_BACKEND_TRITON`, the DeepSeek V4 `SGLANG_OPT_*` group, and the speculative-decoding switches they set
 (`SGLANG_ENABLE_SPEC_V2`, `SGLANG_SPEC_ENABLE_OVERLAP_REFLOW`, `FORCE_DRAFT_MODEL_NON_QUANT`).
 
 ### Parallelism
