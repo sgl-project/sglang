@@ -11,11 +11,14 @@ send is waiting for, and both GPUs hang. Model the worst case, where every send
 must rendezvous with the peer's recv at the head of its stream.
 """
 
+import pickle
 import unittest
 from collections import deque
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest import mock
+
+import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import (
@@ -27,8 +30,10 @@ from sglang.test.test_utils import (
 maybe_stub_sgl_kernel()
 
 from sglang.srt.environ import envs  # noqa: E402
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput  # noqa: E402
 from sglang.srt.managers import scheduler_pp_mixin as pp_mod  # noqa: E402
 from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin  # noqa: E402
+from sglang.srt.managers.utils import GenerationBatchResult  # noqa: E402
 from sglang.srt.model_executor.forward_mode import ForwardMode  # noqa: E402
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
@@ -84,6 +89,103 @@ def _posted_output_ops(pp_rank, spec_relay, send_msg, recv_msg, **server_args):
 
 
 class TestPPOutputExchangeOrder(CustomTestCase):
+    def test_numeric_logprob_rows_keep_independent_containers(self):
+        for values in ([], [1, 2], [1.25, 2.5], [1, 2.5]):
+            with self.subTest(values=values):
+                expected = values.copy()
+                result = GenerationBatchResult(
+                    next_token_ids=torch.tensor([7]),
+                    logits_output=LogitsProcessorOutput(
+                        next_token_logits=None,
+                        input_top_logprobs_val=[[values]],
+                        next_token_top_logprobs_val=[values],
+                    ),
+                )
+                wire = SchedulerPPMixin()._pp_prepare_tensor_dict(
+                    result, SimpleNamespace(return_logprob=True)
+                )
+                values.append(99)
+                values[0] = -1
+                self.assertEqual(wire["input_top_logprobs_val"][0][0], expected)
+                self.assertEqual(wire["next_token_top_logprobs_val"][0], expected)
+
+    def test_numeric_prefix_does_not_hide_a_later_tensor(self):
+        for dtype in (torch.float32, torch.int64):
+            with self.subTest(dtype=dtype):
+                base = torch.arange(100000, dtype=dtype)
+                view = base.view(10000, 10)[5:7, :2]
+                expected = view.clone()
+                frozen = pp_mod._pp_freeze_output_metadata([7, view])
+                self.assertEqual(frozen[0], 7)
+                self.assertEqual(frozen[1].shape, view.shape)
+                self.assertEqual(frozen[1].dtype, dtype)
+                self.assertEqual(
+                    frozen[1].untyped_storage().nbytes(),
+                    view.numel() * view.element_size(),
+                )
+                base.zero_()
+                torch.testing.assert_close(frozen[1], expected)
+
+    def test_nested_logprob_views_serialize_only_their_own_storage(self):
+        """A tiny PP logprob row must not serialize or retain its large base."""
+        bases = [torch.arange(100000, dtype=d) for d in (torch.float32, torch.int64)]
+        views = [base.view(10000, 10)[5:6, :2] for base in bases]
+        expected = [view.clone() for view in views]
+        result = GenerationBatchResult(
+            next_token_ids=torch.tensor([7]),
+            logits_output=LogitsProcessorOutput(
+                next_token_logits=None,
+                input_top_logprobs_val=[[views[0]]],
+                input_top_logprobs_idx=[[views[1]]],
+            ),
+        )
+        wire = SchedulerPPMixin()._pp_prepare_tensor_dict(
+            result, SimpleNamespace(return_logprob=True)
+        )
+        fields = ("input_top_logprobs_val", "input_top_logprobs_idx")
+        for field, view in zip(fields, views):
+            frozen = wire[field][0][0]
+            self.assertEqual(frozen.dtype, view.dtype)
+            self.assertEqual(
+                frozen.untyped_storage().nbytes(),
+                frozen.numel() * frozen.element_size(),
+            )
+            self.assertNotEqual(frozen.data_ptr(), view.data_ptr())
+        for base in bases:
+            base.zero_()
+        payload = pickle.dumps(wire)
+        self.assertLess(len(payload), 4096)
+        restored = pickle.loads(payload)  # Only this test's locally generated data.
+        for field, values in zip(fields, expected):
+            torch.testing.assert_close(restored[field][0][0], values)
+
+    def test_nested_metadata_preserves_container_types_and_values(self):
+        """Tuple/dict metadata must not bypass the same tensor ownership rule."""
+        base = torch.arange(1000)
+        wire = pp_mod._pp_freeze_output_metadata(
+            {"rows": [(base[500:502], None, 7, False)]}
+        )
+        self.assertIsInstance(wire, dict)
+        self.assertIsInstance(wire["rows"], list)
+        self.assertIsInstance(wire["rows"][0], tuple)
+        self.assertEqual(wire["rows"][0][1:], (None, 7, False))
+        base.zero_()
+        self.assertEqual(wire["rows"][0][0].tolist(), [500, 501])
+        self.assertEqual(wire["rows"][0][0].untyped_storage().nbytes(), 16)
+
+    def test_top_level_output_tensor_keeps_communication_fast_path(self):
+        """The metadata fix must not clone top-level communication tensors."""
+        ids = torch.tensor([7])
+        result = GenerationBatchResult(
+            next_token_ids=ids,
+            logits_output=LogitsProcessorOutput(next_token_logits=None),
+        )
+        wire = SchedulerPPMixin()._pp_prepare_tensor_dict(
+            result, SimpleNamespace(return_logprob=False)
+        )
+        self.assertEqual(list(wire), ["next_token_ids"])
+        self.assertIs(wire["next_token_ids"], ids)
+
     def test_two_in_flight_output_exchange_does_not_cross_deadlock(self):
         for spec_relay in (False, True):
             with self.subTest(spec_relay=spec_relay):

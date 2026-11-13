@@ -61,6 +61,31 @@ if TYPE_CHECKING:
     from sglang.srt.observability.forward_pass_metrics import FpmTiming
 
 
+def _pp_freeze_output_metadata(value, *, numeric_rows=False):
+    """Keep nested tensor storage out of pickling on the PP comm stream."""
+    if isinstance(value, torch.Tensor):
+        if value.is_cuda:
+            logger.warning_once(
+                "PP output metadata contains a nested CUDA tensor; copying it "
+                "on the forward stream before CPU serialization."
+            )
+        # A small CPU view would otherwise pickle its entire backing storage.
+        return value.detach().to(device="cpu", copy=True, non_blocking=False)
+    if isinstance(value, list):
+        # Logprob producers supply scalar lists or tensors at the row leaves.
+        return [
+            item.copy()
+            if numeric_rows and isinstance(item, list)
+            else _pp_freeze_output_metadata(item)
+            for item in value
+        ]
+    if isinstance(value, tuple):
+        return tuple(_pp_freeze_output_metadata(item) for item in value)
+    if isinstance(value, dict):
+        return {key: _pp_freeze_output_metadata(item) for key, item in value.items()}
+    return value
+
+
 def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
     """Check if output send/recv can be skipped for this batch."""
     return (
@@ -1046,12 +1071,10 @@ class SchedulerPPMixin:
             result.logits_output is not None
             and result.logits_output.sampling_mask_output is not None
         )
+        logits_output_dict = {}
         if batch.return_logprob or has_sampling_mask_output:
             logits_output_dict = get_logprob_dict_from_result(result)
-            tensor_dict = {
-                **tensor_dict,
-                **logits_output_dict,
-            }
+            tensor_dict.update(logits_output_dict)
         auxiliary_output = (
             result.logits_output.auxiliary_device_output
             if result.logits_output is not None
@@ -1060,6 +1083,24 @@ class SchedulerPPMixin:
         add_auxiliary_output_to_pp_tensors(tensor_dict, auxiliary_output)
         if result.routed_experts_output is not None:
             tensor_dict[PP_ROUTED_EXPERTS_KEY] = result.routed_experts_output.topk
+        # Prepare metadata on the forward stream, before queued communication.
+        # Top-level tensors retain the existing device-to-device path.
+        for key, value in tensor_dict.items():
+            if not isinstance(value, torch.Tensor):
+                if (
+                    key in logits_output_dict
+                    and key.startswith("input_")
+                    and isinstance(value, list)
+                ):
+                    # Input logprobs have one additional per-request list level.
+                    tensor_dict[key] = [
+                        _pp_freeze_output_metadata(rows, numeric_rows=True)
+                        for rows in value
+                    ]
+                else:
+                    tensor_dict[key] = _pp_freeze_output_metadata(
+                        value, numeric_rows=key in logits_output_dict
+                    )
         return tensor_dict
 
     def _pp_send_dict_to_next_stage(
