@@ -73,5 +73,39 @@ class TestQuantLogString(CustomTestCase):
         self.assertIsNone(result)
 
 
+class TestDraftQuantInheritance(CustomTestCase):
+    # When draft quantization is unset, server_args copies the target's onto the
+    # draft. An unquantized draft checkpoint has no matching quant config, so the
+    # inherited value must be cleared (SGLang analog of vLLM #25883).
+    def _model_config(self, *, is_draft_model, quantization):
+        model_config = ModelConfig.__new__(ModelConfig)
+        model_config.is_draft_model = is_draft_model
+        model_config.is_draft_quantization_explicit = False
+        model_config.quantization = quantization
+        model_config._parse_quant_hf_config = MagicMock(return_value=None)
+        model_config._find_quant_modelslim_config = MagicMock(return_value=None)
+        return model_config
+
+    def test_draft_without_config_drops_inherited_quant(self):
+        model_config = self._model_config(is_draft_model=True, quantization="awq")
+        model_config._verify_quantization()
+        self.assertIsNone(model_config.quantization)
+
+    def test_non_draft_keeps_quant(self):
+        model_config = self._model_config(is_draft_model=False, quantization="fp8")
+        model_config._verify_quantization()
+        self.assertEqual(model_config.quantization, "fp8")
+
+    def test_explicit_draft_quantization_is_preserved(self):
+        for quantization in ("fp8", "nvfp4_online"):
+            with self.subTest(quantization=quantization):
+                model_config = self._model_config(
+                    is_draft_model=True, quantization=quantization
+                )
+                model_config.is_draft_quantization_explicit = True
+                model_config._verify_quantization()
+                self.assertEqual(model_config.quantization, quantization)
+
+
 if __name__ == "__main__":
     unittest.main()
