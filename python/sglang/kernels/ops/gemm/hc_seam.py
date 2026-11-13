@@ -16,6 +16,9 @@ Three launches, no atomics and no inter-CTA waits (deterministic, CUDA-graph saf
        that entry of a' from the exact bf16 xn, as the stock combine does.
   K_b  up projection of all HC branches in one dot pair, sigmoid, exact bf16 xn, gated mean.
 ``hc_gated_combine`` (K_c) is the combine alone, for a boundary whose mix runs later.
+Each kernel takes M before its pointers, inside the kernel-argument registers gfx950 preloads; after the pointers it
+fell past that range and cost a scalar load before the first vector load. K_f's eps stays last: its first use comes
+after the partials' loads.
 
 K_a and K_b tile rows on their slowest grid axis: up to _ROW_TILE rows a call runs one BM = next_pow2(rows) tile,
 above that tiles of _ROW_TILE rows, so every row goes through the arithmetic of a single-tile call.
@@ -78,6 +81,7 @@ def _hc_combine_apply_kernel(
 
 @triton.jit
 def _hc_seam_down_kernel(
+    M,
     y_ptr,
     r_ptr,
     a_ptr,
@@ -86,7 +90,6 @@ def _hc_seam_down_kernel(
     wd_ptr,
     p_ptr,
     ss_ptr,
-    M,
     HC_: tl.constexpr,
     HS_: tl.constexpr,
     L: tl.constexpr,
@@ -147,6 +150,7 @@ def _hc_seam_down_kernel(
 
 @triton.jit
 def _hc_seam_reduce_kernel(
+    M,
     p_ptr,
     ss_ptr,
     r_ptr,
@@ -155,7 +159,6 @@ def _hc_seam_reduce_kernel(
     t_ptr,
     rs_ptr,
     aout_ptr,
-    M,
     eps,
     HC_: tl.constexpr,
     HS_: tl.constexpr,
@@ -253,13 +256,13 @@ def _hc_seam_reduce_kernel(
 
 @triton.jit
 def _hc_seam_up_kernel(
+    M,
     t_ptr,
     rs_ptr,
     r_ptr,
     wn_ptr,
     wu_ptr,
     out_ptr,
-    M,
     HC_: tl.constexpr,
     HS_: tl.constexpr,
     L: tl.constexpr,
@@ -400,6 +403,7 @@ def hc_seam(
     )
     nkc = HC * HS // KA_KB
     _hc_seam_down_kernel[(nkc, triton.cdiv(LOWRANK, KA_BN), row_tiles)](
+        rows,
         y if has_combine else residual,
         residual,
         gate_prev if has_combine else ws["rs"],
@@ -408,7 +412,6 @@ def hc_seam(
         w_down,
         ws["p"],
         ws["ss"],
-        rows,
         HC_=HC,
         HS_=HS,
         L=LOWRANK,
@@ -424,6 +427,7 @@ def hc_seam(
     _hc_seam_reduce_kernel[
         (triton.cdiv(rows, kf_bm), nlt + (kf_bm * HC if has_gate else 0))
     ](
+        rows,
         ws["p"],
         ws["ss"],
         r_new,
@@ -432,7 +436,6 @@ def hc_seam(
         ws["t"],
         ws["rs"],
         gate_new if has_gate else ws["rs"],
-        rows,
         eps,
         HC_=HC,
         HS_=HS,
@@ -446,13 +449,13 @@ def hc_seam(
         num_warps=4,
     )
     _hc_seam_up_kernel[(HS // KB_BJ, row_tiles)](
+        rows,
         ws["t"],
         ws["rs"],
         r_new,
         norm_w,
         w_up,
         mixed,
-        rows,
         HC_=HC,
         HS_=HS,
         L=LOWRANK,
