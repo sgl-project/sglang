@@ -325,7 +325,9 @@ def test_qwen4_ple_file_backend_gathers_prefill_rows_on_the_host(monkeypatch, dt
     table reads its rows on the host and gives the kernel's bytes: repeated ids, both
     shard edges, ids outside the shard (zero rows) and a shard none of the ids fall in.
     Control: a decode-sized gather stays in the kernel (no host staging). The GPU is taken
-    as one that faults pageable pages through the driver (HMM), whatever this one does."""
+    as one that faults pageable pages through the driver (HMM), whatever this one does.
+    Every staged gather first advises its rows' pages (WILLNEED), and the kernel takes
+    the advice."""
     monkeypatch.setattr(
         qwen4_exp_module, "device_faults_pageable_pages", lambda device_index=0: True
     )
@@ -336,6 +338,15 @@ def test_qwen4_ple_file_backend_gathers_prefill_rows_on_the_host(monkeypatch, dt
         Qwen4ExpPinnedHostEmbedding,
         "_stage_rows",
         lambda self, *a: staged.append(a[0].numel()) or stage(self, *a),
+    )
+    advised = []
+    advise = qwen4_exp_module.advise_rows_willneed
+    monkeypatch.setattr(
+        qwen4_exp_module,
+        "advise_rows_willneed",
+        lambda table, rows: (
+            advised.append((rows.tolist(), advise(table, rows))) or advised[-1][1]
+        ),
     )
     with tempfile.TemporaryDirectory() as table_dir:
         filed = Qwen4ExpPinnedHostEmbedding(
@@ -373,6 +384,8 @@ def test_qwen4_ple_file_backend_gathers_prefill_rows_on_the_host(monkeypatch, dt
         big[:4] = torch.tensor([4, 7, 3, 8], device="cuda")
         torch.testing.assert_close(gather(big), expected(big), rtol=0, atol=0)
         assert staged == [4096]
+        in_shard = big[(big >= 4) & (big < 8)].unique().cpu() - 4
+        assert advised == [(in_shard.tolist(), 1)]  # rows 0-3 share page 0
         outside = torch.full((2048,), 2, device="cuda")
         torch.testing.assert_close(
             gather(outside),
@@ -381,9 +394,11 @@ def test_qwen4_ple_file_backend_gathers_prefill_rows_on_the_host(monkeypatch, dt
             atol=0,
         )
         assert staged == [4096, 2048]
+        assert advised[1:] == [([0], 1)]  # the row the kernel reads before zeroing
         small = torch.tensor([[4, 7, 3]], device="cuda")
         torch.testing.assert_close(gather(small), expected(small), rtol=0, atol=0)
         assert staged == [4096, 2048]  # decode-sized: the kernel reads the table
+        assert len(advised) == 2
 
 
 @pytest.mark.skipif(

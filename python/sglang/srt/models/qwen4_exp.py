@@ -96,6 +96,7 @@ from sglang.srt.models.qwen3_5 import (
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from sglang.srt.models.qwen4_exp_ple_table import (
     PLE_FILE_PREFETCH_MIN_ROWS,
+    advise_rows_willneed,
     allocate_ple_host_table,
     device_faults_pageable_pages,
     make_ple_file_prefetcher,
@@ -1128,9 +1129,10 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
         if rows.numel() == 0:
             # The kernel reads row 0 for an id outside the shard before zeroing it.
             rows = torch.zeros(1, dtype=torch.int64)
-        table = self.weight.data.view(
-            torch.uint8
-        )  # [rows, row bytes] whatever the dtype
+        # [rows, row bytes], whatever the dtype.
+        table = self.weight.data.view(torch.uint8)
+        # The copy below runs on one thread: queue every cold row's read first.
+        advise_rows_willneed(table, rows)
         staged = torch.empty(
             (rows.numel(), table.shape[1]), dtype=torch.uint8, pin_memory=True
         )

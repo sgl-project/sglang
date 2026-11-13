@@ -46,6 +46,7 @@ from sglang.srt.environ import envs
 logger = logging.getLogger(__name__)
 
 _LIBC: Optional[ctypes.CDLL] = None
+_WILLNEED_FAILED = False
 _SMAPS_HEADER = re.compile(r"^([0-9a-f]+)-([0-9a-f]+) ")
 _SMAPS_RSS = re.compile(r"^Rss:\s+(\d+) kB")
 
@@ -55,6 +56,7 @@ PLE_OFFLOAD_BACKENDS = ("pinned", "file")
 _CUDA_DEV_ATTR_PAGEABLE_MEMORY_ACCESS = 88
 _CUDA_DEV_ATTR_PAGEABLE_MEMORY_ACCESS_USES_HOST_PAGE_TABLES = 100
 _MADV_RANDOM = 1
+_MADV_WILLNEED = 3
 _MADV_DONTNEED = 4
 _PAGE_SHIFT = 12
 # One MADV_DONTNEED call takes mmap_lock for its whole range; over the full
@@ -425,6 +427,51 @@ def _device_attribute(attribute: int, device_index: int) -> Optional[int]:
         except OSError:
             continue
     return None
+
+
+def advise_rows_willneed(table: torch.Tensor, rows: torch.Tensor) -> int:
+    """Queue the page-cache reads of ``rows`` of a file-backed ``table`` and return once
+    they are queued: ``madvise(MADV_WILLNEED)``, one call per run of adjacent pages.
+
+    The host gather copies its rows on one thread (the server runs torch with one
+    thread) from a ``MADV_RANDOM`` mapping, so without this each cold row is its own
+    4 KiB read from storage, one after another. Advised first, the reads are in flight
+    together and the copy finds the rows in the page cache. Advisory: returns the number
+    of pages advised, and stops at the first call that fails.
+    """
+    global _WILLNEED_FAILED
+    if rows.numel() == 0:
+        return 0
+    libc = _libc()
+    if libc is None:
+        return 0
+    row_bytes = table.stride(0) * table.element_size()
+    first = table.data_ptr() + rows.to(torch.int64) * row_bytes
+    pages = torch.cat(
+        [first >> _PAGE_SHIFT, (first + row_bytes - 1) >> _PAGE_SHIFT]
+    ).unique(sorted=True)
+    run_starts = torch.ones_like(pages, dtype=torch.bool)
+    run_starts[1:] = pages[1:] != pages[:-1] + 1
+    starts = torch.nonzero(run_starts).flatten()
+    lengths = torch.diff(starts, append=starts.new_tensor([pages.numel()]))
+    advised = 0
+    for page, count in zip(pages[starts].tolist(), lengths.tolist()):
+        rc = libc.madvise(
+            ctypes.c_void_p(page << _PAGE_SHIFT),
+            ctypes.c_size_t(count << _PAGE_SHIFT),
+            ctypes.c_int(_MADV_WILLNEED),
+        )
+        if rc != 0:
+            if not _WILLNEED_FAILED:
+                _WILLNEED_FAILED = True
+                logger.warning(
+                    "PLE table: madvise(MADV_WILLNEED) failed (errno %d); host gathers "
+                    "read cold rows one at a time",
+                    ctypes.get_errno(),
+                )
+            break
+        advised += count
+    return advised
 
 
 def _madvise_random(storage: torch.Tensor, nbytes: int) -> None:
