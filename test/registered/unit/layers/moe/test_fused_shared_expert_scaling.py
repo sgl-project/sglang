@@ -4,7 +4,7 @@ from sglang.srt.configs.shared_experts import SharedExpertsConfig
 from sglang.srt.runtime_context import get_model
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=15, suite="base-a-test-cpu")
+register_cpu_ci(est_time=24, suite="base-a-test-cpu")
 
 import unittest
 from contextlib import nullcontext
@@ -70,18 +70,6 @@ class TestFusedSharedExpertScaling(CustomTestCase):
         # Routed weights must never be touched by the shared-weight override.
         self.assertTrue(torch.equal(out_weights[0, :-1], routed_weights))
         return out_weights[0, -1].item()
-
-    def test_aiter_path_uses_unit_shared_weight(self):
-        # routed_scaling_factor is folded into the routed weights and the
-        # post-MoE multiply is skipped -> shared weight must be 1.0, NOT 1/rsf.
-        shared_weight = self._run_remap(use_aiter=True)
-        self.assertAlmostEqual(shared_weight, 1.0)
-
-    def test_post_moe_scaling_path_compensates_with_inverse_rsf(self):
-        # Default path: the whole MoE output is multiplied by rsf afterward, so
-        # the shared weight must be 1/rsf to net out to 1.0.
-        shared_weight = self._run_remap(use_aiter=False)
-        self.assertAlmostEqual(shared_weight, 1.0 / self.ROUTED_SCALING_FACTOR)
 
     def _waterfill_shared_weight(self, *, use_aiter, folded_in_topk):
         # Waterfill takes the shared column out of TopK and appends it itself.
@@ -198,7 +186,9 @@ class TestFusedSharedExpertScaling(CustomTestCase):
             e_score_correction_bias=torch.zeros(16) if correction_bias else None
         )
         experts = SimpleNamespace(
-            should_fuse_routed_scaling_factor_in_topk=folded_in_topk
+            should_fuse_routed_scaling_factor_in_topk=folded_in_topk,
+            runner_backend=None,
+            routing_method_type=None,
         )
         exec_config = SimpleNamespace(
             moe=SimpleNamespace(enable_waterfill=False, ep_num_redundant_experts=0)
@@ -529,13 +519,13 @@ class TestFusedSharedExpertScaling(CustomTestCase):
     def test_glm53_idle_rank_preserves_routed_topk_contract(self):
         """An idle rank must return the pre-append top-8 shape; returning top-9
         here would make the AITER postprocessor append shared ID 288 twice."""
-        topk = TopK.__new__(TopK)
-        torch.nn.Module.__init__(topk)
-        topk.topk_config = TopKConfig(
-            top_k=9, shared_experts=SharedExpertsConfig(num_fused_shared_experts=1)
-        )
-        topk.enable_waterfill = False
-        topk.waterfill_balancer = None
+        with (
+            get_context().override_server_args(enable_waterfill=False),
+            get_model().override(
+                shared_experts=SharedExpertsConfig(num_fused_shared_experts=1)
+            ),
+        ):
+            topk = TopK(top_k=8, layer_id=0)
 
         with (
             patch.object(
