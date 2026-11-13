@@ -38,6 +38,11 @@ class NPUTraceHandler:
     """Keep native analysis or submit a daemon capture for background parsing."""
 
     def __init__(self, log_dir: str):
+        # TODO(https://gitcode.com/Ascend/msprof/issues/265): Remove this
+        # daemon-specific background analysis workaround once supported
+        # torch_npu versions can automatically parse traces from multiprocessing
+        # daemon workers. Native analysis currently creates child processes,
+        # which daemon workers cannot spawn.
         self.npu_auto_analysis_in_daemon = multiprocessing.current_process().daemon
         self.on_trace_ready = get_torch_npu().profiler.tensorboard_trace_handler(
             log_dir, analyse_flag=not self.npu_auto_analysis_in_daemon
