@@ -31,7 +31,7 @@ _HC_NORM_KERNELS = [
     ("hc_combine_norm", "hc_combine_norm"),
     ("mhc_post_split_h", "mhc_post_split_h"),
     ("hc_combine_norm", "hc_combine_norm_mxfp8"),
-    ("mxfp8_epilogue", "rmsnorm_mxfp8"),
+    ("rmsnorm_mxfp8", "rmsnorm_mxfp8"),
 ]
 for _mod, _fn in _HC_NORM_KERNELS:
     register_kernel(
@@ -43,28 +43,30 @@ for _mod, _fn in _HC_NORM_KERNELS:
     )
 del _mod, _fn
 
-# The fused-rmsnorm variants physically live in the shared fused-pointwise
-# collection (sglang.kernels.ops.elementwise.elementwise) but stay layernorm ops.
 for _fn in ("fused_dual_residual_rmsnorm", "fused_rmsnorm"):
     register_kernel(
         KernelSpec(
             op=f"layernorm.{_fn}",
             backend=KernelBackend.TRITON,
-            target=f"sglang.kernels.ops.elementwise.elementwise:{_fn}",
+            target=f"sglang.kernels.ops.layernorm.fused_rmsnorm:{_fn}",
         )
     )
 del _fn
 
 
 # Public entry points inventoried by logical operator group (RFC #29630).
-register_kernel(
-    KernelSpec(
-        op="layernorm.rmsnorm_hf",
-        backend=KernelBackend.JIT,
-        target="sglang.kernels.ops.layernorm.rmsnorm_hf:rmsnorm_hf",
-        capabilities=CUDA_ONLY,
+# The rmsnorm family: one JIT template for plain / fused residual-add / fp8 per-tensor quant.
+for _fn in ("rmsnorm", "fused_add_rmsnorm", "rmsnorm_quant", "fused_add_rmsnorm_quant"):
+    register_kernel(
+        KernelSpec(
+            op=f"layernorm.{_fn}",
+            backend=KernelBackend.JIT,
+            target=f"sglang.kernels.ops.layernorm.norm:{_fn}",
+            capabilities=CUDA_ONLY,
+        )
     )
-)
+del _fn
+
 register_kernel(
     KernelSpec(
         op="layernorm.grouped_gemma_rmsnorm",
@@ -81,6 +83,62 @@ register_kernel(
         target="sglang.kernels.ops.layernorm.rmsnorm_fanout:rmsnorm_fanout",
         capabilities=frozenset(
             {CapabilityRequirement.cuda(min_sm=(10, 0), max_sm=(10, 9))}
+        ),
+    )
+)
+
+register_kernel(
+    KernelSpec(
+        op="layernorm.mhc_post_combine_norm_decode",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.layernorm.mhc_post_combine_norm_decode:mhc_post_combine_norm_decode",
+        capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(10, 0))}),
+    )
+)
+
+# Muse Spark and Beam fused norms. The per-layer ops are inventoried through
+# their class methods; the NVFP4 quant op through its module-level instance.
+for _op, _target, _backends in (
+    (
+        "muse_spark_norm_gate",
+        "muse_spark_norm_gate:FusedRMSNormGate",
+        ("torch", "jit", "helion", "triton"),
+    ),
+    (
+        "muse_spark_norm_residual",
+        "muse_spark_norm_residual:FusedPostNormResidualPreNorm",
+        ("torch", "jit", "triton"),
+    ),
+    (
+        "muse_spark_rmsnorm_nvfp4_quant",
+        "muse_spark_rmsnorm_nvfp4_quant:_FUSED_NORM_FP4_QUANT",
+        ("torch", "jit", "helion"),
+    ),
+    (
+        "beam_sandwich_residual_rmsnorm",
+        "beam_fused:BeamSandwichResidualRMSNormOp",
+        ("torch", "triton"),
+    ),
+):
+    for _bk in _backends:
+        register_kernel(
+            KernelSpec(
+                op=f"layernorm.{_op}",
+                backend=KernelBackend(_bk),
+                target=f"sglang.kernels.ops.layernorm.{_target}."
+                + ("forward_native" if _bk == "torch" else f"forward_{_bk}"),
+                capabilities=frozenset() if _bk == "torch" else CUDA_ONLY,
+            )
+        )
+del _op, _target, _backends, _bk
+
+register_kernel(
+    KernelSpec(
+        op="layernorm.fused_kda_output_quant",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.layernorm.fused_kda_output_quant:fused_kda_output_quant",
+        capabilities=frozenset(
+            {CapabilityRequirement.cuda(min_sm=(9, 0), max_sm=(9, 0))}
         ),
     )
 )

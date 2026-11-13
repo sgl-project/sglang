@@ -113,6 +113,14 @@ register_kernel(
 )
 register_kernel(
     KernelSpec(
+        op="mamba.fused_qwen4_varlen_conv",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.mamba.qwen4_short_conv:fused_qwen4_varlen_conv",
+        capabilities=CUDA_ONLY,
+    )
+)
+register_kernel(
+    KernelSpec(
         op="mamba.fused_qwen4_verify_conv",
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.mamba.qwen4_short_conv:fused_qwen4_verify_conv",
@@ -144,3 +152,13 @@ register_kernel(
         capabilities=CUDA_ONLY,
     )
 )
+for _fn in ("kda_track_conv_window", "kda_track_ssm_state"):
+    register_kernel(
+        KernelSpec(
+            op=f"mamba.{_fn}",
+            backend=KernelBackend.TRITON,
+            target=f"sglang.kernels.ops.mamba.kda_prefill_track:{_fn}",
+            capabilities=CUDA_ONLY,
+        )
+    )
+del _fn

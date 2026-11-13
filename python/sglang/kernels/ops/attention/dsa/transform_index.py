@@ -6,14 +6,6 @@ import triton
 import triton.language as tl
 
 
-def transform_index_page_table_prefill(**kwargs):
-    return transform_index_page_table_prefill_fast(**kwargs)
-
-
-def transform_index_page_table_decode(**kwargs):
-    return transform_index_page_table_decode_fast(**kwargs)
-
-
 @triton.jit
 def transform_index_page_table_dcp_kernel(
     page_table_ptr,
@@ -270,7 +262,7 @@ def transform_index_page_table_prefill_kernel(
     )
 
 
-def transform_index_page_table_decode_fast(
+def transform_index_page_table_decode(
     page_table: torch.Tensor,
     topk_indices: torch.Tensor,
     result: Optional[torch.Tensor] = None,
@@ -322,7 +314,7 @@ def transform_index_page_table_decode_fast(
     return result
 
 
-def transform_index_page_table_prefill_fast(
+def transform_index_page_table_prefill(
     page_table: torch.Tensor,
     topk_indices: torch.Tensor,
     extend_lens_cpu: List[int],

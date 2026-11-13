@@ -19,7 +19,7 @@ from sglang.test.test_utils import (
 GLM52_MODEL = os.environ.get("SGLANG_LINKER_GLM52_MODEL", "zai-org/GLM-5.2-FP8")
 GLM52_LAUNCH_TIMEOUT = 3600
 
-register_cuda_ci(est_time=383, stage="extra-b", runner_config="8-gpu-h200")
+register_cuda_ci(est_time=266, stage="extra-b", runner_config="8-gpu-h200")
 
 
 class TestGLM52UnifiedCacheLinkerKL(UnifiedRadixTreeTestMixin, CustomTestCase):
@@ -60,7 +60,7 @@ class TestGLM52UnifiedCacheLinkerKL(UnifiedRadixTreeTestMixin, CustomTestCase):
                     "1",
                     "--enable-cache-report",
                     "--enable-unified-cache-external-linker",
-                    "--hicache-storage-backend-extra-config",
+                    "--unified-cache-external-linker-config",
                     json.dumps({"enable_group_semantics": True}),
                 ],
                 env=unified_radix_tree_server_env(

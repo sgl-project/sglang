@@ -32,6 +32,7 @@ register_amd_ci(
     est_time=3600,
     suite="nightly-amd-accuracy-8-gpu-glm5",
     nightly=True,
+    disabled="Older model generation; AMD nightly keeps the latest two per family",
 )
 
 INVALID = -9999999

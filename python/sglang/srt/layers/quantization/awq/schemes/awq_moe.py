@@ -5,9 +5,9 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.srt.layers.linear import set_weight_attrs
 from sglang.srt.layers.moe.moe_runner import MoeRunner, MoeRunnerConfig
 from sglang.srt.layers.moe.utils import MoeRunnerBackend, get_moe_runner_backend
+from sglang.srt.layers.utils.common import set_weight_attrs
 
 from .awq_scheme import AWQMoESchemeBase
 
@@ -133,6 +133,9 @@ class AWQMoEScheme(AWQMoESchemeBase):
         self.moe_runner_config = moe_runner_config
         self.kernel.runner = MoeRunner(MoeRunnerBackend.MARLIN, moe_runner_config)
 
+    def get_moe_runner_backend(self, layer):
+        return self.kernel.runner.runner_backend
+
     def apply_weights(
         self,
         layer: torch.nn.Module,
@@ -167,6 +170,9 @@ class AWQAscendMoEScheme(AWQMoEScheme):
         if backend.is_auto():
             backend = MoeRunnerBackend.ASCEND
         self.runner = MoeRunner(backend, moe_runner_config)
+
+    def get_moe_runner_backend(self, layer):
+        return self.runner.runner_backend
 
     def apply_weights(
         self,
