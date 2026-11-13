@@ -4287,6 +4287,8 @@ class HybridLinearKVPool(KVCache):
         # full-attention layers instead of constructing one internally.
         full_kv_pool: Optional[KVCache] = None,
         post_capture_active: bool = False,
+        # HiSparse only: forwarded to a HiSparseDSATokenToKVPool full pool.
+        host_to_device_ratio: Optional[int] = None,
         use_fp4_indexer: bool = False,
         use_combined_kv_buffer: bool = False,
     ):
@@ -4344,6 +4346,11 @@ class HybridLinearKVPool(KVCache):
                 if full_kv_pool_class is not None
                 else DSATokenToKVPool
             )
+            hisparse_kwargs = (
+                {}
+                if host_to_device_ratio is None
+                else {"host_to_device_ratio": host_to_device_ratio}
+            )
             self.full_kv_pool = DSAPoolClass(
                 size=size,
                 page_size=self.page_size,
@@ -4361,6 +4368,7 @@ class HybridLinearKVPool(KVCache):
                 max_running_requests=max_running_requests,
                 skip_topk_layers=skip_topk_layers,
                 kv_scale_ue8m0=kv_scale_ue8m0,
+                **hisparse_kwargs,
                 use_fp4_indexer=use_fp4_indexer,
             )
         else:
@@ -4493,6 +4501,25 @@ class HybridLinearKVPool(KVCache):
 
     def maybe_get_custom_mem_pool(self):
         return self.full_kv_pool.maybe_get_custom_mem_pool()
+
+    def register_mapping(self, mapping: torch.Tensor) -> None:
+        self.full_kv_pool.register_mapping(mapping)
+
+    def _translate_loc_to_hisparse_device(self, indices: torch.Tensor) -> torch.Tensor:
+        return self.full_kv_pool._translate_loc_to_hisparse_device(indices)
+
+    def translate_loc_to_hisparse_device(self, indices: torch.Tensor) -> torch.Tensor:
+        return self.full_kv_pool.translate_loc_to_hisparse_device(indices)
+
+    def translate_loc_from_full_to_hisparse_device(
+        self, indices: torch.Tensor
+    ) -> torch.Tensor:
+        return self.full_kv_pool.translate_loc_from_full_to_hisparse_device(indices)
+
+    def translate_loc_from_full_to_compressed(
+        self, indices: torch.Tensor
+    ) -> torch.Tensor:
+        return self.full_kv_pool.translate_loc_from_full_to_compressed(indices)
 
     def _transfer_full_attention_id(self, layer_id: int):
         if layer_id not in self.full_attention_layer_id_mapping:
