@@ -12,6 +12,8 @@ Copied from [facebookexperimental/triton](https://github.com/facebookexperimenta
 changed, so re-syncing is a copy plus the import edits above; the pre-commit
 config excludes the two copied files so formatting never diverges from upstream.
 
+The entry point is registered for inventory as `gemm.tlx_linear`.
+
 ## Runtime
 
 The kernel needs `triton.language.extra.tlx`. On stock ROCm Triton, install the
@@ -30,6 +32,19 @@ its `libutlx.so` needs `mlir::argSort`, which `triton-rocm 3.8.0` does not expor
 `triton.knobs.compilation.fpsan_homomorphic_casts`) to decide whether its
 compiled-cache fast launch is safe. `_compat.add_missing_triton_knobs()` defines
 them as `False` on stock Triton, which has no such instrumentation.
+
+## Integration
+
+`SGLANG_USE_TLX_GEMM=1` routes BF16/FP16 unquantized linears without bias on
+gfx950 to `linear` (`srt/layers/quantization/unquant.py`), ahead of every other
+dense GEMM path. Bias, quantized weights, non-contiguous inputs, deterministic
+mode, and bf16 single-row inputs stay on the existing paths. Startup fails if no
+TLX (uTLX or fbtriton) is installed.
+
+The bf16 single-row fallback exists because `mm`'s packed GEMV uses
+`tlx.amd_packed_dot2`, which uTLX does not provide (checked through
+`triton-utlx 3.9.0.post4`). Projections a model runs on FP8 weight copies (the ROCm Muse
+Spark QKV / O / unpooler paths) do not go through `unquant.py` and are unaffected.
 
 ## Tests
 

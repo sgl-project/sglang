@@ -595,6 +595,15 @@ for _mod, _fn, _desc in _MUSE_SPARK_GFX950_KERNELS:
         )
     )
 del _mod, _fn, _desc
+# Vendored tlx.ops.mm (gfx950); needs triton.language.extra.tlx from fbtriton or the uTLX plugin.
+register_kernel(
+    KernelSpec(
+        op="gemm.tlx_linear",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.gemm.tlx:linear",
+        capabilities=frozenset({CapabilityRequirement.HIP}),
+    )
+)
 register_kernel(
     KernelSpec(
         op="gemm.hopper_fp8_block_gemv",
