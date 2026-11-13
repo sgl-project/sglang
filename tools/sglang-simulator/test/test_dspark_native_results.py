@@ -40,7 +40,7 @@ C_SchedulerHook.INFERENCE_PREDICTOR = NS(supports_dspark=True,
 retirer = RequestRetirer(
     tree_cache=NS(finish=lambda *args: events.append(('cache', args[0]))),
     beam_coordinator=NS(retire_group=noop), hisparse_coordinator=None,
-    uocr_runtime=None, send_abort_output=noop)
+    uocr_runtime=None, send_abort_output=noop, stream_output=noop)
 for retracted in (False, True):
     rid = 'retracted' if retracted else 'queued'
     params = SamplingParams(max_new_tokens=8, ignore_eos=True)
@@ -310,7 +310,7 @@ scheduler.batch_result_processor = SchedulerBatchResultProcessor(
     hisparse_coordinator=None, req_to_token_pool=pool, decode_offload_manager=None,
     kv_weight_version_tracker=None,
     request_retirer=RequestRetirer(tree_cache=cache, beam_coordinator=scheduler.beam_coordinator,
-        hisparse_coordinator=None, uocr_runtime=None, send_abort_output=noop),
+        hisparse_coordinator=None, uocr_runtime=None, send_abort_output=noop, stream_output=noop),
     metrics_collector=None, metrics_reporter=metrics, draft_worker=worker,
     model_worker=worker, logprob_result_processor=None,
     output_streamer=NS(stream_output=noop), beam_coordinator=scheduler.beam_coordinator,
