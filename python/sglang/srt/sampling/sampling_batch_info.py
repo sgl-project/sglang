@@ -127,7 +127,8 @@ class SamplingBatchInfo:
 
     # Host-side upper bound on every row's top_k, or None when some row samples
     # from the whole vocabulary. Any value >= the true max stays exact, so
-    # filter_batch keeps it unchanged.
+    # filter_batch keeps it unchanged (ScheduleBatch tightens it with
+    # refresh_top_k_flags).
     max_top_k: Optional[int] = None
 
     @classmethod
@@ -302,19 +303,9 @@ class SamplingBatchInfo:
             top_ks=top_ks,
             min_ps=min_ps,
             sampling_seed=sampling_seed,
-            is_all_greedy=all(r.sampling_params.top_k <= 1 for r in reqs),
-            is_any_greedy=any(r.sampling_params.top_k <= 1 for r in reqs),
             need_top_p_sampling=any(r.sampling_params.top_p != 1.0 for r in reqs),
-            need_top_k_sampling=any(r.sampling_params.top_k != TOP_K_ALL for r in reqs),
             need_min_p_sampling=any(r.sampling_params.min_p > 0 for r in reqs),
-            npu_top_k_top_p_eligible=all(
-                1 <= r.sampling_params.top_k <= 1024 for r in reqs
-            ),
-            max_top_k=(
-                max(r.sampling_params.top_k for r in reqs)
-                if reqs and all(1 <= r.sampling_params.top_k < TOP_K_ALL for r in reqs)
-                else None
-            ),
+            **_top_k_flags([r.sampling_params.top_k for r in reqs]),
             vocab_size=vocab_size,
             penalizer_orchestrator=penalizer_orchestrator,
             has_custom_logit_processor=has_custom_logit_processor,
@@ -656,6 +647,17 @@ class SamplingBatchInfo:
 
         self.adjusted_merge_batch(other)
 
+    def refresh_top_k_flags(self, top_ks: List[int]) -> None:
+        """Set the top-k flags from the rows' top_k, as from_schedule_batch does.
+
+        filter_batch leaves them as they were, which is safe but sticky: one
+        finished greedy row (top_k=1) keeps need_top_k_sampling on and max_top_k
+        None for the rest of the running batch. ScheduleBatch.filter_batch calls
+        this with its kept requests' top_k.
+        """
+        for name, value in _top_k_flags(top_ks).items():
+            setattr(self, name, value)
+
     def _merge_processor_entries(
         self, other: SamplingBatchInfo
     ) -> Dict[int, ProcessorEntry]:
@@ -714,6 +716,20 @@ def _fast_copy_enabled() -> bool:
 
 _FIELD_NAMES = tuple(f.name for f in dataclasses.fields(SamplingBatchInfo))
 _FIELD_GETTER = operator.itemgetter(*_FIELD_NAMES)
+
+
+def _top_k_flags(top_ks: List[int]) -> Dict[str, Any]:
+    """The SamplingBatchInfo flags that follow from the rows' top_k values."""
+    return {
+        "is_all_greedy": all(k <= 1 for k in top_ks),
+        "is_any_greedy": any(k <= 1 for k in top_ks),
+        "need_top_k_sampling": any(k != TOP_K_ALL for k in top_ks),
+        "npu_top_k_top_p_eligible": all(1 <= k <= 1024 for k in top_ks),
+        # None when any row samples the whole vocabulary.
+        "max_top_k": (
+            max(top_ks) if top_ks and all(1 <= k < TOP_K_ALL for k in top_ks) else None
+        ),
+    }
 
 
 def merge_bias_tensor(
