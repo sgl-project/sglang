@@ -47,7 +47,10 @@ from sglang.srt.layers.dcp.layout import (
     get_dcp_lens,
     update_local_kv_lens_for_dcp,
 )
-from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
+from sglang.srt.layers.dcp.metadata import (
+    DecodeContextParallelMetadata,
+    is_dsa_dcp_gathered_prefill,
+)
 
 # NOTE: planner.py is intentionally NOT imported here. It depends on server_args
 # (get_server_args), whereas this package-init executes at module-load time
@@ -59,6 +62,7 @@ from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
 
 __all__ = [
     "DecodeContextParallelMetadata",
+    "is_dsa_dcp_gathered_prefill",
     "dcp_a2a_lse_reduce",
     "dcp_push_combine_fits",
     "dcp_push_combine_reduce",

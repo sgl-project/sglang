@@ -1,10 +1,11 @@
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import msgspec
 import torch
 
+from sglang.kernels.ops.attention.dcp_kernels import _lse_pack_dim
 from sglang.kernels.ops.attention.dsa.transform_index import (
     transform_index_page_table_dcp,
 )
@@ -117,6 +118,56 @@ def dcp_trtllm_sparse_attention(
         outputs.append(output)
     output = outputs[0] if len(outputs) == 1 else torch.cat(outputs)
     return output.view(rows, 1, heads, -1), lse
+
+
+def dcp_gathered_prefill_crossover(
+    *,
+    v_head_dim: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    partial_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+    project_before_merge: bool,
+    q_all_gather: bool,
+) -> float:
+    """Prefix tokens per extend token and gathered head at which the two DCP
+    prefill routes put the same bytes on the wire; width and bandwidth cancel."""
+    latent = kv_lora_rank + qk_rope_head_dim
+    partial_width = v_head_dim if project_before_merge else kv_lora_rank
+    owned = (partial_width + _lse_pack_dim(partial_dtype)) * partial_dtype.itemsize
+    if q_all_gather:
+        # The query crosses in the KV dtype (see "Gather the DSA DCP Q in the
+        # FP8 KV dtype"), one latent-wide row per head per extend token.
+        owned += latent * kv_dtype.itemsize
+    return owned / (latent * kv_dtype.itemsize)
+
+
+def dcp_use_gathered_prefill(
+    extend_prefix_lens_cpu: List[int],
+    extend_num_tokens: int,
+    gathered_heads: int,
+    crossover: float,
+) -> bool:
+    """Whether this DCP prefill gathers the cached prefix instead of the query.
+    The gather reads position p from rank p % W, so prefixes must be page-whole."""
+    w = get_parallel().dcp_group.world_size
+    if any(p % w for p in extend_prefix_lens_cpu):
+        return False
+    prefix = sum(extend_prefix_lens_cpu)
+    return prefix < crossover * gathered_heads * extend_num_tokens
+
+
+def dcp_gathered_page_table(
+    dcp_kv_indptr: torch.Tensor,
+    dcp_kv_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    width: int,
+) -> torch.Tensor:
+    """[bs, width] sequence position -> row of the all-gathered ``dcp_kv_buffer``."""
+    cols = torch.arange(width, device=seq_lens.device)
+    valid = cols < seq_lens[:, None]
+    flat = torch.where(valid, dcp_kv_indptr[:-1, None].long() + cols, 0)
+    return torch.where(valid, dcp_kv_indices[flat], 0).to(torch.int32)
 
 
 def dcp_split_rows(rows: int) -> Tuple[int, int, int, int]:
