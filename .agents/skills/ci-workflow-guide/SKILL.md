@@ -87,6 +87,7 @@ Every stage job runs `check-pr-test-health` after checkout: if any job in the ru
 - **Layer 1**: `-f` flag appended to all `python3 -m pytest` / `unittest` invocations in `ci_utils.py`
 - **Layer 2**: `--continue-on-error` flag in `run_suite.py` — off for PRs, on for scheduled runs
 - **Layer 3**: skipped when `SKIP_PR_TEST_HEALTH_CHECK` is set (scheduled, `run_all_tests`, `test_parallel_dispatch`); filters out cascade failures to show only root cause jobs
+- **AMD layer 3**: `pr-test-amd.yml` and `pr-test-amd-extra.yml` check health after checkout, before GPU cleanup and container setup. Non-PR and continue-on-error runs skip it; the base workflow also skips it for `run_all_tests`. Nondeterministic test failures do not cascade, but setup and lint failures still do. AMD finish summaries and wait jobs caused only by health cascades do not block producer retries.
 - **Layer 4**: `wait-for-base-*` jobs run only on `pull_request` events without `test_parallel_dispatch`
 
 The control labels `bypass-fail-fast`, `parallel-stages`, `max-concurrency`, and `highest-priority` (all three) relax these limits for one PR; `.github/scripts/ci-labels.cjs` resolves them, and the [contribution guide](https://docs.sglang.io/developer_guide/contribution_guide.html#ci-control-labels) describes each.

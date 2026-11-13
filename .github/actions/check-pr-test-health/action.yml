@@ -104,8 +104,14 @@ runs:
               return false;
             }
             // a base-b wait can fail solely because health checks stopped its producers
-            if (baseName === 'wait-for-base-b') {
-              const failedProducers = failedJobs.filter(job => job.name.startsWith('base-b-test-'));
+            const producerPrefixes = {
+              'wait-for-base-b': 'base-b-test-',
+              'wait-for-stage-a-amd': 'stage-a-test-',
+              'wait-for-stage-b-amd': 'stage-b-test-',
+            };
+            const producerPrefix = producerPrefixes[baseName];
+            if (producerPrefix) {
+              const failedProducers = failedJobs.filter(job => job.name.startsWith(producerPrefix));
               if (failedProducers.length > 0 && failedProducers.every(job => {
                 const failedStep = (job.steps || []).find(s => s.conclusion === 'failure');
                 return failedStep && (failedStep.name.includes('check-pr-test-health') || failedStep.name.includes('Check PR test health'));
@@ -120,7 +126,12 @@ runs:
               return false;
             }
             // finish only aggregates producer results; it cannot be a producer prerequisite
-            if (baseName === 'pr-test-finish') {
+            const leafJobName = j.name.split(' / ').pop().split(/[ (]/)[0];
+            if (
+              baseName === 'pr-test-finish' ||
+              leafJobName === 'pr-test-amd-finish' ||
+              leafJobName === 'pr-test-amd-extra-finish'
+            ) {
               core.info(`[health-check] Filtered out finish summary: ${j.name}`);
               return false;
             }
