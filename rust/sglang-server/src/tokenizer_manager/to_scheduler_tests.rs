@@ -1017,6 +1017,79 @@ fn tokenize_pool_gone_deregisters() {
     assert!(detok_rx.try_recv().is_err(), "no further shard messages");
 }
 
+/// A full tokenizer pool queue rejects instead of parking intake, as a full
+/// mm pool does: a text generate request (registered, so deregistered) and a
+/// `Tokenize` request (never registered) both fail with `QueueFull`.
+#[test]
+fn full_tokenizer_pool_rejects_without_blocking_intake() {
+    let (tok_tx, tok_rx) = flume::bounded(1);
+    tok_tx
+        .send(generate_req(1, SamplingParams::default()))
+        .unwrap();
+    let (detok_tx, detok_rx) = flume::unbounded();
+    let (to_scheduler_tx, consumer) = to_scheduler(16);
+    let (sd_tx, sd_rx) = flume::unbounded::<()>();
+    std::mem::forget(sd_tx);
+    let mut intake = Intake::new(
+        flume::unbounded().1,
+        flume::unbounded().1,
+        Senders {
+            tok_manager_tx: flume::unbounded().0,
+            abort_tx: flume::unbounded().0,
+            tokenizer_tx: tok_tx,
+            detokenizer_tx: vec![detok_tx],
+        },
+        to_scheduler_tx,
+        test_limits(),
+        test_mm(flume::unbounded().0, true),
+        sd_rx,
+    );
+    let (generate_tx, mut generate_rx) = mpsc::channel(8);
+    let mut generate = generate_req(2, SamplingParams::default());
+    generate.sink = ResponseSink::Local(generate_tx);
+    if let RequestKind::Generate(g) = &mut generate.kind {
+        g.input_ids = None;
+        g.text = Some("hi".into());
+    }
+    let (tokenize_tx, mut tokenize_rx) = mpsc::channel(8);
+    let tokenize = Request {
+        rid: "3".into(),
+        state: RequestState::Received,
+        sink: ResponseSink::Local(tokenize_tx),
+        kind: RequestKind::Tokenize(TokenizeInput::Text {
+            text: "hi".into(),
+            add_special_tokens: false,
+        }),
+    };
+    // On its own thread, so a blocking hand-off fails the test, not hangs it.
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        intake.drive(generate);
+        intake.drive(tokenize);
+        let _ = done_tx.send(());
+    });
+    done_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("intake must not wait on a full tokenizer pool");
+
+    for rx in [&mut generate_rx, &mut tokenize_rx] {
+        let Ok(ResponseItem::Error(err)) = rx.try_recv() else {
+            panic!("expected a terminal error frame");
+        };
+        assert!(matches!(err, Error::QueueFull), "{err}");
+    }
+    assert!(
+        matches!(detok_rx.try_recv(), Ok(DetokMsg::Register { rid, .. }) if rid.as_str() == "2")
+    );
+    assert!(matches!(detok_rx.try_recv(), Ok(DetokMsg::Deregister { rid }) if rid.as_str() == "2"));
+    assert!(
+        detok_rx.try_recv().is_err(),
+        "the tokenize request was never registered"
+    );
+    assert_eq!(tok_rx.len(), 1, "only the filler reached the pool");
+    assert!(consumer.drain(16).is_empty(), "nothing queued");
+}
+
 /// The mm pool gone (receiver dropped) hands the request back: rejected with
 /// a 500 and deregistered, like the tokenizer pool's edge.
 #[test]

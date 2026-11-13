@@ -390,9 +390,10 @@ impl Server {
             .map_err(|e| pyo3::exceptions::PyOSError::new_err(e.to_string()))
     }
 
-    /// Signal all threads to stop (best effort).
-    pub fn shutdown(&self) {
-        self.rt.request_shutdown();
+    /// Signal all threads to stop (best effort). Joining them and writing out
+    /// the request log can take a while, so other Python threads keep running.
+    pub fn shutdown(&self, py: Python<'_>) {
+        py.detach(|| self.rt.request_shutdown());
     }
 }
 
