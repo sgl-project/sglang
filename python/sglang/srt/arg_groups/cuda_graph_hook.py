@@ -372,7 +372,18 @@ def apply_inkling_prefill_cuda_graph_default(server_args: Any):
         )
 
 
-def apply_muse_glimmer_prefill_cuda_graph_max_bs_default(server_args: Any):
+# Largest prefill graph per architecture when the user sets none. Above a few
+# thousand tokens a prefill step is compute-bound, so larger graphs only add
+# capture time; MiniMax-M3 steps of 8K-16K tokens time the same eager.
+_PREFILL_CUDA_GRAPH_MAX_BS_DEFAULTS = {
+    "MuseGlimmerForCausalLM": 512,
+    "MuseGlimmerForConditionalGeneration": 512,
+    "MiniMaxM3SparseForCausalLM": 8192,
+    "MiniMaxM3SparseForConditionalGeneration": 8192,
+}
+
+
+def apply_arch_prefill_cuda_graph_max_bs_default(server_args: Any):
 
     cfg = resolving_view(server_args)
     if (
@@ -381,12 +392,16 @@ def apply_muse_glimmer_prefill_cuda_graph_max_bs_default(server_args: Any):
     ):
         return
     arch = model_config_of(server_args).hf_config.architectures[0]
-    if arch in ("MuseGlimmerForCausalLM", "MuseGlimmerForConditionalGeneration"):
-        declare_resolution(
-            server_args,
-            "_apply_muse_glimmer_prefill_cuda_graph_max_bs_default",
-            cuda_graph_max_bs_prefill=512,
-        )
+    max_bs = _PREFILL_CUDA_GRAPH_MAX_BS_DEFAULTS.get(arch)
+    if max_bs is None:
+        return
+    if cfg.chunked_prefill_size is not None and cfg.chunked_prefill_size > 0:
+        max_bs = min(max_bs, cfg.chunked_prefill_size)
+    declare_resolution(
+        server_args,
+        "_apply_arch_prefill_cuda_graph_max_bs_default",
+        cuda_graph_max_bs_prefill=max_bs,
+    )
 
 
 def apply_unlimited_ocr_v2_cuda_graph_default(server_args: Any):

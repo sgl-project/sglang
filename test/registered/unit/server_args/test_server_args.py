@@ -26,6 +26,7 @@ from sglang.srt.arg_groups.attention_hook import (
     handle_deterministic_inference,
 )
 from sglang.srt.arg_groups.cuda_graph_hook import (
+    apply_arch_prefill_cuda_graph_max_bs_default,
     apply_cuda_graph_compatibility,
     finalize_cuda_graph_prefill_max_context,
     handle_cuda_graph_config,
@@ -3637,6 +3638,27 @@ class TestCudaGraphPrefillMaxContextResolution(CustomTestCase):
                 args = self._make_args(max_context_size)
                 with self.assertRaisesRegex(ValueError, expected_error):
                     finalize_cuda_graph_prefill_max_context(args)
+
+
+class TestArchPrefillCudaGraphMaxBsDefault(CustomTestCase):
+    def _resolve(self, arch, **kwargs):
+        args = ServerArgs(model_path="dummy", **kwargs)
+        model_config = SimpleNamespace(hf_config=SimpleNamespace(architectures=[arch]))
+        with patch(
+            "sglang.srt.arg_groups.cuda_graph_hook.model_config_of",
+            return_value=model_config,
+        ):
+            apply_arch_prefill_cuda_graph_max_bs_default(args)
+        return resolution_result(args, "cuda_graph_max_bs_prefill")
+
+    def test_minimax_m3_caps_prefill_graphs_at_8192_tokens(self):
+        arch = "MiniMaxM3SparseForConditionalGeneration"
+        self.assertEqual(self._resolve(arch), 8192)
+        self.assertEqual(self._resolve(arch, chunked_prefill_size=32768), 8192)
+        self.assertEqual(self._resolve(arch, chunked_prefill_size=4096), 4096)
+        self.assertEqual(self._resolve(arch, cuda_graph_max_bs_prefill=16384), 16384)
+        self.assertEqual(self._resolve("MuseGlimmerForCausalLM"), 512)
+        self.assertIsNone(self._resolve("LlamaForCausalLM"))
 
 
 class TestPipelineParallelPrefillCudaGraphPolicy(CustomTestCase):

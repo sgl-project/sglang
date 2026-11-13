@@ -41,7 +41,7 @@ _OVERRIDABLE_HOOKS: FrozenSet[str] = frozenset(
         "validate_prefill_only_disable_kv_cache_args",
         "handle_decode_context_parallelism",
         "apply_inkling_prefill_cuda_graph_default",
-        "apply_muse_glimmer_prefill_cuda_graph_max_bs_default",
+        "apply_arch_prefill_cuda_graph_max_bs_default",
         "apply_unlimited_ocr_v2_cuda_graph_default",
         "handle_dwdp",
         "handle_cuda_graph_config",
