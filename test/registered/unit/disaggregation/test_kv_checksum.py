@@ -21,6 +21,10 @@ from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixi
 from sglang.srt.disaggregation.utils import MetadataBuffers, kv_layout_signature
 from sglang.srt.environ import envs
 from sglang.srt.managers.req_types import FINISH_ABORT
+from sglang.srt.managers.scheduler_components.request_list import (
+    KeyedReqList,
+    ListKind,
+)
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.router import PlainPoolRouter
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -140,6 +144,25 @@ class TestKvChecksumComputerConfig(unittest.TestCase):
         self.assertEqual(computer._state_data_ptrs, [55, 66, 77])
         self.assertEqual(computer._state_item_lens, [88, 99, 111])
 
+    def test_leaves_out_the_dflash_draft_kv_ring(self):
+        kv_args = SimpleNamespace(
+            kv_data_ptrs=[11],
+            kv_item_lens=[33],
+            state_types=[StateType.MAMBA, StateType.DRAFT_RING, StateType.REQUEST_ROW],
+            state_data_ptrs=[[55, 66], [77, 78], [79]],
+            state_item_lens=[[88, 99], [111, 112], [4]],
+        )
+        computer = KvChecksumComputer.for_kv_args(kv_args, torch.device("cpu"))
+        self.assertEqual(computer._state_data_ptrs, [55, 66])
+        self.assertEqual(computer._state_item_lens, [88, 99])
+        self.assertEqual(computer._state_entry_sizes, [2])
+
+        kv_args.state_types = [StateType.MAMBA, StateType.REQUEST_ROW]
+        kv_args.state_data_ptrs = [[55, 66], [79]]
+        kv_args.state_item_lens = [[88, 99], [4]]
+        computer = KvChecksumComputer.for_kv_args(kv_args, torch.device("cpu"))
+        self.assertEqual(computer._state_data_ptrs, [55, 66, 79])
+
 
 class TestKvChecksumHealthCheck(unittest.TestCase):
     def test_detects_health_check_request(self):
@@ -258,6 +281,7 @@ class _FakeScheduler(SchedulerDisaggregationDecodeMixin):
         self.kv_checksum_computer = computer
         self.enable_overlap = False
         self.waiting_queue = []
+        self.running_reqs = KeyedReqList(ListKind.DECODING)
         # A static pool: no unified storage.
         self.token_to_kv_pool_allocator = SimpleNamespace(
             page_size=1, get_kvcache=_plain_kv_pool, storage=None

@@ -20,7 +20,8 @@ from sglang.srt.mem_cache.kv.decl import (
     MHAGeometry,
     MLAGeometry,
     PartGeometry,
-    RequestPartDecl,
+    RequestGeometry,
+    RequestLifetime,
     ScratchDecl,
     StateGeometry,
     StateLifetime,
@@ -32,6 +33,7 @@ from sglang.srt.mem_cache.kv.decl import (
 from sglang.srt.mem_cache.kv.layout.base import SubPoolSpec, _store_dtype_for
 from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
 from sglang.srt.mem_cache.kv.layout.mla import MLASubPoolSpec
+from sglang.srt.mem_cache.kv.layout.request import RequestSubPoolSpec
 from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
 from sglang.srt.mem_cache.layout.fused_draft import (
     LAYER_STATE,
@@ -47,6 +49,7 @@ from sglang.srt.mem_cache.layout.fused_draft import (
 _SUB_POOL_NAMES: Dict[Type, str] = {
     FullLifetime: "full",
     StateLifetime: "mamba",
+    RequestLifetime: "request",
 }
 
 
@@ -83,6 +86,14 @@ _EXTERNAL: Dict[Type, SubPoolExternal] = {
         label="mamba",
         wire="mamba",
         wire_key="mamba",
+    ),
+    # Never cached, stored on the host or sent to a PD peer: its names exist for
+    # metrics only.
+    RequestLifetime: SubPoolExternal(
+        host_pool="request",
+        tree_component="REQUEST",
+        metrics="request",
+        label="request",
     ),
 }
 
@@ -123,7 +134,6 @@ _WIRE_ORDER = (
     "dsa_tail",
     "qsa_pending",
     "qsa_compressed",
-    "request_row",
 )
 
 # How a prefix tree keeps a sub-pool for a cached prefix: every token, the
@@ -173,7 +183,7 @@ class PlannedSubPool(msgspec.Struct, frozen=True, kw_only=True):
     name: str
     lifetime: KVLifetime
     # Entries per allocation unit: the page for token sub-pools, one entry (a
-    # request's slot) for state.
+    # request's slot or row) for state and request sub-pools.
     unit: int
     layer_ids: Tuple[int, ...]
     geometry: PartGeometry
@@ -187,7 +197,6 @@ class KVStoragePlan(msgspec.Struct, frozen=True, kw_only=True):
     sub_pools: Tuple[PlannedSubPool, ...]
     fused_draft: Optional[FusedDraftPlacement] = None
     scratch: Tuple[ScratchDecl, ...] = ()
-    request_parts: Tuple[RequestPartDecl, ...] = ()
     derived_parts: Tuple[DerivedPartDecl, ...] = ()
 
     def storage_format_tag(self) -> Optional[str]:
@@ -257,13 +266,28 @@ class KVStoragePlan(msgspec.Struct, frozen=True, kw_only=True):
         pools and transfers list them in."""
         return tuple(reversed(self.sub_pools))
 
+    def requests(self) -> Tuple[PlannedSubPool, ...]:
+        """The request sub-pools: one unit per bound request row, outside the
+        prefix tree, host stores and PD transfers."""
+        return tuple(
+            s for s in self.sub_pools if isinstance(s.lifetime, RequestLifetime)
+        )
+
+    def cached_sub_pools(self) -> Tuple[PlannedSubPool, ...]:
+        """The sub-pools a prefix tree caches, in chain order: all but the
+        request sub-pools."""
+        return tuple(
+            s for s in self.sub_pools if not isinstance(s.lifetime, RequestLifetime)
+        )
+
     def drive_order(self) -> Tuple[PlannedSubPool, ...]:
-        """The sub-pools from the longest retention to the shortest: the owner,
-        then windows from the largest, then state; ties by unit, then name.
-        A prefix tree drives eviction and lists its components in this order."""
+        """The cached sub-pools from the longest retention to the shortest: the
+        owner, then windows from the largest, then state; ties by unit, then
+        name. A prefix tree drives eviction and lists its components in this
+        order."""
         return tuple(
             sorted(
-                self.sub_pools,
+                self.cached_sub_pools(),
                 key=lambda s: (
                     tuple(-r for r in s.lifetime.retention()),
                     s.unit,
@@ -343,18 +367,6 @@ class KVStoragePlan(msgspec.Struct, frozen=True, kw_only=True):
                         key=self.sub_pool(declared.sub_pool).external.wire_key,
                     ),
                 )
-        for declared in self.request_parts:
-            if declared.wire is not None:
-                key = (self.owner().name, declared.wire)
-                groups.setdefault(
-                    key,
-                    WireEntry(
-                        sub_pool=self.owner().name,
-                        part=declared.wire,
-                        state_type=declared.wire,
-                        key=self.owner().external.wire_key,
-                    ),
-                )
         entries.extend(groups.values())
         unknown = [e.state_type for e in entries if e.state_type not in _WIRE_ORDER]
         if unknown:
@@ -368,7 +380,7 @@ class KVStoragePlan(msgspec.Struct, frozen=True, kw_only=True):
 
 
 def _unit(lifetime: KVLifetime, page_size: int) -> int:
-    return 1 if isinstance(lifetime, StateLifetime) else page_size
+    return 1 if isinstance(lifetime, (StateLifetime, RequestLifetime)) else page_size
 
 
 def _chain_key(key: Tuple[KVLifetime, int]) -> tuple:
@@ -398,7 +410,30 @@ def _group_parts(
                     "pool lays out one geometry per sub-pool"
                 )
             layer_ids.append(decl.layer_id)
+    request = _request_group(groups)
+    if request is not None:
+        groups[(RequestLifetime(), 1)] = request
     return groups
+
+
+def _request_group(
+    groups: Dict[Tuple[KVLifetime, int], Tuple[List[int], PartGeometry]],
+) -> Optional[Tuple[List[int], RequestGeometry]]:
+    """The request sub-pool the state sub-pools' request parts form, each part
+    named by its state sub-pool; None when no state declares any."""
+    parts, layer_ids = [], set()
+    for (lifetime, _), (layers, geometry) in groups.items():
+        if not isinstance(geometry, StateGeometry) or not geometry.request_parts:
+            continue
+        name = _sub_pool_name(lifetime)
+        parts.extend(
+            msgspec.structs.replace(part, name=f"{name}.{part.name}")
+            for part in geometry.request_parts
+        )
+        layer_ids.update(layers)
+    if not parts:
+        return None
+    return sorted(layer_ids), RequestGeometry(parts=tuple(parts))
 
 
 def sub_pool_names(decls: Sequence[KVLayerDecl]) -> Tuple[str, ...]:
@@ -439,6 +474,16 @@ def _spec_for(
             grow_direction=grow_direction,
             draft_region=draft_region,
         )
+    if isinstance(geometry, RequestGeometry):
+        assert fused_draft is None or fused_draft.region(name) is None, (
+            "a fused draft rides in no request entry"
+        )
+        return RequestSubPoolSpec(
+            name=name,
+            layer_num=layer_num,
+            grow_direction=grow_direction,
+            parts=geometry.parts,
+        )
     assert isinstance(geometry, StateGeometry), f"unknown geometry {geometry}"
     return MambaSubPoolSpec(
         name=name,
@@ -461,7 +506,6 @@ def plan_kv_storage(
     page_size: int,
     fused_draft: Optional[FusedDraftPlacement] = None,
     speculative_num_draft_tokens: Optional[int] = None,
-    request_parts: Sequence[RequestPartDecl] = (),
     derived_parts: Sequence[DerivedPartDecl] = (),
 ) -> KVStoragePlan:
     """The unified-buffer plan for these declarations."""
@@ -535,17 +579,6 @@ def plan_kv_storage(
                 ),
             )
         )
-    request_parts = list(request_parts)
-    for sub_pool in sub_pools:
-        if isinstance(sub_pool.geometry, StateGeometry):
-            request_parts.extend(
-                RequestPartDecl(
-                    part=msgspec.structs.replace(
-                        part, name=f"{sub_pool.name}.{part.name}"
-                    )
-                )
-                for part in sub_pool.geometry.request_parts
-            )
     scratch = [
         ScratchDecl(
             part=msgspec.structs.replace(part, name=f"{sub_pool.name}.{part.name}")
@@ -596,16 +629,12 @@ def plan_kv_storage(
                 f"derived part {derived.part.name!r} has no owning sub-pool"
             )
     wire_owners = {}
-    for declared in (*derived_parts, *request_parts):
+    for declared in derived_parts:
         if declared.wire is None:
             continue
         if declared.wire not in _WIRE_ORDER:
             raise ValueError(f"unknown transfer wire name {declared.wire!r}")
-        owner = (
-            ("page", declared.sub_pool)
-            if isinstance(declared, DerivedPartDecl)
-            else ("request",)
-        )
+        owner = ("page", declared.sub_pool)
         if wire_owners.setdefault(declared.wire, owner) != owner:
             raise ValueError(
                 f"wire component {declared.wire!r} mixes allocation domains"
@@ -615,6 +644,5 @@ def plan_kv_storage(
         sub_pools=tuple(sub_pools),
         fused_draft=fused_draft,
         scratch=tuple(scratch),
-        request_parts=tuple(request_parts),
         derived_parts=tuple(derived_parts),
     )
