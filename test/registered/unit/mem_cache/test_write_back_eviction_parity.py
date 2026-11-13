@@ -160,7 +160,12 @@ class _Workload:
             def evict(params, _real=real, _name=name, **kwargs):
                 result = _real(params, **kwargs)
                 cache.sanity_check()
-                self.snapshots.append((_name, params.num_tokens, self._state()))
+                tokens = (
+                    params.num_tokens
+                    if isinstance(params, EvictParams)
+                    else params.full_tokens
+                )
+                self.snapshots.append((_name, tokens, self._state()))
                 return result
 
             setattr(cache, name, evict)

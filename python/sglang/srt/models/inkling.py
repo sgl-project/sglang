@@ -98,6 +98,7 @@ from sglang.srt.models.inkling_common.util import (
     trtllm_bf16_weight_prep_enabled,
     use_inkling_shared_fused_moe,
 )
+from sglang.srt.models.utils import keeps_no_quant_config
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.runtime_context import (
     get_disagg,
@@ -1777,6 +1778,9 @@ class InklingForConditionalGenerationMTP(nn.Module):
 
     fall_back_to_pt_during_load = False
     mtp_layer_id_is_depth = True
+    # The MTP block is bf16 in the checkpoint (no mtp.* quant excludes), so the
+    # draft is built unquantized and keeps no quant config.
+    own_quant_config = staticmethod(keeps_no_quant_config)
 
     def __init__(
         self,
@@ -1802,9 +1806,7 @@ class InklingForConditionalGenerationMTP(nn.Module):
             config.text_config.chain_hidden_post_norm = config.mtp_config.get(
                 "chain_hidden_post_norm", config.text_config.chain_hidden_post_norm
             )
-        # The MTP block is bf16 in the checkpoint (no mtp.* quant excludes), so build
-        # the draft unquantized.
-        quant_config = None
+        quant_config = self.own_quant_config(config, quant_config)
         # Without an alt_stream the InklingAttention fused-prologue gate can
         # never pass in the draft, leaving every draft forward on the unfused
         # {2x causal_conv1d + qk-norm + KV-store scatter (+ tau scale)} chain.
@@ -1844,6 +1846,12 @@ class InklingForConditionalGenerationMTP(nn.Module):
             hidden_states_before_norm=hidden_states_before_norm,
         )
 
+    @staticmethod
+    def sliding_layer_window_size(config) -> Optional[int]:
+        """A banded depth's window, one less than its extent; only banded depths
+        (``mtp_local_layer_ids``) have window layers."""
+        return config.text_config.mtp_local_extent - 1
+
     def get_attention_sliding_window_size(self) -> Optional[int]:
         """The trunk's convention (`InklingForConditionalGeneration`): the
         backend window is one less than the extent, so the head reads back
@@ -1851,7 +1859,7 @@ class InklingForConditionalGenerationMTP(nn.Module):
         its own extent, every other depth at the trunk's window."""
         text_config = self.text_config
         if self.draft_model_idx in text_config.mtp_local_layer_ids:
-            return text_config.mtp_local_extent - 1
+            return self.sliding_layer_window_size(self.config)
         return text_config.sliding_window_size - 1
 
     def get_embed_and_head(self):
