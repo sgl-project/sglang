@@ -294,5 +294,21 @@ def test_zero_cluster_uuid_clique_ends_at_its_node(
     assert is_one_nvlink_clique(object(), object()) is expected
 
 
+def test_skip_p2p_check_accepts_true(monkeypatch):
+    """SGLANG_SKIP_P2P_CHECK=true must trust the driver's report, not run the P2P probe."""
+    monkeypatch.setenv("SGLANG_SKIP_P2P_CHECK", "true")
+    monkeypatch.setattr(
+        custom_all_reduce_utils.torch.cuda,
+        "can_device_access_peer",
+        lambda src, tgt: True,
+    )
+    monkeypatch.setattr(
+        custom_all_reduce_utils,
+        "gpu_p2p_access_check",
+        Mock(side_effect=AssertionError("ran the P2P probe")),
+    )
+    assert custom_all_reduce_utils.can_p2p(rank=0, world_size=2)
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

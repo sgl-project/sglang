@@ -683,12 +683,51 @@ _MUSE_SPARK_GFX950_KERNELS = [
         "dflash_block_splitkv",
         "DFlash 8-row block extend over an FP8 prefix cache, split-KV, head_dim 128",
     ),
+    (
+        "muse_extend_gluon",
+        "muse_extend_attention",
+        "FP8-Q extend, head_dim 64 GQA 8, FP8 paged KV (Gluon; full layers and the 2047 window)",
+    ),
 ]
 for _mod, _fn, _desc in _MUSE_SPARK_GFX950_KERNELS:
     register_kernel(
         KernelSpec(
             op=f"attention.{_fn}",
             backend=KernelBackend.TRITON,
+            target=f"sglang.kernels.ops.attention.{_mod}:{_fn}",
+            capabilities=frozenset({CapabilityRequirement.HIP}),
+        )
+    )
+del _mod, _fn, _desc
+
+# Muse Spark on gfx950 (MI355X): FlyDSL kernels of the same backends.
+_MUSE_SPARK_GFX950_FLYDSL_KERNELS = [
+    (
+        "muse_verify_flydsl",
+        "gqa_verify_flydsl",
+        "8-token full-attention verify, one wave per KV head, exact BF16, split-KV",
+    ),
+    (
+        "muse_verify_balanced",
+        "gqa_verify_flydsl_balanced",
+        "that verify on a length-balanced split-KV work list",
+    ),
+    (
+        "muse_verify_balanced",
+        "swa_verify_flydsl",
+        "8-token verify on the 2047-token window, fixed splits over the window",
+    ),
+    (
+        "muse_extend_flydsl",
+        "muse_extend_attention_fly",
+        "full-layer FP8-Q extend, head_dim 64 GQA 8, FP8 paged KV",
+    ),
+]
+for _mod, _fn, _desc in _MUSE_SPARK_GFX950_FLYDSL_KERNELS:
+    register_kernel(
+        KernelSpec(
+            op=f"attention.{_fn}",
+            backend=KernelBackend.FLYDSL,
             target=f"sglang.kernels.ops.attention.{_mod}:{_fn}",
             capabilities=frozenset({CapabilityRequirement.HIP}),
         )

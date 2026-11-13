@@ -135,6 +135,7 @@ from sglang.srt.hf_transformers import (
 from sglang.srt.layers.cp.base import get_cp_strategy, is_cp_sharded_padded
 from sglang.srt.layers.cp.utils import from_cp_sharded
 from sglang.srt.layers.dp_attention import get_dp_tp_group, require_mlp_sync
+from sglang.srt.layers.layernorm_sp import is_muse_spark_architecture
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
 from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
@@ -193,6 +194,7 @@ from sglang.srt.managers.io_struct import (
     PluginWeightUpdateReqInput,
     ProfileReq,
     ReleaseMemoryOccupationReqInput,
+    ReleaseMemoryOccupationReqOutput,
     ReleaseUocrDocReqInput,
     RemoveExternalCorpusReqInput,
     RemoveExternalCorpusReqOutput,
@@ -1629,11 +1631,14 @@ class Scheduler(
                 transfer_backend=self.transfer_backend,
             )
 
-        draft_token_to_kv_pool = (
-            self.draft_worker.primary_draft_kv_pool
-            if self.draft_worker is not None
-            else None
-        )
+        # A DFLASH draft KV ring is sent as its own state, not as draft KV pages.
+        draft_kv_ring = None
+        draft_token_to_kv_pool = None
+        if self.draft_worker is not None:
+            if get_spec().speculative_dflash_draft_kv_ring:
+                draft_kv_ring = self.draft_worker.draft_kv_ring
+            else:
+                draft_token_to_kv_pool = self.draft_worker.primary_draft_kv_pool
 
         if self.spec_algorithm.carries_draft_hidden_states():
             # Derive the rank-uniform PD wire schema from config because only the
@@ -1702,6 +1707,7 @@ class Scheduler(
                 max_total_num_tokens=self.max_total_num_tokens,
                 num_reserved_decode_tokens=get_disagg().num_reserved_decode_tokens,
                 transfer_backend=self.transfer_backend,
+                draft_kv_ring=draft_kv_ring,
             )
 
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -1731,6 +1737,7 @@ class Scheduler(
                 scheduler=self,
                 scheduler_stage_metrics=self.scheduler_stage_metrics,
                 transfer_backend=self.transfer_backend,
+                draft_kv_ring=draft_kv_ring,
             )
             self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
 
@@ -1745,6 +1752,20 @@ class Scheduler(
                 hf_config=self.model_config.hf_config,
                 scheduler=self,
             )
+
+    def _gpu_work_on_forward_stream(self) -> bool:
+        # Muse Spark's monokernel launches need every one of their workgroups resident
+        # at once (they wait on each other); a kernel on another stream that takes a CU
+        # while one is dispatched can leave it waiting forever. Keep the scheduler's GPU
+        # work and the result readback on the forward stream (the host side still
+        # overlaps; its kernels queue behind the forward's).
+        architectures = self.model_config.hf_config.architectures
+        return bool(
+            _is_hip
+            and get_exec().kernel.enable_amd_monokernel
+            and architectures
+            and is_muse_spark_architecture(architectures[0])
+        )
 
     def init_overlap(self):
         self.device_module = torch.get_device_module(self.device)
@@ -1797,8 +1818,12 @@ class Scheduler(
         self.forward_stream_ctx: CudaStreamContext = self.device_module.stream(
             self.forward_stream
         )
-        self.copy_stream: CudaStream = self.device_module.Stream(
-            priority=envs.SGLANG_PLB_STREAM_PRIORITY.get()
+        self.copy_stream: CudaStream = (
+            self.forward_stream
+            if self._gpu_work_on_forward_stream()
+            else self.device_module.Stream(
+                priority=envs.SGLANG_PLB_STREAM_PRIORITY.get()
+            )
         )
         self.copy_stream_ctx: CudaStreamContext = self.device_module.stream(
             self.copy_stream
@@ -2101,7 +2126,9 @@ class Scheduler(
             # stream aliases forward_stream, which would eliminate scheduler
             # overlap. Only CUDA/HIP streams expose a ``cuda_stream`` handle;
             # other accelerators (e.g. NPU/XPU) skip the alias check.
-            if self.schedule_stream.cuda_stream == self.forward_stream.cuda_stream:
+            if self._gpu_work_on_forward_stream():
+                self.schedule_stream = self.forward_stream
+            elif self.schedule_stream.cuda_stream == self.forward_stream.cuda_stream:
                 self.schedule_stream = allocate_distinct_stream(
                     self.device_module, (self.forward_stream,)
                 )
@@ -2340,6 +2367,11 @@ class Scheduler(
                 if self.rust_server is None and isinstance(output, RpcReqOutput):
                     if self.ipc_channels.recv_from_rpc is not None:
                         sock_send(self.ipc_channels.recv_from_rpc, output)
+                elif get_parallel().pp_size > 1 and isinstance(
+                    output, ReleaseMemoryOccupationReqOutput
+                ):
+                    # Answered by the first stage once every stage has released.
+                    self._pp_pass_release_verdict(output, recv_req)
                 else:
                     self.send_control_output(output, recv_req)
 
@@ -4221,8 +4253,8 @@ class Scheduler(
             # only finished requests to running_batch.
             reqs_to_exclude.add(self.chunked_req)
 
-            # A parked chunk (add_chunked_req hybrid-SWA early-return) leaves
-            # extend_end at prefix_len: it computed no new KV, so nothing to stash.
+            # A parked chunk (add_chunked_req found no budget) leaves extend_end
+            # at prefix_len: it computed no new KV, so nothing to stash.
             if self.chunked_req.extend_end > self.chunked_req.prefix_len:
                 self.stash_chunked_request(self.chunked_req)
 
@@ -4606,13 +4638,18 @@ class Scheduler(
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
         buffer_pipeline = self.tree_cache.buffer_pipeline
+        # A parked chunk found no budget in this pass: admit no one ahead of it,
+        # so no batch carries a chunked request it does not run.
+        chunk_parked = (
+            self.chunked_req is not None and self.chunked_req not in adder.can_run_list
+        )
         # Requests no memory will ever come back for; aborted after the loop.
         unschedulable: List[Req] = []
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
             # A spent pass budget admits no one, even before the first
             # candidate: the resumed chunk or mixed decode rows can spend it.
-            if adder.budget_state() == AddReqResult.OTHER:
+            if chunk_parked or adder.budget_state() == AddReqResult.OTHER:
                 break
             if self.enable_lora and not self.can_schedule_lora_req(req, running_loras):
                 continue
@@ -6406,9 +6443,6 @@ class Scheduler(
                     )
                 else:
                     req.request_finish(FINISH_ABORT())
-
-    def _pause_engine(self) -> Tuple[List[Req], int]:
-        raise NotImplementedError()
 
     def pause_generation(self, recv_req: PauseGenerationReqInput):
         assert recv_req.mode in ("in_place", "retract")

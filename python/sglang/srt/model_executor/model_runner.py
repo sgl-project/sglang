@@ -218,7 +218,6 @@ from sglang.srt.runtime_context import (
     get_lora,
     get_memory,
     get_model,
-    get_observability,
     get_parallel,
     get_schedule,
     get_spec,
@@ -249,7 +248,6 @@ from sglang.srt.state_capturer.routed_experts import (
 )
 from sglang.srt.utils import (
     cpu_has_amx_support,
-    enable_show_time_cost,
     get_available_gpu_memory,
     is_host_cpu_arm64,
     is_npu,
@@ -457,10 +455,6 @@ class ModelRunner:
 
         # Auxiliary hidden capture: from the draft, or --enable-return-aux-hidden-states.
         self.init_spec_aux_hidden_state()
-
-        # Apply the rank zero filter to logger
-        if get_observability().show_time_cost:
-            enable_show_time_cost()
 
         misc_utils.maybe_disable_chunked_prefix_cache(
             use_mla_backend=self.use_mla_backend,
@@ -1307,6 +1301,8 @@ class ModelRunner:
                     self.max_token_pool_size
                 ),
                 max_running_requests=self.max_running_requests,
+                stage_start_layer=self.layer_info.start_layer,
+                stage_end_layer=self.layer_info.end_layer,
                 device=self.device,
             )
         )

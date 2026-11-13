@@ -1209,6 +1209,12 @@
                     ]
                   },
                   {
+                    "group": "Diffusion",
+                    "pages": [
+                      "docs/hardware-platforms/ascend-npus/diffusion/disaggregation"
+                    ]
+                  },
+                  {
                     "group": "Development",
                     "pages": [
                       "docs/hardware-platforms/ascend-npus/development/contribution_guide",
@@ -1537,6 +1543,7 @@
                   {
                     "group": "Thinking Machines",
                     "pages": [
+                      "cookbook/autoregressive/ThinkingMachines/Inkling-2-Small",
                       "cookbook/autoregressive/ThinkingMachines/Inkling",
                       "cookbook/autoregressive/ThinkingMachines/Inkling-Small"
                     ]
@@ -1712,6 +1719,13 @@
                     "tag": "NEW",
                     "pages": [
                       "cookbook/vla/OpenPI/Pi0.5"
+                    ]
+                  },
+                  {
+                    "group": "Runway",
+                    "tag": "NEW",
+                    "pages": [
+                      "cookbook/vla/Runway/Praxis-1"
                     ]
                   }
                 ]
