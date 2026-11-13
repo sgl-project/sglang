@@ -516,8 +516,7 @@ def set_torch_compile_config():
 
 def get_batch_sizes_to_capture(model_runner: ModelRunner):
     # CPU decode graph buckets are normalized into decode.bs by ServerArgs.
-    # Users can customize them with --cuda-graph-bs-decode or its legacy alias
-    # --cuda-graph-bs.
+    # Users can customize them with --cuda-graph-bs-decode.
     capture_bs = get_exec().graph.cuda_graph_config.decode.bs
     assert capture_bs and min(capture_bs) > 0, f"{capture_bs=}"
     capture_bs = [bs for bs in capture_bs if bs <= model_runner.req_to_token_pool.size]

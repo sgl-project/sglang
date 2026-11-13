@@ -71,7 +71,7 @@ def _init():
         max_push_blocks=0,
     )
     assert not comm.disabled and comm.has_multicast, "needs NVLink multicast"
-    gemma4_ar_fusion.register_comm(comm.obj)
+    gemma4_ar_fusion.register_comm(lambda: comm.obj, world_size=comm.world_size)
     register_comm_cleanup(comm)
     return coord
 

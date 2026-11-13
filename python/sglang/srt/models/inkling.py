@@ -98,6 +98,7 @@ from sglang.srt.models.inkling_common.util import (
     trtllm_bf16_weight_prep_enabled,
     use_inkling_shared_fused_moe,
 )
+from sglang.srt.models.utils import keeps_no_quant_config
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.runtime_context import (
     get_disagg,
@@ -1777,6 +1778,9 @@ class InklingForConditionalGenerationMTP(nn.Module):
 
     fall_back_to_pt_during_load = False
     mtp_layer_id_is_depth = True
+    # The MTP block is bf16 in the checkpoint (no mtp.* quant excludes), so the
+    # draft is built unquantized and keeps no quant config.
+    own_quant_config = staticmethod(keeps_no_quant_config)
 
     def __init__(
         self,
@@ -1802,9 +1806,7 @@ class InklingForConditionalGenerationMTP(nn.Module):
             config.text_config.chain_hidden_post_norm = config.mtp_config.get(
                 "chain_hidden_post_norm", config.text_config.chain_hidden_post_norm
             )
-        # The MTP block is bf16 in the checkpoint (no mtp.* quant excludes), so build
-        # the draft unquantized.
-        quant_config = None
+        quant_config = self.own_quant_config(config, quant_config)
         # Without an alt_stream the InklingAttention fused-prologue gate can
         # never pass in the draft, leaving every draft forward on the unfused
         # {2x causal_conv1d + qk-norm + KV-store scatter (+ tau scale)} chain.

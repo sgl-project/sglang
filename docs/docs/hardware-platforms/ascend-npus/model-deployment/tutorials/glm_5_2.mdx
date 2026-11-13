@@ -31,7 +31,7 @@ multi-node deployment, prefill-decode disaggregation, feature configuration, and
 <Note>
 The values in the **Example usage** column are for illustration only. Adjust them according to your hardware, deployment
 mode, and workload. For parameter details, see
-[Feature descriptions](/docs/hardware-platforms/ascend-npus/optimization/parameter_tuning#feature-descriptions); for
+[Parameter Reference](/docs/hardware-platforms/ascend-npus/optimization/parameter_tuning#parameter-reference); for
 recommended configurations for each deployment scenario, see [Best practices](#best-practices).
 </Note>
 
@@ -59,6 +59,7 @@ For multi-node deployment, download the weights to a shared directory accessible
 
 - [GLM-5.2](https://www.modelscope.cn/models/ZhipuAI/GLM-5.2) (BF16, 1.51TB)
 - [GLM-5.2-w8a8](https://www.modelscope.cn/models/Eco-Tech/GLM-5.2-w8a8/) (Quantized version without MTP, 774.08GB)
+- [GLM-5.2-w4a8](https://www.modelscope.cn/models/Eco-Tech/GLM-5.2-w4a8) (W4A8 quantized version, 377.19GB)
 - You can use [msmodelslim](https://gitcode.com/Ascend/msmodelslim) to quantize the model naively.
 
 <Info>
@@ -128,9 +129,13 @@ swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.
 
 ### Single-node deployment
 
-Quantized model `GLM-5.2-w8a8` can be deployed on one Ascend A3 Series node.
+Quantized GLM-5.2 models can be deployed on one Ascend A3 Series node. Select the tab for the quantized weights you
+downloaded, then run the script to execute online inference.
 
-Run the following script to execute online inference.
+<Tabs>
+  <Tab title="W8A8">
+
+Use the `GLM-5.2-w8a8` checkpoint on one A3 Series node.
 
 ```shell
 # ============================================================
@@ -177,7 +182,7 @@ python3 -m sglang.launch_server \
         --model-path $MODEL_PATH \
         --attention-backend ascend \
         --device npu \
-        --tp-size 16 --nnodes 1 --node-rank 0 \
+        --tp-size 16 \
         --chunked-prefill-size 16384 --max-prefill-tokens 280000 \
         --trust-remote-code \
         --host 127.0.0.1 \
@@ -190,6 +195,74 @@ python3 -m sglang.launch_server \
         --speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4  \
         --moe-a2a-backend deepep --deepep-mode auto
 ```
+
+  </Tab>
+  <Tab title="W4A8">
+
+Use the `GLM-5.2-w4a8` checkpoint on one A3 Series node.
+
+```shell
+# ============================================================
+# Before running, update the following variables:
+#   MODEL_PATH: path to the model weights directory
+# ============================================================
+
+# high performance cpu
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=0
+sysctl -w kernel.numa_balancing=0
+sysctl -w kernel.sched_migration_cost_ns=50000
+# bind cpu
+export SGLANG_SET_CPU_AFFINITY=1
+
+unset https_proxy
+unset http_proxy
+unset HTTPS_PROXY
+unset HTTP_PROXY
+unset ASCEND_LAUNCH_BLOCKING
+# cann
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+
+export STREAMS_PER_DEVICE=32
+export SGLANG_ENABLE_SPEC_V2=1
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export DEEPEP_HCCL_BUFFSIZE=1000
+export HCCL_OP_EXPANSION_MODE=AIV
+export HCCL_SOCKET_IFNAME=lo
+export GLOO_SOCKET_IFNAME=lo
+# DEEPEP
+export DEEPEP_NORMAL_LONG_SEQ_ROUND=72
+export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=1024
+export DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ=1
+export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=16
+export DEEPEP_HYBRID_DEPLOYMENT=1
+
+MODEL_PATH=/path/to/model-weights
+
+python3 -m sglang.launch_server \
+        --model-path $MODEL_PATH \
+        --attention-backend ascend \
+        --device npu \
+        --tp-size 16 \
+        --disable-shared-experts-fusion \
+        --chunked-prefill-size 8192 \
+        --max-prefill-tokens 280000 \
+        --trust-remote-code \
+        --mem-fraction-static 0.78 \
+        --served-model-name GLM-5.2-w4a8 \
+        --max-running-requests 16 \
+        --cuda-graph-max-bs-decode 16 \
+        --quantization modelslim \
+        --moe-a2a-backend deepep --deepep-mode auto \
+        --speculative-algorithm NEXTN --speculative-num-steps 3 --speculative-eagle-topk 1 --speculative-num-draft-tokens 4 \
+        --load-balance-method round_robin \
+        --host 127.0.0.1 --port 8000
+```
+
+  </Tab>
+</Tabs>
 
 ### Multi-node deployment
 

@@ -159,7 +159,7 @@ lora1 = "algoprog/fact-generation-llama-3.1-8b-instruct-lora"  # rank - 64, targ
 lora0_new = "philschmid/code-llama-3-1-8b-text-to-sql-lora"  # rank - 256, target modules - q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj
 
 
-# The `--target-lora-modules` param below is technically not needed, as the server will infer it from lora0 which already has all the target modules specified.
+# The `--lora-target-modules` param below is technically not needed, as the server will infer it from lora0 which already has all the target modules specified.
 # We are adding it here just to demonstrate usage.
 server_process, port = launch_server_cmd(
     """

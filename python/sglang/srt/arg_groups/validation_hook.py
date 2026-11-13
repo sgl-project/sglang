@@ -264,6 +264,10 @@ def check_pipeline_parallel_compat(cfg: Any) -> None:
                 "SGLANG_ENABLE_PP_SPEC is not compatible with attention DP "
                 "(--attn-dp-size)"
             )
+            assert not cfg.enable_return_routed_experts, (
+                "SGLANG_ENABLE_PP_SPEC is not compatible with "
+                "--enable-return-routed-experts"
+            )
         else:
             assert cfg.disaggregation_mode == "prefill", (
                 "PP + speculative decoding (MTP) is only supported on prefill nodes "

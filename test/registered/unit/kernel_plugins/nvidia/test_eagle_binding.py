@@ -580,6 +580,92 @@ class TestEagleEntries(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "multi-step draft"):
             _init(draft={"draft_extend": print}, num_steps=1)
 
+    def test_a_target_verify_megakernel_without_draft_entries_is_refused(self):
+        """A target megakernel covering only the verify step reads the same
+        ReplaySSM ring while its draft offers no entry, so SGLang's side of the
+        entries never runs: the install refuses it before the build, and so before
+        any capture. Static pools keep it."""
+        for unified in (False, True):
+            with self.subTest(unified_memory=unified):
+                model = torch.nn.Module()
+                original = model.forward
+                built = SimpleNamespace(
+                    widths=(2, 4),
+                    summary=lambda: "target_verify",
+                    plan=MagicMock(return_value=None),
+                    forward=MagicMock(),
+                    draft_sampler=None,
+                    draft_loop=None,
+                    draft_extend=None,
+                    begin_draft_round=None,
+                    graph_variants=None,
+                    speculative_runtime_hooks=None,
+                )
+                target_spec = SimpleNamespace(
+                    name="qwen3_5_verify",
+                    build=MagicMock(return_value=built),
+                    prepare=None,
+                    max_rows=4,
+                    numerics=SimpleNamespace(kind=SimpleNamespace(value="exact")),
+                )
+                hooks = []
+                refused = (
+                    self.assertRaisesRegex(ValueError, "ReplaySSM speculative ring")
+                    if unified
+                    else contextlib.nullcontext()
+                )
+                with (
+                    self._target_install_context(unified_memory=unified),
+                    patch.object(
+                        runtime, "_find_spec_on_every_rank", return_value=target_spec
+                    ),
+                    refused,
+                ):
+                    runtime.install_megakernel(
+                        model=model,
+                        hf_config=SimpleNamespace(
+                            architectures=["Qwen3_5MoeForCausalLM"]
+                        ),
+                        capture_tail_hooks=hooks,
+                        is_draft=False,
+                    )
+                if unified:
+                    target_spec.build.assert_not_called()
+                    self.assertEqual(model.forward, original)
+                    self.assertEqual(hooks, [])
+                else:
+                    target_spec.build.assert_called_once()
+                    self.assertNotEqual(model.forward, original)
+                    self.assertEqual(len(hooks), 1)
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _target_install_context(*, unified_memory):
+        """install_megakernel's runtime reads on one CPU rank with speculative
+        ReplaySSM on, and unified memory as given."""
+        memory = SimpleNamespace(enable_unified_memory=unified_memory)
+        exec_ = SimpleNamespace(
+            mamba=SimpleNamespace(enable_linear_replayssm_spec=True)
+        )
+        with (
+            patch.object(runtime, "megakernel_enabled", return_value=True),
+            patch.object(runtime, "msa_serves", return_value=False),
+            patch.object(runtime, "_requirement_reasons", return_value=[]),
+            patch.object(runtime, "_model_disable_reasons", return_value=[]),
+            patch.object(runtime, "get_memory", return_value=memory),
+            patch.object(runtime, "get_exec", return_value=exec_),
+            patch.object(
+                runtime,
+                "get_device",
+                return_value=SimpleNamespace(watchdog_timeout=None),
+            ),
+            patch.object(runtime, "_tokens_per_request", return_value=2),
+            patch.object(runtime, "_decode_graphs_enabled", return_value=True),
+            patch.object(runtime, "_gather_tp", side_effect=lambda x, group=None: [x]),
+            patch.object(torch.cuda, "mem_get_info", return_value=(0, 0)),
+        ):
+            yield
+
     def test_the_draft_worker_takes_its_megakernel_once_both_backends_exist(self):
         """The draft's graph runners read the worker's megakernel when they capture,
         and its init reads both of the draft's attention backends:

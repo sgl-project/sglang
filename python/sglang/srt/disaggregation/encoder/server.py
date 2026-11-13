@@ -21,7 +21,7 @@ import zmq.asyncio
 from sglang.srt.configs.device_config import DeviceConfig
 from sglang.srt.configs.load_config import LoadConfig
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
+from sglang.srt.constants import is_health_check_request
 from sglang.srt.disaggregation.encoder.preprocessor import (
     EncoderPreprocessor,
     EncoderPreprocessResult,
@@ -83,10 +83,6 @@ from sglang.srt.utils.network import (
 )
 
 logger = logging.getLogger(__name__)
-
-
-def is_health_check_request(rid: Optional[str]) -> bool:
-    return isinstance(rid, str) and rid.startswith(HEALTH_CHECK_RID_PREFIX)
 
 
 rid_lock = asyncio.Lock()

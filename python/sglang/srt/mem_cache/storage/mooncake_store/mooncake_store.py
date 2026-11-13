@@ -1238,6 +1238,18 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 except ValueError:
                     boundary = kv_pages
                 pool_restorable = list(range(1, boundary + 1))
+            elif transfer.hit_policy == PoolHitPolicy.BLOCK_GROUPS:
+                # Compressed-block pools (DeepSeek-V4 C128) keep one key per
+                # block. Only endpoints of leading complete blocks are valid
+                # restore boundaries; the query span starts on a block boundary.
+                block = max(1, int(transfer.block_pages))
+                complete = 0
+                for idx in range(block - 1, kv_pages, block):
+                    if not page_exists[idx]:
+                        break
+                    complete += 1
+                boundary = complete * block
+                pool_restorable = list(range(block, boundary + 1, block))
             elif transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES:
                 # A stop point works when the window ending there is complete,
                 # so scan every one instead of stopping at the longest.

@@ -67,6 +67,12 @@ class PDDisaggregationServerBase(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         os.environ["MC_TCP_ENABLE_CONNECTION_POOL"] = "true"
+        # Mooncake binds its handshake RPC port at random from [15000, 17000]
+        # by default, which overlaps the fixed test ports below on some runners
+        # (base port 15000 on GPU 2), so it could grab prefill's HTTP port first.
+        # Keep it above both the test ports and the ephemeral range.
+        os.environ["MC_MIN_RPC_PORT"] = "61000"
+        os.environ["MC_MAX_RPC_PORT"] = "65000"
         os.environ["SGLANG_ENABLE_RANK_CONSENSUS_CHECKER"] = "1"
         parsed_url = urlparse(DEFAULT_URL_FOR_TEST)
         cls.base_host = parsed_url.hostname
@@ -248,6 +254,8 @@ class PDDisaggregationServerBase(CustomTestCase):
         if cls._fail_fast_stop is not None:
             cls._fail_fast_stop.set()
         os.environ.pop("MC_TCP_ENABLE_CONNECTION_POOL")
+        os.environ.pop("MC_MIN_RPC_PORT", None)
+        os.environ.pop("MC_MAX_RPC_PORT", None)
         os.environ.pop("SGLANG_ENABLE_RANK_CONSENSUS_CHECKER")
         if getattr(cls, "_mc_gid_index_set", False):
             os.environ.pop("MC_GID_INDEX", None)

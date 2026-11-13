@@ -67,7 +67,7 @@ pub struct ModelArgs {
     #[arg(long)]
     pub model_id: String,
 
-    /// Extra `model` value served as --model-id (repeatable); forwarded as --model-id,
+    /// Extra `model` value rewritten to --model-id in the forwarded body (repeatable),
     /// preserving a LoRA suffix. /v1/models lists only --model-id.
     #[arg(long = "model-alias", value_name = "MODEL")]
     pub model_alias: Vec<String>,

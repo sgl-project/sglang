@@ -358,6 +358,14 @@ export const DiffusionModelCatalog = ({ category }) => {
       cookbook: "/cookbook/vla/FLUX/FLUX-3-Action",
     },
     {
+      name: "Praxis-1",
+      modelIds: [
+        "runwayml/praxis-1-droid-lerobot",
+        "runwayml/praxis-1-yam-lerobot",
+      ],
+      cookbook: "/cookbook/vla/Runway/Praxis-1",
+    },
+    {
       name: "LingBotWorld",
       modelIds: [
         "IPostYellow/lingbot-world-fast-diffusers",

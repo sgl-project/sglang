@@ -3157,6 +3157,7 @@ class DeepseekV2Model(nn.Module):
         self.layers_to_capture = []
         self.enable_a2a_moe = (
             get_moe_a2a_backend().is_deepep()
+            or get_moe_a2a_backend().is_ascend_ops()
             or get_moe_a2a_backend().is_mooncake()
             or get_moe_a2a_backend().is_deepep_v2()
         )

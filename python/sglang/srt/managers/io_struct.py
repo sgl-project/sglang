@@ -2836,18 +2836,6 @@ class BlockReqInput(BaseReq, kw_only=True):
     req_type: BlockReqType
 
 
-class SetInjectDumpMetadataReqOutput(BaseReq, kw_only=True):
-    success: bool
-
-
-class LazyDumpTensorsReqInput(BaseReq, kw_only=True):
-    pass
-
-
-class LazyDumpTensorsReqOutput(BaseReq, kw_only=True):
-    success: bool
-
-
 class DumperControlReqInput(BaseReq, kw_only=True):
     method: str
     # JSON request body (guarded to be a dict at the /dumper endpoint).

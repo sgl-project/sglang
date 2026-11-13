@@ -62,6 +62,7 @@ jobs:
           - { runner_config: 4-gpu-b200, run_timeout: '150', job_timeout: '210' }
           - { runner_config: 8-gpu-h200, run_timeout: '240', job_timeout: '300' }
           - { runner_config: 8-gpu-b200, run_timeout: '360', job_timeout: '420' }
+          - { runner_config: 8-gpu-b300, run_timeout: '360', job_timeout: '420' }
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
       self_name: weekly-test-${{ matrix.runner_config }}

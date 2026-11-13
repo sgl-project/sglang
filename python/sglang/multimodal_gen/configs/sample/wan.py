@@ -233,6 +233,45 @@ class Wan2_2_TI2V_5B_SamplingParam(Wan2_2_Base_SamplingParams):
         ]
     )
 
+    def _adjust_visual_fields(self, server_args, pipeline_config) -> None:
+        super()._adjust_visual_fields(server_args, pipeline_config)
+        self._align_resolution(pipeline_config)
+
+    def prepare_synthetic_warmup_request_for_queue(self, req, server_args) -> None:
+        # Warmup overwrites the dimensions after _adjust has run.
+        self._align_resolution(server_args.pipeline_config)
+
+    def _align_resolution(self, pipeline_config) -> None:
+        from sglang.multimodal_gen.configs.pipeline_configs.wan import (
+            Wan2_2_TI2V_5B_Config,
+        )
+
+        # The DiT floors an odd latent side when it splits it into 2x2 patches,
+        # so its output no longer matches the latents. The diffusers backend
+        # keeps its own size handling.
+        if not isinstance(pipeline_config, Wan2_2_TI2V_5B_Config):
+            return
+        if self.width is None or self.height is None:
+            return
+        if self.width <= 0 or self.height <= 0:
+            return
+        multiple = (
+            pipeline_config.vae_stride[1]
+            * pipeline_config.dit_config.arch_config.patch_size[1]
+        )
+        requested_size = (self.width, self.height)
+        self.width = max(multiple, self.width // multiple * multiple)
+        self.height = max(multiple, self.height // multiple * multiple)
+        if (self.width, self.height) != requested_size:
+            logger.warning(
+                "Wan2.2 TI2V requires dimensions divisible by %s; adjusted "
+                "requested resolution from %sx%s to %sx%s",
+                multiple,
+                *requested_size,
+                self.width,
+                self.height,
+            )
+
 
 @dataclass
 class Wan2_2_T2V_A14B_SamplingParam(Wan2_2_Base_SamplingParams):

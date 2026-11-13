@@ -277,6 +277,24 @@ to the whole pool rather than rejecting every request, and failures reopen
 them. `--disable-circuit-breaker` turns it off; a worker that stops answering
 then keeps its share of traffic.
 
+### Request body size
+
+The router buffers each inference request body in full before routing it, so
+it caps the body: `/v1/chat/completions`, `/v1/completions`, `/generate`,
+`/v1/embeddings`, `/v1/classify`, `/v1/rerank` and `/v1/messages` (with
+`count_tokens`) answer `413` past it. The cap is 32 MiB by default; set
+`SGLANG_ROUTER_MAX_BODY_BYTES` to a positive byte count (for example
+`268435456` for 256 MiB) to accept larger multimodal requests carrying several
+base64 images or audio clips. Raising it raises the router's worst-case memory
+too: the body is held in full and parsed (and often rebuilt) while the request
+is prepared, so peak memory per in-flight request is a few times its size. The
+value is bytes, so `256` is a 256-byte cap, not 256 MiB. An empty value keeps
+the default; zero or a value that is not a plain decimal integer (no unit
+suffix) keeps the default and logs a warning. The router logs the effective cap
+at startup. The cap does not change the native gRPC server's inbound message
+limit (half of the 64 MiB engine channel), or the 32 MiB cap on a buffered
+non-streaming Anthropic Messages reply.
+
 ### Engines with `--api-key`
 
 The router reads each worker's `/server_info` and `/model_info` to learn its
@@ -489,6 +507,11 @@ a single prompt that has none, and `--override-sampling-params` defaults. Under
 batch or `n > 1` request leaves the prefill rank to the engine, which gives item
 `i` the bootstrap room `room + i`.
 
+Under PD, a buffered request with `return_logprob: true` waits for prefill as
+well, and its response carries prefill's `meta_info.input_token_logprobs` ahead
+of decode's, since only prefill computed the prompt. A streamed, batch, or
+`n > 1` request returns decode's logprobs alone.
+
 ## OpenAI over /generate
 
 `/v1/completions` and `/v1/chat/completions` behave as the engine's own routes,
@@ -521,8 +544,9 @@ unset. `sgl_router_openai_route_total` counts each outcome.
 ## Embeddings
 
 `/v1/embeddings` has the engine's interface: the same OpenAI `EmbeddingRequest`
-body and response. As for chat completions, `model` must name the served model.
-A PD fleet answers 400, since prefill and decode engines serve no embeddings.
+body and response. As for chat completions, any `model` name is served as
+`--model-id`. A PD fleet answers 400, since prefill and decode engines serve no
+embeddings.
 
 Text `input` (a string or a list) is tokenized and forwarded as token IDs, as for
 [`/generate`](#native-generate), plus the EOS SGLang appends for EmbeddingGemma.

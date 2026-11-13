@@ -5,6 +5,8 @@ translates field annotations into argparse arguments.
 """
 
 import argparse
+import contextlib
+import io
 import unittest
 
 from sglang.srt.arg_groups.overrides import resolution_result
@@ -198,15 +200,74 @@ class TestServerArgsAnnotatedCli(CustomTestCase):
             (True, Backend.DISABLED, Backend.DISABLED),
         )
 
+    def test_no_op_flags_still_parse_and_warn(self):
+        """Retired no-op flags keep old launch lines working: each one warns
+        and leaves the parsed arguments exactly as if it were absent."""
+        baseline = vars(self.parser.parse_args(["--model", "dummy"]))
+        for flag in (
+            "--disable-outlines-disk-cache",
+            "--show-time-cost",
+            "--triton-attention-reduce-in-fp32",
+        ):
+            with self.subTest(flag=flag):
+                with self.assertLogs(
+                    "sglang.srt.arg_groups.argparse_actions", level="WARNING"
+                ) as logs:
+                    args = self.parser.parse_args(["--model", "dummy", flag])
+                self.assertIn(f"'{flag}' is deprecated", "\n".join(logs.output))
+                self.assertEqual(vars(args), baseline)
+
+    def test_no_op_python_inputs_still_construct_and_warn(self):
+        """Engine kwargs reach the ServerArgs constructor without CLI parsing."""
+        with self.assertNoLogs("sglang.srt.server_args", level="WARNING"):
+            baseline = ServerArgs(model_path="dummy").resolved_dict()
+        for name in (
+            "disable_outlines_disk_cache",
+            "show_time_cost",
+            "triton_attention_reduce_in_fp32",
+        ):
+            for value in (True, False):
+                with self.subTest(name=name, value=value):
+                    with self.assertLogs(
+                        "sglang.srt.server_args", level="WARNING"
+                    ) as logs:
+                        sa = ServerArgs(model_path="dummy", **{name: value})
+                    self.assertIn(
+                        f"'{name}' is deprecated and has no effect",
+                        "\n".join(logs.output),
+                    )
+                    self.assertIs(getattr(sa, name), value)
+                    resolved = sa.resolved_dict()
+                    resolved[name] = baseline[name]
+                    self.assertEqual(resolved, baseline)
+
+    def test_retired_compressed_backend_names_its_replacement(self):
+        """The removed `compressed` alias stops the launch with a message naming
+        `dsv4`, not argparse's generic invalid-choice list."""
+        for flag in (
+            "--attention-backend",
+            "--decode-attention-backend",
+            "--prefill-attention-backend",
+        ):
+            with self.subTest(flag=flag):
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr):
+                    with self.assertRaises(SystemExit):
+                        self.parser.parse_args(["--model", "dummy", flag, "compressed"])
+                self.assertIn("compressed was removed; use dsv4", stderr.getvalue())
+                args = self.parser.parse_args(["--model", "dummy", flag, "dsv4"])
+                self.assertEqual(getattr(args, flag[2:].replace("-", "_")), "dsv4")
+
     def test_each_deprecation_shape_does_its_job(self):
         """The four `Deprecated*Action` shapes, on a throwaway parser.
 
-        Only `DeprecatedStoreTrueAction` has registrations in `ServerArgs`
-        today (`--disable-cuda-graph`, covered above, and
-        `--enable-dp-attention`). The other three are kept for the next flag
-        that needs them, which makes this the only thing
-        standing between them and silent rot -- and it doubles as the worked
-        example of which shape to reach for.
+        `ServerArgs` registers `DeprecatedStoreTrueAction`
+        (`--disable-cuda-graph`, covered above, and `--enable-dp-attention`)
+        and the no-op form of `DeprecatedAction` (covered above). The other
+        two, and `DeprecatedAction` with `error_message=`, are kept for the
+        next flag that needs them, which makes this the only thing standing
+        between them and silent rot -- and it doubles as the worked example of
+        which shape to reach for.
         """
         from sglang.srt.arg_groups.argparse_actions import (
             DeprecatedAction,

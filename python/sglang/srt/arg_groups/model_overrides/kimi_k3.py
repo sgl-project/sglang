@@ -184,8 +184,6 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
 @_register_for("KimiK31ForConditionalGeneration")
 def _kimi_k31_overrides(server_args: Any, hf_config: Any) -> dict:
     cfg = resolving_view(server_args)
-    if cfg.enable_unified_memory:
-        raise ValueError("Kimi-K3.1 does not support --enable-unified-memory yet.")
     overrides = {}
     if cfg.dcp_size > 1:
         if cfg.speculative_algorithm not in (None, "DSPARK", "DFLASH"):

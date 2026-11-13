@@ -21,7 +21,6 @@ from sglang.kernels.ops.speculative.lilicorr import lilicorr_topk_lse
 from sglang.srt.arg_groups.choices import DFLASH_MLA_ONLY_DRAFT_BACKENDS
 from sglang.srt.configs.draft_parallel import DraftParallelSpec, DraftTPExecution
 from sglang.srt.configs.laguna import normalize_gating
-from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
 from sglang.srt.environ import envs
 from sglang.srt.hf_transformers import get_rope_config
 from sglang.srt.layers.activation import SiluAndMul
@@ -55,7 +54,11 @@ from sglang.srt.model_loader.weight_utils import (
     sharded_weight_loader,
 )
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
-from sglang.srt.models.utils import apply_qk_norm, bind_or_assign
+from sglang.srt.models.utils import (
+    apply_qk_norm,
+    bind_or_assign,
+    keeps_no_quant_config,
+)
 from sglang.srt.runtime_context import get_parallel, get_spec
 from sglang.srt.speculative.dflash_utils import (
     can_dflash_slice_qkv_weight,
@@ -177,7 +180,13 @@ def candidate_topk(
             "DFlash candidate top-k requires a dense FP16/BF16/FP32 target lm_head "
             "or a supported lm_head.quant_method."
         )
-    tp = get_parallel().tp_size == 1
+    if lm_head.tp_size > 1 and lm_head.tp_size != get_parallel().tp_size:
+        raise RuntimeError(
+            "DFlash candidate top-k: the target lm_head is vocab-sharded over a "
+            "group other than the draft's; with dp attention, pass "
+            "--enable-dp-lm-head."
+        )
+    tp = lm_head.tp_size == 1
     num_org = (
         int(lm_head.org_vocab_size)
         if tp
@@ -189,9 +198,7 @@ def candidate_topk(
     if merged_unary_transform is not None and not tp and not with_partition:
         multiplier, softcap = merged_unary_transform
         start = int(lm_head.shard_indices.org_vocab_start_index)
-        gathered = tensor_model_parallel_all_gather(
-            topk_packed(logits, k, start), dim=-1
-        )
+        gathered = lm_head.tp_group.all_gather(topk_packed(logits, k, start), dim=-1)
         ids, vals = merge_candidates(
             gathered, k, multiplier=multiplier, softcap=softcap
         )
@@ -205,14 +212,18 @@ def candidate_topk(
     if tp:
         return ids.long(), vals, lse
     global_ids = ids.long() + int(lm_head.shard_indices.org_vocab_start_index)
-    gathered_vals = tensor_model_parallel_all_gather(vals.float(), dim=-1)
-    gathered_ids = tensor_model_parallel_all_gather(global_ids, dim=-1)
+    gathered_vals = lm_head.tp_group.all_gather(vals.float(), dim=-1)
+    gathered_ids = lm_head.tp_group.all_gather(global_ids, dim=-1)
     top_vals, sel = torch.topk(gathered_vals, k, dim=-1)
     if lse is not None:
         lse = torch.logsumexp(
-            tensor_model_parallel_all_gather(lse.unsqueeze(-1), dim=-1), dim=-1
+            lm_head.tp_group.all_gather(lse.unsqueeze(-1), dim=-1), dim=-1
         )
     return torch.gather(gathered_ids, -1, sel).long(), top_vals, lse
+
+
+def _is_pow2_above_one(n: int) -> bool:
+    return n > 1 and n & (n - 1) == 0
 
 
 def _get_dflash_attention_type(config, *, default: AttentionType) -> AttentionType:
@@ -1027,6 +1038,7 @@ class DFlashDraftModel(nn.Module):
     supports_fused_context_kv = True
     # Layer prefixes and a quant_config-aware `fc`, for quantized checkpoints.
     supports_quantization = False
+    own_quant_config = staticmethod(keeps_no_quant_config)
 
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:
         super().__init__()
@@ -1693,12 +1705,10 @@ class DFlash2DraftModel(DFlashDraftModel):
         self.lm_head: Optional[nn.Module] = None
         # MI355X (SGLANG_ROCM_MUSE_DFLASH_FUSED_CANDIDATES): under TP the ranks' candidates
         # travel in one all-gather and one kernel merges them and applies the transform.
-        tp_size = int(get_parallel().tp_size)
+        # The head's shard count is checked per call: the head is attached later.
         self.merge_candidates_fused = (
             _is_gfx95
             and envs.SGLANG_ROCM_MUSE_DFLASH_FUSED_CANDIDATES.get()
-            and tp_size > 1
-            and tp_size & (tp_size - 1) == 0
             and int(config.vocab_size) < MAX_PACKED_ID
         )
 
@@ -1717,7 +1727,8 @@ class DFlash2DraftModel(DFlashDraftModel):
         """Top-k base candidates via the target lm_head: hidden [N, H] -> global
         candidate_ids / unary_logits [N, K]."""
         assert self.lm_head is not None, "draft_model.lm_head unset before capture"
-        if self.merge_candidates_fused:
+        fused = self.merge_candidates_fused and _is_pow2_above_one(self.lm_head.tp_size)
+        if fused:
             ids, vals, _ = candidate_topk(
                 hidden,
                 self.lm_head,

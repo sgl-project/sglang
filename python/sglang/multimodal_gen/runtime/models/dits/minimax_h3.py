@@ -101,6 +101,9 @@ from sglang.multimodal_gen.runtime.layers.linear import (
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
 )
+from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
+    RotaryEmbedding,
+)
 from sglang.multimodal_gen.runtime.layers.usp import (
     _ring_attention_varlen,
     _usp_all_gather,
@@ -638,16 +641,15 @@ def _apply_rope_qk(
     k: torch.Tensor,
     cos_sin_cache: torch.Tensor,
     positions: torch.Tensor,
+    *,
+    rotary_emb: RotaryEmbedding,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if not q.is_cuda:
         half = cos_sin_cache.shape[-1] // 2
-        cos_half, sin_half = cos_sin_cache.split(half, dim=-1)
-        cos = torch.cat((cos_half, cos_half), dim=-1).unsqueeze(1)
-        sin = torch.cat((sin_half, sin_half), dim=-1).unsqueeze(1)
-        return (
-            _apply_rope_cos_sin(q, cos, sin),
-            _apply_rope_cos_sin(k, cos, sin),
-        )
+        cos, sin = cos_sin_cache.split(half, dim=-1)
+        # forward_npu sends 3D q/k to forward_native; npu_rotary_mul needs BSND.
+        q, k = rotary_emb(query=q.unsqueeze(0), key=k.unsqueeze(0), cos=cos, sin=sin)
+        return q.squeeze(0), k.squeeze(0)
 
     from sgl_kernel import rotary_embedding as apply_sgl_kernel_rotary_embedding
 
@@ -674,10 +676,13 @@ def _apply_qk_norm_rope(
     head_dim: int,
     cos_sin_cache: torch.Tensor,
     positions: torch.Tensor,
+    rotary_emb: RotaryEmbedding,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     def unfused():
         normed_q, normed_k = _apply_qk_norm(q, k, q_norm, k_norm, head_dim)
-        return _apply_rope_qk(normed_q, normed_k, cos_sin_cache, positions)
+        return _apply_rope_qk(
+            normed_q, normed_k, cos_sin_cache, positions, rotary_emb=rotary_emb
+        )
 
     if (
         q_norm.eps is not None
@@ -924,6 +929,8 @@ def _minimax_h3_group_attend(
 # aiter's varlen kernel gives a head group the same bytes as those heads inside
 # the full call (checked at H3's shapes on MI355X)
 _COLLECTIVE_PIPELINED_ATTENTION_BACKENDS = (AttentionBackendEnum.AITER,)
+# packed kernels that return the softmax LSE the ring merge needs
+_RING_ATTENTION_BACKENDS = (AttentionBackendEnum.FA, AttentionBackendEnum.AITER)
 
 
 def _minimax_h3_collective_pipelined_attention(
@@ -1140,10 +1147,10 @@ def _minimax_h3_attention_core_impl(
 
     if ring_active:
         ring_ws, _ = get_ring_ctx()
-        if attention._attention_backend_enum is not AttentionBackendEnum.FA:
+        if attention._attention_backend_enum not in _RING_ATTENTION_BACKENDS:
             raise NotImplementedError(
-                "MiniMax H3 ring parallelism requires the FlashAttention "
-                "backend (matches --ring-degree's general restriction)."
+                "MiniMax H3 ring parallelism requires the FlashAttention or "
+                "aiter backend (their packed kernels return the softmax LSE)."
             )
         # max_seqlen is cu_seqlens[1] (`used`) by construction -- the real,
         # non-padding row count ring needs, already a host int here.
@@ -1313,6 +1320,13 @@ class MiniMaxH3Attention(nn.Module):
             arch, quant_config, prefix=prefix, local_heads=self.num_heads
         )
 
+        self.rotary_emb = RotaryEmbedding(
+            head_size=self.head_dim,
+            rotary_dim=rope_dim,
+            is_neox_style=True,
+            use_precomputed_cache=False,
+        )
+
     def _set_attention_backend(self, backend) -> None:
         if (
             backend.get_enum() is AttentionBackendEnum.CUBE_SPARSE_ATTN
@@ -1333,9 +1347,9 @@ class MiniMaxH3Attention(nn.Module):
             prefix=self.prefix,
             packed_trailing_padding=True,
         )
-        # Ring only supports FA (see _minimax_h3_attention_core_impl); keep
-        # the resolved enum alongside the impl instance instead of a second
-        # get_attn_backend() call at the ring gate.
+        # Ring only supports _RING_ATTENTION_BACKENDS; keep the resolved enum
+        # alongside the impl instance instead of a second get_attn_backend()
+        # call at the ring gate.
         self._attention_backend_enum = backend.get_enum()
 
     def _install_qkv_weight_loader(self, arch: MiniMaxH3DiTArchConfig) -> None:
@@ -1648,6 +1662,7 @@ class MiniMaxH3Attention(nn.Module):
                     self.head_dim,
                     cos_sin_cache,
                     positions,
+                    self.rotary_emb,
                 )
 
         gate_compress = None
@@ -1883,8 +1898,10 @@ class MiniMaxH3DiTBlock(nn.Module):
         *,
         prefix: str,
         use_adaln_cache: bool = False,
+        layer_index: int = 0,
     ) -> None:
         super().__init__()
+        self.layer_index = layer_index
         self.norm1 = _norm(arch.hidden_size, eps=arch.norm_eps)
         self.norm2 = _norm(arch.hidden_size, eps=arch.norm_eps)
         MINIMAX_H3_NORM_MODULATE.mark(self)
@@ -1922,6 +1939,7 @@ class MiniMaxH3DiTBlock(nn.Module):
         ulysses_active: bool = False,
         ring_active: bool = False,
         adaln_params: tuple[torch.Tensor, ...] | None = None,
+        block_adaln_params: tuple[tuple[torch.Tensor, ...], ...] | None = None,
     ) -> torch.Tensor:
         """x: [T, H]; adaln_input: [M, t_dim]; combined_indices: [T]
         (= inverse_indices * modality_num + token_tags.clamp(min=0)).
@@ -1930,6 +1948,10 @@ class MiniMaxH3DiTBlock(nn.Module):
         norm1 -> scale/shift -> attention -> gated residual, followed by
         norm2 -> scale/shift -> MLP -> gated residual.
         """
+        if adaln_params is None and block_adaln_params is not None:
+            # Cache-DiT forwards the same kwargs to every wrapped block.
+            # Select by the original layer index, not the outer stack index.
+            adaln_params = block_adaln_params[self.layer_index]
         if adaln_params is None:
             if self.adaln_proj is None:
                 raise ValueError("MiniMax H3 AdaLN cache parameters are required")
@@ -2627,6 +2649,7 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
                     quant_config,
                     prefix=f"blocks.{index}",
                     use_adaln_cache=self._adaln_precomputed,
+                    layer_index=index,
                 )
                 for index in range(arch.num_layers)
             ]
@@ -3374,7 +3397,7 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
             # (Ulysses) and/or ring-rotates KV across ring ranks; everything
             # else, including the final layer, is row-local. Only the narrow
             # video/audio logits are gathered after the final layer.
-            for index, block in enumerate(self.blocks):
+            for block in self.blocks:
                 hidden = block(
                     hidden,
                     adaln_input=adaln_input,
@@ -3386,11 +3409,7 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
                     subblock_sparse_query_block_mask=subblock_sparse_query_block_mask,
                     ulysses_active=ulysses_ws > 1,
                     ring_active=ring_ws > 1,
-                    adaln_params=(
-                        None
-                        if block_adaln_params is None
-                        else block_adaln_params[index]
-                    ),
+                    block_adaln_params=block_adaln_params,
                 )
             if spectrum_on:
                 self._h3_spectrum_record_targets(

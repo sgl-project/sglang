@@ -103,6 +103,10 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
     packed_modules_mapping = Qwen3_5ForCausalLM.packed_modules_mapping
 
     @staticmethod
+    def own_quant_config(hf_config, quant_config):
+        return _mtp_quant_config(quant_config)
+
+    @staticmethod
     def shared_experts_fusion_disable_reason(hf_config, quant_config):
         return Qwen3_5ForCausalLM.shared_experts_fusion_disable_reason(
             getattr(hf_config, "text_config", hf_config),
@@ -116,6 +120,7 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
         prefix: str = "",
     ) -> None:
         nn.Module.__init__(self)
+        quant_config = self.own_quant_config(config, quant_config)
 
         self.is_multimodal = hasattr(config, "text_config")
         if self.is_multimodal:
@@ -123,8 +128,6 @@ class Qwen3_5ForCausalLMMTP(nn.Module):
 
         # Deep-copy so MTP mutations below don't leak into the target's config.
         config = copy.deepcopy(config)
-
-        quant_config = _mtp_quant_config(quant_config)
 
         self.config = config
         self.quant_config = quant_config

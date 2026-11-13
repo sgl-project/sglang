@@ -209,7 +209,7 @@ from sglang.srt.utils import (
     is_mps,
     kill_process_tree,
 )
-from sglang.srt.utils.auth import AuthLevel, app_has_admin_force_endpoints, auth_level
+from sglang.srt.utils.auth import AuthLevel, add_api_key_middleware, auth_level
 from sglang.srt.utils.json_response import (
     SGLangORJSONResponse,
     dumps_json,
@@ -263,11 +263,6 @@ async def init_multi_tokenizer() -> ServerArgs:
     port_args: PortArgs
 
     publish(server_args, role="tokenizer")
-
-    # API key authentication is not supported in multi-tokenizer mode
-    assert get_serving().api_key is None, (
-        "API key is not supported in multi-tokenizer mode"
-    )
 
     # Create a new ipc name for the current process
     port_args.tokenizer_ipc_name = (
@@ -548,6 +543,11 @@ from sglang.srt.runtime_context import (
 
 elastic_ep_router.route_class = ORJSONRoute
 app.include_router(elastic_ep_router)
+
+# Outermost, and registered at import so that tokenizer workers get it too.
+add_api_key_middleware(
+    app, get_keys=lambda: (get_serving().api_key, get_serving().admin_api_key)
+)
 
 
 def _anthropic_validation_message(raw_errors) -> str:
@@ -3002,26 +3002,6 @@ def _setup_and_run_http_server(
             launch_callback=launch_callback,
             execute_warmup_func=execute_warmup_func,
         )
-
-        # Add api key authorization
-        # This is only supported in single tokenizer mode.
-        #
-        # Backward compatibility:
-        # - api_key only: behavior matches legacy (all endpoints require api_key)
-        # - no keys: legacy had no restriction; ADMIN_FORCE endpoints must still be rejected when
-        #   admin_api_key is not configured.
-        if (
-            get_serving().api_key
-            or get_serving().admin_api_key
-            or app_has_admin_force_endpoints(app)
-        ):
-            from sglang.srt.utils.auth import add_api_key_middleware
-
-            add_api_key_middleware(
-                app,
-                api_key=get_serving().api_key,
-                admin_api_key=get_serving().admin_api_key,
-            )
     else:
         # If it is multi-tokenizer mode, we need to write the arguments to shared memory
         # for other worker processes to read.

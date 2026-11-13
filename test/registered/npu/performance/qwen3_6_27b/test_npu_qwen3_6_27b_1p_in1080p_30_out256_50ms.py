@@ -26,6 +26,9 @@ QWEN3_6_27B_1080P_ENVS = {
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
     "SGLANG_PREFILL_DELAYER_MAX_PREFILL_BS_WINDOW_SIZE": "128",
     "ASCEND_USE_FIA": "1",
+    # Unchunked 77k-token prefill waves fragment the NPU allocator; keep large
+    # blocks growable so contiguous allocations do not OOM.
+    "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
 }
 
 QWEN3_6_27B_1080P_OTHER_ARGS = [
@@ -44,9 +47,9 @@ QWEN3_6_27B_1080P_OTHER_ARGS = [
     "--disable-radix-cache",
     "--trust-remote-code",
     "--max-running-requests",
-    38,
+    30,
     "--max-mamba-cache-size",
-    38,
+    30,
     "--mem-fraction-static",
     0.70,
     "--cuda-graph-bs-decode",
@@ -61,9 +64,6 @@ QWEN3_6_27B_1080P_OTHER_ARGS = [
     24,
     28,
     30,
-    32,
-    35,
-    38,
     "--enable-prefill-delayer",
     "--prefill-delayer-queue-min-ratio",
     0.45,
@@ -103,9 +103,9 @@ class TestNPUQwen3_6_27B_1P_In1080p_30_Out256_50ms(TestNpuPerformanceTestCaseBas
     envs = QWEN3_6_27B_1080P_ENVS
     backend = "sglang-oai-chat"
     dataset_name = "image"
-    warmup_requests = 38
-    max_concurrency = 42
-    num_prompts = 152
+    warmup_requests = 30
+    max_concurrency = 34
+    num_prompts = 120
     input_len = 30
     output_len = 256
     random_range_ratio = 1
