@@ -207,14 +207,8 @@ impl WorkerControlError {
 #[derive(Debug, Clone)]
 pub enum WorkerControlAction {
     Create(WorkerSpec),
-    Replace {
-        spec: WorkerSpec,
-        expected_revision: u64,
-    },
-    Remove {
-        worker_id: WorkerId,
-        expected_revision: u64,
-    },
+    Replace { spec: WorkerSpec },
+    Remove { worker_id: WorkerId },
 }
 
 impl WorkerControlAction {
@@ -285,6 +279,27 @@ impl WorkerControlService {
             }),
             rx,
         )
+    }
+
+    pub(crate) fn registry(&self) -> Arc<WorkerRegistry> {
+        Arc::clone(&self.registry)
+    }
+
+    pub(crate) fn has_managed_url(&self, url: &str) -> bool {
+        self.state
+            .lock()
+            .unwrap()
+            .workers
+            .iter()
+            .any(|(id, record)| {
+                !record.deleted
+                    && ((record.operation.state != OperationState::Failed
+                        && worker_urls_equal(&record.spec.url, url))
+                        || self
+                            .registry
+                            .get(id)
+                            .is_some_and(|worker| worker_urls_equal(&worker.url, url)))
+            })
     }
 
     pub fn create(&self, mut input: WorkerInput) -> Result<AcceptedOperation, WorkerControlError> {
@@ -359,10 +374,7 @@ impl WorkerControlService {
         };
         let command = WorkerControlCommand {
             operation_id: operation_id.clone(),
-            action: WorkerControlAction::Replace {
-                spec: spec.clone(),
-                expected_revision,
-            },
+            action: WorkerControlAction::Replace { spec: spec.clone() },
             submitted_at: Instant::now(),
         };
         state.operation_workers.remove(&previous.operation.id);
@@ -414,7 +426,6 @@ impl WorkerControlService {
             operation_id: operation_id.clone(),
             action: WorkerControlAction::Remove {
                 worker_id: worker_id.clone(),
-                expected_revision,
             },
             submitted_at: Instant::now(),
         };
