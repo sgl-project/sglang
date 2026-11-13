@@ -13,6 +13,15 @@ policy. SimOpus owns source/profile/FIT loading, ordered P/Q projection, graph
 selection, operation lookup, all numerical cost resolution and structured query
 evidence. No simulator cost graph or legacy cost fallback is installed.
 
+Source-binding roots are opaque SDK inputs. Configuration resolution delegates to
+`sdk.resolve_native_source_binding(binding, base_dir=...)`; native policy, source
+validation and profile loading remain with `sdk.load_native_region_assets`.
+The adapter does not inspect SQLite paths or PerfDB metadata layouts. A compatible
+SDK providing both interfaces is required; unsupported SDKs are not replaced by
+filesystem readers. Explicit external capture/analytic assets remain checksummed
+configuration files and are separate from the database storage contract.
+
+
 One worker event requests four EXTEND or five DECODE regional stage results via
 `UMDStaticModel.estimate_prepared_forward_result`. Every stage must resolve and
 retain its declared partial worker scope before progress is drawn or published.
