@@ -516,6 +516,7 @@ class TestSRTEndpoint(CustomTestCase):
         self.assertIsInstance(memory_usage["kvcache"], float)
         self.assertEqual(memory_usage["token_capacity"], max_total_num_tokens)
         self.assertIsNone(memory_usage["token_capacity_swa"])
+        self.assertEqual(memory_usage["token_capacity_window"], {})
         self.assertIsInstance(memory_usage["startup_available"], float)
         self.assertGreater(memory_usage["startup_available"], 0)
         self.assertTrue(graph_phases.issubset(memory_usage["graph"]))

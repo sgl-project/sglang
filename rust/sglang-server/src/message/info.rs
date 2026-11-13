@@ -21,6 +21,11 @@ pub(crate) struct ModelInfo {
     pub(crate) reasoning_parser: Option<String>,
     pub(crate) tool_call_parser: Option<String>,
     pub(crate) disaggregation_mode: DisaggregationMode,
+    // `api.v1` only; the HTTP body gets these keys from `launch_fields`.
+    #[serde(skip)]
+    pub(crate) model_type: Option<String>,
+    #[serde(skip)]
+    pub(crate) architectures: Option<Vec<String>>,
     /// Python's launch-time `/model_info` fields, which the HTTP response
     /// carries after the fields above.
     #[serde(skip)]
@@ -50,6 +55,7 @@ pub(crate) struct ServerInfo {
     pub(crate) tokenizer_path: String,
     pub(crate) max_context_length: u64,
     pub(crate) max_total_num_tokens: u64,
+    pub(crate) num_reserved_tokens: u64,
     pub(crate) version: String,
     pub(crate) frontend: &'static str,
     /// The server's startup phase durations in seconds, Python's
@@ -61,6 +67,8 @@ pub(crate) struct ServerInfo {
     pub(crate) port: u16,
     pub(crate) incremental_streaming_output: bool,
     pub(crate) disaggregation_mode: DisaggregationMode,
+    pub(crate) allow_auto_truncate: bool,
+    pub(crate) skip_tokenizer_init: bool,
     pub(crate) deployment_info: DeploymentInfo,
     /// Under DP, every rank's listener by rank, published by the listener of
     /// DP rank 0 so a client can address each rank's listener directly;
@@ -230,7 +238,10 @@ pub(crate) struct MemoryUsage {
     pub(crate) startup_available: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) token_capacity: Option<u64>,
+    /// The target's own window's token capacity, as before windows were named.
     pub(crate) token_capacity_swa: Option<u64>,
+    /// Each sliding-window pool's token capacity, by the window's name.
+    pub(crate) token_capacity_window: Option<BTreeMap<String, u64>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) graph: Option<BTreeMap<String, f64>>,
 }
