@@ -70,10 +70,14 @@ class OutputStore:
         *,
         stash_type: type[S],
     ) -> list[S]:
-        """Read the named fields of each ref into arrays the caller owns.
+        """Read the named fields of each ref, whole, into arrays the caller owns.
 
         One backend read for all of them; fails before reading anything when a ref has
         no field of a requested name.
+
+        Mooncake registers new memory on every call, which takes several times the
+        transfer below 4 GiB and about as long as it above (measured on H200 hosts).
+        Reads that repeat, or that take part of a field, belong to ``read_ranges``.
         """
         self._check_backend([ref for ref, _ in requests])
         wanted = [_named_specs(ref, names) for ref, names in requests]
@@ -99,6 +103,11 @@ class OutputStore:
 
     def read_ranges(self, reads: Sequence[RangeRead], *, into: ReadBuffer) -> None:
         """Read byte ranges of stored fields into ``into``, without registering memory.
+
+        ``into`` is registered once, by ``read_buffer``, so a read costs only the
+        transfer: the path for reads that repeat. The caller lays ``into`` out and
+        gives its bytes a dtype and shape, and a later read into the same bytes
+        replaces them; ``read_many`` returns each field as its own array instead.
 
         Only identity-coded fields. Fails before reading when ``into`` is closed or
         from another store, a field is missing or not identity coded, a range is
