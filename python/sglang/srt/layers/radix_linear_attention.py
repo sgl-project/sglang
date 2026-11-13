@@ -156,10 +156,7 @@ class RadixLinearAttention(nn.Module):
             b=b,
         )
 
-    def _capture_stub_linear_attention(self, mixed_qkv, a, b, output):
-        output.zero_()
-
-    @eager_on_graph(capture_stub=_capture_stub_linear_attention)
+    @eager_on_graph
     def _eager_linear_attention(self, mixed_qkv, a, b, output):
         forward_batch = get_forward_batch()
         _linear_attention_with_output_impl(mixed_qkv, a, b, output, self, forward_batch)

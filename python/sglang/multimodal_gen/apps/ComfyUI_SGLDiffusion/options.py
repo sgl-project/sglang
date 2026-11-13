@@ -23,6 +23,9 @@ _ATTENTION_IDS = {
 }
 # Display names -> SGLANG_DIFFUSION_CONVROT_INT8_BACKEND values.
 _INT8_GEMMS = {"auto": "auto", "sglang_jit": "jit", "comfy_kitchen": "comfy_kitchen"}
+# Reverse maps, so SGLDWorkerStatus reports the values the widgets show.
+ATTENTION_DISPLAY = {backend: name for name, backend in _ATTENTION_IDS.items()}
+INT8_GEMM_DISPLAY = {backend: name for name, backend in _INT8_GEMMS.items()}
 
 
 def _field(group, kind, default, tooltip="", **kwargs):
@@ -35,7 +38,7 @@ _FIELDS = {
     "model_type": _field(
         "basic",
         ["auto-detect", "qwen_image", "qwen_image_edit", "qwen_image21"]
-        + ["flux", "lumina2", "minimax_h3"],
+        + ["flux", "lumina2", "minimax_h3", "ltxav"],
         "auto-detect",
         "FastH3 / VDN-H3 load through the Native Model Loader.",
     ),

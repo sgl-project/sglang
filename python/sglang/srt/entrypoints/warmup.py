@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, List
 import numpy as np
 import tqdm
 
-from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST
+from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST
 from sglang.srt.managers.io_struct import GenerateReqInput
 
 if TYPE_CHECKING:

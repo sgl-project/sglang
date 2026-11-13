@@ -49,8 +49,8 @@ from sglang.multimodal_gen.runtime.models.dits.qwen_image21 import (
 from sglang.multimodal_gen.runtime.models.encoders.minimax_h3_qwen3vl import (
     MiniMaxH3Qwen3VLEncoder,
 )
+from sglang.srt.hf_transformers import check_gguf_file
 from sglang.srt.layers.quantization.gguf import UNQUANTIZED_TYPES
-from sglang.srt.utils.hf_transformers import check_gguf_file
 
 _F32 = WeightType.F32
 _BF16 = WeightType.BF16
