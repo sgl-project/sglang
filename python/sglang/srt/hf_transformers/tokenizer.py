@@ -53,6 +53,35 @@ _FAST_LLAMA_TOKENIZER = "hf-internal-testing/llama-tokenizer"
 _TOKENIZERS_BACKEND = "TokenizersBackend"
 
 
+def _read_tokenizer_config(tokenizer_name, revision) -> Optional[dict]:
+    try:
+        config_file = _resolve_local_or_cached_file(
+            tokenizer_name, "tokenizer_config.json", revision
+        )
+        with open(config_file) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return None
+    except (OSError, json.JSONDecodeError) as e:
+        logger.debug(
+            "Failed to read tokenizer_config.json for %s: %s", tokenizer_name, e
+        )
+        return None
+
+
+def _declares_tokenizers_backend(tokenizer_name, revision=None) -> bool:
+    """Whether tokenizer_config.json declares a class that transformers v5
+    aliases to TokenizersBackend (e.g. PreTrainedTokenizerFast), so a
+    TokenizersBackend load already is the declared tokenizer."""
+    import transformers
+
+    tok_config = _read_tokenizer_config(tokenizer_name, revision)
+    tok_cls = getattr(
+        transformers, (tok_config or {}).get("tokenizer_class") or "", None
+    )
+    return getattr(tok_cls, "__name__", None) == _TOKENIZERS_BACKEND
+
+
 def _load_tokenizer_by_declared_class(tokenizer_name, *args, **kwargs):
     """Load tokenizer by the class declared in tokenizer_config.json.
 
@@ -63,21 +92,11 @@ def _load_tokenizer_by_declared_class(tokenizer_name, *args, **kwargs):
     """
     import transformers
 
-    try:
-        revision = kwargs.get("revision") or kwargs.get("tokenizer_revision")
-        config_file = _resolve_local_or_cached_file(
-            tokenizer_name, "tokenizer_config.json", revision
-        )
-        with open(config_file) as f:
-            tok_config = json.load(f)
-        tok_class_name = tok_config.get("tokenizer_class")
-    except FileNotFoundError:
+    revision = kwargs.get("revision") or kwargs.get("tokenizer_revision")
+    tok_config = _read_tokenizer_config(tokenizer_name, revision)
+    if tok_config is None:
         return None
-    except (OSError, json.JSONDecodeError) as e:
-        logger.debug(
-            "Failed to read tokenizer_config.json for %s: %s", tokenizer_name, e
-        )
-        return None
+    tok_class_name = tok_config.get("tokenizer_class")
 
     if not tok_class_name:
         return None
@@ -598,6 +617,9 @@ def get_tokenizer(
             if (
                 type(tokenizer).__name__ == _TOKENIZERS_BACKEND
                 and tokenizer_backend != "fastokens"
+                and not _declares_tokenizers_backend(
+                    tokenizer_name, kwargs.get("revision") or tokenizer_revision
+                )
             ):
                 tokenizer = _resolve_tokenizers_backend(
                     tokenizer_name, *args, **common_kwargs

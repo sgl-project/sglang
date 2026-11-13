@@ -11,13 +11,19 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import torch
 from PIL import Image
 from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
 from tokenizers.pre_tokenizers import WhitespaceSplit
-from transformers import CLIPImageProcessor, LlavaProcessor, PreTrainedTokenizerFast
+from transformers import (
+    AutoTokenizer,
+    CLIPImageProcessor,
+    LlavaProcessor,
+    PreTrainedTokenizerFast,
+)
 
 from sglang.srt.hf_transformers import (
     get_config,
@@ -203,6 +209,26 @@ class TestHFTransformersLoading(unittest.TestCase):
                 return_dict=False,
             ),
             [5, 2],
+        )
+
+    def test_tokenizer_declared_as_fast_backend_loads_once(self):
+        self.write_config(self.text_config())
+        self.make_tokenizer().save_pretrained(self.model_path)
+        config_path = Path(self.model_path, "tokenizer_config.json")
+        tok_config = json.loads(config_path.read_text())
+        tok_config["tokenizer_class"] = "PreTrainedTokenizerFast"
+        config_path.write_text(json.dumps(tok_config))
+
+        with patch.object(
+            AutoTokenizer, "from_pretrained", wraps=AutoTokenizer.from_pretrained
+        ) as from_pretrained:
+            tokenizer = get_tokenizer(self.model_path, local_files_only=True)
+        self.addCleanup(unpatch_tokenizer, tokenizer)
+
+        self.assertEqual(from_pretrained.call_count, 1)
+        self.assertIsInstance(tokenizer, PreTrainedTokenizerFast)
+        self.assertEqual(
+            tokenizer.encode("hello world", add_special_tokens=False), [5, 6]
         )
 
     def test_processor_loading_preserves_image_tokens_and_backend(self):
