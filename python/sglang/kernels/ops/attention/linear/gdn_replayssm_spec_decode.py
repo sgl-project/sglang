@@ -68,7 +68,7 @@ def gdn_replayssm_spec_circular_kernel(
     beta_cache,  # fp32 beta for exact replay
     query_start_loc,  # [B+1] int  packed cu_seqlens
     ssm_state_indices,  # [B] int  physical block per request
-    replay_indices,  # [B] int  active request slot per request
+    replay_indices,  # [B] int ring row: the request row, or its request sub-pool unit
     write_pos,  # [num_replay_slots] int32
     cache_base,  # [num_replay_slots] int32
     is_flush_flags,  # [num_replay_slots] int8
@@ -511,7 +511,7 @@ def gdn_replayssm_exact_fold_kernel(
     g_cache,  # [num_slots, HV, L]  fp32
     beta_cache,  # [num_slots, HV, L]  fp32
     ssm_state_indices,  # [B] int  physical block per request
-    replay_indices,  # [B] int active request slot per request
+    replay_indices,  # [B] int ring row: the request row, or its request sub-pool unit
     write_pos,
     cache_base,
     is_flush_flags,
@@ -1160,7 +1160,7 @@ def gdn_replayssm_spec_decode(
     out: torch.Tensor,  # [total_tokens, HV, V]  preallocated
     query_start_loc: torch.Tensor,  # [B+1] int
     ssm_state_indices: torch.Tensor,  # [B] int  physical block per request
-    replay_indices: torch.Tensor,  # [B] int active request slot per request
+    replay_indices: torch.Tensor,  # [B] int ring row: request row or request unit
     write_pos: torch.Tensor,
     cache_base: torch.Tensor,
     is_flush: torch.Tensor,
@@ -1313,7 +1313,7 @@ def commit_gdn_replayssm_spec(
     cache_base: torch.Tensor,
     is_flush: torch.Tensor,
     num_accepted: torch.Tensor,  # [n_rows] int  (already includes the bonus token)
-    replay_indices: torch.Tensor,  # [n_rows] int active request row
+    replay_indices: torch.Tensor,  # [n_rows] int ring row: request row or request unit
     state_batch_indices: torch.Tensor,  # [n_rows] int physical mamba slot
     max_cache_len: int,
     max_spec_len: int | None,  # early-flush margin; unused under the fold
@@ -1473,7 +1473,7 @@ def commit_gdn_replayssm_after_verify(
     cache_base: torch.Tensor,
     is_flush: torch.Tensor,
     state_batch_indices: torch.Tensor,  # [B] physical mamba slot
-    replay_indices: torch.Tensor,  # [B] request row keying the ring and cursors
+    replay_indices: torch.Tensor,  # [B] ring row: request row or request unit
     accept_lens: torch.Tensor,  # [B] committed verify positions, incl. the bonus
     last_correct_step_indices: torch.Tensor,  # [B] conv rollback step
     fold_every_commit: bool,

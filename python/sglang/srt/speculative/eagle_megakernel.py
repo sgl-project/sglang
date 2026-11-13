@@ -26,7 +26,7 @@ from sglang.srt.kernel_plugins.nvidia.eagle_binding import (
     split_backend,
 )
 from sglang.srt.model_executor.forward_context import get_attn_backend
-from sglang.srt.runtime_context import get_exec, get_memory, get_parallel, get_spec
+from sglang.srt.runtime_context import get_parallel, get_spec
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -125,15 +125,6 @@ def _unservable_reasons(draft: Any) -> list[str]:
         # the graph runners would pad to other DP ranks' batches, which _bucket does
         # not see
         reasons.append("the entries do not run under DP attention")
-    if (
-        get_memory().enable_unified_memory
-        and get_exec().mamba.enable_linear_replayssm_spec
-    ):
-        # The binding hands over the ReplaySSM ring as rows indexed by request
-        # slot; unified memory keeps them in units of its request sub-pool.
-        reasons.append(
-            "the entries do not run the ReplaySSM speculative ring under unified memory"
-        )
     return reasons + _backend_reasons(
         target=draft.target_worker.model_runner.attn_backend,
         draft=(

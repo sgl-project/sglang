@@ -1133,8 +1133,9 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         ``input_tokens`` can be admitted with in an empty pool, within
         ``token_capacity``; None when even the prompt cannot. Priced as
         `DemandPurpose.CEILING`: all of its decode, a fresh request's state
-        slots and request row, window retirement (`demand.window_retirement`), and the smallest
-        chunk admission may cut its prompt to (`smallest_admissible_chunk`)."""
+        slots and request row, window retirement (`demand.window_retirement`),
+        and the smallest chunk admission may cut its prompt to
+        (`smallest_admissible_chunk`)."""
         page = self.page_size
         paged_input = -(-input_tokens // page) * page
         max_new_tokens = min(

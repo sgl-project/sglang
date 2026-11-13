@@ -890,8 +890,6 @@ class PrefillAdder:
         return slots
 
     def _request_rows_for_req(self, req: Req) -> int:
-        """Request rows ``req`` binds when admitted (a unit of every request
-        sub-pool each): one unless it holds a row."""
         return self.memory_budget.request_rows(req)
 
     def _request_slot_reserve_for_req(

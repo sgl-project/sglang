@@ -1027,13 +1027,23 @@ class TestDeclaredParts(CustomTestCase):
         unit = int(ids.ids(torch.tensor([row]))[0])
         self.assertEqual(int(cursor[unit]), 0)
 
-    def test_usage_reports_the_request_sub_pool(self):
+    def test_request_usage_counts_rows_past_a_larger_state_entry(self):
         """Usage lists every sub-pool, the request sub-pool included, though
-        views and the prefix tree's components leave it out. A request unit
-        binds a request row, so the rows bound and free are its usage."""
-        storage, plan, _ = _build(state=True, gamma=3, replay=_GDN_SPEC_REPLAY)
+        views and the prefix tree's components leave it out; its usage is the
+        request rows bound and free. The arena's padding sink spans the largest
+        unit, so with a state entry larger than a request entry the request
+        band's first physical unit lies past 1. That padding is physical: the
+        free request rows are still the request table's rows past its padding
+        row 0."""
+        big = TensorPartDecl(
+            name="wide", shape=(512,), dtype=torch.float32, layer_ids=(1, 2)
+        )
+        storage, plan, _ = _build(
+            extra=(big,), state=True, gamma=3, replay=_GDN_SPEC_REPLAY
+        )
         (request,) = plan.requests()
-        self.assertNotIn(request.name, storage.sub_pool_names())
+        (snapshot, *_) = storage.allocator._stage_snapshots()
+        self.assertGreater(snapshot.band(request.name).min_page, 1)
         self.assertEqual(
             [u.name for u in storage.usage()],
             [s.name for s in plan.owner_first()],
@@ -1052,24 +1062,6 @@ class TestDeclaredParts(CustomTestCase):
         self.assertEqual(request_usage(), (rows, rows - 1))
         storage.release_row(req)
         self.assertEqual(request_usage(), (rows, rows))
-
-    def test_request_usage_counts_rows_past_a_larger_state_entry(self):
-        """The arena's padding sink spans the largest unit, so with a state
-        entry larger than a request entry the request band's first physical
-        unit lies past 1. That padding is physical: the free request rows are
-        still the request table's rows past its padding row 0."""
-        big = TensorPartDecl(
-            name="wide", shape=(512,), dtype=torch.float32, layer_ids=(1, 2)
-        )
-        storage, plan, _ = _build(
-            extra=(big,), state=True, gamma=3, replay=_GDN_SPEC_REPLAY
-        )
-        (request,) = plan.requests()
-        (snapshot, *_) = storage.allocator._stage_snapshots()
-        self.assertGreater(snapshot.band(request.name).min_page, 1)
-        rows = storage.requests.available_size()
-        (usage,) = [u for u in storage.usage() if u.metrics == "request"]
-        self.assertEqual((usage.capacity, usage.available), (rows, rows))
 
     def test_request_rows_are_priced_with_the_other_units(self):
         """A demand's request rows take a unit of every request sub-pool, priced

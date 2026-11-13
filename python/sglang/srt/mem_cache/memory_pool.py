@@ -809,10 +809,7 @@ class MambaPool:
                     and (not cache_params.is_kda or replayssm_request_ring)
                 )
                 num_slots = (
-                    spec_state_size + 1
-                    if enable_linear_replayssm_spec
-                    and (not cache_params.is_kda or self.replayssm_request_ring)
-                    else size + 1
+                    spec_state_size + 1 if self.replayssm_request_ring else size + 1
                 )
                 # Decode records follow the SSM dtype. Spec-verify compact d/k
                 # records follow the activation dtype; g stays fp32.
