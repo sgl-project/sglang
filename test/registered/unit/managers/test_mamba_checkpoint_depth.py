@@ -71,7 +71,7 @@ def _prepare_extend(
     batch.model_config = SimpleNamespace(
         hf_text_config=SimpleNamespace(mamba_chunk_size=CHUNK)
     )
-    batch.tree_cache = SimpleNamespace(page_size=tree_page)
+    batch.tree_cache = SimpleNamespace(page_size=tree_page, exact_checkpoint=False)
     batch.req_to_token_pool = MagicMock()
     batch.req_to_token_pool.get_mamba_ping_pong_other_idx.return_value = 1 - next_idx
 

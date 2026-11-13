@@ -257,13 +257,17 @@ class StateStorage:
         table,
         req: Req,
         mamba_ping_pong_track_buffer_to_keep: Optional[int] = None,
+        keep_state_slot: bool = False,
     ) -> None:
         """Gives back the request's state slot and its ping-pong slots, except
-        the one kept for the radix cache. The request drops the slot tensors
-        it frees here, so an open free group holds them without a copy."""
+        the one kept for the radix cache, or the state slot itself when the
+        radix cache took that one (``keep_state_slot``). The request drops the
+        slot tensors it frees here, so an open free group holds them without
+        a copy."""
         mamba_index = req.kv.mamba_pool_idx
         assert mamba_index is not None, "double free? mamba_index is None"
-        self.slots.free(mamba_index.unsqueeze(0), owned=True)
+        if not keep_state_slot:
+            self.slots.free(mamba_index.unsqueeze(0), owned=True)
         req.kv.mamba_pool_idx = None
 
         if table.enable_mamba_extra_buffer:

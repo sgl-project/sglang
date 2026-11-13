@@ -576,5 +576,6 @@ POSITIONAL_FIELD_ORDER = (
     "enable_token_space_processor",
     "enable_mamba_unit_eviction",
     "enable_cache_miss_attribution",
+    "enable_mamba_exact_checkpoint",
 )
 # fmt: on

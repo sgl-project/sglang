@@ -191,6 +191,7 @@ def _tree_cache(window=8):
     )
     tree.buffer_pipeline = None
     tree.transfers_in_flight.return_value = False
+    tree.exact_checkpoint = False
     return tree
 
 
