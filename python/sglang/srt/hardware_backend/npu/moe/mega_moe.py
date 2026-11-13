@@ -17,8 +17,28 @@ if TYPE_CHECKING:
 _BUFFER_NAME = "ascend_ops_mega_moe"
 
 
+def _mega_moe_ops():
+    """Resolve (mega_moe, get_symm_buffer_for_mega_moe).
+
+    sgl-kernel-npu exposes these as registered public operators, but wheels
+    built before that registration still ship the CANN provider bindings the
+    public operator forwards to.
+    """
+    try:
+        from sgl_kernel_npu.operators.moe import (
+            get_symm_buffer_for_mega_moe,
+            mega_moe,
+        )
+    except ImportError:
+        from cann_ops_transformer.ops import (
+            get_symm_buffer_for_mega_moe,
+            mega_moe,
+        )
+    return mega_moe, get_symm_buffer_for_mega_moe
+
+
 def _get_symm_buffer(x, config, state, quant_mode, quant_dtype):
-    from sgl_kernel_npu.operators.moe import get_symm_buffer_for_mega_moe
+    _, get_symm_buffer_for_mega_moe = _mega_moe_ops()
 
     buffers = get_buffer(_BUFFER_NAME, dict)
     topk = state.topk_ids.shape[1]
@@ -195,7 +215,7 @@ def _prepare_inputs(x, ids, weights, capacity, is_arch35):
 def run_mega_moe(
     x: torch.Tensor, config: MoeRunnerConfig, state: _MegaMoEState
 ) -> torch.Tensor:
-    from sgl_kernel_npu.operators.moe import mega_moe
+    mega_moe, _ = _mega_moe_ops()
 
     from sglang.srt.hardware_backend.npu.quantization.dtype_utils import (
         _get_float4_e2m1fn_x2_dtype,
