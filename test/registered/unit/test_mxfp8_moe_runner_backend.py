@@ -117,7 +117,11 @@ class TestSailMoeA2aBackend(CustomTestCase):
 
     @staticmethod
     def _run_hook(backend, waterfill=False):
-        args = SimpleNamespace(moe_a2a_backend=backend, enable_waterfill=waterfill)
+        args = SimpleNamespace(
+            moe_a2a_backend=backend,
+            moe_runner_backend="auto",
+            enable_waterfill=waterfill,
+        )
         declared = _a2a_backend_overrides(ResolvedView(args))
         if declared:
             declare_resolution(args, "_a2a_backend_overrides", **declared)
@@ -159,7 +163,11 @@ class TestSailMoeA2aBackend(CustomTestCase):
 
     def test_other_platforms_keep_megamoe(self):
         with override_platform(is_sail=False):
-            args = SimpleNamespace(moe_a2a_backend="megamoe", enable_waterfill=True)
+            args = SimpleNamespace(
+                moe_a2a_backend="megamoe",
+                moe_runner_backend="auto",
+                enable_waterfill=True,
+            )
             handle_sail_backends(args)
             self.assertEqual(ResolvedView(args).moe_a2a_backend, "megamoe")
 
