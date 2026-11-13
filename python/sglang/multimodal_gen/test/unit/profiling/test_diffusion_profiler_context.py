@@ -70,5 +70,6 @@ class TestDiffusionProfilerContext(unittest.TestCase):
             raise ValueError("model failed")
         self.profiler.stop.assert_called_once_with(export_trace=True, dump_rank=0)
 
+
 if __name__ == "__main__":
     unittest.main()

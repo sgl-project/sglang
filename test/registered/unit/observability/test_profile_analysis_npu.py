@@ -221,5 +221,6 @@ class TestNPUProfileAnalysis(unittest.TestCase):
         self.assertIn("cannot exec", self.status(directory)["error"])
         self.assertEqual(self.status(directory)["state"], "failed")
 
+
 if __name__ == "__main__":
     unittest.main()
