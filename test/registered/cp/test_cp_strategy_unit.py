@@ -44,7 +44,7 @@ from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMod
 from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     PrefillCudaGraphRunner,
 )
-from sglang.srt.runtime_context import get_context, get_parallel
+from sglang.srt.runtime_context import get_context, get_parallel, override_platform
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.mem_cache_utils import routed
 from sglang.test.test_utils import CustomTestCase
@@ -68,10 +68,21 @@ class _FakeCPGroup:
 
 @contextmanager
 def _bcg_config(
-    *, strategy="interleave", backend="dsv4", cp=8, tp=8, pp=1, enabled=True
+    *,
+    strategy="interleave",
+    backend="dsv4",
+    cp=8,
+    tp=8,
+    pp=1,
+    enabled=True,
+    bounded_replay=False,
 ):
     cfg = SimpleNamespace(
-        enable_prefill_cp=enabled, pp_size=pp, tp_size=tp, cp_strategy=strategy
+        enable_prefill_cp=enabled,
+        pp_size=pp,
+        tp_size=tp,
+        cp_strategy=strategy,
+        enable_decoder_swa_bounded_replay=bounded_replay,
     )
     resolved = SimpleNamespace(attn_cp_size=cp)
     module = "sglang.srt.layers.cp.bcg"
@@ -146,6 +157,25 @@ class TestCPBCGConfiguration(CustomTestCase):
                 filter_prefill_cp_bcg_capture_num_tokens([1, 2, 4, 8, 16], cfg),
                 [8, 16],
             )
+
+    def test_dsv4_cp_bcg_rejects_hip_but_preserves_cuda(self):
+        for is_hip in (False, True):
+            with (
+                self.subTest(is_hip=is_hip),
+                override_platform(is_hip=is_hip, is_cuda=not is_hip),
+                _bcg_config() as cfg,
+            ):
+                self.assertEqual(DSV4CPBCGInput.supports(cfg), not is_hip)
+                self.assertEqual(supports_prefill_cp_bcg(cfg), not is_hip)
+
+    def test_decoder_bounded_replay_excludes_cp_bcg(self):
+        for bounded_replay in (None, False, True):
+            with (
+                self.subTest(bounded_replay=bounded_replay),
+                override_platform(is_hip=False),
+                _bcg_config(bounded_replay=bounded_replay) as cfg,
+            ):
+                self.assertEqual(supports_prefill_cp_bcg(cfg), not bounded_replay)
 
     def test_unsupported_cp_bcg_configurations_stay_disabled(self):
         cases = (
