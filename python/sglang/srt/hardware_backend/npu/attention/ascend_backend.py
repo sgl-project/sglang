@@ -428,9 +428,11 @@ class AscendAttnBackend(AttentionBackend):
                 raise ValueError(
                     "Ascend DSA DCP with FP8 KV requires the A5 packed KV pool."
                 )
-            self.dcp_fp8_sparse_attention = (
-                torch.ops.npu.sgl_kv_quant_sparse_flash_attention
+            from sgl_kernel_npu.operators.attention import (
+                kv_quant_sparse_flash_attention,
             )
+
+            self.dcp_fp8_sparse_attention = kv_quant_sparse_flash_attention
         self.graph_mode = False
         self.use_fa = get_bool_env_var("ASCEND_USE_FA", "False")
         self.enable_sparsity_driven_kv_offload = is_sparsity_driven_kv_offload_enabled(
