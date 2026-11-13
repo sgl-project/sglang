@@ -519,6 +519,9 @@ class Envs:
     # Physical KV-page checks: committed<=allocated + no page alias. Runs them at
     # every busy iteration, with or without the BUSY flag.
     SGLANG_CHECK_KV_PAGE_INVARIANTS = EnvBool(False)
+    # HiCache: hash every backed-up device row and check each load-back against
+    # it (mem_cache/hicache_verify.py); synchronizes on every transfer.
+    SGLANG_DEBUG_HICACHE_VERIFY = EnvBool(False)
     SGLANG_TBO_DEBUG = EnvBool(False)
     # Timing probe: run the swap-in fully but skip the host->device KV bytes,
     # measuring the "IO is free" floor. GARBAGE OUTPUT -- benchmarking only.

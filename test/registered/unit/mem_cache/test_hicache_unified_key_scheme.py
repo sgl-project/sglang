@@ -263,6 +263,7 @@ class TestControllerUnifiedKeys(CustomTestCase):
                         controller.mem_pool_host.logical_size = 256
                         controller.host_memory_mode = "cache"
                         controller.storage_stop_event = threading.Event()
+                        controller.l2_transfer_engine = MagicMock()
                         config = HiCacheStorageConfig(
                             tp_rank=tp_rank,
                             tp_size=2,
