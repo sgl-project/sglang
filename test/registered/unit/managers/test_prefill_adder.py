@@ -12,7 +12,7 @@ from sglang.srt.disaggregation.prefill import (
 )
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
-from sglang.srt.managers.req_types import FINISH_LENGTH
+from sglang.srt.managers.req_types import FINISH_ABORT, FINISH_LENGTH
 from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
@@ -176,6 +176,7 @@ class TestPrefillAdder(CustomTestCase):
             max_new_tokens=max_new_tokens, ignore_eos=False
         )
         req.time_stats = SimpleNamespace(wait_queue_entry_time=wait_time)
+        req.beam_group = None
         req.retracted_stain = False
         req.host_hit_length = 0
         req.window_host_hit_lengths = {}
@@ -207,7 +208,9 @@ class TestPrefillAdder(CustomTestCase):
         defaults["token_to_kv_pool_allocator"].page_size = defaults["page_size"]
         return PrefillAdder(**defaults)
 
-    def create_shared_adder(self, *, num_mixed_decode_tokens=0, total_bytes=2048):
+    def create_shared_adder(
+        self, *, num_mixed_decode_tokens=0, total_bytes=2048, running_batch=None
+    ):
         self.mock_tree_cache.supports_mamba.return_value = False
         self.mock_tree_cache.sliding_window_size = 8
         # The tree's target window slot retains its sliding window.
@@ -236,7 +239,7 @@ class TestPrefillAdder(CustomTestCase):
         ).token_to_kv_pool_allocator
         self.mock_tree_cache.token_to_kv_pool_allocator = allocator
         return self.create_adder(
-            self.create_running_batch(),
+            running_batch or self.create_running_batch(),
             page_size=4,
             rem_chunk_tokens=16,
             num_mixed_decode_tokens=num_mixed_decode_tokens,
@@ -1151,6 +1154,83 @@ class TestPrefillAdder(CustomTestCase):
             adder.memory_budget.total_offset, 375
         )  # 50 + 75 + 100 + 125 + 125 - 100 = 375
         running_batch.release_req.assert_called_once()
+
+    def _shared_preemption_adder(self, victims):
+        """A unified-pool adder whose running ``victims`` reserve their decode
+        headroom in the shared arena."""
+        self.scheduling_order(schedule_low_priority_values_first=False)
+        running_batch = self.create_running_batch(victims)
+        return self.create_shared_adder(running_batch=running_batch), running_batch
+
+    def _no_release_admits(self, adder, req):
+        budget = adder.memory_budget
+        demand = budget.request_demand(
+            len(req.full_untruncated_fill_ids) - req.prefix_len,
+            adder._swa_new_tokens(req),
+        )
+        return budget.admits_after_release(
+            demand, released_tokens=0, released_state_slots=0, released_rows=0
+        ), budget._admits(demand)
+
+    def test_unified_preemption_releases_the_fewest_victims(self):
+        """A unified budget has no remaining token count, so preemption asks it
+        whether the request fits once victims give back their decode headroom;
+        it stops at the first victim that makes room."""
+        low = self.create_mock_req("low", priority=0, max_new_tokens=1000)
+        mid = self.create_mock_req("mid", priority=1, max_new_tokens=1000)
+        adder, running_batch = self._shared_preemption_adder([low, mid])
+        new_req = self.create_shared_req("new")
+        new_req.priority = 5
+        self.assertEqual(self._no_release_admits(adder, new_req), (False, False))
+
+        self.assertTrue(adder.preempt_to_schedule(new_req))
+        self.assertEqual(adder.preempt_list, [low])
+        self.assertEqual(adder.preempt_aborted, [])
+        running_batch.release_req.assert_called_once()
+        running_batch.filter_batch.assert_called_once_with(keep_indices=[1])
+        self.assertEqual(adder.memory_budget.total_offset, 1000)
+
+    def test_unified_preemption_releases_nothing_when_no_set_makes_room(self):
+        """When even every preemptible victim leaves the request unadmitted,
+        no victim is released."""
+        low = self.create_mock_req("low", priority=0, max_new_tokens=1000)
+        adder, running_batch = self._shared_preemption_adder([low])
+        new_req = self.create_shared_req("huge")
+        new_req.priority = 5
+        new_req.full_untruncated_fill_ids = list(range(100_000))
+
+        self.assertFalse(adder.preempt_to_schedule(new_req))
+        self.assertEqual(adder.preempt_list, [])
+        running_batch.release_req.assert_not_called()
+        self.assertEqual(adder.memory_budget.total_offset, 1000)
+
+    def test_unified_release_pricing_matches_admission_with_nothing_released(self):
+        """Preemption and admission price the same demand alike when nothing is
+        released, so preemption never commits to a set admission then refuses."""
+        adder, _ = self._shared_preemption_adder([])
+        for length in (4, 12, 40, 400):
+            req = self.create_shared_req(f"r{length}")
+            req.full_untruncated_fill_ids = list(range(length))
+            first, second = self._no_release_admits(adder, req)
+            self.assertEqual(first, second, length)
+
+    def test_preemption_aborts_a_victim_that_cannot_resume(self):
+        """A victim whose release finds no KV backup or rebuild is aborted, not
+        requeued: requeueing it would resume a request whose KV is gone."""
+        victim = self.create_mock_req("victim", priority=0, max_new_tokens=50)
+        self.scheduling_order(schedule_low_priority_values_first=False)
+        running_batch = self.create_running_batch([victim])
+        running_batch.release_req.return_value = False
+        adder = self.create_adder(running_batch)
+        self.mock_token_allocator.full_available_size.return_value = 50
+        self.mock_token_allocator.available_size.return_value = 50
+        new_req = self.create_mock_req("new", priority=1, max_new_tokens=49)
+
+        self.assertTrue(adder.preempt_to_schedule(new_req))
+        self.assertEqual(adder.preempt_list, [])
+        self.assertEqual(adder.preempt_aborted, [victim])
+        (reason,), _ = victim.request_finish.call_args
+        self.assertIsInstance(reason, FINISH_ABORT)
 
     def test_preempt_success_low_priority_values_first_exact_twice(self):
         params = [

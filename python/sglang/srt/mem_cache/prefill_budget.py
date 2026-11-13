@@ -735,6 +735,33 @@ class ChainPrefillBudget(PrefillBudget):
             **kwargs,
         )
 
+    def admits_after_release(
+        self,
+        demand: KVDemand,
+        *,
+        released_tokens: float,
+        released_state_slots: int,
+        released_rows: int,
+    ) -> bool:
+        """Whether ``demand`` fits beside the pending work once running requests
+        give back ``released_tokens`` of the decode headroom in `total_offset`,
+        the state slots they hold and their request rows. Their KV rows are not
+        credited: another request may still lock them in the prefix tree."""
+        pending = KVDemand(
+            max(demand.full_tokens + self.total_offset - released_tokens, 0),
+            {
+                name: demand.window_tokens[name] + self.window_offsets[name]
+                for name, _ in self.windows
+            },
+            max(
+                demand.state_slots + self.pending_state_slots - released_state_slots, 0
+            ),
+            max(demand.request_rows + self.pending_request_rows - released_rows, 0),
+        )
+        return self.allocator.admits(
+            pending, evictable=evictable_by_sub_pool(self.tree_cache, self.allocator)
+        )
+
     @property
     def remaining_window_tokens(self):
         return self._available_and_evictable()

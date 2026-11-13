@@ -336,9 +336,7 @@ class SchedulerDllmMixin:
     ) -> None:
         """Update state for the batch."""
 
-        if adder.preempt_list:
-            for req in adder.preempt_list:
-                self._add_request_to_queue(req)
+        self.requeue_preempted(adder)
 
     def _create_dllm_batch(
         self: Scheduler,

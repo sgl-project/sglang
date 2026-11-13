@@ -45,15 +45,19 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from enum import Enum, auto
 from functools import lru_cache
+from http import HTTPStatus
 from typing import TYPE_CHECKING, Dict, Iterable, List, Mapping, Optional, Set, Union
 
 import torch
 
 from sglang.srt.dllm.config import DllmConfig
+from sglang.srt.managers.req_types import FINISH_ABORT
 from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
+    free_beam_member_rows,
     split_cached_prefix_by_tier,
+    unresumable_abort_message,
 )
 from sglang.srt.mem_cache.allocation import retire_window
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
@@ -711,6 +715,9 @@ class PrefillAdder:
         self.req_states = None
         self.can_run_list = []
         self.preempt_list = []
+        # Preempted requests that cannot resume (a beam group, or no KV backup
+        # or rebuild); the scheduler aborts them instead of requeueing them.
+        self.preempt_aborted: List[Req] = []
         self.new_chunked_req = None
         # The unfinished chunked request could not run this pass; only one is
         # tracked, and others would take its room, so none is admitted.
@@ -2047,7 +2054,26 @@ class PrefillAdder:
             ),
         )
 
-        preemptible_reqs = []
+        candidates = []
+        for running_req in sorted_valid_running_reqs:
+            # Priority difference needs to meet the threshold to be preemptible.
+            priority_diff = (req.priority - running_req.priority) * (-priority_sign)
+            if priority_diff <= self.priority_scheduling_preemption_threshold:
+                break
+            candidates.append(running_req)
+
+        if self.memory_budget.prices_by_demand:
+            victims = self._victims_by_demand(req, candidates)
+        else:
+            victims = self._victims_by_tokens(req, candidates)
+        if not victims:
+            return False
+        self._release_victims(set(victims))
+        return True
+
+    def _victims_by_tokens(self, req: Req, candidates: List[Req]) -> List[Req]:
+        """The fewest leading ``candidates`` whose decode headroom covers what
+        ``req`` lacks in the remaining token count; empty when all do not."""
         min_tokens_to_remove = (
             len(req.full_untruncated_fill_ids)
             - req.prefix_len
@@ -2055,41 +2081,81 @@ class PrefillAdder:
             + self._request_slot_reserve_for_req(req)
             - self.rem_total_tokens
         )
-        for running_req in sorted_valid_running_reqs:
-            # Priority difference needs to meet the threshold to be preemptible.
-            priority_diff = (req.priority - running_req.priority) * (-priority_sign)
+        for i, running_req in enumerate(candidates):
+            min_tokens_to_remove -= self._get_running_request_total_token_offset(
+                running_req
+            )
+            if min_tokens_to_remove <= 0:
+                return candidates[: i + 1]
+        return []
 
-            if priority_diff > self.priority_scheduling_preemption_threshold:
-                preemptible_reqs.append(running_req)
-                min_tokens_to_remove -= self._get_running_request_total_token_offset(
-                    running_req
-                )
-                if min_tokens_to_remove <= 0:
-                    break
-            else:
-                break
+    def _victims_by_demand(self, req: Req, candidates: List[Req]) -> List[Req]:
+        """The fewest leading ``candidates`` after whose release the memory
+        budget admits ``req`` whole; empty when all of them do not make room."""
+        budget = self.memory_budget
+        demand = budget.request_demand(
+            len(req.full_untruncated_fill_ids) - req.prefix_len,
+            self._swa_new_tokens(req),
+            state_slots=self._state_slots_for_req(req),
+            request_rows=self._request_rows_for_req(req),
+        )
+        released_tokens = 0.0
+        released_state_slots = 0
+        released_rows = 0
+        for i, running_req in enumerate(candidates):
+            released_tokens += self._get_running_request_total_token_offset(running_req)
+            if budget.has_state_slots:
+                released_state_slots += budget.request_held_state_slots(running_req)
+            released_rows += int(
+                budget.has_request_rows and running_req.kv.req_pool_idx is not None
+            )
+            if budget.admits_after_release(
+                demand,
+                released_tokens=released_tokens,
+                released_state_slots=released_state_slots,
+                released_rows=released_rows,
+            ):
+                return candidates[: i + 1]
+        return []
 
-        # Check max token count limit can be met
-        if len(preemptible_reqs) == 0 or min_tokens_to_remove > 0:
-            return False
-
-        # Preempt running requests. Release allocated resources for immediate usage.
-        preemptible_reqs = set(preemptible_reqs)
+    def _release_victims(self, victims: Set[Req]) -> None:
+        """Release ``victims`` from the running batch for immediate reuse. One
+        that cannot resume is aborted (`preempt_aborted`), as `retract_all` does."""
+        batch = self.running_batch
         keep_indices = []
         release_counter = 0
-        for i, running_req in enumerate(self.running_batch.reqs):
-            if running_req in preemptible_reqs:
-                self.memory_budget.total_offset -= (
-                    self._get_running_request_total_token_offset(running_req)
-                )
-                release_counter += 1
-                self.running_batch.release_req(
-                    i,
-                    len(self.running_batch.reqs) - release_counter,
-                    self.request_retirer,
-                )
-            else:
+        for i, running_req in enumerate(batch.reqs):
+            if running_req not in victims:
                 keep_indices.append(i)
-        self.running_batch.filter_batch(keep_indices=keep_indices)
-        self.preempt_list.extend(preemptible_reqs)
-        return True
+                continue
+            self.memory_budget.total_offset -= (
+                self._get_running_request_total_token_offset(running_req)
+            )
+            release_counter += 1
+            remaining = len(batch.reqs) - release_counter
+            if running_req.beam_group is not None:
+                running_req.request_finish(
+                    FINISH_ABORT(
+                        "Beam search group aborted: beam groups cannot be "
+                        "preempted, so they are aborted instead of being requeued.",
+                        status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                    )
+                )
+                free_beam_member_rows(
+                    running_req,
+                    batch.req_to_token_pool,
+                    batch.token_to_kv_pool_allocator,
+                )
+                batch.release_req(i, remaining, self.request_retirer, offload_kv=False)
+                self.preempt_aborted.append(running_req)
+            elif batch.release_req(i, remaining, self.request_retirer):
+                self.preempt_list.append(running_req)
+            else:
+                running_req.request_finish(
+                    FINISH_ABORT(
+                        unresumable_abort_message(),
+                        status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                    )
+                )
+                self.preempt_aborted.append(running_req)
+        batch.filter_batch(keep_indices=keep_indices)

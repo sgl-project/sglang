@@ -1555,13 +1555,9 @@ class Scheduler(
                 )
 
         # NOTE: preemption is enabled by default for priority scheduling.
-        # TODO(ch-wan): a unified pool admits by pricing demands, and preemption
-        # does not yet ask admission itself whether its victims make room; it
-        # stays off there until it does.
         self.enable_priority_preemption = (
             self.enable_priority_scheduling
             and not get_schedule().disable_priority_preemption
-            and not get_memory().enable_unified_memory
         )
 
         self.new_token_ratio_tracker = NewTokenRatioTracker.from_config()
@@ -3807,6 +3803,15 @@ class Scheduler(
         self._retry_storage_prefetch(req)
         return True
 
+    def requeue_preempted(self, adder: PrefillAdder) -> None:
+        """Requeue the requests a prefill pass preempted, and abort the ones it
+        could not resume."""
+        for req in adder.preempt_list:
+            self._add_request_to_queue(req)
+        for req in adder.preempt_aborted:
+            # Preemption recorded the reason and freed any member rows.
+            self.request_retirer.abort_retracted(req, reason=req.to_finish)
+
     def _add_request_to_queue(
         self,
         req: Req,
@@ -4778,8 +4783,7 @@ class Scheduler(
         if len(can_run_list) == 0:
             # Preemption already released these requests; requeue them even
             # though the request they made room for was not admitted.
-            for req in adder.preempt_list:
-                self._add_request_to_queue(req)
+            self.requeue_preempted(adder)
             # Empty passes are the key signal for head-of-line blocking.
             self._maybe_log_schedule_decision(
                 can_run_list=can_run_list, running_batch=running_batch, adder=adder
@@ -4803,9 +4807,7 @@ class Scheduler(
             [req for req in admitted if req is not new_chunked_req],
             self.prefill_launched_reqs,
         )
-        if adder.preempt_list:
-            for req in adder.preempt_list:
-                self._add_request_to_queue(req)
+        self.requeue_preempted(adder)
 
         # After the re-queue, so #left-in-queue is what the next pass sees.
         self._maybe_log_schedule_decision(
