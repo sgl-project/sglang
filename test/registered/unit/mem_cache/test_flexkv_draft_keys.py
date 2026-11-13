@@ -135,3 +135,9 @@ def test_flexkv_activation_passes_the_actual_draft_pool(
     runner.runner_ids.is_fused_draft = True
     with pytest.raises(NotImplementedError, match="fused draft"):
         spec.BaseSpecWorker._build_hicache_draft_plan(worker)
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__]))
