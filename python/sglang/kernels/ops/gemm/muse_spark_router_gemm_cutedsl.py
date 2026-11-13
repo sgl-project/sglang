@@ -12,6 +12,7 @@ import functools
 import msgspec
 import torch
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.jit.utils import is_arch_support_pdl
 
 # Tactic space. cta_m = experts per CTA, cta_n = tokens per CTA, split_k = cluster
@@ -48,16 +49,6 @@ class RouterTactic(msgspec.Struct, frozen=True):
 # =====================================================================
 # Host side: SMEM sizing, tactics, entry points.
 # =====================================================================
-def _smem_capacity(device=None) -> int:
-    """Shared memory per block of the current device."""
-    if torch.cuda.get_device_capability(device) == (10, 7):
-        # The device query does not report the sm_107 capacity; CuTe DSL's does.
-        import cutlass
-
-        return cutlass.memory.get_smem_capacity_in_bytes("sm_107")
-    return torch.cuda.get_device_properties(device).shared_memory_per_block_optin
-
-
 def _smem_bytes(tactic: RouterTactic, stages: int) -> int:
     """Upper bound of the kernel's shared memory (allocation order and alignment)."""
 
@@ -101,7 +92,7 @@ def default_tactic(
     smem_capacity: int | None = None,
     max_stages_limit: int = _MAX_STAGES,
 ) -> RouterTactic:
-    smem_capacity = smem_capacity or _smem_capacity()
+    smem_capacity = smem_capacity or current_arch().smem_bytes
     # Token tile: the smallest covering M, or an explicit one (larger M runs
     # several token tiles).
     mma_n = mma_n or next((n for n in _MMA_N if n >= m), _MMA_N[-1])
@@ -122,7 +113,7 @@ def validate(
     tactic: RouterTactic, m: int, e: int, k: int, smem_capacity: int | None = None
 ) -> None:
     """Reject a tactic that cannot serve ``x[m, k] @ w[e, k]^T``."""
-    smem_capacity = smem_capacity or _smem_capacity()
+    smem_capacity = smem_capacity or current_arch().smem_bytes
     if tactic.mma_m not in _MMA_M or tactic.mma_n not in _MMA_N:
         raise ValueError(f"unsupported tile {tactic}")
     if tactic.split_k not in _SPLIT_K or tactic.cta_k not in _CTA_K:
@@ -152,7 +143,7 @@ def router_logits_tf32(
     e, k = w.shape
     assert k == h and x.dtype == w.dtype == torch.float32
     assert x.is_contiguous() and w.is_contiguous()
-    smem_capacity = _smem_capacity(x.device)
+    smem_capacity = current_arch().smem_bytes
     if tactic is None:
         tactic = serve_tactic(m, e, k, smem_capacity, _capability(x.device.index))
     validate(tactic, m, e, k, smem_capacity)
@@ -245,7 +236,7 @@ def _serve_overrides(m: int, capability: tuple) -> dict | None:
 def serve_tactic(
     m: int, e: int, k: int, smem_capacity: int = 0, capability: tuple = (10, 3)
 ) -> RouterTactic:
-    smem_capacity = smem_capacity or _smem_capacity()
+    smem_capacity = smem_capacity or current_arch().smem_bytes
     overrides = _serve_overrides(m, capability)
     if overrides is None:
         raise ValueError(f"M={m} runs cuBLAS on {capability}")
