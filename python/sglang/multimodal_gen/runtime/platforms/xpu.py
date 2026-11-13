@@ -145,6 +145,41 @@ class XpuPlatform(Platform):
                 )
                 return "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
 
+        if selected_backend == AttentionBackendEnum.SAGE_ATTN_3:
+            # Same dtype / head-size gate as the XPU flash-attention backend; the
+            # Sage V3 impl keeps flash attention for layers its kernels skip.
+            fa_backend = cls.get_attn_backend_cls_str(
+                AttentionBackendEnum.FA, head_size, dtype
+            )
+            if not fa_backend.endswith(".XPUAttentionBackend"):
+                return fa_backend
+            from sglang.multimodal_gen.runtime.layers.attention.backends import (
+                xpu_backend,
+            )
+
+            # Fall back here rather than failing later in the worker's model build,
+            # to XPU flash attention (the XPU default, ring-capable like this
+            # backend) rather than SDPA.
+            if (
+                xpu_backend.sageattn_v3 is None
+                or xpu_backend.sageattn_v3_hybrid is None
+            ):
+                logger.warning(
+                    "sgl-kernel-xpu has no sageattn_v3 / sageattn_v3_hybrid "
+                    "(SageAttention V3 needs an sgl-kernel-xpu build that has them). "
+                    "Falling back to XPU flash attention."
+                )
+                return fa_backend
+            if dtype != torch.bfloat16:
+                logger.warning(
+                    "SageAttention V3 on XPU takes BF16 only, got %s. "
+                    "Falling back to XPU flash attention.",
+                    dtype,
+                )
+                return fa_backend
+            logger.info("Using SageAttention V3 (sgl-kernel-xpu) backend on Intel XPU.")
+            return "sglang.multimodal_gen.runtime.layers.attention.backends.xpu_backend.XPUSageAttention3Backend"
+
         if selected_backend == AttentionBackendEnum.TORCH_SDPA:
             logger.info("Using Torch SDPA backend for Intel XPU.")
             return "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
@@ -152,7 +187,6 @@ class XpuPlatform(Platform):
         if selected_backend in (
             AttentionBackendEnum.SLIDING_TILE_ATTN,
             AttentionBackendEnum.SAGE_ATTN,
-            AttentionBackendEnum.SAGE_ATTN_3,
             AttentionBackendEnum.VIDEO_SPARSE_ATTN,
             AttentionBackendEnum.VMOBA_ATTN,
             AttentionBackendEnum.AITER,

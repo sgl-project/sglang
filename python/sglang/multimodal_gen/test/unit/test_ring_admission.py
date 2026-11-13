@@ -19,7 +19,10 @@ from sglang.multimodal_gen.runtime.layers.usp import (
     _merge_attention_partials,
     _ring_merge_attention,
 )
-from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
 from sglang.multimodal_gen.runtime.server_args.server_args import (
     RING_CAPABLE_ATTENTION_BACKENDS,
 )
@@ -46,6 +49,17 @@ class TestRingAdmission(unittest.TestCase):
         self.assertIn(
             AttentionBackendEnum.AITER.name.lower(), RING_CAPABLE_ATTENTION_BACKENDS
         )
+        if current_platform.is_xpu():
+            # XPUSageAttention3Backend keeps XPU flash attention for LSE ring steps.
+            from sglang.multimodal_gen.runtime.layers.attention.backends.xpu_backend import (
+                XPUSageAttention3Backend,
+            )
+
+            self.assertTrue(XPUSageAttention3Backend.supports_ring_rotation())
+            self.assertIn(
+                XPUSageAttention3Backend.get_enum().name.lower(),
+                RING_CAPABLE_ATTENTION_BACKENDS,
+            )
 
     def test_local_usp_backend_does_not_require_ring_capability(self):
         layer_module = "sglang.multimodal_gen.runtime.layers.attention.layer"
