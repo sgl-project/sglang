@@ -2146,8 +2146,10 @@ class ResponsesRequest(PDRoutingFields):
         ]
     ] = None
     # Preserve JSON input for downstream validation; SDK TypedDicts discard extra fields.
-    input: Union[str, List[Dict[str, Any]], List[ResponseInputOutputItem]] = Field(
-        union_mode="left_to_right"
+    # Optional: OpenAI allows omitting `input` (e.g. instructions-only requests);
+    # serving_responses.py enforces that at least one of input/instructions is set.
+    input: Optional[Union[str, List[Dict[str, Any]], List[ResponseInputOutputItem]]] = (
+        Field(default=None, union_mode="left_to_right")
     )
     instructions: Optional[str] = None
     max_output_tokens: Optional[int] = None
@@ -2164,6 +2166,7 @@ class ResponsesRequest(PDRoutingFields):
     text: Optional[ResponseTextConfig] = None
     tool_choice: Union[Literal["auto", "required", "none"], Dict[str, Any]] = "auto"
     tools: List[ResponseTool] = Field(default_factory=list)
+    # top_logprobs > 0 implies logprobs are wanted, same as the include entry.
     top_logprobs: Optional[int] = 0
     top_p: Optional[float] = None
     truncation: Optional[Literal["auto", "disabled"]] = "disabled"
@@ -2303,8 +2306,18 @@ class ResponsesRequest(PDRoutingFields):
         schema = response_format.schema_
         return convert_json_schema_to_str(schema) if schema is not None else None
 
+    @model_validator(mode="after")
+    def _disable_background_when_streaming(self):
+        # Streaming responses are consumed on the request connection, so
+        # background execution cannot apply; drop it instead of rejecting.
+        if self.stream and self.background:
+            self.background = False
+        return self
+
     def is_include_output_logprobs(self) -> bool:
-        return bool(self.include and "message.output_text.logprobs" in self.include)
+        if self.include and "message.output_text.logprobs" in self.include:
+            return True
+        return bool(self.top_logprobs and self.top_logprobs > 0)
 
     def is_include_encrypted_reasoning(self) -> bool:
         return bool(self.include and "reasoning.encrypted_content" in self.include)
