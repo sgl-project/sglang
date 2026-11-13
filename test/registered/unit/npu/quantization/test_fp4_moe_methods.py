@@ -32,9 +32,13 @@ from sglang.srt.hardware_backend.npu.quantization.online_moe_methods import (
 )
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
+from sglang.srt.layers.moe.moe_runner.ascend import AscendRunnerCore
 from sglang.srt.layers.moe.token_dispatcher import deepep
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
+from sglang.srt.layers.quantization.modelslim.schemes.modelslim_w4a8_int8_moe import (
+    ModelSlimW4A8Int8MoE,
+)
 from sglang.srt.runtime_context import get_context
 from sglang.test.test_utils import CustomTestCase
 
@@ -902,6 +906,110 @@ class TestProcessWeightsAfterLoadingZeroScale(CustomTestCase):
                 "low_latency_dispatcher_output_dtype": "mxfp8",
             }
         )
+
+
+class TestModelSlimW4A8(unittest.TestCase):
+    def test_padding_preserves_gate_up_and_down_projections(self):
+        layer = torch.nn.Module()
+        layer.moe_tp_size = 16
+        w13 = ModelSlimW4A8Int8MoE({}, "w13")
+        w2 = ModelSlimW4A8Int8MoE({}, "w2")
+        w13.create_weights(layer, 1, 64, 144)
+        w2.create_weights(layer, 1, 64, 144)
+        with torch.no_grad():
+            for param in layer.parameters():
+                param.random_(1, 7)
+        original = {name: param.clone() for name, param in layer.named_parameters()}
+        w13._pad_intermediate_for_nz(layer)
+        self.assertEqual(layer.intermediate_size_per_partition, 192)
+
+        def unpack(weight):
+            low = weight & 15
+            high = (weight >> 4) & 15
+            values = torch.stack((low, high), dim=1).flatten(0, 1)
+            return torch.where(values >= 8, values - 16, values).float()
+
+        x = torch.arange(64, dtype=torch.float32).view(1, -1)
+        before = x @ unpack(original["w13_weight"][0]).T
+        after = x @ unpack(layer.w13_weight[0]).T
+        for index in range(2):
+            torch.testing.assert_close(
+                after[:, index * 192 : index * 192 + 144],
+                before[:, index * 144 : (index + 1) * 144],
+            )
+            self.assertEqual(
+                after[:, index * 192 + 144 : (index + 1) * 192].count_nonzero(), 0
+            )
+        activation = torch.arange(144, dtype=torch.float32).view(1, -1)
+        padded_activation = torch.nn.functional.pad(activation, (0, 48))
+        torch.testing.assert_close(
+            activation @ unpack(original["w2_weight"][0]).T,
+            padded_activation @ unpack(layer.w2_weight[0]).T,
+        )
+
+    def test_a3_runner_preserves_swiglu_limit(self):
+        kernel = ModelSlimW4A8Int8MoE({}, "w2").kernel
+        config = MoeRunnerConfig(
+            layer=SimpleNamespace(w13_kernel=kernel, w2_kernel=kernel),
+            swiglu_limit=10.0,
+        )
+        for use_deepep in (False, True):
+            with (
+                self.subTest(deepep=use_deepep),
+                patch(
+                    "sglang.srt.layers.moe.moe_runner.ascend.is_npu_arch35",
+                    return_value=False,
+                ),
+                patch(
+                    "sglang.srt.layers.moe.moe_runner.ascend.get_moe_a2a_backend",
+                    return_value=SimpleNamespace(
+                        is_deepep=MagicMock(return_value=use_deepep),
+                        is_ascend_ops=lambda: False,
+                    ),
+                ),
+            ):
+                runner = AscendRunnerCore(config)
+                self.assertEqual(runner.activation.swiglu_limit, 10.0)
+
+    def test_w2_compensation_follows_tp_input_shards(self):
+        checkpoint_bias = torch.arange(8 * 16, dtype=torch.float32).view(8, 16)
+        channel_scale = torch.arange(1, 9, dtype=torch.float32).view(8, 1)
+        for tp_size in (1, 2, 4, 8, 16):
+            for rank in range(tp_size):
+                with self.subTest(tp_size=tp_size, rank=rank):
+                    layer = FusedMoE.__new__(FusedMoE)
+                    torch.nn.Module.__init__(layer)
+                    layer.moe_tp_size, layer.moe_tp_rank = tp_size, rank
+                    layer.quant_config = SimpleNamespace(
+                        get_name=lambda: "modelslim",
+                        quant_description={"quant_method": "modelslim"},
+                    )
+                    layer.quant_method = SimpleNamespace()
+                    layer.scheme = None
+                    layer.use_triton_kernels = False
+                    layer.use_flashinfer_trtllm_moe = False
+                    layer.use_padded_loading = False
+                    layer.use_presharded_weights = False
+                    layer._load_gguf_weight = lambda *args: False
+                    layer._maybe_load_bf16_shared_expert_as_fp4 = lambda **kw: False
+                    layer._maybe_load_fp8_shared_expert_as_fp4 = lambda **kw: False
+                    scheme = ModelSlimW4A8Int8MoE({}, "w2")
+                    scheme.create_weights(layer, 1, 8, 64)
+                    for suffix, value in (
+                        ("scale_bias", checkpoint_bias),
+                        ("weight_scale", channel_scale),
+                    ):
+                        layer._weight_loader_impl(
+                            getattr(layer, f"w2_{suffix}"),
+                            value,
+                            f"experts.0.w2.{suffix}",
+                            "w2",
+                            0,
+                        )
+                    scheme.kernel._update_bias(layer, "w2")
+                    expected = checkpoint_bias.chunk(tp_size, dim=-1)[rank].sum(-1)
+                    torch.testing.assert_close(layer.w2_scale_bias[0], expected)
+                    torch.testing.assert_close(layer.w2_weight_scale[0], channel_scale)
 
 
 if __name__ == "__main__":

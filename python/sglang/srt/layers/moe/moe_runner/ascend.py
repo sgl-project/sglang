@@ -145,12 +145,12 @@ class AscendRunnerCore(MoeRunnerCore):
         super().__init__(config)
 
         kernel = config.layer.w2_kernel
-        # A3 W8A8 checkpoints retain DSV4's clip-before-SiLU semantics.
+        # A3 W4A8/W8A8 checkpoints retain DSV4's clip-before-SiLU semantics.
         # Leave the A5 MX and existing unclipped activation paths unchanged.
         swiglu_limit = (
             config.swiglu_limit
             if not is_npu_arch35()
-            and isinstance(kernel, NPUW8A8Int8MoEMethod)
+            and isinstance(kernel, (NPUW4A8Int8MoEMethod, NPUW8A8Int8MoEMethod))
             and config.activation == "silu"
             and config.swiglu_limit is not None
             and config.swiglu_limit > 0

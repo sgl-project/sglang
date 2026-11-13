@@ -17,6 +17,10 @@ from unittest.mock import Mock, patch
 import torch
 import torch.nn.functional as F
 
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=8, stage="base-a", runner_config="cpu")
+
 ROOT = Path(__file__).resolve().parents[5]
 BACKEND = (
     ROOT / "python/sglang/srt/hardware_backend/npu/attention/ascend_dsv4_backend.py"
@@ -549,7 +553,9 @@ class TestA3GraphInitContract(unittest.TestCase):
             "ForwardMetadata": SimpleNamespace,
             "is_npu_arch35": lambda: False,
         }
-        exec(compile(ast.fix_missing_locations(module), str(BACKEND), "exec"), namespace)  # noqa: S102
+        exec(
+            compile(ast.fix_missing_locations(module), str(BACKEND), "exec"), namespace
+        )  # noqa: S102
         backend_type = type(
             "GraphInitBackend", (), {name: namespace[name] for name in names}
         )
@@ -580,7 +586,9 @@ class TestA3GraphInitContract(unittest.TestCase):
                 for name in ("c1a", "c4a", "c128a", "li_quant")
             }
         )
-        b.graph_metadata["c4_topk_indices"] = torch.full((2, 512), -1, dtype=torch.int32)
+        b.graph_metadata["c4_topk_indices"] = torch.full(
+            (2, 512), -1, dtype=torch.int32
+        )
         self.forward_batch = SimpleNamespace(
             batch_size=2,
             seq_lens=torch.tensor([129, 128], dtype=torch.int32),
