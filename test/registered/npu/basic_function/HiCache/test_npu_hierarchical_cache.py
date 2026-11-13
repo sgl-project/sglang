@@ -1,3 +1,4 @@
+import os
 import unittest
 
 import requests
@@ -40,12 +41,18 @@ class TestNPUHierarchicalCache(CustomTestCase):
             "--tp-size",
             1,
             "--enable-hierarchical-cache",
+            "--hicache-size",
+            1,
         ]
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=other_args,
+            env={
+                **os.environ,
+                "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True,pin_memory_expandable_segments:True",
+            },
         )
         cls.base_url += "/v1"
 
