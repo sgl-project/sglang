@@ -1008,6 +1008,97 @@ def map_chunk_into_span(
     check_drv(drv.cuMemRelease(imp_h), "cuMemRelease(span)")
 
 
+FABRIC_HANDLE_BYTES = 64
+
+
+def get_gpu_fabric_clique(device_id: int):
+    """``(cluster_uuid, clique_id)`` of a GPU's NVLink fabric, or ``None`` when
+    NVML is missing or the GPU has not joined a clique."""
+    if pynvml is None:
+        return None
+    try:
+        pynvml.nvmlInit()
+        try:
+            return _gpu_fabric_clique(torch.device("cuda", int(device_id)))
+        finally:
+            pynvml.nvmlShutdown()
+    except Exception as error:
+        logger.warning("GPU fabric clique query failed: %r", error)
+        return None
+
+
+def export_fabric_handle(handle) -> bytes:
+    """Export a FABRIC-exportable allocation handle as its 64 opaque bytes."""
+    drv = _get_cuda_driver()
+    fabric = check_drv(
+        drv.cuMemExportToShareableHandle(
+            handle, drv.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC, 0
+        ),
+        "cuMemExportToShareableHandle(FABRIC)",
+    )
+    return bytes(fabric.data)
+
+
+def map_fabric_import(
+    fabric_handle: bytes, size: int, device_id: int, *, read_only: bool
+) -> int:
+    """Import a peer FABRIC allocation of ``size`` bytes and map it at a fresh VA.
+
+    Every step is rolled back on failure, so an exception leaves nothing mapped.
+    Undo with :func:`unmap_fabric_import`.
+    """
+    drv = _get_cuda_driver()
+    size = int(size)
+    handle = check_drv(
+        drv.cuMemImportFromShareableHandle(
+            bytes(fabric_handle),
+            drv.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC,
+        ),
+        "cuMemImportFromShareableHandle(FABRIC)",
+    )
+    va = None
+    mapped = False
+    try:
+        prop = check_drv(
+            drv.cuMemGetAllocationPropertiesFromHandle(handle),
+            "cuMemGetAllocationPropertiesFromHandle",
+        )
+        granularity = get_allocation_granularity(prop)
+        if size <= 0 or size % granularity:
+            raise ValueError(
+                f"import size {size} is not a positive multiple of {granularity}"
+            )
+        va = int(
+            check_drv(
+                drv.cuMemAddressReserve(size, granularity, 0, 0),
+                "cuMemAddressReserve(import)",
+            )
+        )
+        check_drv(drv.cuMemMap(va, size, 0, handle, 0), "cuMemMap(import)")
+        mapped = True
+        access = make_rw_access_desc(int(device_id))
+        if read_only:
+            access.flags = drv.CUmemAccess_flags.CU_MEM_ACCESS_FLAGS_PROT_READ
+        check_drv(drv.cuMemSetAccess(va, size, [access], 1), "cuMemSetAccess(import)")
+    except BaseException as error:
+        if mapped and drv.cuMemUnmap(va, size)[0] != drv.CUresult.CUDA_SUCCESS:
+            error.add_note("cuMemUnmap(import rollback) also failed")
+        if va is not None:
+            drv.cuMemAddressFree(va, size)
+        drv.cuMemRelease(handle)
+        raise
+    # The mapping keeps the physical allocation alive; the import handle is not needed.
+    check_drv(drv.cuMemRelease(handle), "cuMemRelease(import)")
+    return va
+
+
+def unmap_fabric_import(va: int, size: int) -> None:
+    """Undo :func:`map_fabric_import`. The caller must have drained every access."""
+    drv = _get_cuda_driver()
+    check_drv(drv.cuMemUnmap(int(va), int(size)), "cuMemUnmap(import)")
+    check_drv(drv.cuMemAddressFree(int(va), int(size)), "cuMemAddressFree(import)")
+
+
 class VmmGraphInputManager:
     def __init__(
         self,
