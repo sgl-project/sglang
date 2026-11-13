@@ -15,6 +15,86 @@ from sglang.test.ci.ci_register import register_cuda_ci
 register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_context_recording_preserves_selected_rows_and_capacity(device):
+    state = WatermarkState(
+        max_num_reqs=5,
+        context_window=2,
+        max_contexts_per_req=3,
+        key="0123456789abcdef",
+        device=device,
+    )
+    state.watermarked_context_hashes.fill_(-1)
+    state.num_watermarked_contexts.copy_(
+        torch.tensor([0, 2, 0, 3, 0], dtype=torch.int32, device=device)
+    )
+    # An inactive row must not write a count shared with a selected request.
+    rows = torch.tensor([4, 1, 3, 2, 4], dtype=torch.int32, device=device)
+    hashes = torch.tensor([101, 2**31 + 7, 303, 404, 505], device=device)
+    selected = torch.tensor([True, True, True, False, False], device=device)
+
+    state._record_contexts(rows, hashes, selected)
+
+    assert state.num_watermarked_contexts.tolist() == [0, 3, 0, 3, 1]
+    assert state.watermarked_context_hashes.tolist() == [
+        [-1, -1, -1],
+        [-1, -1, -2147483641],
+        [-1, -1, -1],
+        [-1, -1, -1],
+        [101, -1, -1],
+    ]
+    before = state.watermarked_context_hashes.clone()
+    state._record_contexts(rows, hashes, torch.zeros_like(selected))
+    state._record_contexts(rows[:0], hashes[:0], selected[:0])
+    assert torch.equal(state.watermarked_context_hashes, before)
+    assert state.num_watermarked_contexts.tolist() == [0, 3, 0, 3, 1]
+
+    # A new request reusing the same pool slot starts a fresh history.
+    state.init_from_prompt(rows[:1], [[10, 11]])
+    state._record_contexts(rows[:1], hashes[:1] + 1, selected[:1])
+    assert state.num_watermarked_contexts.tolist() == [0, 3, 0, 3, 1]
+    assert state.watermarked_context_hashes[4].tolist() == [102, -1, -1]
+
+
+def test_full_vocabulary_force_records_without_dynamic_cuda_indexing():
+    from torch.profiler import ProfilerActivity, profile
+
+    state = WatermarkState(
+        max_num_reqs=2,
+        context_window=2,
+        max_contexts_per_req=3,
+        key="0123456789abcdef",
+        device="cuda",
+        default_enabled=True,
+    )
+    rows = torch.tensor([1, 0], dtype=torch.int32, device="cuda")
+    state.init_from_prompt(rows, [[10, 11], [20, 21]])
+    sampling_info = SimpleNamespace(
+        temperatures=torch.ones((2, 1), device="cuda"),
+        top_ks=torch.full((2,), 1 << 30, device="cuda", dtype=torch.int32),
+        top_ps=torch.ones(2, device="cuda"),
+        min_ps=torch.zeros(2, device="cuda"),
+        max_top_k=None,
+        watermark_keys=None,
+        watermark_context_windows=None,
+        watermark_enabled=None,
+        has_watermark_candidates=True,
+    )
+    logits = torch.zeros((2, 65), device="cuda")
+    state.force(logits, rows, sampling_info)
+    state.num_watermarked_contexts.zero_()
+    logits.zero_()
+    torch.cuda.synchronize()
+
+    with profile(activities=[ProfilerActivity.CPU]) as prof:
+        state.force(logits, rows, sampling_info)
+        torch.cuda.synchronize()
+
+    assert state.num_watermarked_contexts.tolist() == [1, 1]
+    assert torch.isfinite(logits).sum(-1).tolist() == [1, 1]
+    assert "aten::nonzero" not in {event.key for event in prof.key_averages()}
+
+
 def test_repeated_context_and_greedy_bypass():
     device = "cuda"
     state = WatermarkState(
