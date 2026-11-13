@@ -881,6 +881,21 @@ fn flatten_column<T>(column: Vec<Option<Option<T>>>) -> Vec<Option<T>> {
 /// Reject `n` copies of one prompt (chat's `n` choices) before they are
 /// cloned: the batch cap, and the clone budget a broadcast is held to for its
 /// `ids` plus the list `fields` copied with them.
+/// Python's deprecated spelling (`GenerateReqInput.normalize_batch_and_arguments`):
+/// a set `data_parallel_rank` names the DP rank when `routed_dp_rank` does
+/// not, and is dropped either way.
+pub(crate) fn move_deprecated_dp_rank(fields: &mut serde_json::Map<String, serde_json::Value>) {
+    if let Some(rank) = fields
+        .remove("data_parallel_rank")
+        .filter(|rank| !rank.is_null())
+        && fields
+            .get("routed_dp_rank")
+            .is_none_or(serde_json::Value::is_null)
+    {
+        fields.insert("routed_dp_rank".into(), rank);
+    }
+}
+
 pub(crate) fn check_prompt_copies(
     ids: usize,
     fields: &[&serde_json::Value],

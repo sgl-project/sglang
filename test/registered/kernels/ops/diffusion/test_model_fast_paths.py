@@ -2,8 +2,8 @@
 
 A diffusion kernel is only as good as the wrapper that decides when to use it,
 and that decision is model-specific: FLUX.1 and GLM-Image feed different adaLN
-layouts to the same LayerNorm+modulate kernel, Sana only engages on non-default
-streams, ERNIE runs a bit-exact chain unconditionally.  Kernel-level numerics
+layouts to the same LayerNorm+modulate kernel, Sana gates on stream and model
+opt-in, ERNIE runs a bit-exact chain unconditionally.  Kernel-level numerics
 live in ``test_norm.py`` / ``test_modulate.py`` / ``test_rope.py``; this file
 covers the wiring: right kernel, right reference, gate ends in the right state.
 
@@ -770,6 +770,7 @@ def test_glm_qk_head_layernorm_is_bit_exact(shape):
 
 
 @requires_inline_ptx
+@pytest.mark.parametrize("allow_eager", [False, True])
 @pytest.mark.parametrize(
     "shape,nmod,transposed",
     [
@@ -779,10 +780,15 @@ def test_glm_qk_head_layernorm_is_bit_exact(shape):
         ((1, 37, 2240), 6, False),
     ],
 )
-def test_sana_fused_ln_modulate_is_bit_exact(shape, nmod, transposed):
-    # (., 1024, 2240) is the real Sana 1024px shape; hidden 2240 % 512 != 0
-    # exercises the kernel's partial tail chunk.  nmod mirrors the two adaLN
-    # chunk layouts, transposed the permuted layout the Sana DiT serves.
+def test_sana_fused_ln_modulate_is_bit_exact(
+    shape, nmod, transposed, allow_eager, monkeypatch
+):
+    gate = BitExactFusionGate("Sana test LN+modulate", per_signature=True)
+    monkeypatch.setattr(sana, "_SANA_LN_MOD", gate)
+    monkeypatch.setattr(sana, "_SANA_LN_MOD_SIGS", gate.verified_sigs)
+    monkeypatch.setattr(sana, "_SANA_LN_MOD_DISABLED", False)
+    # Width 2240 exercises a partial tail chunk; nmod mirrors the two adaLN
+    # layouts, and transposed covers the permuted layout the DiT serves.
     torch.manual_seed(0)
     batch, seq, hidden = shape
     norm = torch.nn.LayerNorm(hidden, eps=1e-6, elementwise_affine=False).cuda()
@@ -791,27 +797,36 @@ def test_sana_fused_ln_modulate_is_bit_exact(shape, nmod, transposed):
         x = x.permute(0, 2, 1).contiguous().permute(0, 2, 1)
     emb = torch.randn(batch, nmod, hidden, device="cuda").bfloat16()
     shift, scale = emb.chunk(nmod, dim=1)[0], emb.chunk(nmod, dim=1)[-1]
-    # default-stream eager serving must stay on the untouched eager chain
-    n_sigs = len(sana._SANA_LN_MOD.verified_sigs)
-    sana_ln_modulate(norm, x, scale, shift)
-    assert len(sana._SANA_LN_MOD.verified_sigs) == n_sigs
-    # The fusion engages on non-default streams (the BCG warmup/capture path).
-    # x/scale/shift were filled on the default stream, so the side stream must
-    # wait for that work before reading them -- without this the fused kernel
-    # can read a half-written tensor, the first-sight torch.equal check fails,
-    # and the gate disables itself *permanently*, which then breaks every later
-    # parametrization too. It only loses the race when the GPU is contended,
-    # which is why it shows up on shared CI runners and not on an idle box.
-    side = torch.cuda.Stream()
-    side.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(side):
+
+    # Image inference still defaults to the eager chain.
+    with torch.no_grad():
         out = sana_ln_modulate(norm, x, scale, shift)
-        assert len(sana._SANA_LN_MOD.verified_sigs) == n_sigs + 1  # verified
-        out2 = sana_ln_modulate(norm, x, scale, shift)  # verified-sig lane
-    torch.cuda.current_stream().wait_stream(side)
+        assert torch.equal(out, _sana_eager_ln_modulate(norm, x, scale, shift))
+    assert not gate.verified_sigs
+
+    # The video opt-in must preserve autograd on the default stream.
+    with torch.enable_grad():
+        grad_out = sana_ln_modulate(
+            norm, x.requires_grad_(), scale, shift, allow_eager=allow_eager
+        )
+    assert grad_out.requires_grad
+    assert torch.equal(grad_out, _sana_eager_ln_modulate(norm, x, scale, shift))
+    x = x.detach()
+    assert not gate.verified_sigs
+
+    # The BCG side stream must wait for inputs filled on the default stream
+    # before first-use verification; otherwise a race permanently disables it.
+    current = torch.cuda.current_stream()
+    stream = current if allow_eager else torch.cuda.Stream()
+    stream.wait_stream(current)
+    with torch.no_grad(), torch.cuda.stream(stream):
+        out = sana_ln_modulate(norm, x, scale, shift, allow_eager=allow_eager)
+        assert len(gate.verified_sigs) == 1
+        out2 = sana_ln_modulate(norm, x, scale, shift, allow_eager=allow_eager)
+    current.wait_stream(stream)
     torch.cuda.synchronize()
     assert torch.equal(out, _sana_eager_ln_modulate(norm, x, scale, shift))
-    assert torch.equal(out2, out) and not sana._SANA_LN_MOD.disabled
+    assert torch.equal(out2, out) and not gate.disabled
 
 
 # -------------------------------------------------------------------------
@@ -1580,51 +1595,6 @@ def test_autoencoder_kl_fastpath_install():
 
 
 @torch.no_grad()
-@pytest.mark.skipif(not is_cuda(), reason="the fused Q/K norm is CUDA-only")
-def test_qwen21_qk_norm_verifies_and_preserves_native_fallback(monkeypatch):
-    x = torch.randn(1, 257, 8, 128, device="cuda", dtype=torch.bfloat16)
-    norm = qwen_image21.RMSNorm(
-        128, 1e-6, cast_x_before_out_mul=True, force_native=True
-    ).to(device=x.device, dtype=x.dtype)
-    norm.weight.normal_()
-    expected = norm(x)
-    gate = BitExactFusionGate("test Q/K norm")
-    monkeypatch.setattr(qwen_image21, "_QK_NORM_FUSION", gate)
-    assert torch.equal(qwen_image21.apply_qk_norm(x, norm), expected)
-    assert gate.verified and not gate.disabled
-    x.normal_()
-    assert torch.equal(qwen_image21.apply_qk_norm(x, norm), norm(x))
-
-    gate = BitExactFusionGate("test mismatched Q/K norm")
-    monkeypatch.setattr(qwen_image21, "_QK_NORM_FUSION", gate)
-    monkeypatch.setattr(
-        qwen_image21,
-        "rmsnorm_preserve_reduction",
-        lambda x, weight, eps: torch.zeros_like(x),
-    )
-    assert torch.equal(qwen_image21.apply_qk_norm(x, norm), norm(x))
-    assert gate.disabled and not gate.verified
-
-
-@torch.no_grad()
-def test_qwen21_qk_norm_does_not_verify_during_capture(monkeypatch):
-    x = torch.randn(1, 17, 2, 128, device="cuda", dtype=torch.bfloat16)
-    norm = qwen_image21.RMSNorm(
-        128, 1e-6, cast_x_before_out_mul=True, force_native=True
-    ).to(device=x.device, dtype=x.dtype)
-    norm(x)
-    gate = BitExactFusionGate("test captured Q/K norm")
-    monkeypatch.setattr(qwen_image21, "_QK_NORM_FUSION", gate)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        out = qwen_image21.apply_qk_norm(x, norm)
-    assert not gate.verified and not gate.disabled
-    x.normal_()
-    graph.replay()
-    assert torch.equal(out, norm(x))
-
-
-@torch.no_grad()
 @pytest.mark.skipif(not is_cuda(), reason="the fused LayerNorm modulation is CUDA-only")
 def test_qwen21_modulation_verifies_and_preserves_native_fallback(monkeypatch):
     x = torch.randn(1, 257, 4096, device="cuda", dtype=torch.bfloat16)
@@ -1676,6 +1646,71 @@ def test_qwen21_modulation_does_not_verify_during_capture(monkeypatch):
 requires_nvidia_jit = pytest.mark.skipif(
     not is_cuda(), reason="the Qwen-Image 2.1 JIT CUDA kernels are NVIDIA-only"
 )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or torch.version.hip is not None
+    or torch.cuda.get_device_capability() != (12, 0),
+    reason="Qwen-Image 2.1 BF16 MLP packing is enabled on SM120 only",
+)
+@torch.no_grad()
+@pytest.mark.parametrize("tokens", [1024, 4096])
+def test_qwen21_bf16_mlp_packing_restore_and_lora(tokens):
+    from sglang.multimodal_gen.runtime.layers.lora.linear import wrap_with_lora_layer
+
+    if not model_parallel_is_initialized():
+        ensure_distributed_env_defaults()
+        maybe_init_distributed_environment_and_model_parallel(tp_size=1, sp_size=1)
+    torch.manual_seed(42)
+    mlp = qwen_image21.QwenImage21FeedForward(4096, 3, None, "img_mlp").to(
+        device="cuda", dtype=torch.bfloat16
+    )
+    for parameter in mlp.parameters():
+        parameter.normal_(0, 0.01)
+    x = torch.randn(1, tokens, 4096, device="cuda", dtype=torch.bfloat16)
+    reference = mlp.out(F.silu(mlp.gate_layer(x)[0]) * mlp.proj(x)[0])[0]
+    mlp.pack_gate_up_weights()
+    assert set(mlp.state_dict()) == {"gate_layer.weight", "proj.weight", "out.weight"}
+    with patch.object(
+        qwen_image21,
+        "fused_packed_silu_mul_bitexact",
+        wraps=qwen_image21.fused_packed_silu_mul_bitexact,
+    ) as fused:
+        torch.testing.assert_close(
+            mlp(x, use_packed_bf16=True), reference, atol=2e-2, rtol=2e-2
+        )
+        assert fused.call_count == 1
+        assert torch.equal(mlp(x), reference)
+        prefix = x[:, :33].contiguous()
+        assert torch.equal(mlp(prefix, use_packed_bf16=True), mlp(prefix))
+        assert fused.call_count == 1
+
+        compiled = torch.compile(mlp, backend="eager", fullgraph=True)
+        assert torch.equal(compiled(x, use_packed_bf16=True), reference)
+        assert fused.call_count == 1
+
+        mlp.cpu().cuda()
+        torch.testing.assert_close(
+            mlp(x, use_packed_bf16=True), reference, atol=2e-2, rtol=2e-2
+        )
+        assert fused.call_count == 2
+        mlp.proj.weight.data = mlp.proj.weight.data.clone()
+        assert torch.equal(mlp(x, use_packed_bf16=True), reference)
+        assert fused.call_count == 2
+        mlp.pack_gate_up_weights()
+
+        wrapper = wrap_with_lora_layer(mlp.gate_layer, lora_rank=4, lora_alpha=4)
+        wrapper.set_lora_weights(
+            torch.randn(4, 4096, device=x.device, dtype=x.dtype) * 0.02,
+            torch.randn(12288, 4, device=x.device, dtype=x.dtype) * 0.02,
+            merge_weights=False,
+        )
+        mlp.gate_layer = wrapper
+        adapted = mlp(x)
+        assert not torch.equal(adapted, reference)
+        assert torch.equal(mlp(x, use_packed_bf16=True), adapted)
+        assert fused.call_count == 2
 
 
 def _qwen21_rope(tokens: int, device: torch.device) -> torch.Tensor:
@@ -2624,6 +2659,73 @@ def test_wan_text_kv_lives_for_one_loop_of_one_request():
         del req
         gc.collect()
         assert gone() is None
+
+
+@torch.inference_mode()
+@pytest.mark.skipif(not is_cuda(), reason="Requires CUDA")
+@pytest.mark.parametrize("mode", ["fused", "strided", "fp32", "mismatch"])
+def test_hidream_rope_dispatch_and_fallback(monkeypatch, mode):
+    """Preserve GQA and batch-specific tables, including the native fallback."""
+    from types import SimpleNamespace
+
+    from sglang.multimodal_gen.runtime.models.dits import hidream_o1_image as hidream
+
+    gate = BitExactFusionGate("HiDream RoPE test")
+    monkeypatch.setattr(hidream, "_HIDREAM_ROPE", gate)
+    generator = torch.Generator(device="cuda").manual_seed(42)
+    dtype = torch.float32 if mode == "fp32" else torch.bfloat16
+    qkv = torch.randn(2, 17, 12 * 128, device="cuda", dtype=dtype, generator=generator)
+    angles = torch.randn(2, 17, 128, device="cuda", generator=generator)
+    cos, sin = angles.cos().to(dtype), angles.sin().to(dtype)
+    norm = (lambda x: x) if mode == "strided" else lambda x: x.contiguous()
+    captured = []
+
+    def attention(q, k, v, *, attn_mask):
+        captured.append((q, k, v))
+        return q
+
+    # Run the real attention forward; isolate its RoPE from projection weights
+    # and SDPA so a Q/K rounding mismatch cannot disappear in a later cast.
+    layer = SimpleNamespace(
+        num_heads=8,
+        num_kv_heads=2,
+        head_dim=128,
+        q_size=8 * 128,
+        kv_size=2 * 128,
+        qkv_proj=lambda x: (x, None),
+        q_norm=norm,
+        k_norm=norm,
+        attn=attention,
+        o_proj=lambda x: (x, None),
+    )
+    fused = MagicMock(
+        side_effect=(
+            (lambda x, cos, sin: torch.zeros_like(x))
+            if mode == "mismatch"
+            else hidream.fused_rope_rotate_half_bitexact
+        )
+    )
+    monkeypatch.setattr(hidream, "fused_rope_rotate_half_bitexact", fused)
+    mask = torch.zeros(1, 1, 17, 17, device="cuda", dtype=dtype)
+    for x in (qkv, qkv * 2):
+        original = x.clone()
+        q, k, v = x.split([8 * 128, 2 * 128, 2 * 128], dim=-1)
+        expected_q, expected_k = hidream.qwen3_apply_rotary_pos_emb(
+            norm(q.reshape(2, 17, 8, 128)),
+            norm(k.reshape(2, 17, 2, 128)),
+            cos.unsqueeze(2),
+            sin.unsqueeze(2),
+        )
+        hidream.HiDreamO1Attention.forward(layer, x, cos, sin, mask)
+        actual_q, actual_k, actual_v = captured[-1]
+        assert torch.equal(actual_q, expected_q) and torch.equal(actual_k, expected_k)
+        assert torch.equal(actual_v, v.reshape(2, 17, 2, 128))
+        assert torch.equal(x, original)
+    assert (
+        fused.call_count == {"fused": 4, "strided": 0, "fp32": 0, "mismatch": 2}[mode]
+    )
+    assert gate.verified == (mode == "fused")
+    assert gate.disabled == (mode == "mismatch")
 
 
 if __name__ == "__main__":

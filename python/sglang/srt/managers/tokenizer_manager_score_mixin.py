@@ -14,6 +14,7 @@ from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 from sglang.srt.multimodal.media_io import ImageData
 from sglang.srt.runtime_context import get_exec, get_memory, get_schedule, get_serving
+from sglang.srt.utils.rid_utils import expand_base_rid
 
 logger = logging.getLogger(__name__)
 
@@ -212,7 +213,13 @@ class TokenizerManagerScoreMixin:
         phs_list = None
         if return_pooled_hidden_states:
             raw_phs = single_result.get("pooled_hidden_state")
-            if raw_phs is not None and len(raw_phs) == expected_count:
+            if raw_phs is not None:
+                if len(raw_phs) != expected_count:
+                    raise RuntimeError(
+                        f"Expected {expected_count} pooled hidden state rows for "
+                        f"multi-item scoring with {num_items} items, but got "
+                        f"{len(raw_phs)}. Request ID: {request_id}"
+                    )
                 phs_list = list(raw_phs[1:])
 
         return ScoreResult(
@@ -490,37 +497,6 @@ class TokenizerManagerScoreMixin:
             for idx, tok in enumerate(token_ids)
             if tok == embed_override_token_id
         ]
-
-    def _resolve_embed_overrides_for_request(
-        self,
-        query: List[int],
-        item: List[int],
-        embed_override_token_id: int,
-        query_embed_overrides: Optional[List[torch.Tensor]],
-        item_embeds: Optional[List[torch.Tensor]],
-        item_position_offset: int,
-        item_label: str,
-    ) -> Optional[PositionalEmbeds]:
-        """Resolve embed overrides for a query+item pair; None when no overrides exist."""
-        q_embeds, q_positions = self._resolve_overrides_for_sequence(
-            query,
-            query_embed_overrides,
-            embed_override_token_id,
-            position_offset=0,
-            label="query",
-        )
-        i_embeds, i_positions = self._resolve_overrides_for_sequence(
-            item,
-            item_embeds,
-            embed_override_token_id,
-            position_offset=item_position_offset,
-            label=item_label,
-        )
-        all_embeds = q_embeds + i_embeds
-        all_positions = q_positions + i_positions
-        if not all_embeds:
-            return None
-        return PositionalEmbeds(embeds=all_embeds, positions=all_positions)
 
     # ------------------------------------------------------------------
     # Input preparation (tokenization + input_ids construction)
@@ -908,6 +884,7 @@ class TokenizerManagerScoreMixin:
         temperature: float = 1.0,
         return_token_logprobs: bool = False,
         image_data: Optional[List[List[ImageData]]] = None,
+        rid: Optional[str] = None,
     ) -> ScoreResult:
         """
         Score the probability of specified token IDs appearing after the given (query + item) pair.
@@ -1015,10 +992,10 @@ class TokenizerManagerScoreMixin:
                 "stacked_query_item_embed_overrides is mutually exclusive with "
                 "query_embed_overrides / item_embed_overrides."
             )
-        if item_embed_overrides is not None and len(item_embed_overrides) != len(items):
+        if item_embed_overrides is not None and len(item_embed_overrides) != num_items:
             raise ValueError(
                 f"item_embed_overrides length ({len(item_embed_overrides)}) "
-                f"must match items length ({len(items)})."
+                f"must match items length ({num_items})."
             )
         if stacked_query_item_embed_overrides is not None:
             if isinstance(query, str) or isinstance(items, str):
@@ -1178,6 +1155,10 @@ class TokenizerManagerScoreMixin:
 
         # Create the appropriate request type
         mis_delimiter_indices = [delimiter_indices] if use_multi_item_scoring else None
+        sub_rids = None
+        if rid is not None:
+            prompts = text_prompts if text_prompts is not None else input_ids
+            sub_rids = expand_base_rid(rid, len(prompts))
         if is_generation:
             # packed MIS requests gather the union, then select per item
             request_labels = (
@@ -1205,6 +1186,7 @@ class TokenizerManagerScoreMixin:
                 positional_embed_overrides=positional_embed_overrides,
                 multi_item_delimiter_indices=mis_delimiter_indices,
                 token_indices_to_pool=token_indices_to_pool,
+                rid=sub_rids,
             )
         else:
             batch_request = EmbeddingReqInput(
@@ -1214,6 +1196,7 @@ class TokenizerManagerScoreMixin:
                 return_pooled_hidden_states=return_pooled_hidden_states,
                 multi_item_delimiter_indices=mis_delimiter_indices,
                 token_indices_to_pool=token_indices_to_pool,
+                rid=sub_rids,
             )
 
         results = await self.generate_request(batch_request, request).__anext__()
