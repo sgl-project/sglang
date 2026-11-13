@@ -212,7 +212,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                     and native.index_k is not None
                 ):
                     index_page_size = native.index_k.shape[2]
-                    index_compress_ratio = self.page_size // index_page_size
+                    index_compress_ratio = page_size // index_page_size
                     self._size_per_token += (
                         native.index_width
                         * self.dtype.itemsize
