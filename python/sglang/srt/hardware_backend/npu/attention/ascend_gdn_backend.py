@@ -355,6 +355,10 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
         h = k.new_empty(
             len(chunk_indices), v.shape[-2], v.shape[-1], k.shape[-1]
         )  # [NT, NH, DV, Dk]
+        if initial_state is not None and h.dtype != initial_state.dtype:
+            # The kernel asserts chunk_state.dtype == initial_state.dtype, and the
+            # recurrent state is fp32 while k/v follow the model dtype.
+            h = h.to(initial_state.dtype)
 
         core_attn_out, last_recurrent_state = torch.ops.npu.chunk_gated_delta_rule(
             q,
