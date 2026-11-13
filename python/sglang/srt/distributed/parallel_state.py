@@ -113,11 +113,13 @@ def get_torch_distributed_pg_options(group_name=None):
 
     import torch_npu
 
-    options = torch_npu._C._distributed_c10d.ProcessGroupHCCL.Options()
-    hccl_buffer_size = int(
-        os.environ.get("DEEPEP_HCCL_BUFFSIZE") or os.environ.get("HCCL_BUFFSIZE") or 200
+    # Local import avoids a cycle through sglang.srt.layers.moe.utils.
+    from sglang.srt.hardware_backend.npu.mc2_memory import (
+        resolve_deepep_hccl_buffsize_mb,
     )
-    options.hccl_config = {"hccl_buffer_size": hccl_buffer_size}
+
+    options = torch_npu._C._distributed_c10d.ProcessGroupHCCL.Options()
+    options.hccl_config = {"hccl_buffer_size": resolve_deepep_hccl_buffsize_mb()}
     return options
 
 
