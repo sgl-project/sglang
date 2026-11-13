@@ -51,8 +51,10 @@ from sglang.srt.plugins import GENERAL_PLUGINS_GROUP
 from sglang.srt.runtime_context import (
     get_context,
     get_device,
+    get_disagg,
     get_exec,
     get_parallel,
+    get_schedule,
     get_spec,
 )
 
@@ -1180,6 +1182,49 @@ def megakernel_enabled() -> bool:
     return get_exec().kernel.enable_nvidia_megakernel
 
 
+def _kimi_build_widths(
+    max_rows: int, tokens: int, architectures: Any, *, is_draft: bool
+) -> tuple[int, ...]:
+    """Omit unreachable q6 widths without changing eager or graph dispatch.
+
+    Preparation precedes KV sizing. For ordinary TP8, the resolved request
+    limit bounds the eventual pool, and unaligned graph buckets are clamped
+    to that pool. Keep every intervening width for eager execution and buckets
+    added during sizing. Unknown bounds or other layouts retain full preparation.
+    """
+    widths = tuple(range(tokens, max_rows + 1, tokens))
+    if is_draft or tuple(architectures or ()) != ("KimiK3ForConditionalGeneration",):
+        return widths
+    from sglang.srt.layers.dp_attention import get_cuda_graph_batch_size_alignment
+
+    config, parallel, disagg = get_spec(), get_parallel(), get_disagg()
+    graph = get_exec().graph.cuda_graph_config
+    request_limit = get_schedule().max_running_requests
+    if (
+        tokens == 6
+        and config.speculative_algorithm == "DSPARK"
+        and not config.speculative_adaptive
+        and type(request_limit) is int
+        and request_limit > 0
+        and parallel.tp_size == 8
+        and parallel.pp_size
+        == parallel.dp_size
+        == parallel.attn_cp_size
+        == parallel.dcp_size
+        == 1
+        and not parallel.enable_dp_attention
+        and disagg.disaggregation_mode == "null"
+        and not disagg.enable_pd_role_switch
+        and graph is not None
+        and graph.decode.backend == Backend.FULL
+        and get_cuda_graph_batch_size_alignment() == 1
+    ):
+        widths = tuple(range(tokens, min(max_rows, request_limit * tokens) + 1, tokens))
+    # Every target rank participates, including ranks retaining full preparation.
+    megakernel_agree(widths, what="Kimi preparation widths")
+    return widths
+
+
 def install_megakernel(
     *,
     model: torch.nn.Module,
@@ -1202,7 +1247,9 @@ def install_megakernel(
     tokens = _tokens_per_request()
     binding = _binding_class(hf_config.architectures)(model=model)
     context = BuildContext(
-        widths=tuple(range(tokens, spec.max_rows + 1, tokens)),
+        widths=_kimi_build_widths(
+            spec.max_rows, tokens, hf_config.architectures, is_draft=is_draft
+        ),
         tokens_per_request=tokens,
         deadline_s=deadline_s(get_device().watchdog_timeout),
         binding=binding,
