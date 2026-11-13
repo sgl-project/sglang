@@ -34,6 +34,8 @@ from sglang.kernels.plugin_kernels.nvidia.spec import (
     BuiltMegakernel,
     Feature,
     MegakernelSpec,
+    PostVerifyStrategy,
+    SpeculativeRuntimeHooks,
     Step,
     find_spec,
     registered_architectures,
@@ -49,8 +51,10 @@ from sglang.srt.plugins import GENERAL_PLUGINS_GROUP
 from sglang.srt.runtime_context import (
     get_context,
     get_device,
+    get_disagg,
     get_exec,
     get_parallel,
+    get_schedule,
     get_spec,
 )
 
@@ -383,6 +387,10 @@ class MegakernelBinding:
             backend, self._seal_cache, hybrid=hybrid, legacy=not hybrid_family
         )
         return view
+
+    def prefill_view(self) -> ForwardView:
+        """The view for an eager prefill step, without graph-static decode metadata."""
+        return self.forward_view(forward_batch=None)
 
     def seal_capture_view(self, forward_batch: ForwardBatch, view: ForwardView) -> None:
         """Seal graph-static step tensors for this mode and batch-size bucket."""
@@ -1174,6 +1182,49 @@ def megakernel_enabled() -> bool:
     return get_exec().kernel.enable_nvidia_megakernel
 
 
+def _kimi_build_widths(
+    max_rows: int, tokens: int, architectures: Any, *, is_draft: bool
+) -> tuple[int, ...]:
+    """Omit unreachable q6 widths without changing eager or graph dispatch.
+
+    Preparation precedes KV sizing. For ordinary TP8, the resolved request
+    limit bounds the eventual pool, and unaligned graph buckets are clamped
+    to that pool. Keep every intervening width for eager execution and buckets
+    added during sizing. Unknown bounds or other layouts retain full preparation.
+    """
+    widths = tuple(range(tokens, max_rows + 1, tokens))
+    if is_draft or tuple(architectures or ()) != ("KimiK3ForConditionalGeneration",):
+        return widths
+    from sglang.srt.layers.dp_attention import get_cuda_graph_batch_size_alignment
+
+    config, parallel, disagg = get_spec(), get_parallel(), get_disagg()
+    graph = get_exec().graph.cuda_graph_config
+    request_limit = get_schedule().max_running_requests
+    if (
+        tokens == 6
+        and config.speculative_algorithm == "DSPARK"
+        and not config.speculative_adaptive
+        and type(request_limit) is int
+        and request_limit > 0
+        and parallel.tp_size == 8
+        and parallel.pp_size
+        == parallel.dp_size
+        == parallel.attn_cp_size
+        == parallel.dcp_size
+        == 1
+        and not parallel.enable_dp_attention
+        and disagg.disaggregation_mode == "null"
+        and not disagg.enable_pd_role_switch
+        and graph is not None
+        and graph.decode.backend == Backend.FULL
+        and get_cuda_graph_batch_size_alignment() == 1
+    ):
+        widths = tuple(range(tokens, min(max_rows, request_limit * tokens) + 1, tokens))
+    # Every target rank participates, including ranks retaining full preparation.
+    megakernel_agree(widths, what="Kimi preparation widths")
+    return widths
+
+
 def install_megakernel(
     *,
     model: torch.nn.Module,
@@ -1196,7 +1247,9 @@ def install_megakernel(
     tokens = _tokens_per_request()
     binding = _binding_class(hf_config.architectures)(model=model)
     context = BuildContext(
-        widths=tuple(range(tokens, spec.max_rows + 1, tokens)),
+        widths=_kimi_build_widths(
+            spec.max_rows, tokens, hf_config.architectures, is_draft=is_draft
+        ),
         tokens_per_request=tokens,
         deadline_s=deadline_s(get_device().watchdog_timeout),
         binding=binding,
@@ -1275,6 +1328,43 @@ def prepare_megakernel(model_runner: ModelRunner) -> None:
         installed.prepare(
             installed.built, installed.binding.preparation_view(model_runner)
         )
+
+
+def bind_speculative_runtime_hooks(
+    model: torch.nn.Module,
+    defaults: SpeculativeRuntimeHooks,
+) -> SpeculativeRuntimeHooks:
+    """Resolve target-side speculative strategies once at the binding boundary.
+
+    The caller's stock strategies are returned by identity when the runtime master
+    switch is off or the built provider has no factory. Provider presence must agree
+    across ranks before any rank can call it. The provider may change the local key
+    builder, but the runtime-owned verification runner cannot be replaced.
+    """
+    if not envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get():
+        return defaults
+
+    built = built_megakernel(model)
+    factory = None if built is None else built.speculative_runtime_hooks
+    megakernel_agree(
+        factory is not None,
+        what="speculative runtime hooks factory presence",
+    )
+    if factory is None:
+        return defaults
+
+    hooks = factory(defaults)
+    if not isinstance(hooks, SpeculativeRuntimeHooks):
+        raise TypeError(
+            "speculative runtime hooks factory must return SpeculativeRuntimeHooks"
+        )
+    if not isinstance(hooks.post_verify, PostVerifyStrategy):
+        raise TypeError("post_verify must be a PostVerifyStrategy")
+    if hooks.post_verify.run is not defaults.post_verify.run:
+        raise ValueError("a provider cannot replace the runtime post-verify runner")
+    if not callable(hooks.post_verify.local_keys):
+        raise TypeError("post_verify.local_keys must be callable")
+    return hooks
 
 
 def megakernel_agree(value: Any, *, what: str, group: Any = None) -> None:
@@ -1472,11 +1562,18 @@ class _Dispatch:
                     input_ids, positions, forward_batch, *args, **kwargs
                 )
             if isinstance(self.binding, MegakernelBinding):
-                view = self.binding.forward_view(forward_batch)
-                if capturing:
-                    self.binding.seal_capture_view(forward_batch, view)
+                if step.mode == "prefill":
+                    view = self.binding.prefill_view()
+                else:
+                    view = self.binding.forward_view(forward_batch)
+                    if capturing:
+                        self.binding.seal_capture_view(forward_batch, view)
             else:
-                view = self.binding.forward_view()
+                view = (
+                    self.binding.prefill_view()
+                    if step.mode == "prefill"
+                    else self.binding.forward_view()
+                )
             return self.built.forward(
                 msgspec.structs.replace(step, view=view),
                 self.original,

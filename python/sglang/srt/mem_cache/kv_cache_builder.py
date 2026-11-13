@@ -42,6 +42,7 @@ from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.events import KvEventLoraNames
 from sglang.srt.mem_cache.hicache_auto_size import auto_size_hicache
+from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.memory.views import MHAKVView, MLAKVView
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
@@ -52,6 +53,7 @@ from sglang.srt.mem_cache.pool_host.base import (
 from sglang.srt.mem_cache.pool_host.mha import prepare_mha_write_back_staging
 from sglang.srt.mem_cache.pool_host.page_unified import resolve_kv_host_geometry
 from sglang.srt.mem_cache.registry import TreeCacheBuildContext, create_tree_cache
+from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.runtime_context import (
@@ -226,6 +228,15 @@ def uses_ssm_state(model_config) -> bool:
     )
 
 
+def agree_on_stage_request_capacity(*, tp_worker: BaseTpWorker) -> None:
+    """Once the pool is final, and before its request limits are read and the HiCache
+    host pools are sized: pipeline stages serve the same requests, so every stage
+    keeps the smallest share."""
+    allocator = tp_worker.model_runner.token_to_kv_pool_allocator
+    if get_parallel().pp_size > 1 and isinstance(allocator, ChainAllocator):
+        allocator.agree_on_stage_shares(get_parallel().pp_group.cpu_group)
+
+
 def resolve_decode_retraction_backup(*, tp_worker: BaseTpWorker) -> str:
     """Resolve the retraction backend onto the config bags and return it.
 
@@ -337,7 +348,7 @@ def validate_decode_radix_cache(
     # DeepSeek-V4 qualifies only on the unified KV layout (bf16 or fp8 rows): its
     # SWA ring and c128 state are request-scoped and always transferred whole, so
     # the tree shares only the compressed full-attention pages.
-    if getattr(model_config, "is_deepseek_v4_arch", False) and not getattr(
+    if getattr(model_config, "is_compressed_kv_arch", False) and not getattr(
         token_to_kv_pool, "_unified_kv", False
     ):
         raise ValueError(
@@ -365,7 +376,7 @@ def build_kv_cache(
     hicache_draft_plan: Optional[HiCacheDraftPlan] = None,
     dynamo_kv_event_format: bool = False,
     kv_event_lora_names: Optional[KvEventLoraNames] = None,
-    draft_swa_window: int = 0,
+    draft_window_reaches: Optional[dict[str, int]] = None,
 ) -> KVCacheBuildResult:
     parallel = get_parallel()
     sliding_window_size: Optional[int] = None
@@ -390,11 +401,13 @@ def build_kv_cache(
         full_tokens_per_layer, swa_tokens_per_layer = (
             tp_worker.get_tokens_per_layer_info()
         )
-    assert draft_swa_window == 0 or sliding_window_size is not None, (
-        "a fused draft reads an swa sub-pool this target does not build"
-    )
 
     req_to_token_pool, token_to_kv_pool_allocator = tp_worker.get_memory_pool()
+    # The tail a running request keeps of each window, which the prefix tree,
+    # PD peers and admission read from the storage alone.
+    kv_storage_of(req_to_token_pool, token_to_kv_pool_allocator).bind_window_retention(
+        sliding_window_size, draft_window_reaches
+    )
     mtp_draft_device_pools = tp_worker.model_runner.mtp_draft_device_pools
     # SWA the tree does not own must not gate prefix matching: a per-request ring,
     # or paged SWA beside the target's encoder-replay request window, which then
@@ -467,7 +480,6 @@ def build_kv_cache(
         chunked_prefill_size=effective_chunked_prefill_size,
         sliding_window_size=sliding_window_size,
         swa_gates_prefix_match=swa_gates_prefix_match,
-        draft_swa_window=draft_swa_window,
         mtp_draft_device_pools=mtp_draft_device_pools,
         mtp_draft_mamba_pools=tp_worker.model_runner.mtp_draft_mamba_pools,
         sidecar_draft_device_pools=(

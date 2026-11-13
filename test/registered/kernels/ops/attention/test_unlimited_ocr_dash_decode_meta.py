@@ -40,7 +40,7 @@ from sglang.test.kernels.unlimited_ocr_dash import (
     torch_decode_page_meta,
 )
 
-register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 BS, IMG, PAGE, MM_PAD = 128, 99, 7, 1_000_000
 NUM_BLOCKS, WIDTH = 64, 12
