@@ -380,7 +380,12 @@ class ChunkSizePredictor:
             return None
 
         sqrt_discriminant = math.sqrt(discriminant)
-        calculated_chunk_size_float = (-B + sqrt_discriminant) / (2 * A)
+        # Rationalize the positive root to avoid subtracting nearly equal
+        # values when the latency model is dominated by its linear term.
+        denominator = B + sqrt_discriminant
+        if denominator == 0:
+            return None
+        calculated_chunk_size_float = -2 * C / denominator
 
         if calculated_chunk_size_float <= 0:
             logger.warning(
