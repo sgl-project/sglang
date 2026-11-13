@@ -36,10 +36,17 @@ from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.layout.paged_view import paged_kv_view
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
+    get_attn_backend,
     get_kv_layers,
     get_token_to_kv_pool,
 )
 from sglang.srt.model_executor.runner import get_is_capture_mode
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    is_in_breakable_cuda_graph,
+)
+from sglang.srt.model_executor.runner_utils.prefill_graph import (
+    is_in_prefill_graph_scope,
+)
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_exec, get_forward, get_parallel, get_spec
 from sglang.srt.utils import (
@@ -322,27 +329,66 @@ def enable_fused_set_kv_buffer(forward_batch: ForwardBatch):
     if get_parallel().dcp_enabled:
         return False
     pool = get_token_to_kv_pool()
+    if (
+        _is_hip
+        and is_in_breakable_cuda_graph()
+        and is_in_prefill_graph_scope()
+        and getattr(pool, "requires_physical_write_loc", False)
+    ):
+        # Breakable prefill can rebuild window write ids on replay instead of
+        # refilling the tensor whose address a fused store would capture.
+        router = pool.layer_router
+        if any(
+            sub_pool.layer_ids and not router.layer(sub_pool.layer_ids[0]).owner
+            for sub_pool in router.sub_pools()
+        ):
+            return False
     return (
         _is_cuda
         and pool.dtype == torch.bfloat16
         and pool.layer_router.sub_pool(IdSpaceKind.SLIDING_WINDOW) is None
         and not is_cp_active(forward_batch)
         and getattr(forward_batch, "dcp_kv_mask", None) is None
-    ) or (
-        _is_hip
-        and getattr(forward_batch, "dcp_kv_mask", None) is None
-        and not _window_writes_translated(pool)
+    ) or (_is_hip and getattr(forward_batch, "dcp_kv_mask", None) is None)
+
+
+def _fused_window_cache_loc(forward_batch, sub_pool: str) -> torch.Tensor:
+    """Borrow the physical window write ids prepared by the active backend.
+
+    Decode graphs refill these buffers in place after page relocation.
+    """
+    from sglang.srt.layers.attention.hybrid_attn_backend import HybridAttnBackend
+    from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+        HybridLinearAttnBackend,
     )
+    from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 
+    backend = get_attn_backend()
+    while True:
+        if isinstance(backend, HybridAttnBackend):
+            backend = backend._select_backend(forward_batch.forward_mode)
+        elif isinstance(backend, HybridLinearAttnBackend):
+            backend = backend.full_attn_backend
+        elif isinstance(backend, TboAttnBackend):
+            # TBO model operations publish their child in ForwardContext;
+            # outside a child scope the dispatcher runs its primary.
+            backend = backend.primary
+        else:
+            break
 
-def _window_writes_translated(pool) -> bool:
-    """Whether the pool's window layers write at ids of their own that only the
-    pool's write door derives (a unified pool's window view). The fused store
-    maps window slots through `full_to_swa_index_mapping`, which such a pool
-    does not have, so it would write window layers at the owner's ids."""
-    router = pool.layer_router
-    window = router.sub_pool(IdSpaceKind.SLIDING_WINDOW)
-    return window is not None and router.view(window.name).requires_physical_write_loc
+    metadata = backend.forward_metadata
+    # Triton carries named rails; the other MHA backends carry one window.
+    windows = getattr(metadata, "windows", None)
+    loc = (
+        windows[sub_pool].out_cache_loc
+        if windows is not None
+        else metadata.swa_out_cache_loc
+    )
+    num_tokens = forward_batch.out_cache_loc.numel()
+    assert loc is not None and loc.numel() >= num_tokens, (
+        f"Fused KV store requires prepared physical write ids for {sub_pool!r}."
+    )
+    return loc[:num_tokens]
 
 
 def create_fused_set_kv_buffer_arg(
@@ -371,17 +417,24 @@ def create_fused_set_kv_buffer_arg(
         # share one slot space indexed directly by out_cache_loc (as --disable-hybrid-swa-memory
         # gives). Leaving swa_slot_mapping=None makes the fused store write at
         # out_cache_loc, matching the CUDA path (which never fuses the hybrid pool).
-        full_to_swa = (
-            token_to_kv_pool.full_to_swa_index_mapping
-            if token_to_kv_pool.layer_router.sub_pool(IdSpaceKind.SLIDING_WINDOW)
-            is not None
-            else None
-        )
-        slot_mapping_swa = (
-            full_to_swa.long()
-            if layer.sliding_window_size > 0 and full_to_swa is not None
-            else None
-        )
+        translated = getattr(token_to_kv_pool, "requires_physical_write_loc", False)
+        slot_mapping = forward_batch.out_cache_loc
+        slot_mapping_swa = None
+        if translated:
+            assert forward_batch.out_cache_loc_is_physical, (
+                "Fused arena KV store requires physical write locations."
+            )
+            if not kv.owner:
+                slot_mapping = _fused_window_cache_loc(forward_batch, kv.route.sub_pool)
+        else:
+            full_to_swa = (
+                token_to_kv_pool.full_to_swa_index_mapping
+                if token_to_kv_pool.layer_router.sub_pool(IdSpaceKind.SLIDING_WINDOW)
+                is not None
+                else None
+            )
+            if layer.sliding_window_size > 0 and full_to_swa is not None:
+                slot_mapping_swa = full_to_swa.long()
         # SHUFFLE 5D pools (k_buffer.ndim == 5) consumed natively by
         # fused_qk_rope_reshape_and_cache via flash_layout=False. For the
         # legacy NHD 3D pool we reshape to the (num_blocks, page_size, H, D)
@@ -402,8 +455,9 @@ def create_fused_set_kv_buffer_arg(
             "v_scale": layer.v_scale,
             "key_cache": key_cache,
             "value_cache": value_cache,
-            "slot_mapping": forward_batch.out_cache_loc,
+            "slot_mapping": slot_mapping,
             "swa_slot_mapping": slot_mapping_swa,
+            "reserved_skip_index": 0 if translated else -1,
         }
 
 
