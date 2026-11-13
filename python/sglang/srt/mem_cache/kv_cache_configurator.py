@@ -1187,11 +1187,7 @@ class KVCacheConfigurator:
                 else 0
             )
             return extra_max_context_len, pre_alloc_size
-        pre_alloc_size = 0
-        if disagg.disaggregation_mode == "decode" or disagg.enable_pd_role_switch:
-            # A flip-capable prefill needs the decode pool shape.
-            pre_alloc_size = disagg.disaggregation_decode_extra_slots or 0
-        return get_req_to_token_extra_context_len(), pre_alloc_size
+        return get_req_to_token_extra_context_len(), self._req_pool_pre_alloc_size()
 
     def _unified_swa_head_geometry(self) -> _UnifiedSWAHeadGeometry:
         """Head geometry of a hybrid-SWA host's full and SWA sub-pools."""
@@ -1493,16 +1489,23 @@ class KVCacheConfigurator:
             return 2 * max_running_requests
         return max_running_requests
 
+    def _req_pool_pre_alloc_size(self) -> int:
+        """Pre-alloc rows of a PD decode req pool (0 for any other pool)."""
+        disagg = get_disagg()
+        # A flip-capable prefill needs the decode pool shape, and the extra-slot
+        # default is only computed for a decode launch.
+        if disagg.enable_pd_role_switch:
+            return disagg.disaggregation_decode_extra_slots or 0
+        if disagg.disaggregation_mode == "decode":
+            return disagg.disaggregation_decode_extra_slots
+        return 0
+
     def _build_req_to_token_pool(self, *, max_num_reqs: int) -> ReqToTokenPool:
         extra_max_context_len = get_req_to_token_extra_context_len()
 
         disagg = get_disagg()
         if disagg.disaggregation_mode == "decode" or disagg.enable_pd_role_switch:
-            # A flip-capable prefill needs the decode pool shape, and the extra-slot
-            # default is only computed for a decode launch.
-            pre_alloc_size = disagg.disaggregation_decode_extra_slots
-            if disagg.enable_pd_role_switch:
-                pre_alloc_size = pre_alloc_size or 0
+            pre_alloc_size = self._req_pool_pre_alloc_size()
             if self.mambaish_config:
                 return self._build_hybrid_mamba_decode_req_pool(
                     max_num_reqs=max_num_reqs,
@@ -2669,6 +2672,20 @@ class KVCacheConfigurator:
             mla_pool_class=mla_pool_class,
             dsa_pool_class=dsa_pool_class,
         )
+        if (
+            extra_args.get("use_dsa")
+            and not self.is_draft_worker
+            and get_memory().enable_hisparse
+        ):
+            reject_out_of_tree_path(
+                current_platform, subsystem="the HiSparse DSA KV pool"
+            )
+            from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+
+            full_pool_class = HiSparseDSATokenToKVPool
+            extra_args["host_to_device_ratio"] = (
+                parse_hisparse_config().host_to_device_ratio
+            )
         from sglang.srt.layers.attention.qsa.config import (
             parse_qsa_profile,
         )
@@ -2736,9 +2753,10 @@ class KVCacheConfigurator:
         page_size = get_schedule().page_size * self.dflash_draft_loc_space_scale
         rows = draft_kv_ring_pool_rows_from_config(
             self.spec_aux_config.draft_model_config.hf_config,
-            # Request rows plus the padding row: the ring is off under PD, so no
-            # pre-alloc rows.
-            req_to_token_rows=self._req_pool_rows(max_num_reqs) + 1,
+            # Request rows, PD pre-alloc rows and the padding row.
+            req_to_token_rows=(
+                self._req_pool_rows(max_num_reqs) + self._req_pool_pre_alloc_size() + 1
+            ),
             page_size=page_size,
         )
         # The pool adds one padding page.
@@ -3617,21 +3635,26 @@ def calculate_mla_kv_cache_dim(
     if not is_dsa_model:
         return kv_cache_dim
 
-    # TRTLLM uses the raw MLA KV layout. In disaggregated serving only the
-    # backend for the local role determines the local pool layout; the
+    # TRTLLM and Prims-TS use the raw MLA KV layout. In disaggregated serving
+    # only the backend for the local role determines the local pool layout; the
     # inactive role may legitimately have a different default backend.
+    from sglang.srt.layers.attention.dsa_backend import uses_raw_fp8_dsa_kv_layout
+
     disaggregation_mode = get_disagg().disaggregation_mode
     if disaggregation_mode == "decode":
-        uses_trtllm_kv_layout = get_exec().kernel.dsa_decode_backend == "trtllm"
-    elif disaggregation_mode == "prefill":
-        uses_trtllm_kv_layout = get_exec().kernel.dsa_prefill_backend == "trtllm"
-    else:
-        uses_trtllm_kv_layout = (
-            get_exec().kernel.dsa_prefill_backend == "trtllm"
-            or get_exec().kernel.dsa_decode_backend == "trtllm"
+        uses_raw_fp8_kv_layout = uses_raw_fp8_dsa_kv_layout(
+            get_exec().kernel.dsa_decode_backend
         )
+    elif disaggregation_mode == "prefill":
+        uses_raw_fp8_kv_layout = uses_raw_fp8_dsa_kv_layout(
+            get_exec().kernel.dsa_prefill_backend
+        )
+    else:
+        uses_raw_fp8_kv_layout = uses_raw_fp8_dsa_kv_layout(
+            get_exec().kernel.dsa_prefill_backend
+        ) or uses_raw_fp8_dsa_kv_layout(get_exec().kernel.dsa_decode_backend)
 
-    if uses_trtllm_kv_layout:
+    if uses_raw_fp8_kv_layout:
         return kv_cache_dim
 
     # On HIP, TileLang and AITER DSA kernels consume the raw MLA KV layout:

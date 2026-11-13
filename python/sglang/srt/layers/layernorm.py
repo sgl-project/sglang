@@ -1663,26 +1663,3 @@ class Gemma4RMSNorm(BaseFusedOp):
         # sgl_kernel's gemma_rmsnorm is not available on ROCm;
         # delegate to the pure-PyTorch implementation.
         return self.forward_native(x)
-
-
-class RMSNormWithoutScale(BaseFusedOp):
-    def __init__(self, hidden_size: int, eps=1e-6):
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.eps = eps
-
-    def _norm(self, x):
-        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
-
-    def forward_native(self, x):
-        orig_dtype = x.dtype
-        x = x.float()
-        variance = x.pow(2).mean(dim=-1, keepdim=True)
-        x = x * torch.rsqrt(variance + self.eps)
-        return x.to(orig_dtype)
-
-    def forward_cuda(self, x):
-        return self.forward_native(x)
-
-    def extra_repr(self):
-        return f"{self.hidden_size}, eps={self.eps}"
