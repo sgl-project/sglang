@@ -306,11 +306,22 @@ class ConfigManager:
                             "path": cls.resolve_simopus_path(options[key].get("path")),
                         }
                 if options.get("native_source_binding") is not None:
-                    binding = options["native_source_binding"]
-                    options["native_source_binding"] = {
-                        **binding,
-                        "root": cls.resolve_simopus_path(binding.get("root")),
-                    }
+                    from sglang_simulator.time_predictor.simopus_sdk import load_sdk
+
+                    try:
+                        _, sdk = load_sdk()
+                        resolve_binding = sdk.resolve_native_source_binding
+                    except (ImportError, AttributeError) as error:
+                        from sglang_simulator.time_predictor.base import PredictorError
+
+                        raise PredictorError(
+                            "provider_initialization_failed",
+                            "SimOpus lacks the public source-binding contract",
+                        ) from error
+                    options["native_source_binding"] = resolve_binding(
+                        options["native_source_binding"],
+                        base_dir=Path(Envs.config_path()).resolve().parent,
+                    )
                 for key in ("native_cost_evidence_path", "model_config_root"):
                     if options.get(key) is not None:
                         options[key] = cls.resolve_simopus_path(options[key])
