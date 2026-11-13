@@ -5,8 +5,10 @@ sets: native capture, Foundry SAVE (captures and writes the archive) and
 Foundry LOAD (rebuilds the graphs from the archive instead of capturing). LOAD
 must produce the same greedy tokens as native, restore every archived graph
 (the summed restore time is printed, not bounded), and actually run Foundry.
-Two cases: test_restore_replays_every_archived_graph and
-test_greedy_output_matches_native.
+Three cases: test_restore_replays_every_archived_graph,
+test_greedy_output_matches_native and test_load_startup_stays_bounded (LOAD's
+capture loops and scheduler init stay under a bound in CI, and under half of
+native's capture time anywhere).
 
 Two configurations: Qwen3.5-2B (hybrid gated DeltaNet) with decode graphs
 only, since its full-backend prefill capture fails in SGLang (the GDN
@@ -34,6 +36,7 @@ import unittest
 import requests
 
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.kits.perf_bench_kit import at_most, check_perf, reported
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -90,6 +93,7 @@ _CAPTURED_BS = re.compile(
 )
 # SGLang's own startup timers (the launcher prints them once the schedulers are up).
 _STARTUP_TIMINGS = re.compile(r"Engine startup timings \(s\): (.*)")
+_STARTUP_FIELDS = re.compile(r"scheduler_e2e=([0-9.]+), cuda_graph=\{([^}]*)\}")
 _PREFILL_PASSES = re.compile(
     r'^sglang:cuda_graph_passes_total\{[^}]*mode="prefill_cuda_graph"[^}]*\}'
     r"\s+([0-9.eE+-]+)$",
@@ -107,6 +111,16 @@ def _write_toml(path: str, workspace: str) -> str:
             f'workspace_root = "{workspace}"\nscratch_space_size = "1024MB"\n'
         )
     return path
+
+
+def _startup_seconds(log: str):
+    """(scheduler init, time in the runners' capture loops over every graph set)
+    from the engine's startup-timings line, or None without one."""
+    match = _STARTUP_FIELDS.search(log)
+    if match is None:
+        return None
+    graph_s = sum(float(item.split("=")[1]) for item in match.group(2).split(", "))
+    return float(match.group(1)), graph_s
 
 
 def _prefill_graph_passes(base_url: str) -> float:
@@ -145,6 +159,11 @@ class TestFoundryGraphPersistence(CustomTestCase):
     # Batched outputs are compared with native unless a subclass says otherwise
     # (DP attention composes batches per rank, which differs run to run natively).
     compare_batched = True
+    # Upper bounds on the LOAD engine in CI, seconds, about twice what the H100
+    # runners measure: the capture loops of every graph set (restore + SGLang's
+    # per-shape prep) and the scheduler's whole init.
+    load_graph_s = 4.0
+    load_scheduler_s = 20.0
     # A layout whose native engine cannot start on this machine (DeepEP without
     # a usable NVSHMEM transport) is skipped instead of failed.
     native_failure_skips = False
@@ -361,6 +380,26 @@ class TestFoundryGraphPersistence(CustomTestCase):
                 # An allocation outside the region is only logged by the hook.
                 self.assertNotIn("[HOOK] ERROR", engine_log)
 
+    def test_load_startup_stays_bounded(self):
+        """Without it a change that makes LOAD pay capture work again (a warmup
+        forward per shape, a compile inside the capture loop) passes the output
+        and count checks while the restore saves nothing."""
+        native, load = (
+            _startup_seconds(self.runs[engine]["log"]) for engine in ("native", "load")
+        )
+        self.assertIsNotNone(native, "no startup-timings line in the native log")
+        self.assertIsNotNone(load, "no startup-timings line in the LOAD log")
+        check_perf(
+            self,
+            at_most("load_cuda_graph", load[1], self.load_graph_s, unit="s"),
+            at_most("load_scheduler_e2e", load[0], self.load_scheduler_s, unit="s"),
+            reported("native_cuda_graph", native[1], unit="s"),
+            reported("native_scheduler_e2e", native[0], unit="s"),
+            suffix=f"_{type(self).__name__}",
+        )
+        # On any machine: native warms every shape up twice and captures it once.
+        self.assertLess(load[1], 0.5 * native[1])
+
     def test_greedy_output_matches_native(self):
         for engine in ("save", "load"):
             kinds = (
@@ -402,6 +441,9 @@ class TestFoundryGraphPersistenceSpecPrefill(TestFoundryGraphPersistence):
         "--load-format",
         "dummy",
     ]
+    # Four graph sets instead of one, and a draft model to initialize.
+    load_graph_s = 12.0
+    load_scheduler_s = 28.0
 
 
 if __name__ == "__main__":
