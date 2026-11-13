@@ -1,7 +1,8 @@
 """P0 NPU tests: tensor weight refit with TP=2 (per-rank NPU IPC).
 
 One payload is sent per TP rank and compared (text + token logprobs) against a
-server that loaded the same generated checkpoint at startup.
+server that loaded the same generated checkpoint at startup. Each model case
+becomes its own test class, so new models only add a ``WeightUpdateModelCase``.
 """
 
 import os
@@ -15,6 +16,7 @@ from sglang.test.ascend import test_npu_rl_weights as weights
 from sglang.test.ascend.test_npu_rl_utils import (
     assert_logprob_signature_equal,
     begin_weight_update,
+    checkpoint_manifest,
     checkpoint_tensor_index,
     end_weight_update,
     health,
@@ -33,15 +35,8 @@ from sglang.test.test_utils import CustomTestCase
 register_npu_ci(est_time=1200, suite="base-b-test-2-npu-a3")
 register_npu_ci(est_time=1200, suite="nightly-2-npu-a3", nightly=True)
 
-CASE = weights.GLM52_CASE
-MODEL = weights.model_path(CASE)
-PROMPTS = weights.SIGNATURE_PROMPTS
 TP_SIZE = 2
 UPDATE_ROUNDS = 2
-TARGET_WEIGHT = "model.layers.0.mlp.down_proj.weight"
-SUBSET_WEIGHT = "model.layers.1.mlp.down_proj.weight"
-MOE_LAYER = 3
-MOE_EXPERTS = CASE.hf_overrides["n_routed_experts"]
 FLATTENED_BUCKET_SKIP_REASON = (
     "blocked: flattened_bucket updates corrupt routed-expert weights on both "
     "the IPC and HCCL paths; per-tensor updates reproduce startup loading."
@@ -51,7 +46,7 @@ HCCL_PORT_RANGE = os.environ.setdefault(
     "HCCL_NPU_SOCKET_PORT_RANGE",
     f"{30000 + (os.getpid() * 7) % 20000}-{30000 + (os.getpid() * 7) % 20000 + 99}",
 )
-GLM_ARGS = (
+BASE_ARGS = (
     "--trust-remote-code",
     "--attention-backend",
     "ascend",
@@ -62,36 +57,64 @@ GLM_ARGS = (
     "4096",
     "--max-running-requests",
     "4",
-    "--tp-size",
-    str(TP_SIZE),
-    # The trainer process holds one full payload per rank on the NPUs.
+    # Leave room for the trainer's full payload on the same NPU.
     "--mem-fraction-static",
     "0.35",
-    *weights.server_override_args(CASE),
 )
-REFERENCE_ARGS = GLM_ARGS
-LANE_ARGS = GLM_ARGS + ("--load-format", "dummy")
+
+
+def _server_args(case, *, dummy):
+    args = (*BASE_ARGS, "--tp-size", str(TP_SIZE), *case.extra_server_args)
+    return args + (("--load-format", "dummy") if dummy else ())
+
+
+def _pick_tensor(manifest, suffixes, *, exclude=()):
+    for suffix in suffixes:
+        for name, _, _ in manifest:
+            if name.endswith(suffix) and name not in exclude:
+                return name
+    raise AssertionError(f"no tensor ending with {suffixes}")
 
 
 def _ids(signature):
     return [item[0] for item in signature]
 
 
-@unittest.skipUnless(npu_device_count() >= TP_SIZE, "requires at least 2 Ascend NPUs")
-class TestNpuUpdateWeightsFromTensor(CustomTestCase):
+class _TensorSuite:
+    CASE = None
+
     @classmethod
     def setUpClass(cls):
-        cls.checkpoint = weights.ensure_checkpoint(CASE)
+        case = cls.CASE
+        cls.checkpoint = weights.ensure_checkpoint(case)
+        cls.manifest = checkpoint_manifest(cls.checkpoint)
         cls.tensor_index = checkpoint_tensor_index(cls.checkpoint)
+        cls.target = _pick_tensor(
+            cls.manifest, [".self_attn.o_proj.weight", ".linear_attn.out_proj.weight"]
+        )
+        cls.subset = _pick_tensor(
+            cls.manifest,
+            [".self_attn.o_proj.weight", ".linear_attn.out_proj.weight"],
+            exclude={cls.target},
+        )
+        cls.expert_tensors = [
+            name
+            for name, _, _ in cls.manifest
+            if ".mlp.experts." in name and "down_proj" in name
+        ]
         env = {**npu_rl_env(), "HCCL_NPU_SOCKET_PORT_RANGE": HCCL_PORT_RANGE}
-        with npu_server(cls.checkpoint, extra_args=REFERENCE_ARGS, env=env) as base_url:
-            cls.reference = logprob_signature(base_url, PROMPTS)
-        cls._lane_ctx = npu_server(MODEL, extra_args=LANE_ARGS, env=env)
-        cls.lane_url = cls._lane_ctx.__enter__()
+        with npu_server(
+            cls.checkpoint, extra_args=_server_args(case, dummy=False), env=env
+        ) as base_url:
+            cls.reference = logprob_signature(base_url, weights.SIGNATURE_PROMPTS)
+        cls._lane = npu_server(
+            cls.checkpoint, extra_args=_server_args(case, dummy=True), env=env
+        )
+        cls.lane_url = cls._lane.__enter__()
 
     @classmethod
     def tearDownClass(cls):
-        cls._lane_ctx.__exit__(None, None, None)
+        cls._lane.__exit__(None, None, None)
 
     def tearDown(self):
         try:
@@ -99,123 +122,117 @@ class TestNpuUpdateWeightsFromTensor(CustomTestCase):
         except Exception:
             pass
 
-    def _assert_serves_reference(self, message):
+    def _assert_reference(self, message):
         assert_logprob_signature_equal(
-            logprob_signature(self.lane_url, PROMPTS), self.reference, message
+            logprob_signature(self.lane_url, weights.SIGNATURE_PROMPTS),
+            self.reference,
+            message,
         )
 
-    def _refit(self, *, flattened_bucket):
+    def test_01_per_tensor_refit(self):
         for round_idx in range(UPDATE_ROUNDS):
             update_full_checkpoint_per_rank(
-                self.lane_url,
-                self.checkpoint,
-                TP_SIZE,
-                flattened_bucket=flattened_bucket,
+                self.lane_url, self.checkpoint, TP_SIZE, flattened_bucket=False
             )
-            mode = "flattened_bucket" if flattened_bucket else "per-tensor"
-            self._assert_serves_reference(
-                f"{mode} TP2 refit round {round_idx + 1} did not reproduce "
+            self._assert_reference(
+                f"per-tensor refit round {round_idx + 1} did not reproduce "
                 "startup loading"
             )
 
-    def test_01_per_tensor_per_rank_refit(self):
-        self._refit(flattened_bucket=False)
-
     @unittest.skip(FLATTENED_BUCKET_SKIP_REASON)
     def test_02_flattened_bucket_refit(self):
-        self._refit(flattened_bucket=True)
+        update_full_checkpoint_per_rank(
+            self.lane_url, self.checkpoint, TP_SIZE, flattened_bucket=True
+        )
+        self._assert_reference(
+            "flattened_bucket refit did not reproduce startup loading"
+        )
 
     def test_03_flattened_bucket_matches_per_tensor_update(self):
-        original = load_checkpoint_tensor(self.tensor_index, TARGET_WEIGHT)
+        original = load_checkpoint_tensor(self.tensor_index, self.target)
         updated = original.new_full(original.shape, 0.0)
 
         update_weights_from_tensor_per_rank(
-            self.lane_url,
-            [(TARGET_WEIGHT, updated)],
-            TP_SIZE,
-            flattened_bucket=True,
+            self.lane_url, [(self.target, updated)], TP_SIZE, flattened_bucket=True
         )
-        flattened_bucket_signature = logprob_signature(self.lane_url, PROMPTS)
+        flattened = logprob_signature(self.lane_url, weights.SIGNATURE_PROMPTS)
         self.assertNotEqual(
-            _ids(flattened_bucket_signature),
+            _ids(flattened),
             _ids(self.reference),
             "flattened_bucket update had no effect",
         )
 
         update_weights_from_tensor_per_rank(
-            self.lane_url, [(TARGET_WEIGHT, original)], TP_SIZE
+            self.lane_url, [(self.target, original)], TP_SIZE
         )
-        self._assert_serves_reference("per-tensor restore did not restore the output")
+        self._assert_reference("per-tensor restore did not restore the output")
 
         update_weights_from_tensor_per_rank(
-            self.lane_url, [(TARGET_WEIGHT, updated)], TP_SIZE
+            self.lane_url, [(self.target, updated)], TP_SIZE
         )
-        per_tensor_signature = logprob_signature(self.lane_url, PROMPTS)
+        per_tensor = logprob_signature(self.lane_url, weights.SIGNATURE_PROMPTS)
         self.assertEqual(
-            _ids(flattened_bucket_signature),
-            _ids(per_tensor_signature),
+            _ids(flattened),
+            _ids(per_tensor),
             "flattened_bucket and per-tensor updates produced different outputs",
         )
 
         update_weights_from_tensor_per_rank(
-            self.lane_url, [(TARGET_WEIGHT, original)], TP_SIZE
+            self.lane_url, [(self.target, original)], TP_SIZE
         )
-        self._assert_serves_reference("second restore did not restore the output")
+        self._assert_reference("second restore did not restore the output")
 
     def test_04_update_moe_experts(self):
-        names = [
-            f"model.layers.{MOE_LAYER}.mlp.experts.{expert}.down_proj.weight"
-            for expert in range(MOE_EXPERTS)
+        originals = [
+            load_checkpoint_tensor(self.tensor_index, name)
+            for name in self.expert_tensors
         ]
-        originals = [load_checkpoint_tensor(self.tensor_index, name) for name in names]
-
         update_weights_from_tensor_per_rank(
             self.lane_url,
             [
                 (name, original.new_full(original.shape, 0.0))
-                for name, original in zip(names, originals)
+                for name, original in zip(self.expert_tensors, originals)
             ],
             TP_SIZE,
         )
-        changed = logprob_signature(self.lane_url, PROMPTS)
+        changed = logprob_signature(self.lane_url, weights.SIGNATURE_PROMPTS)
         self.assertNotEqual(
-            _ids(changed),
-            _ids(self.reference),
-            "zeroing every routed expert of a MoE layer had no effect",
+            _ids(changed), _ids(self.reference), "routed-expert update had no effect"
         )
 
         update_weights_from_tensor_per_rank(
             self.lane_url,
-            [(name, original) for name, original in zip(names, originals)],
+            [
+                (name, original)
+                for name, original in zip(self.expert_tensors, originals)
+            ],
             TP_SIZE,
         )
-        self._assert_serves_reference(
+        self._assert_reference(
             "restoring the routed experts did not restore the output"
         )
 
     def test_05_update_subset_changes_output(self):
-        original = load_checkpoint_tensor(self.tensor_index, SUBSET_WEIGHT)
+        original = load_checkpoint_tensor(self.tensor_index, self.subset)
         updated = original.new_full(original.shape, 0.0)
 
         update_weights_from_tensor_per_rank(
-            self.lane_url, [(SUBSET_WEIGHT, updated)], TP_SIZE
+            self.lane_url, [(self.subset, updated)], TP_SIZE
         )
-        changed = logprob_signature(self.lane_url, PROMPTS)
+        changed = logprob_signature(self.lane_url, weights.SIGNATURE_PROMPTS)
         self.assertNotEqual(
-            _ids(changed),
-            _ids(self.reference),
-            "a subset update did not change the output",
+            _ids(changed), _ids(self.reference), "subset update had no effect"
         )
 
         update_weights_from_tensor_per_rank(
-            self.lane_url, [(SUBSET_WEIGHT, original)], TP_SIZE
+            self.lane_url, [(self.subset, original)], TP_SIZE
         )
-        self._assert_serves_reference("restoring the subset did not restore the output")
+        self._assert_reference("restoring the subset did not restore the output")
 
     def test_06_update_failure_is_fail_stop(self):
         bad = torch.zeros(1, dtype=torch.bfloat16, device="npu")
         payloads = [
-            serialize_named_tensors([(TARGET_WEIGHT, bad)]) for _ in range(TP_SIZE)
+            serialize_named_tensors([(self.target, bad)]) for _ in range(TP_SIZE)
         ]
         begin_weight_update(self.lane_url)
         try:
@@ -248,6 +265,25 @@ class TestNpuUpdateWeightsFromTensor(CustomTestCase):
             health(self.lane_url),
             "engine stayed alive after a failed in-place weight update",
         )
+
+
+def _make_suite(case):
+    name = "TestNpuUpdateWeightsFromTensor_" + case.id.replace("-", "_").replace(
+        ".", "_"
+    )
+    suite = type(
+        name, (_TensorSuite, CustomTestCase), {"CASE": case, "__module__": __name__}
+    )
+    return unittest.skipUnless(
+        npu_device_count() >= TP_SIZE, f"requires at least {TP_SIZE} Ascend NPUs"
+    )(suite)
+
+
+for _case in weights.MODEL_CASES:
+    _name = "TestNpuUpdateWeightsFromTensor_" + _case.id.replace("-", "_").replace(
+        ".", "_"
+    )
+    globals()[_name] = _make_suite(_case)
 
 
 if __name__ == "__main__":
