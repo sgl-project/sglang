@@ -13,9 +13,10 @@ from __future__ import annotations
 
 import logging
 import os
+from types import SimpleNamespace
 
 from sglang.srt.mem_cache.registry import register_radix_cache_backend
-from sglang.srt.runtime_context import get_memory, get_serving
+from sglang.srt.runtime_context import get_context, get_memory, get_serving
 
 logger = logging.getLogger(__name__)
 
@@ -73,7 +74,9 @@ def _flexkv_factory(ctx):
     )
     from sglang.srt.runtime_context import get_parallel
 
-    server_args = ctx.server_args
+    # The external connector consumes a flat startup config. Hand it the
+    # resolved values, including runtime overrides, rather than the raw seed.
+    server_args = SimpleNamespace(**get_context().resolved_server_args_dict())
     if get_memory().flexkv_config_file and not os.environ.get("FLEXKV_CONFIG_PATH"):
         os.environ["FLEXKV_CONFIG_PATH"] = get_memory().flexkv_config_file
 
@@ -100,7 +103,7 @@ def _flexkv_factory(ctx):
     # TpModelWorker no longer carries a ParallelState; ranks are published to
     # the runtime context before the tree cache is built.
     parallel_state = get_parallel()
-    if server_args.enable_dp_attention:
+    if parallel_state.attn_dp_size > 1:
         dp_rank = getattr(parallel_state, "attn_dp_rank", 0)
     else:
         dp_rank = getattr(parallel_state, "dp_rank", 0) or 0

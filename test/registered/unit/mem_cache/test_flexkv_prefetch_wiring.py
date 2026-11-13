@@ -19,6 +19,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
 from sglang.srt.mem_cache.storage.flexkv import _flexkv_factory
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.flexkv_test_utils import RequestState as SimpleNamespace
 
@@ -251,20 +252,13 @@ def test_shutdown_releases_flexkv_and_inner_host_resources(
     assert order == (["flexkv", "inner"] if hybrid else ["flexkv"])
 
 
-@pytest.mark.parametrize("enable_dp_attention, expected_rank", [(False, 2), (True, 3)])
+@pytest.mark.parametrize("enable_dp_attention", [False, True])
 @pytest.mark.parametrize("hybrid", [False, True])
-def test_factory_uses_published_parallel_context(
-    enable_dp_attention, expected_rank, hybrid
-):
-    parallel = SimpleNamespace(
-        pp_group=SimpleNamespace(rank_in_group=1),
-        attn_tp_group=object(),
-        attn_cp_group=SimpleNamespace(rank_in_group=0),
-        dp_rank=2,
-        attn_dp_rank=3,
-    )
+def test_factory_uses_published_parallel_context(enable_dp_attention, hybrid):
+    """Connector construction must see resolved DP/KV settings and runtime
+    overrides; the pristine startup seed can still say auto/DP-disabled.
+    """
     context = SimpleNamespace(
-        server_args=SimpleNamespace(enable_dp_attention=enable_dp_attention),
         params=SimpleNamespace(is_eagle=False),
         model_config=object(),
         tp_rank=6,
@@ -282,6 +276,20 @@ def test_factory_uses_published_parallel_context(
     hybrid_module = MagicMock()
     unified_module = MagicMock()
     with (
+        get_context().override_server_args(
+            tp_size=8,
+            pp_size=2,
+            dp_size=1 if enable_dp_attention else 2,
+            attn_dp_size=2 if enable_dp_attention else 1,
+            kv_cache_dtype="auto",
+        ) as server_args,
+        get_parallel().override(
+            pp_group=SimpleNamespace(rank_in_group=1),
+            attn_tp_group=object(),
+            attn_cp_group=SimpleNamespace(rank_in_group=0),
+            dp_rank=0 if enable_dp_attention else 1,
+            attn_dp_rank=1 if enable_dp_attention else 0,
+        ),
         patch.dict(
             sys.modules,
             {
@@ -292,19 +300,16 @@ def test_factory_uses_published_parallel_context(
             },
         ),
         patch(
-            "sglang.srt.mem_cache.storage.flexkv.get_serving",
-            return_value=SimpleNamespace(enable_streaming_session=False),
-        ),
-        patch(
-            "sglang.srt.mem_cache.storage.flexkv.get_memory",
-            return_value=SimpleNamespace(flexkv_config_file=None),
-        ),
-        patch(
             "sglang.srt.mem_cache.registry.create_unified_radix_cache",
             return_value=unified_module,
         ) as build_inner,
-        patch("sglang.srt.runtime_context.get_parallel", return_value=parallel),
     ):
+        context.server_args = server_args
+        get_context().override(
+            "flexkv-test",
+            kv_cache_dtype="fp8_e4m3",
+            hicache_storage_prefetch_policy="timeout",
+        )
         result = _flexkv_factory(context)
 
     constructor = (
@@ -313,9 +318,14 @@ def test_factory_uses_published_parallel_context(
         else radix_module.FlexKVRadixCache
     )
     assert result is constructor.return_value
-    assert constructor.call_args.kwargs["dp_rank"] == expected_rank
+    assert constructor.call_args.kwargs["dp_rank"] == 1
     assert constructor.call_args.kwargs["pp_rank"] == 1
     assert constructor.call_args.kwargs["attn_cp_rank"] == 0
+    connector_config = constructor.call_args.kwargs["server_args"]
+    assert connector_config.kv_cache_dtype == "fp8_e4m3"
+    assert connector_config.hicache_storage_prefetch_policy == "timeout"
+    assert connector_config.attn_dp_size == (2 if enable_dp_attention else 1)
+    assert server_args.kv_cache_dtype == "auto"
     if hybrid:
         build_inner.assert_called_once_with(context)
         assert constructor.call_args.kwargs["inner_cache"] is unified_module
