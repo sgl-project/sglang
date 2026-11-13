@@ -5,8 +5,10 @@ import os
 from pathlib import Path
 
 from sglang_simulator.tools.collect_baseline.hooks import (
+    COLLECTION_EXPORT_AIS_OBSERVATIONS_ENV,
     COLLECTION_OUTPUT_DIR_ENV,
     TokenizerManagerCollectionHook,
+    collection_export_enabled,
     install_frontend_collection_hooks,
     run_collection_scheduler_process,
     validate_collection_hook,
@@ -49,10 +51,23 @@ def main(argv: list[str] | None = None) -> None:
             "and schedule_batch.jsonl"
         ),
     )
+    collection.add_argument(
+        "--collection-export-ais-observations",
+        action="store_true",
+        default=collection_export_enabled(
+            os.getenv(COLLECTION_EXPORT_AIS_OBSERVATIONS_ENV)
+        ),
+        help=(
+            "Also export TP*.ais_observations.json (native AISimulate tuning "
+            "observations, wall_time in seconds) on /stop_profile"
+        ),
+    )
     ServerArgs.add_cli_args(parser.add_argument_group("sglang"))
 
     raw_args = parser.parse_args(argv)
     output_dir = _prepare_output_dir(parser, raw_args.collection_output_dir)
+    if raw_args.collection_export_ais_observations:
+        os.environ[COLLECTION_EXPORT_AIS_OBSERVATIONS_ENV] = "1"
     server_args = ServerArgs.from_cli_args(raw_args)
     if not server_args.disable_overlap_schedule:
         parser.error(

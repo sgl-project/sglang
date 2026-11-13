@@ -4,19 +4,37 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import time
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field
 from functools import wraps
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 from sglang_simulator.hook import BaseHook, install_class_hooks
 from sglang_simulator.hook.class_hook_entry import is_class_hook_matched
+from sglang_simulator.simulation.sglang.batch_snapshot import (
+    batch_to_fpm_metrics,
+    capture_batch_entry,
+)
 
 logger = logging.getLogger(__name__)
 
 COLLECTION_OUTPUT_DIR_ENV = "SGLANG_SIMULATOR_COLLECTION_DIR"
+COLLECTION_EXPORT_AIS_OBSERVATIONS_ENV = (
+    "SGLANG_SIMULATOR_COLLECTION_EXPORT_AIS_OBSERVATIONS"
+)
+
+
+def collection_export_enabled(value: str | None) -> bool:
+    """One parser for the export flag so the CLI default and runtime agree."""
+    return (value or "").strip().lower() not in ("", "0", "false", "no", "off")
+
+
+def _ais_export_enabled() -> bool:
+    return collection_export_enabled(os.getenv(COLLECTION_EXPORT_AIS_OBSERVATIONS_ENV))
 
 
 @dataclass
@@ -45,12 +63,17 @@ class CollectionState:
     active: bool = False
     requests: dict[str, RequestRecord] = field(default_factory=dict)
     schedule_batches: list[dict[str, Any]] = field(default_factory=list)
+    # One single-rank observation list per exported scheduler step.
+    ais_observations: list[list[dict[str, Any]]] = field(default_factory=list)
+    ais_error: str | None = None
 
     def start(self) -> None:
         if self.active:
             raise RuntimeError("baseline collection is already active")
         self.requests.clear()
         self.schedule_batches.clear()
+        self.ais_observations.clear()
+        self.ais_error = None
         self.active = True
 
     def get_request(self, rid: str) -> RequestRecord:
@@ -60,6 +83,15 @@ class CollectionState:
             self.requests[rid] = record
         return record
 
+    def record_ais_observation(self, metrics: dict[str, Any], wall_time: float) -> None:
+        if not math.isfinite(wall_time) or wall_time <= 0:
+            self.ais_error = (
+                f"AIS observation export got invalid wall_time {wall_time!r}; "
+                "the synchronized step timing is broken"
+            )
+            return
+        self.ais_observations.append([dict(metrics, wall_time=wall_time)])
+
     def stop_and_export(self) -> list[Path]:
         if not self.active:
             raise RuntimeError("baseline collection is not active")
@@ -68,6 +100,8 @@ class CollectionState:
             raise RuntimeError(
                 f"{COLLECTION_OUTPUT_DIR_ENV} is required for baseline collection"
             )
+        if _ais_export_enabled() and self.ais_error is not None:
+            raise RuntimeError(self.ais_error)
 
         root = Path(output_dir).expanduser()
         root.mkdir(parents=True, exist_ok=True)
@@ -85,6 +119,11 @@ class CollectionState:
                     paths.append(path)
                     for row in rows:
                         output.write(json.dumps(row) + "\n")
+            if _ais_export_enabled():
+                path = root / f"{prefix}.ais_observations.json"
+                with path.open("x", encoding="utf-8") as output:
+                    paths.append(path)
+                    output.write(json.dumps(self.ais_observations))
         except (OSError, TypeError, ValueError):
             # Keep in-memory records for retry; never remove an existing file.
             for path in paths:
@@ -99,6 +138,8 @@ class CollectionState:
         self.active = False
         self.requests.clear()
         self.schedule_batches.clear()
+        self.ais_observations.clear()
+        self.ais_error = None
         return paths
 
 
@@ -203,11 +244,70 @@ def _batch_request_lengths(batch: Any) -> list[tuple[int, int]]:
         return []
     if batch.forward_mode.is_decode():
         lengths = [(1, max(length - 1, 0)) for length in batch.seq_lens_cpu.tolist()]
+        # Beam-tail rows are computed rows with no request of their own;
+        # request_infos stay tied to the batch's actual requests.
+        if getattr(batch, "beam_tail", None) is not None:
+            lengths = lengths[: len(batch.reqs)]
     else:
         lengths = list(zip(batch.extend_lens, batch.prefix_lens, strict=True))
     if len(lengths) != len(batch.reqs):
         raise ValueError("ScheduleBatch length vectors and reqs must have equal size")
     return lengths
+
+
+def _capture_ais_metrics(batch: Any) -> dict[str, Any] | None:
+    """Snapshot scheduled work as plain SDK-free metrics before run_batch mutates it.
+
+    Returns None for steps without estimable work (idle or empty batches). A
+    layout the shared snapshot rejects is recorded and fails the export at
+    stop time instead of silently dropping or mis-sizing the step.
+    """
+    if not _ais_export_enabled():
+        return None
+    mode = getattr(getattr(batch, "forward_mode", None), "name", "").lower()
+    if mode == "idle" or not (batch.reqs or ()):
+        return None
+    try:
+        return batch_to_fpm_metrics(capture_batch_entry(batch))
+    except ValueError as exc:
+        COLLECTION_STATE.ais_error = (
+            f"cannot export a step with forward mode {mode!r} as an AIS "
+            f"observation: {exc}"
+        )
+        return None
+
+
+def _validate_ais_export_request() -> None:
+    """Reject observation export for unsupported serving setups up front."""
+    if not _ais_export_enabled():
+        return
+    from sglang.srt.runtime_context import (
+        get_parallel,
+        get_server_args,
+        process_model_config,
+    )
+
+    parallel = get_parallel()
+    unsupported = [
+        f"{name}={getattr(parallel, name)}"
+        for name in ("pp_size", "attn_dp_size", "attn_cp_size")
+        if getattr(parallel, name) > 1
+    ]
+    if unsupported:
+        raise RuntimeError(
+            "AIS observation export requires PP=attention-DP=CP=1; got "
+            + ", ".join(unsupported)
+        )
+    if get_server_args().speculative_algorithm is not None:
+        raise RuntimeError(
+            "AIS observation export does not support speculative decoding; "
+            "collect without --speculative-algorithm"
+        )
+    if process_model_config().is_multimodal:
+        raise RuntimeError(
+            "AIS observation export supports text-only models; multimodal "
+            "elapsed work would be labeled with text-token features"
+        )
 
 
 def _synchronize_device() -> None:
@@ -226,6 +326,7 @@ def _profile_output(message: str, success: bool = True) -> Any:
 def _handle_profile_request(recv_req: Any) -> Any:
     try:
         if recv_req.req_type.name == "START_PROFILE":
+            _validate_ais_export_request()
             COLLECTION_STATE.start()
             return _profile_output("Baseline collection started")
         paths = COLLECTION_STATE.stop_and_export()
@@ -312,6 +413,8 @@ class SchedulerCollectionHook(BaseHook):
             if any(is_health_check_generate_req(req) for req in requests):
                 return original_run(self, batch, *args, **kwargs)
 
+            ais_metrics = _capture_ais_metrics(batch)
+
             lengths = _batch_request_lengths(batch)
             row = {
                 "forward_mode": int(batch.forward_mode),
@@ -335,6 +438,8 @@ class SchedulerCollectionHook(BaseHook):
                 start_timestamp=start, end_timestamp=end, iter_latency=end - start
             )
             COLLECTION_STATE.schedule_batches.append(row)
+            if ais_metrics is not None:
+                COLLECTION_STATE.record_ais_observation(ais_metrics, end - start)
             return result
 
         @wraps(original_result)

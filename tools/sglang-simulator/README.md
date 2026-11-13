@@ -48,7 +48,8 @@ pip install -e "tools/sglang-simulator[aisimulate]"
 
 The extra pins `aisimulate==0.13.0`. The official wheels require Python
 3.11–3.13 and cover Linux x86_64/aarch64 and macOS arm64. This release exposes
-the modern `aisimulate.sdk` namespace.
+the modern `aisimulate.sdk` namespace and the native forward-pass API in
+`aisimulate_core.sdk`.
 
 AISimulate 0.13.0 requires NumPy>=2.1,<3, replacing the NumPy 1.26.4 pin
 used by standalone AIConfigurator 0.10.0. Use an environment compatible with
@@ -61,8 +62,25 @@ installs the simulator and estimator SDK, not the SGLang runtime dependencies;
 adding source directories to `PYTHONPATH` does not install those dependencies.
 No old-package uninstall is needed in a fresh environment.
 
-Use the `aisimulate` predictor name for the existing static op-level path,
-including phase scale factors.
+Use the existing `aisimulate` predictor name for every mode. All
+estimation modes (`op_level`, `fpm_regression`, `fpm_interpolation`, `auto`)
+run on the SDK ForwardPass estimator; `op_level` is the default and runs
+without SDK learned correction, which is opt-in. The former static op-level path was
+removed; its options are carried forward with explicit semantics:
+`prefill_scale_factor`, `decode_scale_factor` and `prefill_min_latency`
+are optional post-processing on the SDK estimate, `database_path` is an
+alias for a single-entry `systems_paths`, and `enable_oom_check` is
+accepted only as the neutral `false`. SDK learned correction and the old
+uneven-prefill correction are mutually exclusive: with correction enabled
+the SDK estimate is used as-is, even when untuned or its factor is 1
+(tuning observations are forwarded raw), and the default uncorrected
+`op_level` keeps the old `seq_imbalance_correction_scale` as a
+context-attention-only correction with its historical `R >= 0.4` gate. The
+optional phase scale factors and prefill latency floor still run afterward
+in every mode.
+`workload_distribution` has no path
+through the unified estimator and fails with a specific error. See
+[forward-pass estimation, calibration inputs and collection](docs/aisimulate_fpm.md).
 The shared memory-estimation path also uses this SDK for ML/replay predictors.
 
 #### Migrating from AIConfigurator
@@ -91,8 +109,8 @@ There is no compatibility layer: a simulator configuration that still uses the
 `"aiconfigurator"` predictor name fails with an explicit error naming the
 replacement. Update the configuration instead of relying on a fallback.
 
-The migration keeps the SGLang-side parameter construction, uneven-batch
-compensation, and phase scale factors. It does not promise unchanged numerical
+The simulator supplies deployment and scheduled-batch inputs to the
+AISimulate SDK. It does not promise unchanged numerical
 results between AIConfigurator and AISimulate performance databases; re-baseline
 against your own measurements.
 
@@ -269,7 +287,7 @@ Supported predictors:
 
 | Predictor | Purpose |
 |---|---|
-| `aisimulate` | Operator and module performance-database estimation. |
+| `aisimulate` | SDK forward-pass estimation modes with optional correction. |
 | `ml` | A trained sklearn-compatible 18-feature latency model. |
 | `replay` | Exact or nearest-neighbor batch-composition replay. |
 
@@ -309,6 +327,8 @@ python3 -m pytest -q tools/sglang-simulator/test/test_simulation_sglang_serving.
 python3 -m pytest -q tools/sglang-simulator/test/test_simulation_cache_hit_ratio.py
 python3 -m pytest -q tools/sglang-simulator/test/test_simulation_offline_blocking.py
 python3 -m pytest -q tools/sglang-simulator/test/test_aisimulate_predictor.py
+python3 -m pytest -q tools/sglang-simulator/test/test_aisimulate_native.py
+python3 -m pytest -q tools/sglang-simulator/test/test_aisimulate_native_runner.py
 ```
 
 Run each file as a separate pytest command because the runner test installs
