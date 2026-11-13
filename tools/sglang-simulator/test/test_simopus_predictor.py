@@ -162,7 +162,10 @@ def sdk_double(tmp_path, monkeypatch):
     stack = tmp_path / "stack.json"
     stack.write_bytes(b'{"stack":"test"}')
     module = ModuleType("simopus.sdk")
-    module.database = SimpleNamespace(slice_ref=SimpleNamespace(stack_path=stack))
+    module.database = SimpleNamespace(
+        slice_ref=SimpleNamespace(stack_path=stack),
+        stack_sha256=hashlib.sha256(stack.read_bytes()).hexdigest(),
+    )
     module.opened, module.built = [], []
 
     def open_fidb(*args, **kwargs):
@@ -420,6 +423,19 @@ def test_production_binding_and_portable_provenance(sdk_double):
     assert metrics["provider_revision"] == "a" * 40
     assert metrics["stack_digest"] == hashlib.sha256(stack.read_bytes()).hexdigest()
     assert "systems_root" not in metrics and "database_path" not in metrics
+
+
+def test_stack_identity_uses_sdk_without_opening_a_slice_path(sdk_double):
+    class OpaqueSlice:
+        @property
+        def stack_path(self):
+            raise AssertionError("the adapter must not interpret a PerfDB path")
+
+    sdk_double.database.slice_ref = OpaqueSlice()
+    predictor = _predictor(_Provider())
+    assert predictor.get_metrics()["simopus"]["stack_digest"] == (
+        sdk_double.database.stack_sha256
+    )
 
 
 @pytest.mark.parametrize("actual_revision", [None, "main", "b" * 40])

@@ -396,12 +396,12 @@ class SimOpusTimePredictor(InferTimePredictor):
             return (
                 provider,
                 package.__version__,
-                _sha256(database.slice_ref.stack_path),
+                database.stack_sha256,
             )
         except (ImportError, AttributeError) as error:
             raise _error(
                 "provider_initialization_failed",
-                "SimOpus is not installed",
+                "SimOpus is not installed or lacks the public storage identity contract",
             ) from error
         except FileNotFoundError as error:
             raise _error(

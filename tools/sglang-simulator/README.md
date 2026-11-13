@@ -47,7 +47,7 @@ pip install -e "tools/sglang-simulator[aisimulate]"
 ```
 
 The extra pins `aisimulate==0.13.0`. The official wheels require Python
-3.11–3.13 and cover Linux x86_64/aarch64 and macOS arm64. This release exposes
+3.11â€“3.13 and cover Linux x86_64/aarch64 and macOS arm64. This release exposes
 the modern `aisimulate.sdk` namespace.
 
 AISimulate 0.13.0 requires NumPy>=2.1,<3, replacing the NumPy 1.26.4 pin
@@ -343,3 +343,8 @@ Contract checks run without model execution. The HTTP checks in
 `test/test_simopus_e2e.py` require Linux, SGLang, the real SDK,
 `SIMOPUS_E2E_SYSTEMS_ROOT` and `SIMOPUS_E2E_MODEL_PATH`; missing inputs are reported
 as skipped rather than presented as integration evidence.
+
+The compatible SDK must expose `PerfDatabase.stack_sha256`. The adapter records
+that original stack digest through the SDK; it never opens a slice metadata path
+or selects a storage format. Directory and SQLite data therefore use the same
+initialization and provenance contract.
