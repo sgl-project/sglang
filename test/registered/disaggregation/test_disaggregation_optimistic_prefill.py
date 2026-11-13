@@ -28,6 +28,7 @@ from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
     KeyedReqList,
     ListKind,
+    move,
 )
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams
@@ -484,7 +485,7 @@ class TestOptimisticPrefillMambaRetryRelease(CustomTestCase):
             processed_tokens_counter=0,
             prefill_launched_reqs=KeyedReqList(ListKind.PREFILL_LAUNCHED),
         )
-        scheduler.prefill_launched_reqs.join([req])
+        move([req], scheduler.prefill_launched_reqs)
         with patch(
             "sglang.srt.disaggregation.prefill.get_disagg",
             return_value=SimpleNamespace(optimistic_prefill_attempts=3),
@@ -572,7 +573,7 @@ class TestOptimisticPrefillWriteThroughRetryPublish(CustomTestCase):
             processed_tokens_counter=0,
             prefill_launched_reqs=KeyedReqList(ListKind.PREFILL_LAUNCHED),
         )
-        scheduler.prefill_launched_reqs.join([req])
+        move([req], scheduler.prefill_launched_reqs)
         with (
             patch(
                 "sglang.srt.disaggregation.prefill.get_disagg",

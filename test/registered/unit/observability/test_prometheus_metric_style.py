@@ -74,6 +74,31 @@ class TestPrometheusMetricStyle(unittest.TestCase):
         self.assertEqual(c._name, "sglang_test_counter")
         self.assertEqual(g._name, "sglang_test_gauge")
 
+    def test_gauge_histogram_metric_style(self):
+        from prometheus_client import Gauge
+
+        for style, expected in (
+            ("colon", "sglang:test"),
+            ("underscore", "sglang_test"),
+        ):
+            with self.subTest(style=style):
+                registry = CollectorRegistry()
+                *_, factory = _StatLoggerDIMixin()._resolve_metric_classes(
+                    SimpleNamespace(prometheus_metric_style=style),
+                    include_gauge_histogram=True,
+                )
+                with patch(
+                    "prometheus_client.Gauge",
+                    side_effect=lambda **kwargs: Gauge(registry=registry, **kwargs),
+                ):
+                    metric = factory("sglang:test", "Test", [], [1, 2])
+                metric.set_by_current_observations({}, [1, 2, 3])
+                self.assertEqual(metric._gauge._name, expected)
+                self.assertEqual(
+                    [sample.value for sample in next(registry.collect()).samples],
+                    [1, 1, 1],
+                )
+
     def test_storage_collector_metric_style(self):
         # Test with colon style
         server_args_colon = SimpleNamespace(prometheus_metric_style="colon")
