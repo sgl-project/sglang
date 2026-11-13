@@ -68,18 +68,15 @@ class TestLIMState(CustomTestCase):
             **kwargs,
         )
 
-    def test_model_index_heads_control_query_scale_budget(self):
+    def test_model_index_heads_do_not_change_lim_scale_free_budget(self):
         options = self.options()
         options["model_config"].hf_config.index_n_heads = 32
         small = resolve_sparse_kv_budget(**options)
         options["model_config"].hf_config.index_n_heads = 64
         large = resolve_sparse_kv_budget(**options)
-        self.assertEqual(small.adapter_buffers["query_scale"].shape[-1], 32)
-        self.assertEqual(large.adapter_buffers["query_scale"].shape[-1], 64)
-        self.assertEqual(
-            large.managed_hbm_bytes - small.managed_hbm_bytes,
-            small.batch_capacity * small.max_query_width * (64 - 32) * 4,
-        )
+        self.assertNotIn("query_scale", small.adapter_buffers)
+        self.assertNotIn("query_scale", large.adapter_buffers)
+        self.assertEqual(large.managed_hbm_bytes, small.managed_hbm_bytes)
 
     def test_native_source_addressing_limit(self):
         options = self.options()
@@ -259,10 +256,11 @@ class TestLIMState(CustomTestCase):
             allocated = sum(
                 t.numel() * t.element_size()
                 for t in vars(adapter).values()
-                if isinstance(t, torch.Tensor) and t is not adapter.key_scale
+                if isinstance(t, torch.Tensor)
             )
             self.assertEqual(manager.budget.adapter_bytes, allocated)
-            self.assertEqual(adapter.query_scale.shape[-1], indexer_heads)
+            self.assertFalse(hasattr(adapter, "query_scale"))
+            self.assertFalse(hasattr(adapter, "key_scale"))
 
     def test_plan_alignment_and_limits(self):
         for width in (1, 4):
@@ -385,11 +383,7 @@ class TestLIMState(CustomTestCase):
             + actual_bytes(manager.lim_adapter, plan.adapter_buffers),
             plan.managed_hbm_bytes,
         )
-        self.assertEqual(
-            manager.lim_adapter.key_scale.numel()
-            * manager.lim_adapter.key_scale.element_size(),
-            (4096 + 128) * 4,
-        )
+        self.assertFalse(hasattr(manager.lim_adapter, "key_scale"))
         self.assertIs(plan.bind_native_pool(pool), plan)
         self.assertEqual(
             manager.host_source_indices(

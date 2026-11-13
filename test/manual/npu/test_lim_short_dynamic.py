@@ -238,9 +238,7 @@ def test_short_sparse_graph_lifecycle(
                 for owner in (manager, manager.lim_adapter)
                 for value in vars(owner).values()
                 for tensor in (value if isinstance(value, (list, tuple)) else [value])
-                if isinstance(tensor, torch.Tensor)
-                and tensor.device.type == "npu"
-                and tensor is not manager.lim_adapter.key_scale
+                if isinstance(tensor, torch.Tensor) and tensor.device.type == "npu"
             ]
             assert (
                 sum(t.numel() * t.element_size() for t in allocations)

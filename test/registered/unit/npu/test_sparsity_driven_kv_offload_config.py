@@ -197,7 +197,7 @@ class TestSparsityDrivenKVOffloadConfig(CustomTestCase):
                         plan.manager_buffers["fused_attn_out"].shape,
                         (4, native_heads, 512),
                     )
-                    self.assertEqual(plan.adapter_buffers["query_scale"].shape, (4, 32))
+                    self.assertNotIn("query_scale", plan.adapter_buffers)
 
     def test_graph_alignment_is_reserved_before_buckets_are_resolved(self):
         from sglang.srt.environ import envs

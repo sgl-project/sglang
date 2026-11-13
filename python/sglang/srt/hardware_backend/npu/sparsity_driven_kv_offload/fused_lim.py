@@ -62,9 +62,6 @@ class LIMDecodeAdapter:
             else:
                 value = spec.allocate(device)
             setattr(self, name, value)
-        spec = manager.budget.key_scale_spec
-        self.key_scale = spec.allocate(device)
-        spec.validate(self.key_scale, "key_scale")
         manager.budget.validate_buffers(self, manager.budget.adapter_buffers)
 
     def reset_requests(self, request_slots):
@@ -99,15 +96,10 @@ class LIMDecodeAdapter:
             request_rows=self.rows,
             query_width=width,
         )
-        scale = self.query_scale.view(-1)[: rows * query.shape[1]].view(
-            rows, query.shape[1]
-        )
         sources = self.source_ids[:rows]
         fused_lightning_indexer_manage(
             weights=weights[:rows].contiguous(),
-            query_scale=scale,
             query=query[:rows].contiguous(),
-            key_scale=self.key_scale,
             key=key,
             block_table=self.block_table[:batch],
             query_ends=self.query_ends[width - 1, :batch],

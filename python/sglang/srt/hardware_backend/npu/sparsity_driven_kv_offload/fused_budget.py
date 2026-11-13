@@ -50,9 +50,6 @@ class BufferSpec:
 class BudgetPlan:
     """Persistent buffer geometry and accounting for one native KV pool."""
 
-    scale_dtype = torch.float32
-    scale_element_size = torch.float32.itemsize
-
     def __init__(
         self,
         *,
@@ -69,7 +66,6 @@ class BudgetPlan:
         kv_lora_rank: int,
         qk_rope_head_dim: int,
         index_head_dim: int,
-        index_n_heads: int,
         prefill_workspace_tokens: int = 0,
     ) -> None:
         self.request_rows = request_rows
@@ -83,7 +79,6 @@ class BudgetPlan:
         self.cache_tokens = cache_tokens
         self.page_size = page_size
         self.index_head_dim = index_head_dim
-        self.index_n_heads = index_n_heads
         self.kv_cache_dim = kv_lora_rank + qk_rope_head_dim
         self.prefill_workspace_tokens = prefill_workspace_tokens
         self.prefill_workspace_sizing_finalized = False
@@ -144,10 +139,6 @@ class BudgetPlan:
             "miss_sources": BufferSpec((batch_capacity, MISS_CAPACITY), metadata_dtype),
             "miss_slots": BufferSpec((batch_capacity, MISS_CAPACITY), metadata_dtype),
             "miss_counts": BufferSpec((batch_capacity,), metadata_dtype),
-            "query_scale": BufferSpec(
-                (batch_capacity * max_query_width, index_n_heads),
-                self.scale_dtype,
-            ),
             "query_ends": BufferSpec((max_query_width, batch_capacity), metadata_dtype),
             "block_table": BufferSpec(
                 (batch_capacity, context_len // page_size), metadata_dtype
@@ -182,7 +173,6 @@ class BudgetPlan:
         self.adapter_bytes = sum(s.nbytes for s in self.adapter_buffers.values())
         self.host_token_capacity = None
         self.host_kv_spec = None
-        self.key_scale_spec = None
 
     @property
     def managed_hbm_bytes(self) -> int:
@@ -225,17 +215,12 @@ class BudgetPlan:
         # get_index_k_buffer returns one layer: [pages, page_size, 1, head_dim].
         # Its pages already include the native allocator's dummy page.
         host_token_capacity = key.shape[0] * self.page_size
-        key_scale_spec = BufferSpec(tuple(key.shape[:3]), self.scale_dtype)
         if self.host_token_capacity is not None:
-            if (
-                self.host_token_capacity != host_token_capacity
-                or self.key_scale_spec != key_scale_spec
-            ):
+            if self.host_token_capacity != host_token_capacity:
                 raise ValueError(
                     "Native KV pool differs from the already bound layout."
                 )
             return self
-        self.key_scale_spec = key_scale_spec
         self.host_token_capacity = host_token_capacity
         self.host_kv_spec = BufferSpec(
             (1, self.host_token_capacity, 1, self.kv_cache_dim),
@@ -270,7 +255,6 @@ def resolve_sparse_kv_budget(
     kv_lora_rank = model_config.kv_lora_rank
     qk_rope_head_dim = model_config.qk_rope_head_dim
     index_head_dim = model_config.index_head_dim
-    index_n_heads = model_config.hf_config.index_n_heads
     if context_len > 2**21:
         raise ValueError("Native LIM requires context length <= 2**21.")
     if not 1 <= max_query_width <= MAX_QUERY_WIDTH or not (
@@ -305,7 +289,6 @@ def resolve_sparse_kv_budget(
         kv_lora_rank=kv_lora_rank,
         qk_rope_head_dim=qk_rope_head_dim,
         index_head_dim=index_head_dim,
-        index_n_heads=index_n_heads,
         prefill_workspace_tokens=prefill_workspace_tokens,
     )
     if (

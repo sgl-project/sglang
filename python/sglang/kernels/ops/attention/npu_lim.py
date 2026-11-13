@@ -1,7 +1,7 @@
 """Adapter for the optional Ascend FusedLightningIndexerManage native extension.
 
 The in-place ABI is implemented by sgl-kernel-npu. Its optional full-visible
-mode extends the default 19-tensor call with a scalar flag. Native source and
+mode extends the default 17-tensor call with a scalar flag. Native source and
 direct AscendC launch live in that repository; importing this
 module neither imports torch_npu nor loads/compiles a native library.
 """
@@ -32,9 +32,7 @@ def load_fused_lim_operator():
 def fused_lightning_indexer_manage(
     *,
     weights: torch.Tensor,
-    query_scale: torch.Tensor,
     query: torch.Tensor,
-    key_scale: torch.Tensor,
     key: torch.Tensor,
     block_table: torch.Tensor,
     query_ends: torch.Tensor,
@@ -71,9 +69,7 @@ def fused_lightning_indexer_manage(
         )
     inputs = (
         weights,
-        query_scale,
         query,
-        key_scale,
         key,
         block_table,
         query_ends,

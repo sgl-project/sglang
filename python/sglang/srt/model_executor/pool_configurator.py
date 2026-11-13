@@ -343,14 +343,6 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     budget.context_len, 2 * (budget.request_rows - 1)
                 )
                 self._fixed_overhead_bytes += budget.managed_hbm_bytes
-                # One FP32 dequant-scale workspace shared across indexer
-                # layers, with a row for every physical indexer token.
-                self._cell_size += budget.scale_element_size
-                # The native index pool retains one dummy page in addition to
-                # its token capacity. Its shared scale workspace covers it too.
-                self._fixed_overhead_bytes += (
-                    budget.scale_element_size * get_schedule().page_size
-                )
 
         # EAGLE/STANDALONE: assumes the draft shares the target's per-layer KV size,
         # which holds for EAGLE/MTP drafts that reuse the target's attention config.

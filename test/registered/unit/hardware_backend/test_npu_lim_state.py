@@ -74,8 +74,8 @@ class TestLIMKernelLoad(CustomTestCase):
 
         def native(*tensors, full_visible=False):
             # Emulate the native boundary, not the framework's tensor ordering.
-            tensors[13].copy_(torch.arange(2048, dtype=torch.int32).view(1, 1, -1))
-            tensors[18].copy_(tensors[9])
+            tensors[11].copy_(torch.arange(2048, dtype=torch.int32).view(1, 1, -1))
+            tensors[16].copy_(tensors[7])
 
         api.fused_lightning_indexer_manage = native
         modules = {"sgl_kernel_npu": package, api.__name__: api}
@@ -91,9 +91,7 @@ class TestLIMKernelLoad(CustomTestCase):
         ids, counts = ints(1, 1, 2048), ints(1)
         fused_lightning_indexer_manage(
             weights=torch.ones(1, 32, dtype=torch.bfloat16),
-            query_scale=torch.ones(1, 32),
             query=torch.ones(1, 32, 128, dtype=torch.bfloat16),
-            key_scale=torch.ones(33, 128, 1),
             key=torch.ones(33, 128, 1, 128, dtype=torch.bfloat16),
             block_table=ints(1, 33),
             query_ends=ints(1),
