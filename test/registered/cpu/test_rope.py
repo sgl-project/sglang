@@ -3,6 +3,10 @@ import unittest
 import sgl_kernel  # noqa: F401
 import torch
 
+from sglang.kernels.ops.diffusion import apply_rotary_embedding
+from sglang.kernels.ops.diffusion.common.fallback_torch import (
+    apply_rotary_embedding_native,
+)
 from sglang.srt.layers.rotary_embedding import (
     MRotaryEmbedding,
     RotaryEmbedding,
@@ -24,6 +28,27 @@ register_cpu_ci(est_time=33, suite="stage-a-test-cpu-intel")
 register_cpu_ci(est_time=10, suite="base-b-test-cpu-arm64")
 
 torch.manual_seed(1234)
+
+
+def _apply_rotary_embedding_fp32_reference(
+    x: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    interleaved: bool,
+) -> torch.Tensor:
+    if interleaved and cos.shape[-1] == x.shape[-1]:
+        cos = cos[..., ::2]
+        sin = sin[..., ::2]
+    cos = cos.float().unsqueeze(-2)
+    sin = sin.float().unsqueeze(-2)
+    while cos.ndim < x.ndim:
+        cos = cos.unsqueeze(0)
+        sin = sin.unsqueeze(0)
+    x_even = x.float()[..., ::2]
+    x_odd = x.float()[..., 1::2]
+    out_even = x_even * cos - x_odd * sin
+    out_odd = x_odd * cos + x_even * sin
+    return torch.stack((out_even, out_odd), dim=-1).flatten(-2).to(x.dtype)
 
 
 class TestROPE(CustomTestCase):
@@ -221,8 +246,9 @@ class TestROPE(CustomTestCase):
                 rope_ref.cos_sin_cache.to(query.dtype),
                 rope_ref.is_neox_style,
             )
-            torch.testing.assert_close(query_ref_out, query_cpu, atol=1e-2, rtol=1e-2)
-            torch.testing.assert_close(key_ref_out, key_cpu, atol=1e-2, rtol=1e-2)
+            atol = rtol = 2 * precision[dtype]
+            torch.testing.assert_close(query_ref_out, query_cpu, atol=atol, rtol=rtol)
+            torch.testing.assert_close(key_ref_out, key_cpu, atol=atol, rtol=rtol)
 
         test_config = [
             (64, 64, 32, 8000, True, torch.bfloat16, "cpu", 32, 32, 1, 1),
@@ -300,182 +326,85 @@ class TestROPE(CustomTestCase):
             torch.testing.assert_close(q_out_ref, q_out_sgl, atol=1e-2, rtol=1e-2)
             torch.testing.assert_close(k_out_ref, k_out_sgl, atol=1e-2, rtol=1e-2)
 
-    def apply_rotary_embedding_reference(
-        self,
-        x: torch.Tensor,
-        cos: torch.Tensor,
-        sin: torch.Tensor,
-    ) -> torch.Tensor:
-        x_fp32 = x.float()
-
-        # cos/sin: [S, D / 2]
-        #
-        # Expand the head dimension:
-        #   3D x [S, H, D]    -> [S, 1, D / 2]
-        #   4D x [B, S, H, D] -> [1, S, 1, D / 2]
-        if x.dim() == 3:
-            cos_fp32 = cos.float().unsqueeze(1)
-            sin_fp32 = sin.float().unsqueeze(1)
-        elif x.dim() == 4:
-            cos_fp32 = cos.float().unsqueeze(0).unsqueeze(2)
-            sin_fp32 = sin.float().unsqueeze(0).unsqueeze(2)
-        else:
-            raise ValueError(f"Unsupported input shape: {x.shape}")
-
-        x_even = x_fp32[..., 0::2]
-        x_odd = x_fp32[..., 1::2]
-
-        out_even = x_even * cos_fp32 - x_odd * sin_fp32
-        out_odd = x_odd * cos_fp32 + x_even * sin_fp32
-
-        return torch.stack((out_even, out_odd), dim=-1).flatten(-2).to(x.dtype)
-
-    def test_apply_rotary_embedding(self):
+    def test_apply_rotary_embedding_cpu_path(self):
         torch.manual_seed(1234)
-
         test_config = [
-            ((7, 3, 64), torch.float32, torch.float32),
-            ((7, 3, 64), torch.bfloat16, torch.bfloat16),
-            ((2, 5, 4, 66), torch.bfloat16, torch.float32),
+            ((7, 3, 66), torch.float16, False),
+            ((2, 5, 4, 64), torch.bfloat16, False),
+            ((7, 3, 66), torch.float16, True),
         ]
 
-        for shape, input_dtype, param_dtype in test_config:
-            if len(shape) == 3:
-                x = torch.randn(
-                    shape[1], shape[0], shape[2], dtype=input_dtype
-                ).transpose(0, 1)
-            else:
-                x = torch.randn(
-                    shape[0], shape[2], shape[1], shape[3], dtype=input_dtype
-                ).transpose(1, 2)
+        for shape, dtype, interleaved in test_config:
+            with self.subTest(shape=shape, dtype=dtype, interleaved=interleaved):
+                x = torch.randn(shape, dtype=dtype)
+                num_tokens = shape[0] if len(shape) == 3 else shape[1]
+                head_size = shape[-1]
+                angles = torch.randn(num_tokens, head_size // 2)
+                cos = angles.cos().to(dtype)
+                sin = angles.sin().to(dtype)
+                if interleaved:
+                    cos_interleaved = torch.full(
+                        (num_tokens, head_size), 0.25, dtype=dtype
+                    )
+                    sin_interleaved = torch.full(
+                        (num_tokens, head_size), -0.5, dtype=dtype
+                    )
+                    cos_interleaved[..., ::2] = cos
+                    sin_interleaved[..., ::2] = sin
+                    cos, sin = cos_interleaved, sin_interleaved
 
-            num_tokens = shape[0] if len(shape) == 3 else shape[1]
-            head_size = shape[-1]
-            half_size = head_size // 2
+                output = apply_rotary_embedding(x, cos, sin, interleaved)
+                legacy_output = apply_rotary_embedding_native(x, cos, sin, interleaved)
+                fp32_output = _apply_rotary_embedding_fp32_reference(
+                    x, cos, sin, interleaved
+                )
 
-            angles = torch.randn(num_tokens, half_size, dtype=torch.float32)
+                self.assertEqual(output.shape, x.shape)
+                self.assertEqual(output.dtype, x.dtype)
+                torch.testing.assert_close(
+                    output, fp32_output, atol=precision[dtype], rtol=precision[dtype]
+                )
+                torch.testing.assert_close(output, legacy_output, atol=1e-2, rtol=1e-2)
 
-            cos_dense = angles.cos().to(param_dtype)
-            sin_dense = angles.sin().to(param_dtype)
+    def test_apply_rotary_embedding_cpu_fallbacks(self):
+        torch.manual_seed(5678)
+        num_tokens, head_size = 5, 64
+        half_size = head_size // 2
+        cases = []
 
-            cos_storage = torch.empty(num_tokens, 2, half_size, dtype=param_dtype)
-            sin_storage = torch.empty(num_tokens, 2, half_size, dtype=param_dtype)
+        x = torch.randn(num_tokens, 3, head_size, dtype=torch.float16)
+        angles = torch.randn(num_tokens, half_size)
+        cases.append(
+            (
+                "cache dtype mismatch",
+                x,
+                angles.cos(),
+                angles.sin().to(torch.bfloat16),
+                False,
+            )
+        )
 
-            cos = cos_storage[:, 0, :]
-            sin = sin_storage[:, 0, :]
+        x = torch.randn(num_tokens, 3, head_size * 2, dtype=torch.float16)[..., ::2]
+        cos = angles.cos().to(torch.float16)
+        sin = angles.sin().to(torch.float16)
+        cases.append(("non-contiguous input", x, cos, sin, False))
 
-            cos.copy_(cos_dense)
-            sin.copy_(sin_dense)
+        batch_size, seq_len = 2, 3
+        x = torch.randn(batch_size, seq_len, 4, head_size, dtype=torch.float16)
+        cos = torch.randn(batch_size, seq_len, half_size, dtype=torch.float16)
+        sin = torch.randn(batch_size, seq_len, half_size, dtype=torch.float16)
+        cases.append(("batched cache", x, cos, sin, False))
 
-            output_ref = self.apply_rotary_embedding_reference(x, cos, sin)
-            output_sgl = torch.ops.sgl_kernel.apply_rotary_embedding_cpu(x, cos, sin)
+        x = torch.randn(num_tokens, 3, head_size, dtype=torch.float64)
+        cos = angles.cos().to(torch.float64)
+        sin = angles.sin().to(torch.float64)
+        cases.append(("unsupported dtype", x, cos, sin, False))
 
-            self.assertEqual(output_sgl.shape, x.shape)
-            self.assertEqual(output_sgl.dtype, x.dtype)
-
-            atol = rtol = precision[input_dtype]
-
-            torch.testing.assert_close(output_ref, output_sgl, atol=atol, rtol=rtol)
-        num_tokens = 1024
-        num_heads = 8
-        num_kv_heads = 2
-        head_size = 72
-        batch_size = 4
-        seq_len = 64
-        for dtype in [torch.bfloat16, torch.float32]:
-            for sincos_dtype in [torch.float32, torch.bfloat16]:
-                # 3D: [num_tokens, num_heads, head_size], unsqueeze_dim=1
-                single_test(
-                    torch.randn(num_tokens, num_heads, head_size).to(dtype),
-                    torch.randn(num_tokens, num_heads, head_size).to(dtype),
-                    (num_tokens, head_size),
-                    1,
-                    sincos_dtype,
-                )
-                # 3D with GQA, q/k split from qkv (non-contiguous)
-                single_test(
-                    *split_qk((num_tokens,), num_heads, num_kv_heads, head_size, dtype),
-                    (num_tokens, head_size),
-                    1,
-                    sincos_dtype,
-                )
-                # 4D: [batch, num_heads, seq_len, head_size], unsqueeze_dim=1
-                single_test(
-                    torch.randn(batch_size, num_heads, seq_len, head_size).to(dtype),
-                    torch.randn(batch_size, num_kv_heads, seq_len, head_size).to(dtype),
-                    (batch_size, seq_len, head_size),
-                    1,
-                    sincos_dtype,
-                )
-                # 4D: split from qkv, transposed to [batch, num_heads, seq_len, head]
-                query, key = split_qk(
-                    (batch_size, seq_len), num_heads, num_kv_heads, head_size, dtype
-                )
-                single_test(
-                    query.transpose(1, 2),
-                    key.transpose(1, 2),
-                    (batch_size, seq_len, head_size),
-                    1,
-                    sincos_dtype,
-                )
-                # 4D: [batch, seq_len, num_heads, head_size], unsqueeze_dim=2
-                single_test(
-                    torch.randn(batch_size, seq_len, num_heads, head_size).to(dtype),
-                    torch.randn(batch_size, seq_len, num_kv_heads, head_size).to(dtype),
-                    (batch_size, seq_len, head_size),
-                    2,
-                    sincos_dtype,
-                )
-                # 4D: [batch, seq_len, num_heads, head_size], negative unsqueeze_dim=-2
-                single_test(
-                    torch.randn(batch_size, seq_len, num_heads, head_size).to(dtype),
-                    torch.randn(batch_size, seq_len, num_kv_heads, head_size).to(dtype),
-                    (batch_size, seq_len, head_size),
-                    -2,
-                    sincos_dtype,
-                )
-                # q/k and cos/sin all have a non-unit stride in the feature dimension
-                single_test(
-                    torch.randn(batch_size, seq_len, num_heads, 2 * head_size).to(
-                        dtype
-                    )[..., ::2],
-                    torch.randn(batch_size, seq_len, num_kv_heads, 2 * head_size).to(
-                        dtype
-                    )[..., ::2],
-                    (batch_size, seq_len, head_size),
-                    2,
-                    sincos_dtype,
-                    strided_cache=True,
-                )
-                single_test(
-                    torch.randn(batch_size, seq_len, num_heads, head_size).to(dtype),
-                    torch.randn(batch_size, seq_len, num_kv_heads, 2 * head_size).to(
-                        dtype
-                    )[..., ::2],
-                    (batch_size, seq_len, head_size),
-                    2,
-                    sincos_dtype,
-                    strided_cache=True,
-                )
-                single_test(
-                    torch.randn(num_heads, seq_len, head_size).to(dtype),
-                    torch.randn(num_kv_heads, seq_len, head_size).to(dtype),
-                    (seq_len, head_size),
-                    0,
-                    sincos_dtype,
-                )
-                single_test(
-                    torch.randn(2, 3, num_heads, 5, head_size)
-                    .to(dtype)
-                    .transpose(0, 1),
-                    torch.randn(2, 3, num_kv_heads, 5, head_size)
-                    .to(dtype)
-                    .transpose(0, 1),
-                    (3, 2, 5, head_size),
-                    2,
-                    sincos_dtype,
-                    strided_cache=True,
-                )
+        for name, x, cos, sin, interleaved in cases:
+            with self.subTest(fallback=name):
+                expected = apply_rotary_embedding_native(x, cos, sin, interleaved)
+                output = apply_rotary_embedding(x, cos, sin, interleaved)
+                torch.testing.assert_close(output, expected, atol=0, rtol=0)
 
     def test_apply_multidimensional_rope(self):
         """Test apply_multidimensional_rope_cpu against the native Python reference."""

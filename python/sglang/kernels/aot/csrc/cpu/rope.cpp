@@ -99,6 +99,12 @@ struct RopeParams {
   inline int64_t rows() const {
     return batches * seqlen;
   }
+  inline int64_t q_offset(int64_t batch, int64_t seq, int64_t head) const {
+    return batch * q_strideB + seq * q_strideS + head * q_strideH;
+  }
+  inline int64_t q_out_offset(int64_t batch, int64_t seq, int64_t head) const {
+    return batch * q_out_strideB + seq * q_out_strideS + head * q_out_strideH;
+  }
   inline std::array<int64_t, 4> row_offsets(int64_t row, int64_t b, int64_t s) const {
     std::array<int64_t, 4> offsets{
         b * q_strideB + s * q_strideS,
@@ -161,26 +167,7 @@ template <typename scalar_t>
 struct RotaryEmbedInternal<scalar_t, RotaryMode::Interleaved> {
   static inline void
   apply(scalar_t* __restrict__ out, const scalar_t* __restrict__ input, const scalar_t* __restrict__ cache, int size) {
-    constexpr int kVecSize = at::vec::Vectorized<scalar_t>::size();
-    const int half_size = size / 2;
-
-    int d = 0;
-    for (; d <= size - kVecSize; d += kVecSize) {
-      auto [xy0, xy1] = load_float_vec2(input + d);
-      auto [x, y] = at::vec::deinterleave2(xy0, xy1);
-      auto cos = load_float_vec(cache + d / 2);
-      auto sin = load_float_vec(cache + half_size + d / 2);
-      auto out0 = x * cos - y * sin;
-      auto out1 = y * cos + x * sin;
-      std::tie(xy0, xy1) = at::vec::interleave2(out0, out1);
-      convert_from_float_ext<scalar_t>(xy0, xy1).store(out + d);
-    }
-    for (; d < size; d += 2) {
-      float x = input[d], y = input[d + 1];
-      float cos = cache[d >> 1], sin = cache[half_size + (d >> 1)];
-      out[d] = static_cast<scalar_t>(x * cos - y * sin);
-      out[d + 1] = static_cast<scalar_t>(y * cos + x * sin);
-    }
+    apply(out, input, SplitCosSinRow<scalar_t>{cache, cache + size / 2}, size);
   }
   template <typename param_t>
   static inline void
@@ -404,7 +391,7 @@ void apply_rotary_embedding_single_kernel_impl(
 }  // namespace
 
 // Diffusion GPT-J-style rotary embedding.
-at::Tensor apply_rotary_embedding_cpu(const at::Tensor& input, const at::Tensor& cos, const at::Tensor& sin) {
+at::Tensor diffusion_apply_rotary_embedding_cpu(const at::Tensor& input, const at::Tensor& cos, const at::Tensor& sin) {
   const int64_t input_dim = input.dim();
 
   TORCH_CHECK(input_dim == 3 || input_dim == 4, "expects input to be [S, H, D] or [B, S, H, D]");
