@@ -16,7 +16,9 @@ use super::{AppState, openai_error, unix_seconds_u32};
 pub(super) fn routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/v1/models", get(available_models))
-        .route("/v1/models/{model}", get(retrieve_model))
+        // `{*model}`: a served name may carry a slash (`org/model`), as Python's
+        // `{model:path}` takes it.
+        .route("/v1/models/{*model}", get(retrieve_model))
 }
 
 /// `GET /v1/models` — OpenAI-compatible model list. Served from core metadata;

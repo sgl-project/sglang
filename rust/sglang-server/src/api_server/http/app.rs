@@ -10,7 +10,7 @@ use axum::Router;
 use super::generate_hook::GenerateHook;
 use super::{
     anthropic, auth, corpus, dp_relay, hicache, info, loads, metrics, native_api, ollama, openai,
-    parsers, pre_generate, request_decompression, weights,
+    parsers, pre_generate, request_decompression, weights, wrappers,
 };
 use crate::HttpLayer;
 use crate::api_server::core::{DrainEnd, FLUSH_INTERVAL};
@@ -205,6 +205,10 @@ pub async fn serve(
     };
     // Outside the embedding package's layers, so they read decompressed bodies.
     app = request_decompression::apply(app, &server_args);
+    // Python's generation wrappers (`/vertex_generate`, `/invocations`)
+    // rewrite the request and send it back through everything above, so a
+    // wrapped generate is relayed and parsed like a direct one.
+    app = wrappers::apply(app);
     // Outside the extension layer, so its routes are keyed too. The bootstrap
     // registry below stays open, as Python serves it on its own server. Auth
     // runs before decompression, so an unauthenticated body is never inflated.

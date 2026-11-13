@@ -1697,6 +1697,24 @@
       "canonical": "{\"tokens\":[[1,2],[3]],\"count\":[2,1],\"max_model_len\":4096}"
     },
     {
+      "type": "OpenAiModelList",
+      "name": "the OpenAI model list",
+      "input": {
+        "object": "list",
+        "data": [
+          {
+            "id": "m",
+            "object": "model",
+            "created": 1,
+            "owned_by": "sglang",
+            "root": "m",
+            "max_model_len": 4096
+          }
+        ]
+      },
+      "canonical": "{\"object\":\"list\",\"data\":[{\"id\":\"m\",\"object\":\"model\",\"created\":1,\"owned_by\":\"sglang\",\"root\":\"m\",\"parent\":null,\"max_model_len\":4096}]}"
+    },
+    {
       "type": "OpenAiErrorResponse",
       "name": "the OpenAI error body",
       "input": {

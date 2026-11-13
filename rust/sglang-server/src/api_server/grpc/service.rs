@@ -1258,6 +1258,20 @@ impl SglangService for GrpcService {
         Err(openai_unimplemented())
     }
 
+    async fn open_ai_list_models(
+        &self,
+        _request: Request<api::OpenAiListModelsRequest>,
+    ) -> Result<Response<api::OpenAiModelList>, Status> {
+        Err(openai_unimplemented())
+    }
+
+    async fn open_ai_retrieve_model(
+        &self,
+        _request: Request<api::OpenAiRetrieveModelRequest>,
+    ) -> Result<Response<api::OpenAiModelCard>, Status> {
+        Err(openai_unimplemented())
+    }
+
     type OpenAiStreamCompletionsStream = ResponseStream<api::OpenAiCompletionStreamResponse>;
 
     async fn open_ai_stream_completions(
