@@ -1008,6 +1008,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         *,
         item_id: str,
         status: Optional[str],
+        is_final: bool = True,
     ) -> ResponseReasoningItem:
         """Build a reasoning item, mirroring the trace into ``summary`` when the
         caller opted in via ``reasoning.summary``; the full trace stays in
@@ -1024,7 +1025,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             content=[ResponseReasoningTextContent(type="reasoning_text", text=text)],
             encrypted_content=(
                 encode_reasoning_state(text)
-                if request.is_include_encrypted_reasoning()
+                if is_final and request.is_include_encrypted_reasoning()
                 else None
             ),
             status=status,
@@ -1991,6 +1992,7 @@ class OpenAIServingResponses(OpenAIServingChat):
                     "\n".join(part.text for part in item.content or []),
                     item_id=item.id,
                     status=item.status,
+                    is_final=done,
                 )
             snapshot = item.model_dump()
             output_index = len(emitted_items)
