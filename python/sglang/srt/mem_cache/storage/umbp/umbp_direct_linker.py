@@ -368,16 +368,28 @@ class UMBPDirectLinker(UnifiedCacheLinker):
         self._offload_thread.start()
 
     def _register_buffers(self) -> None:
+        from mori.io import MemoryLocationType
+
         seen = set()
         self._registered: list[tuple[int, int]] = []
         for pool in self.pools.values():
             for buffer in pool.get_hybrid_pool_buffer():
+                device = buffer.device
+                if device.type != "cuda" or device.index is None:
+                    raise ValueError(
+                        "Direct UMBP requires CUDA/ROCm device KV buffers."
+                    )
                 storage = buffer.untyped_storage()
                 allocation = (int(storage.data_ptr()), int(storage.nbytes()))
                 if allocation in seen:
                     continue
                 seen.add(allocation)
-                if not self.storage.client.register_memory(*allocation):
+                # The native binding defaults to CPU. A registered ref bypasses
+                # pointer detection, so omitting the location routes device KV
+                # through CPU memcpy instead of the GPU transfer engine.
+                if not self.storage.client.register_memory(
+                    *allocation, MemoryLocationType.GPU, device.index
+                ):
                     raise RuntimeError(
                         "Failed to register a GPU KV buffer with UMBP: "
                         f"ptr=0x{allocation[0]:x}, size={allocation[1]}."
