@@ -86,6 +86,7 @@ class TestHeldRowAdmission(CustomTestCase):
         s.min_free_slots_delayer = None
         s.invariant_checker = Mock()
         s.policy = Mock(
+            _bounded_active=False,
             calc_priority=lambda waiting, *args, **kwargs: list(waiting),
             admission_candidates=lambda waiting: iter(waiting),
         )
@@ -212,6 +213,7 @@ class TestBoundedV2SkippedAdmission(TestHeldRowAdmission):
                 s.policy = SchedulePolicy(
                     "lpm", RadixCache.create_simulated(), False, False, False
                 )
+                s.policy._should_start_bounded_batch = Mock(return_value=True)
                 s.policy._compute_prefix_matches = Mock(return_value=set())
                 s.policy._touch_waiting_prefixes = Mock()
                 s.policy.shortest_prefill_chunk_limit = Mock(return_value=None)

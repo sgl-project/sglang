@@ -21,7 +21,9 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 def policy(name="lpm", disabled=False, enabled=True):
     cache = RadixCache.create_simulated()
     cache.disable = disabled
-    return SchedulePolicy(name, cache, False, False, False, bounded_lpm_enabled=enabled)
+    p = SchedulePolicy(name, cache, False, False, False, bounded_lpm_enabled=enabled)
+    p._should_start_bounded_batch = lambda waiting: True
+    return p
 
 
 def requests(n):
@@ -96,26 +98,22 @@ class TestBoundedLPM(CustomTestCase):
             self.assertFalse(p.allows_admission(q[64]))
 
     def test_departure_before_retraction_without_priority_call(self):
-        for operation in ("move", "take", "clear", "replace"):
+        for operation in ("move", "bulk_move"):
             with self.subTest(operation=operation):
                 p, q = policy(), requests(150)
                 waiting = IndexedReqList(
                     ListKind.WAITING, on_leave=p.retire_waiting_members
                 )
                 running = IndexedReqList(ListKind.DECODING)
-                waiting.join(q)
+                move(q, waiting)
                 with patch.object(p, "_compute_prefix_matches", return_value=set()):
-                    waiting.replace(p.calc_priority(waiting))
+                    waiting.reorder(p.calc_priority(waiting))
                     a = waiting[0]
                     if operation == "move":
-                        move([a], waiting, running)
-                    elif operation == "take":
-                        waiting.take(lambda req: req is a)
-                    elif operation == "clear":
-                        waiting.clear()
+                        move([a], running)
                     else:
-                        waiting.replace([r for r in waiting if r is not a])
-                    waiting.join([a])
+                        move(list(waiting), running)
+                    move([a], waiting)
                     self.assertFalse(p.allows_admission(a))
 
     def test_scheduler_installs_departure_hook(self):
@@ -132,13 +130,24 @@ class TestBoundedLPM(CustomTestCase):
             return_value=SimpleNamespace(tp_size=1),
         ):
             s.init_running_status()
+        s.enable_hierarchical_cache = False
+        s.enable_priority_scheduling = False
+        s.schedule_low_priority_values_first = False
+        s.dllm_config = None
+        s.init_schedule_policy()
+        s.policy._should_start_bounded_batch = lambda waiting: True
+        self.assertIsNone(s.waiting_queue._on_leave)
         q = requests(150)
-        s.waiting_queue.join(q)
+        move(q, s.waiting_queue)
         with patch.object(s.policy, "_compute_prefix_matches", return_value=set()):
             s.policy.calc_priority(s.waiting_queue)
-        s.waiting_queue.leave([q[0]])
-        s.waiting_queue.join([q[0]])
+        running = IndexedReqList(ListKind.DECODING)
+        move([q[0]], running)
+        move([q[0]], s.waiting_queue)
         self.assertFalse(s.policy.allows_admission(q[0]))
+        move(list(s.waiting_queue), running)
+        s.policy.calc_priority(s.waiting_queue)
+        self.assertIsNone(s.waiting_queue._on_leave)
 
     def test_dllm_legacy_fallback_and_other_policies(self):
         q = requests(200)

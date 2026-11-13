@@ -40,6 +40,7 @@ logger = logging.getLogger(__name__)
 
 import os
 import random
+import time
 from collections import Counter
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
@@ -197,6 +198,8 @@ class SchedulePolicy:
         schedule_low_priority_values_first: bool,
         bounded_lpm_enabled: bool = True,
     ):
+        self._lpm_gate_next_check = 0.0
+        self._on_bounded_state_change = None
         self._bounded_lpm_enabled = bounded_lpm_enabled
         self._bounded_active = False
         self._bounded_members: List[Req] = []
@@ -224,12 +227,20 @@ class SchedulePolicy:
     ) -> List[Req]:
         """The waiting requests in the order the policy admits them."""
         waiting_queue = list(waiting)
-        if self.policy == CacheAwarePolicy.LPM and self._bounded_lpm_enabled:
-            live = {id(req) for req in waiting_queue}
-            self._bounded_members = [r for r in self._bounded_members if id(r) in live]
-            self._bounded_next_members = [
-                r for r in self._bounded_next_members if id(r) in live
-            ]
+        if self._bounded_active or (
+            len(waiting_queue) > WAITING_QUEUE_PREFIX_MATCH_MAX
+            and self._bounded_lpm_enabled
+            and self.policy == CacheAwarePolicy.LPM
+        ):
+            was_active = self._bounded_active
+            if was_active:
+                live = {id(req) for req in waiting_queue}
+                self._bounded_members = [
+                    r for r in self._bounded_members if id(r) in live
+                ]
+                self._bounded_next_members = [
+                    r for r in self._bounded_next_members if id(r) in live
+                ]
             if not self._bounded_members:
                 self._bounded_members = self._bounded_next_members
                 self._bounded_next_members = []
@@ -238,10 +249,16 @@ class SchedulePolicy:
                     self._bounded_members = (
                         waiting_queue[:BOUNDED_LPM_WINDOW_SIZE]
                         if len(waiting_queue) > WAITING_QUEUE_PREFIX_MATCH_MAX
+                        and self._should_start_bounded_batch(waiting_queue)
                         else []
                     )
             # Finish committed batches even after the queue drops below 128.
             self._bounded_active = bool(self._bounded_members)
+            if (
+                self._bounded_active != was_active
+                and self._on_bounded_state_change is not None
+            ):
+                self._on_bounded_state_change(self._bounded_active)
 
         if self._bounded_active:
             self._bounded_skipped.clear()
@@ -335,6 +352,44 @@ class SchedulePolicy:
 
         self._touch_waiting_prefixes(policy, waiting_queue, bootstrap_queue)
         return waiting_queue
+
+    def _should_start_bounded_batch(self, waiting_queue: List[Req]) -> bool:
+        from sglang.srt.managers.lpm_opportunity import (
+            RECHECK_SECONDS,
+            competition_opportunity,
+            prefix_opportunity,
+        )
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        now = time.monotonic()
+        if now < self._lpm_gate_next_check:
+            return False
+        self._lpm_gate_next_check = now + RECHECK_SECONDS
+        self._lpm_gate_competition = None
+        cache = self.tree_cache
+        # Fail closed for cache modes not represented in the observation study.
+        if type(cache) not in (RadixCache, UnifiedRadixCache):
+            return False
+        if (
+            cache.disable
+            or self.enable_hierarchical_cache
+            or cache.cache_controller is not None
+            or getattr(cache, "is_swa_enabled", False)
+            or getattr(cache, "is_mamba_enabled", False)
+            or getattr(cache, "enable_session_radix_cache", False)
+        ):
+            return False
+        allocator = cache.token_to_kv_pool_allocator
+        capacity = getattr(allocator, "size", 0)
+        if not isinstance(capacity, int) or capacity <= 0:
+            return False
+        candidates = waiting_queue[:BOUNDED_LPM_WINDOW_SIZE]
+        if not prefix_opportunity(candidates):
+            return False
+        self._lpm_gate_competition = competition_opportunity(
+            candidates, capacity, include_pairs=False
+        )
+        return self._lpm_gate_competition["allowed"]
 
     def retire_waiting_members(self, reqs: Iterable[Req]) -> None:
         """Retire on departure; never refill the next batch within an epoch."""

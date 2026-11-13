@@ -398,6 +398,7 @@ class TestRunningReqsHooks(CustomTestCase):
         s.min_free_slots_delayer = None
         s.get_num_allocatable_reqs = lambda *args, **kwargs: 0
         s.policy = Mock(
+            _bounded_active=False,
             calc_priority=lambda waiting, *args, **kwargs: list(waiting),
             admission_candidates=lambda waiting: iter(waiting),
         )
@@ -473,6 +474,7 @@ class TestPriorityPreemptionUnderUnifiedMemory(CustomTestCase):
         s.enable_priority_scheduling = True
         s.schedule_low_priority_values_first = False
         s.metrics_reporter = SimpleNamespace(enable_metrics=False)
+        s.dllm_config = None
         Scheduler.init_schedule_policy(s)
         return s.enable_priority_preemption
 

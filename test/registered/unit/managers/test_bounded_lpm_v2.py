@@ -31,6 +31,7 @@ class TestBoundedLPMV2(CustomTestCase):
         self.p = SchedulePolicy(
             "lpm", RadixCache.create_simulated(), False, False, False
         )
+        self.p._should_start_bounded_batch = lambda waiting: True
         self.match = patch.object(
             self.p, "_compute_prefix_matches", return_value=set()
         ).start()
