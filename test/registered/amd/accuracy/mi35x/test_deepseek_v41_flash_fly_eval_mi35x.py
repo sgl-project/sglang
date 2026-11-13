@@ -43,9 +43,10 @@ SERVER_LAUNCH_TIMEOUT = 5400
 TP_SIZE = 4
 FLY_WINDOW_SIZE = 2
 FLY_ENTROPY_THRESHOLD = 0.3
-# sgl-eval gsm8k measured about 0.97 on MI35x with and without FLy (temperature 0);
-# the threshold leaves room for the temperature-1.0 sampling noise.
-ACCURACY_THRESHOLD = 0.90
+# Measured 0.9659 on all 1319 questions with this setup on MI35x (accept length
+# 4.51). The threshold sits about 0.05 under that, this repo's convention for
+# sgl-eval gsm8k.
+ACCURACY_THRESHOLD = 0.91
 
 
 class TestDeepseekV41FlashFlyEvalMI35x(CustomTestCase):
