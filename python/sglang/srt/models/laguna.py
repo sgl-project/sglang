@@ -174,6 +174,33 @@ def _load_flydsl_router():
     return router_logits_fp32
 
 
+def _load_router_fused(config, topk, softcap):
+    """Static conditions of the fused router (item R); per-call ones are in LagunaMoE._fused_topk."""
+    if not envs.SGLANG_OPT_LAGUNA_ROUTER_FUSED.get():
+        return None
+    if not torch.cuda.get_device_properties(0).gcnArchName.startswith("gfx1250"):
+        return None
+    cfg = topk.topk_config
+    if (
+        softcap > 0.0
+        or config.num_experts != 512
+        or config.hidden_size != 16384
+        or cfg.scoring_func != "sigmoid"
+        or not cfg.renormalize
+        or cfg.use_grouped_topk
+        or cfg.custom_routing_function is not None
+        or cfg.routed_scaling_factor not in (None, 1.0)
+        or cfg.num_shared_topk_slots != 0
+        or not (1 <= cfg.top_k <= 32)
+        or envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
+        or envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS.get()
+    ):
+        return None
+    from sglang.srt.layers.moe.laguna_router_fused_gfx1250 import laguna_router_fused
+
+    return laguna_router_fused
+
+
 class LagunaMoE(nn.Module):
     def __init__(
         self,
@@ -218,6 +245,7 @@ class LagunaMoE(nn.Module):
             correction_bias=self.gate.e_score_correction_bias,
         )
         self.topk.bind_runner_backend(self.experts.runner_backend)
+        self._router_fused = _load_router_fused(config, self.topk, self.router_logit_softcapping)
 
         # HF safetensors key is singular `shared_expert.…`; mirror so the
         # default loader picks it up without remapping.
@@ -236,6 +264,41 @@ class LagunaMoE(nn.Module):
             **(dict(parallel_group="replicated") if self._shared_expert_tp1 else {}),
         )
 
+    def _fused_topk(self, hidden_states: torch.Tensor):
+        """SGLANG_OPT_LAGUNA_ROUTER_FUSED: weights / ids from one fused launch, then the ordinary
+        precomputed-top-k post-processing (padding, EPLB, recorder, waterfill). None -> ordinary path."""
+        if self._router_fused is None:
+            return None
+        m = hidden_states.shape[0]
+        if not (1 <= m <= 64) or hidden_states.dtype != torch.bfloat16:
+            return None
+        from sglang.srt.layers.moe.topk import (
+            TopKOutputFormat,
+            build_precomputed_topk_output,
+            get_parallel as _gp,
+            is_allocation_symmetric as _sym,
+            use_symmetric_memory as _usm,
+        )
+
+        topk = self.topk
+        cfg = topk.topk_config
+        if cfg.output_format != TopKOutputFormat.STANDARD:
+            return None
+        num_token_non_padded, dispatch_info = topk._resolve_routing_inputs(None, None)
+        with _usm(_gp().tp_group, disabled=not _sym()):
+            w, ids = self._router_fused(
+                hidden_states, self.gate.weight, self.gate.e_score_correction_bias, topk=cfg.top_k
+            )
+            out = build_precomputed_topk_output(
+                w,
+                ids,
+                cfg,
+                topk.layer_id,
+                num_token_non_padded=num_token_non_padded,
+                expert_location_dispatch_info=dispatch_info,
+            )
+        return topk._apply_waterfill(out, m)
+
     def get_moe_weights(self):
         return [x.data for x in self.experts.parameters()]
 
@@ -249,11 +312,13 @@ class LagunaMoE(nn.Module):
 
         shared_out = self.shared_expert(hidden_states)
 
-        router_logits = self.gate(hidden_states)
-        if self.router_logit_softcapping > 0.0:
-            cap = self.router_logit_softcapping
-            router_logits = torch.tanh(router_logits / cap) * cap
-        topk_output = self.topk(hidden_states, router_logits)
+        topk_output = self._fused_topk(hidden_states)
+        if topk_output is None:
+            router_logits = self.gate(hidden_states)
+            if self.router_logit_softcapping > 0.0:
+                cap = self.router_logit_softcapping
+                router_logits = torch.tanh(router_logits / cap) * cap
+            topk_output = self.topk(hidden_states, router_logits)
         routed_out = self.experts(hidden_states, topk_output)
 
         # Non-grouped TopK doesn't honor apply_routed_scaling_factor_on_output,

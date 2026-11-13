@@ -1120,6 +1120,9 @@ class Envs:
     # M>64 router logits: split the fp32 weight into 3 bf16 residuals and run
     # one tuned bf16 GEMM. M<=64 stays on the FlyDSL GEMV when that flag is set.
     SGLANG_OPT_LAGUNA_ROUTER_BF16X3 = EnvBool(False)
+    # gfx1250 Laguna router for 1 <= M <= 64: one FlyDSL launch (gemv + split-K reduce + sigmoid top-k)
+    # instead of gemv + torch.sum + triton gate; same selection and tie rule as the triton gate.
+    SGLANG_OPT_LAGUNA_ROUTER_FUSED = EnvBool(False)
     # Laguna decode: one Triton kernel for q/k RMSNorm + RoPE + fp8 KV store (triton backend, MHA pools).
     SGLANG_OPT_LAGUNA_FUSED_QK_NORM_ROPE_KV = EnvBool(False)
     # Laguna prefill sequence parallel (TP, any EP): for plain EXTEND batches of at least
