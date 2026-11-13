@@ -5,14 +5,9 @@
 # (/root/.cache/tests/output/...) consumed by the data dashboard, and are also
 # uploaded as workflow artifacts for direct download.
 #
-# To add a model/case, append an entry to the `collect` matrix below. Each entry
-# is one test case; both `perf` and `accuracy` cases are supported. Prefer one
-# entry per (model, test_type) so the artifact name stays unique.
 name: Release Model Data (NPU)
 
 on:
-  # TEMPORARY: run the pipeline on PRs that touch it, for validation.
-  # Remove this trigger before merging. 
   pull_request:
     paths:
       - ".github/workflows/release-model-data-npu.yml"
