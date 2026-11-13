@@ -652,6 +652,12 @@ Quark change defers its optional AITER import until the quantization call in all
 execution modes; that call keeps its original arguments, result and dependency
 error. This changes import timing without replacing the quantizer.
 
+Explicit CPU simulation also defaults `SGLANG_TIMEOUT_KEEP_ALIVE` to 3600 real
+seconds. The native five-second idle lifetime can close a pooled HTTP connection
+while a virtual-time client performs slow CPU work between requests. Explicit
+user values are preserved. This finite transport setting does not change the
+simulated benchmark horizon, workload or metric clock.
+
 The CPU pool plumbing translates an explicit logical token capacity to the
 native pool byte budget. Its bounded search rejects unreachable layouts rather
 than spinning indefinitely, preserving native sizing and rounding.

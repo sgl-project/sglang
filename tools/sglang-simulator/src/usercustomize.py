@@ -3,11 +3,21 @@
 import os
 
 
-def apply_cpu_simulation_compat() -> None:
-    if not (
+def configure_cpu_simulation_environment() -> bool:
+    enabled = (
         os.environ.get("SGLANG_SIMULATOR_BOOTSTRAP") == "1"
         and os.environ.get("SGLANG_USE_CPU_ENGINE") == "1"
-    ):
+    )
+    if enabled:
+        # The virtual-time client can spend more than the native five real
+        # seconds doing CPU work between requests on a pooled HTTP connection.
+        # Keep the transport lifetime finite and preserve explicit user values.
+        os.environ.setdefault("SGLANG_TIMEOUT_KEEP_ALIVE", "3600")
+    return enabled
+
+
+def apply_cpu_simulation_compat() -> None:
+    if not configure_cpu_simulation_environment():
         return
 
     import torch
