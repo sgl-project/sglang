@@ -20,7 +20,6 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
-from sglang.srt.layers.attention.dsa.dsa_dcp import set_dcp_row_consumer
 from sglang.srt.layers.dcp import (
     DcpA2aChunkPipeline,
     DcpA2aChunkPlanner,
@@ -982,6 +981,7 @@ class DeepseekMLARocmForwardMixin:
             topk_indices,
             llama_4_scaling,
             q_nope if fuse_bmm_rope_cache else None,
+            pack_q8_for_asm,
         )
 
     def _applies_rope_in_prepare(
@@ -1031,6 +1031,7 @@ class DeepseekMLARocmForwardMixin:
         topk_indices,
         llama_4_scaling,
         q_nope_unabsorbed=None,
+        asm_q8: bool = False,
     ):
         save_kv_cache = True
         a2a_pipeline = None
@@ -1118,13 +1119,8 @@ class DeepseekMLARocmForwardMixin:
                     }
                 if self.is_dcp_mla_decode_phase(forward_batch):
                     a2a_pipeline = self._dcp_a2a_pipeline(
-                        forward_batch, q_nope_out, q_pe
+                        forward_batch, q_nope_out.shape[0], asm_q8
                     )
-                    set_dcp_row_consumer(a2a_pipeline)
-                    from sglang.kernels.ops.attention.dsa.asm_sparse_mla_dcp import (
-                        is_asm_q8,
-                    )
-
                     # set return_lse=True to correct attn_output
                     attn_output, lse = self.attn_mqa_for_dcp_decode(
                         q_nope_out,
@@ -1134,7 +1130,9 @@ class DeepseekMLARocmForwardMixin:
                         q_rope=q_pe,
                         k_rope=k_pe,
                         # Prepare wrote the KV with the asm query.
-                        save_kv_cache=not is_asm_q8(q_nope_out, q_pe),
+                        save_kv_cache=not asm_q8,
+                        asm_q8=asm_q8,
+                        row_consumer=a2a_pipeline,
                         **extra_args,
                         **(
                             dict(topk_indices=topk_indices)
@@ -1142,7 +1140,6 @@ class DeepseekMLARocmForwardMixin:
                             else {}
                         ),
                     )
-                    set_dcp_row_consumer(None)
                 else:
                     attn_output = self.attn_mqa(
                         q_nope_out,
@@ -1244,7 +1241,7 @@ class DeepseekMLARocmForwardMixin:
                 )
             else:
                 dcp_comm_backend = get_parallel().dcp_comm_backend
-                is_lse_base_on_e = self._dcp_lse_base_on_e(q_nope_out, q_pe)
+                is_lse_base_on_e = self._dcp_lse_base_on_e(asm_q8)
                 if self._dcp_project_before_merge():
                     # Project-before-merge: the LSE merge is linear in the
                     # partial output, so V-project every group head first and
@@ -1382,21 +1379,19 @@ class DeepseekMLARocmForwardMixin:
     def _dcp_a2a_pipeline(
         self: DeepseekV2AttentionMLA,
         forward_batch: ForwardBatch,
-        q_nope_out: torch.Tensor,
-        q_pe: torch.Tensor,
+        rows: int,
+        asm_q8: bool,
     ) -> Optional[DcpA2aChunkPipeline]:
         """Row-chunk the prefill partial exchange so each chunk's a2a overlaps
         the next chunk's attention, as far as the measured costs say it pays."""
-        from sglang.kernels.ops.attention.dsa.asm_sparse_mla_dcp import is_asm_q8
         from sglang.srt.model_executor.runner import get_is_capture_mode
 
         if get_is_capture_mode() or not self._dcp_project_before_merge():
             return None
-        asm = is_asm_q8(q_nope_out, q_pe)
-        planner = _dcp_a2a_planners.get(asm)
+        planner = _dcp_a2a_planners.get(asm_q8)
         if planner is None:
             planner = DcpA2aChunkPlanner(get_parallel().dcp_group)
-            _dcp_a2a_planners[asm] = planner
+            _dcp_a2a_planners[asm_q8] = planner
         layer_id = self.attn_mqa.layer_id
         planner.settle(layer_id)
         if not (
@@ -1406,21 +1401,14 @@ class DeepseekMLARocmForwardMixin:
             return None
         return planner.pipeline(
             layer_id,
-            q_nope_out.shape[0],
+            rows,
             self._dcp_project_partials,
-            is_lse_base_on_e=self._dcp_lse_base_on_e(q_nope_out, q_pe),
+            is_lse_base_on_e=self._dcp_lse_base_on_e(asm_q8),
         )
 
-    def _dcp_lse_base_on_e(
-        self: DeepseekV2AttentionMLA, q_nope_out: torch.Tensor, q_pe: torch.Tensor
-    ) -> bool:
-        from sglang.kernels.ops.attention.dsa.asm_sparse_mla_dcp import is_asm_q8
-
-        # The asm owned attention, which the backend picks by this same query
-        # layout, returns a natural-log LSE.
-        return is_mla_dcp_lse_base_on_e(self.current_attention_backend) or is_asm_q8(
-            q_nope_out, q_pe
-        )
+    def _dcp_lse_base_on_e(self: DeepseekV2AttentionMLA, asm_q8: bool) -> bool:
+        # The asm owned attention returns a natural-log LSE.
+        return is_mla_dcp_lse_base_on_e(self.current_attention_backend) or asm_q8
 
     def _skip_rope_for_dsa_tilelang_fused(self: DeepseekV2AttentionMLA) -> bool:
         """

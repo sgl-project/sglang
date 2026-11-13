@@ -70,7 +70,6 @@ from sglang.srt.layers.attention.dsa.dsa_dcp import (
     DcpPageTableCache,
     dcp_trtllm_sparse_attention,
     localize_dcp_page_table,
-    take_dcp_row_consumer,
 )
 from sglang.srt.layers.attention.dsa.dsa_dcp_sharded import (
     dcp_gather_request_rows,
@@ -2400,6 +2399,8 @@ class DeepseekSparseAttnBackend(
         is_neox: Optional[bool] = False,
         llama_4_scaling: Optional[torch.Tensor] = None,
         attn_sink: Optional[torch.Tensor] = None,
+        asm_q8: bool = False,
+        row_consumer=None,
     ) -> torch.Tensor:
 
         causal = not layer.is_cross_attention
@@ -2599,6 +2600,8 @@ class DeepseekSparseAttnBackend(
                     sm_scale=layer.scaling,
                     layer=layer,
                     topk_indices=shared_topk_indices,
+                    asm_q8=asm_q8,
+                    row_consumer=row_consumer,
                 )
             from sglang.kernels.ops.attention.dsa.triton_sparse_mla import (
                 triton_sparse_mla_fwd,
@@ -2805,6 +2808,8 @@ class DeepseekSparseAttnBackend(
         is_neox: Optional[bool] = False,
         llama_4_scaling: Optional[torch.Tensor] = None,
         attn_sink: Optional[torch.Tensor] = None,
+        asm_q8: bool = False,
+        row_consumer=None,
     ) -> torch.Tensor:
 
         causal = not layer.is_cross_attention
@@ -2957,6 +2962,8 @@ class DeepseekSparseAttnBackend(
                     sm_scale=layer.scaling,
                     layer=layer,
                     topk_indices=shared_topk_indices,
+                    asm_q8=asm_q8,
+                    row_consumer=row_consumer,
                 )
             return self._forward_triton_decode(
                 q_nope=q_nope,
@@ -3805,6 +3812,8 @@ class DeepseekSparseAttnBackend(
         sm_scale: float,
         layer: RadixAttention,
         topk_indices: Optional[torch.Tensor],
+        asm_q8: bool = False,
+        row_consumer=None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Attend the owned slots of the global top-k; one query row per token."""
         from sglang.kernels.ops.attention.dsa.triton_sparse_mla_decode import (
@@ -3826,9 +3835,7 @@ class DeepseekSparseAttnBackend(
             dcp_size=self.attn_dcp_size,
             dcp_rank=self.attn_dcp_rank,
         )
-        from sglang.kernels.ops.attention.dsa.asm_sparse_mla_dcp import is_asm_q8
-
-        if is_asm_q8(q_nope, q_rope):
+        if asm_q8:
             from sglang.kernels.ops.attention.dsa.asm_sparse_mla_dcp import (
                 asm_sparse_mla_dcp,
             )
@@ -3875,10 +3882,10 @@ class DeepseekSparseAttnBackend(
                 )
                 return out.view(hi - lo, heads, v_head_dim), lse
 
-        consumer = take_dcp_row_consumer(rows)
-        if consumer is None:
+        if row_consumer is None:
             return attend(0, rows)
-        return consumer.run(attend), None
+        assert row_consumer.rows == rows
+        return row_consumer.run(attend), None
 
     def _forward_intel_xpu_sparse_decode(
         self,
