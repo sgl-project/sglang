@@ -36,3 +36,6 @@ zeromq = { version = "0.6", default-features = false, features = ["tokio-runtime
 [build-dependencies]
 protoc-bin-vendored = "3.2.0"
 tonic-prost-build = "0.14.6"
+
+[dev-dependencies]
+serde_json = "1"
