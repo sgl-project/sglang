@@ -16,30 +16,31 @@ logger = init_logger(__name__)
 
 _is_npu = current_platform.is_npu()
 
-try:
-    if _is_npu:
+if _is_npu:
+    try:
         from sgl_kernel_npu.operators.attention import la
-    else:
-        import attentions  # noqa: F401
-except ImportError as e:
-    logger.warning_once(
-        "The Laser Attention kernel library is not installed. Laser Attention is "
-        "unavailable. Installing this library may improve performance on NPU. "
-        "See: sgl-project/sgl-kernel-npu"
-    )
-    raise ImportError(
-        (
-            "The required Laser Attention kernel library is not installed: "
-            "'sgl_kernel_npu' (operator attention.laser_attention) on NPU, "
-            "'attentions' elsewhere. Install it from sgl-project/sgl-kernel-npu."
+    except ImportError as e:
+        logger.warning_once(
+            "The Laser Attention kernel library is not installed. Laser Attention is "
+            "unavailable. Installing this library may improve performance on NPU. "
+            "See: sgl-project/sgl-kernel-npu"
         )
-    ) from e
+        raise ImportError(
+            (
+                "The required Laser Attention kernel library is not installed: "
+                "'sgl_kernel_npu' (operator attention.laser_attention) on NPU. "
+                "Install it from sgl-project/sgl-kernel-npu."
+            )
+        ) from e
 
 
 def _laser_attention_op(**kwargs):
-    if _is_npu:
-        return la(**kwargs)
-    return torch.ops.attentions.la(**kwargs)
+    if not _is_npu:
+        raise RuntimeError(
+            "Laser Attention is only supported on NPU and requires the "
+            "'attentions' module shipped with sgl_kernel_npu."
+        )
+    return la(**kwargs)
 
 
 # The current NPU kernel stores QK scores and V in FP16 even for BF16 inputs.
