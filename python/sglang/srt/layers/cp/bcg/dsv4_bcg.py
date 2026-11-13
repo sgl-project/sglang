@@ -22,7 +22,7 @@ from sglang.srt.layers.cp.utils import (
     prepare_cp_forward,
 )
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, get_platform
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -40,8 +40,9 @@ class DSV4CPBCGInput(PrefillCPBCGInput):
 
     @staticmethod
     def supports(server_args) -> bool:
+        # HIP compression metadata does not support padded CP graph replay yet.
         # The V4.1 adapter prepares embeddings on every rank and requires PP=1.
-        return resolving_view(server_args).pp_size == 1
+        return not get_platform().is_hip and resolving_view(server_args).pp_size == 1
 
     def _max_local_tokens(self, extend_seq_lens):
         size = get_parallel().attn_cp_size

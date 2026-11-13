@@ -4,12 +4,22 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-from sglang.srt.arg_groups.deepseek_v4_hook import validate_deepseek_v4_cp
+from sglang.srt.arg_groups.cuda_graph_hook import (
+    apply_prefill_cp_cuda_graph_default,
+    parse_cuda_graph_config,
+)
+from sglang.srt.arg_groups.deepseek_v4_hook import (
+    validate_deepseek_v4_cp,
+    validate_deepseek_v41_features,
+)
+from sglang.srt.arg_groups.model_override_base import resolving_view
+from sglang.srt.arg_groups.overrides import declare_resolution
 from sglang.srt.arg_groups.parallel_hook import (
     handle_context_parallelism,
     validate_prefill_cp_platform,
 )
 from sglang.srt.layers.cp.base import init_cp_strategy
+from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
 from sglang.srt.runtime_context import override_platform
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -37,6 +47,21 @@ def _cp_args(arch="DeepseekV4ForCausalLM", model_type="deepseek_v4", **overrides
         is_multimodal=False,
     )
     return args
+
+
+def _parse_disabled_prefill_graph_default(args):
+    parse_cuda_graph_config(args)
+    # Earlier model/compatibility defaults can disable capture without locking
+    # the user's prefill backend, which the CP default may later restore.
+    declare_resolution(
+        args,
+        "test_earlier_prefill_graph_default",
+        cuda_graph_config=with_phase(
+            resolving_view(args).cuda_graph_config,
+            Phase.PREFILL,
+            backend=Backend.DISABLED,
+        ),
+    )
 
 
 class TestPlatformPrefillCPPolicy(CustomTestCase):
@@ -120,6 +145,56 @@ class TestPlatformPrefillCPPolicy(CustomTestCase):
     @override_platform(is_hip=False, is_npu=False, is_musa=False)
     def test_cuda_deepseek_v4_cp_allows_multiple_nodes(self):
         validate_deepseek_v4_cp(_cp_args(nnodes=2))
+
+    @override_platform(is_cuda=False, is_hip=True)
+    def test_hip_dsv4_cp_graph_default_stays_disabled(self):
+        args = _cp_args(tp_size=8, attn_cp_size=8)
+        _parse_disabled_prefill_graph_default(args)
+        validate_deepseek_v4_cp(args)
+        apply_prefill_cp_cuda_graph_default(args)
+        self.assertEqual(
+            resolving_view(args).cuda_graph_config.prefill.backend, Backend.DISABLED
+        )
+
+    @override_platform(is_cuda=True, is_hip=False)
+    def test_dsv41_cp_graph_default_respects_decoder_bounded_replay(self):
+        for bounded_replay in (None, False, True):
+            with self.subTest(bounded_replay=bounded_replay):
+                args = _cp_args(
+                    model_type="deepseek_v41",
+                    tp_size=8,
+                    attn_cp_size=8,
+                    enable_decoder_swa_bounded_replay=bounded_replay,
+                )
+                _parse_disabled_prefill_graph_default(args)
+                self.assertIsNone(args.cuda_graph_backend_prefill)
+                self.assertEqual(
+                    resolving_view(args).cuda_graph_config.prefill.backend,
+                    Backend.DISABLED,
+                )
+                # Feature validation runs before automatic CP graph selection.
+                validate_deepseek_v41_features(args)
+                apply_prefill_cp_cuda_graph_default(args)
+                expected = Backend.DISABLED if bounded_replay else Backend.BREAKABLE
+                self.assertEqual(
+                    resolving_view(args).cuda_graph_config.prefill.backend, expected
+                )
+                validate_deepseek_v41_features(args)
+
+    @override_platform(is_cuda=True, is_hip=False)
+    def test_dsv41_cp_explicit_bcg_with_bounded_replay_still_rejected(self):
+        args = _cp_args(
+            model_type="deepseek_v41",
+            tp_size=8,
+            attn_cp_size=8,
+            enable_decoder_swa_bounded_replay=True,
+            cuda_graph_backend_prefill=Backend.BREAKABLE,
+        )
+        parse_cuda_graph_config(args)
+        with self.assertRaisesRegex(
+            ValueError, "prefill CP with the prefill CUDA graph"
+        ):
+            validate_deepseek_v41_features(args)
 
     def test_non_cp_and_decode_cp_are_not_rejected(self):
         for platform in ("is_hip", "is_npu", "is_musa"):
