@@ -3207,7 +3207,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         assert self._draft_seq_lens_cpu_buf is not None
 
         prep_fast = None
-        if self._prep_graph is not None:
+        # The prep graph writes the target's slots; a draft KV ring runs eager.
+        if self._prep_graph is not None and self.draft_kv_ring is None:
             prep_fast = self._prep_graph.run(
                 batch=batch, draft_input=draft_input, bs=bs
             )
@@ -3441,6 +3442,13 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         # Consume in this step: every decode graph size shares one aux output,
         # which the next target forward overwrites (resolve_aux_hidden_states_width).
+        ring_block_locs = (
+            None
+            if self.draft_kv_ring is None
+            else self.draft_kv_ring.block_locs(
+                batch.req_pool_indices, positions, block_size
+            )
+        )
         cache_loc = (
             ring_block_locs
             if ring_block_locs is not None
