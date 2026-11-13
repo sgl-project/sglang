@@ -14,7 +14,7 @@ from sglang.kernels.ops.kvcache.hicache import (
 )
 from sglang.kernels.ops.kvcache.hisparse import transfer_cache_dsv4_mla
 from sglang.srt.mem_cache.pool_host._kvcacheio import (
-    MLA_KVCACHEIO_OPS,
+    MLA_PAGE_UNIFIED_KVCACHEIO_OPS,
     require_kvcacheio_ops,
     unavailable_stub,
 )
@@ -330,7 +330,7 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
                 for _ in range(self.layer_num)
             ]
             self.data_refs = [self.kv_buffer[i] for i in range(self.layer_num)]
-        elif self.layout == "page_first":
+        elif self.layout in ("page_first", "page_unified"):
             self.kv_buffer = alloc_func(
                 (num_host_pages, self.layer_num, self.item_bytes),
                 dtype=self.dtype,
@@ -384,7 +384,7 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
     def _init_write_back_staging_buffers(self):
         self.staging_buffer = None
         if (
-            self.layout != "page_first"
+            self.layout not in ("page_first", "page_unified")
             or not current_platform.capabilities.hicache_device_kernels
         ):
             return
@@ -504,7 +504,7 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
     if _is_xpu:
         # {io_backend: {layout: kvcacheio ops}} the transfer methods below call,
         # checked at construction; keep in step with their branches.
-        _kvcacheio_ops = MLA_KVCACHEIO_OPS
+        _kvcacheio_ops = MLA_PAGE_UNIFIED_KVCACHEIO_OPS
 
     def backup_tokens_from_device_all_layer(self, host_indices, device_indices):
         """Copy individual tokens; the page path below would copy whole pages."""
@@ -513,7 +513,7 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         # Token-granular DSV4 C4 copy needs this helper because a token is
         # not one contiguous byte range in the paged row:
         # [value0..value63][scale0..scale63].
-        if self.page_aligned_only:
+        if self.page_aligned_only or self.layout == "page_unified":
             raise self._unaligned_transfer_error(host_indices, device_indices)
         transfer_cache_dsv4_mla(
             src_ptrs=self.device_ptrs,
@@ -545,7 +545,7 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
                 item_size=self.item_bytes,
                 num_layers=self.layer_num,
             )
-        elif io_backend == "kernel" and self.layout == "page_first":
+        elif io_backend == "kernel" and self.layout in ("page_first", "page_unified"):
             if self.can_use_write_back_jit:
                 jit_transfer_hicache_all_layer_mla_staged_lf_pf(
                     ptr_src=self.device_ptrs,
@@ -645,7 +645,7 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
         ):
             # Same DSV4 C4 layout issue as backup: this is token-granular
             # preload, so it cannot use the normal HiCache page-row copy.
-            if self.page_aligned_only:
+            if self.page_aligned_only or self.layout == "page_unified":
                 raise self._unaligned_transfer_error(host_indices, device_indices)
             transfer_cache_dsv4_mla(
                 src_ptrs=self.data_ptrs[layer_id : layer_id + 1],
@@ -665,7 +665,7 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
                 dst_indices=device_rows,
                 item_size=self.item_bytes,
             )
-        elif io_backend == "kernel" and self.layout == "page_first":
+        elif io_backend == "kernel" and self.layout in ("page_first", "page_unified"):
             transfer_kv_per_layer_mla_pf_lf(
                 src=self.kv_buffer,
                 dst=self.device_buffers[layer_id],
@@ -742,7 +742,7 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
             data_page = torch.stack(
                 [self.kv_buffer[i][index] for i in range(self.layer_num)]
             )
-        elif self.layout in ["page_first", "page_first_direct"]:
+        elif self.layout in ["page_first", "page_first_direct", "page_unified"]:
             data_page = self.kv_buffer[index]
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
@@ -762,7 +762,7 @@ class DeepSeekV4PagedHostPool(HiSparseHostPoolMixin, HostKVCache):
             data = data_page.view(self.dtype).reshape(self.layer_num, self.item_bytes)
             for i in range(self.layer_num):
                 self.kv_buffer[i][index].copy_(data[i])
-        elif self.layout == "page_first":
+        elif self.layout in ("page_first", "page_unified"):
             self.kv_buffer[index].copy_(
                 data_page.view(self.dtype).reshape(self.layer_num, self.item_bytes)
             )
@@ -883,7 +883,7 @@ class DeepSeekV4StateHostPool(HostKVCache):
                 for _ in range(self.layer_num)
             ]
             self.data_refs = [self.kv_buffer[i] for i in range(self.layer_num)]
-        elif self.layout == "page_first":
+        elif self.layout in ("page_first", "page_unified"):
             self.kv_buffer = alloc_func(
                 (num_host_pages, self.layer_num, self.state_page_bytes),
                 dtype=self.dtype,
@@ -957,7 +957,7 @@ class DeepSeekV4StateHostPool(HostKVCache):
     def _init_write_back_staging_buffers(self):
         self.staging_buffer = None
         if (
-            self.layout != "page_first"
+            self.layout not in ("page_first", "page_unified")
             or not current_platform.capabilities.hicache_device_kernels
         ):
             return
@@ -1040,7 +1040,7 @@ class DeepSeekV4StateHostPool(HostKVCache):
     if _is_xpu:
         # {io_backend: {layout: kvcacheio ops}} the transfer methods below call,
         # checked at construction; keep in step with their branches.
-        _kvcacheio_ops = MLA_KVCACHEIO_OPS
+        _kvcacheio_ops = MLA_PAGE_UNIFIED_KVCACHEIO_OPS
 
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
@@ -1059,7 +1059,7 @@ class DeepSeekV4StateHostPool(HostKVCache):
                 item_size=self.state_page_bytes,
                 num_layers=self.layer_num,
             )
-        elif io_backend == "kernel" and self.layout == "page_first":
+        elif io_backend == "kernel" and self.layout in ("page_first", "page_unified"):
             if self.can_use_write_back_jit:
                 jit_transfer_hicache_all_layer_mla_staged_lf_pf(
                     ptr_src=self.device_ptrs,
@@ -1164,7 +1164,7 @@ class DeepSeekV4StateHostPool(HostKVCache):
                 dst_indices=device_rows,
                 item_size=self.state_page_bytes,
             )
-        elif io_backend == "kernel" and self.layout == "page_first":
+        elif io_backend == "kernel" and self.layout in ("page_first", "page_unified"):
             transfer_kv_per_layer_mla_pf_lf(
                 src=self.kv_buffer,
                 dst=self.device_page_views[layer_id],
@@ -1246,7 +1246,7 @@ class DeepSeekV4StateHostPool(HostKVCache):
             data_page = torch.stack(
                 [self.kv_buffer[i][index] for i in range(self.layer_num)]
             )
-        elif self.layout in ["page_first", "page_first_direct"]:
+        elif self.layout in ["page_first", "page_first_direct", "page_unified"]:
             data_page = self.kv_buffer[index]
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
@@ -1268,7 +1268,7 @@ class DeepSeekV4StateHostPool(HostKVCache):
             )
             for i in range(self.layer_num):
                 self.kv_buffer[i][index].copy_(data[i])
-        elif self.layout == "page_first":
+        elif self.layout in ("page_first", "page_unified"):
             self.kv_buffer[index].copy_(
                 data_page.view(self.dtype).reshape(
                     self.layer_num, self.state_page_bytes

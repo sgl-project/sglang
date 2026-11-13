@@ -31,6 +31,12 @@ they fix chunk boundaries, and boundaries are namespace identity. Left unset,
 each falls back to this rank's own shard, which shares only with its own
 topology.
 
+DSA and DeepSeek V4/V4.1 native pools instead store one complete native page per
+global owner layer, with the pool role and byte encoding in the digest; both
+partitions must be unset or 1. DSA keeps its real MLA KV anchor plus indexer
+pages, while DeepSeek V4 anchors the logical page with a zero-byte KV marker.
+CP, DCP and draft sidecars are unsupported for these pools.
+
 The digest prefixes every key, so any identity mismatch misses rather than
 collides. dtype is the LOGICAL one: fp8_e4m3 and fp8_e5m2 never share a
 keyspace even though both store as uint8.
@@ -40,6 +46,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+from dataclasses import dataclass
 
 import msgspec
 
@@ -50,6 +57,40 @@ logger = logging.getLogger(__name__)
 # The digest covers the encoded struct, so any schema change changes every key.
 # Bump on any field change.
 _SCHEMA_VERSION = 1
+
+
+@dataclass(frozen=True)
+class UnifiedPoolPlan:
+    """Topology-free object suffixes paired with runs in one host page."""
+
+    suffixes: tuple[str, ...]
+    chunk_spans: tuple[tuple[int, int], ...]
+
+    def __post_init__(self) -> None:
+        if (
+            not self.suffixes
+            or len(self.suffixes) != len(self.chunk_spans)
+            or len(set(self.suffixes)) != len(self.suffixes)
+            or any(not suffix for suffix in self.suffixes)
+        ):
+            raise ValueError("Unified pool objects require unique suffixes and spans.")
+        # A logical KV anchor persists one empty marker alongside its real pools.
+        if self.chunk_spans == ((0, 0),):
+            return
+        end = 0
+        for offset, length in sorted(self.chunk_spans):
+            if (
+                type(offset) is not int
+                or type(length) is not int
+                or offset != end
+                or length <= 0
+            ):
+                raise ValueError("Unified pool spans must cover a page without gaps.")
+            end = offset + length
+
+    @property
+    def page_bytes(self) -> int:
+        return sum(length for _, length in self.chunk_spans)
 
 
 class KVCacheNamespace(

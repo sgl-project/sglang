@@ -12,6 +12,7 @@ against itself.
 """
 
 import sys
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -279,6 +280,91 @@ def test_mla_page_unified(kv_lora_rank, qk_rope_head_dim, dtype, preallocate):
             device_pool.kv_buffer[layer][device_indices],
             original[layer][device_indices],
         ), f"latent KV mismatch at layer {layer}"
+
+
+@pytest.mark.parametrize(
+    "kind,dtype",
+    [
+        ("paged", torch.uint8),
+        ("paged", torch.bfloat16),
+        ("paged", torch.float32),
+        ("state", torch.bfloat16),
+        ("state", torch.float32),
+    ],
+)
+def test_dsv4_native_page_unified(kind, dtype):
+    """Native page widths are bytes even when the device stores FP16/FP32."""
+    from sglang.srt.mem_cache.deepseek_v4_buffer_info import DSV4StateBufferInfo
+    from sglang.srt.mem_cache.memory_pool_host import (
+        DeepSeekV4PagedHostPool,
+        DeepSeekV4StateHostPool,
+    )
+    from sglang.srt.mem_cache.pool_host.common import (
+        ALLOC_MEMORY_FUNCS,
+        alloc_with_pin_memory,
+    )
+
+    row_bytes, pages, layers = 128, 8, 3
+    buffers = [
+        (
+            (
+                torch.arange(pages * row_bytes // dtype.itemsize, device=DEVICE)
+                + layer * 17
+            )
+            % 97
+        )
+        .to(dtype)
+        .reshape(pages, -1)
+        for layer in range(layers)
+    ]
+    originals = [buffer.clone() for buffer in buffers]
+    with patch.dict(ALLOC_MEMORY_FUNCS, {DEVICE: alloc_with_pin_memory}):
+        common = dict(
+            pool_name="deepseek_v4_c4_state" if kind == "state" else "deepseek_v4_c4",
+            num_host_pages=pages,
+            layout="page_unified",
+            pin_memory=True,
+        )
+        if kind == "state":
+            host = DeepSeekV4StateHostPool(
+                state_infos=[
+                    DSV4StateBufferInfo(
+                        pages=buffer.view(torch.uint8), ring_size=8, dtype=dtype
+                    )
+                    for buffer in buffers
+                ],
+                swa_page_size=PAGE_SIZE,
+                **common,
+            )
+        else:
+            host = DeepSeekV4PagedHostPool(
+                device_buffers=buffers,
+                item_bytes=row_bytes,
+                slot_page_size=PAGE_SIZE,
+                page_aligned_only=True,
+                **common,
+            )
+
+    device_indices = _page_indices([2, 4], PAGE_SIZE).to(DEVICE)
+    host_indices = _page_indices([1, 3], PAGE_SIZE).to(DEVICE)
+    host.backup_from_device_all_layer(None, host_indices, device_indices, "kernel")
+    torch.cuda.synchronize()
+    stored = [host.get_data_page(page * PAGE_SIZE).clone() for page in (1, 3)]
+    host.kv_buffer.zero_()
+    for page, data in zip((6, 2), stored):
+        host.set_from_flat_data_page(page * PAGE_SIZE, data)
+    for buffer in buffers:
+        buffer.zero_()
+
+    restored_host = _page_indices([6, 2], PAGE_SIZE).to(DEVICE)
+    restored_device = _page_indices([5, 6], PAGE_SIZE).to(DEVICE)
+    for layer in range(layers):
+        host.load_to_device_per_layer(
+            None, restored_host, restored_device, layer, "kernel"
+        )
+    torch.cuda.synchronize()
+    for actual, expected in zip(buffers, originals):
+        assert torch.equal(actual[[5, 6]], expected[[2, 4]])
 
 
 if __name__ == "__main__":
