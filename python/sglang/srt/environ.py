@@ -699,6 +699,14 @@ class Envs:
     SGLANG_CACHE_HIT_RATE_WINDOW_SECONDS = EnvFloat(15.0)
     SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES = EnvInt(None)
     SGLANG_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK = EnvFloat(None)
+    # --load-balance-method prefix_aware, named after sgl-model-gateway's
+    # cache_aware knobs: the matched fraction of a prompt below which it goes to
+    # the least-loaded rank (--cache-threshold), and the load gap in requests and
+    # as a ratio, both of which must be exceeded, at which a rank stops taking
+    # prefix-matched requests (--balance-abs-threshold, --balance-rel-threshold).
+    SGLANG_DP_PREFIX_ROUTING_CACHE_THRESHOLD = EnvFloat(0.5)
+    SGLANG_DP_PREFIX_ROUTING_BALANCE_ABS_THRESHOLD = EnvInt(4)
+    SGLANG_DP_PREFIX_ROUTING_BALANCE_REL_THRESHOLD = EnvFloat(1.5)
     # Compact extend-attention scheduler tile-budget admission (AMD/HIP-only).
     # Budget <= 0 disables; >0 sets the max prefix-extend tiles per batch.
     SGLANG_PREFILL_TILE_BUDGET = EnvInt(0)

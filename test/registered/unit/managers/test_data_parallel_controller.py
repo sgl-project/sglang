@@ -33,6 +33,11 @@ from sglang.srt.managers.data_parallel_controller import (
     LoadBalanceMethod,
     WorkerPortHandshake,
 )
+from sglang.srt.managers.dp_prefix_router import (
+    PrefixAffinityIndex,
+    PrefixAwareSelector,
+    prefix_block_size,
+)
 from sglang.srt.managers.io_struct import ActiveRanksOutput
 from sglang.srt.managers.load_snapshot import LoadSnapshot
 from sglang.srt.runtime_context import get_context
@@ -638,6 +643,283 @@ class TestRefreshLoadBudgetThrottle(CustomTestCase):
             ctl.dp_budget.total_tokens,
             after_burst,
             "a stale-timestamp snapshot must not wipe the speculative state",
+        )
+
+
+def _prompt(session: int, num_blocks: int, block_size: int = 4) -> list[int]:
+    """A prompt whose blocks are unique to ``session``."""
+    return [session * 10_000 + i for i in range(num_blocks * block_size)]
+
+
+def _selector(num_ranks=4, block_size=4, capacity_blocks=1000, **overrides):
+    kwargs = dict(
+        cache_threshold=0.5,
+        balance_abs_threshold=4,
+        balance_rel_threshold=1.5,
+    )
+    kwargs.update(overrides)
+    return PrefixAwareSelector(
+        num_ranks=num_ranks,
+        block_size=block_size,
+        capacity_blocks=capacity_blocks,
+        **kwargs,
+    )
+
+
+class TestPrefixAffinityIndex(CustomTestCase):
+    def test_prefix_block_size_bounds_small_pages_and_aligns_large_pages(self):
+        self.assertEqual(prefix_block_size(None), 64)
+        self.assertEqual(prefix_block_size(1), 64)
+        self.assertEqual(prefix_block_size(16), 64)
+        self.assertEqual(prefix_block_size(48), 96)
+        self.assertEqual(prefix_block_size(64), 64)
+        self.assertEqual(prefix_block_size(128), 128)
+        self.assertEqual(prefix_block_size(256), 256)
+
+    def test_block_keys_chain_over_the_whole_prefix(self):
+        index = PrefixAffinityIndex(num_ranks=1, block_size=2, capacity_blocks=10)
+        a = index.block_keys([1, 2, 3, 4, 5])
+        b = index.block_keys([9, 9, 3, 4])
+        self.assertEqual(len(a), 2, "the partial tail block is ignored")
+        self.assertNotEqual(a[1], b[1], "same block after a different prefix")
+        self.assertEqual(a, index.block_keys([1, 2, 3, 4]))
+        self.assertNotEqual(a, index.block_keys([1, 2, 3, 4], seed=7))
+
+    def test_match_counts_leading_blocks_per_rank(self):
+        index = PrefixAffinityIndex(num_ranks=3, block_size=2, capacity_blocks=10)
+        index.insert(0, index.block_keys([1, 2, 3, 4]))
+        index.insert(2, index.block_keys([1, 2, 7, 7]))
+        self.assertEqual(index.match(index.block_keys([1, 2, 3, 4, 5, 6])), [2, 0, 1])
+
+    def test_lru_evicts_leaves_before_their_prefix(self):
+        index = PrefixAffinityIndex(num_ranks=1, block_size=1, capacity_blocks=3)
+        index.insert(0, index.block_keys([1, 2, 3]))
+        index.insert(0, index.block_keys([5]))  # pushes out the oldest key
+        self.assertEqual(index.num_blocks(0), 3)
+        self.assertEqual(
+            index.match(index.block_keys([1, 2, 3])),
+            [2],
+            "the leaf block goes first; the prefix [1, 2] still matches",
+        )
+
+    def test_reinsert_refreshes_the_prefix(self):
+        index = PrefixAffinityIndex(num_ranks=1, block_size=1, capacity_blocks=3)
+        index.insert(0, index.block_keys([1, 2]))
+        index.insert(0, index.block_keys([7]))
+        index.insert(0, index.block_keys([1, 2]))  # [7] is now the oldest
+        index.insert(0, index.block_keys([8]))
+        self.assertEqual(index.match(index.block_keys([1, 2])), [2])
+        self.assertEqual(index.match(index.block_keys([7])), [0])
+
+
+class TestPrefixAwareSelector(CustomTestCase):
+    def test_new_prompts_go_to_least_loaded_rank(self):
+        sel = _selector()
+        self.assertEqual(sel.select(_prompt(1, 4), [3, 1, 2, 5], [0, 1, 2, 3]), 1)
+
+    def test_follow_up_turn_returns_to_the_rank_holding_its_prefix(self):
+        sel = _selector()
+        turn1 = _prompt(1, 4)
+        self.assertEqual(sel.select(turn1, [0, 0, 0, 0], [0, 1, 2, 3]), 0)
+        turn2 = turn1 + _prompt(2, 4)  # turn 1 + its response + a new message
+        self.assertEqual(sel.select(turn2, [1, 0, 0, 0], [0, 1, 2, 3]), 0)
+
+    def test_sessions_spread_and_each_stays_on_its_rank(self):
+        sel = _selector()
+        loads = [0, 0, 0, 0]
+        first = {}
+        for s in range(4):
+            first[s] = sel.select(_prompt(s, 4), loads, [0, 1, 2, 3])
+            loads[first[s]] += 1
+        self.assertEqual(sorted(first.values()), [0, 1, 2, 3])
+        for s in range(4):
+            turn2 = _prompt(s, 4) + _prompt(100 + s, 4)
+            self.assertEqual(sel.select(turn2, loads, [0, 1, 2, 3]), first[s])
+
+    def test_shared_system_prompt_does_not_pull_new_sessions(self):
+        sel = _selector()
+        system = _prompt(0, 2)
+        loads = [0, 0, 0, 0]
+        ranks = []
+        for s in range(4):
+            # 2 shared blocks of 8: below the 0.5 cache threshold.
+            r = sel.select(system + _prompt(1 + s, 6), loads, [0, 1, 2, 3])
+            loads[r] += 1
+            ranks.append(r)
+        self.assertEqual(sorted(ranks), [0, 1, 2, 3])
+
+    def test_long_reply_keeps_the_session_on_its_rank(self):
+        sel = _selector()
+        turn1 = _prompt(1, 4)
+        self.assertEqual(sel.select(turn1, [0, 0, 0, 0], [0, 1, 2, 3]), 0)
+        # Turn 1 + an 8-block reply/tool result the index never saw: 4 of 12
+        # blocks match, under the 0.5 ratio, but the match ends where turn 1 did.
+        turn2 = turn1 + _prompt(2, 8)
+        self.assertEqual(sel.select(turn2, [1, 0, 0, 0], [0, 1, 2, 3]), 0)
+
+    def test_match_ending_mid_prompt_still_needs_the_ratio(self):
+        sel = _selector()
+        turn1 = _prompt(1, 4)
+        self.assertEqual(sel.select(turn1, [0, 0, 0, 0], [0, 1, 2, 3]), 0)
+        # Shares only turn 1's first 2 blocks: 2 of 10 match, no prompt ended there.
+        other = turn1[:8] + _prompt(2, 8)
+        self.assertEqual(sel.select(other, [1, 0, 0, 0], [0, 1, 2, 3]), 1)
+
+    def test_long_shared_prefix_packs_until_the_overload_guard(self):
+        """Known limit: a shared prefix over cache_threshold of the prompt pulls
+        new sessions to the ranks holding it until they are overloaded."""
+        sel = _selector(num_ranks=8)
+        system = _prompt(0, 6)
+        loads = [0] * 8
+        for s in range(16):
+            # 6 shared blocks of 8: over the 0.5 cache threshold.
+            r = sel.select(system + _prompt(1 + s, 2), loads, list(range(8)))
+            loads[r] += 1
+        self.assertEqual(loads, [5, 5, 5, 1, 0, 0, 0, 0])
+        # Once every rank holds the shared part, equal matches go by load.
+        for r in range(8):
+            sel.index.insert(r, sel.index.block_keys(system))
+        for s in range(16, 32):
+            r = sel.select(system + _prompt(1 + s, 2), loads, list(range(8)))
+            loads[r] += 1
+        self.assertEqual(loads, [5, 5, 5, 4, 4, 3, 3, 3])
+
+    def test_overloaded_rank_loses_its_prefix_matches(self):
+        sel = _selector(balance_abs_threshold=2, balance_rel_threshold=1.5)
+        turn1 = _prompt(1, 4)
+        self.assertEqual(sel.select(turn1, [0, 0], [0, 1]), 0)
+        turn2 = turn1 + _prompt(2, 4)
+        # Rank 0 has 2 more requests than rank 1: within the threshold.
+        self.assertEqual(sel.select(turn2, [3, 1], [0, 1]), 0)
+        # 4 more (and > 1.5x): rank 0 is skipped, and the turn re-caches on 1.
+        turn3 = turn2 + _prompt(3, 4)
+        self.assertEqual(sel.select(turn3, [5, 1], [0, 1]), 1)
+        turn4 = turn3 + _prompt(4, 4)
+        self.assertEqual(
+            sel.select(turn4, [1, 1], [0, 1]), 1, "rank 1 now holds the longest prefix"
+        )
+
+    def test_equal_matches_tie_break_on_load(self):
+        sel = _selector()
+        prefix = _prompt(1, 4)
+        sel.select(prefix, [0, 0, 0], [0, 1, 2])
+        sel.index.insert(2, sel.index.block_keys(prefix))
+        self.assertEqual(sel.select(prefix + [1], [2, 0, 1], [0, 1, 2]), 2)
+
+    def test_only_active_ranks_are_chosen(self):
+        sel = _selector()
+        turn1 = _prompt(1, 4)
+        self.assertEqual(sel.select(turn1, [0, 0, 0], [0, 1, 2]), 0)
+        self.assertEqual(sel.select(turn1 + _prompt(2, 4), [0, 0, 0], [1, 2]), 1)
+
+    def test_prompt_shorter_than_a_block_goes_by_load(self):
+        sel = _selector(block_size=16)
+        self.assertEqual(sel.select([1, 2, 3], [2, 0], [0, 1]), 1)
+        self.assertEqual(sel.select([1, 2, 3], [0, 2], [0, 1]), 0)
+
+
+class TestPrefixAwareScheduler(CustomTestCase):
+    def _controller(self, num_dp_ranks=4):
+        ctl = _make_controller(num_dp_ranks)
+        ctl.prefix_selector = _selector(num_ranks=num_dp_ranks)
+        return ctl
+
+    def test_sticks_a_session_and_bumps_the_budget(self):
+        ctl = self._controller()
+        turn1 = _prompt(1, 4)
+        ctl.prefix_aware_scheduler(_req(input_ids=turn1))
+        ctl.prefix_aware_scheduler(_req(input_ids=_prompt(2, 4)))
+        ctl.prefix_aware_scheduler(_req(input_ids=turn1 + _prompt(3, 4)))
+        self.assertEqual(ctl.workers[0].send_pyobj.call_count, 2)
+        self.assertEqual(ctl.workers[1].send_pyobj.call_count, 1)
+        self.assertEqual(ctl.dp_budget.total_requests, [2, 1, 0, 0])
+        self.assertEqual(ctl.dp_budget.total_tokens, [16 + 32, 16, 0, 0])
+
+    def test_routed_dp_rank_bypasses_prefix_routing(self):
+        ctl = self._controller()
+        ctl.prefix_aware_scheduler(_req(routed_dp_rank=3, input_ids=_prompt(1, 4)))
+        ctl.workers[3].send_pyobj.assert_called_once()
+        self.assertEqual(ctl.dp_budget.total_requests, [0, 0, 0, 0])
+
+    def test_skips_inactive_workers(self):
+        ctl = self._controller()
+        ctl._active_workers = [1, 3]
+        ctl.prefix_aware_scheduler(_req(input_ids=_prompt(1, 4)))
+        ctl.workers[1].send_pyobj.assert_called_once()
+
+    def test_mm_inputs_and_input_embeds_fall_back_to_load(self):
+        ctl = self._controller()
+        turn1 = _prompt(1, 4)
+        # Two VLM requests sharing placeholder tokens must spread by load, not stick.
+        r1 = _req(input_ids=turn1)
+        r1.mm_inputs = object()
+        r2 = _req(input_ids=turn1)
+        r2.mm_inputs = object()
+        ctl.prefix_aware_scheduler(r1)
+        ctl.prefix_aware_scheduler(r2)
+        self.assertEqual(ctl.dp_budget.total_requests, [1, 1, 0, 0])
+        self.assertEqual(ctl.prefix_selector.index.num_blocks(0), 0)
+        # input_embeds (input_ids=None) also routes by load and counts embed length.
+        ctl.prefix_aware_scheduler(_req(input_embeds=[[0.0]] * 10))
+        self.assertEqual(ctl.dp_budget.total_requests, [1, 1, 1, 0])
+        self.assertEqual(ctl.dp_budget.total_tokens[2], 10)
+
+    def test_lora_extra_key_and_cache_salt_partition_affinities(self):
+        ctl = self._controller()
+        turn1 = _prompt(1, 4)
+        r_a = _req(input_ids=turn1)
+        r_a.lora_id = "lora-a"
+        ctl.prefix_aware_scheduler(r_a)
+        # Same input_ids under a different LoRA/extra_key/cache_salt must not match rank 0.
+        for attr, val in (
+            ("lora_id", "lora-b"),
+            ("extra_key", "tenant-2"),
+            ("cache_salt", "salt-2"),
+        ):
+            r = _req(input_ids=turn1)
+            setattr(r, attr, val)
+            ctl.prefix_aware_scheduler(r)
+        self.assertEqual(ctl.dp_budget.total_requests, [1, 1, 1, 1])
+
+    def test_selector_derives_block_size_capacity_and_log_interval(self):
+        ctl = _make_controller(4)
+        ctl.max_dp_size = 4
+        ctl.max_total_num_tokens = 1000
+        ctl.page_size = 1
+        with patch(
+            "sglang.srt.managers.data_parallel_controller.get_observability",
+            return_value=SimpleNamespace(decode_log_interval=40),
+        ):
+            sel = ctl._make_prefix_selector()
+        self.assertEqual(sel.index.block_size, 64, "page_size=1 floors at 64 tokens")
+        self.assertEqual(sel.index.capacity_blocks, 4 * 1000 // 64)
+        self.assertEqual(sel.log_interval, 40)
+
+    def test_selector_builds_within_dp_controller_namespaces(self):
+        """Under SGLANG_ROLE_NAMESPACES=enforce the controller may only read its
+        audited namespaces; building the selector runs during its startup, so an
+        out-of-set read (e.g. `schedule`) would abort the server."""
+        import sglang.srt.runtime_context as rc
+
+        override = rc.get_context().override_server_args(
+            dp_size=4, enable_dp_attention=True, load_balance_method="prefix_aware"
+        )
+        override.install()
+        self.addCleanup(override.restore)
+        ctl = _make_controller(4)
+        ctl.max_dp_size = 4
+        ctl.max_total_num_tokens = 1000
+        ctl.page_size = 128
+        with (
+            patch.object(rc, "_ROLE_NS_MODE", "enforce"),
+            patch.object(rc._CONTEXT, "_publish_role", "dp_controller"),
+        ):
+            sel = ctl._make_prefix_selector()
+        self.assertEqual(sel.index.block_size, 128)
+
+    def test_method_parses_from_server_arg(self):
+        self.assertEqual(
+            LoadBalanceMethod.from_str("prefix_aware"), LoadBalanceMethod.PREFIX_AWARE
         )
 
 
