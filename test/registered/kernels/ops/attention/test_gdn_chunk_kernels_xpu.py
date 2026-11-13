@@ -115,7 +115,7 @@ def _reference_w_u(inputs: dict, solved: torch.Tensor):
 
 
 def _reference_o(inputs: dict, h: torch.Tensor, scale: float) -> torch.Tensor:
-    """o_t = scale (exp(g_t) q_t h^T + sum_{j<=t in chunk} q_t.k_j exp(g_t - g_j) v_j)."""
+    """scale * (exp(g_t) q_t h^T + sum_{j<=t in chunk} q_t.k_j exp(g_t - g_j) v_j)."""
     q = _per_value_head(inputs["q"][0].float())
     k = _per_value_head(inputs["k"][0].float())
     v, g = inputs["v"][0].float(), inputs["g"][0].float()
@@ -158,7 +158,7 @@ class TestGdnChunkKernelsXpu(CustomTestCase):
                 self.assert_close(u[0], expected_u, "u")
 
     def test_recompute_w_u_alone(self):
-        """recompute_w_u with an arbitrary A, so a wrong w or u cannot hide behind kkt."""
+        """recompute_w_u with a random A, so a wrong w or u cannot hide behind kkt."""
         for key_dim, value_dim in HEAD_DIMS:
             with self.subTest(K=key_dim, V=value_dim):
                 inputs = _make_inputs(key_dim, value_dim)

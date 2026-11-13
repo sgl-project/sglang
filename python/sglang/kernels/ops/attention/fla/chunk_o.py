@@ -56,7 +56,7 @@ def chunk_fwd_kernel_o(
     HAS_OUTPUT_INDICES: tl.constexpr = False,
     USE_TENSOR_DESC: tl.constexpr = False,
 ):
-    # USE_TENSOR_DESC: on XPU, descriptor tiles get 2D block I/O and masked loads do not
+    # USE_TENSOR_DESC: on XPU, descriptor tiles get 2D block I/O; masked loads do not.
     # Set only on Intel XPU (constexpr): other backends compile only the pointer path.
     # TODO(dayanandav): drop USE_TENSOR_DESC once the XPU torch ships a triton-xpu with
     # https://github.com/intel/intel-xpu-backend-for-triton/pull/7196 and

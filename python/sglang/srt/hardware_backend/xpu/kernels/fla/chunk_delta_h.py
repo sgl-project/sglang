@@ -245,6 +245,8 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64_k_loop(
             # Save updated h to scratch (initial_state) for next time step
             if INPLACE_UPDATE and valid_state:
                 ht_desc.store([i_v * BV, k_blk], b_h.to(ht.dtype.element_ty))
+        # The next time step reloads ht across warps.
+        tl.debug_barrier()
 
 
 def chunk_gated_delta_rule_fwd_h(

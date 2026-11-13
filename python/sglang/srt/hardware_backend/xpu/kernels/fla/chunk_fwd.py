@@ -72,7 +72,8 @@ def chunk_gated_delta_rule_fwd_kkt_solve_kernel_low_reg(
         )
         T = eos - bos
     else:
-        bos, eos = i_b * T, i_b * T + T
+        bos = i_b.to(tl.int64) * T
+        eos = bos + T
 
     if i_t * BT >= T:
         return
@@ -128,6 +129,8 @@ def chunk_gated_delta_rule_fwd_kkt_solve_kernel_low_reg(
             b_Ai = tl.where((o_i == i)[:, None], b_a, b_Ai)
         b_Ai += m_I
         A_desc.store([i_tci, i_b * BC], b_Ai.to(A.dtype.element_ty))
+    # Pass 2 reloads the Ai_ii tiles stored above across warps.
+    tl.debug_barrier()
 
     ############################################################################
     # Pass 2: off-diagonal blocks — one K-loop per (i,j) pair.
@@ -203,6 +206,8 @@ def chunk_gated_delta_rule_fwd_kkt_solve_kernel_low_reg(
                 input_precision=_MERGE_DOT_PRECISION,
             )
             A_desc.store([i_tci, j * BC], b_Ai_ij.to(A.dtype.element_ty))
+            # Later (i, j) pairs and the cleanup reload these tiles across warps.
+            tl.debug_barrier()
 
     # Clean up scratch slots: Pass 2 stored raw A_ij blocks in the upper-triangular
     # part of row i_tc0 (cols BC..3*BC). These must be zeroed because
