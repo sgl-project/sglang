@@ -35,8 +35,6 @@ def _ada_block_sparse_attention(**kwargs) -> torch.Tensor:
 
 
 class BlockSparseAttentionBackend(AttentionBackend):
-    accept_output_buffer: bool = True
-
     @staticmethod
     def get_supported_head_sizes() -> list[int]:
         return [32, 64, 96, 128]

@@ -11,7 +11,7 @@ these hooks then:
 
 Compressor state is fixed ring storage and does not participate in this
 allocation/write path. PD reuses the public SWA/C128-state payloads and builds
-NPU-specific payloads for the independently addressed C128 KV pool and Ascend 950 C4
+NPU-specific payloads for the independently addressed C128 KV pool and C4
 compress-state rows.
 
 Non-DSV4 paths leave ``batch.out_cache_loc_dsv4`` None, so this module is a
@@ -78,10 +78,10 @@ def dsv4_state_payloads(
     cross-hardware ``StateType.SWA`` / ``StateType.DSV4_REQUEST_STATE`` defaults:
 
     * ``DSV4_C128`` — C128 KV pages from ``req_to_c128_sidecar``.
-    * ``DSV4_C4_STATE`` (Ascend 950 only) — live C4 compress-state rows. Prefill
-      and decode map the same logical positions through their local SWA pages
-      and ring sizes, including when only decode enables MTP. Earlier
-      architectures carry the C4 state in the shared ``StateType.SWA`` payload.
+    * ``DSV4_C4_STATE`` — live C4 compress-state rows.  Prefill
+      and decode derive physical rows using their own local ring sizes, so
+      decode-only MTP can safely transfer from an 8-row ring to a 16-row ring.
+      Both A3 and Ascend 950 derive rows from their local SWA pages.
     """
 
     import numpy as np
@@ -106,11 +106,8 @@ def dsv4_state_payloads(
         )
         return pages[pages > 0]
 
-    payloads = {AscendStateType.DSV4_C128: c128_kv_pages}
-
-    if is_npu_arch35():
-
-        def c4_state_indices():
+    def c4_state_indices():
+        if is_npu_arch35():
             return (
                 req_to_token_pool.get_dsv4_c4_state_transfer_rows(req_pool_idx, seq_len)
                 .to(torch.int32)
@@ -118,9 +115,23 @@ def dsv4_state_payloads(
                 .numpy()
             )
 
-        payloads[AscendStateType.DSV4_C4_STATE] = c4_state_indices
+        # A3's explicit compressor table follows full -> SWA -> state. Pair
+        # the last coff * ratio (2 * 4) positions in logical token order,
+        # including history spanning noncontiguous SWA pages.
+        full_locs = req_to_token_pool.req_to_token[
+            req_pool_idx, max(0, seq_len - 8) : seq_len
+        ]
+        kv_pool = req_to_token_pool._dsv4_allocator.get_kvcache()
+        ring_size = kv_pool.get_ring_size(4)
+        swa_locs = kv_pool.translate_loc_from_full_to_swa(full_locs).to(torch.int64)
+        swa_pages = swa_locs // kv_pool.swa_page_size
+        rows = swa_pages * ring_size + swa_locs % ring_size
+        return rows.to(torch.int32).cpu().numpy()
 
-    return payloads
+    return {
+        AscendStateType.DSV4_C128: c128_kv_pages,
+        AscendStateType.DSV4_C4_STATE: c4_state_indices,
+    }
 
 
 def dsv4_prealloc_kwargs(allocator, req, fill_len, req_to_token_pool, *, device):

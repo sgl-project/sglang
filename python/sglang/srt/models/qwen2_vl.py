@@ -26,7 +26,7 @@
 import logging
 from array import array
 from functools import lru_cache, partial
-from typing import Iterable, List, Optional, Tuple, Type, TypedDict
+from typing import Iterable, List, Optional, Tuple, Type
 
 import torch
 import torch.nn as nn
@@ -60,36 +60,6 @@ from sglang.srt.models.utils import WeightsMapper, compute_cu_seqlens_from_grid_
 from sglang.srt.utils import is_npu
 
 logger = logging.getLogger(__name__)
-
-
-# === Vision Inputs === #
-
-
-class Qwen2VLImageInputs(TypedDict):
-    pixel_values: torch.Tensor
-    """Shape:
-    `(num_patches, num_channels * patch_size * patch_size)`
-    """
-
-    image_grid_thw: torch.Tensor
-    """Shape: `(num_images, 3)`
-
-    This should be in `(grid_t, grid_h, grid_w)` format.
-    """
-
-
-class Qwen2VLVideoInputs(TypedDict):
-    pixel_values_videos: torch.Tensor
-    """Shape:
-    `(num_patches,
-      num_channels * temporal_patch_size * patch_size * patch_size)`
-    """
-
-    video_grid_thw: torch.Tensor
-    """Shape: `(num_videos, 3)`
-
-    This should be in `(grid_t, grid_h, grid_w)` format.
-    """
 
 
 # === Vision Encoder === #
@@ -517,13 +487,6 @@ class Qwen2VLForConditionalGeneration(nn.Module):
         assert pixel_values.dim() == 2, pixel_values.dim()
         assert video_grid_thw.dim() == 2, video_grid_thw.dim()
         video_embeds = self.visual(pixel_values, grid_thw=video_grid_thw)
-        return video_embeds
-
-    def _process_video_input(self, video_input: Qwen2VLVideoInputs) -> torch.Tensor:
-        pixel_values_videos = video_input["pixel_values_videos"].type(self.visual.dtype)
-        video_embeds = self.visual(
-            pixel_values_videos, grid_thw=video_input["video_grid_thw"]
-        )
         return video_embeds
 
     def get_input_embeddings(self):
