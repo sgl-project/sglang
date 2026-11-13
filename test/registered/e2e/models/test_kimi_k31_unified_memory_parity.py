@@ -1,28 +1,11 @@
-"""Kimi-K3.1 on the unified memory pool matches the static pools.
-
-Sparse attention reads FP8 latent rows and indexer keys that the unified pool
-lays out per page of its full sub-pool, beside the KDA state. Kimi-K3.1 cut to
-its first eight layers (real weights) runs the same requests on both pools, in
-two cases, each a chunked prefill with decoding and then a second request that
-reuses the first one's prefix:
-
-  * short: the contexts stay within the indexer's top-k, so every token is
-    attended and the indexer's scores pick nothing; this covers the latent
-    rows and the prefix reuse;
-  * long: the prompt is over twice the top-k, so prefill chunks past it, every
-    decode step and the second request's extend over the cached prefix score
-    the indexer keys and attend only the top-k they select. Wrong keys change
-    which tokens attention reads.
-
-With CUDA graphs and in eager mode, each against the static pools in the same
-mode (the two modes' kernels round differently), logprobs predicted from a
-context within the top-k must agree token by token. Past the top-k the sparse selection is not
-bitwise deterministic: the static pools' own runs differ by about 0.03 on
-average (up to ~0.4 at single tokens), and near-tied greedy choices can flip
-between runs of the same pool. There the prompt's teacher-forced logprobs are
-compared by their mean difference instead, and greedy tokens only where every
-context stays within the top-k: wrong indexer keys would select other tokens
-and move the mean well past the static runs' own spread.
+"""Kimi-K3.1 (first eight layers, real weights) on the unified pool matches the
+static pools in the same mode (CUDA graph, eager): a short case within the
+indexer top-k and a long case over twice the top-k, each a chunked prefill with
+decode, then a prefix-reusing request. Within the top-k, logprobs agree per
+token. Past it, sparse selection is not bitwise deterministic (static runs
+differ by about 0.03 on average, up to about 0.4), so only the mean difference
+is bounded, and greedy tokens are compared only when every context is within
+the top-k.
 """
 
 import json

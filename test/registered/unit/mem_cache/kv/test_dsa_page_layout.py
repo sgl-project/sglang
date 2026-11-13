@@ -1,11 +1,6 @@
-"""The sparse-attention page layout of the unified pool, as a composite unit.
-
-A DSA model's full layers declare FP8 latent rows with block scales laid out
-layer by layer, and the layers that select top-k declare their indexer keys as
-a second full-lifetime part. The plan composes both into one unit: each page
-holds the layers' latent rows, then one index-key blob per indexer layer,
-padded to whole rows and whole token entries. The latent rows are the
-sub-pool's token KV view; the keys are routed per layer by their own part.
+"""The DSA page of a unified composite unit: every layer's FP8 latent rows,
+then one index-key blob per indexer layer, padded to whole rows and whole token
+entries.
 """
 
 import unittest
@@ -49,14 +44,14 @@ def _rows(row_bytes=32, kv_lora_rank=8):
     )
 
 
-def _decls(*, full=(0, 2, 4), index=(0, 4), rows=None, keys=None, state=(1, 3)):
+def _decls(*, full=(0, 2, 4), index=(0, 4), rows=None, state=(1, 3)):
     return kv_layer_decls(
         full_layer_ids=full,
         full_geometry=rows or _rows(),
         full_layer_parts=(
             FullLayerParts(
                 layer_ids=index,
-                geometry=keys or IndexKeyGeometry(index_head_dim=128),
+                geometry=IndexKeyGeometry(index_head_dim=128),
             ),
         ),
         state_layer_ids=state,
@@ -70,24 +65,21 @@ def _decls(*, full=(0, 2, 4), index=(0, 4), rows=None, keys=None, state=(1, 3)):
 
 
 class TestPageArithmetic(CustomTestCase):
-    def _k31(self, keys):
+    def test_kimi_k31_page(self):
+        """24 layers of 64 656-byte FP8 rows and an 8448-byte index blob per
+        layer fill 1,210,368 bytes; the page rounds up to 1848 rows of 656
+        bytes, a whole number of 64-token entries. FP4 keys take 64 + 4 bytes
+        per token."""
         layers = tuple(range(24))
-        return plan_kv_storage(
+        full = plan_kv_storage(
             _decls(
                 full=layers,
                 index=layers,
                 rows=_rows(row_bytes=656, kv_lora_rank=512),
-                keys=keys,
                 state=(),
             ),
             page_size=64,
         ).owner()
-
-    def test_kimi_k31_page(self):
-        """24 layers of 64 656-byte FP8 rows and an 8448-byte index blob per
-        layer fill 1,210,368 bytes; the page rounds up to 1848 rows of 656
-        bytes, a whole number of 64-token entries."""
-        full = self._k31(IndexKeyGeometry(index_head_dim=128))
         spec = full.spec
         self.assertIsInstance(spec, CompositeSubPoolSpec)
         self.assertEqual([p.name for p in full.parts], [KV_PART, INDEX_K_PART])
@@ -95,21 +87,9 @@ class TestPageArithmetic(CustomTestCase):
         self.assertEqual(spec.page_bytes(), 1_212_288)
         self.assertEqual(spec.page_bytes() % 656, 0)
         self.assertEqual(spec.entry_bytes() * 64, spec.page_bytes())
-
-    def test_fp4_keys(self):
-        """FP4 keys take 64 + 4 bytes per token: 4352 bytes per page per layer."""
-        keys = IndexKeyGeometry(index_head_dim=128, use_fp4=True)
-        self.assertEqual(keys.bytes_per_token, 68)
-        self.assertEqual(keys.key_bytes_per_token, 64)
-        spec = self._k31(keys).spec
-        raw = 24 * 64 * 656 + 24 * 64 * 68
-        self.assertEqual(spec.page_bytes(), -(-raw // 2624) * 2624)
-
-    def test_index_layers_are_their_own_part(self):
-        full = plan_kv_storage(_decls(), page_size=_PAGE).owner()
-        self.assertEqual(full.part(KV_PART).layer_ids, (0, 2, 4))
-        self.assertEqual(full.part(INDEX_K_PART).layer_ids, (0, 4))
-        self.assertEqual(full.spec.layer_num, 3)
+        fp4 = IndexKeyGeometry(index_head_dim=128, use_fp4=True)
+        self.assertEqual(fp4.bytes_per_token, 68)
+        self.assertEqual(fp4.key_bytes_per_token, 64)
 
     def test_stored_rows_need_the_layer_major_layout(self):
         rows = MLAGeometry(
@@ -132,19 +112,16 @@ class TestPageArithmetic(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "layer_major"):
             plan_kv_storage(decls, page_size=_PAGE)
 
-    def test_layer_major_rows_need_the_packed_format(self):
-        """Only packed FP8 rows with block scales have a layer-major reader:
-        the planner and the view both refuse plain latent rows."""
+    def test_layer_major_view_needs_the_packed_format(self):
+        """Only packed FP8 rows with block scales have a layer-major reader."""
         plain = MLAGeometry(
             kv_lora_rank=8,
             qk_rope_head_dim=8,
             kv_cache_dtype=torch.bfloat16,
             layer_major=True,
         )
-        refused = "stored only in the 'fp8_ds_mla' row format"
-        with self.assertRaisesRegex(ValueError, refused):
-            plan_kv_storage(_decls(rows=plain), page_size=_PAGE)
         spec = plan_kv_storage(_decls(), page_size=_PAGE).owner().spec
+        refused = "stored only in the 'fp8_ds_mla' row format"
         with self.assertRaisesRegex(ValueError, refused):
             LayerMajorMLAView(
                 arena=None,

@@ -29,7 +29,7 @@ Each kind of memory a model's layers declare becomes one sub-pool:
 | Sliding window | `window_<length>`, for example `window_4096` (`window` when the model does not state the length) | The KV of layers that attend through one window length | A page |
 | Recurrent state | `mamba` | One state entry per slot (conv and SSM state of every state layer) | One slot |
 
-With DSA sparse attention, each page of the `full` sub-pool holds its tokens' FP8 latent rows (with block scales) layer by layer, then each indexer layer's keys for those tokens, as the paged indexer kernels read them. A layer's rows form a paged buffer whose pages lie one page entry apart; the sparse attention kernels and the latent row writers and gathers address a token's row through that buffer's page and row strides.
+With DSA sparse attention, each page of the `full` sub-pool holds its tokens' FP8 latent rows (with block scales) layer by layer, then each indexer layer's keys for those tokens, as the paged indexer kernels read them.
 
 Sub-pools are laid out in the arena by retention: the state sub-pool takes the low end and grows up, the full-attention sub-pool takes the high end and grows down, and window sub-pools sit between them. With no state sub-pool, the longest window takes the low end. A sub-pool between the two ends is a *float*: it occupies a span between its neighbours and is relocated when the layout needs it.
 

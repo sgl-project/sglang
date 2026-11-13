@@ -19,8 +19,6 @@ def _physical_token_ids(vals, v2p, num_v_pages, PAGE_SIZE: tl.constexpr):
 
 
 def _v2p_args(v2p: Optional[torch.Tensor], dummy: torch.Tensor):
-    """The kernel arguments of an optional virtual->physical page table: the
-    table (or a dummy pointer), its row count, and whether it is present."""
     if v2p is None:
         return dummy, 0, False
     assert v2p.is_cuda and v2p.dtype == torch.int64 and v2p.dim() == 1
@@ -161,10 +159,8 @@ def fused_dsa_decode_metadata(
     uses real_page_table); ``physical_page_size`` must be >1 in that case. When a
     tensor is passed, behavior is unchanged (both tables are written).
 
-    ``v2p``, a virtual->physical page table at ``physical_page_size``, maps the
-    ids ``req_to_token`` holds to the physical ids both tables then carry
-    (`_physical_token_ids`); None when they index the pool as they are. The
-    target-verify and draft-extend builders below take it alike.
+    ``v2p``: optional virtual->physical page table at ``physical_page_size``;
+    when given, both tables carry physical ids (`_physical_token_ids`).
 
     Contract: each page-table row is written only over its live prefix
     ([:cache_seqlens]); the tail keeps stale values across CUDA-graph replays, so

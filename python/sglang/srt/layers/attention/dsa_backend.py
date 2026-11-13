@@ -4518,7 +4518,8 @@ class DeepseekSparseAttnBackend(
             )
             write_loc = KVWriteLoc.for_layer(forward_batch, layer)
             if cp_store_cache_loc is not None:
-                # The live prefix of the batch's own write ids, under its mark.
+                # cp_store_cache_loc is a prefix of out_cache_loc, so it keeps
+                # the batch's physical mark.
                 write_loc = KVWriteLoc(
                     cp_store_cache_loc,
                     physical=forward_batch.out_cache_loc_is_physical,

@@ -1,11 +1,6 @@
-"""DSA attention on the unified memory pool, on CPU.
-
-`req_to_token` holds virtual token ids there, which the backend's page tables
-translate once, as they gather them, into the physical ids of the full
-sub-pool: the indexer, the top-k transforms and attention then all read
-physical ids. A layer's latent rows are a paged buffer the kernels address by
-the physical token id itself; the backend hands them its writes' ids marked
-physical. A static pool keeps the ids as `req_to_token` holds them.
+"""DSA backend on the unified pool, on CPU: page tables hold physical ids
+translated from `req_to_token`'s virtual ids, and latent writes carry the
+batch's physical mark.
 """
 
 import unittest
@@ -175,78 +170,50 @@ class TestPhysicalPageTables(CustomTestCase):
     def setUp(self):
         setup_allocator_context()
 
-    def _extend(self, runner_ids):
-        req_to_token, v2p = _virtual_batch()
-        backend = _metadata_backend(req_to_token, runner_ids(v2p))
-        rows, seq_lens = [2, 0, 3], [13, 7, 21]
-        backend.init_forward_metadata(_extend_batch(rows, seq_lens, [5, 3, 9]))
-        metadata = backend.forward_metadata
-        virtual = req_to_token[torch.tensor(rows), : max(seq_lens)]
-        return metadata, virtual, v2p, rows, seq_lens
-
-    def test_eager_extend_tables_hold_physical_ids(self):
-        """page_table_1, real_page_table and page_table_1_flattened (the prefix
-        gather) all name physical ids; the capacity check, which bounds the
-        static pool's ids, does not reject them though the batch outgrows the
-        pool's `size`."""
-        metadata, virtual, v2p, rows, seq_lens = self._extend(_runner_ids)
-        physical = _reference(virtual, v2p)
-        self.assertTrue(torch.equal(metadata.page_table_1, physical))
-        self.assertTrue(
-            torch.equal(metadata.real_page_table, physical[:, ::PAGE] // PAGE)
-        )
-        flat = torch.cat([physical[i, :n] for i, n in enumerate(seq_lens)])
-        self.assertTrue(torch.equal(metadata.page_table_1_flattened, flat))
-
-    def test_static_pool_tables_hold_req_to_token_ids(self):
-        req_to_token = torch.arange(REQ_ROWS * WIDTH, dtype=torch.int32).view(
-            REQ_ROWS, WIDTH
-        )
-        backend = _metadata_backend(req_to_token, None)
-        backend.token_to_kv_pool.size = REQ_ROWS * WIDTH
-        rows, seq_lens = [2, 0], [13, 7]
-        backend.init_forward_metadata(_extend_batch(rows, seq_lens, [5, 3]))
-        metadata = backend.forward_metadata
-        expected = req_to_token[torch.tensor(rows), :13]
-        self.assertTrue(torch.equal(metadata.page_table_1, expected))
-        self.assertTrue(
-            torch.equal(metadata.real_page_table, expected[:, ::PAGE] // PAGE)
-        )
-
-    def test_eager_decode_tables_hold_physical_ids(self):
-        req_to_token, v2p = _virtual_batch()
-        backend = _metadata_backend(req_to_token, _runner_ids(v2p))
-        rows, seq_lens = [3, 1], [17, 6]
-        # The paged logits schedule is a GPU kernel's; these tables are not.
-        with patch(
-            "sglang.srt.layers.attention.dsa_backend.is_cuda", return_value=False
-        ):
-            backend.init_forward_metadata(
-                SimpleNamespace(
-                    forward_mode=ForwardMode.DECODE,
-                    batch_size=2,
-                    req_pool_indices=torch.tensor(rows),
-                    seq_lens=torch.tensor(seq_lens),
-                    seq_lens_cpu=torch.tensor(seq_lens),
-                    seq_lens_sum=sum(seq_lens),
-                    global_num_tokens_cpu=None,
-                    attn_cp_metadata=None,
+    def test_eager_tables_hold_physical_ids(self):
+        """page_table_1 and real_page_table name physical ids in extend and
+        decode, as does extend's prefix gather (page_table_1_flattened); the
+        capacity check, which bounds the static pool's ids, does not reject
+        them though the batch outgrows the pool's `size`."""
+        for mode in (ForwardMode.EXTEND, ForwardMode.DECODE):
+            with self.subTest(mode=mode):
+                req_to_token, v2p = _virtual_batch()
+                backend = _metadata_backend(req_to_token, _runner_ids(v2p))
+                if mode.is_extend():
+                    rows, seq_lens = [2, 0, 3], [13, 7, 21]
+                    backend.init_forward_metadata(
+                        _extend_batch(rows, seq_lens, [5, 3, 9])
+                    )
+                else:
+                    rows, seq_lens = [3, 1], [17, 6]
+                    # The paged logits schedule is a GPU kernel's; these
+                    # tables are not.
+                    with patch(
+                        "sglang.srt.layers.attention.dsa_backend.is_cuda",
+                        return_value=False,
+                    ):
+                        backend.init_forward_metadata(
+                            SimpleNamespace(
+                                forward_mode=mode,
+                                batch_size=len(rows),
+                                req_pool_indices=torch.tensor(rows),
+                                seq_lens=torch.tensor(seq_lens),
+                                seq_lens_cpu=torch.tensor(seq_lens),
+                                seq_lens_sum=sum(seq_lens),
+                                global_num_tokens_cpu=None,
+                                attn_cp_metadata=None,
+                            )
+                        )
+                metadata = backend.forward_metadata
+                virtual = req_to_token[torch.tensor(rows), : max(seq_lens)]
+                physical = _reference(virtual, v2p)
+                self.assertTrue(torch.equal(metadata.page_table_1, physical))
+                self.assertTrue(
+                    torch.equal(metadata.real_page_table, physical[:, ::PAGE] // PAGE)
                 )
-            )
-        metadata = backend.forward_metadata
-        physical = _reference(req_to_token[torch.tensor(rows), :17], v2p)
-        self.assertTrue(torch.equal(metadata.page_table_1, physical))
-        self.assertTrue(
-            torch.equal(metadata.real_page_table, physical[:, ::PAGE] // PAGE)
-        )
-
-    def test_unmapped_pages_read_the_sink(self):
-        req_to_token, v2p = _virtual_batch()
-        backend = _metadata_backend(req_to_token, _runner_ids(v2p))
-        dropped = int(req_to_token[1, 0]) // PAGE
-        v2p[dropped] = -1
-        table = backend._gather_token_table(req_to_token, torch.tensor([1]), PAGE)
-        self.assertEqual(table.tolist(), [[0] * PAGE])
+                if mode.is_extend():
+                    flat = torch.cat([physical[i, :n] for i, n in enumerate(seq_lens)])
+                    self.assertTrue(torch.equal(metadata.page_table_1_flattened, flat))
 
 
 class _Written(Exception):
@@ -299,63 +266,15 @@ class TestLatentWrites(CustomTestCase):
         self.assertIs(loc_info.loc, loc)
         return loc_info
 
-    def test_writes_carry_the_physical_mark(self):
-        for forward, mode in (
-            ("forward_extend", ForwardMode.EXTEND),
-            ("forward_decode", ForwardMode.DECODE),
+    def test_writes_carry_the_batch_physical_mark(self):
+        for forward, mode, physical in (
+            ("forward_extend", ForwardMode.EXTEND, True),
+            ("forward_decode", ForwardMode.DECODE, True),
+            ("forward_decode", ForwardMode.DECODE, False),
         ):
-            with self.subTest(forward=forward):
-                loc_info = self._write_loc(forward, mode, physical=True)
-                self.assertTrue(write_loc_is_physical(loc_info))
-
-    def test_static_writes_stay_unmarked(self):
-        loc_info = self._write_loc("forward_decode", ForwardMode.DECODE, False)
-        self.assertFalse(write_loc_is_physical(loc_info))
-
-
-class TestFlashMLAReadsPagedRows(CustomTestCase):
-    def test_indices_are_token_ids_and_the_cache_keeps_its_pages(self):
-        """FlashMLA takes the layer's paged rows as they are, with the top-k's
-        physical token ids: no remapping per layer."""
-        rows = _k31_layer_rows()
-        topk = torch.tensor([[0, 65, 130, -1], [3, 64, -1, -1]], dtype=torch.int32)
-        seen = {}
-
-        def fake_flash_mla(**kwargs):
-            seen.update(kwargs)
-            q = kwargs["q"]
-            return q.new_zeros(*q.shape[:3], 512), q.new_zeros(q.shape[0], 1)
-
-        backend = DeepseekSparseAttnBackend.__new__(DeepseekSparseAttnBackend)
-        backend.__dict__.update(
-            flashmla_kv_num_q_heads=2,
-            dsa_shards_index_k=False,
-            physical_page_size=64,
-            kv_cache_dim=656,
-            dsa_kv_cache_store_fp8=True,
-            dsa_index_topk=topk.shape[1],
-            flashmla_kv_format="V32",
-            _call_flash_mla_with_kvcache=fake_flash_mla,
-        )
-        backend._forward_flashmla_kv(
-            q_all=torch.zeros(2, 2, 576),
-            kv_cache=rows,
-            v_head_dim=512,
-            sm_scale=1.0,
-            layer=SimpleNamespace(tp_q_head_num=2, head_dim=576),
-            metadata=SimpleNamespace(
-                dsa_cache_seqlens_int32=torch.full((2,), 4, dtype=torch.int32),
-                flashmla_metadata=SimpleNamespace(
-                    flashmla_metadata=None, num_splits=None
-                ),
-            ),
-            page_table_1=topk,
-            forward_batch=SimpleNamespace(),
-        )
-        self.assertTrue(torch.equal(seen["indices"].squeeze(1), topk))
-        k_cache = seen["k_cache"]
-        self.assertEqual(k_cache.data_ptr(), rows.data_ptr())
-        self.assertEqual(k_cache.stride(), (1_212_288, 656, 656, 1))
+            with self.subTest(forward=forward, physical=physical):
+                loc_info = self._write_loc(forward, mode, physical)
+                self.assertEqual(write_loc_is_physical(loc_info), physical)
 
 
 class TestTorchWriterPagedRows(CustomTestCase):

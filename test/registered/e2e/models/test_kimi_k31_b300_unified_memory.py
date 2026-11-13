@@ -1,5 +1,4 @@
-"""Nightly coverage of Kimi-K3.1 sparse attention on the unified memory pool:
-FP8 latent rows and the indexer keys share each page of the full sub-pool."""
+"""Kimi-K3.1 TP8 GSM8K with sparse attention on the unified memory pool."""
 
 import unittest
 

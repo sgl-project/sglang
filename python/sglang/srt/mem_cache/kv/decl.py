@@ -115,7 +115,6 @@ class MLAGeometry(msgspec.Struct, frozen=True, kw_only=True, repr_omit_defaults=
     layer_major: bool = False
 
     def row_bytes(self) -> int:
-        """Bytes of one stored latent row."""
         if self.row_format is not None:
             return self.row_format.row_bytes
         return (
