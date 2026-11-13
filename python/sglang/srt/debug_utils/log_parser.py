@@ -2,9 +2,12 @@ _PATTERN_DECODE = (
     r"(\(\w+ pid=(?P<pid>\d+)(?:,\s*ip=(?P<ip>[\d\.]+))?\))?\s*"
     r"\[(?P<time>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})"
     r"(?:\s+DP(?P<dp_rank>\d+))?"
+    r"(?:\s+PP(?P<pp_rank>\d+))?"
+    r"(?:\s+ATTN_CP(?P<attn_cp_rank>\d+))?"
+    r"(?:\s+MOE_DP(?P<moe_dp_rank>\d+))?"
     r"(?:\s+TP(?P<tp_rank>\d+))?"
     r"(?:\s+EP(?P<ep_rank>\d+))?"
-    r"(?:\s+PP(?P<pp_rank>\d+))?"
+    r"(?:\s+PID(?P<process_id>\d+))?"
     r"\]\s+"
     r"Decode batch( \[\d+\])?,\s+"
     r"#running-req:\s*(?P<num_running_req>\d+),\s+"
@@ -31,9 +34,12 @@ def parse(lines):
             for col, dtype in [
                 ("pid", pl.Int64),
                 ("dp_rank", pl.Int64),
+                ("pp_rank", pl.Int64),
+                ("attn_cp_rank", pl.Int64),
+                ("moe_dp_rank", pl.Int64),
                 ("tp_rank", pl.Int64),
                 ("ep_rank", pl.Int64),
-                ("pp_rank", pl.Int64),
+                ("process_id", pl.Int64),
                 ("num_running_req", pl.Int64),
                 ("num_token", pl.Int64),
                 ("token_usage", pl.Float64),

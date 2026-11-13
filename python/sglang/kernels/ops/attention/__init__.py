@@ -58,6 +58,7 @@ _TRITON_KERNELS = [
     ("kv_indices", "get_num_page_per_block_flashmla"),
     ("trtllm_mha_page_table", "build_trtllm_mha_page_table"),
     ("trtllm_mha_graph_metadata", "update_trtllm_mha_graph_metadata"),
+    ("trtllm_mha_graph_metadata", "update_draft_step_seqlens"),
     ("aiter_unified_page_table", "scatter_ragged_to_page_table_kernel"),
     ("aiter_unified_page_table", "scatter_req_to_token_to_page_table_kernel"),
     ("fused_qk_rope_reshape_and_cache", "fused_qk_rope_reshape_and_cache"),
@@ -72,6 +73,24 @@ for _mod, _fn in _TRITON_KERNELS:
         )
     )
 del _mod, _fn
+
+register_kernel(
+    KernelSpec(
+        op="attention.qk_norm_rope",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.attention.qk_norm_rope:qk_norm_rope",
+        capabilities=CUDA_ONLY,
+    )
+)
+
+register_kernel(
+    KernelSpec(
+        op="attention.dcp_push_combine",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.attention.dcp_push_combine:dcp_push_combine",
+        capabilities=CUDA_ONLY,
+    )
+)
 
 register_kernel(
     KernelSpec(
@@ -292,6 +311,16 @@ register_kernel(
 # Public entry points inventoried by logical operator group (RFC #29630).
 register_kernel(
     KernelSpec(
+        op="attention.cute_sparse_mla_h16_fwd",
+        backend=KernelBackend.CUTE_DSL,
+        target="sglang.kernels.ops.attention.dsv4.cute_sparse_mla_h16:cute_sparse_mla_h16_fwd",
+        capabilities=frozenset(
+            {CapabilityRequirement.cuda(min_sm=(9, 0), max_sm=(9, 0))}
+        ),
+    )
+)
+register_kernel(
+    KernelSpec(
         op="attention.get_block_table",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.attention.minicpm_sala.get_block_table:get_block_table",
@@ -303,6 +332,14 @@ register_kernel(
         op="attention.fast_kpool_topk_transform_fused",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.attention.dsa.kpool_topk_transform:fast_kpool_topk_transform_fused",
+        capabilities=CUDA_ONLY,
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="attention.flashmla_token_pack_prepare",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.attention.dsa.flashmla_token_pack:flashmla_token_pack_prepare",
         capabilities=CUDA_ONLY,
     )
 )
@@ -335,10 +372,10 @@ register_kernel(
         op="attention.deep_select_topk",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.attention.deep_select:topk",
-        # Exactly SM90, SM100 and SM103, the architectures DeepSelect is tuned for.
+        # Exactly SM90, SM100, SM103 and SM107, the architectures DeepSelect is tuned for.
         capabilities=frozenset(
             CapabilityRequirement.cuda(min_sm=sm, max_sm=sm)
-            for sm in ((9, 0), (10, 0), (10, 3))
+            for sm in ((9, 0), (10, 0), (10, 3), (10, 7))
         ),
     )
 )
@@ -511,7 +548,6 @@ for _mod, _fn, _backend in [
         )
     )
 del _mod, _fn, _backend
-# Its PDL probe reads the device major only, which also enables PDL on ROCm gfx9.
 register_kernel(
     KernelSpec(
         op="attention.dash_sparse_attn_decode",
@@ -590,5 +626,135 @@ register_kernel(
         capabilities=frozenset(
             {CapabilityRequirement.cuda(min_sm=(12, 0), max_sm=(12, 1))}
         ),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="attention.topk_page_table_transform_",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.attention.topk_page_table:topk_page_table_transform_",
+        capabilities=CUDA_ONLY,
+    )
+)
+# DSA prefill indexer top-k (sampled-threshold candidates + top-k), SM100 builds only.
+for _fn in ("fp8_indexer_topk", "fp4_indexer_topk"):
+    register_kernel(
+        KernelSpec(
+            op=f"attention.{_fn}",
+            backend=KernelBackend.JIT,
+            target=f"sglang.kernels.ops.attention.dsa.litetopk_prefill.indexer_topk:{_fn}",
+            capabilities=frozenset(
+                {CapabilityRequirement.cuda(min_sm=(10, 0), max_sm=(10, 9))}
+            ),
+        )
+    )
+del _fn
+
+# Muse Spark on gfx950 (MI355X): Triton kernels the ROCm Muse Spark model and the aiter /
+# Triton attention backends dispatch to by shape; registered for inventory.
+_MUSE_SPARK_GFX950_KERNELS = [
+    (
+        "qk_norm_rope_cache",
+        "qk_norm_rope_cache",
+        "QK RMSNorm + interleaved RoPE + FP8 paged KV store, head_dim 64",
+    ),
+    (
+        "qk_norm_rope_cache",
+        "qkv_proj_qk_norm_rope_cache",
+        "QKV+gate split-K projection with the QK-norm/RoPE/FP8-cache epilogue",
+    ),
+    (
+        "swa_verify_splitkv",
+        "swa_verify_splitkv",
+        "8-token GQA-8 verify on a 2047-token window, split-KV, FP8 KV page 16",
+    ),
+    (
+        "gqa_verify_splitkv",
+        "gqa_verify_splitkv",
+        "8-token GQA-8 verify, one 64-row tile per (request, KV head), split-KV",
+    ),
+    (
+        "gqa_verify_splitkv_2kv",
+        "gqa_verify_splitkv_2kv",
+        "8-token full-attention verify, both KV heads per program, split-KV",
+    ),
+    (
+        "dflash_block_splitkv",
+        "dflash_block_splitkv",
+        "DFlash 8-row block extend over an FP8 prefix cache, split-KV, head_dim 128",
+    ),
+    (
+        "muse_extend_gluon",
+        "muse_extend_attention",
+        "FP8-Q extend, head_dim 64 GQA 8, FP8 paged KV (Gluon; full layers and the 2047 window)",
+    ),
+]
+for _mod, _fn, _desc in _MUSE_SPARK_GFX950_KERNELS:
+    register_kernel(
+        KernelSpec(
+            op=f"attention.{_fn}",
+            backend=KernelBackend.TRITON,
+            target=f"sglang.kernels.ops.attention.{_mod}:{_fn}",
+            capabilities=frozenset({CapabilityRequirement.HIP}),
+        )
+    )
+del _mod, _fn, _desc
+
+# Muse Spark on gfx950 (MI355X): FlyDSL kernels of the same backends.
+_MUSE_SPARK_GFX950_FLYDSL_KERNELS = [
+    (
+        "muse_verify_flydsl",
+        "gqa_verify_flydsl",
+        "8-token full-attention verify, one wave per KV head, exact BF16, split-KV",
+    ),
+    (
+        "muse_verify_balanced",
+        "gqa_verify_flydsl_balanced",
+        "that verify on a length-balanced split-KV work list",
+    ),
+    (
+        "muse_verify_balanced",
+        "swa_verify_flydsl",
+        "8-token verify on the 2047-token window, fixed splits over the window",
+    ),
+    (
+        "muse_extend_flydsl",
+        "muse_extend_attention_fly",
+        "full-layer FP8-Q extend, head_dim 64 GQA 8, FP8 paged KV",
+    ),
+]
+for _mod, _fn, _desc in _MUSE_SPARK_GFX950_FLYDSL_KERNELS:
+    register_kernel(
+        KernelSpec(
+            op=f"attention.{_fn}",
+            backend=KernelBackend.FLYDSL,
+            target=f"sglang.kernels.ops.attention.{_mod}:{_fn}",
+            capabilities=frozenset({CapabilityRequirement.HIP}),
+        )
+    )
+del _mod, _fn, _desc
+register_kernel(
+    KernelSpec(
+        op="attention.append_window_to_topk",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.attention.dsa.append_window_to_topk:append_window_to_topk",
+        capabilities=CUDA_ONLY,
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="attention.postmix_fp8_wo_a_quant",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.attention.postmix_fp8_wo_a:postmix_fp8_wo_a_quant",
+        # The UE8M0 packed scales are an SM100 layout.
+        capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(10, 0))}),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="attention.indexer_q_quant_head_gate",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.attention.dsa.head_gate:indexer_q_quant_head_gate",
+        capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(8, 9))}),
     )
 )

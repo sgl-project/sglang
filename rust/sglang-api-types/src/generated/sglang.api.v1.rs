@@ -167,13 +167,19 @@ pub struct OptionalInt64List {
 }
 /// The native error body: `{"error": {"message", "code"}}` (Python
 /// `http_server.generate_request` parity). Transports frame it themselves
-/// (unary status + body, SSE error frame, gRPC status detail).
+/// (unary status + body, SSE error frame, gRPC status detail). A streamed
+/// error also carries `type` and `retryable`, as Python's `stream_results()`
+/// frame does; a unary body leaves them unset.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ErrorBody {
     #[prost(string, tag = "1")]
     pub message: ::prost::alloc::string::String,
     #[prost(uint32, tag = "2")]
     pub code: u32,
+    #[prost(string, optional, tag = "3")]
+    pub r#type: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(bool, optional, tag = "4")]
+    pub retryable: ::core::option::Option<bool>,
 }
 /// Python's `matched` key, `Union\[str, int, List[int]\]`: the three wire shapes
 /// are disjoint, so shape alone picks the arm (untagged).
@@ -601,6 +607,10 @@ pub struct GenerateMetaInfo {
     /// tokens.
     #[prost(message, optional, tag = "21")]
     pub cached_tokens_details: ::core::option::Option<CachedTokensDetails>,
+    /// The data-parallel rank whose scheduler served the request, on every
+    /// frame; null when the server runs without data parallelism.
+    #[prost(uint32, optional, tag = "22")]
+    pub dp_rank: ::core::option::Option<u32>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct WeightVersionSpan {
@@ -902,6 +912,11 @@ pub struct GetModelInfoResponse {
     pub reasoning_parser: ::core::option::Option<::prost::alloc::string::String>,
     #[prost(string, optional, tag = "9")]
     pub tool_call_parser: ::core::option::Option<::prost::alloc::string::String>,
+    /// The HF config's `model_type` and `architectures`.
+    #[prost(string, optional, tag = "10")]
+    pub model_type: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, repeated, tag = "11")]
+    pub architectures: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct GetServerInfoRequest {}
@@ -917,6 +932,10 @@ pub struct GetServerInfoResponse {
     pub max_context_length: u32,
     #[prost(uint64, optional, tag = "5")]
     pub max_total_num_tokens: ::core::option::Option<u64>,
+    /// Output-token slots each request reserves for speculative draft tokens;
+    /// the server counts them as input when checking a request against max_context_length.
+    #[prost(uint64, tag = "15")]
+    pub num_reserved_tokens: u64,
     #[prost(string, tag = "6")]
     pub version: ::prost::alloc::string::String,
     /// The allowlisted runtime metrics (last_gen_throughput, memory_usage,
@@ -934,6 +953,11 @@ pub struct GetServerInfoResponse {
     pub incremental_streaming_output: bool,
     #[prost(string, tag = "11")]
     pub disaggregation_mode: ::prost::alloc::string::String,
+    /// True: an over-long request is truncated to fit instead of rejected.
+    #[prost(bool, tag = "13")]
+    pub allow_auto_truncate: bool,
+    #[prost(bool, tag = "14")]
+    pub skip_tokenizer_init: bool,
     /// Distributed deployment metadata required by out-of-process orchestrators.
     #[prost(message, optional, tag = "12")]
     pub deployment_info: ::core::option::Option<DeploymentInfo>,
@@ -982,6 +1006,26 @@ pub struct DeploymentInfo {
     /// KV-cache event streams published by this deployment.
     #[prost(message, repeated, tag = "19")]
     pub kv_event_sources: ::prost::alloc::vec::Vec<KvEventSource>,
+    /// Every Rust listener this launch runs on this node, in port-offset order.
+    /// Each of them reports the same list, so one connection finds the rest.
+    #[prost(message, repeated, tag = "20")]
+    pub node_listeners: ::prost::alloc::vec::Vec<NodeRustListener>,
+}
+/// One Rust listener: the HTTP (and native gRPC) server embedded by a DP-group
+/// leader scheduler.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct NodeRustListener {
+    /// The listener binds --port + port_offset and --grpc-port + port_offset.
+    #[prost(uint32, tag = "1")]
+    pub port_offset: u32,
+    /// The DP rank it serves; equals that listener's DeploymentInfo.dp_rank.
+    #[prost(uint32, tag = "2")]
+    pub dp_rank: u32,
+    #[prost(uint32, tag = "3")]
+    pub http_port: u32,
+    /// Unset without native gRPC.
+    #[prost(uint32, optional, tag = "4")]
+    pub grpc_port: ::core::option::Option<u32>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct KvEventSource {

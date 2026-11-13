@@ -18,7 +18,7 @@ from sglang.srt.layers.attention.linear.kda_backend import (
 )
 from sglang.srt.layers.attention.linear.utils import LinearAttnKernelBackend
 from sglang.srt.mem_cache.memory_pool import MambaPool
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import override_platform
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -150,6 +150,7 @@ class TestKDAFusedVerifyBackend(CustomTestCase):
             retrieve_next_token=None,
             retrieve_next_sibling=None,
             retrieve_parent_token=None,
+            replayssm_ring_indices=None,
         )
         backend.verify_intermediate_state_indices = torch.arange(
             slots.numel(), device="cuda", dtype=torch.int32

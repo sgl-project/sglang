@@ -25,6 +25,7 @@ runtime_base = [
   "anthropic>=0.20.0",
   "apache-tvm-ffi",
   "av",
+  "blake3>=1.0.0",
   "blobfile==3.0.0",
   "build",
   "datasets",
@@ -46,7 +47,8 @@ runtime_base = [
   "orjson",
   "packaging",
   "partial_json_parser",
-  "pillow",
+  # The Rust image pipeline (dynamo-multimodal) reproduces Pillow 12.x bicubic.
+  "pillow<13",
   "prometheus-client>=0.20.0",
   "psutil",
   "py-spy",
@@ -108,9 +110,15 @@ tracing = [
   "opentelemetry-sdk",
 ]
 
+# Same pin as the CUDA pyproject. The ROCm image installs srt_hip*, not `all`,
+# so the Dockerfile has to ask for this extra by name.
+fastokens = [
+  "fastokens>=0.3.2",
+]
+
 # Monokernels for gfx950 (--enable-amd-monokernel); the ROCm image checks out this pin too.
 monokernels_hip = [
-  "sgl-amd-mono @ git+https://github.com/sgl-project/sgl-amd-mono.git@b10f3b71c45a70f504c5cad2d622c3e423196e90",
+  "sgl-amd-mono @ git+https://github.com/sgl-project/sgl-amd-mono.git@7113024f8b2e4612b891d330a525a9a7d57de371",
 ]
 
 # HIP (Heterogeneous-computing Interface for Portability) for AMD
@@ -171,6 +179,14 @@ srt_sail = [
   "sglang[runtime_common]",
   "torch-for-sail",
   "triton-for-sail",
+]
+
+# Keep vendor pins in sync with scripts/ci/mlu/component_versions.properties.
+srt_mlu = [
+  "sglang[runtime_common]",
+  "torch-mlu==1.34.1+torch2.13.0",
+  "torch-mlu-ops==1.13.0+torch2.13.0",
+  "triton==3.4.0+mlu2.1.3",
 ]
 
 # https://docs.sglang.io/platforms/mthreads_gpu.md
@@ -243,11 +259,12 @@ test = [
   "tabulate",
 ]
 
-all_hip = ["sglang[diffusion_hip]", "sglang[srt_hip]", "sglang[tracing]"]
-all_hip_rocm724 = ["sglang[diffusion_hip]", "sglang[srt_hip_rocm724]", "sglang[tracing]"]
-all_hip_rocm101 = ["sglang[diffusion_hip]", "sglang[srt_hip_rocm101]", "sglang[tracing]"]
+all_hip = ["sglang[diffusion_hip]", "sglang[fastokens]", "sglang[srt_hip]", "sglang[tracing]"]
+all_hip_rocm724 = ["sglang[diffusion_hip]", "sglang[fastokens]", "sglang[srt_hip_rocm724]", "sglang[tracing]"]
+all_hip_rocm101 = ["sglang[diffusion_hip]", "sglang[fastokens]", "sglang[srt_hip_rocm101]", "sglang[tracing]"]
 all_hpu = ["sglang[srt_hpu]"]
 all_sail = ["sglang[srt_sail]"]
+all_mlu = ["sglang[srt_mlu]", "sglang[tracing]"]
 all_musa = ["sglang[diffusion_musa]", "sglang[srt_musa]"]
 all_mps = ["sglang[diffusion_mps]", "sglang[srt_mps]"]
 
@@ -256,6 +273,7 @@ dev_hip_rocm724 = ["sglang[all_hip_rocm724]", "sglang[test]"]
 dev_hip_rocm101 = ["sglang[all_hip_rocm101]", "sglang[test]"]
 dev_hpu = ["sglang[all_hpu]", "sglang[test]"]
 dev_sail = ["sglang[all_sail]", "sglang[test]"]
+dev_mlu = ["sglang[all_mlu]", "sglang[test]"]
 dev_musa = ["sglang[all_musa]", "sglang[test]"]
 dev_mps = ["sglang[all_mps]", "sglang[test]"]
 

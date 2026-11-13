@@ -16,7 +16,7 @@ from sglang.srt.environ import envs
 def torch_built_with_hip() -> bool:
     """Whether torch is a ROCm build, without importing torch.
 
-    Same answer as srt.utils.common.is_hip, but that one imports torch and this
+    Same answer as srt.utils.device.is_hip, but that one imports torch and this
     has to run before torch is imported. torch/version.py is nothing but a few
     constant assignments, so reading only that file is enough.
     """
