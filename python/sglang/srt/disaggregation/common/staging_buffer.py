@@ -20,6 +20,10 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.kvcache.strided_staging import (
+    gather_strided_staging,
+    scatter_strided_staging,
+)
 from sglang.kernels.ops.memory.ptr_table import make_ptr_table
 from sglang.srt.environ import envs
 from sglang.srt.utils import create_device_stream, device_stream_context
@@ -57,6 +61,54 @@ def _check_kv_on_staging_device(
         f"KV buffers are on {device} but staging is on {staging_device}; "
         f"both must be the same device."
     )
+
+
+def _needs_strided_staging(k_buffers, v_buffers):
+    if any(buf.ndim != 3 for buf in [*k_buffers, *v_buffers]):
+        raise ValueError("Staging requires three-dimensional NHD KV buffers")
+    reference_heads, head_dim = k_buffers[0].shape[1:]
+    return any(
+        buf.shape[1] * buf.shape[2] != reference_heads * head_dim
+        or buf.stride(0) != reference_heads * head_dim
+        for buf in [*k_buffers, *v_buffers]
+    )
+
+
+def _needs_flat_torch_staging(k_buffers, v_buffers):
+    return _needs_strided_staging(k_buffers, v_buffers) or any(
+        buf.shape[1:] != k_buffers[0].shape[1:] for buf in [*k_buffers, *v_buffers]
+    )
+
+
+def _staging_buffer_layout(k_buffers, v_buffers):
+    buffers = [*k_buffers, *v_buffers]
+    reference_heads, head_dim = k_buffers[0].shape[1:]
+    dtype_size = k_buffers[0].element_size()
+    for buf in buffers:
+        if (
+            buf.shape[1] * buf.shape[2] != reference_heads * head_dim
+            or buf.element_size() != dtype_size
+            or buf.stride(1) != buf.shape[2]
+            or buf.stride(2) != 1
+        ):
+            raise RuntimeError(
+                "Staging requires matching flat KV row widths/dtypes and contiguous head elements"
+            )
+    return buffers, [buf.stride(0) for buf in buffers]
+
+
+def validate_staging_buffers(k_buffers, v_buffers):
+    if not k_buffers or len(k_buffers) != len(v_buffers):
+        raise ValueError("Staging requires matching nonempty K/V layer buffers")
+    if any(buf.ndim != 3 for buf in [*k_buffers, *v_buffers]):
+        raise ValueError("Staging requires three-dimensional NHD KV buffers")
+    _staging_buffer_layout(k_buffers, v_buffers)
+    if _USE_TRITON_STAGING and _needs_strided_staging(k_buffers, v_buffers):
+        if k_buffers[0].device.type != "cuda" or torch.version.hip is not None:
+            raise ValueError(
+                "Strided Triton staging requires NVIDIA CUDA; "
+                "select SGLANG_STAGING_USE_TORCH=1 for the Torch implementation"
+            )
 
 
 @triton.jit
@@ -624,6 +676,23 @@ def _gather_all_layers_torch(
     staging_view = staging_buffer.buffer
     offset = 0
     with device_stream_context(gather_stream):
+        if _needs_flat_torch_staging(k_buffers, v_buffers):
+            buffers, _ = _staging_buffer_layout(k_buffers, v_buffers)
+            int_dtype = {1: torch.int8, 2: torch.int16, 4: torch.int32}[dtype_size]
+            begin, end = (
+                src_head_start * head_dim,
+                (src_head_start + num_heads) * head_dim,
+            )
+            for buf in buffers:
+                values = buf.view(int_dtype)[token_indices].reshape(num_tokens, -1)[
+                    :, begin:end
+                ]
+                staging_view[offset : offset + per_layer_bytes].view(int_dtype).copy_(
+                    values.reshape(-1)
+                )
+                offset += per_layer_bytes
+            gather_stream.synchronize()
+            return offset
         for layer_id in range(num_layers):
             dst = (
                 staging_view[offset : offset + per_layer_bytes]
@@ -701,6 +770,24 @@ def _gather_all_layers_triton(
     grid = (2 * num_layers, triton.cdiv(per_layer_elems, BLOCK_SIZE))
 
     with device_stream_context(gather_stream):
+        if _needs_strided_staging(k_buffers, v_buffers):
+            _, strides = _staging_buffer_layout(k_buffers, v_buffers)
+            key = (device.type, device.index)
+            stride_table = _cached_scatter_i64(
+                ("staging_strides", key, *strides), strides, device
+            )
+            gather_strided_staging(
+                layer_ptrs,
+                stride_table,
+                page_idx_tensor,
+                staging_typed,
+                per_layer_elems,
+                src_head_start * head_dim,
+                elems_per_token=elems_per_token,
+                page_size=page_size,
+            )
+            gather_stream.synchronize()
+            return total_bytes
         _fused_gather_to_staging_kernel[grid](
             layer_ptrs,
             page_idx_tensor,
@@ -775,6 +862,39 @@ def _scatter_staging_to_kv_torch(
         num_writers = prefill_attn_tp_size // max(1, decode_attn_tp_size)
     else:
         num_writers = 1
+
+    if _needs_flat_torch_staging(k_buffers, v_buffers):
+        buffers, _ = _staging_buffer_layout(k_buffers, v_buffers)
+        int_dtype = {1: torch.int8, 2: torch.int16, 4: torch.int32}[dtype_size]
+        token_indices = (
+            page_idx_tensor[:, None] * page_size
+            + torch.arange(page_size, device=page_idx_tensor.device)
+        ).reshape(-1)
+        offset = 0
+        for writer in range(num_writers):
+            _, num_heads, head_start, _ = compute_head_slice_params(
+                prefill_attn_tp_size,
+                decode_attn_tp_size,
+                writer,
+                dst_tp_rank,
+                total_kv_heads,
+            )
+            per_layer_bytes = num_tokens * num_heads * head_dim * dtype_size
+            elements = torch.arange(
+                head_start * head_dim,
+                (head_start + num_heads) * head_dim,
+                device=page_idx_tensor.device,
+            )
+            for buf in buffers:
+                values = (
+                    staging_buffer_view[offset : offset + per_layer_bytes]
+                    .view(int_dtype)
+                    .reshape(num_tokens, -1)
+                )
+                flat = buf.view(int_dtype).view(buf.shape[0], -1)
+                flat[token_indices[:, None], elements[None, :]] = values
+                offset += per_layer_bytes
+        return
 
     for writer_rank in range(num_writers):
         _, num_heads, dst_head_start, _ = compute_head_slice_params(
@@ -890,6 +1010,26 @@ def _scatter_staging_to_kv_triton(
         num_tokens * elems_per_token * dtype_size * num_layers * 2 * num_writers
     )
     staging_typed = staging_buffer_view[:total_staging_bytes].view(int_dtype)
+
+    if _needs_strided_staging(k_buffers, v_buffers):
+        _, strides = _staging_buffer_layout(k_buffers, v_buffers)
+        key = (device.type, device.index)
+        stride_table = _cached_scatter_i64(
+            ("staging_strides", key, *strides), strides, device
+        )
+        scatter_strided_staging(
+            layer_ptrs,
+            stride_table,
+            page_idx_tensor,
+            staging_typed,
+            writer_head_offsets,
+            per_layer_elems,
+            elems_per_token=elems_per_token,
+            page_size=page_size,
+            num_slots=2 * num_layers,
+            num_writers=num_writers,
+        )
+        return
 
     _launch_scatter(
         layer_ptrs,

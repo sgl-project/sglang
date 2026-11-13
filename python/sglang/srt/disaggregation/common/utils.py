@@ -38,6 +38,8 @@ class TransferKVChunk:
     # The room's send record this chunk was counted in when queued (a
     # `SendRecord`); the worker reports the chunk finished to it only.
     send_record: Optional[object] = None
+    # Retries must not overwrite a freed slot or forget an earlier aux failure.
+    destination_results: dict[str, bool] = dataclasses.field(default_factory=dict)
 
 
 def bind_thread_to_device(gpu_id: int) -> None:
