@@ -84,6 +84,20 @@ def _top_k_renorm_prob(
     return _platform.top_k_renorm_prob(probs, top_k)
 
 
+def joint_top_k_top_p_renorm_prob(probs, top_ks, top_ps, max_keep=None):
+    """Apply top-p then top-k, fused on the platforms that provide a kernel.
+
+    The platform kernel is only used when a bound on the surviving columns is
+    known; otherwise this falls back to the two kernels in sequence, which is
+    what every platform does today.
+    """
+    fused = getattr(_platform, "top_k_top_p_renorm_prob", None)
+    if fused is not None and max_keep:
+        return fused(probs, top_ks, top_ps, max_keep=int(max_keep))
+    probs = _top_p_renorm_prob(probs, top_ps)
+    return _top_k_renorm_prob(probs, top_ks)
+
+
 top_p_renorm_prob = (
     _top_p_renorm_prob if _platform.top_p_renorm_prob is not None else None
 )
@@ -92,6 +106,7 @@ top_k_renorm_prob = (
 )
 
 __all__ = [
+    "joint_top_k_top_p_renorm_prob",
     "renorm_deterministic",
     "top_k_renorm_prob",
     "top_p_renorm_prob",
