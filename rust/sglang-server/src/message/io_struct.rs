@@ -159,6 +159,115 @@ control_messages! {
         tags: Option<Vec<String>>,
     }
 
+    /// `/get_weights_by_name`: Python's `GetWeightsByNameReqInput`.
+    GetWeightsByNameReqInput {
+        name: String,
+        truncate_size: i64,
+    }
+
+    /// `/init_weights_update_group`: Python's `InitWeightsUpdateGroupReqInput`.
+    InitWeightsUpdateGroupReqInput {
+        master_address: String,
+        master_port: i64,
+        rank_offset: i64,
+        world_size: i64,
+        group_name: String,
+        backend: String,
+    }
+
+    /// `/destroy_weights_update_group`.
+    DestroyWeightsUpdateGroupReqInput {
+        group_name: String,
+    }
+
+    /// `/init_weights_send_group_for_remote_instance`.
+    InitWeightsSendGroupForRemoteInstanceReqInput {
+        master_address: String,
+        ports: String,
+        group_rank: i64,
+        world_size: i64,
+        group_name: String,
+        backend: String,
+    }
+
+    /// `/send_weights_to_remote_instance`.
+    SendWeightsToRemoteInstanceReqInput {
+        master_address: String,
+        ports: String,
+        group_name: String,
+    }
+
+    /// `/update_weights_from_disk`: Python's `UpdateWeightFromDiskReqInput`.
+    /// `is_async`, `keep_pause`, `token_step` and `manifest` are carried as
+    /// Python carries them; its scheduler reads none of them.
+    UpdateWeightFromDiskReqInput {
+        model_path: String,
+        load_format: Option<String>,
+        abort_all_requests: bool,
+        weight_version: Option<String>,
+        is_async: bool,
+        torch_empty_cache: bool,
+        keep_pause: bool,
+        recapture_cuda_graph: bool,
+        token_step: i64,
+        flush_cache: bool,
+        manifest: Option<serde_json::Map<String, serde_json::Value>>,
+    }
+
+    /// `/update_weights_from_distributed`: Python's
+    /// `UpdateWeightsFromDistributedReqInput`.
+    UpdateWeightsFromDistributedReqInput {
+        names: Vec<String>,
+        dtypes: Vec<String>,
+        shapes: Vec<Vec<i64>>,
+        group_name: String,
+        flush_cache: bool,
+        abort_all_requests: bool,
+        weight_version: Option<String>,
+        load_format: Option<String>,
+        selector: String,
+        torch_empty_cache: bool,
+    }
+
+    /// `/update_weights_from_tensor`: Python's `UpdateWeightsFromTensorReqInput`,
+    /// one serialized payload per TP rank, decoded from the body's base64.
+    UpdateWeightsFromTensorReqInput {
+        serialized_named_tensors: Vec<WireBytes>,
+        load_format: Option<String>,
+        flush_cache: bool,
+        abort_all_requests: bool,
+        weight_version: Option<String>,
+        selector: String,
+        torch_empty_cache: bool,
+    }
+
+    /// `/update_weights_from_ipc`: Python's `UpdateWeightsFromIPCReqInput`.
+    UpdateWeightsFromIPCReqInput {
+        zmq_handles: std::collections::BTreeMap<String, String>,
+        flush_cache: bool,
+        weight_version: Option<String>,
+        torch_empty_cache: bool,
+    }
+
+    /// `/begin_weight_update`: Python's `BeginWeightUpdateReqInput`.
+    BeginWeightUpdateReqInput {
+        selector: String,
+    }
+
+    /// `/end_weight_update`: Python's `EndWeightUpdateReqInput`.
+    EndWeightUpdateReqInput {}
+
+    /// `/plugin_weight_update`: Python's `PluginWeightUpdateReqInput`.
+    PluginWeightUpdateReqInput {
+        handler: String,
+        payload: serde_json::Map<String, serde_json::Value>,
+        flush_cache: bool,
+        abort_all_requests: bool,
+        weight_version: Option<String>,
+        selector: String,
+        torch_empty_cache: bool,
+    }
+
     /// `/pause_generation`: Python's `PauseGenerationReqInput`. The scheduler
     /// accepts `in_place` and `retract`; `abort` never reaches it.
     PauseGenerationReqInput {
@@ -285,6 +394,256 @@ impl<'a> From<&'a GenerateRequest> for TokenizedGenerateReqInput<'a> {
 impl SetInternalStateReq {
     pub fn new(rid: String, server_args: serde_json::Map<String, serde_json::Value>) -> Self {
         Self { rid, server_args }
+    }
+}
+
+impl GetWeightsByNameReqInput {
+    pub fn new(rid: String, name: String, truncate_size: i64) -> Self {
+        Self {
+            rid,
+            name,
+            truncate_size,
+        }
+    }
+}
+
+/// The `/init_weights_update_group` fields; the owned form of
+/// `api::InitWeightsUpdateGroupRequest` after its defaults are applied.
+#[derive(Debug, Clone)]
+pub struct WeightsUpdateGroup {
+    pub master_address: String,
+    pub master_port: i64,
+    pub rank_offset: i64,
+    pub world_size: i64,
+    pub group_name: String,
+    pub backend: String,
+}
+
+impl InitWeightsUpdateGroupReqInput {
+    pub fn new(rid: String, group: WeightsUpdateGroup) -> Self {
+        Self {
+            rid,
+            master_address: group.master_address,
+            master_port: group.master_port,
+            rank_offset: group.rank_offset,
+            world_size: group.world_size,
+            group_name: group.group_name,
+            backend: group.backend,
+        }
+    }
+}
+
+impl DestroyWeightsUpdateGroupReqInput {
+    pub fn new(rid: String, group_name: String) -> Self {
+        Self { rid, group_name }
+    }
+}
+
+/// The `/init_weights_send_group_for_remote_instance` fields.
+#[derive(Debug, Clone)]
+pub struct WeightsSendGroup {
+    pub master_address: String,
+    pub ports: String,
+    pub group_rank: i64,
+    pub world_size: i64,
+    pub group_name: String,
+    pub backend: String,
+}
+
+impl InitWeightsSendGroupForRemoteInstanceReqInput {
+    pub fn new(rid: String, group: WeightsSendGroup) -> Self {
+        Self {
+            rid,
+            master_address: group.master_address,
+            ports: group.ports,
+            group_rank: group.group_rank,
+            world_size: group.world_size,
+            group_name: group.group_name,
+            backend: group.backend,
+        }
+    }
+}
+
+impl SendWeightsToRemoteInstanceReqInput {
+    pub fn new(rid: String, master_address: String, ports: String, group_name: String) -> Self {
+        Self {
+            rid,
+            master_address,
+            ports,
+            group_name,
+        }
+    }
+}
+
+/// Bytes on the msgpack wire as `bin`, which Python reads back as `bytes`
+/// (a `Vec<u8>` would serialize as an array of integers).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WireBytes(pub Vec<u8>);
+
+impl Serialize for WireBytes {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_bytes(&self.0)
+    }
+}
+
+/// The `/update_weights_from_disk` fields; the owned form of
+/// `api::UpdateWeightsFromDiskRequest` after the frontend resolved
+/// `load_format` from the launch.
+#[derive(Debug, Clone, Default)]
+pub struct DiskWeightUpdate {
+    pub model_path: String,
+    pub load_format: Option<String>,
+    pub abort_all_requests: bool,
+    pub weight_version: Option<String>,
+    pub is_async: bool,
+    pub torch_empty_cache: bool,
+    pub keep_pause: bool,
+    pub recapture_cuda_graph: bool,
+    pub token_step: i64,
+    pub flush_cache: bool,
+    pub manifest: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+impl UpdateWeightFromDiskReqInput {
+    pub fn new(rid: String, update: DiskWeightUpdate) -> Self {
+        Self {
+            rid,
+            model_path: update.model_path,
+            load_format: update.load_format,
+            abort_all_requests: update.abort_all_requests,
+            weight_version: update.weight_version,
+            is_async: update.is_async,
+            torch_empty_cache: update.torch_empty_cache,
+            keep_pause: update.keep_pause,
+            recapture_cuda_graph: update.recapture_cuda_graph,
+            token_step: update.token_step,
+            flush_cache: update.flush_cache,
+            manifest: update.manifest,
+        }
+    }
+}
+
+/// The `/update_weights_from_distributed` fields; the owned form of
+/// `api::UpdateWeightsFromDistributedRequest` with its defaults applied.
+#[derive(Debug, Clone, Default)]
+pub struct DistributedWeightUpdate {
+    pub names: Vec<String>,
+    pub dtypes: Vec<String>,
+    pub shapes: Vec<Vec<i64>>,
+    pub group_name: String,
+    pub flush_cache: bool,
+    pub abort_all_requests: bool,
+    pub weight_version: Option<String>,
+    pub load_format: Option<String>,
+    pub selector: String,
+    pub torch_empty_cache: bool,
+}
+
+impl UpdateWeightsFromDistributedReqInput {
+    pub fn new(rid: String, update: DistributedWeightUpdate) -> Self {
+        Self {
+            rid,
+            names: update.names,
+            dtypes: update.dtypes,
+            shapes: update.shapes,
+            group_name: update.group_name,
+            flush_cache: update.flush_cache,
+            abort_all_requests: update.abort_all_requests,
+            weight_version: update.weight_version,
+            load_format: update.load_format,
+            selector: update.selector,
+            torch_empty_cache: update.torch_empty_cache,
+        }
+    }
+}
+
+/// The `/update_weights_from_tensor` fields; the owned form of
+/// `api::UpdateWeightsFromTensorRequest` with the payloads decoded.
+#[derive(Debug, Clone, Default)]
+pub struct TensorWeightUpdate {
+    pub serialized_named_tensors: Vec<WireBytes>,
+    pub load_format: Option<String>,
+    pub flush_cache: bool,
+    pub abort_all_requests: bool,
+    pub weight_version: Option<String>,
+    pub selector: String,
+    pub torch_empty_cache: bool,
+}
+
+impl UpdateWeightsFromTensorReqInput {
+    pub fn new(rid: String, update: TensorWeightUpdate) -> Self {
+        Self {
+            rid,
+            serialized_named_tensors: update.serialized_named_tensors,
+            load_format: update.load_format,
+            flush_cache: update.flush_cache,
+            abort_all_requests: update.abort_all_requests,
+            weight_version: update.weight_version,
+            selector: update.selector,
+            torch_empty_cache: update.torch_empty_cache,
+        }
+    }
+}
+
+/// The `/update_weights_from_ipc` fields; the owned form of
+/// `api::UpdateWeightsFromIpcRequest` with its defaults applied.
+#[derive(Debug, Clone, Default)]
+pub struct IpcWeightUpdate {
+    pub zmq_handles: std::collections::BTreeMap<String, String>,
+    pub flush_cache: bool,
+    pub weight_version: Option<String>,
+    pub torch_empty_cache: bool,
+}
+
+impl UpdateWeightsFromIPCReqInput {
+    pub fn new(rid: String, update: IpcWeightUpdate) -> Self {
+        Self {
+            rid,
+            zmq_handles: update.zmq_handles,
+            flush_cache: update.flush_cache,
+            weight_version: update.weight_version,
+            torch_empty_cache: update.torch_empty_cache,
+        }
+    }
+}
+
+impl BeginWeightUpdateReqInput {
+    pub fn new(rid: String, selector: String) -> Self {
+        Self { rid, selector }
+    }
+}
+
+impl EndWeightUpdateReqInput {
+    pub fn new(rid: String) -> Self {
+        Self { rid }
+    }
+}
+
+/// The `/plugin_weight_update` fields; the owned form of
+/// `api::PluginWeightUpdateRequest` with its defaults applied.
+#[derive(Debug, Clone, Default)]
+pub struct PluginWeightUpdate {
+    pub handler: String,
+    pub payload: serde_json::Map<String, serde_json::Value>,
+    pub flush_cache: bool,
+    pub abort_all_requests: bool,
+    pub weight_version: Option<String>,
+    pub selector: String,
+    pub torch_empty_cache: bool,
+}
+
+impl PluginWeightUpdateReqInput {
+    pub fn new(rid: String, update: PluginWeightUpdate) -> Self {
+        Self {
+            rid,
+            handler: update.handler,
+            payload: update.payload,
+            flush_cache: update.flush_cache,
+            abort_all_requests: update.abort_all_requests,
+            weight_version: update.weight_version,
+            selector: update.selector,
+            torch_empty_cache: update.torch_empty_cache,
+        }
     }
 }
 

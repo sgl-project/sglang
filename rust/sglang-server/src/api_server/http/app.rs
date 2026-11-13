@@ -10,7 +10,7 @@ use axum::Router;
 use super::generate_hook::GenerateHook;
 use super::{
     auth, dp_relay, hicache, info, loads, metrics, native_api, openai, pre_generate,
-    request_decompression,
+    request_decompression, weights,
 };
 use crate::HttpLayer;
 use crate::api_server::core::{DrainEnd, FLUSH_INTERVAL};
@@ -153,6 +153,7 @@ pub async fn serve(
     // Each endpoint module registers its own routes and merges here.
     let mut router = Router::new()
         .merge(info::routes())
+        .merge(weights::routes())
         .merge(loads::routes())
         .merge(native_api::routes())
         .merge(openai::routes());
