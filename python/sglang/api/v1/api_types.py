@@ -1205,6 +1205,249 @@ class HiCacheStorageResponse(msgspec.Struct, kw_only=True, frozen=True):
         return encode_HiCacheStorageResponse(self)
 
 
+class OllamaMessage(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.OllamaMessage: JSON object (unknown keys ignored)."""
+
+    role: str = ""
+    content: str = ""
+    images: Optional[StringList] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "OllamaMessage":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_OllamaMessage(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_OllamaMessage(self)
+
+
+class OllamaOptions(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.OllamaOptions: JSON object (unknown keys ignored)."""
+
+    temperature: Optional[float] = None
+    top_p: Optional[float] = None
+    top_k: Optional[int] = None
+    num_predict: Optional[int] = None
+    stop: Optional[StringOrList] = None
+    presence_penalty: Optional[float] = None
+    frequency_penalty: Optional[float] = None
+    seed: Optional[int] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "OllamaOptions":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_OllamaOptions(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_OllamaOptions(self)
+
+
+class OllamaChatRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.OllamaChatRequest: JSON object (unknown keys ignored)."""
+
+    model: str = ""
+    messages: List[OllamaMessage] = []
+    stream: Optional[bool] = True
+    format: Optional[Any] = None
+    options: Optional[OllamaOptions] = None
+    keep_alive: Optional[Any] = None
+    think: Optional[Any] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "OllamaChatRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_OllamaChatRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_OllamaChatRequest(self)
+
+
+class OllamaChatResponse(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.OllamaChatResponse: JSON object (unknown keys ignored)."""
+
+    model: str = ""
+    created_at: str = ""
+    message: Optional[OllamaMessage] = None
+    done: bool = False
+    done_reason: Optional[str] = None
+    total_duration: Optional[int] = None
+    load_duration: Optional[int] = None
+    prompt_eval_count: Optional[int] = None
+    prompt_eval_duration: Optional[int] = None
+    eval_count: Optional[int] = None
+    eval_duration: Optional[int] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "OllamaChatResponse":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_OllamaChatResponse(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_OllamaChatResponse(self)
+
+
+class OllamaGenerateRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.OllamaGenerateRequest: JSON object (unknown keys ignored)."""
+
+    model: str = ""
+    prompt: str = ""
+    suffix: Optional[str] = None
+    system: Optional[str] = None
+    template: Optional[str] = None
+    context: Optional[Int64List] = None
+    stream: Optional[bool] = True
+    raw: Optional[bool] = False
+    format: Optional[Any] = None
+    options: Optional[OllamaOptions] = None
+    keep_alive: Optional[Any] = None
+    images: Optional[StringList] = None
+    think: Optional[bool] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "OllamaGenerateRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_OllamaGenerateRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_OllamaGenerateRequest(self)
+
+
+class OllamaGenerateResponse(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.OllamaGenerateResponse: JSON object (unknown keys ignored)."""
+
+    model: str = ""
+    created_at: str = ""
+    response: str = ""
+    done: bool = False
+    done_reason: Optional[str] = None
+    context: Optional[Int64List] = None
+    total_duration: Optional[int] = None
+    load_duration: Optional[int] = None
+    prompt_eval_count: Optional[int] = None
+    prompt_eval_duration: Optional[int] = None
+    eval_count: Optional[int] = None
+    eval_duration: Optional[int] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "OllamaGenerateResponse":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_OllamaGenerateResponse(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_OllamaGenerateResponse(self)
+
+
+class OllamaTagsRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.OllamaTagsRequest: JSON object (unknown keys ignored)."""
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "OllamaTagsRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_OllamaTagsRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_OllamaTagsRequest(self)
+
+
+class OllamaTagsResponse(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.OllamaTagsResponse: JSON object (unknown keys ignored)."""
+
+    models: List[OllamaModelInfo] = []
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "OllamaTagsResponse":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_OllamaTagsResponse(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_OllamaTagsResponse(self)
+
+
+class OllamaModelInfo(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.OllamaModelInfo: JSON object (unknown keys ignored)."""
+
+    name: str = ""
+    model: str = ""
+    modified_at: str = ""
+    size: int = 0
+    digest: str = ""
+    details: Optional[OllamaModelDetails] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "OllamaModelInfo":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_OllamaModelInfo(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_OllamaModelInfo(self)
+
+
+class OllamaModelDetails(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.OllamaModelDetails: JSON object (unknown keys ignored)."""
+
+    parent_model: Optional[str] = None
+    format: str = ""
+    family: str = ""
+    families: List[str] = []
+    parameter_size: str = ""
+    quantization_level: Optional[str] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "OllamaModelDetails":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_OllamaModelDetails(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_OllamaModelDetails(self)
+
+
+class OllamaShowRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.OllamaShowRequest: JSON object (unknown keys ignored)."""
+
+    model: str = ""
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "OllamaShowRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_OllamaShowRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_OllamaShowRequest(self)
+
+
+class OllamaShowResponse(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.OllamaShowResponse: JSON object (unknown keys ignored)."""
+
+    license: str = ""
+    modelfile: str = ""
+    parameters: str = ""
+    template: str = ""
+    modified_at: str = ""
+    details: Optional[OllamaModelDetails] = None
+    model_info: Optional[Any] = None
+    capabilities: List[str] = []
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "OllamaShowResponse":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_OllamaShowResponse(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_OllamaShowResponse(self)
+
+
 class ParseFunctionCallRequest(msgspec.Struct, kw_only=True, frozen=True):
     """sglang.api.v1.ParseFunctionCallRequest: JSON object (unknown keys ignored)."""
 
@@ -4140,6 +4383,426 @@ def encode_HiCacheStorageResponse(v: HiCacheStorageResponse) -> Dict[str, Any]:
     d: Dict[str, Any] = {}
     d["success"] = v.success
     d["message"] = v.message
+    return d
+
+
+def decode_OllamaMessage(value: Any) -> OllamaMessage:
+    m = _expect_map(value, expected="struct OllamaMessage")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "role":
+            kw["role"] = _expect_str(x, expected="a string")
+        elif key == "content":
+            kw["content"] = _expect_str(x, expected="a string")
+        elif key == "images":
+            kw["images"] = None if x is None else decode_StringList(x)
+    return OllamaMessage(**kw)
+
+
+def encode_OllamaMessage(v: OllamaMessage) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["role"] = v.role
+    d["content"] = v.content
+    if v.images is not None:
+        d["images"] = encode_StringList(v.images)
+    return d
+
+
+def decode_OllamaOptions(value: Any) -> OllamaOptions:
+    m = _expect_map(value, expected="struct OllamaOptions")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "temperature":
+            kw["temperature"] = None if x is None else _expect_float(x, expected="f64")
+        elif key == "top_p":
+            kw["top_p"] = None if x is None else _expect_float(x, expected="f64")
+        elif key == "top_k":
+            kw["top_k"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "num_predict":
+            kw["num_predict"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "stop":
+            kw["stop"] = None if x is None else decode_StringOrList(x)
+        elif key == "presence_penalty":
+            kw["presence_penalty"] = None if x is None else _expect_float(x, expected="f64")
+        elif key == "frequency_penalty":
+            kw["frequency_penalty"] = None if x is None else _expect_float(x, expected="f64")
+        elif key == "seed":
+            kw["seed"] = None if x is None else _expect_int(x, expected="i64")
+    return OllamaOptions(**kw)
+
+
+def encode_OllamaOptions(v: OllamaOptions) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.temperature is not None:
+        d["temperature"] = float(v.temperature)
+    if v.top_p is not None:
+        d["top_p"] = float(v.top_p)
+    if v.top_k is not None:
+        d["top_k"] = v.top_k
+    if v.num_predict is not None:
+        d["num_predict"] = v.num_predict
+    if v.stop is not None:
+        d["stop"] = encode_StringOrList(v.stop)
+    if v.presence_penalty is not None:
+        d["presence_penalty"] = float(v.presence_penalty)
+    if v.frequency_penalty is not None:
+        d["frequency_penalty"] = float(v.frequency_penalty)
+    if v.seed is not None:
+        d["seed"] = v.seed
+    return d
+
+
+def decode_OllamaChatRequest(value: Any) -> OllamaChatRequest:
+    m = _expect_map(value, expected="struct OllamaChatRequest")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "model":
+            kw["model"] = _expect_str(x, expected="a string")
+        elif key == "messages":
+            kw["messages"] = [] if x is None else [decode_OllamaMessage(e) for e in _expect_seq(x, expected="a sequence")]
+        elif key == "stream":
+            kw["stream"] = True if x is None else _expect_bool(x, expected="a boolean")
+        elif key == "format":
+            kw["format"] = x
+        elif key == "options":
+            kw["options"] = None if x is None else decode_OllamaOptions(x)
+        elif key == "keep_alive":
+            kw["keep_alive"] = x
+        elif key == "think":
+            kw["think"] = x
+    return OllamaChatRequest(**kw)
+
+
+def encode_OllamaChatRequest(v: OllamaChatRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["model"] = v.model
+    if v.messages:
+        d["messages"] = [encode_OllamaMessage(e) for e in v.messages]
+    if v.stream is not None:
+        d["stream"] = v.stream
+    if v.format is not None:
+        d["format"] = v.format
+    if v.options is not None:
+        d["options"] = encode_OllamaOptions(v.options)
+    if v.keep_alive is not None:
+        d["keep_alive"] = v.keep_alive
+    if v.think is not None:
+        d["think"] = v.think
+    return d
+
+
+def decode_OllamaChatResponse(value: Any) -> OllamaChatResponse:
+    m = _expect_map(value, expected="struct OllamaChatResponse")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "model":
+            kw["model"] = _expect_str(x, expected="a string")
+        elif key == "created_at":
+            kw["created_at"] = _expect_str(x, expected="a string")
+        elif key == "message":
+            kw["message"] = None if x is None else decode_OllamaMessage(x)
+        elif key == "done":
+            kw["done"] = _expect_bool(x, expected="a boolean")
+        elif key == "done_reason":
+            kw["done_reason"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "total_duration":
+            kw["total_duration"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "load_duration":
+            kw["load_duration"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "prompt_eval_count":
+            kw["prompt_eval_count"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "prompt_eval_duration":
+            kw["prompt_eval_duration"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "eval_count":
+            kw["eval_count"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "eval_duration":
+            kw["eval_duration"] = None if x is None else _expect_int(x, expected="i64")
+    return OllamaChatResponse(**kw)
+
+
+def encode_OllamaChatResponse(v: OllamaChatResponse) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["model"] = v.model
+    d["created_at"] = v.created_at
+    if v.message is not None:
+        d["message"] = encode_OllamaMessage(v.message)
+    d["done"] = v.done
+    if v.done_reason is not None:
+        d["done_reason"] = v.done_reason
+    if v.total_duration is not None:
+        d["total_duration"] = v.total_duration
+    if v.load_duration is not None:
+        d["load_duration"] = v.load_duration
+    if v.prompt_eval_count is not None:
+        d["prompt_eval_count"] = v.prompt_eval_count
+    if v.prompt_eval_duration is not None:
+        d["prompt_eval_duration"] = v.prompt_eval_duration
+    if v.eval_count is not None:
+        d["eval_count"] = v.eval_count
+    if v.eval_duration is not None:
+        d["eval_duration"] = v.eval_duration
+    return d
+
+
+def decode_OllamaGenerateRequest(value: Any) -> OllamaGenerateRequest:
+    m = _expect_map(value, expected="struct OllamaGenerateRequest")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "model":
+            kw["model"] = _expect_str(x, expected="a string")
+        elif key == "prompt":
+            kw["prompt"] = _expect_str(x, expected="a string")
+        elif key == "suffix":
+            kw["suffix"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "system":
+            kw["system"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "template":
+            kw["template"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "context":
+            kw["context"] = None if x is None else decode_Int64List(x)
+        elif key == "stream":
+            kw["stream"] = True if x is None else _expect_bool(x, expected="a boolean")
+        elif key == "raw":
+            kw["raw"] = False if x is None else _expect_bool(x, expected="a boolean")
+        elif key == "format":
+            kw["format"] = x
+        elif key == "options":
+            kw["options"] = None if x is None else decode_OllamaOptions(x)
+        elif key == "keep_alive":
+            kw["keep_alive"] = x
+        elif key == "images":
+            kw["images"] = None if x is None else decode_StringList(x)
+        elif key == "think":
+            kw["think"] = None if x is None else _expect_bool(x, expected="a boolean")
+    return OllamaGenerateRequest(**kw)
+
+
+def encode_OllamaGenerateRequest(v: OllamaGenerateRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["model"] = v.model
+    d["prompt"] = v.prompt
+    if v.suffix is not None:
+        d["suffix"] = v.suffix
+    if v.system is not None:
+        d["system"] = v.system
+    if v.template is not None:
+        d["template"] = v.template
+    if v.context is not None:
+        d["context"] = encode_Int64List(v.context)
+    if v.stream is not None:
+        d["stream"] = v.stream
+    if v.raw is not None:
+        d["raw"] = v.raw
+    if v.format is not None:
+        d["format"] = v.format
+    if v.options is not None:
+        d["options"] = encode_OllamaOptions(v.options)
+    if v.keep_alive is not None:
+        d["keep_alive"] = v.keep_alive
+    if v.images is not None:
+        d["images"] = encode_StringList(v.images)
+    if v.think is not None:
+        d["think"] = v.think
+    return d
+
+
+def decode_OllamaGenerateResponse(value: Any) -> OllamaGenerateResponse:
+    m = _expect_map(value, expected="struct OllamaGenerateResponse")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "model":
+            kw["model"] = _expect_str(x, expected="a string")
+        elif key == "created_at":
+            kw["created_at"] = _expect_str(x, expected="a string")
+        elif key == "response":
+            kw["response"] = _expect_str(x, expected="a string")
+        elif key == "done":
+            kw["done"] = _expect_bool(x, expected="a boolean")
+        elif key == "done_reason":
+            kw["done_reason"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "context":
+            kw["context"] = None if x is None else decode_Int64List(x)
+        elif key == "total_duration":
+            kw["total_duration"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "load_duration":
+            kw["load_duration"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "prompt_eval_count":
+            kw["prompt_eval_count"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "prompt_eval_duration":
+            kw["prompt_eval_duration"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "eval_count":
+            kw["eval_count"] = None if x is None else _expect_int(x, expected="i64")
+        elif key == "eval_duration":
+            kw["eval_duration"] = None if x is None else _expect_int(x, expected="i64")
+    return OllamaGenerateResponse(**kw)
+
+
+def encode_OllamaGenerateResponse(v: OllamaGenerateResponse) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["model"] = v.model
+    d["created_at"] = v.created_at
+    d["response"] = v.response
+    d["done"] = v.done
+    if v.done_reason is not None:
+        d["done_reason"] = v.done_reason
+    if v.context is not None:
+        d["context"] = encode_Int64List(v.context)
+    if v.total_duration is not None:
+        d["total_duration"] = v.total_duration
+    if v.load_duration is not None:
+        d["load_duration"] = v.load_duration
+    if v.prompt_eval_count is not None:
+        d["prompt_eval_count"] = v.prompt_eval_count
+    if v.prompt_eval_duration is not None:
+        d["prompt_eval_duration"] = v.prompt_eval_duration
+    if v.eval_count is not None:
+        d["eval_count"] = v.eval_count
+    if v.eval_duration is not None:
+        d["eval_duration"] = v.eval_duration
+    return d
+
+
+def decode_OllamaTagsRequest(value: Any) -> OllamaTagsRequest:
+    m = _expect_map(value, expected="struct OllamaTagsRequest")
+    return OllamaTagsRequest()
+
+
+def encode_OllamaTagsRequest(v: OllamaTagsRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    return d
+
+
+def decode_OllamaTagsResponse(value: Any) -> OllamaTagsResponse:
+    m = _expect_map(value, expected="struct OllamaTagsResponse")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "models":
+            kw["models"] = [] if x is None else [decode_OllamaModelInfo(e) for e in _expect_seq(x, expected="a sequence")]
+    return OllamaTagsResponse(**kw)
+
+
+def encode_OllamaTagsResponse(v: OllamaTagsResponse) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.models:
+        d["models"] = [encode_OllamaModelInfo(e) for e in v.models]
+    return d
+
+
+def decode_OllamaModelInfo(value: Any) -> OllamaModelInfo:
+    m = _expect_map(value, expected="struct OllamaModelInfo")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "name":
+            kw["name"] = _expect_str(x, expected="a string")
+        elif key == "model":
+            kw["model"] = _expect_str(x, expected="a string")
+        elif key == "modified_at":
+            kw["modified_at"] = _expect_str(x, expected="a string")
+        elif key == "size":
+            kw["size"] = _expect_int(x, expected="i64")
+        elif key == "digest":
+            kw["digest"] = _expect_str(x, expected="a string")
+        elif key == "details":
+            kw["details"] = None if x is None else decode_OllamaModelDetails(x)
+    return OllamaModelInfo(**kw)
+
+
+def encode_OllamaModelInfo(v: OllamaModelInfo) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["name"] = v.name
+    d["model"] = v.model
+    d["modified_at"] = v.modified_at
+    d["size"] = v.size
+    d["digest"] = v.digest
+    if v.details is not None:
+        d["details"] = encode_OllamaModelDetails(v.details)
+    return d
+
+
+def decode_OllamaModelDetails(value: Any) -> OllamaModelDetails:
+    m = _expect_map(value, expected="struct OllamaModelDetails")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "parent_model":
+            kw["parent_model"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "format":
+            kw["format"] = _expect_str(x, expected="a string")
+        elif key == "family":
+            kw["family"] = _expect_str(x, expected="a string")
+        elif key == "families":
+            kw["families"] = [] if x is None else [_expect_str(e, expected="a string") for e in _expect_seq(x, expected="a sequence")]
+        elif key == "parameter_size":
+            kw["parameter_size"] = _expect_str(x, expected="a string")
+        elif key == "quantization_level":
+            kw["quantization_level"] = None if x is None else _expect_str(x, expected="a string")
+    return OllamaModelDetails(**kw)
+
+
+def encode_OllamaModelDetails(v: OllamaModelDetails) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.parent_model is not None:
+        d["parent_model"] = v.parent_model
+    d["format"] = v.format
+    d["family"] = v.family
+    if v.families:
+        d["families"] = list(v.families)
+    d["parameter_size"] = v.parameter_size
+    if v.quantization_level is not None:
+        d["quantization_level"] = v.quantization_level
+    return d
+
+
+def decode_OllamaShowRequest(value: Any) -> OllamaShowRequest:
+    m = _expect_map(value, expected="struct OllamaShowRequest")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "model":
+            kw["model"] = _expect_str(x, expected="a string")
+    return OllamaShowRequest(**kw)
+
+
+def encode_OllamaShowRequest(v: OllamaShowRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["model"] = v.model
+    return d
+
+
+def decode_OllamaShowResponse(value: Any) -> OllamaShowResponse:
+    m = _expect_map(value, expected="struct OllamaShowResponse")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "license":
+            kw["license"] = _expect_str(x, expected="a string")
+        elif key == "modelfile":
+            kw["modelfile"] = _expect_str(x, expected="a string")
+        elif key == "parameters":
+            kw["parameters"] = _expect_str(x, expected="a string")
+        elif key == "template":
+            kw["template"] = _expect_str(x, expected="a string")
+        elif key == "modified_at":
+            kw["modified_at"] = _expect_str(x, expected="a string")
+        elif key == "details":
+            kw["details"] = None if x is None else decode_OllamaModelDetails(x)
+        elif key == "model_info":
+            kw["model_info"] = x
+        elif key == "capabilities":
+            kw["capabilities"] = [] if x is None else [_expect_str(e, expected="a string") for e in _expect_seq(x, expected="a sequence")]
+    return OllamaShowResponse(**kw)
+
+
+def encode_OllamaShowResponse(v: OllamaShowResponse) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["license"] = v.license
+    d["modelfile"] = v.modelfile
+    d["parameters"] = v.parameters
+    d["template"] = v.template
+    d["modified_at"] = v.modified_at
+    if v.details is not None:
+        d["details"] = encode_OllamaModelDetails(v.details)
+    if v.model_info is not None:
+        d["model_info"] = v.model_info
+    if v.capabilities:
+        d["capabilities"] = list(v.capabilities)
     return d
 
 

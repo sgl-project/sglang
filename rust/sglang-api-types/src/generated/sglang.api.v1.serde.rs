@@ -6332,6 +6332,1333 @@ impl<'de> ::serde::Deserialize<'de> for HiCacheStorageResponse {
     }
 }
 
+impl ::serde::Serialize for OllamaMessage {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "role", &self.role)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "content", &self.content)?;
+        if let Some(v) = &self.images {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "images", v)?;
+        }
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for OllamaMessage {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = OllamaMessage;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct OllamaMessage")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_role = None;
+                let mut f_content = None;
+                let mut f_images = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "role" => {
+                            if f_role.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("role"));
+                            }
+                            f_role = Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        "content" => {
+                            if f_content.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("content"));
+                            }
+                            f_content = Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        "images" => {
+                            if f_images.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("images"));
+                            }
+                            f_images = Some(map.next_value::<Option<StringList>>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(OllamaMessage {
+                    role: f_role.unwrap_or_default(),
+                    content: f_content.unwrap_or_default(),
+                    images: f_images.flatten(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for OllamaOptions {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        if let Some(v) = &self.temperature {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "temperature", v)?;
+        }
+        if let Some(v) = &self.top_p {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "top_p", v)?;
+        }
+        if let Some(v) = &self.top_k {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "top_k", v)?;
+        }
+        if let Some(v) = &self.num_predict {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "num_predict", v)?;
+        }
+        if let Some(v) = &self.stop {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "stop", v)?;
+        }
+        if let Some(v) = &self.presence_penalty {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "presence_penalty", v)?;
+        }
+        if let Some(v) = &self.frequency_penalty {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "frequency_penalty", v)?;
+        }
+        if let Some(v) = &self.seed {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "seed", v)?;
+        }
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for OllamaOptions {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = OllamaOptions;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct OllamaOptions")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_temperature = None;
+                let mut f_top_p = None;
+                let mut f_top_k = None;
+                let mut f_num_predict = None;
+                let mut f_stop = None;
+                let mut f_presence_penalty = None;
+                let mut f_frequency_penalty = None;
+                let mut f_seed = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "temperature" => {
+                            if f_temperature.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("temperature"));
+                            }
+                            f_temperature = Some(map.next_value::<Option<f64>>()?);
+                        }
+                        "top_p" => {
+                            if f_top_p.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("top_p"));
+                            }
+                            f_top_p = Some(map.next_value::<Option<f64>>()?);
+                        }
+                        "top_k" => {
+                            if f_top_k.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("top_k"));
+                            }
+                            f_top_k = Some(map.next_value::<Option<i64>>()?);
+                        }
+                        "num_predict" => {
+                            if f_num_predict.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("num_predict"));
+                            }
+                            f_num_predict = Some(map.next_value::<Option<i64>>()?);
+                        }
+                        "stop" => {
+                            if f_stop.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("stop"));
+                            }
+                            f_stop = Some(map.next_value::<Option<StringOrList>>()?);
+                        }
+                        "presence_penalty" => {
+                            if f_presence_penalty.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "presence_penalty",
+                                ));
+                            }
+                            f_presence_penalty = Some(map.next_value::<Option<f64>>()?);
+                        }
+                        "frequency_penalty" => {
+                            if f_frequency_penalty.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "frequency_penalty",
+                                ));
+                            }
+                            f_frequency_penalty = Some(map.next_value::<Option<f64>>()?);
+                        }
+                        "seed" => {
+                            if f_seed.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("seed"));
+                            }
+                            f_seed = Some(map.next_value::<Option<i64>>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(OllamaOptions {
+                    temperature: f_temperature.flatten(),
+                    top_p: f_top_p.flatten(),
+                    top_k: f_top_k.flatten(),
+                    num_predict: f_num_predict.flatten(),
+                    stop: f_stop.flatten(),
+                    presence_penalty: f_presence_penalty.flatten(),
+                    frequency_penalty: f_frequency_penalty.flatten(),
+                    seed: f_seed.flatten(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl OllamaChatRequest {
+    /// The schema default when unset (protobuf arrival).
+    pub fn stream_or_default(&self) -> bool {
+        self.stream.clone().unwrap_or_else(|| true)
+    }
+    /// Protobuf arrival: unset defaulted fields become their schema
+    /// defaults (JSON arrival already baked them at deserialization).
+    pub fn apply_absent_defaults(&mut self) {
+        if self.stream.is_none() {
+            self.stream = Some(true);
+        }
+    }
+}
+
+impl ::serde::Serialize for OllamaChatRequest {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "model", &self.model)?;
+        if !self.messages.is_empty() {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "messages", &self.messages)?;
+        }
+        if let Some(v) = &self.stream {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "stream", v)?;
+        }
+        if let Some(v) = &self.format {
+            ::serde::ser::SerializeMap::serialize_entry(
+                &mut map,
+                "format",
+                &::serde_json::from_str::<::serde_json::Value>(v)
+                    .unwrap_or(::serde_json::Value::Null),
+            )?;
+        }
+        if let Some(v) = &self.options {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "options", v)?;
+        }
+        if let Some(v) = &self.keep_alive {
+            ::serde::ser::SerializeMap::serialize_entry(
+                &mut map,
+                "keep_alive",
+                &::serde_json::from_str::<::serde_json::Value>(v)
+                    .unwrap_or(::serde_json::Value::Null),
+            )?;
+        }
+        if let Some(v) = &self.think {
+            ::serde::ser::SerializeMap::serialize_entry(
+                &mut map,
+                "think",
+                &::serde_json::from_str::<::serde_json::Value>(v)
+                    .unwrap_or(::serde_json::Value::Null),
+            )?;
+        }
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for OllamaChatRequest {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = OllamaChatRequest;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct OllamaChatRequest")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_model = None;
+                let mut f_messages = None;
+                let mut f_stream = None;
+                let mut f_format = None;
+                let mut f_options = None;
+                let mut f_keep_alive = None;
+                let mut f_think = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "model" => {
+                            if f_model.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("model"));
+                            }
+                            f_model = Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        "messages" => {
+                            if f_messages.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("messages"));
+                            }
+                            f_messages = Some(
+                                map.next_value::<Option<Vec<OllamaMessage>>>()?
+                                    .unwrap_or_default(),
+                            );
+                        }
+                        "stream" => {
+                            if f_stream.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("stream"));
+                            }
+                            f_stream = Some(Some(
+                                map.next_value::<Option<bool>>()?.unwrap_or_else(|| true),
+                            ));
+                        }
+                        "format" => {
+                            if f_format.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("format"));
+                            }
+                            f_format = Some(
+                                map.next_value::<Option<::serde_json::Value>>()?
+                                    .map(|v| v.to_string()),
+                            );
+                        }
+                        "options" => {
+                            if f_options.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("options"));
+                            }
+                            f_options = Some(map.next_value::<Option<OllamaOptions>>()?);
+                        }
+                        "keep_alive" => {
+                            if f_keep_alive.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("keep_alive"));
+                            }
+                            f_keep_alive = Some(
+                                map.next_value::<Option<::serde_json::Value>>()?
+                                    .map(|v| v.to_string()),
+                            );
+                        }
+                        "think" => {
+                            if f_think.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("think"));
+                            }
+                            f_think = Some(
+                                map.next_value::<Option<::serde_json::Value>>()?
+                                    .map(|v| v.to_string()),
+                            );
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(OllamaChatRequest {
+                    model: f_model.unwrap_or_default(),
+                    messages: f_messages.unwrap_or_default(),
+                    stream: f_stream.unwrap_or_else(|| Some(true)),
+                    format: f_format.flatten(),
+                    options: f_options.flatten(),
+                    keep_alive: f_keep_alive.flatten(),
+                    think: f_think.flatten(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for OllamaChatResponse {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "model", &self.model)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "created_at", &self.created_at)?;
+        if let Some(v) = &self.message {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "message", v)?;
+        }
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "done", &self.done)?;
+        if let Some(v) = &self.done_reason {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "done_reason", v)?;
+        }
+        if let Some(v) = &self.total_duration {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "total_duration", v)?;
+        }
+        if let Some(v) = &self.load_duration {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "load_duration", v)?;
+        }
+        if let Some(v) = &self.prompt_eval_count {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "prompt_eval_count", v)?;
+        }
+        if let Some(v) = &self.prompt_eval_duration {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "prompt_eval_duration", v)?;
+        }
+        if let Some(v) = &self.eval_count {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "eval_count", v)?;
+        }
+        if let Some(v) = &self.eval_duration {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "eval_duration", v)?;
+        }
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for OllamaChatResponse {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = OllamaChatResponse;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct OllamaChatResponse")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_model = None;
+                let mut f_created_at = None;
+                let mut f_message = None;
+                let mut f_done = None;
+                let mut f_done_reason = None;
+                let mut f_total_duration = None;
+                let mut f_load_duration = None;
+                let mut f_prompt_eval_count = None;
+                let mut f_prompt_eval_duration = None;
+                let mut f_eval_count = None;
+                let mut f_eval_duration = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "model" => {
+                            if f_model.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("model"));
+                            }
+                            f_model = Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        "created_at" => {
+                            if f_created_at.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("created_at"));
+                            }
+                            f_created_at =
+                                Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        "message" => {
+                            if f_message.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("message"));
+                            }
+                            f_message = Some(map.next_value::<Option<OllamaMessage>>()?);
+                        }
+                        "done" => {
+                            if f_done.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("done"));
+                            }
+                            f_done = Some(map.next_value::<bool>()?);
+                        }
+                        "done_reason" => {
+                            if f_done_reason.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("done_reason"));
+                            }
+                            f_done_reason =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        "total_duration" => {
+                            if f_total_duration.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("total_duration"));
+                            }
+                            f_total_duration = Some(map.next_value::<Option<i64>>()?);
+                        }
+                        "load_duration" => {
+                            if f_load_duration.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("load_duration"));
+                            }
+                            f_load_duration = Some(map.next_value::<Option<i64>>()?);
+                        }
+                        "prompt_eval_count" => {
+                            if f_prompt_eval_count.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "prompt_eval_count",
+                                ));
+                            }
+                            f_prompt_eval_count = Some(map.next_value::<Option<i64>>()?);
+                        }
+                        "prompt_eval_duration" => {
+                            if f_prompt_eval_duration.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "prompt_eval_duration",
+                                ));
+                            }
+                            f_prompt_eval_duration = Some(map.next_value::<Option<i64>>()?);
+                        }
+                        "eval_count" => {
+                            if f_eval_count.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("eval_count"));
+                            }
+                            f_eval_count = Some(map.next_value::<Option<i64>>()?);
+                        }
+                        "eval_duration" => {
+                            if f_eval_duration.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("eval_duration"));
+                            }
+                            f_eval_duration = Some(map.next_value::<Option<i64>>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(OllamaChatResponse {
+                    model: f_model.unwrap_or_default(),
+                    created_at: f_created_at.unwrap_or_default(),
+                    message: f_message.flatten(),
+                    done: f_done.unwrap_or_default(),
+                    done_reason: f_done_reason.flatten(),
+                    total_duration: f_total_duration.flatten(),
+                    load_duration: f_load_duration.flatten(),
+                    prompt_eval_count: f_prompt_eval_count.flatten(),
+                    prompt_eval_duration: f_prompt_eval_duration.flatten(),
+                    eval_count: f_eval_count.flatten(),
+                    eval_duration: f_eval_duration.flatten(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl OllamaGenerateRequest {
+    /// The schema default when unset (protobuf arrival).
+    pub fn stream_or_default(&self) -> bool {
+        self.stream.clone().unwrap_or_else(|| true)
+    }
+    /// The schema default when unset (protobuf arrival).
+    pub fn raw_or_default(&self) -> bool {
+        self.raw.clone().unwrap_or_else(|| false)
+    }
+    /// Protobuf arrival: unset defaulted fields become their schema
+    /// defaults (JSON arrival already baked them at deserialization).
+    pub fn apply_absent_defaults(&mut self) {
+        if self.stream.is_none() {
+            self.stream = Some(true);
+        }
+        if self.raw.is_none() {
+            self.raw = Some(false);
+        }
+    }
+}
+
+impl ::serde::Serialize for OllamaGenerateRequest {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "model", &self.model)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "prompt", &self.prompt)?;
+        if let Some(v) = &self.suffix {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "suffix", v)?;
+        }
+        if let Some(v) = &self.system {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "system", v)?;
+        }
+        if let Some(v) = &self.template {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "template", v)?;
+        }
+        if let Some(v) = &self.context {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "context", v)?;
+        }
+        if let Some(v) = &self.stream {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "stream", v)?;
+        }
+        if let Some(v) = &self.raw {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "raw", v)?;
+        }
+        if let Some(v) = &self.format {
+            ::serde::ser::SerializeMap::serialize_entry(
+                &mut map,
+                "format",
+                &::serde_json::from_str::<::serde_json::Value>(v)
+                    .unwrap_or(::serde_json::Value::Null),
+            )?;
+        }
+        if let Some(v) = &self.options {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "options", v)?;
+        }
+        if let Some(v) = &self.keep_alive {
+            ::serde::ser::SerializeMap::serialize_entry(
+                &mut map,
+                "keep_alive",
+                &::serde_json::from_str::<::serde_json::Value>(v)
+                    .unwrap_or(::serde_json::Value::Null),
+            )?;
+        }
+        if let Some(v) = &self.images {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "images", v)?;
+        }
+        if let Some(v) = &self.think {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "think", v)?;
+        }
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for OllamaGenerateRequest {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = OllamaGenerateRequest;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct OllamaGenerateRequest")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_model = None;
+                let mut f_prompt = None;
+                let mut f_suffix = None;
+                let mut f_system = None;
+                let mut f_template = None;
+                let mut f_context = None;
+                let mut f_stream = None;
+                let mut f_raw = None;
+                let mut f_format = None;
+                let mut f_options = None;
+                let mut f_keep_alive = None;
+                let mut f_images = None;
+                let mut f_think = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "model" => {
+                            if f_model.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("model"));
+                            }
+                            f_model = Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        "prompt" => {
+                            if f_prompt.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("prompt"));
+                            }
+                            f_prompt = Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        "suffix" => {
+                            if f_suffix.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("suffix"));
+                            }
+                            f_suffix =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        "system" => {
+                            if f_system.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("system"));
+                            }
+                            f_system =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        "template" => {
+                            if f_template.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("template"));
+                            }
+                            f_template =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        "context" => {
+                            if f_context.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("context"));
+                            }
+                            f_context = Some(map.next_value::<Option<Int64List>>()?);
+                        }
+                        "stream" => {
+                            if f_stream.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("stream"));
+                            }
+                            f_stream = Some(Some(
+                                map.next_value::<Option<bool>>()?.unwrap_or_else(|| true),
+                            ));
+                        }
+                        "raw" => {
+                            if f_raw.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("raw"));
+                            }
+                            f_raw = Some(Some(
+                                map.next_value::<Option<bool>>()?.unwrap_or_else(|| false),
+                            ));
+                        }
+                        "format" => {
+                            if f_format.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("format"));
+                            }
+                            f_format = Some(
+                                map.next_value::<Option<::serde_json::Value>>()?
+                                    .map(|v| v.to_string()),
+                            );
+                        }
+                        "options" => {
+                            if f_options.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("options"));
+                            }
+                            f_options = Some(map.next_value::<Option<OllamaOptions>>()?);
+                        }
+                        "keep_alive" => {
+                            if f_keep_alive.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("keep_alive"));
+                            }
+                            f_keep_alive = Some(
+                                map.next_value::<Option<::serde_json::Value>>()?
+                                    .map(|v| v.to_string()),
+                            );
+                        }
+                        "images" => {
+                            if f_images.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("images"));
+                            }
+                            f_images = Some(map.next_value::<Option<StringList>>()?);
+                        }
+                        "think" => {
+                            if f_think.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("think"));
+                            }
+                            f_think = Some(map.next_value::<Option<bool>>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(OllamaGenerateRequest {
+                    model: f_model.unwrap_or_default(),
+                    prompt: f_prompt.unwrap_or_default(),
+                    suffix: f_suffix.flatten(),
+                    system: f_system.flatten(),
+                    template: f_template.flatten(),
+                    context: f_context.flatten(),
+                    stream: f_stream.unwrap_or_else(|| Some(true)),
+                    raw: f_raw.unwrap_or_else(|| Some(false)),
+                    format: f_format.flatten(),
+                    options: f_options.flatten(),
+                    keep_alive: f_keep_alive.flatten(),
+                    images: f_images.flatten(),
+                    think: f_think.flatten(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for OllamaGenerateResponse {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "model", &self.model)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "created_at", &self.created_at)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "response", &self.response)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "done", &self.done)?;
+        if let Some(v) = &self.done_reason {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "done_reason", v)?;
+        }
+        if let Some(v) = &self.context {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "context", v)?;
+        }
+        if let Some(v) = &self.total_duration {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "total_duration", v)?;
+        }
+        if let Some(v) = &self.load_duration {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "load_duration", v)?;
+        }
+        if let Some(v) = &self.prompt_eval_count {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "prompt_eval_count", v)?;
+        }
+        if let Some(v) = &self.prompt_eval_duration {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "prompt_eval_duration", v)?;
+        }
+        if let Some(v) = &self.eval_count {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "eval_count", v)?;
+        }
+        if let Some(v) = &self.eval_duration {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "eval_duration", v)?;
+        }
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for OllamaGenerateResponse {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = OllamaGenerateResponse;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct OllamaGenerateResponse")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_model = None;
+                let mut f_created_at = None;
+                let mut f_response = None;
+                let mut f_done = None;
+                let mut f_done_reason = None;
+                let mut f_context = None;
+                let mut f_total_duration = None;
+                let mut f_load_duration = None;
+                let mut f_prompt_eval_count = None;
+                let mut f_prompt_eval_duration = None;
+                let mut f_eval_count = None;
+                let mut f_eval_duration = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "model" => {
+                            if f_model.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("model"));
+                            }
+                            f_model = Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        "created_at" => {
+                            if f_created_at.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("created_at"));
+                            }
+                            f_created_at =
+                                Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        "response" => {
+                            if f_response.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("response"));
+                            }
+                            f_response = Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        "done" => {
+                            if f_done.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("done"));
+                            }
+                            f_done = Some(map.next_value::<bool>()?);
+                        }
+                        "done_reason" => {
+                            if f_done_reason.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("done_reason"));
+                            }
+                            f_done_reason =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        "context" => {
+                            if f_context.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("context"));
+                            }
+                            f_context = Some(map.next_value::<Option<Int64List>>()?);
+                        }
+                        "total_duration" => {
+                            if f_total_duration.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("total_duration"));
+                            }
+                            f_total_duration = Some(map.next_value::<Option<i64>>()?);
+                        }
+                        "load_duration" => {
+                            if f_load_duration.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("load_duration"));
+                            }
+                            f_load_duration = Some(map.next_value::<Option<i64>>()?);
+                        }
+                        "prompt_eval_count" => {
+                            if f_prompt_eval_count.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "prompt_eval_count",
+                                ));
+                            }
+                            f_prompt_eval_count = Some(map.next_value::<Option<i64>>()?);
+                        }
+                        "prompt_eval_duration" => {
+                            if f_prompt_eval_duration.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "prompt_eval_duration",
+                                ));
+                            }
+                            f_prompt_eval_duration = Some(map.next_value::<Option<i64>>()?);
+                        }
+                        "eval_count" => {
+                            if f_eval_count.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("eval_count"));
+                            }
+                            f_eval_count = Some(map.next_value::<Option<i64>>()?);
+                        }
+                        "eval_duration" => {
+                            if f_eval_duration.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("eval_duration"));
+                            }
+                            f_eval_duration = Some(map.next_value::<Option<i64>>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(OllamaGenerateResponse {
+                    model: f_model.unwrap_or_default(),
+                    created_at: f_created_at.unwrap_or_default(),
+                    response: f_response.unwrap_or_default(),
+                    done: f_done.unwrap_or_default(),
+                    done_reason: f_done_reason.flatten(),
+                    context: f_context.flatten(),
+                    total_duration: f_total_duration.flatten(),
+                    load_duration: f_load_duration.flatten(),
+                    prompt_eval_count: f_prompt_eval_count.flatten(),
+                    prompt_eval_duration: f_prompt_eval_duration.flatten(),
+                    eval_count: f_eval_count.flatten(),
+                    eval_duration: f_eval_duration.flatten(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for OllamaTagsRequest {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for OllamaTagsRequest {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = OllamaTagsRequest;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct OllamaTagsRequest")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(OllamaTagsRequest {})
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for OllamaTagsResponse {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        if !self.models.is_empty() {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "models", &self.models)?;
+        }
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for OllamaTagsResponse {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = OllamaTagsResponse;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct OllamaTagsResponse")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_models = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "models" => {
+                            if f_models.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("models"));
+                            }
+                            f_models = Some(
+                                map.next_value::<Option<Vec<OllamaModelInfo>>>()?
+                                    .unwrap_or_default(),
+                            );
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(OllamaTagsResponse {
+                    models: f_models.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for OllamaModelInfo {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "name", &self.name)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "model", &self.model)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "modified_at", &self.modified_at)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "size", &self.size)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "digest", &self.digest)?;
+        if let Some(v) = &self.details {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "details", v)?;
+        }
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for OllamaModelInfo {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = OllamaModelInfo;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct OllamaModelInfo")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_name = None;
+                let mut f_model = None;
+                let mut f_modified_at = None;
+                let mut f_size = None;
+                let mut f_digest = None;
+                let mut f_details = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "name" => {
+                            if f_name.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("name"));
+                            }
+                            f_name = Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        "model" => {
+                            if f_model.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("model"));
+                            }
+                            f_model = Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        "modified_at" => {
+                            if f_modified_at.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("modified_at"));
+                            }
+                            f_modified_at =
+                                Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        "size" => {
+                            if f_size.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("size"));
+                            }
+                            f_size = Some(map.next_value::<i64>()?);
+                        }
+                        "digest" => {
+                            if f_digest.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("digest"));
+                            }
+                            f_digest = Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        "details" => {
+                            if f_details.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("details"));
+                            }
+                            f_details = Some(map.next_value::<Option<OllamaModelDetails>>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(OllamaModelInfo {
+                    name: f_name.unwrap_or_default(),
+                    model: f_model.unwrap_or_default(),
+                    modified_at: f_modified_at.unwrap_or_default(),
+                    size: f_size.unwrap_or_default(),
+                    digest: f_digest.unwrap_or_default(),
+                    details: f_details.flatten(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for OllamaModelDetails {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        if let Some(v) = &self.parent_model {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "parent_model", v)?;
+        }
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "format", &self.format)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "family", &self.family)?;
+        if !self.families.is_empty() {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "families", &self.families)?;
+        }
+        ::serde::ser::SerializeMap::serialize_entry(
+            &mut map,
+            "parameter_size",
+            &self.parameter_size,
+        )?;
+        if let Some(v) = &self.quantization_level {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "quantization_level", v)?;
+        }
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for OllamaModelDetails {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = OllamaModelDetails;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct OllamaModelDetails")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_parent_model = None;
+                let mut f_format = None;
+                let mut f_family = None;
+                let mut f_families = None;
+                let mut f_parameter_size = None;
+                let mut f_quantization_level = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "parent_model" => {
+                            if f_parent_model.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("parent_model"));
+                            }
+                            f_parent_model =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        "format" => {
+                            if f_format.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("format"));
+                            }
+                            f_format = Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        "family" => {
+                            if f_family.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("family"));
+                            }
+                            f_family = Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        "families" => {
+                            if f_families.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("families"));
+                            }
+                            f_families = Some(
+                                map.next_value::<Option<Vec<::prost::alloc::string::String>>>()?
+                                    .unwrap_or_default(),
+                            );
+                        }
+                        "parameter_size" => {
+                            if f_parameter_size.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("parameter_size"));
+                            }
+                            f_parameter_size =
+                                Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        "quantization_level" => {
+                            if f_quantization_level.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "quantization_level",
+                                ));
+                            }
+                            f_quantization_level =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(OllamaModelDetails {
+                    parent_model: f_parent_model.flatten(),
+                    format: f_format.unwrap_or_default(),
+                    family: f_family.unwrap_or_default(),
+                    families: f_families.unwrap_or_default(),
+                    parameter_size: f_parameter_size.unwrap_or_default(),
+                    quantization_level: f_quantization_level.flatten(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for OllamaShowRequest {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "model", &self.model)?;
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for OllamaShowRequest {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = OllamaShowRequest;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct OllamaShowRequest")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_model = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "model" => {
+                            if f_model.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("model"));
+                            }
+                            f_model = Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(OllamaShowRequest {
+                    model: f_model.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for OllamaShowResponse {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "license", &self.license)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "modelfile", &self.modelfile)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "parameters", &self.parameters)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "template", &self.template)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "modified_at", &self.modified_at)?;
+        if let Some(v) = &self.details {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "details", v)?;
+        }
+        if let Some(v) = &self.model_info {
+            ::serde::ser::SerializeMap::serialize_entry(
+                &mut map,
+                "model_info",
+                &::serde_json::from_str::<::serde_json::Value>(v)
+                    .unwrap_or(::serde_json::Value::Null),
+            )?;
+        }
+        if !self.capabilities.is_empty() {
+            ::serde::ser::SerializeMap::serialize_entry(
+                &mut map,
+                "capabilities",
+                &self.capabilities,
+            )?;
+        }
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for OllamaShowResponse {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = OllamaShowResponse;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct OllamaShowResponse")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_license = None;
+                let mut f_modelfile = None;
+                let mut f_parameters = None;
+                let mut f_template = None;
+                let mut f_modified_at = None;
+                let mut f_details = None;
+                let mut f_model_info = None;
+                let mut f_capabilities = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "license" => {
+                            if f_license.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("license"));
+                            }
+                            f_license = Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        "modelfile" => {
+                            if f_modelfile.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("modelfile"));
+                            }
+                            f_modelfile = Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        "parameters" => {
+                            if f_parameters.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("parameters"));
+                            }
+                            f_parameters =
+                                Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        "template" => {
+                            if f_template.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("template"));
+                            }
+                            f_template = Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        "modified_at" => {
+                            if f_modified_at.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("modified_at"));
+                            }
+                            f_modified_at =
+                                Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        "details" => {
+                            if f_details.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("details"));
+                            }
+                            f_details = Some(map.next_value::<Option<OllamaModelDetails>>()?);
+                        }
+                        "model_info" => {
+                            if f_model_info.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("model_info"));
+                            }
+                            f_model_info = Some(
+                                map.next_value::<Option<::serde_json::Value>>()?
+                                    .map(|v| v.to_string()),
+                            );
+                        }
+                        "capabilities" => {
+                            if f_capabilities.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("capabilities"));
+                            }
+                            f_capabilities = Some(
+                                map.next_value::<Option<Vec<::prost::alloc::string::String>>>()?
+                                    .unwrap_or_default(),
+                            );
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(OllamaShowResponse {
+                    license: f_license.unwrap_or_default(),
+                    modelfile: f_modelfile.unwrap_or_default(),
+                    parameters: f_parameters.unwrap_or_default(),
+                    template: f_template.unwrap_or_default(),
+                    modified_at: f_modified_at.unwrap_or_default(),
+                    details: f_details.flatten(),
+                    model_info: f_model_info.flatten(),
+                    capabilities: f_capabilities.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
 impl ::serde::Serialize for ParseFunctionCallRequest {
     fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut map = serializer.serialize_map(None)?;

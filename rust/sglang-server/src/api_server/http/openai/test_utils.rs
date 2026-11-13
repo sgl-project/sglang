@@ -273,6 +273,11 @@ fn answering_app_state_built(
     })
 }
 
+/// The built-in chatml template, for tests that render a chat prompt.
+pub(crate) fn chatml_formatter() -> super::ChatFormatter {
+    sglang_processor::load_chat_formatter(None, None, None, Some("chatml")).unwrap()
+}
+
 /// Serve one request through the full router (extractors, auth, routing).
 /// `with_state` consumes the state into a `Router<()>`, which is what
 /// implements `tower::Service`.

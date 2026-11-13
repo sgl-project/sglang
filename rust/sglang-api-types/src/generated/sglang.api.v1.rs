@@ -1166,6 +1166,220 @@ pub struct HiCacheStorageResponse {
     #[prost(string, tag = "2")]
     pub message: ::prost::alloc::string::String,
 }
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct OllamaMessage {
+    #[prost(string, tag = "1")]
+    pub role: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub content: ::prost::alloc::string::String,
+    /// Base64 images; accepted and not rendered.
+    #[prost(message, optional, tag = "3")]
+    pub images: ::core::option::Option<StringList>,
+}
+/// The Ollama `options` keys SGLang maps onto its sampling params; any other
+/// key is ignored, as Python's `_convert_options_to_sampling_params` does.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OllamaOptions {
+    #[prost(double, optional, tag = "1")]
+    pub temperature: ::core::option::Option<f64>,
+    #[prost(double, optional, tag = "2")]
+    pub top_p: ::core::option::Option<f64>,
+    #[prost(int64, optional, tag = "3")]
+    pub top_k: ::core::option::Option<i64>,
+    /// `max_new_tokens`; defaults to 2048 when absent (Ollama answers run long).
+    #[prost(int64, optional, tag = "4")]
+    pub num_predict: ::core::option::Option<i64>,
+    #[prost(message, optional, tag = "5")]
+    pub stop: ::core::option::Option<StringOrList>,
+    #[prost(double, optional, tag = "6")]
+    pub presence_penalty: ::core::option::Option<f64>,
+    #[prost(double, optional, tag = "7")]
+    pub frequency_penalty: ::core::option::Option<f64>,
+    /// `sampling_seed`.
+    #[prost(int64, optional, tag = "8")]
+    pub seed: ::core::option::Option<i64>,
+}
+/// `POST /api/chat`.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OllamaChatRequest {
+    #[prost(string, tag = "1")]
+    pub model: ::prost::alloc::string::String,
+    #[prost(message, repeated, tag = "2")]
+    pub messages: ::prost::alloc::vec::Vec<OllamaMessage>,
+    #[prost(bool, optional, tag = "3")]
+    pub stream: ::core::option::Option<bool>,
+    /// "json" or a JSON schema; accepted and ignored.
+    #[prost(string, optional, tag = "4")]
+    pub format: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, optional, tag = "5")]
+    pub options: ::core::option::Option<OllamaOptions>,
+    /// Seconds or a duration string; accepted and ignored (no model unloading).
+    #[prost(string, optional, tag = "6")]
+    pub keep_alive: ::core::option::Option<::prost::alloc::string::String>,
+    /// Bool or "low" | "medium" | "high"; accepted and ignored.
+    #[prost(string, optional, tag = "7")]
+    pub think: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// One `/api/chat` frame. Unary: the whole answer with `done` set and the
+/// counters filled. Streamed: a delta per frame, then a `done` frame whose
+/// counters are filled (Python leaves them out; the Ollama API fills them).
+/// Durations are nanoseconds, as Ollama reports them.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct OllamaChatResponse {
+    #[prost(string, tag = "1")]
+    pub model: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub created_at: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "3")]
+    pub message: ::core::option::Option<OllamaMessage>,
+    #[prost(bool, tag = "4")]
+    pub done: bool,
+    #[prost(string, optional, tag = "5")]
+    pub done_reason: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(int64, optional, tag = "6")]
+    pub total_duration: ::core::option::Option<i64>,
+    #[prost(int64, optional, tag = "7")]
+    pub load_duration: ::core::option::Option<i64>,
+    #[prost(int64, optional, tag = "8")]
+    pub prompt_eval_count: ::core::option::Option<i64>,
+    #[prost(int64, optional, tag = "9")]
+    pub prompt_eval_duration: ::core::option::Option<i64>,
+    #[prost(int64, optional, tag = "10")]
+    pub eval_count: ::core::option::Option<i64>,
+    #[prost(int64, optional, tag = "11")]
+    pub eval_duration: ::core::option::Option<i64>,
+}
+/// `POST /api/generate`. `prompt` is sent raw; `system` is prepended with a
+/// blank line. `suffix`, `template`, `context`, `raw`, `format`, `images`,
+/// `keep_alive`, and `think` are accepted and ignored, as in Python.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OllamaGenerateRequest {
+    #[prost(string, tag = "1")]
+    pub model: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub prompt: ::prost::alloc::string::String,
+    #[prost(string, optional, tag = "3")]
+    pub suffix: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "4")]
+    pub system: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "5")]
+    pub template: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, optional, tag = "6")]
+    pub context: ::core::option::Option<Int64List>,
+    #[prost(bool, optional, tag = "7")]
+    pub stream: ::core::option::Option<bool>,
+    #[prost(bool, optional, tag = "8")]
+    pub raw: ::core::option::Option<bool>,
+    #[prost(string, optional, tag = "9")]
+    pub format: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, optional, tag = "10")]
+    pub options: ::core::option::Option<OllamaOptions>,
+    #[prost(string, optional, tag = "11")]
+    pub keep_alive: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, optional, tag = "12")]
+    pub images: ::core::option::Option<StringList>,
+    #[prost(bool, optional, tag = "13")]
+    pub think: ::core::option::Option<bool>,
+}
+/// One `/api/generate` frame; the same unary / streamed contract as
+/// OllamaChatResponse. `context` is never filled (no conversation encoding).
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct OllamaGenerateResponse {
+    #[prost(string, tag = "1")]
+    pub model: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub created_at: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub response: ::prost::alloc::string::String,
+    #[prost(bool, tag = "4")]
+    pub done: bool,
+    #[prost(string, optional, tag = "5")]
+    pub done_reason: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, optional, tag = "6")]
+    pub context: ::core::option::Option<Int64List>,
+    #[prost(int64, optional, tag = "7")]
+    pub total_duration: ::core::option::Option<i64>,
+    #[prost(int64, optional, tag = "8")]
+    pub load_duration: ::core::option::Option<i64>,
+    #[prost(int64, optional, tag = "9")]
+    pub prompt_eval_count: ::core::option::Option<i64>,
+    #[prost(int64, optional, tag = "10")]
+    pub prompt_eval_duration: ::core::option::Option<i64>,
+    #[prost(int64, optional, tag = "11")]
+    pub eval_count: ::core::option::Option<i64>,
+    #[prost(int64, optional, tag = "12")]
+    pub eval_duration: ::core::option::Option<i64>,
+}
+/// `GET /api/tags`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct OllamaTagsRequest {}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct OllamaTagsResponse {
+    #[prost(message, repeated, tag = "1")]
+    pub models: ::prost::alloc::vec::Vec<OllamaModelInfo>,
+}
+/// One served model as an Ollama model card: SGLang has no model files, so
+/// `size` is 0 and `digest` a fixed placeholder.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct OllamaModelInfo {
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub model: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub modified_at: ::prost::alloc::string::String,
+    #[prost(int64, tag = "4")]
+    pub size: i64,
+    #[prost(string, tag = "5")]
+    pub digest: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "6")]
+    pub details: ::core::option::Option<OllamaModelDetails>,
+}
+/// Ollama's `details` block. `/api/tags` fills format, family, and
+/// parameter_size; `/api/show` fills every field.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct OllamaModelDetails {
+    #[prost(string, optional, tag = "1")]
+    pub parent_model: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, tag = "2")]
+    pub format: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub family: ::prost::alloc::string::String,
+    #[prost(string, repeated, tag = "4")]
+    pub families: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(string, tag = "5")]
+    pub parameter_size: ::prost::alloc::string::String,
+    #[prost(string, optional, tag = "6")]
+    pub quantization_level: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// `POST /api/show`.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct OllamaShowRequest {
+    #[prost(string, tag = "1")]
+    pub model: ::prost::alloc::string::String,
+}
+/// A model card synthesized from the model name and context length.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct OllamaShowResponse {
+    #[prost(string, tag = "1")]
+    pub license: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub modelfile: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub parameters: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub template: ::prost::alloc::string::String,
+    #[prost(string, tag = "5")]
+    pub modified_at: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "6")]
+    pub details: ::core::option::Option<OllamaModelDetails>,
+    /// Ollama's GGUF-style metadata; its keys are prefixed with the model
+    /// family (`<family>.context_length`), so it is an open object.
+    #[prost(string, optional, tag = "7")]
+    pub model_info: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, repeated, tag = "8")]
+    pub capabilities: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+}
 /// `/parse_function_call`.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ParseFunctionCallRequest {
