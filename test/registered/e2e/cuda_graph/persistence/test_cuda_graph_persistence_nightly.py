@@ -25,6 +25,8 @@ class TestFoundryGraphPersistenceSpecPrefillNoPins(
     e2e.TestFoundryGraphPersistenceSpecPrefill
 ):
     engine_env = {}
+    # Without the pinned-buffer registration the per-shape prep is slower.
+    load_graph_s = 14.0
 
 
 if __name__ == "__main__":
