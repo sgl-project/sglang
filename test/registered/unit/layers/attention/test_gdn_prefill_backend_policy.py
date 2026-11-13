@@ -15,7 +15,12 @@ from sglang.srt.layers.attention.linear.gdn_backend import (
     flashinfer_gdn_prefill_default,
     validate_gdn_mis_backend,
 )
+from sglang.srt.layers.attention.linear.gdn_prefill_graph import (
+    GDNPrefillGraphMetadata,
+)
+from sglang.srt.layers.attention.linear.kda_prefill_graph import KDAPrefillTrackRows
 from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
+    FlashInferGDNKernel,
     maybe_build_flashinfer_checkpoint_plan,
 )
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
@@ -25,6 +30,9 @@ from sglang.srt.layers.attention.linear.utils import (
 )
 from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
 from sglang.srt.model_executor.forward_mode import ForwardMode
+from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
+    set_external_prefill_body,
+)
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -88,21 +96,41 @@ def make_runner(
 
 class TestGDNPrefillGraphExtend(CustomTestCase):
     @contextmanager
-    def _setup(self, *, cuda=True, enable_mis=False, draft=False):
+    def _setup(
+        self,
+        *,
+        cuda=True,
+        enable_mis=False,
+        draft=False,
+        kernel=TritonGDNKernel,
+        temporal=None,
+        capability=(10, 0),
+        extra_buffer=False,
+        cache_chunk=64,
+        external_body=True,
+    ):
         """A target's GDN backend on a setup the graph-safe chain supports, unless
-        cuda, enable_mis or draft say otherwise."""
+        the arguments say otherwise."""
         backend = GDNAttnBackend.__new__(GDNAttnBackend)
         backend.is_draft_worker = draft
         backend.enable_mis = enable_mis
         backend._mamba_chunk_size = 64
         backend.kernel_dispatcher = SimpleNamespace(
-            extend_kernel=TritonGDNKernel.__new__(TritonGDNKernel)
+            extend_kernel=kernel.__new__(kernel)
         )
-        cache = SimpleNamespace(conv=[torch.zeros(2, 3)], temporal=torch.zeros(2, 3))
+        temporal = torch.zeros(2, 3) if temporal is None else temporal
+        cache = SimpleNamespace(conv=[torch.zeros(2, 3)], temporal=temporal)
         backend.state_pool = SimpleNamespace(mamba_cache=cache)
+        backend.req_to_token_pool = SimpleNamespace(size=64)
+        backend.prefill_graph_max_seqs = 64
+        backend.device = "cpu"
+        backend._model_runner = SimpleNamespace(model=torch.nn.Module())
+        if external_body:
+            set_external_prefill_body(backend._model_runner.model)
         graph = SimpleNamespace(
             cuda_graph_config=SimpleNamespace(prefill=SimpleNamespace(bs=[512]))
         )
+        mamba = SimpleNamespace(enable_mamba_extra_buffer=extra_buffer)
         with (
             patch.object(gdn_backend, "is_cuda", return_value=cuda),
             patch.object(gdn_backend, "FLA_CHUNK_SIZE", 64, create=True),
@@ -110,7 +138,18 @@ class TestGDNPrefillGraphExtend(CustomTestCase):
                 gdn_backend, "buckets_keep_chunk_o_block_size", return_value=True
             ),
             patch.object(
-                gdn_backend, "get_exec", return_value=SimpleNamespace(graph=graph)
+                gdn_backend,
+                "get_exec",
+                return_value=SimpleNamespace(graph=graph, mamba=mamba),
+            ),
+            patch.object(
+                gdn_backend, "mamba_cache_chunk_size", return_value=cache_chunk
+            ),
+            patch.object(torch.cuda, "get_device_capability", return_value=capability),
+            patch.object(
+                torch.cuda,
+                "get_device_properties",
+                return_value=SimpleNamespace(multi_processor_count=148),
             ),
             patch(
                 "sglang.srt.model_executor.runner.prefill_cuda_graph_runner."
@@ -137,6 +176,105 @@ class TestGDNPrefillGraphExtend(CustomTestCase):
                 self._setup(**setup) as backend,
             ):
                 self.assertEqual(backend.supports_prefill_graph_extend(), captured)
+
+    def test_flashinfer_tables_are_built_only_for_an_external_body(self):
+        """With the FlashInfer prefill kernel the GDN layers keep breaking unless
+        SGLANG_OPT_GDN_PREFILL_GRAPH_FLASHINFER is on and an external prefill body
+        runs the core; then the tables are built on SM10x with a bf16 state pool
+        and a 64-token cache chunk, for up to
+        SGLANG_GDN_PREFILL_GRAPH_FLASHINFER_MAX_SEQS sequences."""
+        bf16 = torch.zeros(1, 2, 4, 8, 8, dtype=torch.bfloat16)
+        for switch, setup, captured in (
+            (False, {}, False),
+            (True, {}, True),
+            (True, dict(external_body=False), False),
+            (True, dict(extra_buffer=True), True),
+            (True, dict(extra_buffer=True, cache_chunk=256), False),
+            (True, dict(capability=(9, 0)), False),
+            (True, dict(temporal=bf16.float()), False),
+            (True, dict(cuda=False), False),
+            (True, dict(draft=True), False),
+        ):
+            with (
+                self.subTest(switch=switch, **setup),
+                envs.SGLANG_ENABLE_GDN_PREFILL_GRAPH_EXTEND.override(True),
+                envs.SGLANG_OPT_GDN_PREFILL_GRAPH_FLASHINFER.override(switch),
+                self._setup(
+                    **{"kernel": FlashInferGDNKernel, "temporal": bf16, **setup}
+                ) as backend,
+            ):
+                self.assertEqual(backend.supports_prefill_graph_extend(), captured)
+                self.assertEqual(backend.prefill_graph_flashinfer, captured)
+                self.assertEqual(backend.prefill_graph_max_seqs, 8 if captured else 64)
+                self.assertTrue(backend._fi_graph_cp_single)
+
+    def test_flashinfer_tables_skip_the_cp_call_with_many_heads(self):
+        """FlashInfer takes its CP kernel only while heads x 4 < SMs, so with 64
+        heads a one-sequence batch goes to the non-CP tables too."""
+        temporal = torch.zeros(1, 2, 64, 8, 8, dtype=torch.bfloat16)
+        with (
+            envs.SGLANG_ENABLE_GDN_PREFILL_GRAPH_EXTEND.override(True),
+            envs.SGLANG_OPT_GDN_PREFILL_GRAPH_FLASHINFER.override(True),
+            envs.SGLANG_GDN_PREFILL_GRAPH_FLASHINFER_MAX_SEQS.override(3),
+            self._setup(kernel=FlashInferGDNKernel, temporal=temporal) as backend,
+        ):
+            self.assertTrue(backend.supports_prefill_graph_extend())
+            self.assertFalse(backend._fi_graph_cp_single)
+            self.assertEqual(backend.prefill_graph_max_seqs, 3)
+
+    def test_flashinfer_tables_split_cp_and_non_cp_batches(self):
+        """A one-sequence batch fills only the CP tables, any other batch the
+        non-CP ones; prefix-cache snapshots read the 64-token checkpoints, or the
+        initial state for a chunk-0 snapshot."""
+
+        def fill(meta, lens, slots, track_rows=None):
+            with patch.object(torch.Tensor, "pin_memory", lambda t: t):
+                meta.fill(
+                    extend_seq_lens=lens,
+                    cache_indices=torch.tensor(slots, dtype=torch.int32),
+                    extend_prefix_lens=torch.zeros(len(lens), dtype=torch.int64),
+                    track_rows=track_rows,
+                )
+            return meta.flashinfer
+
+        def allocate(cp_single):
+            return GDNPrefillGraphMetadata.allocate(
+                num_tokens=256,
+                max_seqs_cap=4,
+                track=True,
+                cache_index_dtype=torch.int32,
+                device=torch.device("cpu"),
+                flashinfer=True,
+                flashinfer_cp_single=cp_single,
+            )
+
+        tables = fill(allocate(cp_single=True), [130], [5])
+        self.assertEqual(tables.cp_cu_seqlens.tolist(), [0, 130])
+        self.assertEqual(tables.cp_checkpoint_cu.tolist(), [0, 2])
+        self.assertEqual(tables.cp_state_indices.tolist(), [5])
+        self.assertEqual(tables.ncp_cu_seqlens.tolist(), [0] * 5)
+        self.assertEqual(tables.ncp_state_indices.tolist(), [0] * 4)
+
+        tables = fill(allocate(cp_single=False), [130], [5])
+        self.assertEqual(tables.cp_cu_seqlens.tolist(), [0, 0])
+        self.assertEqual(tables.ncp_cu_seqlens.tolist(), [0, 130, 130, 130, 130])
+        self.assertEqual(tables.ncp_state_indices.tolist(), [5, 0, 0, 0])
+
+        track_rows = KDAPrefillTrackRows(
+            chunk_rows=[(0, 0), (2, 2)],
+            final_rows=[1],
+            conv_rows=[],
+            conv_len=3,
+            dst=torch.tensor([9, 10, 11]),
+        )
+        tables = fill(allocate(cp_single=True), [64, 10, 129], [3, -1, 7], track_rows)
+        self.assertEqual(tables.cp_cu_seqlens.tolist(), [0, 0])
+        self.assertEqual(tables.ncp_cu_seqlens.tolist(), [0, 64, 74, 203, 203])
+        self.assertEqual(tables.ncp_checkpoint_cu.tolist(), [0, 1, 1, 3, 3])
+        self.assertEqual(tables.ncp_state_indices.tolist(), [3, 0, 7, 0])
+        self.assertEqual(tables.pre_track_mode.tolist(), [1, 0, 0, 0])
+        self.assertEqual(tables.track_mode.tolist(), [0, 1, 2, 0])
+        self.assertEqual(tables.track_h_row.tolist(), [0, 0, 2, 0])
 
 
 class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):
