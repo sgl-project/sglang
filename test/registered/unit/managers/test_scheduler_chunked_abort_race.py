@@ -24,12 +24,17 @@ from sglang.srt.disaggregation.common.conn import (  # noqa: E402
     CommonKVSender,
 )
 from sglang.srt.disaggregation.mode import DisaggregationMode  # noqa: E402
+from sglang.srt.managers.io_struct import AbortReq  # noqa: E402
 from sglang.srt.managers.req_types import FINISH_ABORT  # noqa: E402
 from sglang.srt.managers.schedule_batch import Req  # noqa: E402
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
 from sglang.srt.managers.scheduler_components import (  # noqa: E402
     request_retirer as retirer_mod,
 )
+from sglang.srt.managers.scheduler_components.pause_state import (  # noqa: E402
+    PauseState,
+)
+from sglang.srt.managers.scheduler_components.request_list import move  # noqa: E402
 from sglang.test.scheduler_test_utils import FakeReq, empty_request_lists  # noqa: E402
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
@@ -67,7 +72,8 @@ def _make_scheduler(pending_req, *, chunked_req, running_reqs) -> Scheduler:
     empty_request_lists(sched)
     sched.enable_continuous_input_polling = False
     sched.result_queue = deque()
-    sched.chunked_req = chunked_req
+    if chunked_req is not None:
+        move([chunked_req], sched.chunked_reqs)
     sched._pending_chunked_abort_req = pending_req
     sched.disaggregation_mode = None
     sched.enable_hicache_storage = False
@@ -148,6 +154,56 @@ class TestPendingChunkedAbortRace(CustomTestCase):
             sched.process_pending_chunked_abort()
 
         self.assertEqual(calls, [("hisparse", req), ("kv", req)])
+
+
+class TestPPPrefillLoopAppliesChunkedAbort(CustomTestCase):
+    def setUp(self):
+        enter_scope(self, published_topology(pp_size=2))
+
+    def test_abort_clears_chunked_slot_before_admission(self):
+        req = _FakeReq("chunked")
+        req.disagg_kv_sender = None
+        req.metadata_buffer_index = -1
+        sched = _make_scheduler(None, chunked_req=req, running_reqs=[])
+        sched.disaggregation_mode = DisaggregationMode.PREFILL
+        sched.req_to_metadata_buffer_idx_allocator = Mock()
+        sched.init_pp_loop_state = Mock()
+        sched.pp_loop_size = 1
+        sched.pause_state = PauseState()
+        sched.pp_group = SimpleNamespace(is_last_rank=True)
+        sched.mbs = [None]
+        sched.running_mbs = [SimpleNamespace(reqs=[])]
+        sched.last_mbs = [None]
+        sched.process_bootstrapped_queue = Mock()
+        sched._pp_pd_get_prefill_transferred_ids = Mock(return_value={})
+        sched._pp_commit_comm_work = Mock()
+        sched.process_prefill_chunk = Mock()
+        sched._process_hicache_events = Mock()
+
+        def ingest(stop_at_pause):
+            sched.abort_request(AbortReq(rid=req.rid))
+            return []
+
+        sched.ingest_requests = ingest
+        chunked_at_admission = []
+
+        def admit(running_batch):
+            chunked_at_admission.append(sched.chunked_req)
+            # Stop the infinite loop at admission.
+            raise StopIteration
+
+        sched.get_new_batch_prefill = admit
+
+        with (
+            patch.object(sched.request_retirer, "_detach"),
+            patch.object(retirer_mod, "release_kv_cache"),
+            self.assertRaises(StopIteration),
+        ):
+            Scheduler.event_loop_pp_disagg_prefill(sched)
+
+        self.assertEqual(chunked_at_admission, [None])
+        self.assertIsInstance(req.finished_reason, FINISH_ABORT)
+        self.assertIsNone(sched._pending_chunked_abort_req)
 
 
 class _SendBookkeeping(CommonKVManager):
