@@ -1044,6 +1044,37 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
     def resolve_quant_algo(self, prefix: str) -> Optional[str]:
         return self._resolve_quant_algo(prefix)
 
+    def can_fuse_shared_expert(self) -> bool:
+        # Fusion puts shared and routed experts in the same packed buffers.
+        # MIXED_PRECISION can leave shared experts in BF16 beside NVFP4 experts.
+        def algo(prefix: str, *, linear: bool = False) -> Optional[str]:
+            if self.is_layer_excluded(prefix) or (
+                linear
+                and is_layer_skipped(
+                    prefix, self.exclude_modules, self.packed_modules_mapping or {}
+                )
+            ):
+                return None
+            return self._resolve_quant_algo(prefix)
+
+        layers = {
+            key.split(".mlp.", 1)[0]
+            for key in self.quantized_layers
+            if ".mlp.experts" in key or ".mlp.shared_expert" in key
+        }
+        for layer in layers:
+            routed = algo(f"{layer}.mlp.experts")
+            shared = f"{layer}.mlp.shared_expert"
+            if not any(
+                key == shared or key.startswith(shared + ".")
+                for key in self.quantized_layers
+            ):
+                shared += "s"
+            for proj in ("gate_up_proj", "down_proj"):
+                if algo(f"{shared}.{proj}", linear=True) != routed:
+                    return False
+        return True
+
     def convert_block_fp8_experts_to_nvfp4(self) -> None:
         """Quantize block-FP8 MoE experts to NVFP4 while they load.
 
