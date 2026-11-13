@@ -951,16 +951,27 @@ def write_memfabric_tent_conf(path="/tmp/memfabric_tent.json"):
     return path
 
 
-def get_mooncake_ld_library_path():
-    """Build LD_LIBRARY_PATH for Mooncake/MemFabric shared libraries."""
-    paths = []
-    for module_name, lib_subdir in (("memfabric_hybrid", "lib"), ("mooncake", None)):
+def append_ld_library_path(*module_specs):
+    """Build ``LD_LIBRARY_PATH`` with the given modules' library dirs first.
+
+    Each spec is ``(module_name, lib_subdir)``. ``lib_subdir`` is joined under
+    the package directory when given (e.g. ``"lib"`` for ``memfabric_hybrid``);
+    otherwise the package directory itself is used. The new directories go
+    first so they win over stale copies already on the path, and missing
+    modules are skipped.
+
+    Returns:
+        str: The resulting ``LD_LIBRARY_PATH`` value.
+    """
+    entries = [p for p in os.environ.get("LD_LIBRARY_PATH", "").split(":") if p]
+    new_entries = []
+    for module_name, lib_subdir in module_specs:
         spec = importlib.util.find_spec(module_name)
         if spec is None or spec.origin is None:
+            logger.warning(f"Module {module_name} not found, skip LD_LIBRARY_PATH")
             continue
-        pkg_dir = pathlib.Path(spec.origin).parent
-        paths.append(str(pkg_dir / lib_subdir) if lib_subdir else str(pkg_dir))
-    existing = os.environ.get("LD_LIBRARY_PATH")
-    if existing:
-        paths.append(existing)
-    return ":".join(paths)
+        lib_dir = pathlib.Path(spec.origin).parent
+        if lib_subdir:
+            lib_dir = lib_dir / lib_subdir
+        new_entries.append(str(lib_dir))
+    return ":".join(dict.fromkeys([*new_entries, *entries]))

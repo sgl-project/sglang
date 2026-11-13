@@ -1,3 +1,4 @@
+import importlib.util
 import unittest
 
 from sglang.test.ascend.e2e.test_npu_accuracy_utils import (
@@ -9,7 +10,7 @@ from sglang.test.ascend.e2e.test_npu_performance_utils import (
     run_bench_serving,
 )
 from sglang.test.ascend.test_ascend_utils import (
-    get_mooncake_ld_library_path,
+    append_ld_library_path,
     write_memfabric_tent_conf,
 )
 from sglang.test.ci.ci_register import register_npu_ci
@@ -19,6 +20,17 @@ register_npu_ci(
     suite="",
     nightly=True,
 )
+
+MOONCAKE_INSTALLED = importlib.util.find_spec("mooncake") is not None
+DISAGGREGATION_TRANSFER_BACKEND = "mooncake" if MOONCAKE_INSTALLED else "ascend"
+
+# Mooncake + TENT + MemFabric, only used when the Mooncake package is present.
+MOONCAKE_ENVS = {
+    "MC_USE_TENT": "1",
+    "MF_PROTOCOL": "device_sdma",
+    "MF_TRANSFER_TIMEOUT": "10000",
+    "ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE": "true",
+}
 
 DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_COMMON_ENVS = {
     "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
@@ -52,11 +64,6 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_COMMON_ENVS = {
     "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT": "1800",
     "SGLANG_DISAGGREGATION_WAITING_TIMEOUT": "1800",
     "SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER": "1",
-    # Mooncake + TENT + MemFabric
-    "MC_USE_TENT": "1",
-    "MF_PROTOCOL": "device_sdma",
-    "MF_TRANSFER_TIMEOUT": "10000",
-    "ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE": "true",
 }
 
 # Prefill node environment variables for DSV4-Flash-0731 PD-Sep deployment.
@@ -106,7 +113,7 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ARGS = [
     "--disaggregation-mode",
     "prefill",
     "--disaggregation-transfer-backend",
-    "mooncake",
+    DISAGGREGATION_TRANSFER_BACKEND,
     "--mem-fraction-static",
     0.62,
     "--prefill-max-requests",
@@ -168,7 +175,7 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_DECODE_ARGS = [
     "--disaggregation-mode",
     "decode",
     "--disaggregation-transfer-backend",
-    "mooncake",
+    DISAGGREGATION_TRANSFER_BACKEND,
     "--max-running-requests",
     256,
     "--dp-size",
@@ -185,6 +192,8 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_DECODE_ARGS = [
     "bfloat16",
     "--load-balance-method",
     "round_robin",
+    # Temporarily disable decode CUDA graph.
+    "--disable-cuda-graph",
     "--cuda-graph-bs-decode",
     1,
     2,
@@ -237,12 +246,13 @@ class TestNPUDeepSeekV4Flash0731W8A8PDSEPGPQAHigh(
 
     @classmethod
     def setUpClass(cls):
-        tent_conf_path = write_memfabric_tent_conf()
-        common_envs = {
-            **DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_COMMON_ENVS,
-            "MC_TENT_CONF": tent_conf_path,
-            "LD_LIBRARY_PATH": get_mooncake_ld_library_path(),
-        }
+        common_envs = dict(DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_COMMON_ENVS)
+        if MOONCAKE_INSTALLED:
+            common_envs.update(MOONCAKE_ENVS)
+            common_envs["MC_TENT_CONF"] = write_memfabric_tent_conf()
+            common_envs["LD_LIBRARY_PATH"] = append_ld_library_path(
+                ("memfabric_hybrid", "lib"), ("mooncake", None)
+            )
         cls.model_config = {
             "model_path": DEEPSEEK_V4_FLASH_0731_W8A8_MODEL_PATH,
             "prefill_args": list(DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ARGS),
