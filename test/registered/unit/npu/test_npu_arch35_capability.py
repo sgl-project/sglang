@@ -10,6 +10,9 @@ from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 
 
 class TestArch35Capability(unittest.TestCase):
+    def setUp(self):
+        is_npu_arch35.cache_clear()
+
     def tearDown(self):
         is_npu_arch35.cache_clear()
 
