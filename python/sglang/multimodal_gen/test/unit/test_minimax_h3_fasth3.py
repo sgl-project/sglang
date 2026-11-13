@@ -18,10 +18,6 @@ from sglang.multimodal_gen.registry import (
     get_model_info,
     get_non_diffusers_pipeline_name,
 )
-from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-    maybe_init_distributed_environment_and_model_parallel,
-    model_parallel_is_initialized,
-)
 from sglang.multimodal_gen.runtime.layers.linear import UnquantizedLinearMethod
 from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8Config
 from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import MiniMaxH3DiTModel
@@ -31,19 +27,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.time_request import (
     minimax_h3_time_shift_sigmas,
 )
-from sglang.multimodal_gen.test.single_test_file.component_accuracy.utils import (
-    ensure_distributed_env_defaults,
-)
 
 FASTH3_MODEL_ID = "FastVideo/FastVideo-FastH3-8-Step-V2"
 DMD_STEPS = (999, 874, 749, 624, 500, 375, 250, 125)
-
-
-def _ensure_single_process_parallel_runtime() -> None:
-    if model_parallel_is_initialized():
-        return
-    ensure_distributed_env_defaults()
-    maybe_init_distributed_environment_and_model_parallel(tp_size=1, sp_size=1)
 
 
 def test_registry_resolves_fasth3_configs() -> None:
@@ -167,8 +153,8 @@ def test_fasth3_lora_bundle_is_rejected_loudly() -> None:
         MiniMaxH3DiTModel.prepare_lora_adapter(model, bundle)
 
 
+@pytest.mark.usefixtures("single_process_model_parallel")
 def test_fasth3_gates_stay_bf16_under_runtime_quantization() -> None:
-    _ensure_single_process_parallel_runtime()
     with torch.device("meta"):
         model = MiniMaxH3DiTModel(
             config=FastH3PipelineConfig().dit_config,
