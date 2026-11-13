@@ -249,6 +249,7 @@ OTHER_SUITES = {
         "weekly-test-4-gpu-b200",
         "weekly-test-8-gpu-h200",
         "weekly-test-8-gpu-b200",
+        "weekly-test-8-gpu-b300",
     ],
 }
 
