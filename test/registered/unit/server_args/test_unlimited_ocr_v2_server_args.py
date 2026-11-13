@@ -83,9 +83,11 @@ class TestUnsupportedServingModes(CustomTestCase):
         split = dict(uocr_doc_split=True, uocr_max_page_tokens=8000)
         # 16 GB Mac (12,124 MiB working-set limit) -> 2 windows of 15,168 tokens.
         self.assertEqual(pool(**split), 2 * 15168)
-        # 20 GiB adds one window per 2 GiB above that limit; 48 GiB hits the cap.
+        # 20 GiB adds one window per 2 GiB above the M5 limit; 48 GiB hits the cap.
         self.assertEqual(pool(mem_mib=20 * 1024, **split), 6 * 15168)
         self.assertEqual(pool(mem_mib=48 * 1024, **split), 8 * 15168)
+        # 16 GB Macs that report less, such as an M1 (10,922 MiB), still get two.
+        self.assertEqual(pool(mem_mib=10922, **split), 2 * 15168)
         self.assertEqual(pool(mem_mib=8 * 1024, **split), 15168)
         # The per-window slack is one prefill chunk, so a larger chunk widens it.
         self.assertEqual(pool(chunked_prefill_size=4096, **split), 2 * (15168 + 2048))

@@ -98,18 +98,19 @@ def _unlimited_ocr_v2_overrides(server_args: Any, hf_config: Any) -> dict:
     return overrides
 
 
-# Measured on a 16 GB M5 only: two windows at its working-set limit, one below;
-# each further 2 GiB, about twice a window's KV, adds one.
+# Two windows from 10 GiB, covering 16 GB Macs below the measured M5 (an M1 reports
+# 10,922 MiB); each 2 GiB above the M5, about twice a window's KV, adds one.
+_MPS_TWO_WINDOW_MIN_MIB = 10 * 1024
 _MPS_MEASURED_LIMIT_MIB = 12124
 _MPS_MIB_PER_EXTRA_WINDOW = 2 * 1024
 _MPS_MAX_DEFAULT_WINDOWS = 8
 
 
 def _mps_window_budget(gpu_mem_mib: Optional[float]) -> int:
-    if gpu_mem_mib is None or gpu_mem_mib < _MPS_MEASURED_LIMIT_MIB:
+    if gpu_mem_mib is None or gpu_mem_mib < _MPS_TWO_WINDOW_MIN_MIB:
         return 1
-    extra = int(gpu_mem_mib - _MPS_MEASURED_LIMIT_MIB) // _MPS_MIB_PER_EXTRA_WINDOW
-    return min(2 + extra, _MPS_MAX_DEFAULT_WINDOWS)
+    extra = max(0, int(gpu_mem_mib) - _MPS_MEASURED_LIMIT_MIB)
+    return min(2 + extra // _MPS_MIB_PER_EXTRA_WINDOW, _MPS_MAX_DEFAULT_WINDOWS)
 
 
 def mps_window_tokens(
