@@ -929,7 +929,6 @@ def resolve_local_ip():
     host_ip = os.getenv("POD_IP")
     if host_ip:
         return host_ip
-    logger.info("POD_IP is not set, using the loopback address (single-machine case)")
     return "127.0.0.1"
 
 
