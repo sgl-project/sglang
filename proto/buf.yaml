@@ -1,0 +1,15 @@
+version: v2
+name: buf.build/sgl-project/sglang
+lint:
+  use:
+    - STANDARD
+  except:
+    # Existing wire schemas use domain-specific response/stream names
+    # (e.g., GenerateStreamItem, HiCacheStatus) and shared response messages.
+    - ENUM_ZERO_VALUE_SUFFIX
+    - RPC_REQUEST_RESPONSE_UNIQUE
+    - RPC_REQUEST_STANDARD_NAME
+    - RPC_RESPONSE_STANDARD_NAME
+breaking:
+  use:
+    - FILE
