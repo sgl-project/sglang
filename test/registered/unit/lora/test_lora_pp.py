@@ -43,6 +43,7 @@ from sglang.srt.managers.scheduler_components.request_list import (
     move,
 )
 from sglang.srt.runtime_context import get_context, get_parallel
+from sglang.test.scheduler_test_utils import FakeReq
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -111,13 +112,14 @@ class TestAllPPLoras(CustomTestCase):
     @mock.patch("time.monotonic", return_value=100.0)
     def test_draining_uses_all_micro_batches(self, _clock):
         def request(lora_id, max_new_tokens):
-            req = _req(lora_id)
-            req.sampling_params = SimpleNamespace(max_new_tokens=max_new_tokens)
-            req.output_ids = []
-            req.is_retracted = False
-            req.owner_list = None
-            req.time_stats = SimpleNamespace(wait_queue_entry_time=0.0)
-            return req
+            return FakeReq(
+                lora_id=lora_id,
+                finished=lambda: False,
+                sampling_params=SimpleNamespace(max_new_tokens=max_new_tokens),
+                output_ids=[],
+                is_retracted=False,
+                time_stats=SimpleNamespace(wait_queue_entry_time=0.0),
+            )
 
         short, long = request("short", 5), request("long", 100)
         waiting = request("waiting", 100)
