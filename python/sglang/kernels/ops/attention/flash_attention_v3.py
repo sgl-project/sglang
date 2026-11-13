@@ -21,7 +21,7 @@ def _call_fa3_kernel(kernel, *args, out=None, **kwargs):
 
 @cache_once
 def _load_fa3_kernels():
-    from sgl_kernel.flash_attn import (
+    from sgl_fa3 import (
         flash_attn_varlen_func,
         flash_attn_with_kvcache,
     )
@@ -40,7 +40,7 @@ def _is_fa3_supported() -> bool:
     #  Right now, fa3 is supported for sm80/sm87 and sm86/sm89. The main different
     #  Between sm80/sm87 and sm86/sm89 is the shared memory size. you can follow the link below for more information
     #  https://docs.nvidia.com/cuda/cuda-c-programming-guide/#shared-memory-8-x
-    #  And for sgl-kernel right now, we can build fa3 on sm80/sm86/sm89/sm90a.
+    #  The sgl-fa3 wheel ships sm80/sm86/sm90a kernels (x86_64 only).
     #  That means if you use A100/A*0/L20/L40/L40s/4090 you can use fa3.
     if is_musa():
         major, _ = get_device_capability()
