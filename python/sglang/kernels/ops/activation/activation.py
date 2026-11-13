@@ -10,6 +10,7 @@ from sglang.kernels.jit.utils import (
     load_jit,
     make_cpp_args,
 )
+from sglang.srt.utils import is_musa
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -17,7 +18,7 @@ if TYPE_CHECKING:
 
 
 @cache_once
-def activation_module(dtype: torch.dtype, *, fast_math: bool) -> Module:
+def _jit_activation_module(dtype: torch.dtype, *, fast_math: bool) -> Module:
     args = make_cpp_args(dtype, is_arch_support_pdl(), fast_math)
     return load_jit(
         "activation",
@@ -374,3 +375,73 @@ def gelu_tanh_and_mul(
         num_tokens_post_padded=num_tokens_post_padded,
         num_valid_tokens=num_valid_tokens,
     )
+
+
+class _TorchActivationModule:
+    def __init__(self, dtype: torch.dtype, *, fast_math: bool):
+        self.dtype = dtype
+        self.fast_math = fast_math
+
+    @staticmethod
+    def _activate(x: torch.Tensor, op_name: str) -> torch.Tensor:
+        if op_name == "silu":
+            return torch.nn.functional.silu(x)
+        if op_name == "gelu":
+            return torch.nn.functional.gelu(x)
+        if op_name == "gelu_tanh":
+            return torch.nn.functional.gelu(x, approximate="tanh")
+        raise ValueError(f"unsupported activation: {op_name}")
+
+    def _gated(
+        self, input: torch.Tensor, op_name: str, clamp_limit: float = 0.0
+    ) -> torch.Tensor:
+        hidden = input.shape[-1] // 2
+        gate = input[..., :hidden].float()
+        up = input[..., hidden:].float()
+        if clamp_limit > 0:
+            gate = gate.clamp_max(clamp_limit)
+            up = up.clamp(min=-clamp_limit, max=clamp_limit)
+        return (self._activate(gate, op_name) * up).to(input.dtype)
+
+    def run_activation(self, input: torch.Tensor, out: torch.Tensor, op_name: str):
+        out.copy_(self._gated(input, op_name))
+
+    def run_activation_with_rounding(
+        self,
+        input: torch.Tensor,
+        out: torch.Tensor,
+        op_name: str,
+        clamp_limit: float = 0.0,
+    ):
+        hidden = input.shape[-1] // 2
+        gate = input[..., :hidden].float()
+        up = input[..., hidden:].float()
+        if clamp_limit > 0:
+            gate = gate.clamp_max(clamp_limit)
+            up = up.clamp(min=-clamp_limit, max=clamp_limit)
+        activated = self._activate(gate, op_name).to(input.dtype).float()
+        out.copy_((activated * up).to(input.dtype))
+
+    def run_activation_with_rounding_input_inplace(
+        self, input: torch.Tensor, out: torch.Tensor, op_name: str
+    ):
+        self.run_activation_with_rounding(input, out, op_name)
+
+    def run_activation_filtered(self, *args, **kwargs):
+        raise NotImplementedError("filtered activation is not supported on MUSA")
+
+    def run_activation_sorted_filtered(self, *args, **kwargs):
+        raise NotImplementedError("sorted activation is not supported on MUSA")
+
+    def run_unary_activation(
+        self, input: torch.Tensor, out: torch.Tensor, op_name: str
+    ):
+        if op_name != "relu2":
+            raise ValueError(f"unsupported unary activation: {op_name}")
+        out.copy_(torch.relu(input).square())
+
+
+def activation_module(dtype: torch.dtype, *, fast_math: bool) -> Module:
+    if is_musa():
+        return _TorchActivationModule(dtype, fast_math=fast_math)
+    return _jit_activation_module(dtype, fast_math=fast_math)
