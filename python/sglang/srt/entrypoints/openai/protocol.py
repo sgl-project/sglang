@@ -1256,6 +1256,7 @@ class ChatCompletionRequest(PDRoutingFields):
         model_generation_config: Dict[str, Any],
         tool_call_constraint: Optional[ToolCallConstraint] = None,
         renderer_handles_response_format: bool = False,
+        tool_call_constraint_covers_answer: bool = False,
     ) -> Dict[str, Any]:
         """
         Convert request to sampling parameters.
@@ -1321,6 +1322,8 @@ class ChatCompletionRequest(PDRoutingFields):
             and response_format
             and response_format.type in ("json_object", "json_schema")
         ):
+            response_format = None
+        if tool_call_constraint_covers_answer:
             response_format = None
 
         if response_format and response_format.type == "json_schema":
@@ -2220,6 +2223,7 @@ class ResponsesRequest(PDRoutingFields):
         default_params: Optional[Dict] = None,
         stop: Optional[Union[str, List[str]]] = None,
         tool_call_constraint: Optional[ToolCallConstraint] = None,
+        tool_call_constraint_covers_answer: bool = False,
     ) -> Dict[str, Any]:
         """Convert to sampling parameters for generation.
 
@@ -2276,7 +2280,7 @@ class ResponsesRequest(PDRoutingFields):
                 params[key] = value
 
         json_schema = self._json_schema_from_text_format(self.text)
-        if json_schema is not None:
+        if json_schema is not None and not tool_call_constraint_covers_answer:
             params["json_schema"] = json_schema
 
         has_existing_constraints = (
@@ -2539,6 +2543,9 @@ class MessageProcessingResult:
         Callable[[], Optional[ToolCallConstraint]]
     ] = None
     uses_response_template: bool = False
+    # The tool-call constraint also holds the final answer to the requested
+    # JSON format, so the format must not be applied on its own.
+    tool_call_constraint_covers_answer: bool = False
 
 
 class ToolCallProcessingResult(NamedTuple):
