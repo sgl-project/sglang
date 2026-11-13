@@ -12,9 +12,7 @@ import torch
 from gguf import GGMLQuantizationType as WeightType
 from torch.nn.parameter import Parameter, UninitializedParameter
 
-from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
-    NPUUnquantMoEMethod,
-)
+from sglang.srt.hardware_backend.npu.quantization.moe_methods import NPUUnquantMoEMethod
 from sglang.srt.hardware_backend.npu.utils import npu_format_cast
 from sglang.srt.layers.linear import LinearBase
 from sglang.srt.layers.moe.moe_runner import MoeRunner, MoeRunnerConfig
@@ -204,6 +202,27 @@ def dequantize_gguf_weight(
     block_size, type_size = gguf.GGML_QUANT_SIZES[qweight_type]
     shape = (qweight.shape[0], qweight.shape[1] // type_size * block_size)
     return ggml_dequantize(qweight, qweight_type, *shape, dtype)
+
+
+def get_gguf_dequantized_weight(
+    module: torch.nn.Module, dtype: torch.dtype
+) -> torch.Tensor:
+    """Return a dense weight for a possibly GGUF-quantized module.
+
+    GGUF-quantized embedding and lm_head modules hold packed ``qweight`` and
+    expose no ``.weight``. Speculative decoding hands the target embedding and
+    output head to the draft model, so the caller needs a dense tensor.
+    Dequantize once and cache it on the module.
+    """
+    if hasattr(module, "weight"):
+        return module.weight
+    cached = getattr(module, "_gguf_dequantized_weight", None)
+    if cached is None:
+        cached = dequantize_gguf_weight(
+            module.qweight, module.qweight_type.weight_type, dtype
+        )
+        module._gguf_dequantized_weight = cached
+    return cached
 
 
 def fused_mul_mat_gguf(
