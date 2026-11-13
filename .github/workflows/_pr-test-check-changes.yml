@@ -29,6 +29,8 @@ on:
         value: ${{ jobs.run.outputs.multimodal_gen }}
       multimodal_gen_server:
         value: ${{ jobs.run.outputs.multimodal_gen_server }}
+      diffusion_sm103:
+        value: ${{ jobs.run.outputs.diffusion_sm103 }}
       processor:
         value: ${{ jobs.run.outputs.processor }}
       server_args_docs:
@@ -55,6 +57,7 @@ jobs:
       jit_kernel: ${{ steps.filter.outputs.jit_kernel || steps.run-mode.outputs.run_all_tests }}
       multimodal_gen: ${{ steps.filter.outputs.multimodal_gen || steps.run-mode.outputs.run_all_tests }}
       multimodal_gen_server: ${{ steps.filter.outputs.multimodal_gen_server || steps.run-mode.outputs.run_all_tests }}
+      diffusion_sm103: ${{ steps.filter.outputs.diffusion_sm103 || steps.run-mode.outputs.run_all_tests }}
       processor: ${{ steps.filter.outputs.processor || steps.run-mode.outputs.run_all_tests }}
       server_args_docs: ${{ steps.filter.outputs.server_args_docs || steps.run-mode.outputs.run_all_tests }}
       partitions: ${{ steps.partitions.outputs.partitions }}
@@ -137,9 +140,12 @@ jobs:
               - "benchmark/simulator/**/!(*.md)"
               - "tools/sglang-simulator/**/!(*.md)"
             multimodal_gen:
+              - ".github/actions/**"
               - ".github/workflows/pr-test.yml"
+              - ".github/workflows/_pr-test-check-changes.yml"
               - ".github/workflows/pr-test-multimodal-gen.yml"
               - ".github/workflows/_diffusion-pr-test-stage.yml"
+              - "scripts/ci/cuda/ci_install_dependency.sh"
               - "scripts/ci/cuda/ci_install_dependency_diffusion.sh"
               - "scripts/ci/runner_configs.yml"
               - "python/pyproject.toml"
@@ -157,9 +163,12 @@ jobs:
             # the server, runtime or GPU suites imports the plugin, so a plugin-only
             # change runs the diffusion unit suite but not the server suites.
             multimodal_gen_server:
+              - ".github/actions/**"
               - ".github/workflows/pr-test.yml"
+              - ".github/workflows/_pr-test-check-changes.yml"
               - ".github/workflows/pr-test-multimodal-gen.yml"
               - ".github/workflows/_diffusion-pr-test-stage.yml"
+              - "scripts/ci/cuda/ci_install_dependency.sh"
               - "scripts/ci/cuda/ci_install_dependency_diffusion.sh"
               - "scripts/ci/runner_configs.yml"
               - "python/pyproject.toml"
@@ -179,6 +188,20 @@ jobs:
               - "test/registered/unit/diffusion/**"
               - "test/registered/e2e/diffusion/**"
               - "python/sglang/cli/**"
+            # SM103 bit-exact coverage is needed for runtime/kernel changes, not
+            # unrelated diffusion test fixtures, baselines, or documentation.
+            diffusion_sm103:
+              - ".github/workflows/{pr-test*,_pr-test*,_diffusion*}.yml"
+              - ".github/actions/**"
+              - "scripts/ci/**"
+              - "python/{pyproject.toml,setup.py}"
+              - "python/sglang/{__init__.py,utils.py}"
+              - "python/sglang/multimodal_gen/{__init__.py,envs.py}"
+              - "python/sglang/multimodal_gen/{runtime,configs}/**/!(*.md|*.ipynb)"
+              - "python/sglang/kernels/**/!(*.md)"
+              - "python/sglang/srt/**/!(*.md)"
+              - "python/sglang/{utils,distributed,test}/**/!(*.md)"
+              - "test/registered/kernels/ops/diffusion/**"
             jit_kernel:
               - ".github/workflows/pr-test.yml"
               - ".github/workflows/pr-test-jit-kernel.yml"
@@ -276,6 +299,8 @@ jobs:
       - name: Build runs_on_map (resolves $b200_runner sentinel)
         id: runner-map
         run: |
+          python3 -c 'import yaml' 2>/dev/null ||
+            python3 -m pip install --disable-pip-version-check pyyaml
           python3 scripts/ci/runner_configs.py --map \
             '${{ steps.set-runner.outputs.b200_runner }}' \
             >> "$GITHUB_OUTPUT"

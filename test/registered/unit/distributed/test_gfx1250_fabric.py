@@ -113,5 +113,63 @@ def test_probe_fabric_clique_agrees(monkeypatch, peer, expected):
     assert gfx1250_fabric.probe_fabric_clique(object(), Mock(index=0)) is expected
 
 
+@pytest.mark.parametrize(
+    "accel_ids, expected",
+    [
+        # two DPX hosts, partitions of one SoC adjacent
+        (
+            [52, 52, 53, 53, 56, 56, 57, 57],
+            [[0, 1], [2, 3], [4, 5], [6, 7]],
+        ),
+        # pairs found by accel_id, not by rank parity
+        ([53, 52, 52, 53], [[0, 3], [1, 2]]),
+        ([52, 53, 54, 55], None),  # SPX
+        ([52, 52, 52, 52], None),  # CPX
+        ([52, 52, 53], None),  # half a SoC in the group
+        ([52, None], None),
+        ([], None),
+    ],
+)
+def test_dpx_pairs(accel_ids, expected):
+    assert gfx1250_fabric.dpx_pairs(accel_ids) == expected
+
+
+@pytest.mark.parametrize(("peer_accel_id", "expected"), [(52, [[0, 1]]), (None, None)])
+def test_probe_dpx_pairs_gathers_every_rank(monkeypatch, peer_accel_id, expected):
+    """Pairs come from every rank's ID; one rank without an ID disables them."""
+    monkeypatch.setattr(gfx1250_fabric.torch.cuda, "get_device_properties", Mock())
+    monkeypatch.setattr(
+        gfx1250_fabric, "pci_function0_bus_id", lambda p: "0001:04:00.0"
+    )
+    monkeypatch.setattr(
+        gfx1250_fabric, "read_ualink_sysfs", lambda bus_id: {"accel_id": "52"}
+    )
+    monkeypatch.setattr(gfx1250_fabric.dist, "get_world_size", lambda group: 2)
+
+    def all_gather_object(gathered, local, group):
+        gathered[:] = [local, peer_accel_id]
+
+    monkeypatch.setattr(gfx1250_fabric.dist, "all_gather_object", all_gather_object)
+    assert gfx1250_fabric.probe_dpx_pairs(object(), Mock(index=0)) == expected
+
+
+def test_probe_dpx_pairs_survives_a_raising_probe(monkeypatch):
+    def boom(index):
+        raise RuntimeError("no device")
+
+    monkeypatch.setattr(gfx1250_fabric.torch.cuda, "get_device_properties", boom)
+    monkeypatch.setattr(gfx1250_fabric.dist, "get_world_size", lambda group: 2)
+    gathered_local = []
+
+    def all_gather_object(gathered, local, group):
+        gathered_local.append(local)
+        gathered[:] = [local, 52]
+
+    monkeypatch.setattr(gfx1250_fabric.dist, "all_gather_object", all_gather_object)
+    # the failing rank still joins the gather, so no rank is left waiting
+    assert gfx1250_fabric.probe_dpx_pairs(object(), Mock(index=0)) is None
+    assert gathered_local == [None]
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
