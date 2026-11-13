@@ -27,7 +27,9 @@ from sglang.srt.layers.layer_boundary import layer_stack
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
+from sglang.srt.layers.moe.utils import get_num_fused_shared_experts
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -35,7 +37,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.glm4_moe import Glm4MoeDecoderLayer, Glm4MoeForCausalLM
 from sglang.srt.runtime_context import get_parallel, get_spec
-from sglang.srt.utils import add_prefix, is_npu
+from sglang.srt.utils import is_npu
 
 logger = logging.getLogger(__name__)
 
@@ -129,12 +131,8 @@ class Glm4MoeForCausalLMNextN(Glm4MoeForCausalLM):
             quant_config = None
         self.quant_config = quant_config
 
-        # The draft's own gate: its quantization can differ from the
-        # target's, and the decoder below reads the ACTIVE decision while it
-        # builds. Also sets num_fused_shared_experts, which drives the
-        # inherited loader's shared-expert remap.
-        self.num_fused_shared_experts = 0
-        self.determine_num_fused_shared_experts()
+        # Drives the inherited loader's shared-expert remap after the build.
+        self.num_fused_shared_experts = get_num_fused_shared_experts()
 
         self.model = Glm4MoeModelNextN(
             config, quant_config, prefix=add_prefix("model", prefix)

@@ -4,8 +4,26 @@ import msgspec
 import torch
 
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
-from sglang.kernels.ops.attention.dsv4.request_window_copy import copy_packed_rows
+from sglang.kernels.ops.kvcache.dsv4_request_window_copy import (
+    commit_packed_rows,
+    copy_packed_rows,
+)
+from sglang.srt.environ import InvariantCheckLevel
 from sglang.srt.model_executor.runner_utils.capture_mode import get_is_capture_mode
+from sglang.srt.utils import is_hip
+from sglang.srt.utils.invariants import Bucket, Invariant, IsTrue, expect, resolve_level
+
+_is_hip = is_hip()
+
+# A window row the replay expects but no longer holds; that request's attention
+# would read the wrong rows.
+_SWA_HISTORY_PRESENT = Invariant(
+    "dsv41.swa_history_present", Bucket.FATAL_CONTAINABLE, IsTrue()
+)
+# More contiguous request runs than num_groups: the runs past it get no history.
+_WINDOW_GROUPS_FIT = Invariant(
+    "dsv41.window_groups_fit", Bucket.FATAL_CONTAINABLE, IsTrue()
+)
 
 
 class WindowLayout(msgspec.Struct, frozen=True):
@@ -18,8 +36,25 @@ class WindowLayout(msgspec.Struct, frozen=True):
     history_pos: torch.Tensor
     history_loc: torch.Tensor
     history_valid: torch.Tensor
+    # Window row each history slot copies from (zero_row when invalid); every
+    # layer reads the same rows, so the layout computes them once.
+    history_src: torch.Tensor
     commit_mask: torch.Tensor
     size: int
+
+    def leading_rows(self, num_rows: int) -> "WindowLayout":
+        """The layout of the live queries; a prefill CUDA graph pads the rest."""
+        if num_rows == self.pos.numel():
+            return self
+        return msgspec.structs.replace(
+            self,
+            req=self.req[:num_rows],
+            pos=self.pos[:num_rows],
+            write_loc=self.write_loc[:num_rows],
+            indices=self.indices[:num_rows],
+            lengths=self.lengths[:num_rows],
+            commit_mask=self.commit_mask[:num_rows],
+        )
 
     def copy_(self, other: "WindowLayout") -> None:
         # Captured copy kernels read these tensors by address, so a graph replay
@@ -34,6 +69,7 @@ class WindowLayout(msgspec.Struct, frozen=True):
         self.history_pos.copy_(other.history_pos)
         self.history_loc.copy_(other.history_loc)
         self.history_valid.copy_(other.history_valid)
+        self.history_src.copy_(other.history_src)
         self.commit_mask.copy_(other.commit_mask)
 
 
@@ -58,14 +94,43 @@ def window_layout(
     req,
     pos,
     *,
+    zero_row: int,
     window: int = 128,
     capacity: int = 256,
     floor: Optional[torch.Tensor] = None,
     num_groups: Optional[int] = None,
+    padded_rows: Optional[int] = None,
 ):
+    """padded_rows is set for the prefill CUDA graph, which pads the layout to that
+    many query rows past the live ones in req and pos."""
     n = pos.numel()
     if n == 0:
         raise ValueError("request-window layout needs at least one query")
+    if req.is_cuda and not _is_hip:
+        from sglang.kernels.ops.kvcache.dsv41_window_layout import build_window_layout
+
+        group, first, last = _first_row_offsets(req)
+        if (
+            num_groups is not None
+            and resolve_level() >= InvariantCheckLevel.WARN
+            and not _capturing()
+        ):
+            expect(_WINDOW_GROUPS_FIT, group[-1:] < num_groups, msg="request runs")
+        return WindowLayout(
+            **build_window_layout(
+                req,
+                pos,
+                group,
+                first,
+                last,
+                zero_row=zero_row,
+                window=window,
+                capacity=capacity,
+                floor=floor,
+                num_groups=num_groups,
+                padded_rows=padded_rows,
+            )
+        )
     req = req.to(torch.int64)
     pos = pos.to(torch.int64)
     device = pos.device
@@ -106,8 +171,31 @@ def window_layout(
         history_valid &= history_pos >= g_floor.repeat_interleave(window)
     history_req = g_req.repeat_interleave(window)
     history_loc = torch.arange(history_rows, device=device)
+    history_src = torch.where(
+        history_valid, history_req * capacity + history_pos % capacity, zero_row
+    )
 
     commit_mask = (group_last - offset) < capacity
+    if padded_rows is not None and padded_rows > n:
+        # Padding rows write the workspace past the live rows and commit nowhere.
+        padding = padded_rows - n
+        zeros = req.new_zeros(padding)
+        req, pos = torch.cat([req, zeros]), torch.cat([pos, zeros])
+        write_loc = torch.cat(
+            [
+                write_loc,
+                torch.arange(
+                    history_rows + n,
+                    history_rows + padded_rows,
+                    dtype=torch.int32,
+                    device=device,
+                ),
+            ]
+        )
+        indices = torch.cat([indices, indices.new_full((padding, window), -1)])
+        lengths = torch.cat([lengths, lengths.new_zeros(padding)])
+        commit_mask = torch.cat([commit_mask, commit_mask.new_zeros(padding)])
+        n = padded_rows
     return WindowLayout(
         req,
         pos,
@@ -118,6 +206,7 @@ def window_layout(
         history_pos,
         history_loc,
         history_valid,
+        history_src,
         commit_mask,
         history_rows + n,
     )
@@ -134,81 +223,204 @@ def _capturing() -> bool:
     return torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
 
 
-class RequestWindow:
-    def __init__(
-        self,
-        pool_factory,
-        *,
-        num_slots,
-        layers,
-        page_size,
-        capacity,
-        workspace_rows: Optional[int] = None,
-    ):
-        self.capacity = ((capacity + page_size - 1) // page_size) * page_size
-        self.page_size = page_size
-        self.pool_factory = pool_factory
-        self.num_slots = num_slots
-        self.rows = num_slots * self.capacity
+class PackedWindowView(msgspec.Struct, frozen=True, kw_only=True):
+    """Nonallocating view of packed pages consumed by attention and PD."""
 
-        self.state = pool_factory(self.rows + page_size, layers)
+    size: int
+    page_size: int
+    kv_layout: KVLayout
+    dtype: torch.dtype
+    kv_buffer: tuple[torch.Tensor, ...]
+
+    @property
+    def kv_cache_total_dim(self) -> int:
+        """Packed bytes per token in the attention kernel's paged view."""
+        return self.kv_layout.bytes_per_token
+
+
+class RequestWindowSpec(msgspec.Struct, frozen=True, kw_only=True):
+    """Request-owned ring and fixed workspace extents, including padding pages."""
+
+    num_slots: int
+    layers: int
+    page_size: int
+    capacity: int
+    workspace_rows: int
+    kv_layout: KVLayout
+
+    def __post_init__(self):
+        if (
+            min(
+                self.num_slots,
+                self.layers,
+                self.page_size,
+                self.capacity,
+                self.workspace_rows,
+            )
+            < 1
+        ):
+            raise ValueError("request-window extents must be positive")
+        if self.capacity % self.page_size or self.workspace_rows % self.page_size:
+            raise ValueError("request-window extents must contain whole pages")
+
+    @property
+    def request_parts(self):
+        from sglang.srt.mem_cache.kv.decl import RequestPartDecl, TensorPartDecl
+
+        layers = tuple(range(self.layers))
+        return (
+            RequestPartDecl(
+                part=TensorPartDecl(
+                    name="pages",
+                    shape=(
+                        self.capacity // self.page_size,
+                        self.kv_layout.page_bytes(self.page_size),
+                    ),
+                    dtype=torch.uint8,
+                    layer_ids=layers,
+                )
+            ),
+            RequestPartDecl(
+                part=TensorPartDecl(
+                    name="tags",
+                    shape=(self.capacity,),
+                    dtype=torch.int64,
+                    layer_ids=layers,
+                    reset_value=-1,
+                )
+            ),
+        )
+
+    @property
+    def state_pages(self):
+        # The historical state pool reserves a dummy page in its requested size
+        # and another in the backing. PD page numbering includes both.
+        return self.num_slots * self.capacity // self.page_size + 2
+
+    @property
+    def tag_rows(self):
+        return self.num_slots * self.capacity + self.page_size
+
+    @property
+    def workspace_pages(self):
+        return self.workspace_rows // self.page_size + 1
+
+    @property
+    def nbytes(self):
+        page_bytes = self.kv_layout.page_bytes(self.page_size)
+        return (
+            self.layers * self.state_pages + self.workspace_pages
+        ) * page_bytes + self.layers * self.tag_rows * 8
+
+    @classmethod
+    def create(
+        cls, *, num_slots, layers, page_size, capacity, workspace_rows, kv_layout
+    ):
+        return cls(
+            num_slots=num_slots,
+            layers=layers,
+            page_size=page_size,
+            capacity=-(-capacity // page_size) * page_size,
+            workspace_rows=-(-workspace_rows // page_size) * page_size,
+            kv_layout=kv_layout,
+        )
+
+
+def request_window_workspace_rows(
+    num_slots: int, window: int, draft_tokens: int
+) -> int:
+    from sglang.srt.layers.dp_attention import get_cuda_graph_max_batch_size
+    from sglang.srt.model_executor.cuda_graph_config import Backend
+    from sglang.srt.runtime_context import get_exec, get_schedule
+
+    graph_config = get_exec().graph.cuda_graph_config
+    prefill = graph_config.prefill if graph_config is not None else None
+    graph_rows = (
+        get_cuda_graph_max_batch_size(max(prefill.bs))
+        if prefill is not None and prefill.backend == Backend.BREAKABLE and prefill.bs
+        else 0
+    )
+    return (num_slots + 1) * window + max(
+        get_schedule().chunked_prefill_size or 0,
+        graph_rows,
+        (num_slots + 1) * (1 + draft_tokens),
+    )
+
+
+class RequestWindow:
+    def __init__(self, spec: RequestWindowSpec, *, state, tags, workspace):
+        self.spec = spec
+        self.capacity = spec.capacity
+        self.page_size = spec.page_size
+        self.num_slots = spec.num_slots
+        self.rows = spec.num_slots * spec.capacity
+        self.state = state
         self.zero_row = self.rows
         self.sink_row = self.rows + 1
-        self.tags = torch.full(
-            (layers, self.rows + page_size),
-            -1,
-            dtype=torch.int64,
-            device=self.state.kv_buffer[0].device,
-        )
-        self.workspace = None
-        if workspace_rows:
-            self._ensure_workspace(workspace_rows)
+        if tags.shape != (spec.layers, spec.tag_rows):
+            raise ValueError("request-window tags do not match the declared extent")
+        self.tags = tags
+        self.workspace = workspace
         self.layout = None
         self.prepared = None
+        self._idle_layout = None
 
-    def _ensure_workspace(self, rows: int) -> None:
-        if self.workspace is not None and self.workspace.size >= rows:
-            return
-        assert not _capturing(), "request-window workspace must be sized before capture"
-        size = ((rows + self.page_size - 1) // self.page_size) * self.page_size
-        self.workspace = self.pool_factory(size, 1)
+    def row_loc(self, slots, positions):
+        return slots * self.capacity + positions % self.capacity
+
+    def page_indices(self, slot: int, start: int, end: int):
+        assert start % self.page_size == 0, (start, self.page_size)
+        positions = torch.arange(start, end, self.page_size)
+        # capacity is whole pages, so a page's rows keep a paged pool's offsets
+        # and pair with decode's paged SWA pages one for one.
+        return (self.row_loc(slot, positions) // self.page_size).to(torch.int32).numpy()
 
     def reset(self, slots):
         loc = slots.to(torch.int64)[:, None] * self.capacity + torch.arange(
             self.capacity, device=slots.device
         )
-        self.tags[:, loc.flatten()] = -1
+        # index_fill_ stays on the device; a scalar index_put waits for the stream.
+        self.tags.index_fill_(1, loc.flatten(), -1)
         self.prepared = None
 
     def activate(self, layout):
         if self.layout is layout:
             return
-        self.layout = layout
-        self.prepared = None
-        if self.workspace is None:
-            self._ensure_workspace(layout.size)
-        elif self.workspace.size < layout.size:
+        if self.workspace.size < layout.size:
             # Captured graphs hold the workspace address; growing it strands them.
             raise RuntimeError(
                 f"request-window workspace too small: {self.workspace.size} rows "
                 f"for a layout of {layout.size}"
             )
+        self.layout = layout
+        self.prepared = None
+
+    def activate_idle(self, num_rows: int) -> torch.Tensor:
+        """Activate a layout for an idle forward, whose attention metadata is
+        stale or unset. Its rows write the workspace past an empty history, and
+        an idle forward never commits them."""
+        layout = self._idle_layout
+        if layout is None or layout.pos.numel() != num_rows:
+            zeros = torch.zeros(num_rows, dtype=torch.int64, device=self.tags.device)
+            layout = window_layout(
+                zeros,
+                zeros,
+                zero_row=self.zero_row,
+                capacity=self.capacity,
+                num_groups=1,
+            )
+            self._idle_layout = layout
+        self.activate(layout)
+        return layout.write_loc
 
     def initialize_dummy_history(self):
         layout = self.layout
         self.tags.fill_(-1)
-        loc = layout.history_req * self.capacity + layout.history_pos % self.capacity
+        loc = self.row_loc(layout.history_req, layout.history_pos)
         for buf in self.state.kv_buffer:
             buf.zero_()
         self.tags[:, loc] = layout.history_pos
         self.prepared = None
-
-    def _history_src(self, layout):
-        return torch.where(
-            layout.history_valid,
-            layout.history_req * self.capacity + layout.history_pos % self.capacity,
-            self.zero_row,
-        )
 
     def buffer(self, layer):
         # The runner's capture scope includes eager warmups before CUDA capture
@@ -219,15 +431,15 @@ class RequestWindow:
             layout = self.layout
             if layout is None:
                 raise RuntimeError("request-window metadata was not activated")
-            src = self._history_src(layout)
-            if not in_capture:
-                valid = layout.history_valid
-                if not torch.equal(
-                    self.tags[layer, src][valid], layout.history_pos[valid]
-                ):
-                    raise RuntimeError(
-                        "SWA history is missing: replay or window ownership is invalid"
-                    )
+            src = layout.history_src
+            # Signal-only: skip building the predicate when detection is off.
+            if not in_capture and resolve_level() >= InvariantCheckLevel.WARN:
+                expect(
+                    _SWA_HISTORY_PRESENT,
+                    (self.tags[layer, src] == layout.history_pos)
+                    | ~layout.history_valid,
+                    msg="replay or window ownership is invalid",
+                )
             copy_packed_tokens(
                 self.state.kv_buffer[layer],
                 self.workspace.kv_buffer[0],
@@ -241,17 +453,12 @@ class RequestWindow:
 
     def commit(self, layer):
         layout = self.layout
-        dst = torch.where(
-            layout.commit_mask,
-            layout.req * self.capacity + layout.pos % self.capacity,
-            self.sink_row,
-        )
-        copy_packed_tokens(
+        commit_packed_rows(
             self.buffer(layer),
             self.state.kv_buffer[layer],
-            layout.write_loc,
-            dst,
+            self.tags[layer],
+            layout,
             page_size=self.page_size,
+            capacity=self.capacity,
             layout=self.state.kv_layout,
         )
-        self.tags[layer, dst] = layout.pos
