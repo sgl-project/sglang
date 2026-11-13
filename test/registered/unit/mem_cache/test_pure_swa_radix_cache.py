@@ -105,6 +105,8 @@ class TestPureSWARadixCache(CustomTestCase):
             last_node=cache.root_node,
             lock=None,
             priority=0,
+            # No dLLM block in flight, so every checkpoint length is cacheable.
+            cacheable_checkpoint_len=lambda up_to: up_to,
             kv=ReqKvInfo(
                 req_pool_idx=0,
                 window_evict_floor=4,
