@@ -76,7 +76,6 @@ ATTENTION_BACKEND_CHOICES = [
     "qsa",
     "unlimited_ocr_v2",
     "dsv4",
-    "compressed",  # Deprecated alias for "dsv4"
     "ernie55",
     # NVIDIA specific
     "fa3",
@@ -193,15 +192,7 @@ FP4_GEMM_RUNNER_BACKEND_CHOICES = [
     "marlin",
 ]
 
-RADIX_EVICTION_POLICY_CHOICES = [
-    "lru",
-    "lfu",
-    "slru",
-    "priority",
-    "tlru",
-    "joint_lru",
-    "gds",
-]
+RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru", "priority", "tlru", "joint_lru"]
 
 RL_ON_POLICY_TARGET_CHOICES = ["fsdp"]
 
