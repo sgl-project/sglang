@@ -106,7 +106,7 @@ python3 -m sglang.launch_server \
   --cuda-graph-backend-prefill disabled
 ```
 
-The arena selects AITER unified attention automatically; `SGLANG_USE_AITER_UNIFIED_ATTN` is not required. Decode can use eager execution or full CUDA-graph replay. For experimental FP8 KV, replace `--kv-cache-dtype bf16` with `--kv-cache-dtype fp8_e4m3`. End-to-end sliding-window accuracy validation for FP8 is still in progress. This AITER path does not support MLA, asymmetric K/V dimensions or speculative decoding. The existing AITER and shared unified-memory checks govern context parallelism and deterministic inference.
+The arena selects AITER unified attention automatically; `SGLANG_USE_AITER_UNIFIED_ATTN` is not required. Decode can use eager execution or full CUDA-graph replay. For experimental FP8 KV, replace `--kv-cache-dtype bf16` with `--kv-cache-dtype fp8_e4m3`. FP8 KV supports full-attention and sliding-window layers; generated tokens may differ from the static pool. This AITER path does not support MLA, asymmetric K/V dimensions or speculative decoding. The existing AITER and shared unified-memory checks govern context parallelism and deterministic inference.
 
 HiCache can be enabled with `--enable-hierarchical-cache`. PD disaggregation uses the shared unified-memory path, subject to the PD restrictions and failed-transfer limitation below.
 
