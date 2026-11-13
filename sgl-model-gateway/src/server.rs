@@ -25,6 +25,7 @@ use wfaas::LoggingSubscriber;
 
 use crate::{
     app_context::AppContext,
+    completion::CompletionRequest,
     config::{RouterConfig, RoutingMode},
     core::{
         job_queue::{JobQueue, JobQueueConfig},
@@ -42,7 +43,6 @@ use crate::{
     protocols::{
         chat::ChatCompletionRequest,
         classify::ClassifyRequest,
-        completion::CompletionRequest,
         embedding::EmbeddingRequest,
         generate::GenerateRequest,
         parser::{ParseFunctionCallRequest, SeparateReasoningRequest},
@@ -199,7 +199,7 @@ async fn v1_completions(
 ) -> Response {
     state
         .router
-        .route_completion(Some(&headers), &body, Some(&body.model))
+        .route_completion(Some(&headers), &body, Some(body.model()))
         .await
 }
 
