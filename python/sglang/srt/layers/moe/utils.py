@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass
 from enum import Enum, IntEnum
@@ -1136,11 +1135,7 @@ def get_moe_padding_size(is_aiter_moe):
     if is_aiter_moe:
         return AITER_PADDING_SIZE
     else:
-        return (
-            TRITON_PADDING_SIZE
-            if bool(int(os.getenv("SGLANG_MOE_PADDING", "0")))
-            else 0
-        )
+        return TRITON_PADDING_SIZE if envs.SGLANG_MOE_PADDING.get() else 0
 
 
 def get_moe_weight_sizes(inter_dim, is_concat, is_packed, is_aiter_moe):

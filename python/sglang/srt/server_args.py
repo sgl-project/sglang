@@ -34,6 +34,8 @@ from sglang.srt.arg_groups.arg_utils import (
     record_fields,
 )
 from sglang.srt.arg_groups.argparse_actions import (
+    DeprecatedAction,
+    DeprecatedAliasStoreAction,
     DeprecatedChoiceToFlagAction,
     DeprecatedStoreTrueAction,
 )
@@ -228,6 +230,17 @@ class ServerArgs:
 
     def __post_init__(self):
         """Leave construction unresolved; launchers and publishers call ``resolve_once``."""
+        for name in (
+            "disable_outlines_disk_cache",
+            "show_time_cost",
+            "triton_attention_reduce_in_fp32",
+        ):
+            if getattr(self, name) is not None:
+                logger.warning(
+                    "'%s' is deprecated and has no effect. It will be removed "
+                    "in a future release.",
+                    name,
+                )
 
     def resolve_once(self) -> None:
         """Resolve once, preserving declarations across pickling to child processes.
@@ -430,6 +443,27 @@ class ServerArgs:
             "--monokernel-backend amd, and --enable-nvidia-megakernel instead of "
             "--monokernel-backend msa.",
         )
+        # `mamba_max_states_per_path` is `no_cli=True`; any cap still applies.
+        parser.add_argument(
+            "--mamba-max-states-per-path",
+            action=DeprecatedAliasStoreAction,
+            new_flag="--hybrid-cache-checkpoints-level 2",
+            dest="mamba_max_states_per_path",
+            type=int,
+            default=None,
+            help="Deprecated. Use --hybrid-cache-checkpoints-level 2 instead.",
+        )
+        for flag in (
+            "--disable-outlines-disk-cache",
+            "--show-time-cost",
+            "--triton-attention-reduce-in-fp32",
+        ):
+            parser.add_argument(
+                flag,
+                action=DeprecatedAction,
+                default=argparse.SUPPRESS,
+                help="Deprecated. Has no effect.",
+            )
         parser.add_argument(
             "--enable-flashinfer-allreduce-fusion",
             action="store_true",
