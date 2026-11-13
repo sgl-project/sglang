@@ -284,9 +284,9 @@ class TestEnsureHostFree(CustomTestCase):
         HiSparseCoordinator._ensure_host_free(self._coord(available=0), 4)
 
 
-class TestHostDecodeCapacity(CustomTestCase):
-    """HiSparseCoordinator.host_decode_capacity_ok: the per-step host check that
-    lets decode past CLIP_MAX_NEW_TOKEN retract instead of failing the alloc."""
+class TestNextStepHostDemand(CustomTestCase):
+    """HiSparseCoordinator.next_step_host_demand: the per-step host check, as a
+    KVDemand, that lets decode past the clip retract instead of failing alloc."""
 
     PAGE = 64
 
@@ -309,29 +309,39 @@ class TestHostDecodeCapacity(CustomTestCase):
         coord._ensure_host_free = lambda n: HiSparseCoordinator._ensure_host_free(
             coord, n
         )
+        coord.host_available = lambda: HiSparseCoordinator.host_available(coord)
+        coord.host_reclaim = lambda n: HiSparseCoordinator.host_reclaim(coord, n)
         return coord, pool, evicted
 
     @staticmethod
     def _req(slot, seqlen):
         return SimpleNamespace(kv=SimpleNamespace(req_pool_idx=slot), seqlen=seqlen)
 
-    def _ok(self, coord, reqs):
-        return HiSparseCoordinator.host_decode_capacity_ok(coord, reqs)
+    def _demand(self, coord, reqs):
+        return HiSparseCoordinator.next_step_host_demand(coord, reqs)
+
+    def _fits(self, coord, reqs):
+        demand = self._demand(coord, reqs)
+        return coord.host_reclaim(demand.host_tokens) >= demand.host_tokens
 
     def test_mid_page_needs_nothing(self):
         # Next backup lands inside an allocated page: no host demand at all.
         coord, _, evicted = self._coord([128], available=0)
-        self.assertTrue(self._ok(coord, [self._req(0, 100)]))
+        self.assertEqual(self._demand(coord, [self._req(0, 100)]).host_tokens, 0)
+        self.assertTrue(self._fits(coord, [self._req(0, 100)]))
         self.assertEqual(evicted, [])
 
-    def test_page_boundary_with_free_page(self):
+    def test_page_boundary_asks_one_page(self):
         coord, _, evicted = self._coord([128], available=self.PAGE)
-        self.assertTrue(self._ok(coord, [self._req(0, 129)]))
+        self.assertEqual(
+            self._demand(coord, [self._req(0, 129)]).host_tokens, self.PAGE
+        )
+        self.assertTrue(self._fits(coord, [self._req(0, 129)]))
         self.assertEqual(evicted, [])
 
     def test_page_boundary_reclaims_tree_cache(self):
         coord, _, evicted = self._coord([128], available=0, evictable=self.PAGE)
-        self.assertTrue(self._ok(coord, [self._req(0, 129)]))
+        self.assertTrue(self._fits(coord, [self._req(0, 129)]))
         self.assertEqual(evicted, [self.PAGE])
 
     def test_past_clip_exhausted_host_retracts_until_it_fits(self):
@@ -343,25 +353,38 @@ class TestHostDecodeCapacity(CustomTestCase):
         allocated -= allocated % self.PAGE  # boundary position matters here
         coord, pool, _ = self._coord([allocated, allocated], available=0)
         reqs = [self._req(0, allocated + 1), self._req(1, allocated + 1)]
-        self.assertFalse(self._ok(coord, reqs))
+        self.assertEqual(self._demand(coord, reqs).host_tokens, 2 * self.PAGE)
+        self.assertFalse(self._fits(coord, reqs))
         pool.available += allocated  # retract request 1: its host slots return
-        self.assertTrue(self._ok(coord, reqs[:1]))
+        self.assertTrue(self._fits(coord, reqs[:1]))
 
     def test_unslotted_request_is_skipped(self):
         coord, _, _ = self._coord([0], available=0)
-        self.assertTrue(self._ok(coord, [self._req(None, 10)]))
+        self.assertEqual(self._demand(coord, [self._req(None, 10)]).host_tokens, 0)
 
 
 class TestHiSparseCheckDecodeCapacity(CustomTestCase):
-    """HiSparseTokenToKVPoolAllocator.check_decode_capacity folds the host check
+    """HiSparseTokenToKVPoolAllocator.check_decode_capacity folds the host demand
     into the per-step decode capacity gate the retract loop converges on."""
 
-    def _alloc(self, logical, hot, host_fn=None):
+    def _alloc(self, logical, hot, host_demand=None, binding=True):
         alloc = object.__new__(HiSparseTokenToKVPoolAllocator)
         alloc.logical_attn_allocator = SimpleNamespace(available_size=lambda: logical)
         alloc.hisparse_attn_allocator = SimpleNamespace(available_size=lambda: hot)
-        if host_fn is not None:
-            alloc.set_host_decode_capacity_fn(host_fn)
+        if host_demand is not None or binding:
+            calls = []
+
+            def next_step_host_demand(reqs):
+                calls.append(reqs)
+                return SimpleNamespace(
+                    host_tokens=0 if host_demand is None else host_demand
+                )
+
+            coord = SimpleNamespace(
+                next_step_host_demand=next_step_host_demand,
+                host_reclaim=lambda n: 0,
+            )
+            alloc.set_host_pool(coord, binding=binding)
         return alloc
 
     def _check(self, alloc, num_tokens=8, requests=("r",)):
@@ -370,24 +393,22 @@ class TestHiSparseCheckDecodeCapacity(CustomTestCase):
         )
 
     def test_host_shortfall_fails_the_check(self):
-        self.assertFalse(self._check(self._alloc(64, 64, host_fn=lambda r: False)))
+        self.assertFalse(self._check(self._alloc(64, 64, host_demand=64)))
 
     def test_device_shortfall_short_circuits_host_check(self):
-        calls = []
-        alloc = self._alloc(4, 64, host_fn=lambda r: calls.append(r) or True)
+        alloc = self._alloc(4, 64, host_demand=64)
         self.assertFalse(self._check(alloc))
-        self.assertEqual(calls, [])
 
     def test_passes_when_both_fit(self):
-        self.assertTrue(self._check(self._alloc(64, 64, host_fn=lambda r: True)))
-
-    def test_without_host_fn_only_device_counts(self):
         self.assertTrue(self._check(self._alloc(64, 64)))
+
+    def test_without_host_pool_only_device_counts(self):
+        self.assertTrue(self._check(self._alloc(64, 64, binding=False)))
 
 
 class TestHostGrowthReserved(CustomTestCase):
-    """DecodePreallocQueue host-gate helpers: full-output host target and the
-    decode growth still owed by admitted requests."""
+    """Coordinator host accounting: full-output host target and the decode
+    growth still owed by admitted requests."""
 
     @staticmethod
     def _req(idx, prompt, max_new, finished=False):
@@ -398,24 +419,22 @@ class TestHostGrowthReserved(CustomTestCase):
             finished=lambda: finished,
         )
 
-    def _queue(self, allocated, running=(), waiting=(), transfer=()):
-        from sglang.srt.disaggregation.decode import DecodePreallocQueue
-
-        q = DecodePreallocQueue.__new__(DecodePreallocQueue)
-        q.scheduler = SimpleNamespace(
-            hisparse_coordinator=SimpleNamespace(
-                mem_pool_host=_FakeHostPool(0, page_size=4),
-                req_to_host_pool_allocated_len=torch.tensor(allocated),
-            ),
-            running_batch=SimpleNamespace(reqs=list(running)),
-            waiting_queue=list(waiting),
+    def _coord(self, allocated):
+        coord = SimpleNamespace(
+            mem_pool_host=_FakeHostPool(0, page_size=4),
+            req_to_host_pool_allocated_len=torch.tensor(allocated),
         )
-        q.transfer_queue = SimpleNamespace(queue=list(transfer))
-        return q
+        coord.host_target = lambda req, fill_len: HiSparseCoordinator.host_target(
+            coord, req, fill_len
+        )
+        coord.host_growth_reserved = lambda reqs: (
+            HiSparseCoordinator.host_growth_reserved(coord, reqs)
+        )
+        return coord
 
     def test_target_is_page_rounded_prompt_plus_output(self):
-        q = self._queue([0])
-        self.assertEqual(q._hisparse_host_target(self._req(0, 10, 5), 10), 16)
+        coord = self._coord([0])
+        self.assertEqual(coord.host_target(self._req(0, 10, 5), 10), 16)
 
     def test_rebootstrap_target_counts_emitted_tokens(self):
         # A retracted request refills prompt + emitted tokens, so a prompt-only
@@ -424,22 +443,22 @@ class TestHostGrowthReserved(CustomTestCase):
 
         req = self._req(0, 10, 5)
         req.output_ids = list(range(7))
-        q = self._queue([0])
+        coord = self._coord([0])
         fill_len = pre_alloc_fill_len(req)  # 10 + 7 - 1 pending input
-        self.assertEqual(q._hisparse_host_target(req, fill_len), 24)  # 21 -> 24
+        self.assertEqual(coord.host_target(req, fill_len), 24)  # 21 -> 24
 
     def test_growth_sums_active_requests(self):
         running = self._req(0, 10, 5)  # target 16, allocated 12 -> owes 4
         waiting = self._req(1, 8, 8)  # target 16, allocated 8 -> owes 8
         moving = self._req(2, 4, 0)  # target 4, allocated 4 -> owes 0
-        q = self._queue([12, 8, 4], [running], [waiting], [moving])
-        self.assertEqual(q._hisparse_host_growth_reserved(), 12)
+        coord = self._coord([12, 8, 4])
+        self.assertEqual(coord.host_growth_reserved([running, waiting, moving]), 12)
 
     def test_growth_skips_finished_and_unslotted(self):
         done = self._req(0, 10, 5, finished=True)
         no_slot = self._req(None, 10, 5)
-        q = self._queue([0], [done, no_slot])
-        self.assertEqual(q._hisparse_host_growth_reserved(), 0)
+        coord = self._coord([0])
+        self.assertEqual(coord.host_growth_reserved([done, no_slot]), 0)
 
 
 class TestHostTokenCapacityConfig(CustomTestCase):

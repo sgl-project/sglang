@@ -59,6 +59,7 @@ from sglang.srt.mem_cache.allocator.hisparse import (
 from sglang.srt.mem_cache.hisparse_memory_pool import (
     HiSparseDSATokenToKVPool,
 )
+from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool, ReqToTokenPool
 from sglang.srt.mem_cache.memory_pool_host import DeepSeekV4PagedHostPool
 from sglang.srt.mem_cache.pool_host.mha import HiSparseMHATokenToKVPoolHost
@@ -1049,11 +1050,56 @@ class HiSparseCoordinator:
         if available < num_tokens:
             self._host_evict_fn(num_tokens - available)
 
-    def host_decode_capacity_ok(self, requests) -> bool:
-        """Whether next step's decode backups fit in the host pool, evicting first.
+    def host_available(self) -> int:
+        """Free slots in the HiSparse host pool (page granular)."""
+        return int(self.mem_pool_host.available_size())
 
-        Admission only reserves growth up to CLIP_MAX_NEW_TOKEN, so decoding past
-        it can exhaust the pool. False lets the scheduler retract (HiSparse
+    def host_reclaim(self, num_tokens: int) -> int:
+        """Evict tree-held host slots until ``num_tokens`` are free; return
+        what is free afterwards."""
+        if num_tokens > 0:
+            self._ensure_host_free(num_tokens)
+        return self.host_available()
+
+    def host_target(self, req: Req, fill_len: int) -> int:
+        """Host slots a request holds once its (clipped) output is generated.
+
+        ``fill_len`` is what pre-alloc fills: a re-bootstrapped request counts
+        its emitted tokens too, as _required_admission_tokens does.
+        """
+        from sglang.srt.utils.common import ceil_align
+
+        return ceil_align(
+            fill_len
+            + min(
+                req.sampling_params.max_new_tokens,
+                envs.SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION.get(),
+            ),
+            self.mem_pool_host.page_size,
+        )
+
+    def host_growth_reserved(self, reqs) -> int:
+        """Host slots admitted requests will still allocate while decoding.
+
+        Admission reserves each request against its prompt, as the logical
+        budget does; growth past it is caught per step by next_step_host_demand.
+        """
+        reserved = 0
+        for req in reqs:
+            req_pool_idx = req.kv.req_pool_idx
+            if req_pool_idx is None or req.finished():
+                continue
+            target = self.host_target(req, len(req.origin_input_ids))
+            reserved += max(
+                0, target - int(self.req_to_host_pool_allocated_len[req_pool_idx])
+            )
+        return reserved
+
+    def next_step_host_demand(self, requests) -> KVDemand:
+        """Host slots the next decode step's backups need, as a demand.
+
+        Admission only reserves growth up to the clip, so decoding past it can
+        exhaust the pool; a shortfall here lets the scheduler retract (HiSparse
         re-bootstraps) instead of failing in alloc_paged_token_slots.
         """
         num_pages = 0
@@ -1067,11 +1113,7 @@ class HiSparseCoordinator:
                 self.req_to_host_pool_allocated_len[req_pool_idx]
             ):
                 num_pages += 1
-        if num_pages == 0:
-            return True
-        need = num_pages * self.page_size
-        self._ensure_host_free(need)
-        return self.mem_pool_host.available_size() >= need
+        return KVDemand(host_tokens=num_pages * self.page_size)
 
     def _preload_to_device_buffer(self, req: Req) -> None:
         """Preload all tokens from host pool into the device buffer."""

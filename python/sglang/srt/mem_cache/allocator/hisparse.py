@@ -116,12 +116,41 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.hisparse_attn_allocator.available_size(),
         )
 
-    # Set by the scheduler when the HiSparse host pool can run out before the
-    # logical pool (host-radix or host_token_capacity); see check_decode_capacity.
-    _host_decode_capacity_fn = None
+    # The coordinator owns the HiSparse host pool. It is registered here (not
+    # injected as a boolean callback) so both admission and the per-step check
+    # can price the host pool from the same KVDemand shape.
+    _host_pool = None
+    _host_binding = False
 
-    def set_host_decode_capacity_fn(self, fn) -> None:
-        self._host_decode_capacity_fn = fn
+    def set_host_pool(self, coordinator, *, binding: bool) -> None:
+        """Register the host-pool owner; ``binding`` says whether the host pool
+        can run out before the logical pool (host-radix or a decoupled pool)."""
+        self._host_pool = coordinator
+        self._host_binding = bool(binding)
+
+    def host_fits(self, demand) -> bool:
+        """Whether ``demand``'s host slots fit, reclaiming tree-held slots first."""
+        if demand.host_tokens <= 0 or not self._host_binding:
+            return True
+        reclaimed = self._host_pool.host_reclaim(demand.host_tokens)
+        return reclaimed >= demand.host_tokens
+
+    def prealloc_fits(
+        self,
+        demand,
+        *,
+        evictable,
+        full_budget_tokens,
+        window_budget_tokens=None,
+    ) -> bool:
+        if not super().prealloc_fits(
+            demand,
+            evictable=evictable,
+            full_budget_tokens=full_budget_tokens,
+            window_budget_tokens=window_budget_tokens,
+        ):
+            return False
+        return self.host_fits(demand)
 
     def check_decode_capacity(
         self,
@@ -138,8 +167,9 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             spec_algorithm=spec_algorithm,
         ):
             return False
-        fn = self._host_decode_capacity_fn
-        return fn is None or requests is None or fn(requests)
+        if requests is None or not self._host_binding:
+            return True
+        return self.host_fits(self._host_pool.next_step_host_demand(requests))
 
     @property
     def supports_deferred_release(self) -> bool:

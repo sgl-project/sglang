@@ -13,13 +13,16 @@ from sglang.srt.utils.common import ceil_align
 
 class KVDemand(msgspec.Struct, frozen=True):
     """What an allocation takes: tokens of the token sub-pool, tokens of each
-    window sub-pool by its name, and state slots. Admission and the take must
-    name every window (`checked`); an eviction request may name only the
-    sub-pools it is short of (`completed`)."""
+    window sub-pool by its name, state slots, and (HiSparse) L2 host slots.
+    Admission and the take must name every window (`checked`); an eviction
+    request may name only the sub-pools it is short of (`completed`)."""
 
     full_tokens: int = 0
     window_tokens: Mapping[str, int] = msgspec.field(default_factory=dict)
     state_slots: int = 0
+    # HiSparse: host slots this allocation takes from the L2 host pool. Every
+    # other pool leaves it 0, so a demand without it prices exactly as before.
+    host_tokens: int = 0
 
     @classmethod
     def same_tokens(cls, allocator, tokens: int, *, state_slots: int = 0) -> KVDemand:
@@ -39,7 +42,7 @@ class KVDemand(msgspec.Struct, frozen=True):
                 f"a demand must name every window pool: it names "
                 f"{sorted(self.window_tokens)}, the allocator keeps {sorted(names)}"
             )
-        if self.full_tokens < 0 or self.state_slots < 0:
+        if self.full_tokens < 0 or self.state_slots < 0 or self.host_tokens < 0:
             raise ValueError(f"negative demand {self}")
         if any(t < 0 for t in self.window_tokens.values()):
             raise ValueError(f"negative window demand {self}")
@@ -62,6 +65,7 @@ class KVDemand(msgspec.Struct, frozen=True):
         return not (
             self.full_tokens > 0
             or self.state_slots > 0
+            or self.host_tokens > 0
             or any(t > 0 for t in self.window_tokens.values())
         )
 

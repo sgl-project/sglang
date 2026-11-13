@@ -1383,13 +1383,15 @@ class Scheduler(
         self.hisparse_coordinator = self.tp_worker.model_runner.hisparse_coordinator
         self.hisparse_coordinator.set_decode_producer_stream(self.forward_stream)
 
-        if (
-            self.enable_hisparse_host_radix
-            or self.hisparse_coordinator.host_pool_decoupled
-        ):
-            self.token_to_kv_pool_allocator.set_host_decode_capacity_fn(
-                self.hisparse_coordinator.host_decode_capacity_ok
-            )
+        # The coordinator owns the host pool; binding says whether it can run
+        # out before the logical pool (host-radix or a decoupled host size).
+        self.token_to_kv_pool_allocator.set_host_pool(
+            self.hisparse_coordinator,
+            binding=(
+                self.enable_hisparse_host_radix
+                or self.hisparse_coordinator.host_pool_decoupled
+            ),
+        )
 
         if self.enable_hisparse_host_radix:
             from sglang.srt.mem_cache.hicache_storage import PoolName
