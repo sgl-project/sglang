@@ -20,6 +20,7 @@ PR #25090 vs #14194):
   - cp_lse_ag_out_rs_mla: Triton (log2/exp2) correction / reduce-scatter
 """
 
+import itertools
 import logging
 from typing import Optional
 
@@ -229,21 +230,18 @@ def all_gather_kv_cache_for_mha_extend(
     token_to_kv_pool,
     attn_mqa,
     dcp_local_prefix_kv_indices,
-    seq_lens,
-    extend_prefix_lens,
     extend_prefix_lens_cpu: list[int],
-    extend_seq_lens,
+    extend_seq_lens_cpu: list[int],
     kv_a: torch.Tensor,
     k_pe: torch.Tensor,
 ):
     prefix_kv_a, prefix_k_pe = token_to_kv_pool.layer_router.read(
         attn_mqa.layer_id
     ).read_mla(attn_mqa, dcp_local_prefix_kv_indices, dst_dtype=kv_a.dtype)
-    extend_prefix_lens_cpu = torch.tensor(extend_prefix_lens_cpu)
     gathered_kv_cache = all_gather_kv_cache_for_dcp(
         prefix_kv_a,
         prefix_k_pe,
-        extend_prefix_lens_cpu,
+        torch.tensor(extend_prefix_lens_cpu),
     )
     prefix_kv_a, prefix_k_pe = gathered_kv_cache.split(
         [kv_a.shape[-1], k_pe.shape[-1]], dim=-1
@@ -255,29 +253,26 @@ def all_gather_kv_cache_for_mha_extend(
         prefix_kv_a = prefix_kv_a.to(kv_a.dtype)
     if prefix_k_pe.dtype != k_pe.dtype:
         prefix_k_pe = prefix_k_pe.to(k_pe.dtype)
-    # re-organize kv with query orders
-    prefix_lens_cu = torch.zeros(
-        len(seq_lens) + 1,
-        dtype=torch.int32,
-        device=kv_a.device,
+    # Host lengths avoid a device sync per slice bound, and this runs once per MLA layer.
+    prefix_starts = [0, *itertools.accumulate(extend_prefix_lens_cpu)]
+    extend_starts = [0, *itertools.accumulate(extend_seq_lens_cpu)]
+    assert len(prefix_starts) == len(extend_starts), (
+        f"{len(extend_prefix_lens_cpu)=} != {len(extend_seq_lens_cpu)=}"
     )
-    extend_lens_cu = torch.zeros_like(prefix_lens_cu)
-    prefix_lens_cu[1:] = torch.cumsum(extend_prefix_lens, dim=0)
-    extend_lens_cu[1:] = torch.cumsum(extend_seq_lens, dim=0)
-    kv_a_tuple = ()
-    k_pe_tuple = ()
-    for i in range(len(seq_lens)):
-        kv_a_tuple += (
-            prefix_kv_a[prefix_lens_cu[i] : prefix_lens_cu[i + 1]],
-            kv_a[extend_lens_cu[i] : extend_lens_cu[i + 1]],
-        )
-        k_pe_tuple += (
-            prefix_k_pe[prefix_lens_cu[i] : prefix_lens_cu[i + 1]],
-            k_pe[extend_lens_cu[i] : extend_lens_cu[i + 1]],
-        )
-    kv_a = torch.cat(kv_a_tuple, dim=0)
-    k_pe = torch.cat(k_pe_tuple, dim=0)
-    return kv_a.contiguous(), k_pe.contiguous()
+    # kv_a may end in attention-TP padding rows, which the slices below drop.
+    assert extend_starts[-1] <= kv_a.shape[0], (
+        f"{extend_starts[-1]=} > {kv_a.shape[0]=}"
+    )
+    kv_a_parts = []
+    k_pe_parts = []
+    for i in range(len(extend_seq_lens_cpu)):
+        prefix = slice(prefix_starts[i], prefix_starts[i + 1])
+        extend = slice(extend_starts[i], extend_starts[i + 1])
+        kv_a_parts += [prefix_kv_a[prefix], kv_a[extend]]
+        k_pe_parts += [prefix_k_pe[prefix], k_pe[extend]]
+    kv_a = torch.cat(kv_a_parts, dim=0)
+    k_pe = torch.cat(k_pe_parts, dim=0)
+    return kv_a, k_pe
 
 
 def all_gather_q_for_mla_decode(
@@ -550,8 +545,9 @@ _PUSH_COMBINE_COMM = None
 
 
 def init_dcp_push_combine(cp_group: "GroupCoordinator", num_heads: int) -> None:
-    """Allocate the push plane of the one-kernel DCP reduce (see
-    dcp_push_combine_reduce). Call once per process before CUDA-graph capture."""
+    """Declare the push slots of the one-kernel DCP reduce (see
+    dcp_push_combine_reduce) on the CP group's symmetric workspace. Call once
+    per process during model construction, before CUDA-graph capture."""
     global _PUSH_COMBINE_COMM
     from sglang.srt.environ import envs
 
@@ -560,8 +556,12 @@ def init_dcp_push_combine(cp_group: "GroupCoordinator", num_heads: int) -> None:
     if not envs.SGLANG_ENABLE_DCP_PUSH_COMBINE.get() or num_heads % cp_group.world_size:
         return
     from sglang.kernels.ops.attention import dcp_push_combine as pc
-    from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
-        CustomAllReduceV2,
+    from sglang.srt.distributed.device_communicators.configs.custom_all_reduce_v2 import (
+        get_all_reduce_config,
+    )
+    from sglang.srt.distributed.device_communicators.symm_workspace import (
+        WorkspaceRequest,
+        request_group_workspace,
     )
 
     slot_bytes = (
@@ -569,19 +569,22 @@ def init_dcp_push_combine(cp_group: "GroupCoordinator", num_heads: int) -> None:
         * (num_heads // cp_group.world_size)
         * pc.SLOT_BYTES_PER_ROW
     )
-    comm = CustomAllReduceV2(
-        cp_group.cpu_group,
-        torch.device("cuda", torch.cuda.current_device()),
-        max_pull_size=0,
-        max_push_size=slot_bytes,
+    lease = request_group_workspace(
+        cp_group, WorkspaceRequest(owner="dcp_push_combine", push_slot_bytes=slot_bytes)
     )
-    if comm.disabled:
+    if lease is None:
         logger.warning(
-            "DCP push-combine: CustomAllReduceV2 unavailable, keeping the a2a reduce"
+            "DCP push-combine: no symmetric workspace on the CP group, keeping the "
+            "a2a reduce"
         )
         return
-    pc.register_comm(comm.obj)
-    _PUSH_COMBINE_COMM = comm
+    # the grid cap the tuned custom all-reduce config gives this world size
+    push_blocks = get_all_reduce_config(cp_group.world_size).num_push_blocks
+    pc.register_comm(
+        lambda: lease.get_communicator(push_blocks=push_blocks),
+        world_size=lease.world_size,
+    )
+    _PUSH_COMBINE_COMM = lease
 
 
 def dcp_push_combine_fits(rows: int) -> bool:
@@ -591,7 +594,7 @@ def dcp_push_combine_fits(rows: int) -> bool:
 
     return (
         _PUSH_COMBINE_COMM is not None
-        and rows * pc.SLOT_BYTES_PER_ROW <= _PUSH_COMBINE_COMM.max_push_size
+        and rows * pc.SLOT_BYTES_PER_ROW <= _PUSH_COMBINE_COMM.request.push_slot_bytes
     )
 
 

@@ -156,7 +156,7 @@ class TestServerArgsPositionalOrder(CustomTestCase):
             with self.subTest(index=index):
                 self.assertEqual(fields[index].name, name)
         defaults = ServerArgs(model_path="dummy")
-        # Surviving legacy inputs retain their slots after an intentional removal.
+        # deprecated constructor fields keep their historical slots
         positional = [getattr(defaults, field.name) for field in fields[:533]]
         positional[95] = True
         positional[96] = False
@@ -1002,6 +1002,30 @@ class TestPrepareServerArgs(CustomTestCase):
             )
         )
 
+    def test_config_deprecated_no_op_boolean_flags(self):
+        """Retired booleans in YAML remain accepted without changing arguments."""
+        parser = argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        base_args = ["--model-path", "dummy"]
+        baseline = vars(parser.parse_args(base_args))
+
+        for flag in (
+            "disable-outlines-disk-cache",
+            "show-time-cost",
+            "triton-attention-reduce-in-fp32",
+        ):
+            for value in (True, False):
+                with (
+                    self.subTest(flag=flag, value=value),
+                    tempfile.NamedTemporaryFile(mode="w", suffix=".yaml") as f,
+                ):
+                    f.write(f"{flag}: {str(value).lower()}\n")
+                    f.flush()
+                    merged = ConfigArgumentMerger(parser).merge_config_with_args(
+                        ["--config", f.name] + base_args
+                    )
+                    self.assertEqual(vars(parser.parse_args(merged)), baseline)
+
     def test_config_nested_dict_args_are_json(self):
         with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
             f.write("mm-process-config:\n  image:\n    resize: 128\n")
@@ -1125,6 +1149,40 @@ class TestTokenspeedMlaAlias(CustomTestCase):
         self.assertEqual(
             resolution_result(server_args, "speculative_attention_mode"), "decode"
         )
+
+
+class TestFlashinferMoeA2AAlias(CustomTestCase):
+    def test_maps_to_flashinfer_nvlink_one_sided(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            moe_a2a_backend="flashinfer",
+            speculative_moe_a2a_backend="flashinfer",
+        )
+
+        with self.assertLogs(serving_hook.logger, level="WARNING") as cm:
+            handle_deprecated_args(server_args)
+
+        for field in ("moe_a2a_backend", "speculative_moe_a2a_backend"):
+            self.assertEqual(
+                resolution_result(server_args, field), "flashinfer_nvlink_one_sided"
+            )
+            flag = "--" + field.replace("_", "-")
+            self.assertTrue(
+                any(f"{flag}=flashinfer is deprecated" in line for line in cm.output)
+            )
+
+    def test_canonical_name_is_unchanged(self):
+        server_args = ServerArgs(
+            model_path="dummy", moe_a2a_backend="flashinfer_nvlink_one_sided"
+        )
+
+        handle_deprecated_args(server_args)
+
+        self.assertEqual(
+            resolution_result(server_args, "moe_a2a_backend"),
+            "flashinfer_nvlink_one_sided",
+        )
+        self.assertIsNone(resolution_result(server_args, "speculative_moe_a2a_backend"))
 
 
 class TestMultimodalFeatureTransport(CustomTestCase):
@@ -2095,6 +2153,37 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "speculative-adaptive"):
                 validate_hisparse(server_args)
 
+    def _validate_hisparse_with_spec(self, algorithm):
+        server_args = ServerArgs(
+            model_path="dummy",
+            enable_hisparse=True,
+            disable_radix_cache=True,
+            speculative_algorithm=algorithm,
+            speculative_eagle_topk=1,
+        )
+        model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=["GlmMoeDsaForCausalLM"])
+        )
+
+        with (
+            patch(
+                "sglang.srt.arg_groups.hisparse_hook.model_config_of",
+                return_value=model_config,
+            ),
+            patch(
+                "sglang.srt.configs.model_config.is_deepseek_dsa",
+                return_value=True,
+            ),
+        ):
+            validate_hisparse(server_args)
+
+    def test_hisparse_accepts_dflash_speculation(self):
+        self._validate_hisparse_with_spec("DFLASH")
+
+    def test_hisparse_rejects_unvalidated_speculation(self):
+        with self.assertRaisesRegex(ValueError, "has not validated"):
+            self._validate_hisparse_with_spec("NGRAM")
+
 
 class TestFa4PageSizeAutoForce(CustomTestCase):
     """FA4 requires page_size 128 for non-MLA models on SM100. The auto-force
@@ -2112,7 +2201,6 @@ class TestFa4PageSizeAutoForce(CustomTestCase):
         # real model_config. Pre-set the attribute so get_model_config returns
         # early without touching ModelConfig.from_server_args.
         args._model_config = MagicMock()
-        args._model_config.hf_config.dual_chunk_attention_config = None
         return args
 
     @override_platform(is_sm100=True)
@@ -2259,7 +2347,7 @@ class TestFlashinferA2ADispatchType(CustomTestCase):
         server_args = ServerArgs(
             model_path="dummy",
             quantization=quantization,
-            moe_a2a_backend="flashinfer",
+            moe_a2a_backend="flashinfer_nvlink_one_sided",
             moe_runner_backend=runner_backend,
             flashinfer_a2a_dispatch_type=dispatch_type,
             attn_dp_size=4,
@@ -3435,6 +3523,8 @@ class TestPipelineParallelCompat(CustomTestCase):
             enable_multi_layer_eagle=False,
             disaggregation_mode="prefill",
             min_free_slots_delay=None,
+            scheduler_recv_interval=1,
+            enable_return_routed_experts=False,
         )
         cfg.update(overrides)
         return SimpleNamespace(**cfg)
@@ -3442,6 +3532,10 @@ class TestPipelineParallelCompat(CustomTestCase):
     def test_overlap_schedule_must_be_off(self):
         with self.assertRaisesRegex(AssertionError, "overlap schedule"):
             check_pipeline_parallel_compat(self._cfg(disable_overlap_schedule=False))
+
+    def test_scheduler_recv_interval_must_be_one(self):
+        with self.assertRaisesRegex(AssertionError, "--scheduler-recv-interval"):
+            check_pipeline_parallel_compat(self._cfg(scheduler_recv_interval=2))
 
     def test_no_speculative_decoding_is_fine(self):
         check_pipeline_parallel_compat(self._cfg())
@@ -3606,6 +3700,53 @@ class TestPipelineParallelPrefillCudaGraphPolicy(CustomTestCase):
                     handle_gpu_memory_settings(args)
                 prefill = resolution_result(args, "cuda_graph_config").prefill
                 self.assertEqual((prefill.max_bs, prefill.bs[-1]), (expected, expected))
+
+
+class TestDecodeCudaGraphCeilingByMemoryTier(CustomTestCase):
+    def _resolve_decode(self, gpu_mem_mb, tp_size, max_bs=None):
+        args = ServerArgs(
+            model_path="dummy",
+            tp_size=tp_size,
+            mem_fraction_static=0.8,
+            cuda_graph_config=CudaGraphConfig(decode=PhaseConfig(max_bs=max_bs)),
+        )
+        with (
+            patch(
+                "sglang.srt.arg_groups.memory_hook.use_mla_backend",
+                return_value=False,
+            ),
+            patch(
+                "sglang.srt.arg_groups.memory_hook.get_device_memory_capacity",
+                return_value=gpu_mem_mb,
+            ),
+        ):
+            handle_gpu_memory_settings(args)
+        return resolution_result(args, "cuda_graph_config").decode
+
+    def test_ceiling_never_drops_as_memory_grows(self):
+        """A larger GPU must not get a smaller default ceiling, or decode batches
+        between the two ceilings run eager only on the larger GPU."""
+        gib = (16, 24, 35, 40, 45, 48, 60, 80, 96, 192)
+        ceilings = [self._resolve_decode(g * 1024, 1).max_bs for g in gib]
+        self.assertEqual(ceilings, sorted(ceilings), dict(zip(gib, ceilings)))
+
+    def test_default_ceiling_for_35_to_60_gib(self):
+        cases = (
+            # (reported MiB, tp_size, expected decode max_bs)
+            (35 * 1024, 1, 128),
+            (46068, 1, 128),  # L40S, A40
+            (60 * 1024 - 1, 1, 128),
+            (60 * 1024, 1, 256),
+            (46068, 4, 160),
+        )
+        for gpu_mem_mb, tp_size, expected in cases:
+            with self.subTest(gpu_mem_mb=gpu_mem_mb, tp_size=tp_size):
+                decode = self._resolve_decode(gpu_mem_mb, tp_size)
+                self.assertEqual((decode.max_bs, decode.bs[-1]), (expected, expected))
+
+    def test_explicit_ceiling_is_kept(self):
+        decode = self._resolve_decode(46068, 1, max_bs=64)
+        self.assertEqual((decode.max_bs, decode.bs[-1]), (64, 64))
 
 
 class TestCudaGraphDisaggregationRoles(CustomTestCase):

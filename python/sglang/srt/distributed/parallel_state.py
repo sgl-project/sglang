@@ -2115,6 +2115,15 @@ class GroupCoordinator:
         if self.pcie_ipc_comm is not None:
             self.pcie_ipc_comm.destroy()
             self.pcie_ipc_comm = None
+        # Also before destroy_process_group(): the symmetric workspace is released
+        # collectively on cpu_group, after the custom all-reduce drops its views.
+        self.ca_comm = None
+        if self.cpu_group is not None:
+            from sglang.srt.distributed.device_communicators.symm_workspace import (
+                close_group_symm_workspaces,
+            )
+
+            close_group_symm_workspaces(self.cpu_group)
         if self.device_group is not None:
             torch.distributed.destroy_process_group(self.device_group)
             self.device_group = None
@@ -2125,8 +2134,6 @@ class GroupCoordinator:
             self.pynccl_comm = None
         if self.pymscclpp_comm is not None:
             self.pymscclpp_comm.destroy()
-        if self.ca_comm is not None:
-            self.ca_comm = None
         if self.mq_broadcaster is not None:
             self.mq_broadcaster = None
 
@@ -3328,6 +3335,39 @@ def destroy_distributed_environment():
     _MODEL_PARALLEL_GROUP_TIMEOUT = None
     if torch.distributed.is_initialized():
         torch.distributed.destroy_process_group()
+
+
+def close_custom_all_reduce() -> None:
+    """Release ROCm carv2 multi-node workspaces while the groups still exist.
+
+    Graceful shutdown aborts the process groups instead of destroying them, and
+    carv2 frees a FABRIC workspace collectively on its group.
+    """
+    if not is_hip():
+        return
+    from sglang.srt.distributed.device_communicators.symm_workspace import (
+        close_multinode_symm_workspaces,
+        is_multinode_symm_group,
+    )
+
+    for name in sorted(_groups):
+        group = _groups[name]()
+        if group is None or not is_multinode_symm_group(group.cpu_group):
+            continue
+        try:
+            if group.ca_comm is not None:
+                group.ca_comm.close()
+        except Exception as e:
+            logger.warning(
+                f"Custom all-reduce close on shutdown failed, {type(e).__name__}: {e}"
+            )
+        group.ca_comm = None
+    try:
+        close_multinode_symm_workspaces()
+    except Exception as e:
+        logger.warning(
+            f"Symmetric workspace close on shutdown failed, {type(e).__name__}: {e}"
+        )
 
 
 def abort_distributed_environment() -> None:
