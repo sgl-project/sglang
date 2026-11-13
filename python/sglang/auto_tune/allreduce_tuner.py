@@ -13,20 +13,9 @@ The server dispatches all-reduces in two stages, and so does the tuner:
 The eager table goes in ``SGLANG_TUNED_EAGER_CONFIG`` and the graph table in
 ``SGLANG_TUNED_GRAPH_CONFIG``.
 
-Which backends compete is a selection file, not a list in this module.
-``generate_selection_config`` writes it. The default selection is:
-
-- ``sglang_custom_allreduce``: SGLang's CustomAllreduce.
-- ``aiter_custom_allreduce``: AITER's CustomAllreduce, the ROCm default.
-- ``custom_allreduce_v2``: SGLang's CustomAllReduceV2. On ROCm its graph path
-  is the eager kernel recorded as is.
-- ``nccl``: PyNccl out-of-place all-reduce (RCCL on ROCm), the call the server
-  makes for an ``nccl`` row.
-- ``torch_symm_mem``: torch symmetric-memory all-reduce.
-- ``quick_allreduce_<codec>``: HIP QuickReduce at one codec. The server
-  dispatches this name.
-- ``quick_allreduce_flydsl_INT4``: AITER FlyDSL QuickReduce, mesh schedule,
-  INT4 on both laps. A different kernel from the HIP entry.
+Which backends compete comes from the selection ``generate_selection_config``
+writes. This module opens each row of that table and does not keep its own
+copy of the list.
 """
 
 from __future__ import annotations
@@ -44,6 +33,7 @@ from sglang.auto_tune.generate_selection_config import (
     QR_QUANT_REGIMES,
     build_selection,
     load_selection,
+    selection_open_params,
 )
 
 logger = logging.getLogger(__name__)
@@ -653,41 +643,6 @@ _OPENERS = {
 }
 
 
-def _bind_selection(
-    selection: Dict[str, Dict[str, Any]],
-    cpu_group,
-    device,
-) -> Dict[str, Dict[str, Any]]:
-    """Add the process group and device to each selection entry.
-
-    The file holds the opener name and its static arguments. ``cpu_group``
-    and ``device`` exist only after torchrun has started, so they are bound
-    here, once, and every rank binds the same selection.
-    """
-    bound: Dict[str, Dict[str, Any]] = {}
-    for name, spec in selection.items():
-        opener = spec["opener"]
-        shared = {"cpu_group": cpu_group, "device": device}
-        if opener == "custom_allreduce":
-            params = {**shared, "kind": spec["kind"], "lift_cap": spec["lift_cap"]}
-        elif opener == "quick_allreduce":
-            params = {
-                **shared,
-                "quant": spec["quant"],
-                "cast_bf16_to_fp16": spec["cast_bf16_to_fp16"],
-            }
-        elif opener == "quick_allreduce_flydsl":
-            params = {
-                **shared,
-                "algorithm": spec["algorithm"],
-                "codec": spec["codec"],
-            }
-        else:
-            params = shared
-        bound[name] = {"opener": opener, "params": params}
-    return bound
-
-
 def _open_backends(
     bound: Dict[str, Dict[str, Any]],
     verbose: bool,
@@ -702,7 +657,14 @@ def _open_backends(
     for name, spec in bound.items():
         if verbose:
             print(f"  opening {name}", flush=True)
-        opened = _OPENERS[spec["opener"]](**spec["params"])
+        try:
+            opener = _OPENERS[spec["opener"]]
+        except KeyError:
+            raise ValueError(
+                f"{name}: selection opener {spec['opener']!r} has no tuner "
+                "implementation"
+            ) from None
+        opened = opener(**spec["params"])
         if opened is None:
             if verbose:
                 print(f"  {name}: unavailable", flush=True)
@@ -773,7 +735,9 @@ def tune_allreduce(
             ignore_scr_max_size=ignore_scr_max_size,
             qr_cast_bf16_to_fp16=qr_cast_bf16_to_fp16,
         )
-    backends = _open_backends(_bind_selection(selection, cpu_group, device), verbose)
+    backends = _open_backends(
+        selection_open_params(selection, cpu_group, device), verbose
+    )
     dtype = torch.bfloat16
     if verbose:
         if selection_config:

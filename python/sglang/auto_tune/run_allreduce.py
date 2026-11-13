@@ -42,7 +42,21 @@ def _bool01(value: str) -> bool:
 def create_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Time every all-reduce kernel per message size, eagerly "
-        "or inside a CUDA graph, and write the fastest per size."
+        "or inside a CUDA graph, and write the fastest per size.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+examples:
+  torchrun --nproc_per_node=8 -m sglang.auto_tune.run_allreduce \\
+      --selection-config /tmp/ar-tune/selection_config.json \\
+      --tp 8 --graph 0 --median 1 -n 200 \\
+      --output-dir /tmp/ar-tune \\
+      --sizes 16384 65536 131072
+
+  torchrun --nproc_per_node=8 -m sglang.auto_tune.run_allreduce \\
+      --selection-config /tmp/ar-tune/selection_config.json \\
+      --tp 8 --graph 1 --output-dir /tmp/ar-tune \\
+      --sizes 16384 65536
+""",
     )
     parser.add_argument("--tp", "--tp-size", dest="tp_size", type=int, required=True)
     parser.add_argument(

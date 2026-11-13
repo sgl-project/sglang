@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from typing import Any, Dict
 
 # Codecs QuickAllReduce reads from ROCM_QUICK_REDUCE_QUANTIZATION. NONE leaves
@@ -26,16 +27,19 @@ QR_QUANT_REGIMES = ("FP", "INT8", "INT6", "INT4")
 
 # FlyDSL mesh QuickReduce wire formats. The default schedule is single-codec
 # INT4. INT5 is mesh-only; the ring schedule accepts INT4 and INT6.
-_FLYDSL_CODECS = ("int4", "int5", "int6")
+_FLYDSL_CODECS = ("int4", "int6", "int8")
 _FLYDSL_ALGORITHMS = ("mesh", "ring")
-_OPENERS = (
-    "custom_allreduce",
-    "custom_allreduce_v2",
-    "nccl",
-    "torch_symm_mem",
-    "quick_allreduce",
-    "quick_allreduce_flydsl",
-)
+# Opener name to the static keys the tuner passes through, besides the CPU
+# group and the device. ``opener`` and ``impl`` stay out of that call.
+_OPENER_KWARGS = {
+    "custom_allreduce": ("kind", "lift_cap"),
+    "custom_allreduce_v2": (),
+    "nccl": (),
+    "torch_symm_mem": (),
+    "quick_allreduce": ("quant", "cast_bf16_to_fp16"),
+    "quick_allreduce_flydsl": ("algorithm", "codec"),
+}
+OPENER_NAMES = tuple(_OPENER_KWARGS)
 
 
 def build_selection(
@@ -102,9 +106,9 @@ def validate_selection(selection: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
         if not isinstance(spec, dict):
             raise ValueError(f"{name}: entry must be an object")
         opener = spec.get("opener")
-        if opener not in _OPENERS:
+        if opener not in _OPENER_KWARGS:
             raise ValueError(
-                f"{name}: opener must be one of {_OPENERS}, got {opener!r}"
+                f"{name}: opener must be one of {OPENER_NAMES}, got {opener!r}"
             )
         entry = dict(spec)
         if opener == "custom_allreduce":
@@ -140,6 +144,28 @@ def validate_selection(selection: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     return checked
 
 
+def selection_open_params(
+    selection: Dict[str, Dict[str, Any]],
+    cpu_group,
+    device,
+) -> Dict[str, Dict[str, Any]]:
+    """Map each table name to the opener and the kwargs that open it.
+
+    The selection holds the static arguments. ``cpu_group`` and ``device``
+    exist only after torchrun has started, so they are added here. Every rank
+    passes the same selection.
+    """
+    selection = validate_selection(selection)
+    bound: Dict[str, Dict[str, Any]] = {}
+    for name, spec in selection.items():
+        opener = spec["opener"]
+        params = {key: spec[key] for key in _OPENER_KWARGS[opener]}
+        params["cpu_group"] = cpu_group
+        params["device"] = device
+        bound[name] = {"opener": opener, "params": params}
+    return bound
+
+
 def load_selection(path: str) -> Dict[str, Dict[str, Any]]:
     """Read a selection file written by this script."""
     with open(path) as fh:
@@ -152,6 +178,9 @@ def load_selection(path: str) -> Dict[str, Dict[str, Any]]:
 
 def write_selection(path: str, selection: Dict[str, Dict[str, Any]]) -> None:
     validate_selection(selection)
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
     with open(path, "w") as fh:
         json.dump(selection, fh, indent=2)
         fh.write("\n")
@@ -168,12 +197,20 @@ def _bool01(value: str) -> bool:
 
 def create_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Write the all-reduce selection JSON the tuner opens."
+        description="Write the all-reduce selection JSON the tuner opens.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+example:
+  python -m sglang.auto_tune.generate_selection_config \\
+      --output /tmp/ar-tune/selection_config.json \\
+      --qr-quant INT4 --qr-cast-bf16-to-fp16 1 \\
+      --ignore-acr-max-size 1 --ignore-scr-max-size 0
+""",
     )
     parser.add_argument(
         "--output",
         required=True,
-        help="Path of the JSON file to write.",
+        help="Path of the JSON file to write. Parent directories are created.",
     )
     parser.add_argument(
         "--qr-quant",
