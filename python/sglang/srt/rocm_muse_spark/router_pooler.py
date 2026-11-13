@@ -34,12 +34,26 @@ JOINT_ROUTER_POOLER = envs.SGLANG_ROCM_MUSE_JOINT_ROUTER_POOLER.get()
 # activation (same switch as the FP8 dense GEMMs).
 JOINT_POOLER_FP8 = JOINT_ROUTER_POOLER and envs.SGLANG_ROCM_MUSE_DENSE_FP8.get()
 _JOINT_ROWS = (8, 16, 24)
+# Rows above 64 go to the joint form wherever it has a row-major tile (BM 128 in bf16_tiled_small_m_gemm.ROW_MAJOR).
+JOINT_MAX_ROWS = envs.SGLANG_ROCM_MUSE_JOINT_ROUTER_MAX_ROWS.get()
 _logged: set = set()
 
 
 def can_share_router_pooler(moe, x: torch.Tensor) -> bool:
     """The Muse Spark TP8 routing front: 8192 hidden, 256 experts top-8 sigmoid, 4096-wide pooler + norm."""
-    return 0 < x.shape[0] <= 64 and _routing_front_matches(moe, x)
+    m = x.shape[0]
+    if not (0 < m <= max(64, JOINT_MAX_ROWS) and _routing_front_matches(moe, x)):
+        return False
+    if m <= 64:
+        return True
+    # Above 64 rows only the joint form serves: the shared form's completed-pooler epilogue stops at 64.
+    packed = getattr(moe, "router_pooler_packed_weight", None)
+    return (
+        JOINT_ROUTER_POOLER
+        and envs.SGLANG_ROCM_MUSE_DENSE_TILED.get()
+        and packed is not None
+        and joint_router_pooler_applies(x, packed)
+    )
 
 
 def can_route_fp8_joint(moe, x: torch.Tensor, x_fp8) -> bool:

@@ -20,8 +20,8 @@ from sglang.kernels.ops.layernorm.muse_spark_norm_residual_jit import (
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
-    from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
-        CustomAllReduceV2,
+    from sglang.srt.distributed.device_communicators.symm_workspace import (
+        WorkspaceLease,
     )
 
 _VEC = 8
@@ -58,20 +58,15 @@ def _jit_module(
 
 
 def all_gather_norm_residual_supported(
-    comm: Optional[CustomAllReduceV2], num_tokens: int, hidden_size: int
+    comm: Optional[WorkspaceLease], num_tokens: int, hidden_size: int
 ) -> bool:
-    from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
-        CustomAllReduceV2,
-    )
-
     if (
-        not isinstance(comm, CustomAllReduceV2)
-        or comm.disabled
+        comm is None
         or not comm.has_multicast
         or comm.world_size < 2
         or num_tokens <= 0
         or hidden_size % (comm.world_size * _VEC)
-        or num_tokens * hidden_size * 2 > comm.max_push_size
+        or num_tokens * hidden_size * 2 > comm.request.push_slot_bytes
     ):
         return False
     if not current_arch().is_sm_at_least(10):
@@ -84,7 +79,7 @@ def all_gather_norm_residual_supported(
 
 
 def all_gather_norm_residual(
-    comm: CustomAllReduceV2,
+    comm: WorkspaceLease,
     local: torch.Tensor,
     stream: torch.Tensor,
     post_eps: float,
@@ -113,7 +108,7 @@ def all_gather_norm_residual(
         alpha is not None,
     )
     module.run(
-        comm.obj,
+        comm.get_communicator(),
         local.contiguous(),
         stream,
         output,

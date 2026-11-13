@@ -52,6 +52,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.kv.storage import KVStorage
     from sglang.srt.mem_cache.static_kv_storage import StaticKVStorage
+    from sglang.srt.speculative.dflash_draft_ring import DFlashDraftKVRing
 
 logger = logging.getLogger(__name__)
 
@@ -427,6 +428,20 @@ def check_state_wire(
                 "window tail than the decode server needs, as (sub-pool, prefill "
                 f"tail, decode tail): {shorter}. Both servers need the same "
                 "draft model and front rows, or a prefill keeping more."
+            )
+    from sglang.srt.disaggregation.base.conn import StateType
+
+    ring_entries = [StateType.DRAFT_RING.value, StateType.REQUEST_ROW.value]
+    for role, wire, other in (
+        ("prefill", prefill_wire, decode_wire),
+        ("decode", decode_wire, prefill_wire),
+    ):
+        if wire[:-2] == other and [entry[0] for entry in wire[-2:]] == ring_entries:
+            raise RuntimeError(
+                f"PD state entry mismatch: only the {role} server registers a "
+                f"DFLASH draft KV ring ({wire[-2:]}). Each server resolves the "
+                f"ring on its own: set SGLANG_ENABLE_DFLASH_DRAFT_KV_RING=0 on the "
+                f"{role} server, or align the flags that turn the ring on."
             )
     raise RuntimeError(
         f"PD state entry mismatch: prefill server registers {prefill_wire}, but "
@@ -1214,6 +1229,16 @@ def should_send_replicated_state(
     return local_tp_rank_in_group % writers_per_decode == 0
 
 
+def draft_kv_ring_row_pairs(
+    src_rows: Sequence[int], dst_rows: Sequence[int]
+) -> Tuple[List[int], List[int]]:
+    """The (prefill, decode) ring rows a DRAFT_RING transfer copies, from two
+    position-matched ``transfer_rows``: a position goes only where both ranks
+    own it (row 0 marks one a rank does not own under DCP)."""
+    pairs = [(a, b) for a, b in zip(src_rows, dst_rows) if a and b]
+    return [a for a, _ in pairs], [b for _, b in pairs]
+
+
 def compute_mamba_state_slice_blocks(
     src_dim: int,
     dst_dim: int,
@@ -1812,10 +1837,14 @@ def setup_state_kv_args(
     draft_token_to_kv_pool=None,
     total_kv_layers: Optional[int] = None,
     window_tails: Optional[Dict[str, int]] = None,
+    draft_kv_ring: Optional[DFlashDraftKVRing] = None,
 ) -> None:
     """Register the storage's state entries in its wire order, and the flags
     peers read from its token KV layout. ``window_tails`` gives the tail each
-    window sub-pool carries (`KVStorage.retained_window_lengths`); peers agree on it."""
+    window sub-pool carries (`KVStorage.retained_window_lengths`); peers agree on it.
+    A DFLASH draft KV ring's rows and floor go after the storage's entries:
+    readers that zip against the storage's wire entries skip them, and the wire
+    check and the checksum filter find them there."""
     from sglang.srt.disaggregation.base.conn import StateType
     from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
@@ -1868,6 +1897,13 @@ def setup_state_kv_args(
         kv_args.dsa_index_k_token_bytes = (
             key_bytes,
             owner_view.index_bytes_per_token - key_bytes,
+        )
+    if draft_kv_ring is not None:
+        append_state_component(
+            kv_args, StateType.DRAFT_RING, *draft_kv_ring.ring_buf_infos()
+        )
+        append_state_component(
+            kv_args, StateType.REQUEST_ROW, *draft_kv_ring.floor_buf_infos()
         )
     kv_args.state_window_tails = [
         (window_tails or {}).get(sub_pool) if sub_pool is not None else None

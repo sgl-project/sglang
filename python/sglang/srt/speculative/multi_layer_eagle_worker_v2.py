@@ -151,11 +151,6 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
 
         self._rebuild_topk1_chain_buffers()
 
-        # Set constant
-        EagleDraftInput.ALLOC_LEN_PER_DECODE = max(
-            self.speculative_num_steps * self.topk, self.speculative_num_draft_tokens
-        )
-
         # Retain the target's attention topology when swapping TP groups.
         self.parallel_layout = resolve_draft_parallel_layout(
             DraftParallelSpec(tp_execution=DraftTPExecution.TARGET_LAYOUT)
