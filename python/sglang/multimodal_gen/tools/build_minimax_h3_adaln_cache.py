@@ -34,10 +34,7 @@ _CACHE_MODES = {
     "ref2va-image": ("video", "audio", "image"),
     "ref2va-audio": ("video", "audio", "audio_ref"),
     "ref2va-mixed": ("video", "audio", "image", "audio_ref"),
-    # MiniMax H3 image serves both declared tasks from one checkpoint, so one
-    # sidecar file covers them: the t2i plans (the step's timestep alone) and
-    # the edit plans (that timestep plus the pinned reference's). See
-    # _image_timestep_plans for the per-task layout.
+    # One image sidecar covers both declared tasks; see _image_timestep_plans.
     "image": ("video", "image"),
 }
 _IMAGE_TASK_FIELDS = {
@@ -98,8 +95,8 @@ def _cache_timestep_plans(args: argparse.Namespace) -> list[torch.Tensor]:
         return [torch.tensor(args.timesteps, dtype=torch.float32).unique(sorted=True)]
 
     if args.pdd_config is not None:
-        # Image releases are distilled on an explicit grid, not the shifted
-        # video schedule; both branches (image has no audio) step that grid.
+        # Image releases step the distilled grid; no audio branch, so both
+        # sigma lists are the same.
         with args.pdd_config.open() as f:
             video_sigmas = list(minimax_h3_image_pdd_grid(json.load(f)))
         audio_sigmas = video_sigmas
@@ -141,12 +138,8 @@ def _cache_timestep_plans(args: argparse.Namespace) -> list[torch.Tensor]:
 def _image_timestep_plans(
     sigmas: list[float], *, cond_timestep: float
 ) -> list[torch.Tensor]:
-    """Every plan the image denoise loop can look up on a fixed PDD grid.
-
-    t2i forwards only the step's timestep. Editing pins the reference's
-    noise-aug timestep next to it (``pin_imgvid_cond``), so its plans keep
-    both. Both tasks walk the same grid.
-    """
+    """Plans the image loop looks up: t2i the step's timestep, edit also the
+    pinned reference timestep (``pin_imgvid_cond``)."""
     plans = []
     for sigma in sigmas[:-1]:
         timestep = 1.0 - sigma
