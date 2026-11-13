@@ -2543,10 +2543,6 @@ class DeepseekV4AttnBackend(
                 req_pool_indices=req_pool_indices,
             )
         )
-        if self.trtllm_attn:
-            # DP padding can expand a length-one request into nonpositive
-            # per-token lens; trtllm-gen requires them to remain at least one.
-            seq_lens_casual = seq_lens_casual.clamp(min=1)
         core_attn_metadata = self.make_core_attn_metadata(
             req_to_token=self.req_to_token,
             req_pool_indices_repeated=req_pool_indices_repeated,
@@ -4989,6 +4985,9 @@ class DeepseekV4AttnBackend(
         seq_lens_casual = seq_lens[:, None] + torch.arange(
             -qo_len + 1, 1, **self.cuda_int32_kwargs
         )
+        # Graph-padded requests use seq_len=1 even when qo_len is wider. Keep
+        # their causal rows on reserved slot 0 instead of producing negatives.
+        seq_lens_casual.clamp_min_(1)
         seq_lens_casual = seq_lens_casual.flatten()
         idx_to_req_repeated = torch.arange(
             bs, **self.cuda_int32_kwargs
