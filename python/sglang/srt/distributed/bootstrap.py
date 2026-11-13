@@ -32,7 +32,6 @@ from sglang.srt.layers.layernorm_sp import initialize_layernorm_sp
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_device,
-    get_disagg,
     get_exec,
     get_parallel,
     get_serving,
@@ -174,7 +173,7 @@ def init_parallel_runtime(
     ):
         _prewarm_tp_lm_head_all_to_all()
 
-    # EPLB uses the default process group, not the TP/EP coordinators.
+    # CUDA EPLB uses the default process group, not the TP/EP coordinators.
     # Limit warmup to static full-EP layouts for now.
     if (
         device == "cuda"
@@ -185,6 +184,16 @@ def init_parallel_runtime(
         and parallel.moe_ep_size == parallel.tp_size > 1
     ):
         _prewarm_eplb_p2p()
+
+    # Account for NPU EPLB's TP transports before sizing the KV cache.
+    if (
+        device == "npu"
+        and get_exec().moe.enable_eplb
+        and get_exec().moe.elastic_ep_backend is None
+    ):
+        from sglang.srt.hardware_backend.npu.eplb import prewarm_eplb_communication
+
+        prewarm_eplb_communication()
 
     logger.info(f"Init parallel ends. elapsed={time.perf_counter() - tic:.2f} s")
 
@@ -330,7 +339,6 @@ def _init_parallel_groups(
         max_world_size=get_parallel().max_ep_size,
     )
     initialize_model_parallel(
-        duplicate_tp_group=get_disagg().enable_pdmux,
         enable_symm_mem=get_exec().comm.enable_symm_mem,
         # Only WORLD is extended during scale-up. The joiner's model-parallel
         # groups are fixed groups local to its launch cohort.

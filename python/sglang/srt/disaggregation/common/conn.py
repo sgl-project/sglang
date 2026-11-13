@@ -42,12 +42,17 @@ from sglang.srt.disaggregation.common.bootstrap import (
     BootstrapNotification,
     DeferredBootstrap,
 )
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.pp_consensus_store import PPConsensusStore
 from sglang.srt.disaggregation.utils import (
-    DisaggregationMode,
+    MetadataBuffers,
+    check_stage_state_wires,
+    check_state_wire,
     filter_kv_indices_for_cp_rank,
     filter_kv_indices_for_shard_rank,
     get_dsv41_spec_layout,
+    get_spec_kv_layout,
+    state_wire,
 )
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.page_interleave import get_kv_shard_group
@@ -55,6 +60,7 @@ from sglang.srt.observability.trace import TraceNullContext, TraceReqContext
 from sglang.srt.runtime_context import (
     get_device,
     get_disagg,
+    get_memory,
     get_observability,
     get_parallel,
     get_schedule,
@@ -128,10 +134,17 @@ class PrefillServerInfo:
     follow_bootstrap_room: bool
     enable_dsa_cache_layer_split: bool = False
     dsv41_spec_layout: Optional[dict] = None
+    spec_kv_layout: Optional[dict] = None
     kv_layout: Optional[str] = None
+    # The (state type, sub-pool, window tail) entries every prefill rank registers;
+    # None when pipeline stages register different ones or ranks do not report them.
+    state_wire: Optional[List[List[Optional[str]]]] = None
+    # Each pipeline stage's entries, by stage, when the stages differ.
+    state_wires: Optional[List[Optional[List[List[Optional[str]]]]]] = None
     decode_allocation_policy: str = "early"
     # Each prefill shard-group rank owns a subset of logical KV pages.
     enable_kv_cache_sharding: bool = False
+    stores_to_linker: bool = False
 
     # PD true-retraction rebootstrap: the prefill's HTTP API port. The decode
     # already knows the prefill host (the bootstrap_addr host), so it can POST
@@ -158,6 +171,7 @@ class PrefillServerInfo:
         )
         self.follow_bootstrap_room = bool(self.follow_bootstrap_room)
         self.enable_dsa_cache_layer_split = bool(self.enable_dsa_cache_layer_split)
+        self.stores_to_linker = bool(self.stores_to_linker)
         self.prefill_http_port = (
             int(self.prefill_http_port) if self.prefill_http_port is not None else None
         )
@@ -283,6 +297,17 @@ class DeferredAbortAckState(msgspec.Struct):
     prefill_ranks: Set[int]
 
 
+class SendRecord:
+    """A room's sends queued for the transfer worker and finished by it, so a
+    page move can tell when the engine is done with one send's rows."""
+
+    __slots__ = ("queued", "finished")
+
+    def __init__(self) -> None:
+        self.queued = 0
+        self.finished = 0
+
+
 class CommonKVManager(BaseKVManager):
     defer_decode_allocation: bool = False
     deferred_bootstrap: Optional[DeferredBootstrap] = None
@@ -294,6 +319,9 @@ class CommonKVManager(BaseKVManager):
     # carries tagged messages prefix a tag frame and may append a reason:
     # ``[tag, room, status, prefill_rank, reason]``.
     kv_status_msg_tag: Optional[bytes] = None
+    # Each room's `SendRecord`, from its first queued send until the sender is
+    # cleared or the room starts a new lifecycle. Created on first use.
+    _send_records: Optional[Dict[int, SendRecord]] = None
     kv_status_msg_carries_reason: bool = False
     sender_trace_module: Optional[str] = None
     # Sender reports transfer_latency_s (first enqueue -> Success). Otherwise
@@ -302,6 +330,7 @@ class CommonKVManager(BaseKVManager):
 
     kv_layout: Optional[str] = None
     dsv41_spec_layout: Optional[dict] = None
+    spec_kv_layout: Optional[dict] = None
 
     # Logical-page KV sharding (PD prefill only): this rank's slot in the
     # shard group. Each rank owns a subset of logical KV pages.
@@ -321,9 +350,13 @@ class CommonKVManager(BaseKVManager):
         is_mla_backend: Optional[bool] = False,
     ):
         self.kv_args = args
+        self.customized_info_enabled = (
+            envs.SGLANG_DISAGG_CUSTOMIZED_INFO_MAX_BYTES.get() > 0
+        )
         self.kv_cache_dtype_str = args.kv_cache_dtype_str
         self.kv_layout = args.kv_layout
         self.dsv41_spec_layout = get_dsv41_spec_layout(args)
+        self.spec_kv_layout = get_spec_kv_layout(args)
         self.kv_item_lens_sum = sum(args.kv_item_lens)
         self.state_item_lens_sum = sum(x for comp in args.state_item_lens for x in comp)
         self.is_mla_backend = is_mla_backend
@@ -549,7 +582,10 @@ class CommonKVManager(BaseKVManager):
         )
 
     def prepare_dcp_token_item_lens(
-        self, dst_page_item_lens: List[Optional[int]], dst_dcp_size: int
+        self,
+        dst_page_item_lens: List[Optional[int]],
+        dst_dcp_size: int,
+        draft_rows_collapsed: bool = False,
     ) -> List[int]:
         page_size = self.kv_args.page_size
         num_draft = self.kv_args.num_draft_entries
@@ -566,8 +602,9 @@ class CommonKVManager(BaseKVManager):
         for i, dst_item_len in enumerate(dst_page_item_lens):
             if dst_item_len is None:
                 continue
+            is_draft_entry = i >= num_entries - num_draft
             dst_page_scale = page_size * (
-                dst_dcp_size if i >= num_entries - num_draft else 1
+                dst_dcp_size if is_draft_entry and not draft_rows_collapsed else 1
             )
             if dst_item_len // dst_page_scale != src_token_lens[i]:
                 raise RuntimeError(
@@ -650,6 +687,38 @@ class CommonKVManager(BaseKVManager):
     ) -> List[bytes]:
         raise NotImplementedError
 
+    def validate_aux_buffers(
+        self, dst_aux_ptrs: List[int], dst_aux_item_lens: Optional[List[int]]
+    ) -> None:
+        if not self.customized_info_enabled and dst_aux_item_lens is None:
+            return
+
+        src_ptrs = self.kv_args.aux_data_ptrs
+        src_item_lens = self.kv_args.aux_item_lens
+        required_buffers = len(src_ptrs) - int(
+            get_disagg().disaggregation_enable_kv_checksum
+        )
+        slots = MetadataBuffers.CUSTOMIZED_INFO_SLOTS
+        if not (
+            self.customized_info_enabled
+            and dst_aux_item_lens is not None
+            and len(src_ptrs) == len(src_item_lens)
+            and len(dst_aux_ptrs) == len(dst_aux_item_lens)
+            and len(dst_aux_ptrs) in (required_buffers, required_buffers + 1)
+            and (len(dst_aux_ptrs) == required_buffers or dst_aux_item_lens[-1] == 64)
+            and min(len(src_item_lens), len(dst_aux_item_lens)) >= slots.stop
+            and src_item_lens[slots] == dst_aux_item_lens[slots]
+            and all(src <= dst for src, dst in zip(src_item_lens, dst_aux_item_lens))
+        ):
+            raise ValueError(
+                "Disaggregation metadata buffer layout mismatch: "
+                f"prefill has {len(src_ptrs)} buffers with item sizes {src_item_lens}, "
+                f"decode has {len(dst_aux_ptrs)} buffers with item sizes {dst_aux_item_lens}. "
+                "Both servers must support and enable customized-info transfer "
+                "with the same SGLANG_DISAGG_CUSTOMIZED_INFO_MAX_BYTES and "
+                "compatible metadata buffers."
+            )
+
     def update_status(self, bootstrap_room: int, status: KVPoll):
         current = self.request_status.get(bootstrap_room)
         if current is None:
@@ -664,6 +733,7 @@ class CommonKVManager(BaseKVManager):
                 self._deferred_ack_targets.pop(bootstrap_room, None)
                 self._deferred_ack_poisoned_rooms.discard(bootstrap_room)
                 self._staging_outstanding.pop(bootstrap_room, None)
+                self._forget_sends(bootstrap_room)
                 self.request_status[bootstrap_room] = status
             return
         if status == KVPoll.Failed:
@@ -678,6 +748,39 @@ class CommonKVManager(BaseKVManager):
             # happily promote it back to Transferring or Success.
             return
         self.request_status[bootstrap_room] = max(current, status)
+
+    def send_record(self, bootstrap_room: int) -> SendRecord:
+        """The room's send record, created by its first send (scheduler
+        thread); a queued send carries the record it was counted in."""
+        if self._send_records is None:
+            self._send_records = {}
+        record = self._send_records.get(bootstrap_room)
+        if record is None:
+            record = self._send_records[bootstrap_room] = SendRecord()
+        return record
+
+    def note_send_enqueued(self, bootstrap_room: int) -> None:
+        """A send of the room was queued for the transfer worker (scheduler
+        thread)."""
+        self.send_record(bootstrap_room).queued += 1
+
+    def note_send_finished(
+        self, bootstrap_room: int, record: Optional[SendRecord] = None
+    ) -> None:
+        """The transfer worker is done with a queued send (worker thread); a
+        report whose ``record`` is no longer the room's is dropped."""
+        current = (self._send_records or {}).get(bootstrap_room)
+        if current is not None and (record is None or record is current):
+            current.finished += 1
+
+    def send_counts(self, bootstrap_room: int) -> Tuple[int, int]:
+        """The room's sends queued and finished so far, in queue order."""
+        record = (self._send_records or {}).get(bootstrap_room)
+        return (0, 0) if record is None else (record.queued, record.finished)
+
+    def _forget_sends(self, bootstrap_room: int) -> None:
+        if self._send_records is not None:
+            self._send_records.pop(bootstrap_room, None)
 
     def _notify_bootstrap(self, room: int, notification: BootstrapNotification) -> None:
         if notification is None:
@@ -1290,6 +1393,26 @@ class CommonKVManager(BaseKVManager):
                 f"PD retract rebootstrap /generate request errored for rid={rid}.",
             )
 
+    def _check_prefill_state_entries(self, info: PrefillServerInfo) -> None:
+        """Refuse a prefill whose state entries cannot pair with this server's:
+        its own stage when the stage counts match, else every prefill stage."""
+        decode_wire = state_wire(self.kv_args)
+        if info.state_wire is not None or not info.state_wires:
+            check_state_wire(info.state_wire, decode_wire)
+            return
+        wires = info.state_wires
+        if info.pp_size == self.pp_size:
+            if self.pp_rank < len(wires):
+                check_state_wire(wires[self.pp_rank], decode_wire)
+            return
+        check_stage_state_wires(
+            [
+                wires[stage] if stage < len(wires) else None
+                for stage in range(info.pp_size)
+            ],
+            decode_wire,
+        )
+
     def try_ensure_parallel_info(self, bootstrap_addr: str) -> bool:
         """Single non-blocking attempt to fetch and cache prefill parallel info.
         Returns True if info is available (cached or freshly fetched)."""
@@ -1306,7 +1429,11 @@ class CommonKVManager(BaseKVManager):
             response = requests.get(url, timeout=5)
             if response.status_code == 200:
                 data = response.json()
-                info = PrefillServerInfo(**data)
+                # Drop fields from newer prefills.
+                known = {f.name for f in dataclasses.fields(PrefillServerInfo)}
+                info = PrefillServerInfo(
+                    **{key: value for key, value in data.items() if key in known}
+                )
             else:
                 logger.error(
                     f"Failed to get prefill server info: {response.status_code}, {response.text}"
@@ -1356,6 +1483,8 @@ class CommonKVManager(BaseKVManager):
                 f"must use the same --dsv4-attn-backend and SGLANG_DSV4_KV_LAYOUT."
             )
 
+        self._check_prefill_state_entries(info)
+
         local_layout = self.dsv41_spec_layout
         if local_layout is not None or info.dsv41_spec_layout is not None:
             if local_layout != info.dsv41_spec_layout:
@@ -1387,6 +1516,20 @@ class CommonKVManager(BaseKVManager):
                     "DeepSeek-V4.1 DSpark PD requires the same TP size on both "
                     "servers (including prefill CP ranks for MLA)"
                 )
+
+        # None (draftless PP stage, state-only draft) skips the check.
+        if (
+            info.spec_kv_layout is not None
+            and self.spec_kv_layout is not None
+            and info.spec_kv_layout != self.spec_kv_layout
+        ):
+            raise RuntimeError(
+                f"Speculative KV layout mismatch: prefill server has "
+                f"spec_kv_layout={info.spec_kv_layout}, but decode server has "
+                f"spec_kv_layout={self.spec_kv_layout}. DSpark and DFLASH decode "
+                "read the draft KV their prefill writes, so both servers must use "
+                "the same speculative algorithm and draft KV layout."
+            )
 
         # Every send path rejects head-sharded MXFP8 block scales across
         # attention TP sizes, so each request would fail at its first transfer.
@@ -1598,9 +1741,11 @@ class CommonKVManager(BaseKVManager):
             "kv_cache_dtype": self.kv_cache_dtype_str,
             "kv_layout": self.kv_layout,
             "dsv41_spec_layout": self.dsv41_spec_layout,
+            "spec_kv_layout": self.spec_kv_layout or None,
             "load_balance_method": get_parallel().load_balance_method,
             "enable_dsa_cache_layer_split": get_parallel().enable_dsa_cache_layer_split,
             "enable_kv_cache_sharding": get_parallel().enable_kv_cache_sharding,
+            "stores_to_linker": get_memory().enable_unified_cache_external_linker,
             # Self-register the HTTP API port so the decode can derive the PD
             # retract rebootstrap /generate URL from bootstrap info instead of a
             # router-injected pd_rebootstrap_prefill_url.
@@ -1610,6 +1755,11 @@ class CommonKVManager(BaseKVManager):
         payload["decode_allocation_policy"] = (
             get_disagg().disaggregation_decode_allocation_policy
         )
+        # Only a peer with state entries states them, so a payload without any
+        # is the one a peer that predates them sends.
+        wire = state_wire(self.kv_args)
+        if wire:
+            payload["state_wire"] = wire
 
         if envs.SGLANG_RUST_SERVER.get() and self.attn_dp_size > 1:
             topology_rows = get_parallel().world_group.all_gather_object(payload)
@@ -2061,7 +2211,9 @@ class CommonKVManager(BaseKVManager):
         """Handle failure of a prefill node."""
         with self.connection_lock:
             keys_to_remove = [
-                k for k in self.connection_pool if k.startswith(failed_bootstrap_addr)
+                k
+                for k in self.connection_pool
+                if k.startswith(f"{failed_bootstrap_addr}_")
             ]
             # Collect TCP endpoints from cached bootstrap_infos before deletion
             stale_endpoints = set()
@@ -2423,8 +2575,11 @@ class CommonKVSender(BaseKVSender):
             if status in (KVPoll.Success, KVPoll.Failed):
                 self.conclude_state = status
         self.kv_mgr.request_status.pop(self.bootstrap_room, None)
+        self._retire_sends()
         self.kv_mgr.req_to_decode_prefix_len.pop(self.bootstrap_room, None)
         self.kv_mgr.transfer_infos.pop(self.bootstrap_room, None)
+        with self.kv_mgr.failure_lock:
+            self.kv_mgr.failure_records.pop(self.bootstrap_room, None)
         # A sender can be cleared while a counted transfer is still writing:
         # keep the target for the worker, or ACK now if nothing is in flight.
         self.kv_mgr._maybe_ack_drained_abort(self.bootstrap_room)
@@ -2445,15 +2600,20 @@ class CommonKVSender(BaseKVSender):
 
     def failure_exception(self):
         self.conclude_state = KVPoll.Failed
-        self.clear()
         with self.kv_mgr.failure_lock:
             failure_reason = self.kv_mgr.failure_records.pop(self.bootstrap_room, None)
+        self.clear()
         self.trace_ctx.trace_req_finish()
         raise KVTransferError(
             self.bootstrap_room,
             failure_reason or "Failed due to an unknown reason from another rank",
             is_from_another_rank=failure_reason is None,
         )
+
+    def _retire_sends(self) -> None:
+        """Drop the room's send record once it concluded or failed; a later
+        worker report finds no record and is dropped."""
+        self.kv_mgr._forget_sends(self.bootstrap_room)
 
     def abort(self):
         if self.kv_mgr.deferred_bootstrap is not None and not self._owns_bootstrap_room:
@@ -2464,6 +2624,9 @@ class CommonKVSender(BaseKVSender):
         )
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
         self.conclude_state = KVPoll.Failed
+        # Some abort paths release the request without ever clearing the
+        # sender: retire its sends here, or the record outlives the room.
+        self._retire_sends()
         self.trace_ctx.abort(abort_info={"reason": "Aborted"})
         self.trace_ctx.trace_req_finish()
 
@@ -2492,6 +2655,8 @@ class CommonKVReceiver(BaseKVReceiver):
             self._lifecycle_lock = threading.RLock()
         self.conclude_state: Optional[KVPoll] = None
         self.require_staging: bool = False
+        # Filled by send_metadata; staging cleanup can run before it under overlap.
+        self.chunk_staging_infos: List[Tuple[int, int, int, int, int]] = []
         self.init_time: Optional[float] = None
         self._prefill_wait_start: Optional[float] = None
         self.abort_notified: bool = False
@@ -3031,9 +3196,12 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.kv_cache_dtype: Optional[str] = None
         self.kv_layout: Optional[str] = None
         self.dsv41_spec_layout: Optional[dict] = None
+        self.spec_kv_layout: Optional[dict] = None
+        self.state_wire_by_stage: Dict[int, Optional[list]] = {}
         self.follow_bootstrap_room: Optional[bool] = None
         self.enable_dsa_cache_layer_split: Optional[bool] = None
         self.enable_kv_cache_sharding: Optional[bool] = None
+        self.stores_to_linker: Optional[bool] = None
         self.prefill_http_port: Optional[int] = None
         self.decode_allocation_policy = "early"
         self.prefill_port_table: Dict[
@@ -3046,6 +3214,8 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         )
 
         # Start bootstrap server
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._runner: Optional[web.AppRunner] = None
         self.thread = threading.Thread(target=self._run_server, daemon=True)
         self.run()
 
@@ -3086,6 +3256,23 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 text="Method not allowed", status=405, content_type="application/json"
             )
 
+    def _state_wire(self) -> Optional[list]:
+        """The state entries every pipeline stage registers alike, if so."""
+        wires = list(self.state_wire_by_stage.values())
+        if wires and all(w == wires[0] for w in wires):
+            return wires[0]
+        return None
+
+    def _state_wires(self) -> Optional[list]:
+        """Each stage's state entries, by stage, when the stages differ; None
+        when no stage registers any."""
+        if not any(self.state_wire_by_stage.values()) or self._state_wire() is not None:
+            return None
+        return [
+            self.state_wire_by_stage.get(stage)
+            for stage in range(max(self.state_wire_by_stage) + 1)
+        ]
+
     async def _handle_route_put(self, request: web.Request):
         data = await request.json()
         attn_tp_size = data["attn_tp_size"]
@@ -3105,11 +3292,20 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         kv_layout = data.get("kv_layout")
         prefill_http_port = data.get("prefill_http_port")
         dsv41_spec_layout = data.get("dsv41_spec_layout")
+        spec_kv_layout = data.get("spec_kv_layout")
 
         if self._registered_count and self.dsv41_spec_layout != dsv41_spec_layout:
             return web.Response(
                 text="DeepSeek-V4.1 DSpark PD layout differs across prefill ranks",
                 status=400,
+            )
+        if (
+            self.spec_kv_layout is not None
+            and spec_kv_layout is not None
+            and self.spec_kv_layout != spec_kv_layout
+        ):
+            return web.Response(
+                text="Speculative KV layout differs across prefill ranks", status=400
             )
         policy = data.get("decode_allocation_policy", "early")
         if self._registered_count and self.decode_allocation_policy != policy:
@@ -3117,7 +3313,19 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 text="Inconsistent prefill allocation policies", status=400
             )
         self.dsv41_spec_layout = dsv41_spec_layout
+        if self.spec_kv_layout is None:
+            self.spec_kv_layout = spec_kv_layout
         self.decode_allocation_policy = policy
+        rank_state_wire = data.get("state_wire")
+        if (
+            pp_rank in self.state_wire_by_stage
+            and self.state_wire_by_stage[pp_rank] != rank_state_wire
+        ):
+            return web.Response(
+                text="PD state entries differ across the ranks of one pipeline stage",
+                status=400,
+            )
+        self.state_wire_by_stage[pp_rank] = rank_state_wire
 
         if self.attn_tp_size is None:
             self.attn_tp_size = attn_tp_size
@@ -3158,6 +3366,9 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             self.enable_kv_cache_sharding = bool(
                 data.get("enable_kv_cache_sharding", False)
             )
+
+        if self.stores_to_linker is None:
+            self.stores_to_linker = bool(data.get("stores_to_linker", False))
 
         if system_dp_size == 1:
             dp_group = attn_dp_rank
@@ -3219,6 +3430,9 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 kv_cache_dtype=self.kv_cache_dtype,
                 kv_layout=self.kv_layout,
                 dsv41_spec_layout=self.dsv41_spec_layout,
+                spec_kv_layout=self.spec_kv_layout,
+                state_wire=self._state_wire(),
+                state_wires=self._state_wires(),
                 follow_bootstrap_room=(
                     self.follow_bootstrap_room
                     if self.follow_bootstrap_room is not None
@@ -3226,14 +3440,23 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 ),
                 enable_dsa_cache_layer_split=bool(self.enable_dsa_cache_layer_split),
                 enable_kv_cache_sharding=bool(self.enable_kv_cache_sharding),
+                stores_to_linker=bool(self.stores_to_linker),
                 prefill_http_port=self.prefill_http_port,
                 decode_allocation_policy=self.decode_allocation_policy,
             )
             payload = dataclasses.asdict(info)
             if info.dsv41_spec_layout is None:
                 payload.pop("dsv41_spec_layout")
+            if info.spec_kv_layout is None:
+                payload.pop("spec_kv_layout")
             if info.kv_layout is None:
                 payload.pop("kv_layout")
+            # No state entries are stated as none, as a server that predates
+            # them answers, so an older decode reads a dense prefill's answer.
+            if not info.state_wire:
+                payload.pop("state_wire")
+            if not info.state_wires:
+                payload.pop("state_wires")
             return web.json_response(payload, status=200)
 
         if not self._is_ready():
@@ -3326,8 +3549,10 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             logger.error(f"Server error: {str(e)}", exc_info=True)
         finally:
             # Cleanup
-            self._loop.run_until_complete(self._runner.cleanup())
-            self._loop.close()
+            if self._loop is not None:
+                if self._runner is not None:
+                    self._loop.run_until_complete(self._runner.cleanup())
+                self._loop.close()
 
     def close(self):
         """Shutdown"""

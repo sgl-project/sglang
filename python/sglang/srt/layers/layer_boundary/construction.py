@@ -239,6 +239,15 @@ class StagePlan:
     def path_for(self, forward_batch):
         return _bound_for(self.paths, self.variant_for(forward_batch))
 
+    def outputs_on_cp_shards(self, variant) -> bool:
+        """Whether the output contract for ``variant`` puts rows the compute
+        took gathered over attention CP back on this rank's CP rows."""
+        edges = self.edges.get(variant)
+        if edges is None:
+            return False
+        produced = edges.outgoing.produced.layout.sharded
+        return TokenAxis.ATTN_CP in produced - edges.incoming.need.layout.sharded
+
     def fused_input_rows(self, forward_batch):
         if self._next_input_rows is not None:
             return _bound_for(self._next_input_rows, self.variant_for(forward_batch))

@@ -14,17 +14,16 @@ from sglang.multimodal_gen.configs.models.dits.minimax_h3 import (
 from sglang.multimodal_gen.runtime.breakable_cuda_graph.runner import (
     BaseBreakableCudaGraphRunner,
 )
-from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-    maybe_init_distributed_environment_and_model_parallel,
-    model_parallel_is_initialized,
-)
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionRequirements,
 )
 from sglang.multimodal_gen.runtime.layers.attention.backends.cube_sparse_attn import (
     CubeSparseAttentionBackend,
 )
-from sglang.multimodal_gen.runtime.layers.attention.backends.sdpa import SDPAImpl
+from sglang.multimodal_gen.runtime.layers.attention.backends.sdpa import (
+    DynamicCudnnSDPAImpl,
+    SDPAImpl,
+)
 from sglang.multimodal_gen.runtime.layers.attention.selector import (
     component_attn_backend_context_manager,
 )
@@ -33,6 +32,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.fp8 import (
     Fp8Config,
     Fp8LinearMethod,
 )
+from sglang.multimodal_gen.runtime.layers.quantization.mxfp8 import MXFP8Config
 from sglang.multimodal_gen.runtime.layers.usp import _usp_input_all_to_all_packed_qkv
 from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
     _needs_device_weight_postprocess,
@@ -46,22 +46,15 @@ from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
     MiniMaxH3DiTModel,
     _copy_grouped_qkv_tp_shard,
     _diffusers_h3_checkpoint,
+    _minimax_h3_group_attend,
     _modulate_gate,
     _qkv_scale_block_rows,
     _reorder_grouped_qkv_to_qkv,
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
-from sglang.multimodal_gen.test.single_test_file.component_accuracy.utils import (
-    ensure_distributed_env_defaults,
-)
 from sglang.srt.utils import get_device
 
-
-def _ensure_single_process_parallel_runtime() -> None:
-    if model_parallel_is_initialized():
-        return
-    ensure_distributed_env_defaults()
-    maybe_init_distributed_environment_and_model_parallel(tp_size=1, sp_size=1)
+pytestmark = pytest.mark.usefixtures("single_process_model_parallel")
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph replay")
@@ -335,6 +328,7 @@ def test_cache_dit_input_preservation_toggles_every_block():
     model = MiniMaxH3DiTModel.__new__(MiniMaxH3DiTModel)
     torch.nn.Module.__init__(model)
     model.blocks = torch.nn.ModuleList([torch.nn.Identity() for _ in range(5)])
+    model.arch = MiniMaxH3DiTArchConfig()
 
     model.set_cache_dit_input_preservation(True)
     assert all(block.preserve_input_for_cache_dit for block in model.blocks)
@@ -359,6 +353,7 @@ def test_lazy_attention_resolution_preserves_backend_precedence(
     model._component_attention_backend_override = (
         AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN
     )
+    model._required_component_attention_backend = None
     model._resolved_attention_backend = None
     backend = Mock()
     backend.get_enum.return_value = expected_backend
@@ -413,6 +408,36 @@ def test_cache_dit_out_of_place_gate_preserves_cuda_input():
     assert output.data_ptr() != x.data_ptr()
     torch.testing.assert_close(x, original, rtol=0, atol=0)
     torch.testing.assert_close(output, expected, rtol=0, atol=0)
+
+
+# DynamicCudnnSDPAImpl is a CUDA-platform backend; on ROCm its FlashAttention
+# fallback needs the flash_attn package, which the ROCm images do not ship.
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.version.hip is not None,
+    reason="requires CUDA (DynamicCudnnSDPAImpl is not selected on ROCm)",
+)
+def test_group_attend_skips_only_the_trailing_alignment_rows():
+    """The pipelined Ulysses group attention gives the real rows the bytes of
+    forward_varlen and leaves the packing's alignment rows zero."""
+    used, total = 16400, 16448  # long enough for FA4 on sm_103
+    impl = DynamicCudnnSDPAImpl(
+        num_heads=2, head_size=128, causal=False, softmax_scale=128**-0.5
+    )
+    torch.manual_seed(0)
+    q, k, v = (
+        torch.randn(total, 2, 128, device="cuda", dtype=torch.bfloat16)
+        for _ in range(3)
+    )
+    bounds = (0, used, total)
+    kwargs = dict(
+        cu_seqlens=torch.tensor(bounds, device="cuda", dtype=torch.int32),
+        cu_seqlens_host=bounds,
+        max_seqlen=used,
+    )
+    ref = impl.forward_varlen(q, k, v, **kwargs)
+    got = _minimax_h3_group_attend(impl, **kwargs)(q, k, v)
+    assert torch.equal(got[:used], ref[:used])
+    assert not got[used:].any()
 
 
 def test_tp_and_ulysses_admission_uses_tp_local_shapes():
@@ -474,7 +499,6 @@ def test_cube_backend_advertises_packed_varlen_capability():
 
 
 def test_attention_retains_transformer_scoped_backend():
-    _ensure_single_process_parallel_runtime()
     with (
         patch(
             "sglang.multimodal_gen.runtime.models.dits.minimax_h3."
@@ -493,7 +517,6 @@ def test_attention_retains_transformer_scoped_backend():
 
 
 def test_model_lazy_resolver_keeps_transformer_scoped_backend():
-    _ensure_single_process_parallel_runtime()
     with (
         patch(
             "sglang.multimodal_gen.runtime.models.dits.minimax_h3."
@@ -573,7 +596,6 @@ def test_token_refiner_routes_cube_selection_to_exact_fa():
 
 
 def test_meta_model_captures_component_attention_override():
-    _ensure_single_process_parallel_runtime()
     with (
         component_attn_backend_context_manager(
             AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN,
@@ -595,7 +617,6 @@ def test_meta_model_captures_component_attention_override():
 
 def test_meta_model_enforces_mixed_precision_weight_contract():
     expected_fp32 = set(MINIMAX_H3_FP32_PARAM_NAMES) | set(MINIMAX_H3_FP32_BUFFER_NAMES)
-    _ensure_single_process_parallel_runtime()
     with torch.device("meta"):
         model = MiniMaxH3DiTModel(
             config=MiniMaxH3DiTConfig(),
@@ -614,7 +635,6 @@ def test_meta_model_enforces_mixed_precision_weight_contract():
 
 
 def test_pruned_meta_model_preserves_curve_adaln_fp32_island():
-    _ensure_single_process_parallel_runtime()
     config = MiniMaxH3DiTConfig(
         arch_config=MiniMaxH3DiTArchConfig(
             adaln_curve_grid=1025,
@@ -635,7 +655,6 @@ def test_pruned_meta_model_preserves_curve_adaln_fp32_island():
 
 
 def test_online_fp8_keeps_fp32_boundaries_and_ignored_layers_unquantized():
-    _ensure_single_process_parallel_runtime()
     with torch.device("meta"):
         model = MiniMaxH3DiTModel(
             config=MiniMaxH3DiTConfig(),
@@ -658,6 +677,34 @@ def test_online_fp8_keeps_fp32_boundaries_and_ignored_layers_unquantized():
         assert isinstance(layer.quant_method, UnquantizedLinearMethod)
 
 
+@pytest.mark.parametrize("quant_config_cls", [Fp8Config, MXFP8Config])
+def test_online_fp8_adaln_uses_native_checkpoint_projections(quant_config_cls):
+    with torch.device("meta"):
+        model = MiniMaxH3DiTModel(
+            config=MiniMaxH3DiTConfig(),
+            hf_config={},
+            quant_config=quant_config_cls(),
+            adaln_weight_files=["native-bf16.safetensors"],
+        )
+    assert model.adaln_cache.weight_files == ["native-bf16.safetensors"]
+    assert model.blocks[0].adaln_proj is None
+    assert model.final_layer.adaln_proj is None
+    assert isinstance(model.blocks[0].attn.qkv_proj.quant_method, Fp8LinearMethod)
+    assert isinstance(model.time_embedder.proj_in.quant_method, UnquantizedLinearMethod)
+    assert isinstance(model.final_layer.video_out.quant_method, UnquantizedLinearMethod)
+
+
+@pytest.mark.parametrize("quant_config_cls", [Fp8Config, MXFP8Config])
+def test_adaln_rebuild_rejects_serialized_quantized_weights(quant_config_cls):
+    with pytest.raises(ValueError, match="native checkpoint weights"):
+        MiniMaxH3DiTModel(
+            config=MiniMaxH3DiTConfig(),
+            hf_config={},
+            quant_config=quant_config_cls(is_checkpoint_fp8_serialized=True),
+            adaln_weight_files=["quantized.safetensors"],
+        )
+
+
 def _block_fp8_quant_config(block: int = 128, **kwargs) -> Fp8Config:
     return Fp8Config(
         is_checkpoint_fp8_serialized=True,
@@ -668,7 +715,6 @@ def _block_fp8_quant_config(block: int = 128, **kwargs) -> Fp8Config:
 
 
 def _meta_h3(quant_config) -> MiniMaxH3DiTModel:
-    _ensure_single_process_parallel_runtime()
     with torch.device("meta"):
         return MiniMaxH3DiTModel(
             config=MiniMaxH3DiTConfig(), hf_config={}, quant_config=quant_config
@@ -911,7 +957,6 @@ def test_ulysses_qkv_pack_is_bit_exact():
 
 @pytest.mark.parametrize("compiling", [False, True])
 def test_compiled_attention_runs_its_fused_section_eager(compiling):
-    _ensure_single_process_parallel_runtime()
     arch = MiniMaxH3DiTArchConfig()
     with torch.device("meta"):
         attention = MiniMaxH3Attention(arch, None, prefix="blocks.0.attn")
@@ -939,3 +984,91 @@ def test_compiled_attention_runs_its_fused_section_eager(compiling):
 
 def test_eager_attention_section_is_hidden_from_dynamo():
     assert MiniMaxH3Attention._attend_eager._torchdynamo_disable
+
+
+@pytest.mark.parametrize("name", ["video_out", "audio_out"])
+def test_pdd_graph_replay_uses_live_step_and_input(name):
+    """Replaying a graph must select the current PDD head, not the captured one."""
+    from sglang.multimodal_gen.runtime.breakable_cuda_graph.runner import (
+        BaseBreakableCudaGraphRunner,
+    )
+    from sglang.multimodal_gen.runtime.managers.forward_context import (
+        set_forward_context,
+    )
+    from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
+        MiniMaxH3FinalLayer,
+    )
+
+    class Projection(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            scales = torch.arange(1, 4, device="cuda", dtype=torch.float32)
+            self.register_buffer("weight", scales[:, None, None].expand(3, 2, 4))
+            self.register_buffer("bias", scales[:, None].expand(3, 2))
+            self._pdd_heads = {f"{name}.weight": self.weight, f"{name}.bias": self.bias}
+            self._pdd_device_heads = {}
+
+        def forward(self, h):
+            return MiniMaxH3FinalLayer._pdd_project(self, h, name)
+
+    runner = BaseBreakableCudaGraphRunner(Projection().eval(), torch.device("cuda"))
+    try:
+        with torch.inference_mode(), set_forward_context(0, None):
+            assert runner.capture(h=torch.ones(2, 4, device="cuda"))
+        for step, value in ((1, 2.0), (2, 3.0), (0, 4.0)):
+            with torch.inference_mode(), set_forward_context(step, None):
+                actual = runner(h=torch.full((2, 4), value, device="cuda"))
+            expected = torch.full_like(actual, (4 * value + 1) * (step + 1))
+            assert torch.equal(actual, expected)
+    finally:
+        runner.reset()
+
+
+@pytest.mark.parametrize("num_timesteps", [1, 2])
+def test_adaln_graph_replay_uses_live_plan_slot(num_timesteps):
+    """A device plan index must capture without a host sync and stay live on replay."""
+    from sglang.multimodal_gen.configs.models.dits.minimax_h3 import (
+        MiniMaxH3DiTArchConfig,
+    )
+    from sglang.multimodal_gen.runtime.breakable_cuda_graph.runner import (
+        BaseBreakableCudaGraphRunner,
+    )
+    from sglang.multimodal_gen.runtime.models.dits.minimax_h3_adaln_cache import (
+        MiniMaxH3AdalnCache,
+    )
+
+    class Plans(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.cache = MiniMaxH3AdalnCache(
+                MiniMaxH3DiTArchConfig(num_layers=2, hidden_size=4, time_embed_dim=3),
+                weight_files=["unused"],
+                max_plans=3,
+                max_plan_width=2,
+            )
+            self.cache.load(torch.device("cuda"))
+            for slab in (self.cache.block_params, self.cache.final_params):
+                slab.copy_(
+                    torch.arange(slab.numel(), device="cuda").reshape(slab.shape)
+                )
+
+        def forward(self, slot):
+            blocks = self.cache.block_all(
+                cache_plan_index=slot, num_timesteps=num_timesteps
+            )
+            final = self.cache.final(slot, num_timesteps)
+            return tuple(param for layer in blocks for param in layer) + final
+
+    model = Plans().eval()
+    runner = BaseBreakableCudaGraphRunner(model, torch.device("cuda"))
+    try:
+        with torch.inference_mode():
+            assert runner.capture(slot=torch.tensor(0, device="cuda"))
+            for slot in (1, 2, 0):
+                expected = model(slot=torch.tensor(slot, device="cuda"))
+                actual = runner(slot=torch.tensor(slot, device="cuda"))
+                assert all(
+                    torch.equal(got, want) for got, want in zip(actual, expected)
+                )
+    finally:
+        runner.reset()
