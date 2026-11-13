@@ -246,9 +246,8 @@ class TestROPE(CustomTestCase):
                 rope_ref.cos_sin_cache.to(query.dtype),
                 rope_ref.is_neox_style,
             )
-            atol = rtol = 2 * precision[dtype]
-            torch.testing.assert_close(query_ref_out, query_cpu, atol=atol, rtol=rtol)
-            torch.testing.assert_close(key_ref_out, key_cpu, atol=atol, rtol=rtol)
+            torch.testing.assert_close(query_ref_out, query_cpu, atol=1e-2, rtol=1e-2)
+            torch.testing.assert_close(key_ref_out, key_cpu, atol=1e-2, rtol=1e-2)
 
         test_config = [
             (64, 64, 32, 8000, True, torch.bfloat16, "cpu", 32, 32, 1, 1),
@@ -325,6 +324,107 @@ class TestROPE(CustomTestCase):
             torch.testing.assert_close(k_out_ref, k_out_eager)
             torch.testing.assert_close(q_out_ref, q_out_sgl, atol=1e-2, rtol=1e-2)
             torch.testing.assert_close(k_out_ref, k_out_sgl, atol=1e-2, rtol=1e-2)
+
+        num_tokens = 1024
+        num_heads = 8
+        num_kv_heads = 2
+        head_size = 72
+        batch_size = 4
+        seq_len = 64
+        for dtype in [torch.bfloat16, torch.float32]:
+            for sincos_dtype in [torch.float32, torch.bfloat16]:
+                # 3D: [num_tokens, num_heads, head_size], unsqueeze_dim=1
+                single_test(
+                    torch.randn(num_tokens, num_heads, head_size).to(dtype),
+                    torch.randn(num_tokens, num_heads, head_size).to(dtype),
+                    (num_tokens, head_size),
+                    1,
+                    sincos_dtype,
+                )
+                # 3D with GQA, q/k split from qkv (non-contiguous)
+                single_test(
+                    *split_qk((num_tokens,), num_heads, num_kv_heads, head_size, dtype),
+                    (num_tokens, head_size),
+                    1,
+                    sincos_dtype,
+                )
+                # 4D: [batch, num_heads, seq_len, head_size], unsqueeze_dim=1
+                single_test(
+                    torch.randn(batch_size, num_heads, seq_len, head_size).to(dtype),
+                    torch.randn(batch_size, num_kv_heads, seq_len, head_size).to(dtype),
+                    (batch_size, seq_len, head_size),
+                    1,
+                    sincos_dtype,
+                )
+                # 4D: split from qkv, transposed to [batch, num_heads, seq_len, head]
+                query, key = split_qk(
+                    (batch_size, seq_len), num_heads, num_kv_heads, head_size, dtype
+                )
+                single_test(
+                    query.transpose(1, 2),
+                    key.transpose(1, 2),
+                    (batch_size, seq_len, head_size),
+                    1,
+                    sincos_dtype,
+                )
+                # 4D: [batch, seq_len, num_heads, head_size], unsqueeze_dim=2
+                single_test(
+                    torch.randn(batch_size, seq_len, num_heads, head_size).to(dtype),
+                    torch.randn(batch_size, seq_len, num_kv_heads, head_size).to(dtype),
+                    (batch_size, seq_len, head_size),
+                    2,
+                    sincos_dtype,
+                )
+                # 4D: [batch, seq_len, num_heads, head_size], negative unsqueeze_dim=-2
+                single_test(
+                    torch.randn(batch_size, seq_len, num_heads, head_size).to(dtype),
+                    torch.randn(batch_size, seq_len, num_kv_heads, head_size).to(dtype),
+                    (batch_size, seq_len, head_size),
+                    -2,
+                    sincos_dtype,
+                )
+                # q/k and cos/sin all have a non-unit stride in the feature dimension
+                single_test(
+                    torch.randn(batch_size, seq_len, num_heads, 2 * head_size).to(
+                        dtype
+                    )[..., ::2],
+                    torch.randn(batch_size, seq_len, num_kv_heads, 2 * head_size).to(
+                        dtype
+                    )[..., ::2],
+                    (batch_size, seq_len, head_size),
+                    2,
+                    sincos_dtype,
+                    strided_cache=True,
+                )
+                single_test(
+                    torch.randn(batch_size, seq_len, num_heads, head_size).to(dtype),
+                    torch.randn(batch_size, seq_len, num_kv_heads, 2 * head_size).to(
+                        dtype
+                    )[..., ::2],
+                    (batch_size, seq_len, head_size),
+                    2,
+                    sincos_dtype,
+                    strided_cache=True,
+                )
+                single_test(
+                    torch.randn(num_heads, seq_len, head_size).to(dtype),
+                    torch.randn(num_kv_heads, seq_len, head_size).to(dtype),
+                    (seq_len, head_size),
+                    0,
+                    sincos_dtype,
+                )
+                single_test(
+                    torch.randn(2, 3, num_heads, 5, head_size)
+                    .to(dtype)
+                    .transpose(0, 1),
+                    torch.randn(2, 3, num_kv_heads, 5, head_size)
+                    .to(dtype)
+                    .transpose(0, 1),
+                    (3, 2, 5, head_size),
+                    2,
+                    sincos_dtype,
+                    strided_cache=True,
+                )
 
     def test_apply_rotary_embedding_cpu_path(self):
         torch.manual_seed(1234)
