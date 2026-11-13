@@ -4984,6 +4984,8 @@ class Scheduler(
         """The bookkeeping of every step launch, before its forward is issued.
         Returns the unified pool's launch record, which the step's result
         carries to `_on_step_processed`."""
+        if host_sync_logger := self.metrics_reporter.scheduler_host_sync_logger:
+            host_sync_logger.on_step_launch(batch)
         self.metrics_reporter.record_scheduler_active(time.monotonic_ns())
         self.forward_ct += 1
         batch.forward_iter = self.forward_ct
@@ -5736,6 +5738,8 @@ class Scheduler(
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
+        if host_sync_logger := self.metrics_reporter.scheduler_host_sync_logger:
+            host_sync_logger.on_step_result(batch)
         self.deferred_responses.stream_released()
         # Flush async trace ops here: in overlap mode this CPU work runs while
         # the next batch's GPU forward is in flight, giving free overlap.

@@ -32,6 +32,7 @@ from sglang.srt.observability.metrics_collector import (
     SchedulerStats,
     compute_routing_key_stats,
 )
+from sglang.srt.observability.scheduler_host_sync_logger import SchedulerHostSyncLogger
 from sglang.srt.observability.scheduler_stage_metrics import (
     SchedulerStageMetricsRecorder,
 )
@@ -356,6 +357,10 @@ class SchedulerMetricsReporter:
 
         self.scheduler_status_logger = SchedulerStatusLogger.maybe_create(
             enable_metrics=self.enable_metrics
+        )
+        self.scheduler_host_sync_logger = SchedulerHostSyncLogger.maybe_create(
+            enable_metrics=self.enable_metrics,
+            stage_recorder=self.scheduler_stage_metrics,
         )
 
     def _install_device_timer_on_runners(self):

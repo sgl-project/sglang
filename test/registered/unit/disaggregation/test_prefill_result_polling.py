@@ -236,6 +236,7 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
             ]
         )
         self.metrics_reporter.current_scheduler_metrics_enabled = False
+        self.metrics_reporter.scheduler_host_sync_logger = None
         self.kv_events_publisher = Mock(spec=["publish_kv_events"])
         self.publish_load_snapshot = Mock()
         self.load_publisher = Mock(spec=["publish_load_stat"])
@@ -1387,7 +1388,9 @@ class _EarlySendScheduler(SchedulerDisaggregationPrefillMixin):
 
     def __init__(self):
         self.scheduler_stage_metrics = None
-        self.metrics_reporter = SimpleNamespace(record_scheduler_active=Mock())
+        self.metrics_reporter = SimpleNamespace(
+            record_scheduler_active=Mock(), scheduler_host_sync_logger=None
+        )
         self.invariant_checker = Mock()
         self.forward_ct = 0
         self._sched_idled = False
