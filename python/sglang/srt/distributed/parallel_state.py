@@ -243,6 +243,32 @@ def reg_reduce_scatter_tensor(
 
 
 @register_custom_op(mutates_args=["output"])
+def reg_reduce_scatterv(
+    output: torch.Tensor,
+    input: torch.Tensor,
+    sizes: list[int] | None,
+    group_name: str,
+) -> None:
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"Group {group_name} is destroyed.")
+    group._reduce_scatterv(output, input, sizes)
+
+
+@register_custom_op(mutates_args=["output"])
+def reg_all_gatherv(
+    output: torch.Tensor,
+    input: torch.Tensor,
+    sizes: list[int] | None,
+    group_name: str,
+) -> None:
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"Group {group_name} is destroyed.")
+    group._all_gatherv(output, input, sizes)
+
+
+@register_custom_op(mutates_args=["output"])
 def reg_all_to_all_single(
     output: torch.Tensor, input: torch.Tensor, group_name: str
 ) -> None:
@@ -1278,6 +1304,25 @@ class GroupCoordinator:
         output.copy_(reduced.narrow(0, offset, chunk_size))
         return output
 
+    def _reduce_scatterv(
+        self,
+        output: torch.Tensor,
+        input: torch.Tensor,
+        sizes: list[int] | None,
+    ) -> None:
+        group = self.device_group
+        if self.world_size == 1:
+            output.copy_(input)
+        elif sizes is not None:
+            input_list = []
+            offset = 0
+            for size in sizes:
+                input_list.append(input[offset : offset + size])
+                offset += size
+            torch.distributed.reduce_scatter(output, input_list, group=group)
+        else:
+            reduce_scatter_single(output, input, group=group)
+
     def reduce_scatterv(
         self,
         input_: torch.Tensor,
@@ -1289,26 +1334,29 @@ class GroupCoordinator:
         if envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get():
             return self._deterministic_reduce_scatterv(input_, output, sizes)
 
-        pynccl_comm = self.require_pynccl_comm("reduce_scatterv")
-        with pynccl_comm.change_state(enable=True):
-            if sizes is not None:
-                assert len(sizes) == world_size
-                assert input_.shape[0] == sum(sizes)
-                chunk_size = sizes[self.rank_in_group]
-            else:
-                assert input_.shape[0] % world_size == 0
-                chunk_size = input_.shape[0] // world_size
-            output_shape = (chunk_size,) + input_.shape[1:]
+        if sizes is not None:
+            assert len(sizes) == world_size
+            assert input_.shape[0] == sum(sizes)
+            chunk_size = sizes[self.rank_in_group]
+        else:
+            assert input_.shape[0] % world_size == 0
+            chunk_size = input_.shape[0] // world_size
+        output_shape = (chunk_size,) + input_.shape[1:]
 
-            if output is None:
-                output = torch.empty(
-                    output_shape, dtype=input_.dtype, device=input_.device
-                )
-            else:
-                assert output.shape == output_shape
+        if output is None:
+            output = torch.empty(output_shape, dtype=input_.dtype, device=input_.device)
+        else:
+            assert output.shape == output_shape
 
-            pynccl_comm.reduce_scatter(output, input_, sizes=sizes)
-            return output
+        pynccl_comm = self.get_available_pynccl_comm()
+        if pynccl_comm is not None:
+            with pynccl_comm.change_state(enable=True):
+                pynccl_comm.reduce_scatter(output, input_, sizes=sizes)
+        elif _is_cpu:
+            self._reduce_scatterv(output, input_, sizes)
+        else:
+            reg_reduce_scatterv(output, input_, sizes, self.unique_name)
+        return output
 
     def _all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
         # Aiter custom all-gather (ROCm). Set SGLANG_USE_AITER_AG=0 to disable.
@@ -1462,6 +1510,22 @@ class GroupCoordinator:
         )
         return output_tensor
 
+    def _all_gatherv(
+        self,
+        output: torch.Tensor,
+        input: torch.Tensor,
+        sizes: list[int] | None,
+    ) -> None:
+        group = self.device_group
+        if self.world_size == 1:
+            output.copy_(input)
+        elif output.numel() == 0:
+            return
+        elif sizes is None or all(size == sizes[0] for size in sizes):
+            all_gather_single(output, input, group=group)
+        else:
+            torch.distributed.all_gather(list(output.split(sizes)), input, group=group)
+
     def all_gatherv(
         self,
         input_: Union[torch.Tensor, List[torch.Tensor]],
@@ -1472,13 +1536,19 @@ class GroupCoordinator:
         Supports varying sizes per rank and input tensor list.
         `sizes`: a list of len(world_size) with the number of items per rank to gather.
         `output`: optional pre-allocated destination buffer (single-tensor input only).
-            When given, NCCL writes the gathered result directly into it, avoiding an
-            extra output allocation + caller-side copy.
+            When given, the backend writes directly into it, avoiding an extra
+            output allocation + caller-side copy.
+        Returns a list and falls back to torch.distributed when PyNccl is
+        unavailable. All ranks must supply the same sizes.
         """
         world_size = self.world_size
-        pynccl_comm = self.require_pynccl_comm("all_gatherv")
+        pynccl_comm = self.get_available_pynccl_comm()
 
-        with pynccl_comm.change_state(enable=True):
+        with (
+            pynccl_comm.change_state(enable=True)
+            if pynccl_comm is not None
+            else nullcontext()
+        ):
 
             def _all_gather_allocate_output(
                 input_: torch.Tensor,
@@ -1523,10 +1593,17 @@ class GroupCoordinator:
                 output_list.append(output_tensor)
                 size_list.append(s)
 
-            pynccl_comm.group_start()
-            for i, inp in enumerate(input_):
-                pynccl_comm.all_gather(output_list[i], inp, sizes=size_list[i])
-            pynccl_comm.group_end()
+            if pynccl_comm is not None:
+                pynccl_comm.group_start()
+                for i, inp in enumerate(input_):
+                    pynccl_comm.all_gather(output_list[i], inp, sizes=size_list[i])
+                pynccl_comm.group_end()
+            else:
+                for out, inp, s in zip(output_list, input_, size_list):
+                    if _is_cpu:
+                        self._all_gatherv(out, inp, s)
+                    else:
+                        reg_all_gatherv(out, inp, s, self.unique_name)
 
             return output_list
 
