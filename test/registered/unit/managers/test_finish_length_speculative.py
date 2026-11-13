@@ -19,6 +19,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.managers.req_types import (
+    FINISH_ABORT,
     FINISH_LENGTH,
     FINISH_MATCHED_STR,
     FINISH_MATCHED_TOKEN,
@@ -74,6 +75,50 @@ def _make_req(
     req.tokenizer = _FakeTokenizer()
     req.output_ids = array("q", output_ids)
     return req
+
+
+class TestClientAbortYieldsToStepFinish(CustomTestCase):
+    """A client abort (no status code) applied at the commit of a step that
+    reaches a stop or the length cap reports that finish and trims at it."""
+
+    def _abort_step(self, output_ids, accepted, abort, **kwargs):
+        req = _make_req(output_ids, **kwargs)
+        req.request_finish(abort)
+        req.update_finish_state(new_accepted_len=accepted)
+        self.assertIsNone(req.to_finish)
+        return req
+
+    def test_eos_in_the_abort_step_wins(self):
+        req = self._abort_step(
+            [10, 11, EOS_ID, 20], 3, FINISH_ABORT(), max_new_tokens=16
+        )
+        self.assertIsInstance(req.finished_reason, FINISH_MATCHED_TOKEN)
+        self.assertEqual(list(req.output_ids_through_stop), [10, 11, EOS_ID])
+
+    def test_stop_str_in_the_abort_step_wins(self):
+        req = self._abort_step(
+            [10, STOP_ID, 20], 2, FINISH_ABORT(), max_new_tokens=16, stop=["STOP"]
+        )
+        self.assertIsInstance(req.finished_reason, FINISH_MATCHED_STR)
+        self.assertEqual(list(req.output_ids_through_stop), [10, STOP_ID])
+
+    def test_length_cap_in_the_abort_step_wins(self):
+        req = self._abort_step(
+            [10, 11, 12, 20, 21], 3, FINISH_ABORT(), max_new_tokens=4
+        )
+        self.assertIsInstance(req.finished_reason, FINISH_LENGTH)
+        self.assertEqual(list(req.output_ids_through_stop), [10, 11, 12, 20])
+
+    def test_abort_without_a_step_finish_stays_an_abort(self):
+        abort = FINISH_ABORT()
+        req = self._abort_step([10, 11, 12], 2, abort, max_new_tokens=16)
+        self.assertIs(req.finished_reason, abort)
+        self.assertEqual(list(req.output_ids_through_stop), [10, 11, 12])
+
+    def test_abort_with_a_status_code_keeps_its_reason(self):
+        abort = FINISH_ABORT("timed out", 503)
+        req = self._abort_step([10, EOS_ID], 2, abort, max_new_tokens=16)
+        self.assertIs(req.finished_reason, abort)
 
 
 class TestFinishLengthSpeculative(CustomTestCase):
