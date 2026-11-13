@@ -1962,7 +1962,7 @@ class OpenAIServingChat(OpenAIServingBase):
         """Apply Jinja chat template"""
         prompt = ""
         prompt_ids = []
-        decoded_prompt = None
+        prompt_text = None
         openai_compatible_messages = []
         image_data = []
         video_data = []
@@ -2139,7 +2139,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 else {}
             )
             try:
-                prompt_ids, decoded_prompt = self._render_and_encode_chat_template(
+                prompt_ids, prompt_text = self._render_and_encode_chat_template(
                     openai_compatible_messages,
                     tools=tools,
                     template_kwargs=extra_template_kwargs,
@@ -2156,7 +2156,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     else None
                 )
                 try:
-                    prompt_ids, decoded_prompt = self._render_and_encode_chat_template(
+                    prompt_ids, prompt_text = self._render_and_encode_chat_template(
                         openai_compatible_messages,
                         tools=tools,
                         template_kwargs=extra_template_kwargs,
@@ -2175,13 +2175,13 @@ class OpenAIServingChat(OpenAIServingBase):
                 prompt_ids = self._append_assistant_prefix_to_prompt_ids(
                     prompt_ids, assistant_prefix
                 )
-                # The cached decode corresponds to prompt_ids before the prefix.
-                decoded_prompt = None
+                # The prompt text corresponds to prompt_ids before the prefix.
+                prompt_text = None
 
             if is_multimodal:
                 prompt = (
-                    decoded_prompt
-                    if decoded_prompt is not None
+                    prompt_text
+                    if prompt_text is not None
                     else self.tokenizer_manager.tokenizer.decode(prompt_ids)
                 )
 
@@ -2235,9 +2235,10 @@ class OpenAIServingChat(OpenAIServingBase):
             cached = self._chat_template_cache.get(cache_key)
             if cached is not None:
                 self._chat_template_cache.move_to_end(cache_key)
-                prompt_ids, decoded_prompt = cached
-                return list(prompt_ids), decoded_prompt
+                prompt_ids, prompt_text = cached
+                return list(prompt_ids), prompt_text
 
+        prompt_text = None
         if self._prompt_text_round_trip_is_lossy:
             # Re-encoding rendered text would drop the template's control tokens.
             prompt_ids = self.tokenizer_manager.tokenizer.apply_chat_template(
@@ -2260,6 +2261,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     template_kwargs=template_kwargs,
                 )
             if segments is not None:
+                rendered_prompt = "".join(segments)
                 prompt_ids = encode_prompt_segments(
                     self.tokenizer_manager.tokenizer, segments, encode_kwargs
                 )
@@ -2275,18 +2277,21 @@ class OpenAIServingChat(OpenAIServingBase):
                 prompt_ids = parallel_prompt_encode(
                     self.tokenizer_manager.tokenizer, rendered_prompt, encode_kwargs
                 )
-        decoded_prompt = (
-            self.tokenizer_manager.tokenizer.decode(prompt_ids)
-            if cache_key is not None
-            else None
-        )
+            # A multimodal processor tokenizes the prompt text again, and a
+            # decode of the ids need not give the rendered text back (a
+            # tokenizer can mark text in it that the ids do not record).
+            # Specials added by the encode are not in the rendered text.
+            if not encode_kwargs.get("add_special_tokens"):
+                prompt_text = rendered_prompt
+        if prompt_text is None and cache_key is not None:
+            prompt_text = self.tokenizer_manager.tokenizer.decode(prompt_ids)
 
         if cache_key is not None:
-            self._chat_template_cache[cache_key] = (tuple(prompt_ids), decoded_prompt)
+            self._chat_template_cache[cache_key] = (tuple(prompt_ids), prompt_text)
             if len(self._chat_template_cache) > _CHAT_TEMPLATE_CACHE_MAX_SIZE:
                 self._chat_template_cache.popitem(last=False)
 
-        return prompt_ids, decoded_prompt
+        return prompt_ids, prompt_text
 
     def _apply_conversation_template(
         self,
