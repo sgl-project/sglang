@@ -162,23 +162,21 @@ async def prefill_shapes(disaggregation_mode: str, tokenizer_manager: TokenizerM
 
 
 def _drawn_page(title: str) -> str:
-    """A white page with a title and numbered lines, as a PNG data URL."""
+    """A white page with a title and numbered lines, as a PNG data URL.
+
+    Pillow's built-in bitmap font is enough: the warmup only needs the image
+    path to run, not readable text.
+    """
     import base64
     import io
 
-    from PIL import Image, ImageDraw, ImageFont
+    from PIL import Image, ImageDraw
 
     image = Image.new("RGB", (980, 1400), "white")
     draw = ImageDraw.Draw(image)
-    draw.text((90, 90), title, fill="black", font=ImageFont.load_default(size=56))
-    body = ImageFont.load_default(size=34)
+    draw.text((90, 90), title, fill="black")
     for i in range(8):
-        draw.text(
-            (90, 220 + i * 60),
-            f"{i + 1}. {title} line {i + 1}.",
-            fill="black",
-            font=body,
-        )
+        draw.text((90, 220 + i * 60), f"{i + 1}. {title} line {i + 1}.", fill="black")
     buffer = io.BytesIO()
     image.save(buffer, format="PNG")
     return "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
@@ -188,28 +186,23 @@ def _drawn_page(title: str) -> str:
 async def unlimited_ocr_v2(
     disaggregation_mode: str, tokenizer_manager: TokenizerManager
 ):
-    """Run a one-page and a two-page gundam document and a two-page base one.
+    """Run a one-page gundam document through the model; opt in with --warmups.
 
-    The first image request otherwise pays one-time costs in the vision
-    encoder and decoder (graph compiles, kernel builds). On an Apple M5 a fresh
-    server's first one-page request had a TTFT of 2.7-8.5 s against 0.45 s for
-    the next one; after the warmup it is 1.6-1.8 s, as a page of another size
-    still builds its own graphs once.
+    The first image request otherwise pays one-time vision and decoder graph
+    compiles. On an Apple M5 this request takes 3.6 s with a warm Metal cache
+    and 12.7 s with an empty one, and cuts the first real request's TTFT from
+    2.4 s to 1.6 s and from 7.5 s to 1.7 s. Adding a two-page gundam and a
+    two-page base document costs another 3.8-4.3 s for at most 0.2 s less TTFT.
     """
-    for mode, titles in (
-        ("gundam", ["Warmup"]),
-        ("gundam", ["Warmup A", "Warmup B"]),
-        ("base", ["Warmup A", "Warmup B"]),
-    ):
-        req = GenerateReqInput(
-            text="<PAGE><image>" * len(titles) + "Multi page parsing.",
-            image_data=[_drawn_page(title) for title in titles],
-            images_config={"image_mode": mode},
-            sampling_params={"max_new_tokens": 8, "temperature": 0},
-        )
-        if disaggregation_mode != "null":
-            req.bootstrap_room = 0
-            req.bootstrap_host = FAKE_BOOTSTRAP_HOST
-        async for _ in tokenizer_manager.generate_request(req, None):
-            pass
+    req = GenerateReqInput(
+        text="<PAGE><image>Multi page parsing.",
+        image_data=[_drawn_page("Warmup")],
+        images_config={"image_mode": "gundam"},
+        sampling_params={"max_new_tokens": 8, "temperature": 0},
+    )
+    if disaggregation_mode != "null":
+        req.bootstrap_room = 0
+        req.bootstrap_host = FAKE_BOOTSTRAP_HOST
+    async for _ in tokenizer_manager.generate_request(req, None):
+        pass
     logger.info("Unlimited-OCR v2 warmup done.")

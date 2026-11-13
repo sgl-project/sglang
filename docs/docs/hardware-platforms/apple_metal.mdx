@@ -112,9 +112,10 @@ sglang serve \
   --uocr-max-page-tokens 8000
 ```
 
-- With `--uocr-doc-split` and `--uocr-max-page-tokens`, SGLang sizes the KV pool in document windows. One window is `--uocr-doc-page-window` * `--uocr-max-page-tokens` plus prompt and lookahead slack and one `--chunked-prefill-size` chunk: 15,168 tokens for one page and 8000 tokens on a 16 GB Mac. The pool holds one window when the Mac's Metal working-set limit is up to 14 GiB (a 16 GB Mac has 12 GiB), so unified memory does not swap, and one more window for each further 8 GiB, up to eight. Pass `--max-total-tokens` to size the pool yourself, for example `--max-total-tokens 32768` to serve eight documents at once on a 16 GB Mac.
+- With `--uocr-doc-split` and `--uocr-max-page-tokens`, SGLang sizes the KV pool in document windows. One window is `--uocr-doc-page-window` * `--uocr-max-page-tokens` plus prompt and lookahead slack and one `--chunked-prefill-size` chunk: 15,168 tokens for one page and 8000 tokens on a 16 GB Mac. The pool holds two windows on a 16 GB Mac (12 GiB Metal working-set limit) and one more for each further 2 GiB of limit, up to eight; only the 16 GB Mac has been measured. Pass `--max-total-tokens` to size the pool yourself.
+- Without `--uocr-doc-split` and `--uocr-max-page-tokens` the pool is not capped and takes most of the free memory, which on a 16 GB Mac can leave the vision encoder short and make the system swap. Pass `--max-total-tokens` there, for example `--max-total-tokens 32768` as in the cookbook recipe.
 - Requests that send `DeepseekOCRNoRepeatNGramLogitProcessor` as `custom_logit_processor` need `--enable-custom-logit-processor`.
-- Startup runs a built-in `unlimited_ocr_v2` warmup over one- and two-page documents, which takes 10-22 s on an M5 (pass `--skip-server-warmup` to skip it). It moves most one-time PyTorch MPS graph compilation out of the first request; a page of a new size still builds its own graphs once, about 1.3 s.
+- `--warmups unlimited_ocr_v2` sends one drawn page through the model before the server starts listening. On an M5 the warmup takes 3.6 s with a warm Metal cache and 12.7 s with an empty one, and cuts the first request's TTFT from 2.4 s to 1.6 s and from 7.5 s to 1.7 s, so it helps a server that is idle for a while before its first request.
 - Overlap scheduling and CUDA graphs are not available on MPS.
 
 On an M5 MacBook Pro with 16 GB of memory, one document decodes at about 70 tokens/s.

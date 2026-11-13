@@ -61,7 +61,7 @@ class TestUnsupportedServingModes(CustomTestCase):
         self.assertEqual(overrides["attention_backend"], "unlimited_ocr_v2")
         self.assertEqual(overrides["page_size"], 32)
 
-    def test_mps_enables_startup_warmup_and_window_kv_cap_by_default(self):
+    def test_mps_sizes_the_kv_pool_in_windows_by_default(self):
         from unittest import mock
 
         from sglang.srt.arg_groups.model_overrides import unlimited_ocr_v2 as uocr_ov
@@ -74,23 +74,24 @@ class TestUnsupportedServingModes(CustomTestCase):
                     uocr_ov, "get_device_memory_capacity", return_value=mem_mib
                 ),
             ):
-                uocr_ov.apply_unlimited_ocr_v2_mps_defaults(sa)
+                uocr_ov.apply_unlimited_ocr_v2_mps_kv_pool_default(sa)
             return resolving_view(sa)
 
         split = dict(uocr_doc_split=True, uocr_max_page_tokens=8000)
-        # 16 GB Mac (~12 GiB recommended working set) -> 1 window (15,168 tokens).
+        # 16 GB Mac (12,124 MiB working-set limit) -> 2 windows of 15,168 tokens.
         resolved_16g = run(**split)
-        self.assertEqual(resolved_16g.warmups, "unlimited_ocr_v2")
-        self.assertEqual(resolved_16g.max_total_tokens, 15168)
-        # 64 GB Mac (~48 GiB working set) scales up to 5 windows (75,840 tokens).
-        resolved_64g = run(mem_mib=48 * 1024, **split)
-        self.assertEqual(resolved_64g.max_total_tokens, 5 * 15168)
+        self.assertEqual(resolved_16g.max_total_tokens, 2 * 15168)
+        # The warmup stays opt-in.
+        self.assertIsNone(resolved_16g.warmups)
+        # 20 GiB adds one window per 2 GiB above 12 GiB; 48 GiB hits the cap.
+        self.assertEqual(run(mem_mib=20 * 1024, **split).max_total_tokens, 6 * 15168)
+        self.assertEqual(run(mem_mib=48 * 1024, **split).max_total_tokens, 8 * 15168)
+        self.assertEqual(run(mem_mib=8 * 1024, **split).max_total_tokens, 15168)
         # The per-window slack is one prefill chunk, so a larger chunk widens it.
         self.assertEqual(
-            run(chunked_prefill_size=4096, **split).max_total_tokens, 15168 + 2048
+            run(chunked_prefill_size=4096, **split).max_total_tokens,
+            2 * (15168 + 2048),
         )
-        self.assertIsNone(run(skip_server_warmup=True).warmups)
-        self.assertEqual(run(warmups="custom").warmups, "custom")
         self.assertEqual(run(max_total_tokens=16384, **split).max_total_tokens, 16384)
         self.assertIsNone(run(uocr_doc_split=False).max_total_tokens)
 

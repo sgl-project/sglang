@@ -257,10 +257,10 @@ def handle_model_specific_adjustments(server_args: Any):
 
     if model_arch == "UnlimitedOCRV2ForCausalLM":
         from sglang.srt.arg_groups.model_overrides.unlimited_ocr_v2 import (
-            apply_unlimited_ocr_v2_mps_defaults,
+            apply_unlimited_ocr_v2_mps_kv_pool_default,
         )
 
-        apply_unlimited_ocr_v2_mps_defaults(server_args)
+        apply_unlimited_ocr_v2_mps_kv_pool_default(server_args)
 
     if model_arch == "Glm5NextForConditionalGeneration":
         from sglang.srt.arg_groups.glm5_next_hook import (

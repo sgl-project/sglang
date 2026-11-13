@@ -1,8 +1,8 @@
 """End-to-end Unlimited-OCR v2 (BF16) on the standard Torch ModelRunner on Apple MPS.
 
 Covers the multimodal path (processor, SAM/CLIP encoder, DASH decoder with the
-Metal kernels), document splitting and the MPS startup defaults (warmup, KV
-pool size), against drawn pages with known text.
+Metal kernels), document splitting, the opt-in warmup and the MPS KV pool
+default, against drawn pages with known text.
 """
 
 import base64
@@ -10,10 +10,13 @@ import io
 import json
 import os
 import unittest
+from types import SimpleNamespace
 
 import requests
 import torch
 
+from sglang.srt.arg_groups.model_overrides.unlimited_ocr_v2 import mps_window_tokens
+from sglang.srt.configs.unlimited_ocr_v2 import UocrDocumentConfig
 from sglang.test.ci.ci_register import register_mps_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -76,9 +79,12 @@ class TestUnlimitedOcrV2TorchMps(CustomTestCase):
                 "unlimited-ocr",
                 "--enable-custom-logit-processor",
                 "--uocr-doc-split",
-                # With no --max-total-tokens, the MPS defaults size the KV pool.
+                # With no --max-total-tokens, the MPS default sizes the KV pool.
                 "--uocr-max-page-tokens",
                 "8000",
+                # Opt-in; a broken warmup stops the server from starting.
+                "--warmups",
+                "unlimited_ocr_v2",
             ],
         )
 
@@ -87,13 +93,13 @@ class TestUnlimitedOcrV2TorchMps(CustomTestCase):
         if hasattr(cls, "process") and cls.process:
             terminate_and_kill_process_tree(cls.process)
 
-    def test_mps_defaults_cap_the_kv_pool_and_warm_up(self):
+    def test_mps_default_sizes_the_kv_pool_in_windows(self):
         info = requests.get(f"{self.base_url}/server_info", timeout=30).json()
-        self.assertEqual(info["warmups"], "unlimited_ocr_v2")
-        # A whole number of windows: the one-page context with 8000 page tokens
-        # (13,092 tokens) plus one prefill chunk, page-aligned (15,168 on a
-        # 16 GB Mac).
-        window = 13120 + max(info["chunked_prefill_size"], 2048)
+        window = mps_window_tokens(
+            UocrDocumentConfig.from_args(SimpleNamespace(**info)),
+            chunked_prefill_size=info["chunked_prefill_size"],
+            page_size=info["page_size"],
+        )
         self.assertGreater(info["max_total_tokens"], 0)
         self.assertEqual(info["max_total_tokens"] % window, 0)
 
