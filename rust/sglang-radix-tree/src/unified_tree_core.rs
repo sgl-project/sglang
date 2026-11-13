@@ -81,6 +81,9 @@ pub struct IncLockRefResult {
     /// A recorded None means the segment reaches the root; absence means no receipt.
     pub component_lock_uuids: HashMap<u8, Option<i64>>,
     pub component_host_lock_uuids: HashMap<u8, Option<i64>>,
+    /// Actions produced by a lock-walk split; the cache applies them after the
+    /// receipt is returned, matching the Python component's immediate apply.
+    pub cache_actions: CacheActions,
 }
 
 impl IncLockRefResult {

@@ -217,6 +217,7 @@ def _inc_lock_ref_result_from_binding(result) -> IncLockRefResult:
             ComponentType(ct): uuid
             for ct, uuid in result.component_host_lock_uuids.items()
         },
+        cache_actions=_cache_actions_from_tagged(result.cache_actions),
     )
 
 

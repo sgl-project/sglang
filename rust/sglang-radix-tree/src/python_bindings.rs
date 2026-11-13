@@ -739,6 +739,9 @@ pub struct IncLockRefResultBinding {
     component_lock_uuids: HashMap<u8, Option<i64>>,
     #[pyo3(get)]
     component_host_lock_uuids: HashMap<u8, Option<i64>>,
+    /// Lock-walk split actions the cache applies before using the receipt.
+    #[pyo3(get)]
+    cache_actions: Py<PyList>,
 }
 
 #[pymethods]
@@ -751,8 +754,11 @@ impl IncLockRefResultBinding {
 }
 
 impl IncLockRefResultBinding {
-    fn from_result(result: crate::unified_tree_core::IncLockRefResult) -> Self {
-        Self {
+    fn from_result(
+        py: Python<'_>,
+        result: crate::unified_tree_core::IncLockRefResult,
+    ) -> PyResult<Self> {
+        Ok(Self {
             delta: result.delta,
             node_id: result.node_id,
             component_lock_uuids: result.component_lock_uuids,
@@ -762,7 +768,8 @@ impl IncLockRefResultBinding {
                 .iter()
                 .map(|ct| ct.idx() as u8)
                 .collect(),
-        }
+            cache_actions: cache_actions_to_py(py, result.cache_actions)?,
+        })
     }
 }
 
@@ -1219,7 +1226,7 @@ macro_rules! tree_core_methods {
                 let result = py
                     .detach(|| self.core().inc_lock_ref(node_id, skip))
                     .map_err(node_access_error)?;
-                Ok(IncLockRefResultBinding::from_result(result))
+                Ok(IncLockRefResultBinding::from_result(py, result)?)
             }
 
             /// Pin only the FULL device values on a node's root path.
@@ -2064,7 +2071,7 @@ macro_rules! tree_core_methods {
                 let result = py
                     .detach(|| self.core().inc_host_lock_ref(node_id))
                     .map_err(node_access_error)?;
-                Ok(IncLockRefResultBinding::from_result(result))
+                Ok(IncLockRefResultBinding::from_result(py, result)?)
             }
 
             /// Decrease the reference count on a node's host-side component locks.

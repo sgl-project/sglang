@@ -203,6 +203,11 @@ class IncLockRefResult:
     component_host_lock_uuids: dict[ComponentType, Optional[int]] = dataclasses.field(
         default_factory=dict
     )
+    # Actions produced by a lock-walk split; the cache applies them after the
+    # receipt is returned, matching the Python component's immediate apply.
+    cache_actions: list[CacheAction | ComponentAction] = dataclasses.field(
+        default_factory=list
+    )
 
     def set_lock_uuid(
         self,

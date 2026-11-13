@@ -8,8 +8,8 @@ use std::collections::HashMap;
 use tch::{Kind, Tensor};
 
 use crate::cache_action::{
-    FreeComponentHostSlot, FreeDeviceKVFullOnly, RebuildFullToSwaMapping, RecoverSwaWithLockedFull,
-    SwaRebuild,
+    CacheAction, FreeComponentHostSlot, FreeDeviceKVFullOnly, RebuildFullToSwaMapping,
+    RecoverSwaWithLockedFull, SwaRebuild,
 };
 use crate::components::TreeComponent;
 use crate::components::{ComponentType, FULL, Family, SWA};
@@ -121,6 +121,7 @@ impl SwaComponent {
         tree_core: &mut UnifiedTreeCore<K>,
         node_id: NodeIdx_,
         uncovered: usize,
+        cache_actions: &mut CacheActions,
     ) {
         let (is_root, already_locked, has_device_value, write_pending, node_len) = {
             let node = tree_core.arena.node(node_id);
@@ -151,10 +152,13 @@ impl SwaComponent {
             return;
         }
         let (_, action) = tree_core.split_node_(node_id, split_at);
-        assert!(
-            action.is_none(),
-            "a node without write-through cannot return an action"
-        );
+        if let Some(action) = action {
+            assert!(
+                action.ack_id.is_none(),
+                "a node without write-through cannot return an acked action"
+            );
+            cache_actions.push(Box::new(action) as Box<dyn CacheAction>);
+        }
     }
 
     /// The window-only lock split is on by default, matching Python
@@ -1277,7 +1281,12 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
             // requires the node to be unlocked. `cur` keeps its id as the
             // in-window tail, so the walk continues into the split-off parent.
             if window_only {
-                self.maybe_split_for_window_lock_(tree_core, cur, sliding_window_size - covered);
+                self.maybe_split_for_window_lock_(
+                    tree_core,
+                    cur,
+                    sliding_window_size - covered,
+                    &mut result.cache_actions,
+                );
             }
             let value_len = tree_core.component_reclaimable_value_len_(cur, SWA);
             let node = tree_core.arena.node_mut(cur);
