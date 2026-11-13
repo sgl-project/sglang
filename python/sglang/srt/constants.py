@@ -1,3 +1,5 @@
+from typing import Optional
+
 # GPU Memory Types
 GPU_MEMORY_TYPE_KV_CACHE = "kv_cache"
 GPU_MEMORY_TYPE_WEIGHTS = "weights"
@@ -10,6 +12,11 @@ GPU_MEMORY_ALL_TYPES = [
 ]
 
 HEALTH_CHECK_RID_PREFIX = "HEALTH_CHECK"
+
+
+def is_health_check_request(rid: Optional[str]) -> bool:
+    return isinstance(rid, str) and rid.startswith(HEALTH_CHECK_RID_PREFIX)
+
 
 # Placeholder token inserted between items in Multi-Item Scoring sequences:
 # query<delim>item1<delim>item2<delim>... Positions are pre-computed from item
