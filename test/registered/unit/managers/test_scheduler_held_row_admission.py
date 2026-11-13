@@ -1,4 +1,5 @@
-"""A request that already holds a req_to_token row is not counted twice at admission (#38118, #35537)."""
+"""A request that already holds a req_to_token row is not counted twice at admission (#38118, #35537),
+and a parked chunked request lets no one be admitted ahead of it."""
 
 import unittest
 from types import SimpleNamespace
@@ -59,12 +60,21 @@ class _Adder(PrefillAdder):
         return AddReqResult.CONTINUE
 
 
+class _ParkingAdder(_Adder):
+    """The chunked request finds no budget and stays out of the batch."""
+
+    def add_chunked_req(self, req):
+        return req
+
+
 class _BatchBuilt(Exception):
     pass
 
 
 class TestHeldRowAdmission(CustomTestCase):
-    def _scheduler(self, disaggregation_mode, running, final_chunk, waiting):
+    def _scheduler(
+        self, disaggregation_mode, running, final_chunk, waiting, adder_class=_Adder
+    ):
         s = Scheduler.__new__(Scheduler)
         s.grammar_manager = SimpleNamespace(has_waiting_grammars=lambda: False)
         s.enable_priority_preemption = False
@@ -83,7 +93,7 @@ class TestHeldRowAdmission(CustomTestCase):
         s.tp_worker = SimpleNamespace(
             model_runner=SimpleNamespace(attn_backend=SimpleNamespace())
         )
-        s.get_prefill_adder_class = lambda: _Adder
+        s.get_prefill_adder_class = lambda: adder_class
         s.request_retirer = None
         s.page_size = 1
         s.tree_cache = SimpleNamespace(
@@ -153,6 +163,26 @@ class TestHeldRowAdmission(CustomTestCase):
                 can_run_list, batch_is_full, final_chunk, waiting = self._admitted(mode)
                 self.assertEqual(can_run_list, [final_chunk, waiting])
                 self.assertFalse(batch_is_full)
+
+    def test_parked_chunk_admits_no_waiting_request(self):
+        running = [_Req(holds_row=True)]
+        parked = _Req(holds_row=True)
+        waiting = _Req(holds_row=False)
+        running_batch = ScheduleBatch(reqs=running)
+        s = self._scheduler(
+            DisaggregationMode.NULL, running, parked, [waiting], _ParkingAdder
+        )
+        with (
+            get_context().override_server_args(pp_max_micro_batch_size=NUM_ROWS),
+            patch.object(ScheduleBatch, "init_new", side_effect=_BatchBuilt),
+            patch("sglang.srt.managers.scheduler.set_time_batch"),
+        ):
+            new_batch, _ = s._get_new_batch_prefill_raw(
+                prefill_delayer_single_pass=None, running_batch=running_batch
+            )
+        self.assertIsNone(new_batch)
+        self.assertIs(s.chunked_req, parked)
+        self.assertEqual(list(s.waiting_queue), [waiting])
 
 
 if __name__ == "__main__":

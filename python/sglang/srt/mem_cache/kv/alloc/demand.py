@@ -13,13 +13,15 @@ from sglang.srt.utils.common import ceil_align
 
 class KVDemand(msgspec.Struct, frozen=True):
     """What an allocation takes: tokens of the token sub-pool, tokens of each
-    window sub-pool by its name, and state slots. Admission and the take must
-    name every window (`checked`); an eviction request may name only the
-    sub-pools it is short of (`completed`)."""
+    window sub-pool by its name, state slots, and request rows to bind (a unit
+    of every request sub-pool each). Admission and the take must name every
+    window (`checked`); an eviction request may name only the sub-pools it is
+    short of (`completed`)."""
 
     full_tokens: int = 0
     window_tokens: Mapping[str, int] = msgspec.field(default_factory=dict)
     state_slots: int = 0
+    request_rows: int = 0
 
     @classmethod
     def same_tokens(cls, allocator, tokens: int, *, state_slots: int = 0) -> KVDemand:
@@ -39,7 +41,7 @@ class KVDemand(msgspec.Struct, frozen=True):
                 f"a demand must name every window pool: it names "
                 f"{sorted(self.window_tokens)}, the allocator keeps {sorted(names)}"
             )
-        if self.full_tokens < 0 or self.state_slots < 0:
+        if self.full_tokens < 0 or self.state_slots < 0 or self.request_rows < 0:
             raise ValueError(f"negative demand {self}")
         if any(t < 0 for t in self.window_tokens.values()):
             raise ValueError(f"negative window demand {self}")
@@ -62,6 +64,7 @@ class KVDemand(msgspec.Struct, frozen=True):
         return not (
             self.full_tokens > 0
             or self.state_slots > 0
+            or self.request_rows > 0
             or any(t > 0 for t in self.window_tokens.values())
         )
 
@@ -88,6 +91,7 @@ def request_demand(
     decode_retire_lag: int = 0,
     chunk_size: Optional[int] = None,
     state_slots: int = 0,
+    request_rows: int = 0,
     host_hit_lengths: Optional[Mapping[str, int]] = None,
     extra_tokens: int = 0,
     cached_tokens: int = 0,
@@ -168,6 +172,7 @@ def request_demand(
         + extra_tokens,
         {name: window_bound(name, window) for name, window in windows.items()},
         state_slots,
+        request_rows,
     )
 
 
@@ -307,6 +312,7 @@ class DemandInputs(msgspec.Struct, frozen=True, kw_only=True):
     decode_retire_lag: int
     chunk_size: Optional[int]
     state_slots: int
+    request_rows: int
     host_hit_lengths: Mapping[str, int]
     extra_tokens: int
     cached_tokens: int
@@ -327,6 +333,7 @@ class DemandInputs(msgspec.Struct, frozen=True, kw_only=True):
             decode_retire_lag=self.decode_retire_lag,
             chunk_size=self.chunk_size,
             state_slots=self.state_slots,
+            request_rows=self.request_rows,
             host_hit_lengths=self.host_hit_lengths,
             extra_tokens=self.extra_tokens,
             cached_tokens=self.cached_tokens,
@@ -346,6 +353,7 @@ def demand_inputs(
     checkpoint_interval: int = 0,
     decode_retire_lag: int = 0,
     state_slots: int = 0,
+    request_rows: int = 0,
     cached_tokens: int = 0,
     host_hit_lengths: Optional[Mapping[str, int]] = None,
     extra_tokens: int = 0,
@@ -371,6 +379,7 @@ def demand_inputs(
         decode_retire_lag=decode_retire_lag,
         chunk_size=chunk_limit,
         state_slots=state_slots,
+        request_rows=request_rows,
         host_hit_lengths=dict(host_hit_lengths or {}),
         extra_tokens=extra_tokens,
         cached_tokens=cached_tokens,
