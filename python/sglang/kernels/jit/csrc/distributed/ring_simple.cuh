@@ -230,8 +230,11 @@ __global__ __launch_bounds__(kRingSimpleThreads, 1) __attribute__((
   };
 
   // each channel takes a contiguous share of the tensor, then loops over it in
-  // kWorldSize chunks of at most one slot
-  const auto channel_vecs = div_ceil(num_vecs, num_channels);
+  // kWorldSize chunks of at most one slot. Shares are whole hunks per chunk:
+  // a partial hunk runs as passes of the one-pack path, each costing about as
+  // much as a full pass, so the last channels may get less or nothing instead.
+  constexpr uint32_t kShareVecs = kWorldSize * kWarpVecs;
+  const auto channel_vecs = div_ceil(div_ceil(num_vecs, num_channels), kShareVecs) * kShareVecs;
   const auto channel_start = min(ch * channel_vecs, num_vecs);
   const auto channel_len = min(channel_vecs, num_vecs - channel_start);
   const auto loop_vecs = kWorldSize * slot_vecs;
