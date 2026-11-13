@@ -534,3 +534,49 @@ the clear, registration and liveness behavior above, the suite pins the
 manager's acceptance rules for specs and URIs, `NODE_REGISTER` resend
 idempotency, the reported-medium filter, `snapshot_required` semantics and the
 raw `p2p_host_count = 0` answer.
+
+## Peer L1 NVLink POC boundary
+
+The peer-L1 adapter is deliberately separate from Router placement scoring.
+For the GLM POC, an HBM `GetHostCacheState.local` match is only a candidate hint;
+it does not prove that every TP rank, DSA buffer, or required KV pool is present.
+Only the subsequent authoritative Pin operation may authorize a copy. An
+engine-side client must reject `local` outside the requested ROOT-key count;
+the Router backend keeps its existing clamp behavior for routing hints.
+
+Use the existing engine ZMQ event bridge. Configure one reporter per actual
+independent event stream, with an explicit incarnation in `KV_INDEXER_WORKER_ID`
+(for example `engine-a.boot-uuid.tp0`). The value must exactly match the static
+EngineDirectory reporter key and KVCM `hosts[].host_ip_port`; do not synthesize
+missing TP streams or infer identities from addresses. A restart must use a new
+incarnation and refresh the directory. Pin must check that incarnation again.
+
+Provision a dedicated KVCM instance for one compatible model/layout/NVLink
+domain, using the same exact `INSTANCE_ID` in the event backend and Python
+lookup target. Foreign instances/domains must not share that identifier. This
+is an operator-enforced namespace: the generic event backend has no physical
+NVLink-domain discovery or domain authentication. The POC settings are:
+
+```bash
+export KV_INDEXER_BACKEND=tair_kvcache_kvcm
+export KV_INDEXER_TAIR_KVCACHE_KVCM_INSTANCE_ID='model-layout-nvlink-domain-instance'
+export KV_INDEXER_TAIR_KVCACHE_KVCM_REPORT_TIERS=HBM
+export KV_INDEXER_TAIR_KVCACHE_KVCM_AUTO_REGISTER=0
+export KV_INDEXER_WORKER_ID='engine-a.boot-uuid.tp0'
+```
+
+Register the compatible instance and its spec names before starting the backend;
+`AUTO_REGISTER=0` avoids a generic minimal model registration conflicting with
+deployment-specific metadata. The source control endpoint comes only from the
+static EngineDirectory. `event_report://`/`vineyard://` location URIs are metadata
+labels, never source RPC or CUDA IPC addresses.
+
+The imported backend heartbeats every eligible reporter it has seen until that
+backend is dropped, even after the engine or bridge dies. This can keep stale
+placements alive indefinitely; Router health filtering is not a substitute for
+peer-L1 Pin validation. The POC does not add liveness tracking or lease expiry
+unlock semantics. Incarnation fencing, authoritative Pin, and transfer drain
+remain required before any memory can be read or released.
+
+The event-hash golden fixture checks the actual Router hash helper.
+These contracts do not validate live KVCM, GPU copy or model serving.
