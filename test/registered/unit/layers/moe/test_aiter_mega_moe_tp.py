@@ -70,5 +70,23 @@ def test_only_an_eager_extend_forward_inside_the_window_takes_the_kernel(
     assert len(logged) == (0 if takes_kernel or compiled else 1)
 
 
+def test_startup_check_reads_only_existing_server_args():
+    # The check reads every refusal condition up front, so a server-args field that no
+    # longer exists fails here as an AttributeError rather than at a user's launch.
+    from sglang.srt.arg_groups.mega_moe_hook import check_aiter_mega_moe_tp_compat
+    from sglang.srt.runtime_context import override_platform
+    from sglang.srt.server_args import ServerArgs
+
+    def args(tp_size):
+        return ServerArgs(
+            model_path="dummy", tp_size=tp_size, enable_aiter_mega_moe_tp=True
+        )
+
+    with override_platform(is_hip=True):
+        check_aiter_mega_moe_tp_compat(args(2))
+        with pytest.raises(ValueError, match="--tp-size < 2"):
+            check_aiter_mega_moe_tp_compat(args(1))
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

@@ -39,7 +39,6 @@ def check_aiter_mega_moe_tp_compat(server_args: ServerArgs) -> None:
         (cfg.enable_attn_tp_input_scattered, "scattered attention TP input"),
         (cfg.enable_two_batch_overlap, "two-batch overlap"),
         (cfg.enable_single_batch_overlap, "single-batch overlap"),
-        (cfg.enable_pdmux, "PD multiplexing"),
         (cfg.enable_hierarchical_cache, "HiCache (its copy streams share the GPU)"),
         (cfg.enable_lora, "LoRA (its MoE wrappers would be bypassed)"),
         (cfg.speculative_algorithm is not None, "speculative decoding"),
