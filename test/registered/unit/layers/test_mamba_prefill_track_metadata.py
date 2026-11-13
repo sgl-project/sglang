@@ -21,6 +21,7 @@ from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMod
 from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative import spec_utils
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -66,8 +67,8 @@ def make_forward_batch(lengths, starts, cpu_lengths, mode=ForwardMode.EXTEND):
     )
 
 
-def make_metadata_backend():
-    backend = object.__new__(MambaAttnBackendBase)
+def make_metadata_backend(backend_type=MambaAttnBackendBase):
+    backend = object.__new__(backend_type)
     backend.device = "cpu"
     backend.topk = 1
     backend.req_to_token_pool = SimpleNamespace(get_mamba_indices=lambda rows: rows)
@@ -381,6 +382,47 @@ class TestMambaPrefillTrackMetadata(unittest.TestCase):
                 self.assertEqual(snapshot.mamba_prefill_track_mask_cpu, [True])
                 self.assertEqual(snapshot.mamba_track_seqlens_cpu, [65])
                 self.assertIsNone(snapshot.mamba_track_mask_cpu)
+
+
+class TestFlashInferPrefillTrackMetadata(CustomTestCase):
+    def test_ssd_uses_triton_tracking_endpoints(self):
+        """Aligned tracks save the final state; short tracks restore the initial state."""
+        override = get_context().override_server_args(
+            device="cpu",
+            mamba_prefill_backend="flashinfer",
+            _mamba_cache_chunk_size=128,
+        )
+        override.install()
+        self.addCleanup(override.restore)
+        lengths = [129, 255, 17, 5]
+        for mirrored in (False, True):
+            with self.subTest(mirrored=mirrored):
+                backend = make_metadata_backend(Mamba2AttnBackend)
+                backend.conv_states_shape = (1, 8, 4)
+                backend._mamba_chunk_size = 128
+                batch = make_forward_batch(lengths, [0, 129, 384, 401], lengths)
+                tracking = make_batch(
+                    lengths,
+                    [128, 256, 0, 0],
+                    [256, 449, 5, 0],
+                    [True, True, True, False],
+                    mirrored,
+                )
+                for name, value in vars(tracking).items():
+                    setattr(batch, name, value)
+                batch.extend_num_tokens = sum(lengths)
+                backend.init_forward_metadata(batch)
+                meta = backend.forward_metadata
+                ssd = meta.ssd_prefill
+                self.assertEqual(
+                    ssd.checkpoint_token_indices.tolist(), [129, 257, -1, -1]
+                )
+                self.assertEqual(ssd.initial_checkpoint_rows.tolist(), [2])
+                self.assertEqual(ssd.initial_checkpoint_slots.tolist(), [71])
+                self.assertEqual(ssd.checkpoint_state_slots.tolist(), [37, 54, 71, 88])
+                self.assertEqual(meta.track_ssm_final_dst.tolist(), [37])
+                self.assertEqual(meta.track_ssm_end_locs.tolist(), [257])
+                self.assertEqual(meta.track_ssm_recompute_dst.tolist(), [54])
 
 
 class TestDpDecodeRelabel(unittest.TestCase):

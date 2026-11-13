@@ -1230,6 +1230,46 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
             self.mamba_chunk_size,
             forward_batch,
         )
+        if (
+            get_exec().mamba.mamba_prefill_backend == "flashinfer"
+            and self.forward_metadata.num_prefills > 0
+        ):
+            from sglang.kernels.ops.mamba.flashinfer_ssd import (
+                prepare_ssd_prefill_metadata,
+            )
+
+            lengths = forward_batch.extend_seq_lens_cpu
+            if lengths is None:
+                lengths = forward_batch.extend_seq_lens.tolist()
+            endpoints = None
+            slots = None
+            if metadata.has_mamba_track_mask:
+                if self._has_cpu_prefill_track_metadata(forward_batch):
+                    mask = forward_batch.mamba_prefill_track_mask_cpu
+                    track_lens = forward_batch.mamba_track_seqlens_cpu
+                    prefix_lens = forward_batch.extend_prefix_lens_cpu
+                else:
+                    mask = forward_batch.mamba_track_mask.tolist()
+                    track_lens = forward_batch.mamba_track_seqlens.tolist()
+                    prefix_lens = forward_batch.extend_prefix_lens.tolist()
+                num_prefills = len(lengths)
+                plan = build_prefill_track_plan(
+                    mask[:num_prefills],
+                    track_lens[:num_prefills],
+                    lengths,
+                    prefix_lens[:num_prefills],
+                    self.mamba_chunk_size,
+                    mamba2=True,
+                )
+                endpoints = [-1] * num_prefills
+                for row in plan.final_rows:
+                    endpoints[row] = lengths[row]
+                for row in plan.unaligned_rows:
+                    endpoints[row] = plan.chunk_indices[row] * self.mamba_chunk_size
+                slots = forward_batch.mamba_track_indices[: len(lengths)]
+            self.forward_metadata.ssd_prefill = prepare_ssd_prefill_metadata(
+                lengths, forward_batch.input_ids.device, endpoints, slots
+            )
 
     def forward(
         self,
