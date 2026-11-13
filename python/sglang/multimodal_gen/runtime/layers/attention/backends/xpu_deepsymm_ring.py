@@ -135,7 +135,11 @@ def deepsymm_ring_precision(
     # package is missing.
     _import_ring_attn_ipc_forward()
     num_kv_heads = attn_impl.num_kv_heads
-    if head_size != 128 or num_kv_heads not in (None, attn_impl.num_heads):
+    if (
+        head_size != 128
+        or num_kv_heads not in (None, attn_impl.num_heads)
+        or attn_impl.in_bf16_block
+    ):
         return "bf16"
     if precision in _MX_PRECISIONS and query.shape[0] != 1:
         _warn_mx_batch_fallback(precision)

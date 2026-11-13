@@ -106,6 +106,37 @@ def _parse_bf16_blocks(value) -> frozenset[int]:
         ) from None
 
 
+def _bf16_blocks_from_config() -> frozenset[int]:
+    """--attention-backend-config sage_v3_bf16_blocks, on any XPU backend."""
+    config = get_global_server_args().attention_backend_config or {}
+    return _parse_bf16_blocks(config.get(SAGE_V3_BF16_BLOCKS_KEY))
+
+
+def _in_deepsymm_bf16_block(prefix: str, is_cross_attention: bool) -> bool:
+    """Whether the XPU DeepSymm ring keeps this layer on the bf16 ring: its block is
+    in sage_v3_bf16_blocks. Read only with the ring on, its only consumer."""
+    from sglang.multimodal_gen.runtime.layers.attention.backends import (
+        xpu_deepsymm_ring,
+    )
+
+    if xpu_deepsymm_ring.DEEPSYMM_RING_PRECISION is None:
+        return False
+    bf16_blocks = _bf16_blocks_from_config()
+    if not bf16_blocks:
+        return False
+    block = _BLOCK_INDEX_RE.search(prefix)
+    if block is None:
+        if is_cross_attention:
+            return False
+        logger.warning_once(
+            f"{SAGE_V3_BF16_BLOCKS_KEY} is set, but attention layer prefix "
+            f"{prefix!r} has no 'blocks.<N>.' index; the DeepSymm ring runs it at "
+            f"{xpu_deepsymm_ring.DEEPSYMM_RING_PRECISION}"
+        )
+        return False
+    return int(block.group(1)) in bf16_blocks
+
+
 def _sage_v3_options() -> tuple[str, frozenset[int]]:
     """(kind, BF16 block indices) from --attention-backend-config."""
     config = get_global_server_args().attention_backend_config or {}
@@ -116,7 +147,7 @@ def _sage_v3_options() -> tuple[str, frozenset[int]]:
             f"--attention-backend-config {SAGE_V3_KIND_KEY} must be one of "
             f"{_SAGE_V3_KINDS}, got {kind!r}"
         )
-    return kind, _parse_bf16_blocks(config.get(SAGE_V3_BF16_BLOCKS_KEY))
+    return kind, _bf16_blocks_from_config()
 
 
 def _resolve_sage_v3_kind(
@@ -233,6 +264,9 @@ class XPUAttentionImpl(AttentionImpl):
         self.head_size = head_size
         self.causal = causal
         self.softmax_scale = softmax_scale
+        # sage_v3_bf16_blocks also keeps these blocks on the bf16 DeepSymm ring,
+        # whatever the XPU backend (fa or sage_attn_3).
+        self.in_bf16_block = _in_deepsymm_bf16_block(prefix, is_cross_attention)
 
     def forward(
         self,

@@ -18,6 +18,24 @@ def _xpu_count():
     return torch.xpu.device_count() if torch.xpu.is_available() else 0
 
 
+def _set_backend_config(monkeypatch, config):
+    import addict
+
+    from sglang.multimodal_gen.runtime.server_args import server_args
+
+    monkeypatch.setattr(
+        server_args,
+        "_global_server_args",
+        types.SimpleNamespace(attention_backend_config=addict.Dict(config)),
+    )
+
+
+@pytest.fixture(autouse=True)
+def _empty_backend_config(monkeypatch):
+    """With the ring on, XPUAttentionImpl reads sage_v3_bf16_blocks."""
+    _set_backend_config(monkeypatch, {})
+
+
 def _impl(*, num_kv_heads=40, head_size=HEAD_SIZE, causal=False):
     pytest.importorskip("sgl_kernel.flash_attn", reason="needs sgl-kernel-xpu")
     from sglang.multimodal_gen.runtime.layers.attention.backends.xpu_backend import (
@@ -108,6 +126,41 @@ def test_batch_above_one_keeps_mx_precisions_off(ring_precision, precision, expe
     ring_precision(precision)
     q = torch.empty(2, 8, 40, HEAD_SIZE, dtype=torch.bfloat16, device="xpu")
     assert _precision(q, _impl()) == expected
+
+
+@pytest.mark.parametrize("impl_name", ["XPUAttentionImpl", "XPUSageAttention3Impl"])
+@pytest.mark.parametrize(
+    "prefix, expected",
+    [("blocks.33.attn1.impl", "bf16"), ("blocks.330.attn1.impl", "mxfp4")],
+)
+def test_bf16_blocks_keep_the_bf16_ring_with_fa_and_sage_attn_3(
+    monkeypatch, ring_precision, impl_name, prefix, expected
+):
+    """All self-attention goes over the ring, so sage_v3_bf16_blocks must keep
+    those blocks off the MX ring with the default XPU backend (fa) as well as
+    with sage_attn_3."""
+    if _xpu_count() < 1:
+        pytest.skip("needs an XPU")
+    pytest.importorskip("sgl_kernel", reason="needs sgl-kernel-xpu")
+    from sglang.multimodal_gen.runtime.layers.attention.backends import xpu_backend
+
+    monkeypatch.setattr(xpu_backend, "_check_sage_v3_runs", lambda kind: None)
+    _set_backend_config(monkeypatch, {"sage_v3_bf16_blocks": [0, 33]})
+    ring_precision("mxfp4")
+    impl_cls = {
+        "XPUAttentionImpl": xpu_backend.XPUAttentionImpl,
+        "XPUSageAttention3Impl": xpu_backend.XPUSageAttention3Impl,
+    }[impl_name]
+    impl = impl_cls(
+        num_heads=40,
+        head_size=HEAD_SIZE,
+        causal=False,
+        softmax_scale=HEAD_SIZE**-0.5,
+        num_kv_heads=40,
+        prefix=prefix,
+    )
+    q = torch.empty(1, 8, 40, HEAD_SIZE, dtype=torch.bfloat16, device="xpu")
+    assert _precision(q, impl) == expected
 
 
 def test_ring_across_hosts_uses_torch_ring(ring_precision):
