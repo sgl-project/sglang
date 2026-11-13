@@ -93,6 +93,7 @@ from sglang.srt.layers.cp.utils import (
 )
 from sglang.srt.layers.dp_attention import get_dp_tp_group, require_gathered_buffer
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.moe import aiter_mega_moe_tp
 from sglang.srt.layers.moe.mega_moe import allocate_mega_moe_buffers
 from sglang.srt.layers.offloader import (
     create_offloader,
@@ -1513,6 +1514,10 @@ class ModelRunner:
 
     def maybe_precompile_model_kernels_after_loading(self) -> None:
         maybe_precompile_model_kernels_after_loading(self.model, self.device)
+        # Not part of the helper above: it returns early for a model without a
+        # precompile hook, and the encoder server calls it too.
+        if not self.is_draft_worker:
+            aiter_mega_moe_tp.finalize(self.model)
 
     def _uses_cpu_graph_attention_backend(self) -> bool:
         return (
