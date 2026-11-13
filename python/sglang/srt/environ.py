@@ -25,14 +25,6 @@ def _default_hip() -> bool:
         return False
 
 
-def _default_mlu() -> bool:
-    """Return whether the selected platform is the built-in MLU platform."""
-    from sglang.srt.platforms import current_platform
-    from sglang.srt.platforms.mlu import MluSRTPlatform
-
-    return type(current_platform) is MluSRTPlatform
-
-
 _NON_UTF8_PREFIX = "base64:"
 
 
@@ -656,7 +648,7 @@ class Envs:
     SGLANG_COMPACTION_MAX_PAGES_PER_MOVE = EnvInt(4096)
     # HND KV layout folds (page, head) into one paged index for per-kv-head sparse
     # page tables (DP attn); paged backends like trtllm_mha consume it directly.
-    SGLANG_USE_HND_KVCACHE = EnvBool(_default_mlu)
+    SGLANG_USE_HND_KVCACHE = EnvBool(False)
     # --enable-kv-cache-sharding: allocate single-node prefix gather scratch
     # with PyTorch symmetric memory and gather it on copy engines through its
     # CUDA multicast mapping (MulticastAllGather). Without multicast the

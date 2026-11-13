@@ -22,6 +22,10 @@ register_mlu_ci(est_time=60, suite="pr-test-1-mlu")
 class TestMLUMHATokenToKVPool(CustomTestCase):
     def setUp(self):
         super().setUp()
+        stack = ExitStack()
+        self.addCleanup(stack.close)
+        # These tests construct MHA pools without platform configuration.
+        stack.enter_context(envs.SGLANG_USE_HND_KVCACHE.override(True))
         torch.manual_seed(0)
 
     def _create_pool(self, *, dtype=torch.bfloat16, layers=2, start=0, layout=None):

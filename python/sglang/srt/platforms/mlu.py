@@ -6,6 +6,7 @@ from typing import Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.platforms.device_mixin import (
     DeviceCapability,
     DeviceMixin,
@@ -98,6 +99,26 @@ class MluSRTPlatform(MluDeviceMixin, SRTPlatform):
                 raise ValueError(f"MLU inference requires {field}='mlu' or 'triton'.")
             if backend is None:
                 setattr(server_args, field, default_attention_backend)
+        if (
+            server_args.prefill_attention_backend
+            != server_args.decode_attention_backend
+        ):
+            raise ValueError(
+                "MLU prefill and decode share a KV cache memory pool. "
+                "Use the same attention backend to ensure compatible layouts."
+            )
+        use_hnd = server_args.prefill_attention_backend == "mlu"
+        if not envs.SGLANG_USE_HND_KVCACHE.is_set():
+            envs.SGLANG_USE_HND_KVCACHE.set(use_hnd)
+        elif envs.SGLANG_USE_HND_KVCACHE.get() != use_hnd:
+            from sglang.srt.arg_groups.model_override_base import use_mla_backend
+
+            # MLA uses token-linear storage independently of the MHA layout.
+            if not use_mla_backend(server_args):
+                raise ValueError(
+                    f"MLU MHA attention backend {server_args.prefill_attention_backend!r} "
+                    f"requires SGLANG_USE_HND_KVCACHE={int(use_hnd)}."
+                )
         if server_args.sampling_backend is None:
             server_args.sampling_backend = "pytorch"
         if server_args.page_size is None:
@@ -109,6 +130,8 @@ class MluSRTPlatform(MluDeviceMixin, SRTPlatform):
 
     def get_kv_pool_cls(self, *, kind: KVPoolKind) -> Optional[type]:
         if kind == "mha":
+            if not envs.SGLANG_USE_HND_KVCACHE.get():
+                return None
             from sglang.srt.hardware_backend.mlu.memory_pool import (
                 MLUMHATokenToKVPool,
             )

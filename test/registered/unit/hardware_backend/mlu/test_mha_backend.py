@@ -1,12 +1,14 @@
 """Eager MLU paged GQA, cached prefixes, mixed batches and rejected features."""
 
 import unittest
+from contextlib import ExitStack
 from functools import partial
 from types import SimpleNamespace as NS
 from unittest.mock import patch
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.mlu.attention.mha_backend import MLUMHABackend
 from sglang.srt.hardware_backend.mlu.memory_pool import MLUMHATokenToKVPool
 from sglang.srt.layers.radix_attention import AttentionType
@@ -20,6 +22,10 @@ register_mlu_ci(est_time=60, suite="pr-test-1-mlu")
 class TestMLUMHABackend(CustomTestCase):
     def setUp(self):
         super().setUp()
+        stack = ExitStack()
+        self.addCleanup(stack.close)
+        # These tests construct MHA pools without platform configuration.
+        stack.enter_context(envs.SGLANG_USE_HND_KVCACHE.override(True))
         torch.manual_seed(42)
 
     def _create_fixture(self, mode, query_lens, mixed_prefill_reqs=None):
