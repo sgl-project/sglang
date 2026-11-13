@@ -888,14 +888,21 @@ class UnifiedRadixCache(BasePrefixCache):
         return result
 
     def _units_demand(self, units: dict[str, int]) -> KVDemand:
-        """A demand in the allocator's units (pages, slots for state) as the
-        tokens and slots admission prices."""
-        page = self.token_to_kv_pool_allocator.page_size
+        """A demand in the allocator's units (pages, slots for state, units for
+        request sub-pools) as the tokens, slots and request rows admission
+        prices."""
+        allocator = self.token_to_kv_pool_allocator
+        page = allocator.page_size
         owner, windows, state = self._sub_pool_roles()
+        # Every request sub-pool takes a unit per request row the demand binds.
+        request_rows = max(
+            (units.get(name, 0) for name in allocator.request_allocators), default=0
+        )
         return KVDemand(
             units.get(owner, 0) * page,
             {name: units.get(name, 0) * page for name in windows},
             0 if state is None else units.get(state, 0),
+            request_rows,
         )
 
     def _reclaimable_units(self) -> dict[str, int]:
@@ -1754,6 +1761,16 @@ class UnifiedRadixCache(BasePrefixCache):
     def advance_unpublished_req(self, req: Req) -> None:
         assert not self.supports_mamba()
         token_ids = req.get_fill_ids()
+        branching_seqlen = req.swa_branching_seqlen
+        if (
+            branching_seqlen is not None
+            and branching_seqlen > req.kv.cache_protected_len
+        ):
+            branch_end = branching_seqlen + int(self.tree_core.is_eagle)
+            if req.skip_radix_cache_insert:
+                req.swa_branching_seqlen = None
+            elif branch_end <= len(token_ids):
+                self.checkpoint(req, up_to=branch_end)
         insert_params = InsertParams(
             prev_prefix_len=req.kv.cache_protected_len,
             priority=req.priority or 0,

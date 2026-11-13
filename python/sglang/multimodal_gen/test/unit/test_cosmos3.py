@@ -173,12 +173,13 @@ class TestCosmos3RopePlacement(CustomTestCase):
                     self.assertNotIn("inv_freq", rotary_emb.state_dict())
 
 
-class TestCosmos3T1FusedQKNormRoPE(unittest.TestCase):
+class TestCosmos3T1FusedQKNormRoPE(CustomTestCase):
     def _can_enable(
         self,
         *,
         is_blackwell=False,
         is_hopper=False,
+        is_sm121=False,
         hidden_act="silu",
         tp_size=1,
         sp_size=1,
@@ -188,6 +189,7 @@ class TestCosmos3T1FusedQKNormRoPE(unittest.TestCase):
         return _can_enable_t1_fused_qk_norm_rope(
             is_blackwell=is_blackwell,
             is_hopper=is_hopper,
+            is_sm121=is_sm121,
             hidden_act=hidden_act,
             tp_size=tp_size,
             sp_size=sp_size,
@@ -259,6 +261,24 @@ class TestCosmos3T1FusedQKNormRoPE(unittest.TestCase):
 
     def test_compiled_path_disabled(self):
         self.assertFalse(self._can_enable(is_hopper=True, is_compiled=True))
+
+    def test_sm121_single_gpu_nano_and_edge_enabled(self):
+        self.assertTrue(self._can_enable(is_sm121=True, hidden_size=4096))
+        self.assertTrue(
+            self._can_enable(is_sm121=True, hidden_act="relu2", hidden_size=2048)
+        )
+
+    def test_sm121_unmeasured_shapes_and_topologies_disabled(self):
+        for overrides in (
+            {"hidden_size": 5120},
+            {"hidden_size": 5120, "tp_size": 2},
+            {"hidden_act": "relu2", "hidden_size": 4096},
+            {"hidden_size": 4096, "tp_size": 2},
+            {"hidden_size": 4096, "sp_size": 2},
+            {"hidden_size": 4096, "is_compiled": True},
+        ):
+            with self.subTest(overrides=overrides):
+                self.assertFalse(self._can_enable(is_sm121=True, **overrides))
 
     def test_other_architecture_disabled(self):
         self.assertFalse(self._can_enable())

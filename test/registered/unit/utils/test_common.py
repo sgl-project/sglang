@@ -12,6 +12,7 @@ from sglang.srt.multimodal.media_io import _load_image
 from sglang.srt.utils.common import flatten_arrays_to_int64_tensor
 from sglang.srt.utils.device import (
     _get_device_sm_via_nvml,
+    async_h2d_tensor,
     get_nvidia_driver_version_str,
     is_gfx95_supported,
     is_gfx942_supported,
@@ -65,6 +66,36 @@ class TestFlattenArraysToInt64Tensor(CustomTestCase):
             array("q", [1000]),
         ]
         self._check(parts, [10, 20, 30, 100, 200, 1000])
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+class TestAsyncH2dTensor(CustomTestCase):
+    """`async_h2d_tensor` moves host tensors to the device through pinned memory."""
+
+    def test_copies_values_from_pageable_and_pinned_hosts(self):
+        src = torch.arange(1024, dtype=torch.int64)
+        for host in (src, src.pin_memory()):
+            out = async_h2d_tensor(host, device=torch.device("cuda"))
+            self.assertEqual(out.device.type, "cuda")
+            self.assertTrue(torch.equal(out.cpu(), src))
+
+    def test_device_tensor_stays_on_device(self):
+        src = torch.arange(8, device="cuda")
+        out = async_h2d_tensor(src, device=torch.device("cuda"))
+        self.assertTrue(torch.equal(out, src))
+
+    def test_copies_without_pinned_memory(self):
+        src = torch.arange(16, dtype=torch.int64)
+        with (
+            mock.patch(
+                "sglang.srt.utils.device.is_pin_memory_available", return_value=False
+            ),
+            mock.patch.object(
+                torch.Tensor, "pin_memory", side_effect=AssertionError("pinned")
+            ),
+        ):
+            out = async_h2d_tensor(src, device=torch.device("cuda"))
+        self.assertTrue(torch.equal(out.cpu(), src))
 
 
 class TestNvidiaDriverVersionStr(CustomTestCase):
