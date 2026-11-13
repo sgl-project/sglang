@@ -182,7 +182,7 @@ class GatedResidual(HyperConnectionBase):
         # which hands its combine the inject logits as gate partials.
         self._fused_hc_ok = (
             use_mix
-            and envs.SGLANG_OPT_QWEN4_FUSED_HC.get()
+            and envs.SGLANG_ROCM_OPT_QWEN4_FUSED_HC.get()
             and self.hc_count == 4
             and self.config.hc_per_branch_norm
             and _use_aiter

@@ -28,7 +28,7 @@ def _layers():
     with torch.no_grad():
         for p in ref.parameters():
             p.copy_(torch.randn_like(p) * 0.02)
-    with envs.SGLANG_OPT_QWEN4_FUSED_HC.override(True):
+    with envs.SGLANG_ROCM_OPT_QWEN4_FUSED_HC.override(True):
         fused = GatedResidual(cfg).cuda().bfloat16()
     fused.load_state_dict(ref.state_dict())
     assert fused._fused_hc_ok and not ref._fused_hc_ok
