@@ -32,11 +32,13 @@ class RMSNormFwd:
         self,
         N: int,
         *,
+        has_pre_affine: bool = False,
         preload_weight: bool = False,
         x_alignment: int = 16,
     ):
         self.x_alignment = x_alignment
         self.N = N
+        self.has_pre_affine = has_pre_affine
         self.preload_weight = preload_weight
         self.use_x_g2r_load = N <= 128
         self.reload_x_from_smem = N > 8192 and (not self.use_x_g2r_load)
@@ -85,10 +87,17 @@ class RMSNormFwd:
         mX: cute.Tensor,
         mW: cute.Tensor | None,
         mY: cute.Tensor,
+        mPW: cute.Tensor | None,
         eps: Float32,
         stream,
     ) -> None:
-        weight_bits = const_expr(mW.element_type.width if mW is not None else 32)
+        weight_bits = const_expr(
+            mW.element_type.width
+            if mW is not None
+            else mPW.element_type.width
+            if self.has_pre_affine
+            else 32
+        )
         widest_dtype_bits = const_expr(
             max(mX.element_type.width, weight_bits, mY.element_type.width)
         )
@@ -104,10 +113,16 @@ class RMSNormFwd:
             if const_expr(mW is not None)
             else None
         )
+        mPW_expanded = (
+            expand_dim(mPW, dim=0, size=tile_mn[0])
+            if const_expr(self.has_pre_affine)
+            else None
+        )
         self.kernel(
             mX,
             mW_expanded,
             mY,
+            mPW_expanded,
             eps,
             tile_mn,
             tiled_copy,
@@ -125,6 +140,7 @@ class RMSNormFwd:
         mX: cute.Tensor,
         mW: cute.Tensor | None,
         mY: cute.Tensor,
+        mPW: cute.Tensor | None,
         eps: Float32,
         tile_mn: cute.Shape,
         tiled_copy: cute.TiledCopy,
@@ -152,6 +168,8 @@ class RMSNormFwd:
             gW = cute.local_tile(mW, tile_mn, (0, 0))
         gY = cute.local_tile(mY, tile_mn, (bid_m, 0))
         cX = cute.local_tile(cX_full, tile_mn, (bid_m, 0))
+        if const_expr(self.has_pre_affine):
+            gPW = cute.local_tile(mPW, tile_mn, (0, 0))
         thr_copy = tiled_copy.get_slice(tidx)
         if const_expr(cute.rank(mX) == 2):
             tXgX = thr_copy.partition_S(gX)
@@ -169,6 +187,13 @@ class RMSNormFwd:
             None if is_even_n else predicate_n(thr_copy.partition_S(cX), limit=shape[1])
         )
         copy_n = partial(copy_partition, pred=pred_n)
+        if const_expr(self.has_pre_affine):
+            tXgPW = thr_copy.partition_S(gPW)
+            tXrPW = cute.make_rmem_tensor_like(tXgPW)
+            if const_expr(not is_even_n):
+                tXrPW.fill(0.0)
+            copy_n(tXgPW, tXrPW)
+            pw = tXrPW.load().to(cute.Float32)
         if const_expr(mW is not None and self.preload_weight):
             if const_expr(not is_even_n):
                 tXrW.fill(0.0)
@@ -198,10 +223,14 @@ class RMSNormFwd:
             cute.arch.cp_async_wait_group(0)
             cute.autovec_copy(tXsX, tXrX)
         x = tXrX.load().to(cute.Float32)
+        if const_expr(self.has_pre_affine):
+            x = x * pw
         rstd = rmsnorm_row_rstd(x, self.N, eps, threads_per_row, reduction_buffer)
         if const_expr(self.reload_x_from_smem):
             cute.autovec_copy(tXsX, tXrX)
             x = tXrX.load().to(cute.Float32)
+            if const_expr(self.has_pre_affine):
+                x = x * pw
         y = x * rstd
         if const_expr(mW is not None):
             if const_expr(not self.preload_weight):
@@ -220,8 +249,15 @@ BASE_ALIGN = 16
 
 
 @cache
-def _compile_norm(x_dtype, weight_dtype, output_dtype, width, x_layout, preload):
-    kernel = RMSNormFwd(width, preload_weight=preload, x_alignment=x_layout[1])
+def _compile_norm(
+    x_dtype, weight_dtype, output_dtype, pre_weight_dtype, width, x_layout, preload
+):
+    kernel = RMSNormFwd(
+        width,
+        has_pre_affine=pre_weight_dtype is not None,
+        preload_weight=preload,
+        x_alignment=x_layout[1],
+    )
     tokens = cute.sym_int64()
     x = make_fake_norm_rows(x_dtype, width, *x_layout)
 
@@ -246,20 +282,24 @@ def _compile_norm(x_dtype, weight_dtype, output_dtype, width, x_layout, preload)
         x,
         weight(weight_dtype),
         y,
+        weight(pre_weight_dtype),
         Float32(0.0),
         stream,
         options="--enable-tvm-ffi",
     )
 
 
-def rms_norm(x, weight, eps, *, output_dtype=None, out=None):
+def rms_norm(x, weight, eps, *, pre_weight=None, output_dtype=None, out=None):
     assert x.is_cuda and x.shape[-1] > 0 and x.shape[-1] % 4 == 0
     shape = x.shape
     layout = (as_norm_rows(x).ndim, norm_row_alignment(x))
     x = as_norm_rows(x)
-    if weight is not None:
-        assert weight.is_contiguous() and weight.shape == (x.shape[-1],)
-        assert weight.device == x.device
+    for parameter in (weight, pre_weight):
+        if parameter is not None:
+            assert parameter.is_contiguous() and parameter.shape == (x.shape[-1],)
+            assert parameter.device == x.device
+    if weight is not None and pre_weight is not None:
+        assert weight.dtype == pre_weight.dtype
     output_dtype = output_dtype or x.dtype
     if out is not None:
         assert out.shape == shape and out.dtype == output_dtype and out.is_contiguous()
@@ -271,14 +311,20 @@ def rms_norm(x, weight, eps, *, output_dtype=None, out=None):
     if not x.numel():
         return y
     width = x.shape[-1]
-    preload = weight is not None and 1536 <= width <= 8192 and x.numel() // width <= 256
+    preload = (
+        weight is not None
+        and pre_weight is None
+        and 1536 <= width <= 8192
+        and x.numel() // width <= 256
+    )
     compiled = _compile_norm(
         torch_to_cute_dtype[x.dtype],
         torch_to_cute_dtype[weight.dtype] if weight is not None else None,
         torch_to_cute_dtype[output_dtype],
+        torch_to_cute_dtype[pre_weight.dtype] if pre_weight is not None else None,
         width,
         layout,
         preload,
     )
-    compiled(x, weight, y.view(-1, width), float(eps))
+    compiled(x, weight, y.view(-1, width), pre_weight, float(eps))
     return y

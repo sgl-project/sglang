@@ -74,6 +74,7 @@ class Inkling2DecoderLayer(nn.Module):
                 RMSNorm(
                     config.hidden_size,
                     config.rms_norm_eps,
+                    pre_affine=config.pre_norm_pre_affine,
                     output_dtype=torch.bfloat16,
                 ),
             )
@@ -226,6 +227,7 @@ class Inkling2CausalLLM(nn.Module):
         self.norm = RMSNorm(
             config.hidden_size,
             config.rms_norm_eps,
+            pre_affine=config.final_norm_pre_affine,
             output_dtype=torch.bfloat16,
         )
         self.lm_head = ParallelLMHead(

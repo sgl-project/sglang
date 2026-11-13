@@ -238,6 +238,7 @@ class Inkling2Attention(nn.Module):
             and pad_rows & (pad_rows - 1) == 0
             and self.v_norm is not None
             and self.v_norm.weight is None
+            and self.v_norm.pre_weight is None
             and self.q_l2_clip.threshold == self.k_l2_clip.threshold
             and self.q_l2_clip.eps == self.k_l2_clip.eps == self.rel_l2_clip.eps
             and self.k_sconv.use_residual

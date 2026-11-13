@@ -12,6 +12,8 @@ class Inkling2ModelConfig(InklingModelConfig):
         self,
         *,
         model_max_length: int = 1048576,
+        pre_norm_pre_affine: bool = False,
+        final_norm_pre_affine: bool = False,
         use_value_norm_no_gamma: bool = True,
         qk_l2_clip_threshold: float = 22.627416997969522,
         rel_l2_clip_threshold: float = 8.0,
@@ -57,6 +59,8 @@ class Inkling2ModelConfig(InklingModelConfig):
         super().__init__(**(defaults | kwargs))
         self.model_max_length = model_max_length
         self.max_position_embeddings = model_max_length
+        self.pre_norm_pre_affine = pre_norm_pre_affine
+        self.final_norm_pre_affine = final_norm_pre_affine
         self.use_value_norm_no_gamma = use_value_norm_no_gamma
         self.qk_l2_clip_threshold = qk_l2_clip_threshold
         self.rel_l2_clip_threshold = rel_l2_clip_threshold
