@@ -288,12 +288,13 @@ class SamplingBatchInfo:
         penalizer_orchestrator = penaltylib.BatchedPenalizerOrchestrator(
             vocab_size=vocab_size,
             batch=batch,
-            penalizers={
+            # Penalties do not commute; keep their order consistent across TP ranks.
+            penalizers=(
                 penaltylib.BatchedFrequencyPenalizer,
                 penaltylib.BatchedMinNewTokensPenalizer,
                 penaltylib.BatchedPresencePenalizer,
                 penaltylib.BatchedRepetitionPenalizer,
-            },
+            ),
         )
 
         ret = cls(
