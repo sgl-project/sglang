@@ -720,6 +720,11 @@ Where to start for common goals, ordered by expected impact. Each goal is a thin
 full constraint and failure modes live in each row's trade-offs. Turn on every applicable switch from the
 [batch checklist](#batch-checklist) first, and check the enable condition of any workload-dependent switch you add.
 
+Almost every parameter moves more than one goal, directly or indirectly. A smaller prefill chunk buys TTFT and costs
+prefill throughput; a higher graph batch cap buys throughput and costs memory. So no goal can list every parameter
+that acts on it: each list below is a starting point, not a closed set. Expect a change made for one goal to move the
+others, and expect knobs listed under one goal to move another.
+
 For a target held under a budget on another metric — output throughput within a TPOT cap, say — sweep the knob that
 sets the budget first, pin it where the constrained metric sits just inside its bound, and only then sweep the
 maximizing knob.
@@ -739,6 +744,10 @@ On MLA and DeepSeek-style MoE models, enable the MLAPO and multistream-MoE switc
 5. [`--enable-prefill-delayer`](#enable-prefill-delayer) — on mixed workloads with attention DP, bounded prefill
    delays keep decode fed when it would otherwise stall behind prefill bursts (it pays TTFT for TPOT).
 
+**Cross-goal.** The delayer pays TTFT, a higher graph cap costs memory, and verification spends compute that high
+concurrency cannot repay — the [TTFT](#lower-time-to-first-token-ttft), [OOM](#resolve-out-of-memory-errors), and
+[throughput](#higher-throughput) goals read these knobs from the other side.
+
 ### Higher throughput
 
 1. [`--attn-dp-size`](#attn-dp-size) — more independent decode instances.
@@ -751,12 +760,19 @@ server actually forms are three different numbers: requests above the capacity c
 is what the `Decode batch` lines report per rank. Sweep client concurrency against a fixed server configuration first;
 once the server saturates, more concurrency buys queueing and TTFT, not throughput.
 
+**Cross-goal.** More concurrency raises TPOT, and the memory fraction that buys KV is the same budget the
+[OOM](#resolve-out-of-memory-errors) goal spends.
+
 ### Lower time to first token (TTFT)
 
 1. [`--chunked-prefill-size`](#chunked-prefill-size) on mixed workloads — short requests are not delayed behind a
    single long prefill.
 2. Prefix caching — leave [`--disable-radix-cache`](#disable-radix-cache) unset, so shared prompt prefixes reuse KV.
 3. [`--attn-cp-size`](#attn-cp-size) for long inputs — one sequence split across devices.
+
+**Cross-goal.** A smaller chunk interleaves more fairly but lowers prefill throughput, and context parallelism adds
+inter-device traffic — the [throughput](#higher-throughput) and [TPOT](#lower-decode-latency-tpot) goals read the same
+knobs from the other side.
 
 ### Resolve out-of-memory errors
 
@@ -775,6 +791,9 @@ should hold the weights with room to spare, the shortage is in the memory budget
 If startup instead fails with `Not enough memory … increase --mem-fraction-static`, the KV pool is too small: see
 [Troubleshooting](#troubleshooting).
 
+**Cross-goal.** KV headroom is taken from concurrency, quantization from accuracy, and a wider TP from all-reduce
+bandwidth — every fix here is a cost booked under another goal.
+
 ### Serve long contexts
 
 1. [`--enable-prefill-cp`](#enable-prefill-cp) + [`--attn-cp-size`](#attn-cp-size) +
@@ -783,12 +802,16 @@ If startup instead fails with `Not enough memory … increase --mem-fraction-sta
 3. [`--chunked-prefill-size -1`](#chunked-prefill-size) on a dedicated prefill group — the entire sequence prefilled
    in one pass.
 
+**Cross-goal.** Context parallelism adds inter-device traffic, and an unchunked prefill keeps decode waiting wherever
+the two share a node — long-context settings are the most likely to shift [TPOT](#lower-decode-latency-tpot).
+
 ### From an observed symptom
 
 The goals above start from what you want; this table starts from what you see on a running deployment. Utilization
 and communication shares come from [Profiling](/docs/hardware-platforms/ascend-npus/optimization/profiling); batch
 numbers come from the recurring `Decode batch` log line — `#running-req:` per rank, or `sglang:num_running_reqs` on
-`/metrics`.
+`/metrics`. Because the goals are coupled, a symptom usually points at a knob filed under a different goal — follow
+the row, not the section.
 
 | Observation | Inspect first |
 | --- | --- |
