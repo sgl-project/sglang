@@ -281,10 +281,12 @@ def check_pipeline_parallel_compat(cfg: Any) -> None:
 def verify_merged_mixed_enabled(
     server_args: Any, *, hybrid_linear_attn: bool = False
 ) -> bool:
-    """Whether mixed steps run DSPARK's verify-merged path.
+    """Whether mixed steps preserve DSPARK's running rows and verify width.
 
-    Supports eager Ascend DSV4 target forwards with DSPARK and mixed chunk,
-    including phase-coordinated attention-DP ranks.
+    Supports eager Ascend DSV4 prefills with DSPARK and mixed chunk,
+    including phase-coordinated attention-DP ranks. The worker may merge
+    verification into prefill or run a separate decode graph according to
+    the configured decode backend.
     Unsupported setups keep the default 1-token decode of running rows.
     """
     if not envs.SGLANG_ENABLE_MIXED_PREFILL_SPEC_COORDINATION.get():

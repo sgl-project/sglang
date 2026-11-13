@@ -172,6 +172,7 @@ class DSparkWorkerV2(BaseSpecWorker):
     num_folded_verify_ids_steps = 0
     num_relayed_in_graph_steps = 0
     _verify_inputs_ready = None
+    enable_mixed_decode_graph = False
 
     def weight_update_runners(self) -> list[tuple[str, "ModelRunner"]]:
         return [("draft", self.draft_model_runner)] if self._hosts_draft else []
@@ -194,6 +195,16 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.page_size = get_schedule().page_size
         self.device = target_worker.device
         self._draft_worker = None
+        self._is_pd_prefill = get_disagg().disaggregation_mode == "prefill"
+        self._decode_graph_allowed = (
+            get_exec().graph.cuda_graph_config.decode.backend != Backend.DISABLED
+            and not self._is_pd_prefill
+        )
+        # Mixed decode follows the same backend setting as ordinary decode.
+        # With graphs disabled, keep the single merged eager target forward.
+        self.enable_mixed_decode_graph = (
+            self._decode_graph_allowed and verify_merged_mixed_enabled(server_args)
+        )
         self.enable_dp_spec_prefill_coordination = (
             envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.get()
             or (
@@ -212,11 +223,6 @@ class DSparkWorkerV2(BaseSpecWorker):
                 spec_algorithm=target_worker.model_runner.spec_algorithm,
                 dspark_is_moe=self._draft_is_moe,
             )
-        )
-        self._is_pd_prefill = get_disagg().disaggregation_mode == "prefill"
-        self._decode_graph_allowed = (
-            get_exec().graph.cuda_graph_config.decode.backend != Backend.DISABLED
-            and not self._is_pd_prefill
         )
         if (
             get_parallel().attn_dp_enabled
@@ -790,6 +796,13 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
             if plan.heterogeneous:
                 coordination_plan = plan
+        if self.enable_mixed_decode_graph and (
+            coordination_plan is not None
+            or (batch.forward_mode.is_mixed() and batch.num_prefill_rows is not None)
+        ):
+            return self._forward_split_mixed(
+                batch, on_publish, grammar_barrier, coordination_plan
+            )
         if batch.forward_mode.is_mixed() and batch.num_prefill_rows is not None:
             self._verify_planner.note_non_decode_step()
             self._observers.note_prefill_step()
@@ -928,6 +941,186 @@ class DSparkWorkerV2(BaseSpecWorker):
         out.is_all_greedy = all(r.sampling_params.top_k <= 1 for r in reqs)
         out.is_any_greedy = any(r.sampling_params.top_k <= 1 for r in reqs)
         return out
+
+    def _split_mixed_view(self, batch, lo: int, hi: int, *, prefill: bool):
+        """A forward-only population view; never mutate the scheduler's batch."""
+        view = copy.copy(batch)
+        view.reqs = batch.reqs[lo:hi]
+        for name in (
+            "req_pool_indices",
+            "req_pool_indices_cpu",
+            "seq_lens",
+            "seq_lens_cpu",
+            "orig_seq_lens",
+            "multimodal_inputs",
+            "encoder_lens",
+            "encoder_lens_cpu",
+            "encoder_cached",
+            "encoder_swa_reset",
+            "engram_history",
+            "ne_skip_token_table_update",
+        ):
+            value = getattr(batch, name, None)
+            if value is not None:
+                setattr(view, name, value[lo:hi])
+        view.seq_lens_sum = (
+            int(view.seq_lens_cpu.sum()) if view.seq_lens_cpu is not None else None
+        )
+        view.sampling_info = self._slice_sampling_info(
+            batch.sampling_info, lo, hi, view.reqs
+        )
+        view.num_prefill_rows = view.decoding_reqs = None
+        view.prefill_input_ids_cpu = view.mix_running_indices = None
+        view.mix_running_indices_cpu = None
+        view.tbo_split_seq_index = None
+        view.dp_spec_prefill_coordination_metadata = None
+        view.dp_spec_prefill_mixed_decode_counts = None
+        view.global_spec_verify_tier_num_tokens = None
+        view.draft_global_num_tokens = view.draft_global_num_tokens_for_logprob = None
+        view.has_grammar = any(r.grammar is not None for r in view.reqs)
+        view.return_logprob = any(r.return_logprob for r in view.reqs)
+        for name in ("top_logprobs_nums", "token_ids_logprobs"):
+            value = getattr(batch, name, None)
+            if value is not None:
+                setattr(view, name, value[lo:hi])
+        for name in ("extend_lens", "prefix_lens", "extend_logprob_start_lens"):
+            value = getattr(batch, name, None)
+            setattr(view, name, list(value[lo:hi]) if value is not None else [])
+        if prefill:
+            view.forward_mode = ForwardMode.EXTEND if view.reqs else ForwardMode.IDLE
+            view.spec_info = None
+            view.extend_num_tokens = sum(view.extend_lens)
+            if view.reqs:
+                view.input_ids = batch.input_ids[: view.extend_num_tokens]
+                view.out_cache_loc = batch.out_cache_loc[: view.extend_num_tokens]
+            # The merged batch carries allocation bundles for both populations.
+            # Rebuild exactly the prefill interval instead of reusing that bundle.
+            if view.reqs:
+                from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
+                    maybe_build_dsv4_verify_bundle,
+                )
+
+                view.out_cache_loc_dsv4 = maybe_build_dsv4_verify_bundle(
+                    view,
+                    self.verify_num_draft_tokens,
+                    live_seq_lens_cpu=torch.tensor(view.prefix_lens, dtype=torch.int64),
+                    query_lens_cpu=view.extend_lens,
+                )
+        else:
+            view.forward_mode = ForwardMode.DECODE if view.reqs else ForwardMode.IDLE
+            view.spec_info = (
+                batch.spec_info
+                if view.reqs
+                else DFlashDraftInputV2.create_idle_input(device=self.device)
+            )
+            view.input_ids = view.out_cache_loc = None
+            view.extend_num_tokens = 0
+            view.is_prefill_only = False
+            view.engram_staged_rows = None
+        if not view.reqs:
+            view.forward_mode = ForwardMode.IDLE
+            view.input_ids = torch.empty(0, dtype=torch.int64, device=self.device)
+            view.out_cache_loc = torch.empty(0, dtype=torch.int64, device=self.device)
+            view.out_cache_loc_dsv4 = None
+            view.extend_num_tokens = 0
+        return view
+
+    def _apply_split_phase(self, view, phase: str, plan, original):
+        graph_allowed = phase == "decode" and self._decode_graph_allowed
+        if plan is not None:
+            plan.apply(
+                view,
+                phase,
+                get_parallel().attn_dp_rank,
+                local_only=len(original.global_num_tokens) == 1,
+                decode_graph_allowed=graph_allowed,
+            )
+        else:
+            view.global_num_tokens = view.global_num_tokens_for_logprob = None
+            view.dp_spec_prefill_coordination_applied = False
+            view.is_extend_in_batch = phase == "prefill"
+            view.can_run_decode_cuda_graph = graph_allowed
+            view.can_run_dp_prefill_cuda_graph = False
+        view.can_run_dp_draft_cuda_graph = graph_allowed
+        view.global_forward_mode = (
+            ForwardMode.EXTEND if phase == "prefill" else ForwardMode.DECODE
+        )
+        view.recv_skipper_forward_mode = view.global_forward_mode
+
+    def _forward_split_mixed(self, batch, on_publish, grammar_barrier=None, plan=None):
+        """All DP ranks run eager prefill, then ordinary speculative decode.
+
+        Empty populations participate as IDLE. Decode receives raw request
+        counts and no prefill coordination gate, so existing graph selection,
+        draft generation, verification and commit are reused unchanged.
+        """
+        mixed = batch.forward_mode.is_mixed() and batch.num_prefill_rows is not None
+        n_pre = (
+            batch.num_prefill_rows
+            if mixed
+            else len(batch.reqs)
+            if batch.forward_mode.is_extend()
+            else 0
+        )
+        bs = len(batch.reqs)
+        pre = self._split_mixed_view(batch, 0, n_pre, prefill=True)
+        dec = self._split_mixed_view(batch, n_pre, bs, prefill=False)
+        self._apply_split_phase(pre, "prefill", plan, batch)
+        self._verify_planner.note_non_decode_step()
+        self._observers.note_prefill_step()
+        pre_result = self._forward_prefill(pre, None)
+        # Prefill is only the first target forward in this step. An event
+        # published there cannot release shared tables still read by decode.
+        # Decode may publish its own event; otherwise retain the coarse WAR fence.
+        self.model_runner.shared_read_done_event = None
+        # Decode graph replay may reuse target workspaces. Keep the sampled
+        # prefill tokens in their own storage until the final mixed output copy.
+        pre_tokens = pre_result.next_token_ids.clone()
+        self._apply_split_phase(dec, "decode", plan, batch)
+        dec_result = self._forward_decode(dec, None, grammar_barrier)
+        new_seq_lens = torch.cat([pre_result.new_seq_lens, dec_result.new_seq_lens])
+        next_input = make_next_draft_input(
+            bonus_tokens=torch.cat(
+                [pre_tokens, dec_result.next_draft_input.bonus_tokens]
+            ),
+            new_seq_lens=new_seq_lens,
+        )
+        if on_publish is not None:
+            on_publish(new_seq_lens)
+        if not mixed:
+            # The scheduler still processes a pure local prefill/decode as
+            # such, even though it joined both global phases.
+            result = pre_result if n_pre else dec_result
+            if n_pre:
+                result.next_token_ids = pre_tokens
+            result.next_draft_input = next_input
+            result.new_seq_lens = new_seq_lens
+            result.extra_keep_alive_refs = (result.extra_keep_alive_refs or []) + [
+                pre,
+                dec,
+                dec_result if n_pre else pre_result,
+            ]
+            return result
+        logger.info_once(
+            "Mixed DSPARK split: eager prefill, separate decode (NPU graph=%s)",
+            dec_result.can_run_cuda_graph,
+        )
+        return GenerationBatchResult(
+            logits_output=pre_result.logits_output,
+            next_token_ids=torch.cat(
+                [pre_tokens, dec_result.next_token_ids.reshape(-1)]
+            ),
+            accept_lens=dec_result.accept_lens,
+            block_accept_lens=dec_result.block_accept_lens,
+            cap_lens=dec_result.cap_lens,
+            can_run_cuda_graph=False,
+            mixed_decode_can_run_cuda_graph=dec_result.can_run_cuda_graph,
+            next_draft_input=next_input,
+            speculative_num_draft_tokens=self.verify_num_draft_tokens,
+            new_seq_lens=new_seq_lens,
+            extend_input_len_per_req=pre.extend_lens,
+            extra_keep_alive_refs=[pre, dec, pre_result, dec_result],
+        )
 
     def _forward_mixed(
         self, batch: ScheduleBatch, on_publish, coordination_plan=None
@@ -1439,7 +1632,8 @@ class DSparkWorkerV2(BaseSpecWorker):
             self._observers.note_idle_decode_step()
             if get_parallel().attn_dp_enabled:
                 if self._draft_is_moe:
-                    self._proposer.run_idle_participation(batch)
+                    with self._draft_context():
+                        self._proposer.run_idle_participation(batch)
                 if coordination_plan is not None:
                     coordination_plan.apply(
                         batch, "target", rank, local_only=target_local_only

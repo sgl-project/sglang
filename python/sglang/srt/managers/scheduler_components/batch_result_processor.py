@@ -1117,12 +1117,14 @@ class SchedulerBatchResultProcessor:
         batch: ScheduleBatch,
         result: GenerationBatchResult,
     ):
-        """Verify-merged mixed step: rows [0, n) are prefill rows (one sampled
+        """Mixed speculative step: rows [0, n) are prefill rows (one sampled
         token each), rows [n, bs) verify rows (accept_lens, stride W). Split the
         batch and result positionally and run the prefill / decode processors."""
         n = batch.num_prefill_rows
         if get_observability().enable_metrics:
             self.metrics_collector.increment_mixed_verify_step()
+            if result.mixed_decode_can_run_cuda_graph:
+                self.metrics_collector.increment_mixed_decode_graph_step()
 
         pre = copy.copy(batch)
         pre.reqs = batch.reqs[:n]
@@ -1132,6 +1134,7 @@ class SchedulerBatchResultProcessor:
         pre.extend_lens = batch.extend_lens[:n]
         pre.prefix_lens = batch.prefix_lens[:n]
         r_pre = copy.copy(result)
+        r_pre.can_run_cuda_graph = False
         r_pre.next_token_ids = result.next_token_ids[:n]
         r_pre.accept_lens = r_pre.block_accept_lens = r_pre.cap_lens = None
         self.process_batch_result_prefill(pre, r_pre)
@@ -1142,6 +1145,8 @@ class SchedulerBatchResultProcessor:
         dec.decoding_reqs = None
         dec.num_prefill_rows = None
         r_dec = copy.copy(result)
+        if result.mixed_decode_can_run_cuda_graph is not None:
+            r_dec.can_run_cuda_graph = result.mixed_decode_can_run_cuda_graph
         r_dec.next_token_ids = result.next_token_ids[n:]
         self.process_batch_result_decode(dec, r_dec)
         # The scheduler's step stats read the decode-side counters.

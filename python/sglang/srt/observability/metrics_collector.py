@@ -794,7 +794,12 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         if envs.SGLANG_ENABLE_MIXED_PREFILL_SPEC_COORDINATION.get():
             self.mixed_verify_steps_total = Counter(
                 name="sglang:mixed_verify_steps_total",
-                documentation="Total number of verify-merged mixed steps (DSPARK).",
+                documentation="Total number of mixed speculative steps (DSPARK).",
+                labelnames=labels.keys(),
+            )
+            self.mixed_decode_graph_steps_total = Counter(
+                name="sglang:mixed_decode_graph_steps_total",
+                documentation="Mixed DSPARK steps whose decode target replayed a graph.",
                 labelnames=labels.keys(),
             )
 
@@ -1605,6 +1610,9 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
 
     def increment_mixed_verify_step(self) -> None:
         self.mixed_verify_steps_total.labels(**self.labels).inc(1)
+
+    def increment_mixed_decode_graph_step(self) -> None:
+        self.mixed_decode_graph_steps_total.labels(**self.labels).inc(1)
 
     def increment_eplb_balancedness(
         self, forward_mode: str, balancedness: float

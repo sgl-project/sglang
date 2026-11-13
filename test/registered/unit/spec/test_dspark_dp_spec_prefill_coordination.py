@@ -259,6 +259,7 @@ class TestDSparkDPSpecPrefillCoordination(CustomTestCase):
         worker.verify_num_draft_tokens = 6
         worker._draft_is_moe = True
         worker.draft_parallel_layout = SimpleNamespace(local_dp=True)
+        worker._draft_context = nullcontext
         worker._proposer = MagicMock()
         worker._observers = MagicMock()
         worker._verify_executor = MagicMock()

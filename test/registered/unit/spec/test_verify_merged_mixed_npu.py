@@ -230,7 +230,8 @@ def test_legacy_mixed_tail_keeps_lengths_and_reserved_slots_consistent(private_s
     assert batch.out_cache_loc.tolist() == [10, 4 * 256 + 105, 2 * 256 + 203]
 
 
-def test_mixed_result_uses_prefill_and_speculative_decode_processors():
+@pytest.mark.parametrize("decode_graph", [None, False, True])
+def test_mixed_result_uses_prefill_and_speculative_decode_processors(decode_graph):
     batch = SimpleNamespace(
         reqs=["prefill", "decode0", "decode1"],
         num_prefill_rows=1,
@@ -244,6 +245,7 @@ def test_mixed_result_uses_prefill_and_speculative_decode_processors():
         accept_lens=torch.tensor([2, 6]),
         block_accept_lens=torch.tensor([2, 6]),
         speculative_num_draft_tokens=6,
+        mixed_decode_can_run_cuda_graph=decode_graph,
     )
     processor = SimpleNamespace(
         process_batch_result_prefill=Mock(),
@@ -256,6 +258,7 @@ def test_mixed_result_uses_prefill_and_speculative_decode_processors():
         assert dec.forward_mode == ForwardMode.DECODE
         assert output.next_token_ids.tolist() == list(range(1, 13))
         assert output.accept_lens.tolist() == [2, 6]
+        assert output.can_run_cuda_graph is bool(decode_graph)
         output.num_correct_drafts = 6
         output.num_correct_drafts_per_req_cpu = [1, 5]
 
@@ -273,7 +276,11 @@ def test_mixed_result_uses_prefill_and_speculative_decode_processors():
     assert pre.forward_mode == ForwardMode.EXTEND
     assert output.next_token_ids.tolist() == [0]
     assert output.accept_lens is None
+    assert output.can_run_cuda_graph is False
     assert result.num_correct_drafts == 6
     assert result.num_correct_drafts_per_req_cpu == [1, 5]
     assert batch.forward_mode == ForwardMode.MIXED
     processor.metrics_collector.increment_mixed_verify_step.assert_called_once()
+    assert processor.metrics_collector.increment_mixed_decode_graph_step.call_count == (
+        1 if decode_graph else 0
+    )

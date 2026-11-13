@@ -95,6 +95,8 @@ class GenerationBatchResult:
     accept_length_per_req_cpu: Optional[List[int]] = None
     dllm_algo_state: Optional[List[Any]] = None
     can_run_cuda_graph: bool = False
+    # Split mixed execution: only its decode phase may replay a graph.
+    mixed_decode_can_run_cuda_graph: Optional[bool] = None
 
     # PP skip output comm: True when output send/recv was skipped and
     # next_token_ids are placeholder zeros. Used by process_batch_result_prefill

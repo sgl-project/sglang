@@ -27,6 +27,22 @@ class DPSpecPrefillCoordinationPlan(msgspec.Struct, frozen=True):
         return self.mixed_decode_counts or [0] * len(self.counts)
 
     def phase_counts(self, phase):
+        if phase == "prefill":
+            return tuple(
+                [
+                    n - mixed * self.verify_width if p else 0
+                    for p, n, mixed in zip(self.prefills, counts, self._mixed_counts)
+                ]
+                for counts in (self.counts, self.logprob_counts)
+            )
+        if phase == "decode":
+            requests = [
+                mixed if p else n
+                for p, n, mixed in zip(self.prefills, self.counts, self._mixed_counts)
+            ]
+            # Normal DSPARK decode scales these request counts independently
+            # for its draft and target forwards.
+            return requests, requests
         if phase == "draft":
             tokens = [
                 (mixed if p else n) * self.draft_width
@@ -46,14 +62,14 @@ class DPSpecPrefillCoordinationPlan(msgspec.Struct, frozen=True):
             ],
         )
 
-    def apply(self, batch, phase, rank, *, local_only):
+    def apply(self, batch, phase, rank, *, local_only, decode_graph_allowed=False):
         tokens, logprobs = self.phase_counts(phase)
         # Local drafts and EP-only batches retain only this rank's counts.
         if local_only:
             tokens, logprobs = [tokens[rank]], [logprobs[rank]]
         batch.global_num_tokens = tokens
         batch.global_num_tokens_for_logprob = logprobs
-        batch.dp_spec_prefill_coordination_applied = True
-        batch.is_extend_in_batch = True
-        batch.can_run_decode_cuda_graph = False
+        batch.dp_spec_prefill_coordination_applied = phase != "decode"
+        batch.is_extend_in_batch = phase != "decode"
+        batch.can_run_decode_cuda_graph = phase == "decode" and decode_graph_allowed
         batch.can_run_dp_prefill_cuda_graph = False
