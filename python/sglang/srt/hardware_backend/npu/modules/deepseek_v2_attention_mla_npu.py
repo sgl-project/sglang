@@ -475,13 +475,7 @@ def forward_dsa_prepare_npu(
 
         q_nope, q_pe = q.split([m.qk_nope_head_dim, m.qk_rope_head_dim], dim=-1)
 
-        q_nope_out = torch_npu.npu_transpose_batchmatmul(
-            q_nope,
-            m.w_kc,
-            perm_x1=(1, 0, 2),
-            perm_x2=(0, 1, 2),
-            perm_y=(1, 0, 2),
-        )
+        q_nope_out = batch_matmul_transpose(q_nope, m.w_kc, impl="torch_npu")
 
         if is_mla_preprocess_enabled() and not m.rotary_emb.is_neox_style:
             # Match the half-layout RoPE outputs used by MLA preprocessing.
@@ -573,11 +567,7 @@ def forward_dsa_core_npu(
         topk_indices=topk_indices,
     )
 
-    attn_bmm_output = batch_matmul_transpose(
-        attn_output,
-        m.w_vc,
-        is_prefill=forward_batch.forward_mode.is_extend_without_speculative(),
-    )
+    attn_bmm_output = batch_matmul_transpose(attn_output, m.w_vc, is_dsa=True)
 
     attn_bmm_output = attn_bmm_output.reshape(-1, m.num_local_heads * m.v_head_dim)
 
