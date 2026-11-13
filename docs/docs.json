@@ -1543,6 +1543,7 @@
                   {
                     "group": "Thinking Machines",
                     "pages": [
+                      "cookbook/autoregressive/ThinkingMachines/Inkling-2-Small",
                       "cookbook/autoregressive/ThinkingMachines/Inkling",
                       "cookbook/autoregressive/ThinkingMachines/Inkling-Small"
                     ]

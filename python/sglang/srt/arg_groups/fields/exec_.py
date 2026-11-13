@@ -48,10 +48,20 @@ def _paged_experts_num_resident(value: str) -> Optional[int]:
     )
 
 
+def _parse_attention_backend_arg(value: str) -> str:
+    """Reject the retired alias before argparse checks supported choices."""
+    if value == "compressed":
+        raise argparse.ArgumentTypeError("compressed was removed; use dsv4")
+    return value
+
+
 class ExecFeatures(msgspec.Struct):
     """Namespace ``exec.features``."""
 
     _NS_PATH = "exec.features"
+    disable_outlines_disk_cache: A[
+        Optional[bool], Arg(help="Deprecated. Has no effect.", no_cli=True)
+    ] = None
     enable_fp32_lm_head: A[
         bool,
         "If set, the LM head outputs (logits) are in FP32.",
@@ -207,10 +217,6 @@ class ExecFeatures(msgspec.Struct):
         "Use the same value on disaggregated prefill and decode nodes; clients "
         "should set top_k below the limit to leave headroom for cutoff ties.",
     ] = 4096
-    disable_outlines_disk_cache: A[
-        bool,
-        "Disable disk cache of outlines to avoid possible crashes related to file system or high concurrency.",
-    ] = False
     enable_mis: A[
         bool,
         "Enable Multi-Item Scoring optimization. Combines query and multiple items into a single sequence for efficient batch processing. Requires --attention-backend flashinfer; auto-disables CUDA graph, radix cache, and chunked prefill.",
@@ -221,6 +227,9 @@ class ExecKernel(msgspec.Struct):
     """Namespace ``exec.kernel``."""
 
     _NS_PATH = "exec.kernel"
+    triton_attention_reduce_in_fp32: A[
+        Optional[bool], Arg(help="Deprecated. Has no effect.", no_cli=True)
+    ] = None
 
     # -------------------------------------------------------------------------
     # Kernel backend
@@ -230,6 +239,7 @@ class ExecKernel(msgspec.Struct):
         Arg(
             help="Choose the kernels for attention layers.",
             choices=ATTENTION_BACKEND_CHOICES,
+            type_parser=_parse_attention_backend_arg,
             resolvable=True,
         ),
     ] = None
@@ -238,6 +248,7 @@ class ExecKernel(msgspec.Struct):
         Arg(
             help="Choose the kernels for decode attention layers (have priority over --attention-backend).",
             choices=ATTENTION_BACKEND_CHOICES,
+            type_parser=_parse_attention_backend_arg,
             resolvable=True,
         ),
     ] = None
@@ -258,6 +269,7 @@ class ExecKernel(msgspec.Struct):
         Arg(
             help="Choose the kernels for prefill attention layers (have priority over --attention-backend).",
             choices=ATTENTION_BACKEND_CHOICES,
+            type_parser=_parse_attention_backend_arg,
             resolvable=True,
         ),
     ] = None
@@ -438,11 +450,6 @@ class ExecKernel(msgspec.Struct):
             nargs="+",
         ),
     ] = None
-    triton_attention_reduce_in_fp32: A[
-        bool,
-        "Cast the intermediate attention results to fp32 to avoid possible crashes related to fp16."
-        "This only affects Triton attention kernels.",
-    ] = False
     triton_attention_num_kv_splits: A[
         int,
         "The number of KV splits in flash decoding Triton kernel. Larger value is better in longer context scenarios. The default value is 8.",
