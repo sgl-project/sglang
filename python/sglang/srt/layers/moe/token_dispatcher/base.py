@@ -7,6 +7,7 @@ from typing import (
     TYPE_CHECKING,
     Any,
     Callable,
+    Iterator,
     Optional,
     OrderedDict,
     Protocol,
@@ -431,6 +432,44 @@ class BaseDispatcher(ABC):
     def clear_overlap_args(self) -> None:
         self.overlap_args = None
         self.meta_overlap_args = None
+
+    @property
+    def prebuild_pending(self) -> bool:
+        """True while ``prebuild()`` would still create state that the first
+        dispatch otherwise creates lazily."""
+        return False
+
+    def prebuild(self) -> None:
+        """Create the lazily built dispatch state (communication buffers, expert
+        maps) now, outside any graph capture. Idempotent; a no-op by default."""
+
+    @property
+    def implements_prebuild(self) -> bool:
+        """Whether this class overrides ``prebuild``. One that does not builds its
+        state lazily at the first dispatch (the default, fine natively); CUDA
+        graph persistence then falls back to native capture."""
+        return type(self).prebuild is not BaseDispatcher.prebuild
+
+
+def iter_dispatchers(model: torch.nn.Module) -> Iterator[BaseDispatcher]:
+    """Each distinct dispatcher that a module of ``model`` holds as an attribute;
+    models name the attribute differently and LoRA wrappers share their base's."""
+    seen = set()
+    for module in model.modules():
+        for value in vars(module).values():
+            if isinstance(value, BaseDispatcher) and id(value) not in seen:
+                seen.add(id(value))
+                yield value
+
+
+def prebuild_dispatchers(model: torch.nn.Module) -> int:
+    """Prebuild every dispatcher of ``model``; returns how many had state pending."""
+    num_prebuilt = 0
+    for dispatcher in iter_dispatchers(model):
+        if dispatcher.implements_prebuild and dispatcher.prebuild_pending:
+            dispatcher.prebuild()
+            num_prebuilt += 1
+    return num_prebuilt
 
 
 def build_dispatcher_quant_config(

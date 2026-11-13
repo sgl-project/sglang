@@ -527,13 +527,32 @@ class MultimemAllGatherer:
 
         return tensor_model_parallel_all_gather(x, dim=-1)
 
+    @property
+    def prebuild_pending(self) -> bool:
+        return self._state is self._UNINIT
+
+    def prebuild(self, *, hidden_size: int, dtype: torch.dtype) -> bool:
+        """Build the bf16 state now, outside graph capture, for per-rank inputs
+        ``hidden_size`` wide; other dtypes disable it as ``_build`` does.
+        Returns whether a state was built."""
+        if self._state is not self._UNINIT:
+            return False
+        if dtype != torch.bfloat16:
+            self._state = None
+            return False
+        self._state = self._create_state(hidden_size=hidden_size)
+        return self._state is not None
+
     def _build(self, x: torch.Tensor):
         if x.dim() != 2 or x.dtype != torch.bfloat16:
             return None
         if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
             # Can't allocate under capture; retry later.
             return self._UNINIT
-        if x.shape[-1] % _NUMEL_PER_THREAD != 0:
+        return self._create_state(hidden_size=x.shape[-1])
+
+    def _create_state(self, *, hidden_size: int):
+        if hidden_size % _NUMEL_PER_THREAD != 0:
             return None
         try:
             from sglang.srt.distributed.parallel_state import get_tp_group
@@ -545,7 +564,7 @@ class MultimemAllGatherer:
                 group=tp_group.device_group,
                 rank_in_group=tp_group.rank_in_group,
                 max_tokens=self._max_tokens,
-                hidden_size=x.shape[-1] * tp_group.world_size,
+                hidden_size=hidden_size * tp_group.world_size,
             )
             if state.symm_mem_hdl.multicast_ptr == 0:
                 # No multicast for this world size / arch; multimem.st would

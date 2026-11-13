@@ -58,7 +58,10 @@ from sglang.srt.layers.logprob_processor import (
     get_token_ids_logprobs_raw,
     get_top_logprobs_raw,
 )
-from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+from sglang.srt.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
 from sglang.srt.managers.auxiliary_output import DeviceAuxiliaryOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
@@ -621,6 +624,20 @@ class LogitsProcessor(nn.Module):
                 and get_capture_logits_variant() == VERIFY_VOCAB_SHARDS
             )
         return self.verify_uses_vocab_shards(forward_batch)
+
+    @property
+    def logits_gatherer_pending(self) -> bool:
+        return self._logits_gatherer.prebuild_pending
+
+    def prebuild_logits_gatherer(self, *, shard_width: int, dtype: torch.dtype) -> bool:
+        """Build the TP logits all-gather state for ``shard_width``-wide shards;
+        ``dtype`` is the lm_head output dtype unless _compute_lm_head forces one.
+        Returns whether a state was built."""
+        if self.use_fp32_lm_head or self.use_fp32_lm_head_output:
+            dtype = torch.float32
+        elif self.rl_on_policy_target is not None:
+            dtype = torch.bfloat16
+        return self._logits_gatherer.prebuild(hidden_size=shard_width, dtype=dtype)
 
     def forward(
         self,
@@ -1829,3 +1846,29 @@ def should_apply_lm_head_quant_method(lm_head, quant_method) -> bool:
         )
 
     return True
+
+
+def prebuild_logits_gatherers(model: nn.Module, *, dtype: torch.dtype) -> int:
+    """Build the TP logits all-gather state of each LogitsProcessor in ``model``;
+    returns how many were built. A logits shard is one lm_head partition wide;
+    logits dtype is known only at forward, so ``dtype`` is the model (lm_head) dtype."""
+    processors = [
+        module
+        for module in model.modules()
+        if isinstance(module, LogitsProcessor) and module.logits_gatherer_pending
+    ]
+    heads = [module for module in model.modules() if isinstance(module, ParallelLMHead)]
+    if not heads:
+        # Tied word embeddings project through the input embedding.
+        heads = [
+            module
+            for module in model.modules()
+            if isinstance(module, VocabParallelEmbedding)
+        ]
+    if not processors or not heads:
+        return 0
+    shard_width = max(head.num_embeddings_per_partition for head in heads)
+    return sum(
+        processor.prebuild_logits_gatherer(shard_width=shard_width, dtype=dtype)
+        for processor in processors
+    )

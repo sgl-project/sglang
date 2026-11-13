@@ -103,6 +103,7 @@ class TestMegakernelRuntime(CustomTestCase):
             _pre_initialize_fi_a2a_workspace=lambda: events.append("a2a"),
             _pre_initialize_dcp_push_combine=lambda: events.append("dcp"),
             _pre_initialize_pcie_ipc_workspace=lambda: events.append("pcie"),
+            _prepare_capture_state=lambda: events.append("capture_state"),
             _finalize_symm_workspaces=lambda: events.append("symm"),
             _autotune_buffers=lambda: (object(), 1),
             _flashinfer_autotune=lambda **kw: events.append("autotune"),
@@ -209,6 +210,7 @@ class TestMegakernelRuntime(CustomTestCase):
             "a2a",
             "dcp",
             "pcie",
+            "capture_state",
             ("model", mr),
             ("plugin", built, prepared_view),
             "symm",
@@ -282,7 +284,7 @@ class TestMegakernelRuntime(CustomTestCase):
                     self._warmup(SimpleNamespace(model=lm, device="cuda"), events)
                 self.assertEqual(
                     events,
-                    ["allreduce", "a2a", "dcp", "pcie"]
+                    ["allreduce", "a2a", "dcp", "pcie", "capture_state"]
                     + stages[: stages.index(failed_stage) + 1],
                 )
 

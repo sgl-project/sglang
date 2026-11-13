@@ -572,5 +572,7 @@ POSITIONAL_FIELD_ORDER = (
     "_max_running_requests_explicitly_set",
     "hybrid_cache_checkpoints_level",
     "disaggregation_max_top_logprobs_num",
+    "cuda_graph_persistence",
+    "cuda_graph_persistence_config",
 )
 # fmt: on
