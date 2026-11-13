@@ -22,6 +22,7 @@ the routed values to BF16, before the collective.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -129,6 +130,41 @@ def require_cluster_launch_arch() -> None:
 
 @cache_once
 def _jit_module(
+    world_size: int,
+    hidden_dim: int,
+    top_k: int,
+    cluster_size: int,
+    weight_dtype: torch.dtype,
+) -> Module:
+    _build_cluster_variants(world_size, hidden_dim, top_k, weight_dtype)
+    return _build_module(world_size, hidden_dim, top_k, cluster_size, weight_dtype)
+
+
+@cache_once
+def _build_cluster_variants(
+    world_size: int, hidden_dim: int, top_k: int, weight_dtype: torch.dtype
+) -> None:
+    """Compile every cluster size the launch geometry can pick, side by side.
+
+    Graph capture walks batch sizes that select different cluster sizes, so
+    otherwise each one stalls capture on its own serial compile.
+    """
+    candidates = {default_cluster_size(hidden_dim)} | {
+        cluster for table in _TWO_SHOT_GEOMETRY.values() for _, _, cluster in table
+    }
+    sizes = sorted(candidates & set(valid_cluster_sizes(hidden_dim)))
+    with ThreadPoolExecutor(len(sizes)) as pool:
+        for future in [
+            pool.submit(
+                _build_module, world_size, hidden_dim, top_k, size, weight_dtype
+            )
+            for size in sizes
+        ]:
+            future.result()
+
+
+@cache_once
+def _build_module(
     world_size: int,
     hidden_dim: int,
     top_k: int,
