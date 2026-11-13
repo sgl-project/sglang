@@ -86,6 +86,7 @@ from sglang.srt.mem_cache.kv.plan import (
     TREE_WINDOW,
 )
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+from sglang.srt.mem_cache.miss_attribution import CacheMissAttribution
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
 from sglang.srt.mem_cache.unified_cache.cache_action import (
@@ -295,6 +296,14 @@ class UnifiedRadixCache(BasePrefixCache):
         # Whether the mamba extra (ping-pong) buffer is enabled.
         self.enable_mamba_extra_buffer = (
             params.enable_mamba_extra_buffer if self.is_mamba_enabled else False
+        )
+        self.miss_attribution: Optional[CacheMissAttribution] = (
+            CacheMissAttribution(
+                page_size=self.logical_page_size,
+                records_states=self.is_mamba_enabled,
+            )
+            if params.enable_cache_miss_attribution and not self.disable
+            else None
         )
         self.decoder_swa_bounded_replay = params.decoder_swa_bounded_replay
         # The TreeCore owns the tree member-var state (structure, LRUs, sizes,
@@ -806,6 +815,13 @@ class UnifiedRadixCache(BasePrefixCache):
                 if step.result is not None:
                     # Walk actions flow through the steps; the result is action-free.
                     assert not step.result.cache_actions
+                    if self.miss_attribution is not None and (
+                        params.mamba_value is not None
+                        or params.mamba_host_value is not None
+                    ):
+                        self.miss_attribution.record_state(
+                            params.key.raw_token_ids(), len(params.key)
+                        )
                     return step.result
                 step = self.tree_core.resume_insert()
         finally:
@@ -1733,6 +1749,8 @@ class UnifiedRadixCache(BasePrefixCache):
     def on_release(self, req: Req, *, checkpointed: bool) -> None:
         if self._residency is not None and self._residency.subagents is not None:
             self._residency.subagents.on_release(req)
+        if self.miss_attribution is not None:
+            self.miss_attribution.forget_request(req.rid)
         if checkpointed:
             return
         for comp in self._components_tuple:
@@ -1772,6 +1790,11 @@ class UnifiedRadixCache(BasePrefixCache):
                 for comp in self._components_tuple:
                     comp.cleanup_after_caching_req(req, is_finished=True)
             return
+
+        if self.miss_attribution is not None:
+            self.miss_attribution.record_computed(
+                token_ids, len(token_ids), request_id=req.rid, finished=is_finished
+            )
 
         kv_indices_orig = self.req_to_token_pool.req_to_token[
             req.kv.req_pool_idx, : len(token_ids)

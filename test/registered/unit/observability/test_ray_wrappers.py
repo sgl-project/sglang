@@ -292,7 +292,10 @@ class TestTokenizerLatencyAccounting(_TokenizerCollectorCase):
             ),
         )
         request_stats = SimpleNamespace(
-            prompt_tokens=100, cached_tokens=0, cached_tokens_details=None
+            prompt_tokens=100,
+            cached_tokens=0,
+            cached_tokens_details=None,
+            cache_miss_tokens=None,
         )
         for j, count in enumerate(completion_tokens):
             last = j == len(completion_tokens) - 1

@@ -1772,6 +1772,8 @@ class RequestOutputStats(
     video_tokens: int
     # None when metrics are off, for embedding, or when the request's own are off.
     time_stats: Optional[SchedulerOutputTimeStats]
+    # Uncached prompt tokens by cause; None without --enable-cache-miss-attribution.
+    cache_miss_tokens: Optional[Dict[str, int]] = None
 
 
 def flat_top_logprobs_layout(

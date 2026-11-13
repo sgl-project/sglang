@@ -575,5 +575,6 @@ POSITIONAL_FIELD_ORDER = (
     "shortest_prefill_aging_factor",
     "enable_token_space_processor",
     "enable_mamba_unit_eviction",
+    "enable_cache_miss_attribution",
 )
 # fmt: on
