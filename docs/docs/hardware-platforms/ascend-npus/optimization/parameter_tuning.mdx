@@ -118,7 +118,7 @@ condition and the failure are in the row's trade-offs.
 | [`SGLANG_SCHEDULER_SKIP_ALL_GATHER=1`](#scheduler-skip-all-gather) | DP load is balanced — uneven load desyncs silently |
 | [`--enable-eplb`](#enable-eplb) | Expert-load metrics show imbalance |
 | [`--disable-radix-cache`](#disable-radix-cache) | Requests share no prefixes |
-| [`--deepep-dispatcher-output-dtype int8`](#deepep-dispatcher-output-dtype) | The accuracy budget allows a small loss |
+| [`--deepep-dispatcher-output-dtype int8`](#deepep-dispatcher-output-dtype) / [`DEEP_NORMAL_MODE_USE_INT8_QUANT=1`](#deep-normal-mode-use-int8-quant) | Prefill dispatch traffic dominates — typically multi-node; the accuracy budget allows a small loss |
 | [`TASK_QUEUE_ENABLE=2`](#task-queue-enable) | The role captures no graphs |
 | [`HCCL_OP_EXPANSION_MODE=AIV`](#hccl-op-expansion-mode) | Never on Atlas A2 systems with DeepEP |
 
