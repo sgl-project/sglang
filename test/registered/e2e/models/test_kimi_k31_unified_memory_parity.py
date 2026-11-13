@@ -14,8 +14,9 @@ reuses the first one's prefix:
     the indexer keys and attend only the top-k they select. Wrong keys change
     which tokens attention reads.
 
-With CUDA graphs and in eager mode, logprobs predicted from a context within
-the top-k must agree token by token. Past the top-k the sparse selection is not
+With CUDA graphs and in eager mode, each against the static pools in the same
+mode (the two modes' kernels round differently), logprobs predicted from a
+context within the top-k must agree token by token. Past the top-k the sparse selection is not
 bitwise deterministic: the static pools' own runs differ by about 0.03 on
 average (up to ~0.4 at single tokens), and near-tied greedy choices can flip
 between runs of the same pool. There the prompt's teacher-forced logprobs are
@@ -37,7 +38,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=2000, stage="nightly", runner_config="8-gpu-b300")
+register_cuda_ci(est_time=2600, stage="nightly", runner_config="8-gpu-b300")
 
 MODEL_PATH = "moonshotai/Kimi-K3.1-Pro"
 # The checkpoint's first eight layers, numbered from 1 as its config numbers
@@ -195,12 +196,12 @@ class TestKimiK31UnifiedMemoryParity(CustomTestCase):
             )
 
     def test_unified_matches_static(self):
-        static = self._run([])
         for name, extra in (
             ("cuda graph", []),
             ("eager", ["--disable-cuda-graph"]),
         ):
             with self.subTest(mode=name):
+                static = self._run(extra)
                 unified = self._run(["--enable-unified-memory", *extra])
                 for case in self.prompts:
                     with self.subTest(case=case):
