@@ -1799,9 +1799,6 @@ class ModelConfig:
         if rope_scaling:
             self.scaling = compute_mla_mscale_scaling(rope_scaling, self.scaling)
 
-    def get_total_num_attention_heads(self) -> int:
-        return self.num_attention_heads
-
     def get_num_attention_heads(self, tensor_parallel_size) -> int:
         # Pure-SSM (Mamba) models have no attention; num_attention_heads is None.
         total_num_attention_heads = self.num_attention_heads or 0
@@ -2190,6 +2187,7 @@ class ModelConfig:
         rocm_supported_quantization = [
             "awq",
             "fp8",
+            "gptq",
             "compressed_tensors",
             "compressed-tensors",
             "w8a8_fp8",

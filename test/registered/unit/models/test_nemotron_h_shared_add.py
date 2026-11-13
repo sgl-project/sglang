@@ -18,6 +18,10 @@ import torch.nn.functional as F
 
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
+from sglang.srt.lora.backend.torch_backend import (
+    TorchNativeLoRABackend,
+    TorchNativeLoRABatchInfo,
+)
 from sglang.srt.lora.layers import ReplicatedLinearWithLoRA
 from sglang.srt.models.nemotron_h import (
     NemotronHMoE,
@@ -44,7 +48,9 @@ class _FakeLoRABackend:
     def run_lora_a_sgemm(self, x, weights):
         return 2 * x
 
-    def run_lora_b_sgemm(self, *, x, weights, output_offset, base_output):
+    def run_lora_b_sgemm(
+        self, *, x, weights, output_offset, output_offset_cpu, base_output
+    ):
         return base_output + x
 
 
@@ -81,6 +87,42 @@ class TestNemotronHSharedAdd(CustomTestCase):
             2 * self.routed + self.shared,
             rtol=0,
             atol=0,
+        )
+
+    def test_lora_wrapper_on_torch_native_backend(self):
+        """The torch_native backend reads the CPU slice offsets. The
+        single-projection LoRA call passed only the device offsets, so every
+        latent-projection adapter raised TypeError on that backend."""
+        projection = ReplicatedLinear(8, 6, bias=False)
+        with torch.no_grad():
+            projection.weight.copy_(torch.randn_like(projection.weight))
+        backend = TorchNativeLoRABackend(1, torch.device("cpu"))
+        wrapped = ReplicatedLinearWithLoRA(projection, backend)
+        lora_a, lora_b = torch.randn(1, 2, 8), torch.randn(1, 6, 2)
+        wrapped.set_lora_info(lora_a, lora_b)
+        backend.batch_info = TorchNativeLoRABatchInfo(
+            use_cuda_graph=False,
+            bs=1,
+            num_segments=1,
+            seg_indptr=torch.tensor([0, 4], dtype=torch.int32),
+            weight_indices=torch.tensor([0], dtype=torch.int32),
+            lora_ranks=torch.tensor([2], dtype=torch.int32),
+            scalings=torch.tensor([0.5]),
+            max_len=4,
+            seg_lens=torch.tensor([4], dtype=torch.int32),
+            lora_ranks_cpu=torch.tensor([2], dtype=torch.int32),
+            seg_indptr_cpu=torch.tensor([0, 4], dtype=torch.int32),
+            seg_lens_cpu=torch.tensor([4], dtype=torch.int32),
+            weight_indices_cpu=torch.tensor([0], dtype=torch.int32),
+            scalings_cpu=torch.tensor([0.5]),
+        )
+        shared = torch.randn(4, 6)
+
+        torch.testing.assert_close(
+            _apply(wrapped, self.routed, shared),
+            F.linear(self.routed, projection.weight)
+            + 0.5 * self.routed @ lora_a[0].T @ lora_b[0].T
+            + shared,
         )
 
     def test_gate_rejects_quantized_projection(self):

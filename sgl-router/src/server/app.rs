@@ -4,26 +4,36 @@
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::server::metrics::{outcome_from_status, RequestLogContext};
-use crate::server::routes::chat::MAX_CHAT_BODY_BYTES;
+use crate::server::routes::chat::max_chat_body_bytes;
 use axum::extract::{DefaultBodyLimit, MatchedPath, Request, State};
 use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 use axum::response::IntoResponse;
 use axum::response::Response;
-use axum::routing::{get, post, MethodRouter};
+use axum::routing::{any, get, post, MethodRouter};
 use axum::Router;
 use std::sync::{Arc, OnceLock};
 use tower_http::catch_panic::CatchPanicLayer;
 
 /// Infra endpoints whose *successful* polls are logged at DEBUG rather than
 /// INFO. They are polled constantly — Prometheus scrapes `/metrics`, the kubelet
-/// hits `/healthz` + `/readyz` every few seconds — so logging every hit at INFO
-/// would bury real API traffic. A FAILING probe is the opposite: a pod dropping
-/// out of readiness is an incident signal, so it keeps the normal INFO line (see
-/// `access_log_and_record`). They are counted in both edge counters either way;
-/// filter them by `route` in PromQL.
+/// hits `/healthz` + `/readyz` (or their aliases `/health`, `/liveness`,
+/// `/readiness`, or the engine's `/health_generate`) every few seconds — so
+/// logging every hit at INFO would bury real API traffic. A FAILING probe is
+/// the opposite: a pod dropping out of readiness is an incident signal, so it
+/// keeps the normal INFO line (see `access_log_and_record`). They are counted
+/// in both edge counters either way; filter them by `route` in PromQL.
 fn is_infra_path(path: &str) -> bool {
-    matches!(path, "/healthz" | "/readyz" | "/metrics")
+    matches!(
+        path,
+        "/healthz"
+            | "/readyz"
+            | "/health"
+            | "/liveness"
+            | "/readiness"
+            | "/health_generate"
+            | "/metrics"
+    )
 }
 
 /// Collapse an HTTP method to a bounded allow-list for use as a metric label.
@@ -186,9 +196,12 @@ async fn log_413(req: Request, next: Next) -> Response {
 }
 
 /// A Messages route: body limit, 413 logging and the Anthropic 413 envelope.
-fn messages_route(route: MethodRouter<Arc<AppContext>>) -> MethodRouter<Arc<AppContext>> {
+fn messages_route(
+    route: MethodRouter<Arc<AppContext>>,
+    max_body_bytes: usize,
+) -> MethodRouter<Arc<AppContext>> {
     route
-        .layer(DefaultBodyLimit::max(MAX_CHAT_BODY_BYTES))
+        .layer(DefaultBodyLimit::max(max_body_bytes))
         .layer(middleware::from_fn(log_413))
         .layer(middleware::from_fn(
             crate::server::routes::messages::envelope_413,
@@ -196,9 +209,20 @@ fn messages_route(route: MethodRouter<Arc<AppContext>>) -> MethodRouter<Arc<AppC
 }
 
 pub fn build_router(ctx: Arc<AppContext>) -> Router {
+    build_router_with_body_limit(ctx, max_chat_body_bytes())
+}
+
+/// [`build_router`] with an explicit request-body cap on the inference routes,
+/// in place of the one resolved from the environment.
+pub fn build_router_with_body_limit(ctx: Arc<AppContext>, max_body_bytes: usize) -> Router {
     let router = Router::new()
         .route("/healthz", get(crate::server::routes::health::healthz))
         .route("/readyz", get(crate::server::routes::health::readyz))
+        // The same probes under the engine's `/health` and sgl-model-gateway's
+        // `/liveness` and `/readiness`.
+        .route("/health", get(crate::server::routes::health::healthz))
+        .route("/liveness", get(crate::server::routes::health::healthz))
+        .route("/readiness", get(crate::server::routes::health::readyz))
         .route("/metrics", get(crate::server::routes::metrics::metrics))
         .route(
             "/v1/models",
@@ -215,47 +239,53 @@ pub fn build_router(ctx: Arc<AppContext>) -> Router {
         .route(
             "/v1/chat/completions",
             post(crate::server::routes::chat::chat_completions)
-                .layer(DefaultBodyLimit::max(MAX_CHAT_BODY_BYTES))
+                .layer(DefaultBodyLimit::max(max_body_bytes))
                 .layer(middleware::from_fn(log_413)),
         )
         .route(
             "/v1/messages",
-            messages_route(post(crate::server::routes::messages::messages)),
+            messages_route(
+                post(crate::server::routes::messages::messages),
+                max_body_bytes,
+            ),
         )
         .route(
             "/v1/messages/count_tokens",
-            messages_route(post(crate::server::routes::messages::count_tokens)),
+            messages_route(
+                post(crate::server::routes::messages::count_tokens),
+                max_body_bytes,
+            ),
         )
         .route(
             "/v1/completions",
             post(crate::server::routes::chat::completions)
-                .layer(DefaultBodyLimit::max(MAX_CHAT_BODY_BYTES))
+                .layer(DefaultBodyLimit::max(max_body_bytes))
                 .layer(middleware::from_fn(log_413)),
         )
         .route(
             "/generate",
             post(crate::server::routes::chat::generate)
                 .put(crate::server::routes::chat::generate)
-                .layer(DefaultBodyLimit::max(MAX_CHAT_BODY_BYTES))
+                .layer(DefaultBodyLimit::max(max_body_bytes))
                 .layer(middleware::from_fn(log_413)),
         )
         .route(
             "/v1/embeddings",
             post(crate::server::routes::chat::embeddings)
-                .layer(DefaultBodyLimit::max(MAX_CHAT_BODY_BYTES))
+                .layer(DefaultBodyLimit::max(max_body_bytes))
                 .layer(middleware::from_fn(log_413)),
         )
         .route(
             "/v1/classify",
             post(crate::server::routes::chat::classify)
-                .layer(DefaultBodyLimit::max(MAX_CHAT_BODY_BYTES))
+                .layer(DefaultBodyLimit::max(max_body_bytes))
                 .layer(middleware::from_fn(log_413)),
         )
         .route(
             "/v1/rerank",
             post(crate::server::routes::chat::rerank)
                 .put(crate::server::routes::chat::rerank)
-                .layer(DefaultBodyLimit::max(MAX_CHAT_BODY_BYTES))
+                .layer(DefaultBodyLimit::max(max_body_bytes))
                 .layer(middleware::from_fn(log_413)),
         )
         .route(
@@ -265,7 +295,33 @@ pub fn build_router(ctx: Arc<AppContext>) -> Router {
         .route(
             crate::state::kv_events::bootstrap::SNAPSHOT_PATH,
             get(crate::server::routes::cache::kv_snapshot),
+        )
+        .route(
+            "/server_info",
+            get(crate::server::routes::worker_info::server_info),
+        )
+        .route(
+            "/model_info",
+            get(crate::server::routes::worker_info::model_info),
+        )
+        .route(
+            "/health_generate",
+            get(crate::server::routes::worker_info::health_generate),
+        )
+        // The `/get_` names are the engine's older aliases.
+        .route(
+            "/get_server_info",
+            get(crate::server::routes::worker_info::server_info),
+        )
+        .route(
+            "/get_model_info",
+            get(crate::server::routes::worker_info::model_info),
         );
+    let router = crate::server::routes::unsupported::UNSUPPORTED_PATHS
+        .iter()
+        .fold(router, |router, path| {
+            router.route(path, any(crate::server::routes::unsupported::unsupported))
+        });
     // A route that panics on purpose, so the panic-handling layers below are
     // exercised as `build_router` actually composes them. Without it the layers
     // could be deleted from this function and every test would still pass.
@@ -633,6 +689,26 @@ mod tests {
         );
     }
 
+    /// The probe aliases answer exactly as the probes they alias: a stub
+    /// context is alive but never marked ready.
+    #[tokio::test]
+    async fn probe_aliases_answer_like_healthz_and_readyz() {
+        let ctx = Arc::new(AppContext::stub());
+        for (uri, want) in [
+            ("/health", StatusCode::OK),
+            ("/liveness", StatusCode::OK),
+            ("/readiness", StatusCode::SERVICE_UNAVAILABLE),
+        ] {
+            let req = Request::builder()
+                .method("GET")
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap();
+            let res = build_router(Arc::clone(&ctx)).oneshot(req).await.unwrap();
+            assert_eq!(res.status(), want, "{uri}");
+        }
+    }
+
     /// The `method` label must be bounded where it is USED, not merely where it
     /// is computed: `normalize_method` existing is worthless if a call site
     /// still passes the raw verb. An RFC-7230 extension token reaches this
@@ -657,5 +733,57 @@ mod tests {
             !m.contains("BREW"),
             "the raw verb must never reach a metric label: {m}",
         );
+    }
+
+    /// `build_router` takes its body cap from `SGLANG_ROUTER_MAX_BODY_BYTES`.
+    /// The cap is resolved once per process, so the check runs in a child copy
+    /// of this test binary with the variable set.
+    #[test]
+    fn build_router_takes_the_body_cap_from_the_env() {
+        use crate::server::routes::chat::{max_chat_body_bytes, SGLANG_ROUTER_MAX_BODY_BYTES};
+        const CHILD: &str = "SGL_ROUTER_TEST_BODY_CAP_CHILD";
+        const CAP: usize = 4096;
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "server::app::tests::build_router_takes_the_body_cap_from_the_env",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env(SGLANG_ROUTER_MAX_BODY_BYTES, CAP.to_string())
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "{stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        assert_eq!(max_chat_body_bytes(), CAP);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let status = |len: usize| {
+            let req = Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("content-type", "application/json")
+                .body(Body::from(vec![b' '; len]))
+                .unwrap();
+            runtime.block_on(async {
+                build_router(Arc::new(AppContext::stub()))
+                    .oneshot(req)
+                    .await
+                    .unwrap()
+                    .status()
+            })
+        };
+        assert_eq!(status(CAP + 1), StatusCode::PAYLOAD_TOO_LARGE);
+        // At the cap the body reaches the handler, which rejects the blank JSON.
+        assert_ne!(status(CAP), StatusCode::PAYLOAD_TOO_LARGE);
     }
 }
