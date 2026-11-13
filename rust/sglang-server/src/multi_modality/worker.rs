@@ -143,16 +143,18 @@ pub trait MmProcessor: Send + Sync {
     }
 
     /// Finish item layout after caller hash overrides, before feature publication.
+    /// An item whose feature or metadata changes here must not keep a
+    /// precomputed `identity`.
     fn finalize(&self, _entry: &mut MmEncodedEntry) -> Result<(), String> {
         Ok(())
     }
 
     /// Observe a request's final result, as the scheduler will receive it
-    /// (with the caller's `mm_hashes` applied, finalized, validated, and its
-    /// ids fitted to the context), on the worker before the request is queued
-    /// for the scheduler. Lets an implementation hand the result on without
-    /// waiting for the scheduler to drain the request. The default does
-    /// nothing.
+    /// (with the caller's `mm_hashes` applied, finalized, validated, each
+    /// item's `identity` filled in, and its ids fitted to the context), on the
+    /// worker before the request is queued for the scheduler. Lets an
+    /// implementation hand the result on without waiting for the scheduler to
+    /// drain the request. The default does nothing.
     fn processed(&self, _request: MmRequestInfo<'_>, _output: &MmProcessOutput) {}
 
     /// [`processed`](Self::processed), able to fail the request: `Err`
@@ -226,6 +228,7 @@ fn encode_output(output: MmOutput) -> Result<MmProcessOutput, String> {
                 modality: MmModality::Image,
                 feature: tensor(item.feature)?,
                 hash: item.hash,
+                identity: None,
                 offsets: vec![span],
                 model_specific_data: item
                     .aux
@@ -423,6 +426,10 @@ fn process(
         .result
         .validate(output.input_ids.len())
         .map_err(Error::Internal)?;
+    output
+        .result
+        .resolve_identities()
+        .map_err(Error::Internal)?;
     // Intake fits the ids to the context (`check_total_tokens`) before the
     // scheduler sees them; fit them first, so `processed` sees the same ids. A
     // prompt intake will reject is not observed.
@@ -549,6 +556,7 @@ mod tests {
                             data: TensorData::F32(vec![1.0]),
                         },
                         hash: 7,
+                        identity: None,
                         offsets: self.offsets.clone(),
                         model_specific_data: BTreeMap::from([(
                             "clip_index".to_owned(),
@@ -651,6 +659,7 @@ mod tests {
                 data: TensorData::F32(feature),
             },
             hash,
+            identity: None,
             offsets: vec![span],
             model_specific_data: BTreeMap::from([(
                 "image_grid_thw".to_owned(),
@@ -885,12 +894,17 @@ mod tests {
     }
 
     /// Finalization sees the caller's hashes and is validated; `processed`
-    /// observes only a valid finalized result.
+    /// observes only a valid finalized result, with each item's identity
+    /// already hashed over its final feature: the identity the scheduler
+    /// receives in `mm.meta`.
     #[test]
     fn finalization_runs_after_caller_hashes_and_is_validated() {
+        /// Each item's hash and identity, as `processed` saw them.
+        type Observed = Vec<(u64, [u8; 32])>;
+
         struct FinalizingProcessor {
             final_end: u32,
-            processed: std::sync::Mutex<Vec<Vec<u64>>>,
+            processed: std::sync::Mutex<Vec<Observed>>,
         }
 
         impl MmProcessor for FinalizingProcessor {
@@ -913,6 +927,7 @@ mod tests {
                         data: TensorData::F32(vec![2.0]),
                     },
                     hash: parent_hash + 2,
+                    identity: None,
                     offsets: vec![(1, self.final_end)],
                     model_specific_data: BTreeMap::new(),
                 });
@@ -920,8 +935,15 @@ mod tests {
             }
 
             fn processed(&self, _request: MmRequestInfo<'_>, output: &MmProcessOutput) {
-                let hashes = output.result.items.iter().map(|item| item.hash).collect();
-                self.processed.lock().unwrap().push(hashes);
+                let items = output.result.items.iter();
+                let observed = items
+                    .map(|item| {
+                        let identity = item.identity.expect("resolved before `processed`");
+                        assert_eq!(Ok(identity), item.hash_identity());
+                        (item.hash, identity)
+                    })
+                    .collect();
+                self.processed.lock().unwrap().push(observed);
             }
         }
 
@@ -946,14 +968,24 @@ mod tests {
                 assert!(processed.is_empty(), "an invalid result is not observed");
                 continue;
             }
-            assert_eq!(processed, [vec![43, 44]]);
+            let [observed] = processed.as_slice() else {
+                panic!("observed once: {processed:?}");
+            };
+            let hashes: Vec<_> = observed.iter().map(|(hash, _)| *hash).collect();
+            assert_eq!(hashes, [43, 44]);
+            assert_ne!(observed[0].1, observed[1].1);
             let (ids, buffers) = result.expect("valid finalized items");
             assert_eq!(ids, [1, 2]);
             assert!(find(&buffers, "mm.feature.1").is_some());
             let meta: serde_json::Value = rmpv::ext::from_value(decoded_meta(&buffers)).unwrap();
             assert_eq!(meta["items"].as_array().unwrap().len(), 2);
-            assert_eq!(meta["items"][0]["hash"].as_u64(), Some(43));
-            assert_eq!(meta["items"][1]["hash"].as_u64(), Some(44));
+            for (index, (hash, identity)) in observed.iter().enumerate() {
+                assert_eq!(meta["items"][index]["hash"].as_u64(), Some(*hash));
+                assert_eq!(
+                    meta["items"][index]["identity"],
+                    serde_json::json!(identity)
+                );
+            }
         }
     }
 
