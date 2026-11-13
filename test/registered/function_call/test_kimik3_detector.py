@@ -162,9 +162,8 @@ def test_streaming_split_markers(chunk_size: int) -> None:
     )
     normal_text, calls = _stream(detector, _chunks(text, chunk_size), tools)
     assert normal_text == "Hello!"
-    assert len(calls) == 1
-    assert calls[0].name == "python"
-    assert json.loads(calls[0].parameters) == {"code": "print(2)"}
+    assert [c.name for c in calls if c.name] == ["python"]
+    assert json.loads("".join(c.parameters for c in calls)) == {"code": "print(2)"}
 
 
 def test_streaming_two_calls() -> None:
@@ -177,8 +176,11 @@ def test_streaming_two_calls() -> None:
         + TOOLS_CLOSE
     )
     _, calls = _stream(detector, _chunks(text, 7), tools)
-    assert [call.tool_index for call in calls] == [0, 1]
-    assert [json.loads(call.parameters) for call in calls] == [
+    assert [call.tool_index for call in calls if call.name] == [0, 1]
+    assert [
+        json.loads("".join(c.parameters for c in calls if c.tool_index == i))
+        for i in (0, 1)
+    ] == [
         {"code": "a"},
         {"code": "b"},
     ]
@@ -215,7 +217,8 @@ def test_stream_end_reports_truncated_tools_section(caplog) -> None:
     tools = [_make_tool("python")]
     truncated = TOOLS_OPEN + '<|open|>call tool="python" index="1"<|sep|>'
     text, calls = _stream(detector, _chunks(truncated, 7), tools)
-    assert calls == []
+    assert [c.name for c in calls] == ["python"]
+    assert detector.incomplete_tool_call_indices == {0}
     with caplog.at_level("WARNING", logger="sglang.srt.function_call.kimik3_detector"):
         result = detector.finish(tools)
     assert result.calls == []
@@ -247,6 +250,61 @@ def test_detector_capabilities_and_registration() -> None:
     parser = FunctionCallParser([_make_tool("python")], "kimi_k3")
     assert isinstance(parser.detector, KimiK3Detector)
     assert parser.get_structure_constraint("required") is not None
+
+
+@pytest.mark.parametrize("size", [1, 7, 23, 4096])
+def test_streamed_arguments_match_non_streaming(size):
+    args = {
+        'a"&b': ("string", '中文 "quote" \\ path\n' * 100),
+        "empty": ("string", ""),
+        "obj": ("object", '{"a": [1, true, null]}'),
+        "bad": ("number", "not JSON"),
+    }
+    # Escape the attribute independently of the raw string value.
+    text = (
+        TOOLS_OPEN
+        + _call_block("python", 1, args).replace('key="a"&b"', 'key="a&quot;&amp;b"')
+        + _call_block("python", 2, {})
+        + TOOLS_CLOSE
+    )
+    detector = KimiK3Detector()
+    _, calls = _stream(detector, _chunks(text, size), [_make_tool("python")])
+    expected = detector.detect_and_parse(text, []).calls
+    assert [c.name for c in calls if c.name] == ["python", "python"]
+    for i in (0, 1):
+        actual = "".join(c.parameters for c in calls if c.tool_index == i)
+        assert json.loads(actual) == json.loads(expected[i].parameters)
+        assert actual == detector.streamed_args_for_tool[i]
+    assert detector.incomplete_tool_call_indices == set()
+
+
+def test_arguments_are_emitted_before_argument_and_call_close():
+    detector = KimiK3Detector()
+    prefix = (
+        TOOLS_OPEN + '<|open|>call tool="python" index="1"<|sep|>'
+        '<|open|>argument key="code" type="string"<|sep|>'
+    )
+    first = detector.parse_streaming_increment(prefix + "first", [])
+    second = detector.parse_streaming_increment("second", [])
+    assert "first" in "".join(c.parameters for c in first.calls)
+    assert "second" in "".join(c.parameters for c in second.calls)
+    assert detector.incomplete_tool_call_indices == {0}
+    assert all(c.name is None for c in second.calls)
+
+
+def test_nameless_call_is_skipped_like_non_streaming():
+    text = (
+        TOOLS_OPEN
+        + _call_block("", 1, {"x": ("string", "a")})
+        + _call_block("python", 2, {"y": ("string", "b")})
+        + TOOLS_CLOSE
+    )
+    detector = KimiK3Detector()
+    _, calls = _stream(detector, _chunks(text, 5), [_make_tool("python")])
+    expected = detector.detect_and_parse(text, []).calls
+    assert [c.name for c in calls if c.name] == [c.name for c in expected]
+    actual = "".join(c.parameters for c in calls)
+    assert json.loads(actual) == json.loads(expected[0].parameters)
 
 
 if __name__ == "__main__":

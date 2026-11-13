@@ -50,6 +50,7 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_MINIMAX_H3_PDD_HEADS: str | None = None
     SGLANG_DIFFUSION_FLUX3_NATTEN_BACKEND: str | None = None
     SGLANG_DIFFUSION_CFG_GATE_STEP: float = 1.0
+    SGLANG_DIFFUSION_WAN_TEXT_PADDING: str = "max"
     # cache-dit env vars (primary transformer)
     # on by default; engages only on 2 ranks with peer-to-peer access and falls
     # back to NCCL when unavailable. Set 0 to force NCCL. Keep this in step with
@@ -118,7 +119,6 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND: str | None = None
     SGLANG_DIFFUSION_ENABLE_W8A8_FP8_GEMM: bool = False
     SGLANG_ENABLE_FUSED_QKNORM_ROPE: bool = True
-    MINIMAX_H3_VAE_DECODER_FUSED_NORM: bool = True
     MINIMAX_H3_VAE_DECODER_VIT_FP32_NORM: bool = True
     MINIMAX_H3_VAE_DECODER_STREAM_TEMPORAL_CAT: bool = True
     SGLANG_DIFFUSION_MXFP8_FA_HEAD_CHUNK_SIZE: int = 4
@@ -329,6 +329,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_DIFFUSION_CFG_GATE_STEP": _lazy_float(
         "SGLANG_DIFFUSION_CFG_GATE_STEP", 1.0
     ),
+    # Wan UMT5 text padding. "max" (default) pads every prompt to 512 tokens.
+    # "longest" encodes only the real tokens; "bucket" rounds up to a multiple of
+    # 64. Both are faster but change the bf16 rounding, so outputs are not
+    # bit-identical to "max".
+    "SGLANG_DIFFUSION_WAN_TEXT_PADDING": _lazy_str(
+        "SGLANG_DIFFUSION_WAN_TEXT_PADDING", "max"
+    ),
     # Kernel backend for convrot_int8 (online or serialized ConvRot INT8):
     # "auto" prefers SGLang's JIT-compiled convrot_int8 ops where they build
     # and run (CC 9.0, 10.0, 12.0, 12.1 with nvcc) and falls back to
@@ -479,12 +486,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_ENABLE_FUSED_QKNORM_ROPE": lambda: (
         os.getenv("SGLANG_ENABLE_FUSED_QKNORM_ROPE", "1").lower()
         not in {"0", "false", "off", "no"}
-    ),
-    # MiniMax-H3 VAE decoder: fused RMSNorm / QK RMSNorm+RoPE kernels in the
-    # ViT blocks (NVIDIA only). Only 1/true/yes/on keep it enabled.
-    "MINIMAX_H3_VAE_DECODER_FUSED_NORM": lambda: (
-        os.getenv("MINIMAX_H3_VAE_DECODER_FUSED_NORM", "1").strip().lower()
-        in ("1", "true", "yes", "on")
     ),
     # MiniMax-H3 VAE decoder: run the ViT norms in FP32 (the released recipe).
     # Only 1/true/yes/on keep it enabled.

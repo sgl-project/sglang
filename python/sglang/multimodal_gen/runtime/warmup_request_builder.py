@@ -24,12 +24,12 @@ from copy import copy
 from dataclasses import fields, replace
 from typing import Any
 
-from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.configs.sample.sampling_params import (
     SamplingParams,
     align_num_frames_for_num_gpus,
     resolve_sequence_shard,
 )
+from sglang.multimodal_gen.configs.task_type import ModelTaskType
 from sglang.multimodal_gen.registry import get_pipeline_config_classes
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.server_args import (
@@ -153,7 +153,7 @@ def _resolve_default_warmup_resolution(
             or server_args.enable_breakable_cuda_graph is True
         )
     ):
-        return width, height
+        return _two_stage_request_resolution(server_args, width, height)
 
     if server_based_warmup:
         return _resolve_representative_warmup_resolution(server_args, sampling_defaults)
@@ -247,6 +247,24 @@ def _warmup_resolution_alignment(server_args: ServerArgs) -> int:
         alignment = max(alignment, 64, int(vae_scale_factor) * 2)
 
     return alignment
+
+
+def _two_stage_request_resolution(
+    server_args: ServerArgs, width: int, height: int
+) -> tuple[int, int]:
+    """Return the request resolution a sampling default maps to.
+
+    LTX-2 two-stage requests carry the output resolution and stage 1 runs at
+    half of it, so a default the halving rejects (LTX-2.5's 960x544) is the
+    stage-1 size and its request is twice that (1920x1088).
+    """
+    if not is_ltx2_two_stage_pipeline_name(server_args.pipeline_class_name):
+        return width, height
+    alignment = _warmup_resolution_alignment(server_args)
+    if _is_resolution_aligned((width, height), alignment):
+        return width, height
+    doubled = (width * 2, height * 2)
+    return doubled if _is_resolution_aligned(doubled, alignment) else (width, height)
 
 
 def _select_supported_warmup_resolution(
@@ -574,6 +592,9 @@ def build_warmup_reqs(
     if not supports_synthetic_warmup(server_args):
         return []
     sampling_defaults = get_model_sampling_defaults(server_args)
+    warmup_prompt = sampling_defaults.prompt
+    if warmup_prompt is None:
+        warmup_prompt = DEFAULT_PLACEHOLDER_PROMPT
 
     if warmup_resolutions is None:
         width, height = _resolve_default_warmup_resolution(
@@ -638,7 +659,7 @@ def build_warmup_reqs(
             data_type=task_type.data_type(),
             width=width,
             height=height,
-            prompt=DEFAULT_PLACEHOLDER_PROMPT,
+            prompt=warmup_prompt,
         )
         req_kwargs["sampling_params"] = copy(sampling_defaults)
         req_kwargs.update(
@@ -661,7 +682,6 @@ def build_warmup_reqs(
                 raise RuntimeError(
                     "Warmup image path is required for image-input model"
                 )
-            req_kwargs["prompt"] = DEFAULT_PLACEHOLDER_PROMPT
             default_image_path = sampling_defaults.image_path
             image_count = (
                 len(default_image_path)
@@ -678,9 +698,9 @@ def build_warmup_reqs(
 
         run_real_path_prewarm = server_based_warmup and server_args.enable_torch_compile
         prompts = (
-            (DEFAULT_PLACEHOLDER_PROMPT,) + TORCH_COMPILE_REAL_PATH_PREWARM_PROMPTS
+            (warmup_prompt,) + TORCH_COMPILE_REAL_PATH_PREWARM_PROMPTS
             if run_real_path_prewarm
-            else (DEFAULT_PLACEHOLDER_PROMPT,)
+            else (warmup_prompt,)
         )
         for prompt_idx, prompt in enumerate(prompts):
             prompt_req_kwargs = req_kwargs.copy()

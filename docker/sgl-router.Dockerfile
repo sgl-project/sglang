@@ -18,16 +18,24 @@
 #
 # Build (from the repo root):
 #   docker build -f docker/sgl-router.Dockerfile -t sgl-router:dev .
-# Run:
-#   docker run --rm -p 8090:8090 \
-#       -v $(pwd)/docker/sgl-router.sample.yaml:/etc/sgl-router/sgl-router.yaml \
-#       sgl-router:dev --config /etc/sgl-router/sgl-router.yaml
+# Run (the router is configured by CLI flags only):
+#   docker run --rm -p 30000:30000 sgl-router:dev \
+#       --host 0.0.0.0 --port 30000 --model-id qwen3 \
+#       --worker-urls http://10.0.0.1:30000 http://10.0.0.2:30000
 #
 # Image budget: < 100 MB stripped (M6 acceptance). Verify with
 #   `docker image inspect sgl-router:dev --format '{{.Size}}'`.
+#
+# FIPS 140-3 build (aws-lc-rs FIPS module as the TLS provider; see the `fips`
+# feature in sgl-router/Cargo.toml). The module is statically linked, so the
+# runtime image needs nothing extra; RUNTIME_BASE_IMAGE may point at a FIPS
+# base for the OS packages:
+#   docker build -f docker/sgl-router.Dockerfile --build-arg CARGO_FEATURES=fips \
+#       -t sgl-router:fips .
 
 ARG RUST_VERSION=1.92
 ARG DEBIAN_VERSION=bookworm
+ARG RUNTIME_BASE_IMAGE=gcr.io/distroless/cc-debian12:nonroot
 
 ######################## STAGE 1 — chef recipe ##########################
 FROM rust:${RUST_VERSION}-${DEBIAN_VERSION} AS chef
@@ -38,6 +46,7 @@ COPY sgl-router/sgl-kv-indexer/Cargo.toml sgl-kv-indexer/Cargo.toml
 # sglang-processor is a path dependency that inherits from the rust/ workspace manifest.
 COPY rust/Cargo.toml /work/rust/Cargo.toml
 COPY rust/sglang-api-types /work/rust/sglang-api-types
+COPY rust/sglang-runtime-v1-types /work/rust/sglang-runtime-v1-types
 COPY rust/sglang-processor/Cargo.toml /work/rust/sglang-processor/Cargo.toml
 # Stub a minimal src tree so cargo can see the workspace targets, then
 # prepare the chef recipe.
@@ -53,8 +62,14 @@ RUN mkdir -p src sgl-kv-indexer/src/bin /work/rust/sglang-processor/src \
 
 ######################## STAGE 2 — builder ##############################
 FROM rust:${RUST_VERSION}-${DEBIAN_VERSION} AS builder
+# Comma-separated cargo features; empty for the default build. `fips` also
+# needs the aws-lc-fips-sys toolchain (cmake, Go for the delocator, clang).
+ARG CARGO_FEATURES=""
 RUN apt-get update \
     && apt-get install -y --no-install-recommends protobuf-compiler \
+    && case ",${CARGO_FEATURES}," in \
+         *,fips,*) apt-get install -y --no-install-recommends cmake golang-go clang libclang-dev ;; \
+       esac \
     && rm -rf /var/lib/apt/lists/* \
     && cargo install cargo-chef --locked --version ^0.1
 WORKDIR /work/sgl-router
@@ -73,13 +88,15 @@ COPY sgl-router/sgl-kv-indexer/Cargo.toml sgl-kv-indexer/Cargo.toml
 # stub of sglang-processor; its real sources arrive with the router's below.
 COPY rust/Cargo.toml /work/rust/Cargo.toml
 COPY rust/sglang-api-types /work/rust/sglang-api-types
+COPY rust/sglang-runtime-v1-types /work/rust/sglang-runtime-v1-types
 COPY rust/sglang-processor/Cargo.toml /work/rust/sglang-processor/Cargo.toml
 RUN mkdir -p /work/rust/sglang-processor/src && touch /work/rust/sglang-processor/src/lib.rs
 
 # Cook (compile + cache) the dep graph from the recipe. The recipe carries every
 # workspace member's manifest and the lockfile, so chef recreates the Indexer's
 # source stubs itself.
-RUN cargo chef cook --locked --release --recipe-path recipe.json
+RUN cargo chef cook --locked --release --recipe-path recipe.json \
+    ${CARGO_FEATURES:+--features "$CARGO_FEATURES"}
 
 # Now bring in the real sources and the manifests they need.
 COPY sgl-router/Cargo.toml sgl-router/Cargo.lock ./
@@ -92,18 +109,18 @@ COPY rust/sglang-processor/src /work/rust/sglang-processor/src
 
 RUN touch sgl-kv-indexer/build.rs /work/rust/sglang-processor/src/lib.rs \
     && cargo build --locked --release --bin sgl-router \
+       ${CARGO_FEATURES:+--features "$CARGO_FEATURES"} \
     && strip target/release/sgl-router
 
 ######################## STAGE 3 — runtime ##############################
-FROM gcr.io/distroless/cc-debian12:nonroot AS runtime
+FROM ${RUNTIME_BASE_IMAGE} AS runtime
 
 COPY --from=builder /work/sgl-router/target/release/sgl-router /usr/local/bin/sgl-router
 
-# Default config path; mount your own via `-v <host-path>:/etc/sgl-router`.
-ENV SGL_ROUTER_CONFIG=/etc/sgl-router/sgl-router.yaml
-EXPOSE 8090
+EXPOSE 30000
 
 # distroless `nonroot` runs as uid 65532. The router doesn't need root.
-USER nonroot:nonroot
+# Numeric so a RUNTIME_BASE_IMAGE without a `nonroot` passwd entry still works.
+USER 65532:65532
 
 ENTRYPOINT ["/usr/local/bin/sgl-router"]

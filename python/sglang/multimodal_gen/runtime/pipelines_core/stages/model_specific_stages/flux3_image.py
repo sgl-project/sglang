@@ -26,7 +26,9 @@ from sglang.multimodal_gen.runtime.distributed.cfg_policy import (
     CFGPolicy,
 )
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_sp_group,
     get_sp_world_size,
+    get_tp_group,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import (
     get_forward_context,
@@ -60,6 +62,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.precision import precision_to_dtype
@@ -157,13 +160,21 @@ def resolve_sequential_cfg(
         for sample in range(packed.num_samples)
     ]
     free, _ = torch.cuda.mem_get_info(packed.data["image"].device)
+    # Ranks must agree: packed CFG runs one forward per step and sequential CFG
+    # two, so a split decision pairs mismatched TP/SP collectives.
+    free = torch.tensor([free], dtype=torch.int64)
+    for group in (get_tp_group(), get_sp_group()):
+        if group.world_size > 1:
+            torch.distributed.all_reduce(
+                free, op=torch.distributed.ReduceOp.MIN, group=group.cpu_group
+            )
     activation = (
         packed.num_samples
         * max(tokens_per_sample)
         * int(hidden_size)
         * torch.bfloat16.itemsize
     )
-    return activation * _CFG_ACT_STACK >= free
+    return activation * _CFG_ACT_STACK >= int(free)
 
 
 @contextmanager
@@ -251,6 +262,29 @@ def denoise_flow_map(
                 velocity = dit(packed=packed)[mode]
             packed.data[mode] = packed.data[mode] + delta * velocity
     return packed.data[mode]
+
+
+@contextmanager
+def exact_vae_convolutions(exact: bool):
+    """Keep ``quality="exact"`` bit-reproducible through the VAE on ROCm.
+
+    MIOpen's default fp32 convolution kernels are not run-to-run deterministic
+    for some VAE shapes, so the same reference encodes to slightly different
+    latents on each request. Restrict MIOpen to deterministic kernels for the
+    call, and turn off benchmark mode (``SGLANG_USE_ROCM_CUDNN_BENCHMARK``) so
+    the kernel is not picked by timing. Both flags are restored afterwards;
+    other platforms are unchanged.
+    """
+    if not (exact and current_platform.is_hip()):
+        yield
+        return
+    cudnn = torch.backends.cudnn
+    previous = cudnn.deterministic, cudnn.benchmark
+    cudnn.deterministic, cudnn.benchmark = True, False
+    try:
+        yield
+    finally:
+        cudnn.deterministic, cudnn.benchmark = previous
 
 
 def vae_encode(vae, image: Tensor) -> tuple[Tensor, Tensor]:
@@ -356,7 +390,7 @@ def prepare_multi_reference(image: Image.Image) -> Image.Image:
 
 
 def _open_reference(path: str | bytes | Image.Image) -> Image.Image:
-    from sglang.srt.utils.common import get_image_bytes
+    from sglang.srt.multimodal.media_io import get_image_bytes
 
     if isinstance(path, Image.Image):
         return path
@@ -615,6 +649,7 @@ class Flux3ImageConditionEncodeStage(ConditionEncodingStage):
                 phase="condition_encode",
             ),
             use_vae_fast_path(self.vae, batch.quality != "exact"),
+            exact_vae_convolutions(batch.quality == "exact"),
         ):
             with torch.inference_mode():
                 batch.extra["flux3_condition"] = encode_references(
@@ -897,6 +932,7 @@ class Flux3ImageDecodeStage(PipelineStage):
                 phase="decode",
             ),
             use_vae_fast_path(self.vae, batch.quality != "exact"),
+            exact_vae_convolutions(batch.quality == "exact"),
         ):
             with torch.inference_mode():
                 image = crop_output(
@@ -916,6 +952,7 @@ class Flux3ImageDecodeStage(PipelineStage):
                 component_name="vae", module=self.vae, phase="decode"
             ),
             use_vae_fast_path(self.vae, batches[0].quality != "exact"),
+            exact_vae_convolutions(batches[0].quality == "exact"),
         ):
             for group in groups.values():
                 decoded = vae_decode(

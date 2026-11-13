@@ -119,13 +119,6 @@ class DisaggServerArgsMixin:
             f"Default: {cls.disagg_timeout}.",
         )
         parser.add_argument(
-            "--disagg-downstream-wait-timeout",
-            type=int,
-            default=cls.disagg_downstream_wait_timeout,
-            help="Timeout in seconds while waiting for a downstream role slot. "
-            f"Default: {cls.disagg_downstream_wait_timeout}.",
-        )
-        parser.add_argument(
             "--disagg-dispatch-policy",
             type=str,
             default=cls.disagg_dispatch_policy,
@@ -133,52 +126,10 @@ class DisaggServerArgsMixin:
             help="Dispatch policy for pool mode disagg routing.",
         )
         parser.add_argument(
-            "--disagg-instance-id",
-            type=int,
-            default=cls.disagg_instance_id,
-            help="Stable per-role instance ID used by DiffusionServer registration.",
-        )
-        parser.add_argument(
-            "--disagg-max-slots-per-instance",
-            type=int,
-            default=cls.disagg_max_slots_per_instance,
-            help="Maximum concurrent transfer/computation slots tracked per instance.",
-        )
-        parser.add_argument(
-            "--disagg-transfer-redundancy",
-            type=float,
-            default=cls.disagg_transfer_redundancy,
-            help="Redundancy factor used when sizing transfer buffers from warmup.",
-        )
-        parser.add_argument(
-            "--disagg-role-device",
-            type=str,
-            default=cls.disagg_role_device,
-            choices=["auto", "cpu", "cuda"],
-            help=(
-                "Per-role device override. 'cpu' is intended for same-machine "
-                "encoder roles."
-            ),
-        )
-        parser.add_argument(
-            "--disagg-transfer-backend",
-            type=str,
-            default=cls.disagg_transfer_backend,
-            choices=["auto", "mock", "mooncake"],
-            help="Transfer backend for multimodal diffusion disaggregation.",
-        )
-        parser.add_argument(
             "--disagg-transfer-pool-size",
             type=int,
             default=cls.disagg_transfer_pool_size,
             help="Size of the P2P transfer buffer pool in bytes.",
-        )
-        parser.add_argument(
-            "--disagg-transfer-pin-memory",
-            type=str,
-            default=cls.disagg_transfer_pin_memory,
-            choices=["auto", "off", "required"],
-            help="CUDA host-register same-host shared-memory transfer buffers.",
         )
         parser.add_argument(
             "--disagg-p2p-hostname",

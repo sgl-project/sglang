@@ -31,7 +31,7 @@ import msgspec.structs
 
 from sglang.srt.arg_groups.validation_hook import check_load_publish_args
 from sglang.srt.configs.embedding_model_spec import resolve_embedding_model_spec
-from sglang.srt.entrypoints import http_server
+from sglang.srt.entrypoints import http_server, server_utils
 from sglang.srt.entrypoints.grpc_bridge import RuntimeHandle
 from sglang.srt.environ import envs
 from sglang.srt.lora.lora_registry import LoRARef
@@ -39,7 +39,6 @@ from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.runtime_context import get_parallel, publish, reset_context
 from sglang.srt.rust_server import config as rust_config
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import common
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -157,14 +156,57 @@ def _call_server_info_with(
 
 
 class TestServerInfoTransportParity(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        # The HTTP and follower gRPC paths under test are the Python server's;
+        # a Rust-server node skips the follower metadata server (covered by
+        # `test_rust_server_followers_skip_runtime_metadata_server`), so pin the
+        # mode against an inherited SGLANG_RUST_SERVER=1.
+        self.enterContext(envs.SGLANG_RUST_SERVER.override(False))
+
+    def test_rust_launch_info_redacts_the_api_keys(self):
+        # Only the API key (or nothing) guards /server_info, so reporting the
+        # keys would hand the admin key to every API-key holder.
+        args = ServerArgs(
+            model_path="dummy", api_key="sk-api", admin_api_key="sk-api admin"
+        )
+        # The command joins argv: a value may hold spaces or contain the other
+        # key, argparse takes an abbreviated flag, and a later flag overrides.
+        args._launch_command = (
+            "python -m sglang.launch_server --admin-api-key old-admin "
+            "--api-key sk-api --admin-api-ke=sk-api admin"
+        )
+        scheduler = SimpleNamespace(
+            server_args=args, max_total_num_tokens=2048, max_req_input_len=1024
+        )
+        info = rust_config._launch_server_info(scheduler)
+        for secret in ("sk-api", 'admin"', "old-admin"):
+            self.assertNotIn(secret, info)
+        launch = json.loads(info)
+        self.assertEqual(launch["api_key"], "<redacted>")
+        self.assertEqual(launch["admin_api_key"], "<redacted>")
+        self.assertEqual(
+            launch["launch_command"],
+            "python -m sglang.launch_server --admin-api-key <redacted> "
+            "--api-key <redacted> --admin-api-ke=<redacted>",
+        )
+
     def test_http_and_both_grpc_roles_share_startup_metadata(self):
+        secrets = {
+            "api_key": "api-secret",
+            "admin_api_key": "admin-secret",
+            "ssl_keyfile_password": "ssl-secret",
+        }
         for config in (None, '{"publisher": "zmq", "endpoint": "tcp://*:5557"}'):
             with self.subTest(kv_events_config=config):
                 args = ServerArgs(
-                    model_path="dummy", kv_events_config=config, page_size=64
+                    model_path="dummy", kv_events_config=config, page_size=64, **secrets
                 )
                 http_info = _call_server_info_with(args)
                 self.assertEqual(http_info["frontend"], "python")
+                # Every transport below reports the same fields.
+                for name in secrets:
+                    self.assertEqual(http_info[name], "<redacted>")
                 for field in ("startup_time", "internal_states", "version", "frontend"):
                     self.assertIn(field, http_info)
                     http_info.pop(field)
@@ -198,7 +240,7 @@ class TestServerInfoTransportParity(CustomTestCase):
 
                 with (
                     patch.object(
-                        common,
+                        server_utils,
                         "get_serving",
                         return_value=SimpleNamespace(
                             host="127.0.0.1",
@@ -209,7 +251,7 @@ class TestServerInfoTransportParity(CustomTestCase):
                     ),
                     patch("sglang.srt.rust_extensions.load_rust_extension") as load,
                 ):
-                    common.start_follower_grpc_server(args, bridge.scheduler_info)
+                    server_utils.start_follower_grpc_server(args, bridge.scheduler_info)
                 start = load.return_value.start_metadata_server
                 start.assert_called_once_with(
                     host="127.0.0.1", port=50051, server_info_json=ANY
@@ -224,7 +266,7 @@ class TestServerInfoTransportParity(CustomTestCase):
         with (
             envs.SGLANG_RUST_SERVER.override(True),
             patch.object(
-                common,
+                server_utils,
                 "get_serving",
                 return_value=SimpleNamespace(
                     host="127.0.0.1",
@@ -236,9 +278,79 @@ class TestServerInfoTransportParity(CustomTestCase):
             patch("sglang.srt.rust_extensions.load_rust_extension") as load,
         ):
             self.assertIsNone(
-                common.start_follower_grpc_server(ServerArgs(model_path="dummy"), {})
+                server_utils.start_follower_grpc_server(
+                    ServerArgs(model_path="dummy"), {}
+                )
             )
         load.return_value.start_metadata_server.assert_not_called()
+
+
+class TestServerInfoInternalStatesRedaction(CustomTestCase):
+    """`internal_states` is the scheduler's readback of the resolved config,
+    which `/server_info` and `Engine.get_server_info` report next to the
+    redacted top-level fields: the credentials must not reach it either."""
+
+    # Every word is distinctive, so a value split at its space cannot hide.
+    SECRETS = {
+        "api_key": "api-secret tail-api",
+        "admin_api_key": "admin-secret tail-admin",
+        "ssl_keyfile_password": "ssl-secret tail-ssl",
+    }
+
+    def setUp(self):
+        super().setUp()
+        # Rust-server mode refuses --ssl-keyfile-password at resolution, so pin
+        # the Python server against an inherited SGLANG_RUST_SERVER=1.
+        self.enterContext(envs.SGLANG_RUST_SERVER.override(False))
+
+    def _scheduler_readback(self, server_args: ServerArgs) -> dict:
+        from sglang.srt.managers.io_struct import GetInternalStateReq
+        from sglang.srt.managers.scheduler_components.internal_state import (
+            SchedulerInternalStateController,
+        )
+
+        # The contributors read the live scheduler; the config part is under test.
+        contributors = {
+            name: MagicMock()
+            for name in vars(SchedulerInternalStateController)
+            if name.startswith("_add_")
+        }
+        controller = SchedulerInternalStateController(
+            scheduler=SimpleNamespace(), record_step_time=False
+        )
+        publish(server_args, role="scheduler")
+        self.addCleanup(reset_context)
+        with patch.multiple(SchedulerInternalStateController, **contributors):
+            return controller.get_internal_state(GetInternalStateReq()).internal_state
+
+    def _assert_redacted(self, payload: dict) -> None:
+        text = json.dumps(payload, default=str)
+        for secret in self.SECRETS.values():
+            for word in secret.split():
+                self.assertNotIn(word, text)
+        for state in payload["internal_states"]:
+            for name in self.SECRETS:
+                self.assertEqual(state[name], "<redacted>")
+
+    def test_http_and_engine_server_info(self):
+        from sglang.srt.entrypoints.engine import Engine
+
+        server_args = ServerArgs(model_path="dummy", **self.SECRETS)
+        readback = self._scheduler_readback(server_args)
+
+        self._assert_redacted(_call_server_info_with(server_args, [readback]))
+
+        async def _internal_state():
+            return [readback]
+
+        engine = Engine.__new__(Engine)
+        engine.tokenizer_manager = _stub_tokenizer_manager(server_args, _internal_state)
+        engine.loop = asyncio.new_event_loop()
+        self.addCleanup(engine.loop.close)
+        engine._scheduler_init_result = SimpleNamespace(
+            scheduler_infos=[{"max_req_input_len": 1024}]
+        )
+        self._assert_redacted(engine.get_server_info())
 
 
 class TestModelInfoTransportParity(CustomTestCase):
@@ -296,6 +408,7 @@ class TestModelInfoTransportParity(CustomTestCase):
             model_config=model_config,
             kv_events_publisher=SimpleNamespace(local_kv_event_sources=lambda _: []),
             page_size=1,
+            tree_cache=None,
             # The server loads the scheduler's tokenizer copy but reports the
             # public path.
             rust_server_tokenizer_path=lambda: "/loaded-tokenizer",
