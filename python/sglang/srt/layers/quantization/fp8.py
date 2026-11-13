@@ -40,6 +40,7 @@ from sglang.srt.layers.moe.utils import (
     get_moe_padding_size,
     get_moe_runner_backend,
     get_moe_weight_sizes,
+    route_dropped_experts_to_local,
 )
 from sglang.srt.layers.parameter import (
     BlockQuantScaleParameter,
@@ -415,9 +416,7 @@ class Fp8Config(QuantizationConfig):
             if is_layer_skipped(
                 prefix, self.ignored_layers, fused_mapping=self.packed_modules_mapping
             ):
-                return UnquantizedFusedMoEMethod(
-                    layer.use_triton_kernels, layer.use_flashinfer_trtllm_moe
-                )
+                return UnquantizedFusedMoEMethod(layer.use_flashinfer_trtllm_moe)
 
             if is_npu() and self.use_mxfp8:
                 from sglang.srt.hardware_backend.npu.quantization.online_moe_methods import (
@@ -2519,43 +2518,14 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 scale = scale[:, :m, :]
             return qweight, scale
 
-        def _swizzle_mxfp8_sf(scale, num_warps):
-            from triton_kernels.tensor import convert_layout, wrap_torch_tensor
-            from triton_kernels.tensor_details import layout
-
-            scale_layout = layout.make_default_matmul_mxfp4_w_scale_layout(
-                mx_axis=-2, num_warps=num_warps
+        def _unsupported_runner_backend():
+            # Mirrors the check in the Triton MoE runner, which has no NVIDIA
+            # MXFP8 kernel; fail at load time instead of on the first forward.
+            return NotImplementedError(
+                "NVIDIA MXFP8 MoE does not support "
+                f"--moe-runner-backend {get_moe_runner_backend().value}; use "
+                "deep_gemm, cutlass, flashinfer_trtllm or flashinfer_trtllm_routed."
             )
-            scale_layout_opts = {}
-            scale = scale.transpose(-2, -1)
-            scale = convert_layout(
-                wrap_torch_tensor(scale), scale_layout, **scale_layout_opts
-            )
-            return scale
-
-        def _swizzle_with_triton_kernel(
-            weight_shape: tuple[int, int, int], scale: torch.Tensor
-        ):
-            num_experts, m, k = weight_shape
-            aligned_m = ((m + 127) // 128) * 128
-            scale = scale.view(num_experts, aligned_m, k // 32)
-            num_warps = 8
-            scale = _swizzle_mxfp8_sf(scale, num_warps)
-            # convert_layout may pad for alignment; we can't view back to the
-            # unpadded shape, so return the (possibly padded) swizzled tensor.
-            return scale.data
-
-        def _quantize_and_swizzle_with_triton_kernel(weight: torch.Tensor):
-
-            weight = weight.contiguous()
-            _, _, k = weight.shape
-            assert k % 32 == 0, f"{k=} must be divisible by 32 for MXFP8"
-
-            weight_flat = weight.view(-1, k).contiguous()
-            qweight, scale = mxfp8_group_quantize(weight_flat)
-            qweight = qweight.view_as(weight)
-            scale = _swizzle_with_triton_kernel(weight.shape, scale)
-            return qweight, scale
 
         def _quantize_with_flashinfer_trtllm(weight: torch.Tensor):
             weight = weight.contiguous()
@@ -2672,12 +2642,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 w13_q, w13_s = _quantize_with_flashinfer_trtllm(layer.w13_weight.data)
                 w2_q, w2_s = _quantize_with_flashinfer_trtllm(layer.w2_weight.data)
             else:
-                w13_q, w13_s = _quantize_and_swizzle_with_triton_kernel(
-                    layer.w13_weight.data
-                )
-                w2_q, w2_s = _quantize_and_swizzle_with_triton_kernel(
-                    layer.w2_weight.data
-                )
+                raise _unsupported_runner_backend()
         else:
             if _is_hip:
                 w13_q = layer.w13_weight.data
@@ -2713,14 +2678,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                     layer.w2_weight_scale_inv.data, layer.w2_weight.data.shape
                 )
             else:
-                w13_q = layer.w13_weight.data
-                w2_q = layer.w2_weight.data
-                w13_s = _swizzle_with_triton_kernel(
-                    layer.w13_weight.data.shape, layer.w13_weight_scale_inv.data
-                )
-                w2_s = _swizzle_with_triton_kernel(
-                    layer.w2_weight.data.shape, layer.w2_weight_scale_inv.data
-                )
+                raise _unsupported_runner_backend()
 
         # Keep parameter objects to preserve weight_loader attrs for hot reload.
         # Prefer in-place copy; rebind only when shape/dtype changes (online quantize).
@@ -3111,7 +3069,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             # ROCm (_use_aiter): using column-wise scaling
             layer.w13_weight_scale1 *= layer.w13_weight_scale.unsqueeze(-1)
             layer.w2_weight_scale1 *= layer.w2_weight_scale.unsqueeze(-1)
-        elif get_bool_env_var("SGLANG_MOE_PADDING"):
+        elif padding_size:
             # If ROCm, apply weight padding (min. Mem channel contention) only if set
             layer.w13_weight = torch.nn.Parameter(
                 F.pad(layer.w13_weight.data, (0, padding_size), "constant", 0),
@@ -3143,8 +3101,8 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             self.runner = create_ascend_moe_runner(
                 layer,
                 moe_runner_config,
-                w13_kernel=NPUW4A8MXFP4MoEMethod(),
-                w2_kernel=NPUW4A8MXFP4MoEMethod(),
+                w13_kernel=NPUW4A8MXFP4MoEMethod(weight_prefix="w13"),
+                w2_kernel=NPUW4A8MXFP4MoEMethod(weight_prefix="w2"),
             )
             return
 
@@ -3294,6 +3252,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             from sgl_kernel import fused_experts
 
             topk_weights, topk_ids, _ = dispatch_output.topk_output
+            topk_weights, topk_ids = route_dropped_experts_to_local(
+                topk_weights=topk_weights, topk_ids=topk_ids
+            )
             assert layer.w13_weight.dtype == layer.w2_weight.dtype
             use_fp8_w8a8 = layer.w13_weight.dtype == torch.float8_e4m3fn
             use_mxfp4_w4a16 = layer.w13_weight.dtype == torch.int8

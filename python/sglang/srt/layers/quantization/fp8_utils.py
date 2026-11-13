@@ -115,8 +115,7 @@ class _MXFP4QuantizedData(MXFP4QuantizeUtil):
 
 # Force CK bpreshuffle (not Triton) for the dense w8a8-block GEMMs (MLA q/kv/o
 # projections), to match ATOM (CK preshuffle; Triton FP8 blockscale is slower).
-# Default OFF; DeepseekV4 enables it via set_force_ck_w8a8(True). The env var
-# SGLANG_FORCE_CK_W8A8=1 still works as an override.
+# Default OFF; DeepseekV4 enables it via set_force_ck_w8a8(True).
 _FORCE_CK_W8A8: bool = False
 
 
@@ -975,8 +974,22 @@ def can_serve_block_fp8_as_mxfp8(
     return not resolve_block_fp8_mxfp8_backend().is_unsupported()
 
 
+def _b12x_or_cutlass_mxfp8_linear(input, weight, *args, **kwargs):
+    # SM12x: b12x has small-M tiles and beats CUTLASS at every M, but needs
+    # K % 128 == 0.
+    backend = "b12x" if weight.shape[1] % 128 == 0 else "cutlass"
+    return flashinfer_mxfp8_blockscaled_linear(
+        input, weight, *args, backend=backend, pin_tactic=True, **kwargs
+    )
+
+
 def dispatch_block_fp8_mxfp8_linear(backend: Mxfp8DenseGemmBackend) -> Callable:
     """The MXFP8 linear for a block-fp8 weight served as MXFP8."""
+    if (
+        backend.is_flashinfer_cutlass()
+        and _raw_flashinfer_mm_mxfp8.is_backend_supported("b12x", get_device_sm())
+    ):
+        return _b12x_or_cutlass_mxfp8_linear
     if backend.is_flashinfer_cutlass():
         return partial(
             flashinfer_mxfp8_blockscaled_linear, backend="cutlass", pin_tactic=True
@@ -1922,6 +1935,18 @@ def _unpack_ue8m0_scale_for_triton(
     return sf_fp32
 
 
+def fp8_input_quant_format(weight: torch.Tensor, num_tokens: int) -> str:
+    """What a fused producer may quantize the input of an MXFP8-converted linear (one
+    with the rowwise copy) to: "fp8_per_token" as ``aiter.per_token_quant_hip`` for the
+    rowwise GEMM, "fp8" as ``aiter_per1x128_quant`` for the bpreshuffle block GEMM, or
+    "" when aiter_w8a8_block_fp8_linear must quantize it itself."""
+    if getattr(weight, "_ptpc_weight", None) is None:
+        return ""
+    if num_tokens <= MXFP8_DENSE_PTPC_DECODE_MAX_M:
+        return "fp8_per_token"
+    return "fp8" if _use_aiter_bpreshuffle_gfx95 else ""
+
+
 def aiter_w8a8_block_fp8_linear(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -1941,8 +1966,8 @@ def aiter_w8a8_block_fp8_linear(
 
     # dense linears converted from MXFP8 carry a rowwise-fp8 copy; its ptpc GEMM
     # beats the block-fp8 GEMMs at decode-sized M
+    ptpc_weight = getattr(weight, "_ptpc_weight", None)
     if input_scale is None:
-        ptpc_weight = getattr(weight, "_ptpc_weight", None)
         if (
             ptpc_weight is not None
             and input_2d.shape[0] <= MXFP8_DENSE_PTPC_DECODE_MAX_M
@@ -1954,6 +1979,15 @@ def aiter_w8a8_block_fp8_linear(
                 bias=bias,
             )
             return out.to(input.dtype).view(*output_shape)
+    elif ptpc_weight is not None and input_scale.shape == (input_2d.shape[0], 1):
+        # quantized per token by a fused producer, see fp8_input_quant_format
+        out = apply_fp8_ptpc_linear(
+            input=(input_2d, input_scale),
+            weight=ptpc_weight,
+            weight_scale=weight._ptpc_scale,
+            bias=bias,
+        )
+        return out.view(*output_shape)
 
     # DeepSeek-V4 e8m0 mxscale route (SGLANG_DSV4_DENSE_MXSCALE): same
     # (16, 16)-preshuffled weight, e8m0 copy of its scale. A producer that
@@ -2116,15 +2150,24 @@ def triton_w8a8_block_fp8_linear(
     return output.to(dtype=output_dtype).view(*output_shape)
 
 
-@lru_cache(maxsize=1)
-def _get_triton_mxfp8_downcast():
-    try:
-        from triton_kernels.numerics_details.mxfp import downcast_to_mxfp
-    except Exception as err:
-        raise RuntimeError(
-            "MXFP8 quantization requires triton_kernels with MXFP8 support."
-        ) from err
-    return downcast_to_mxfp
+def _mxfp8_group_quantize_torch(
+    x: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Eager MXFP8 quantization with the same ROUND_UP E8M0 scale as the JIT kernel."""
+    m, k = x.shape
+    blocks = x.to(torch.float32).view(m, k // 32, 32)
+    dequant = blocks.abs().amax(dim=-1, keepdim=True) / 448.0
+    # Adding 0x007FFFFF carries into the exponent unless the mantissa is zero.
+    scale_bits = (dequant.view(torch.int32) + 0x007FFFFF) & 0x7F800000
+    dequant_rounded = scale_bits.view(torch.float32)
+    quant_scale = torch.where(
+        dequant_rounded == 0,
+        torch.zeros_like(dequant_rounded),
+        1.0 / dequant_rounded,
+    )
+    q = (blocks * quant_scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+    scale_u8 = (scale_bits >> 23).to(torch.uint8)
+    return q.view(m, k), scale_u8.view(m, k // 32)
 
 
 def mxfp8_group_quantize(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -2139,9 +2182,13 @@ def mxfp8_group_quantize(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         )
 
         return mxfp8_e4m3_quantize(x)
-    downcast_to_mxfp = _get_triton_mxfp8_downcast()
-    q_input, scale_u8 = downcast_to_mxfp(x, torch.float8_e4m3fn, axis=1)
-    return q_input.contiguous(), scale_u8.contiguous()
+    if _is_cuda:
+        from sglang.kernels.ops.quantization.mxfp8_group_quant import (
+            mxfp8_group_quant,
+        )
+
+        return mxfp8_group_quant(x)
+    return _mxfp8_group_quantize_torch(x)
 
 
 # (N, K) of the dense MXFP8 GEMMs where cuDNN's SM107 kernel beats the CuTe-DSL one at

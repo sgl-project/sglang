@@ -107,12 +107,13 @@ from sglang.srt.mem_cache import kv_cache_dtype
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
-from sglang.srt.mem_cache.kv.router import STATE_PART
+from sglang.srt.mem_cache.kv.decl import STATE_PART
 from sglang.srt.mem_cache.kv_cache_configurator import (
     KVCacheConfigurator,
 )
 from sglang.srt.mem_cache.kv_weight_version_tracker import KvWeightVersionRecord
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
@@ -218,7 +219,6 @@ from sglang.srt.runtime_context import (
     get_lora,
     get_memory,
     get_model,
-    get_observability,
     get_parallel,
     get_schedule,
     get_spec,
@@ -249,13 +249,13 @@ from sglang.srt.state_capturer.routed_experts import (
 )
 from sglang.srt.utils import (
     cpu_has_amx_support,
-    enable_show_time_cost,
     get_available_gpu_memory,
     is_host_cpu_arm64,
     is_npu,
     set_cuda_arch,
     slow_rank_detector,
 )
+from sglang.srt.utils.aiter_tuned_tables import install_aiter_tuned_tables
 from sglang.srt.utils.device_timer import device_timer_ctx
 from sglang.srt.utils.nvtx_pytorch_hooks import PytHooks
 from sglang.srt.utils.nvtx_utils import profile_range
@@ -456,10 +456,6 @@ class ModelRunner:
 
         # Auxiliary hidden capture: from the draft, or --enable-return-aux-hidden-states.
         self.init_spec_aux_hidden_state()
-
-        # Apply the rank zero filter to logger
-        if get_observability().show_time_cost:
-            enable_show_time_cost()
 
         misc_utils.maybe_disable_chunked_prefix_cache(
             use_mla_backend=self.use_mla_backend,
@@ -1307,6 +1303,8 @@ class ModelRunner:
                 ),
                 max_req_len=self.max_req_len,
                 max_running_requests=self.max_running_requests,
+                stage_start_layer=self.layer_info.start_layer,
+                stage_end_layer=self.layer_info.end_layer,
                 device=self.device,
             )
         )
@@ -1355,6 +1353,8 @@ class ModelRunner:
             maybe_downgrade_dtype_for_legacy_gpu(model_config=self.model_config)
 
         set_cuda_arch()
+        # before the model looks up an aiter GEMM or fused-MoE config
+        install_aiter_tuned_tables()
 
         draft_load_format = self.draft_load_format
         self.load_config = build_load_config(
@@ -1382,15 +1382,21 @@ class ModelRunner:
             load_format=draft_load_format,
         )
 
-        with self._load_format_scope(draft_load_format):
-            loaded = load_model_with_memory_saver(
-                model_config=self.model_config,
-                load_config=self.load_config,
-                device=self.device,
-                gpu_id=self.gpu_id,
-                memory_saver_adapter=self.memory_saver_adapter,
-                is_draft_worker=self.is_draft_worker,
-            )
+        try:
+            with self._load_format_scope(draft_load_format):
+                loaded = load_model_with_memory_saver(
+                    model_config=self.model_config,
+                    load_config=self.load_config,
+                    device=self.device,
+                    gpu_id=self.gpu_id,
+                    memory_saver_adapter=self.memory_saver_adapter,
+                    is_draft_worker=self.is_draft_worker,
+                )
+        finally:
+            if get_exec().moe.enable_paged_experts:
+                from sglang.srt.layers.moe.paged_experts import expert_cache
+
+                expert_cache.loading_done()
         self.loader = loaded.loader
         self.model = loaded.model
         current_platform.post_load_model(self.model)
@@ -1901,6 +1907,10 @@ class ModelRunner:
 
         self.forward_pass_id += 1
 
+        # On the forward stream, outside every CUDA graph: orders a reused row's
+        # reset after its previous request's last forward.
+        self._reset_new_request_rows()
+
         # Try msprob debugger
         if self.msprobe_debugger is not None:
             rank_id = self.gpu_id if get_parallel().dp_size > 1 else None
@@ -1995,6 +2005,13 @@ class ModelRunner:
             self.maybe_join_ep_ranks()
 
         return output
+
+    def _reset_new_request_rows(self) -> None:
+        if self.req_to_token_pool is None or self.token_to_kv_pool_allocator is None:
+            return
+        kv_storage_of(
+            self.req_to_token_pool, self.token_to_kv_pool_allocator
+        ).reset_new_rows()
 
     def _maybe_execute_deferred_mamba_cow_and_clear(
         self, forward_batch: ForwardBatch

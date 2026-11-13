@@ -396,21 +396,30 @@ def maybe_enable_silu_fp4_quant_fusion(mlp: torch.nn.Module) -> None:
 
     Replaces the separate act_and_mul and per-token FP4 quantize kernels with
     one FlashInfer kernel and feeds down_proj a prequantized (fp4, scale)
-    tuple. Kill switch: SGLANG_DISABLE_SILU_FP4_QUANT_FUSION=1.
+    tuple. For ModelOpt and compressed-tensors W4A4 NVFP4 projections.
+    Kill switch: SGLANG_DISABLE_SILU_FP4_QUANT_FUSION=1.
     """
     if envs.SGLANG_DISABLE_SILU_FP4_QUANT_FUSION.get():
         return
+    from sglang.srt.layers.quantization.compressed_tensors.schemes import (
+        CompressedTensorsW4A4Fp4,
+    )
     from sglang.srt.layers.quantization.fp4_utils import get_fp4_gemm_runner_backend
     from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4LinearMethod
 
-    if not (
-        isinstance(mlp.gate_up_proj.quant_method, ModelOptFp4LinearMethod)
-        and mlp.gate_up_proj.quant_method.quant_mode == "w4a4"
-        and isinstance(mlp.down_proj.quant_method, ModelOptFp4LinearMethod)
+    gate_up, down = mlp.gate_up_proj, mlp.down_proj
+    if (
+        isinstance(gate_up.quant_method, ModelOptFp4LinearMethod)
+        and gate_up.quant_method.quant_mode == "w4a4"
+        and isinstance(down.quant_method, ModelOptFp4LinearMethod)
     ):
-        return
-    # The fused producer does not apply AWQ's per-input-channel scale.
-    if mlp.down_proj.quant_method.quant_config.is_awq:
+        # The fused producer does not apply AWQ's per-input-channel scale.
+        if down.quant_method.quant_config.is_awq:
+            return
+    elif not (
+        isinstance(gate_up.scheme, CompressedTensorsW4A4Fp4)
+        and isinstance(down.scheme, CompressedTensorsW4A4Fp4)
+    ):
         return
     # Marlin, the SM80-SM90 default, takes a floating-point input, not the tuple.
     if get_fp4_gemm_runner_backend().is_marlin():
@@ -434,8 +443,13 @@ def can_run_silu_fp4_quant_fusion(
     return (
         mlp._enable_silu_fp4_quant_fusion
         and not isinstance(gate_up, tuple)
+        and gate_up.dim() == 2
         and not get_forward().sp_active  # the SP g-bar matmul needs a tensor
         and not hasattr(mlp.down_proj, "base_layer")  # LoRA reads the activation
+        # down_proj outputs its params_dtype for the tuple, and gate_up's dtype
+        # for an activation; fuse only where the two agree. After the LoRA check:
+        # the LoRA wrapper has no params_dtype.
+        and gate_up.dtype == mlp.down_proj.params_dtype
     )
 
 
@@ -445,10 +459,20 @@ def silu_and_mul_fp4_quant(
     """SiLU(gate) * up of a dense MLP, quantized to NVFP4 for its down_proj."""
     from flashinfer import silu_and_mul_scaled_nvfp4_experts_quantize
 
-    # input_scale_inv only exists after weight loading, so derive it lazily;
+    from sglang.srt.layers.quantization.compressed_tensors.schemes import (
+        CompressedTensorsW4A4Fp4,
+    )
+
+    # The global scale is final only after weight loading, so derive it lazily;
     # the fused kernel requires a 1-D global scale.
     if mlp._down_input_scale_inv_1d is None:
-        mlp._down_input_scale_inv_1d = mlp.down_proj.input_scale_inv.reshape(1)
+        down = mlp.down_proj
+        # The scale each format's own input quant multiplies by.
+        if isinstance(down.scheme, CompressedTensorsW4A4Fp4):
+            scale = down.input_global_scale
+        else:
+            scale = down.input_scale_inv
+        mlp._down_input_scale_inv_1d = scale.reshape(1)
     num_tokens = gate_up.shape[0]
     masked_m = mlp._masked_m_cache.get(num_tokens)
     if masked_m is None:

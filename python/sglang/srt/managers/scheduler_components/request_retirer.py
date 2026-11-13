@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Callable, Optional
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.req_types import FINISH_ABORT
+from sglang.srt.managers.scheduler_components.exit_ledger import record_exit
 from sglang.srt.managers.utils import make_abort_req
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
 from sglang.srt.mem_cache.common import (
@@ -11,6 +14,8 @@ from sglang.srt.mem_cache.common import (
     release_kv_cache,
 )
 from sglang.srt.runtime_context import get_disagg
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.beam_search.coordinator import BeamCoordinator
@@ -24,11 +29,11 @@ if TYPE_CHECKING:
 
 
 class RequestRetirer:
-    """Ends requests and releases what they hold.
-
-    abort ends a request no launched step reports, tells the tokenizer once,
-    and releases it; release gives back what a request its caller ended holds,
-    detaching it first when aborted; the caller streams it."""
+    """Ends requests and releases what they hold: `abort` for one no launched
+    step reports (sends the abort output), `retire_unadmitted` for one rejected
+    before it was queued (streams its output), `release` for one its caller
+    ended and sends. Each takes the request out of the list it is still in: a
+    request ended on its way between lists leaves for none."""
 
     def __init__(
         self,
@@ -38,12 +43,14 @@ class RequestRetirer:
         hisparse_coordinator: Optional[HiSparseCoordinator],
         uocr_runtime: Optional[UocrSchedulerRuntime],
         send_abort_output: Callable[[AbortReq, Req], None],
+        stream_output: Callable[..., None],
     ):
         self.tree_cache = tree_cache
         self.beam_coordinator = beam_coordinator
         self.hisparse_coordinator = hisparse_coordinator
         self.uocr_runtime = uocr_runtime
         self.send_abort_output = send_abort_output
+        self.stream_output = stream_output
 
     def abort(
         self,
@@ -65,8 +72,24 @@ class RequestRetirer:
         )
         self.release(req, checkpoint=checkpoint)
 
+    def retire_unadmitted(self, req: Req) -> None:
+        """Finish a request rejected before it was queued. It holds no device KV,
+        but the release still frees its streaming session, its cache prefetch
+        retry and a retracted request's host KV backup."""
+        # An already set `finished_reason` is what the client receives.
+        reason = req.finished_reason or req.to_finish
+        req.time_stats.trace_ctx.abort(abort_info={"reason": reason.message})
+        req.update_finish_state()
+        self.release(req, checkpoint=False)
+        # Like `find_active_slot`, the detached request also leaves its session.
+        if req.session is not None and req.session.streaming:
+            req.session = None
+        self.stream_output([req], req.return_logprob)
+
     def release(self, req: Req, *, checkpoint: bool) -> None:
         """Give back what an ended request holds; the caller finishes and streams it."""
+        _leave_owner_list(req)
+        record_exit(req, "release")
         if isinstance(req.finished_reason, FINISH_ABORT):
             self._detach(req)
             # A checkpoint hands the KV to the cache, whose store settles the attempt.
@@ -79,14 +102,14 @@ class RequestRetirer:
         discard_kv_cache_backup(req, self.tree_cache)
         # HiSparse clears its mapping of the row before the row is freed.
         if req.kv.holds_kv and self.hisparse_coordinator is not None:
-            self.hisparse_coordinator.request_finished(req)
+            self.hisparse_coordinator.release_request(req)
         if req.kv.holds_kv or req.kv.holds_mamba:
             release_kv_cache(req, self.tree_cache, checkpoint=checkpoint)
 
     def retract(self, req: Req, *, offload_kv: bool) -> bool:
         """Release a retracted request's memory uncheckpointed; return whether it can resume."""
         if req.kv.holds_kv and self.hisparse_coordinator is not None:
-            self.hisparse_coordinator.retract_req(req)
+            self.hisparse_coordinator.release_request(req)
 
         # PD decode backs the KV up to host to restore it without recompute; a caller
         # that will rebootstrap passes offload_kv=False to skip the copy.
@@ -110,6 +133,8 @@ class RequestRetirer:
     def abort_retracted(self, req: Req, *, reason: FINISH_ABORT) -> None:
         """Abort a retracted request that will not be requeued. Not finished in place:
         a step launched before the retraction may still carry it and report it again."""
+        _leave_owner_list(req)
+        record_exit(req, "abort_retracted")
         self._detach(req)
         # retract released the KV without a checkpoint.
         self.tree_cache.finish(req.cache_request_handle, CacheRequestOutcome.ABORT)
@@ -117,6 +142,26 @@ class RequestRetirer:
         self.send_abort_output(
             make_abort_req(req, finished_reason=reason.to_json()), req
         )
+
+    def abandon(self, req: Req, error: Exception) -> None:
+        """Take out a request whose release raised `error`, freeing nothing.
+        A failed release is a bug: CI raises it."""
+        if envs.SGLANG_IS_IN_CI.get():
+            raise error
+        logger.error(
+            f"Release of request {req.rid} (bootstrap room {req.bootstrap_room}) "
+            "failed; abandoning what it holds",
+            exc_info=error,
+        )
+        if req.owner_list is None:
+            return
+        _leave_owner_list(req)
+        record_exit(req, "abandon")
+
+    def settle_output(self, req: Req) -> None:
+        """Take a released request out of the list holding its final output;
+        its release already recorded the exit."""
+        _leave_owner_list(req)
 
     def _detach(self, req: Req) -> None:
         """Drop an aborted request from the components tracking it and free its
@@ -129,3 +174,8 @@ class RequestRetirer:
             req.session.abort_req()
         if self.uocr_runtime is not None:
             self.uocr_runtime.on_req_dropped(req)
+
+
+def _leave_owner_list(req: Req) -> None:
+    if req.owner_list is not None:
+        req.owner_list._leave([req])
