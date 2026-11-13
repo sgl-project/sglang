@@ -21,6 +21,7 @@ def _inputs(batch=2, queries=64, key_size=40, dtype=torch.bfloat16, device="cuda
     return rel_h, rel_w
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize(
     "batch,queries,key_size",
     [(8, 534, 40), (8, 1600, 40), (2, 1024, 64)],
@@ -33,6 +34,7 @@ def test_sam_rel_pos_bias_bit_identity(batch: int, queries: int, key_size: int):
     assert torch.equal(actual, expected)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_query_chunks_stay_on_the_kernel():
     """The SAM attention slices the query axis into chunks; slices must stay eligible."""
     rel_h, rel_w = _inputs(queries=1600)
@@ -66,12 +68,15 @@ def _misaligned_rel_w():
     ],
     ids=["fp16", "fp32", "cpu", "key_width_12", "strided_rel_w", "misaligned_rel_w"],
 )
-def test_unsupported_inputs_take_the_eager_path(make):
+def test_unsupported_inputs_take_the_eager_path(make, request):
     """Inputs the kernel rejects (or would misread) must take the eager sum."""
+    if request.node.callspec.id != "cpu" and not torch.cuda.is_available():
+        pytest.skip("Test requires CUDA")
     rel_h, rel_w = make()
     assert not can_use_sam_rel_pos_bias(rel_h, rel_w)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize(
     "make",
     [lambda: _inputs(dtype=torch.float16), _strided_rel_w, _misaligned_rel_w],

@@ -127,6 +127,7 @@ class TestGdnReplayssmSpecFold(CustomTestCase):
             NUM_SLOTS, HV, K, V, device=DEVICE, dtype=dtype, generator=gen
         )
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_ring_write_does_not_change_verify_output(self):
         for dtype in (torch.float32, torch.bfloat16):
             state = self._state(dtype)
@@ -137,6 +138,7 @@ class TestGdnReplayssmSpecFold(CustomTestCase):
             )
             self.assertTrue(torch.equal(out_plain, out_ring), f"{dtype=}")
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_ring_write_accepts_strided_qkv_views(self):
         inputs = _make_window(12)
         packed_qkv = torch.cat(
@@ -173,6 +175,7 @@ class TestGdnReplayssmSpecFold(CustomTestCase):
         for name in contiguous:
             self.assertTrue(torch.equal(contiguous[name], strided[name]), name)
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_fold_matches_snapshot_baseline(self):
         for dtype in (torch.float32, torch.bfloat16):
             state = self._state(dtype)
@@ -200,6 +203,7 @@ class TestGdnReplayssmSpecFold(CustomTestCase):
             for s in untouched:
                 self.assertTrue(torch.equal(fold_state[0, s], state[s]))
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_track_store_and_null_slots(self):
         dtype = torch.float32
         state = self._state(dtype)
@@ -236,6 +240,7 @@ class TestGdnReplayssmSpecFold(CustomTestCase):
         self.assertTrue(torch.equal(fold_state[0, 2], state[2]))
         self.assertTrue(torch.equal(fold_state[0, 0], state[0]))
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_long_chain_error_stays_bounded(self):
         """This regression case remains within FP32_ATOL through 256 commits."""
         num_iters = 256

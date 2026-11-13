@@ -42,6 +42,13 @@ Registry: nightly-amd-8-gpu-mi35x-glm52-fp8 suite
 
 import unittest
 
+import pytest
+import torch
+
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
+
 from sglang.test.accuracy_test_runner import AccuracyTestParams
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.run_combined_tests import run_combined_tests

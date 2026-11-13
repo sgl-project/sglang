@@ -10,6 +10,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 register_cuda_ci(est_time=40, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("rows,heads", [(6, 16), (9, 128), (4097, 16)])
 @pytest.mark.parametrize("position_dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize("eps", [None, 1e-6])
@@ -44,6 +45,7 @@ def test_fp8_rope_output_padding_and_graph(rows, heads, position_dtype, eps):
         assert (storage[:, heads:].float() == 7).all()
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_fp8_rope_128_heads_int64_offsets():
     # Both Q and output cross 2**31 elements. Check the rows on either side
     # without allocating another full-sized reference tensor.
@@ -59,6 +61,7 @@ def test_fp8_rope_128_heads_int64_offsets():
     torch.testing.assert_close(output[-2:].float(), q[-2:].float(), rtol=0, atol=0)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
 def test_sparse_tail_short_sequence_and_padding(dtype):
     # A short sequence has one valid SWA entry but still reserves 128 columns.

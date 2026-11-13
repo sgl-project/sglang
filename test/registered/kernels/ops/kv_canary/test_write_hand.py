@@ -184,6 +184,7 @@ class TestSeedSlot:
     def setup_method(self) -> None:
         self.buf_pair = _make_default_buf_pair()
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     def test_seed_slot_idx_negative_uses_anchor(self) -> None:
         """``seed_slot_idx == -1`` → initial ``running_prev_hash`` is ``splitmix64(consts.CANARY_CHAIN_ANCHOR)``."""
         _run_write(
@@ -200,6 +201,7 @@ class TestSeedSlot:
         assert stored_position == 0
         assert stored_prev_hash == chain_anchor_signed()
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     def test_seed_slot_idx_loads_predecessor(self) -> None:
         """``seed_slot_idx >= 0`` → load 3 fields (token, position, prev_hash) from ``canary_buf[seed]`` and splitmix64_mix3-advance into prev_hash."""
         # Step: pre-stamp slot 7 with a known chain link.
@@ -229,6 +231,7 @@ class TestSeedSlot:
         )
         assert stored_prev_hash == to_signed_int64(expected_prev_hash)
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     def test_seed_slot_chain_link_continuous(self) -> None:
         """After write, ``slot[0].prev_hash`` is consistent with verify's chain reconstruction from seed."""
         # Step 1: write a chain from seed slot=7 → newly written slot=2. Then run verify with prev=7 and
@@ -276,6 +279,7 @@ class TestSeedSlot:
         torch.cuda.synchronize()
         assert int(verify_log.write_index[0].item()) == 0
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     def test_seed_slot_resume_5_step_hardcoded(self) -> None:
         cuda_buf = make_canary_buf(num_slots=50, slot_stride_bytes=32, device=_DEVICE)
         ref_buf = cuda_buf.clone()
@@ -328,6 +332,7 @@ class TestSeedSlot:
 
         assert int(cuda_log.write_index[0].item()) == 0
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     def test_seed_continues_existing_chain(self) -> None:
         """Pre-stamp seed slot; subsequent write should continue chain from splitmix64_mix3(seed.*)."""
         seed_slot = 3
@@ -371,6 +376,7 @@ class TestChain:
     def setup_method(self) -> None:
         self.buf_pair = _make_default_buf_pair()
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     def test_chain_link_byte_equal_5_step(self) -> None:
         """5-step chain, buf / ring / counters byte-equal against ref."""
         _run_write(
@@ -380,6 +386,7 @@ class TestChain:
             out_cache_loc=[0, 1, 2, 3, 4],
         )
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     def test_chain_link_byte_equal_5_step_hardcoded(self) -> None:
         """5-step write chain with hand-computed splitmix64 expected fields per slot."""
         tokens = [101, 202, 303, 404, 505]
@@ -416,6 +423,7 @@ class TestChain:
             assert stored_prev_hash == expected_prev_signed
             assert stored_real_kv_hash == 0
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     def test_chain_advances_with_real_kv_hash_all(self) -> None:
         """ALL mode + 2 sources + 5-step chain: stored prev_hash recoverable from seed."""
         cuda_buf = self.buf_pair[0]
@@ -456,6 +464,7 @@ class TestMockMode:
     def setup_method(self) -> None:
         self.buf_pair = _make_default_buf_pair()
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     def test_mock_mode_off_ignores_expected(self) -> None:
         """``enable_write_verify_inputs = OFF`` → expected tensors are ignored (we pass garbage to prove the kernel skips them)."""
         # Garbage expected tensors that, if the kernel mistakenly reads, would generate mismatches.
@@ -470,6 +479,7 @@ class TestMockMode:
 
         assert int(cuda_log.write_index[0].item()) == 0
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     def test_mock_mode_on_match_no_violation(self) -> None:
         """``enable_write_verify_inputs = ON`` and expected matches actual → no violation, chain advances."""
         input_ids = _int32_tensor([7, 8, 9])
@@ -486,6 +496,7 @@ class TestMockMode:
 
         assert int(cuda_log.write_index[0].item()) == 0
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     def test_mock_mode_on_token_mismatch_records_violation(self) -> None:
         """``enable_write_verify_inputs = ON`` token mismatch → violation recorded; chain advances on ACTUAL token."""
         cuda_log, _ = _run_write(
@@ -508,6 +519,7 @@ class TestMockMode:
         )
         assert stored_token == 42
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     def test_mock_mode_on_position_mismatch_records_violation(self) -> None:
         """``enable_write_verify_inputs = ON`` position mismatch → violation recorded; chain advances on ACTUAL position."""
         cuda_log, _ = _run_write(
@@ -529,6 +541,7 @@ class TestMockMode:
         )
         assert stored_position == 7
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     def test_mock_mode_chain_advances_on_actual_not_expected(self) -> None:
         """Expected differs from actual on every entry → downstream verify must NOT cascade chain errors."""
         cuda_buf = self.buf_pair[0]
@@ -571,6 +584,7 @@ class TestMockMode:
         torch.cuda.synchronize()
         assert int(verify_log.write_index[0].item()) == 0
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     @pytest.mark.parametrize("bit_to_trigger", ["MOCK_TOKEN", "MOCK_POSITION"])
     @pytest.mark.parametrize("injection_position", ["head", "mid", "last"])
     def test_mock_violation_bit_injection_position_matrix(
@@ -635,6 +649,7 @@ class TestSlotHandling:
     def setup_method(self) -> None:
         self.buf_pair = _make_default_buf_pair()
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     def test_negative_slot_skips_entry(self) -> None:
         """``out_cache_loc[i] < 0`` → that entry is skipped: no buf write, no violation, no
         canary slot mutation, and no write slot_run_counter increment.
@@ -654,6 +669,7 @@ class TestSlotHandling:
         assert stored_token == 42
         assert int(cuda_log.slot_run_counter.item()) == 1
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     def test_pre_translated_slot_writes_normally(self) -> None:
         """``out_cache_loc[i] >= 0`` → the kernel writes to exactly that slot, with no LUT applied. This
         confirms the kernel is SWA-agnostic: SWA endpoints feed the same shape of input here after their
@@ -673,6 +689,7 @@ class TestSlotHandling:
         )
         assert stored_token == 55
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     def test_padding_block_skipped(self) -> None:
         """``blockIdx.x >= write_num_valid_reqs[0]`` → block early-exits, no write to canary_buf."""
         # Allocate plan with req_capacity=4 but only declare 1 active req.
@@ -695,6 +712,7 @@ class TestSlotHandling:
             )
             assert stored_token_other == 0
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     def test_write_skip_when_out_cache_loc_is_minus_one(self) -> None:
         """out_cache_loc[i] = -1 → that entry's slot is untouched by write kernel."""
         cuda_buf = self.buf_pair[0]
@@ -715,6 +733,7 @@ class TestSlotHandling:
                 f"slot {slot} should not have been written"
             )
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     def test_shrink_active_reqs_does_not_write_stale_slots(self) -> None:
         """Run write with bs=3 plan after a bs=8 run on same buffer: stale slots from bs=8 stay intact."""
         cuda_buf = make_canary_buf(num_slots=32, slot_stride_bytes=32, device=_DEVICE)
@@ -758,6 +777,7 @@ class TestRealKvHash:
     def setup_method(self) -> None:
         self.buf_pair = _make_default_buf_pair()
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     def test_real_kv_mode_off_writes_zero(self) -> None:
         """``consts.RealKvHashMode.NONE`` → ``real_kv_hash`` field is written as 0 regardless of source presence."""
         sources = make_real_kv_sources(count=2, device=_DEVICE)
@@ -775,6 +795,7 @@ class TestRealKvHash:
         assert real_kv_0 == 0
         assert real_kv_1 == 0
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     @pytest.mark.parametrize(
         "mode",
         [
@@ -796,6 +817,7 @@ class TestRealKvHash:
             real_kv_hash_mode=mode,
         )
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     @pytest.mark.parametrize("page_size", [1, 4])
     def test_strided_real_kv_source_byte_equal(self, page_size: int) -> None:
         """A strided source (``stride(0) > shape[1]``) folds the same hash as its packed copy.
@@ -823,6 +845,7 @@ class TestRealKvHash:
             real_kv_hash_mode=consts.RealKvHashMode.ALL,
         )
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     @pytest.mark.parametrize("count", [1, 2, 3, 4])
     def test_real_kv_sources_fold_1_to_4(self, count: int) -> None:
         """Folding ``count`` sources sequentially → CUDA matches ref for every count in {1..4}."""
@@ -838,6 +861,7 @@ class TestRealKvHash:
             real_kv_hash_mode=consts.RealKvHashMode.ALL,
         )
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     def test_real_kv_source_above_4_raises(self) -> None:
         """``len(real_kv_sources) > 4`` → host wrapper raises ValueError before launching."""
         cuda_buf = make_canary_buf(device=_DEVICE)
@@ -877,6 +901,7 @@ class TestRealKvHash:
                 expected_input_positions=None,
             )
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     @pytest.mark.parametrize(
         "mode,fold_fn,expected_hash",
         [
@@ -958,6 +983,7 @@ class TestRealKvHash:
             f"stored_real_kv_hash={stored_real_kv_hash:#x} expected={to_signed_int64(expected_hash):#x}"
         )
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     def test_paged_real_kv_hash_consistent_across_slots(self) -> None:
         """page=16: writing two slots inside same page yields independent real_kv_hash per slot."""
         sources_cuda = make_real_kv_sources(
@@ -992,6 +1018,7 @@ class TestRealKvHash:
         assert slot7[3] == to_signed_int64(_hand_fold_all(pattern_slot7))
         assert slot3[3] != slot7[3]
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     def test_multi_source_real_kv_fold_order_matters(self) -> None:
         """Two sources folded in reverse order yields a different real_kv_hash (fold is ordered)."""
         sources_a = make_real_kv_sources(
@@ -1044,6 +1071,7 @@ class TestRunCounter:
     def setup_method(self) -> None:
         self.buf_pair = _make_default_buf_pair()
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     def test_kernel_run_counter_per_call(self) -> None:
         """``kernel_run_counter`` increments by 1 per call (even when ``write_num_valid_reqs == 0``)."""
         plan_pair = make_write_plan_pair(
@@ -1081,6 +1109,7 @@ class TestRunCounter:
         assert int(cuda_log.kernel_run_counter[0].item()) == 3
         assert_canary_state_equal(log_a=cuda_log, log_b=ref_log)
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     def test_slot_run_counter_sums_entries(self) -> None:
         """``slot_run_counter`` += sum(entry_count) across all active reqs in this call."""
         cuda_log, _ = _run_write(
@@ -1097,6 +1126,7 @@ class TestRunCounter:
 
 
 class TestMisc:
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     def test_empty_plan_no_op(self) -> None:
         """``write_num_valid_reqs = 0`` → no buf write, no slot_run_counter bump, only kernel_run_counter += 1."""
         cuda_log, _ = _run_write(
@@ -1113,6 +1143,7 @@ class TestMisc:
         assert int(cuda_log.slot_run_counter[0].item()) == 0
         assert int(cuda_log.kernel_run_counter[0].item()) == 1
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     def test_disabled_input_verify_does_not_deref_expected_inputs(self) -> None:
         """``enable_write_verify_inputs=False`` must short-circuit before any expected_input_* dereference;
         poison those tensors with 0x7F7F7F7F and assert nothing records a violation."""
@@ -1140,6 +1171,7 @@ class TestMisc:
         assert int(cuda_log.write_index[0].item()) == 0
         assert int(ref_log.write_index[0].item()) == 0
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     def test_disabled_assert_inputs_passes_none_to_cuda(self) -> None:
         """Disabled input assertions pass None instead of dummy tensors."""
         canary_buf = torch.zeros(
@@ -1188,6 +1220,7 @@ class TestMisc:
 
 
 class TestBoundarySweep:
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     @pytest.mark.parametrize(
         "token_val",
         [0, 1, 0xFFFFFFFF, -1, 0x80000000, 0x7FFFFFFF],
@@ -1196,6 +1229,7 @@ class TestBoundarySweep:
         """Sweep token boundary values; assert CUDA write vs ref buf + state byte-equal."""
         _run_write_single_slot_byte_equal(_WriteSingleSlotInput(token=token_val))
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     @pytest.mark.parametrize(
         "position_val",
         [0, 1, 127, 128, 129, 0x7FFFFFFF],
@@ -1209,6 +1243,7 @@ class TestPseudoMode:
     def setup_method(self) -> None:
         self.buf_pair = _make_default_buf_pair()
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     def test_pseudo_mode_on_catches_token_mismatch(self) -> None:
         """enable_write_verify_inputs=ON + intentional token mismatch → WRITE_TOKEN_MISMATCH bit recorded."""
         input_ids = _int32_tensor([10, 20, 30, 40, 50])
@@ -1232,6 +1267,7 @@ class TestPseudoMode:
             f"expected WRITE_TOKEN_MISMATCH bit, got {bits:#b}"
         )
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     def test_pseudo_mode_off_skips_token_check(self) -> None:
         """enable_write_verify_inputs=False makes the caller pass no expected-input tensors."""
         cuda_log, _ = _run_write(

@@ -222,6 +222,7 @@ CASES = [
 ]
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize(
     ("launch", "max_lora_rank", "dtype", "top_k_num", "max_loras"), CASES
 )

@@ -49,6 +49,7 @@ def _assert_same_bits(actual: torch.Tensor, expected: torch.Tensor):
     assert torch.equal(actual[~nan].view(torch.int16), expected[~nan].view(torch.int16))
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("shape", SHAPES)
 def test_matches_reference(shape):
     packed, scale = _make_inputs(shape)
@@ -57,6 +58,7 @@ def test_matches_reference(shape):
     _assert_same_bits(out, _reference(packed, scale))
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_every_code_and_edge_scales():
     # Each row repeats one scale over all 256 byte values (every e2m1 pair).
     scales = [0, 1, 2, 126, 127, 128, 200, 253, 254, 255]

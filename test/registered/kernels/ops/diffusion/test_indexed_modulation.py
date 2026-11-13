@@ -40,6 +40,7 @@ def _inputs(rows: int, hidden: int, seed: int):
     return x, other, shift, scale, indices
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("hidden", HIDDEN)
 @pytest.mark.parametrize("rows", ROWS)
 def test_indexed_scale_shift_matches_torch(rows: int, hidden: int) -> None:
@@ -52,6 +53,7 @@ def test_indexed_scale_shift_matches_torch(rows: int, hidden: int) -> None:
     assert torch.equal(got, ref)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("hidden", HIDDEN)
 @pytest.mark.parametrize("rows", ROWS)
 def test_indexed_gate_matches_torch(rows: int, hidden: int) -> None:
@@ -68,6 +70,7 @@ def _fp32_table(rows: int, hidden: int, seed: int) -> torch.Tensor:
     return table[:, 2 * hidden : 3 * hidden]
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("hidden", HIDDEN)
 @pytest.mark.parametrize("rows", ROWS)
 def test_indexed_scale_shift_fp32_matches_torch(rows: int, hidden: int) -> None:
@@ -81,6 +84,7 @@ def test_indexed_scale_shift_fp32_matches_torch(rows: int, hidden: int) -> None:
     assert torch.equal(indexed_scale_shift_fp32_(x.clone(), shift, scale, indices), ref)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("hidden", HIDDEN)
 @pytest.mark.parametrize("rows", ROWS)
 def test_indexed_gate_fp32_matches_torch(rows: int, hidden: int) -> None:

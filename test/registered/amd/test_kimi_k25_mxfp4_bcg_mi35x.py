@@ -28,6 +28,7 @@ from types import SimpleNamespace
 from typing import Dict, List
 
 import requests
+import torch
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci
@@ -112,6 +113,7 @@ def get_capture_configs() -> List[CaptureConfig]:
     ]
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestKimiK25MXFP4BcgMI35x(CustomTestCase):
     """Validate aiter BCG prefill capture accuracy on MI35x."""
 

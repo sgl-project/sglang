@@ -177,6 +177,7 @@ def _check(scores, bias, **kwargs):
     _assert_matches(w, i, _reference(scores, bias, **kwargs), k_routed)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("config", list(CONFIGS))
 @pytest.mark.parametrize("num_tokens", [1, 3, 64, 600, 5000])
 def test_matches_reference(config: str, num_tokens: int) -> None:
@@ -194,6 +195,7 @@ def test_matches_reference(config: str, num_tokens: int) -> None:
     _check(scores, bias, **kwargs)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize(
     "config", ["deepseek_v3", "kimi_k2", "qwen3_moe", "deepseek_v4"]
 )
@@ -214,6 +216,7 @@ def test_options_match_reference(config: str, overrides) -> None:
     _check(scores, bias, **kwargs)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("scale,shift", [(1, 0), (8, 0), (30, 0), (1, -12)])
 @pytest.mark.parametrize("bias_dtype", [torch.float32, torch.bfloat16])
 def test_sqrtsoftplus_logit_ranges(scale: float, shift: float, bias_dtype) -> None:
@@ -224,6 +227,7 @@ def test_sqrtsoftplus_logit_ranges(scale: float, shift: float, bias_dtype) -> No
     _check(scores, bias, topk=6, scoring_func="sqrtsoftplus", renormalize=True)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("shift", [-50, -88, -104, -120, -170])
 @pytest.mark.parametrize("zero_bias", [True, False])
 def test_sqrtsoftplus_negative_tail(shift: float, zero_bias: bool) -> None:
@@ -240,6 +244,7 @@ def test_sqrtsoftplus_negative_tail(shift: float, zero_bias: bool) -> None:
     torch.testing.assert_close(w.double(), rw, rtol=1e-5, atol=1e-6)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_sqrtsoftplus_uniform_tail() -> None:
     scores = torch.full((4, 384), -88.0, device=DEVICE)
     bias = torch.zeros(384, device=DEVICE)
@@ -250,6 +255,7 @@ def test_sqrtsoftplus_uniform_tail() -> None:
     torch.testing.assert_close(w, torch.full_like(w, 1 / 6))
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("renormalize_epsilon", [0.0, 1e-20])
 def test_sqrtsoftplus_underflow(renormalize_epsilon: float) -> None:
     # exp(x / 2) underflows: the activation is 0, and an all-zero row stays zero.
@@ -279,6 +285,7 @@ def _softmax_bias(scores: torch.Tensor, dtype=torch.float32):
     return (torch.randn(scores.shape[1], device=DEVICE, generator=g) * 2).to(dtype)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("config", ["qwen3_moe", "qwen3_5_moe", "gpt_oss"])
 @pytest.mark.parametrize("bias_dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize(
@@ -310,6 +317,7 @@ def test_softmax_bias(config: str, bias_dtype, overrides) -> None:
     torch.testing.assert_close(tw, w, rtol=1e-5, atol=1e-7)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_softmax_bias_dispatch() -> None:
     scores, _ = _inputs("qwen3_moe", 64, seed=4)
     bias = _softmax_bias(scores)
@@ -319,6 +327,7 @@ def test_softmax_bias_dispatch() -> None:
     assert torch.equal(i, ri) and torch.equal(w, rw)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("config", ["kimi_k2", "qwen3_moe"])
 def test_strided_bias_falls_back(config: str) -> None:
     # A non-contiguous bias view is not loaded by the kernel: Triton serves it.
@@ -334,6 +343,7 @@ def test_strided_bias_falls_back(config: str) -> None:
     _assert_matches(w, i, _reference(scores, bias, **kwargs), kwargs["topk"])
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_softmax_bias_grouped_falls_back() -> None:
     # Grouped softmax stays on the Triton router, bias included.
     scores, _ = _inputs("qwen3_moe", 64, seed=6)
@@ -344,6 +354,7 @@ def test_softmax_bias_grouped_falls_back() -> None:
     _assert_matches(w, i, _reference(scores, bias, **kwargs), 8)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_softmax_token_bias() -> None:
     scores, _ = _inputs("qwen3_moe", 600, seed=8)
     bias = _softmax_bias(scores)
@@ -359,6 +370,7 @@ def test_softmax_token_bias() -> None:
     _assert_matches(w, i, _reference(scores, row_bias, **kwargs), 8)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize(
     "config", ["kimi_k2", "glm4_5", "qwen3_moe", "qwen3_5_moe", "deepseek_v4"]
 )
@@ -373,6 +385,7 @@ def test_exact_ties_lowest_id(config: str) -> None:
     assert torch.equal(i.long(), ri)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_grouped_exact_ties_lowest_id() -> None:
     # All-equal scores: groups 0..3 kept, experts 0..7 chosen.
     scores = torch.zeros(4, 256, device=DEVICE)
@@ -383,6 +396,7 @@ def test_grouped_exact_ties_lowest_id() -> None:
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("config", ["kimi_k2", "qwen3_moe", "deepseek_v4"])
 def test_padding_and_packed(config: str) -> None:
     scores, bias = _inputs(config, 48, seed=5)
@@ -400,6 +414,7 @@ def test_padding_and_packed(config: str) -> None:
     assert torch.equal(packed, (i << 16) | bits)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("bias_dtype", [torch.bfloat16, torch.float16])
 def test_low_precision_bias(bias_dtype: torch.dtype) -> None:
     scores, bias = _inputs("kimi_k2", 64, seed=9)
@@ -410,6 +425,7 @@ def test_low_precision_bias(bias_dtype: torch.dtype) -> None:
     assert torch.equal(i, i32) and torch.equal(w, w32)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("id_dtype", [torch.int32, torch.int64])
 def test_token_bias(id_dtype) -> None:
     # DeepSeek-V4.1 VL: image-token rows rank with the vision correction bias.
@@ -429,6 +445,7 @@ def test_token_bias(id_dtype) -> None:
     assert torch.equal(fi, i) and torch.equal(fw, w)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize(
     "config", ["deepseek_v3", "kimi_k2", "qwen3_moe", "deepseek_v4"]
 )

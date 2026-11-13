@@ -174,6 +174,7 @@ class TestDSparkUnifiedKVKernelsAMD(CustomTestCase):
             )
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestDeepseekV4DSparkUnifiedKVGSM8K(CustomTestCase):
     @classmethod
     def setUpClass(cls):

@@ -72,6 +72,7 @@ def attention_backend_kwargs():
     }
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestLoRAQwen3_8BLogprobDiff(CustomTestCase):
     def test_lora_qwen3_8b_logprob_accuracy(self):
         adapter_path = snapshot_download(

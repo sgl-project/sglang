@@ -3,7 +3,12 @@ import unittest
 from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 import torch
+
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
 
 import sglang.srt.model_executor.model_runner as model_runner_module
 import sglang.srt.speculative.spec_utils as spec_utils

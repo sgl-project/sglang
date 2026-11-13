@@ -92,6 +92,7 @@ DTYPE = torch.bfloat16
 NUM_TOKENS_LIST = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024]
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize(
     "num_tokens,num_heads",
     [(0, 12), (1, 12), (17, 12), (257, 24), (19, 8), (65536, 12)],
@@ -126,6 +127,7 @@ def test_model_mha_k_concat(num_tokens, num_heads, dtype):
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_model_mha_k_concat_graph():
     from sglang.srt.models.deepseek_common.attention_forward_methods import forward_mha
 
@@ -154,6 +156,7 @@ def test_model_mha_k_concat_graph():
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_model_mha_k_concat_fa3_fp8():
     from sglang.srt.models.deepseek_common.attention_forward_methods import forward_mha
 
@@ -186,6 +189,7 @@ def test_model_mha_k_concat_fa3_fp8():
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("num_tokens", NUM_TOKENS_LIST)
 def test_concat_mla_k_jit_vs_torch(num_tokens: int) -> None:
     """Test JIT kernel against PyTorch reference."""
@@ -207,6 +211,7 @@ def test_concat_mla_k_jit_vs_torch(num_tokens: int) -> None:
     triton.testing.assert_close(k_jit, k_torch, atol=0, rtol=0)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("num_tokens", NUM_TOKENS_LIST)
 def test_concat_mla_k_jit_vs_aot(num_tokens: int) -> None:
     """Test JIT kernel against AOT kernel for bitwise equivalence."""
@@ -232,6 +237,7 @@ DIM_0_LIST = [1, 2, 4, 8, 16, 32]
 DIM_1_LIST = [1, 2, 4, 8, 16, 128]
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize(
     "dim_0,dim_1",
     list(itertools.product(DIM_0_LIST, DIM_1_LIST)),
@@ -249,6 +255,7 @@ def test_concat_mla_absorb_q_jit_vs_torch(dim_0: int, dim_1: int) -> None:
     triton.testing.assert_close(out_jit, out_torch, atol=0, rtol=0)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize(
     "dim_0,dim_1",
     list(itertools.product(DIM_0_LIST, DIM_1_LIST)),
@@ -266,6 +273,7 @@ def test_concat_mla_absorb_q_jit_vs_aot(dim_0: int, dim_1: int) -> None:
     triton.testing.assert_close(out_jit, out_aot, atol=0, rtol=0)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("dim_0", [1, 7, 64])
 def test_concat_mla_absorb_q_jit_into_padded_heads(dim_0: int) -> None:
     """`out` as the real heads of a zero-padded head buffer (a strided view):

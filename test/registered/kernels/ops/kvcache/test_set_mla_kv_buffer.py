@@ -46,6 +46,7 @@ def _ref(kv_buffer, loc, cache_k_nope, cache_k_rope):
     kv_view[loc.long(), nope_dim : nope_dim + src_rope.shape[-1]] = src_rope
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("shape", SHAPES)
 @pytest.mark.parametrize("batch_size", BATCH_SIZES)
@@ -67,6 +68,7 @@ def test_set_mla_kv_buffer_correctness(dtype, shape, batch_size):
     assert torch.equal(kv_buffer, kv_ref)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("loc_dtype", [torch.int32, torch.int64])
 @CUDA_TMA_ONLY
 def test_set_mla_kv_buffer_loc_dtypes(loc_dtype):
@@ -89,6 +91,7 @@ def test_set_mla_kv_buffer_loc_dtypes(loc_dtype):
     assert torch.equal(kv_buffer, kv_ref)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @CUDA_TMA_ONLY
 def test_set_mla_kv_buffer_uint8_byte_layout():
     """FP8 DSA byte-layout: cache_k_nope is uint8 with [fp8(512) | scales(16)] = 528,
@@ -116,6 +119,7 @@ def test_set_mla_kv_buffer_uint8_byte_layout():
     assert torch.equal(kv_buffer, kv_ref)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @CUDA_TMA_ONLY
 def test_set_mla_kv_buffer_empty_loc():
     nope_dim, rope_dim = 512, 64
@@ -133,6 +137,7 @@ def test_set_mla_kv_buffer_empty_loc():
     assert torch.equal(kv_buffer, kv_before)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("loc_dtype", [torch.int32, torch.int64])
 @CUDA_TMA_ONLY
 def test_set_mla_kv_buffer_reserved_skip_index(loc_dtype):
@@ -165,6 +170,7 @@ def test_set_mla_kv_buffer_reserved_skip_index(loc_dtype):
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @CUDA_TMA_ONLY
 def test_set_mla_kv_buffer_zero_index_can_be_written_when_skip_disabled():
     nope_dim, rope_dim = 512, 64
@@ -192,6 +198,7 @@ def test_set_mla_kv_buffer_zero_index_can_be_written_when_skip_disabled():
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("loc_dtype", [torch.int32, torch.int64])
 def test_set_mla_kv_buffer_triton_reserved_skip_index(loc_dtype):
     dtype = torch.bfloat16
@@ -224,6 +231,7 @@ def test_set_mla_kv_buffer_triton_reserved_skip_index(loc_dtype):
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 def test_set_mla_kv_buffer_triton_zero_index_can_be_written_when_skip_disabled():
     dtype = torch.bfloat16
     cache_k_nope = torch.randn((1, 1, TRITON_NOPE_DIM), dtype=dtype, device=DEVICE)
@@ -251,6 +259,7 @@ def test_set_mla_kv_buffer_triton_zero_index_can_be_written_when_skip_disabled()
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 def test_set_mla_kv_buffer_triton_fp8_quant_reserved_skip_index():
     fp8_dtype = torch.float8_e4m3fnuz if torch.version.hip else torch.float8_e4m3fn
     cache_k_nope = torch.randn(
@@ -286,6 +295,7 @@ def test_set_mla_kv_buffer_triton_fp8_quant_reserved_skip_index():
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("dcp_rank", range(4))
 def test_set_mla_kv_buffer_triton_fp8_quant_dcp_owner_rows(dcp_rank):
     dcp_world_size = 4
@@ -330,6 +340,7 @@ def test_set_mla_kv_buffer_triton_fp8_quant_dcp_owner_rows(dcp_rank):
     torch.testing.assert_close(kv_buffer, expected, rtol=0.0, atol=0.0)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 def test_set_mla_kv_scale_buffer_triton_reserved_skip_index():
     cache_k_nope = torch.randn((4, 1, 16), dtype=torch.float32, device=DEVICE)
     cache_k_rope = torch.randn((4, 1, 4), dtype=torch.float32, device=DEVICE)
@@ -355,6 +366,7 @@ def test_set_mla_kv_scale_buffer_triton_reserved_skip_index():
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("rope_dim", [TRITON_ROPE_DIM, 0])
 def test_set_mla_kv_buffer_naive_matches_triton(rope_dim):
     """The torch-native scatter backs supports_triton=False platforms.
@@ -389,6 +401,7 @@ def test_set_mla_kv_buffer_naive_matches_triton(rope_dim):
     torch.testing.assert_close(from_naive, reference, rtol=0.0, atol=0.0)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @CUDA_TMA_ONLY
 def test_can_use_set_mla_kv_buffer():
     assert can_use_set_mla_kv_buffer(1024, 128)  # bf16 (512,64)

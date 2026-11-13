@@ -41,6 +41,7 @@ def _build_flat(seqs: list[list[int]]) -> torch.Tensor:
 
 
 class TestScatterReqTokenIds(CustomTestCase):
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_scatter_byte_equal_basic(self) -> None:
         """Triton output matches the PyTorch reference for a small mixed batch."""
         seqs = [[10, 20, 30], [40, 50], [60, 70, 80, 90]]
@@ -73,6 +74,7 @@ class TestScatterReqTokenIds(CustomTestCase):
         self.assertEqual(triton_pool[1, :2].tolist(), [40, 50])
         self.assertEqual(triton_pool[5, :4].tolist(), [60, 70, 80, 90])
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_scatter_empty_batch_no_op(self) -> None:
         """Empty input (num_tokens == 0) returns without touching the pool."""
         flat = torch.empty(0, dtype=torch.int64, device=_DEVICE)
@@ -90,6 +92,7 @@ class TestScatterReqTokenIds(CustomTestCase):
         torch.cuda.synchronize()
         self.assertTrue(torch.equal(pool, pool_before))
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_scatter_single_req(self) -> None:
         """One req with a full row of tokens writes byte-equal to the reference."""
         seqs = [list(range(10))]
@@ -117,6 +120,7 @@ class TestScatterReqTokenIds(CustomTestCase):
         torch.cuda.synchronize()
         self.assertTrue(torch.equal(triton_pool, ref_pool))
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_scatter_truncates_at_max_context_len(self) -> None:
         """Tokens past the pool's max_context_len are silently dropped (no row spill)."""
         # Two reqs; first req longer than max_context_len. Second req must remain
@@ -144,6 +148,7 @@ class TestScatterReqTokenIds(CustomTestCase):
         )
         self.assertEqual(pool[2, :3].tolist(), [777, 888, 999])
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_scatter_mixed_empty_and_nonempty_reqs(self) -> None:
         """Middle req has length 0 between two non-empty reqs: pool rows are byte-equal and untouched rows stay zero."""
         seqs = [[1, 2], [], [3, 4, 5]]
@@ -178,6 +183,7 @@ class TestScatterReqTokenIds(CustomTestCase):
         self.assertEqual(triton_pool[2, :2].tolist(), [1, 2])
         self.assertEqual(triton_pool[6, :3].tolist(), [3, 4, 5])
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_scatter_random_byte_equal(self) -> None:
         """Randomized fuzz across bs, seq lengths, and req pool indices."""
         rng = random.Random(0)
@@ -218,6 +224,7 @@ class TestScatterReqTokenIds(CustomTestCase):
 class TestScatterInputValidation(CustomTestCase):
     """Cover the strict input checks in launch_scatter_req_token_ids_kernel."""
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_raises_on_2d_flat_in(self) -> None:
         """A 2-D flat_in tensor triggers a ValueError before any kernel launch."""
         flat = torch.zeros((2, 2), dtype=torch.int64, device=_DEVICE)
@@ -232,6 +239,7 @@ class TestScatterInputValidation(CustomTestCase):
                 pool_out=pool,
             )
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_raises_on_wrong_dtype_pool(self) -> None:
         """A pool_out with non-int32 dtype triggers a TypeError."""
         flat = torch.tensor([10, 20], dtype=torch.int64, device=_DEVICE)
@@ -246,6 +254,7 @@ class TestScatterInputValidation(CustomTestCase):
                 pool_out=pool,
             )
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_raises_on_offsets_len_mismatch(self) -> None:
         """offsets.shape[0] must equal bs + 1; mismatch triggers a ValueError."""
         flat = torch.tensor([10, 20], dtype=torch.int64, device=_DEVICE)
@@ -261,6 +270,7 @@ class TestScatterInputValidation(CustomTestCase):
                 pool_out=pool,
             )
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_raises_on_bs_plus_one_exceeds_batch_block(self) -> None:
         """bs+1 must fit in _SCATTER_BATCH_BLOCK; exceeding it triggers a ValueError."""
         bs = _SCATTER_BATCH_BLOCK

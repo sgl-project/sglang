@@ -21,6 +21,7 @@ SCALE_BYTES = 4
 PAGE_SIZE = 64
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("num_tokens", [1, 16, 96])
 def test_fp4_index_cache_store_layout(num_tokens: int) -> None:
     torch.manual_seed(num_tokens)

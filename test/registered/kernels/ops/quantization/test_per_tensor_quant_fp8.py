@@ -59,6 +59,7 @@ PER_TENSOR_QUANT_CASES = get_ci_test_range(
 )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("num_tokens,hidden_dim", PER_TENSOR_QUANT_CASES)
 def test_jit_per_tensor_quant_compare_implementations(
     num_tokens: int,
@@ -75,6 +76,7 @@ def test_jit_per_tensor_quant_compare_implementations(
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("shape", [(4, 8, 64), (2, 16, 128), (19260817, 1, 1)])
 def test_jit_per_tensor_quant_supports_3d(shape):
     device = torch.device("cuda")

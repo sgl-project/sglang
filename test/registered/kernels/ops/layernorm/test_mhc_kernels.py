@@ -419,6 +419,7 @@ def test_hopper_mhc_stats_stream_graph(num_tokens):
             torch.testing.assert_close(result, reference, rtol=0, atol=0)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_mhc_refresh_without_deepgemm_prenorm():
     from unittest.mock import patch
 
@@ -568,6 +569,7 @@ def _assert_post_uses_eps_outside_sqrt(post, inputs):
     assert (post.squeeze(-1) - dsv4_post).abs().max() > 1e-2
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("num_tokens", [7, 300, 3000])
 def test_mhc_pre_eps_outside_sqrt(num_tokens, single_process):
     inputs = _eps_outside_sqrt_inputs(num_tokens)
@@ -578,6 +580,7 @@ def test_mhc_pre_eps_outside_sqrt(num_tokens, single_process):
     torch.testing.assert_close(layer_input.float(), ref_input, rtol=2e-2, atol=1e-4)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("num_tokens", [7, 300])
 def test_mhc_pre_eps_outside_sqrt_fused_norm(num_tokens, single_process):
     inputs = _eps_outside_sqrt_inputs(num_tokens)
@@ -604,6 +607,7 @@ def _hc_head_reference(x, fn, scale, base, norm_eps, hc_eps, eps_outside_sqrt):
     return torch.sum((pre + hc_eps).unsqueeze(-1) * x.float(), dim=1).to(x.dtype)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("eps_outside_sqrt", [False, True])
 def test_fused_hc_head(eps_outside_sqrt):
     from sglang.kernels.ops.layernorm.mhc_head import fused_hc_head

@@ -19,6 +19,13 @@ import os
 import unittest
 from typing import Dict
 
+import pytest
+import torch
+
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
+
 # The PD disaggregation backend must be the Ascend engine (not the mooncake
 # default in environ.py) to run the NPU host_pool retraction backup path.
 # ``setdefault`` keeps any value set externally (e.g. by the CI runner) in force.

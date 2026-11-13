@@ -51,6 +51,7 @@ _TOLERANCES = {
 }
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("num_tokens", [1, 7, 128, 8192])
 def test_hc_combine_correctness(dtype, num_tokens):
@@ -79,6 +80,7 @@ def test_hc_combine_correctness(dtype, num_tokens):
     torch.testing.assert_close(out, expected, **_TOLERANCES[dtype])
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_hc_combine_out_param(dtype):
     block_output, residual, normed_residual, inject_weight = _make_inputs(64, dtype)
@@ -107,6 +109,7 @@ def test_hc_combine_out_param(dtype):
     torch.testing.assert_close(result, expected, **_TOLERANCES[dtype])
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_hc_combine_3d_input():
     dtype = torch.bfloat16
     block_output, residual, normed_residual, inject_weight = _make_inputs(32, dtype)
@@ -136,6 +139,7 @@ def test_hc_combine_3d_input():
     torch.testing.assert_close(out, expected, **_TOLERANCES[dtype])
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_hc_combine_bad_hidden_size():
     dtype = torch.bfloat16
     block_output, residual, normed_residual, inject_weight = _make_inputs(

@@ -5,6 +5,10 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
+
 from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.dflash_utils import build_speculative_verify_target_probs
 from sglang.srt.speculative.eagle_utils import _apply_joint_top_k_top_p
@@ -252,6 +256,7 @@ def joint_top_k_top_p_case(request):
     return original_probs, sampling_info, expected_probs
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 def test_eagle_preserves_original_top_p_nucleus(joint_top_k_top_p_case):
     """Production renormalizers must retain token 3: its original preceding
     mass is 0.80 < top_p, while its top-k-normalized mass exceeds top_p."""

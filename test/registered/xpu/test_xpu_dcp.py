@@ -263,17 +263,21 @@ class TestXPUDCPStartupChecks(CustomTestCase):
             self._build(**kwargs)
         self.assertIn(needle, str(cm.exception))
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_supported_config_is_admitted(self):
         self.assertEqual(self._build().dcp_size, 2)
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_triton_backend_rejected(self):
         for backend in ("attention_backend", "decode_attention_backend"):
             with self.subTest(backend=backend):
                 self._assert_rejected("intel_xpu", **{backend: "triton"})
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_mla_model_rejected(self):
         self._assert_rejected("MLA models", model_path=DEFAULT_MLA_MODEL_NAME_FOR_TEST)
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_unshared_kv_heads_rejected(self):
         self._assert_rejected(
             "DCP group's KV heads", model_path=DEFAULT_SMALL_MODEL_NAME_FOR_TEST

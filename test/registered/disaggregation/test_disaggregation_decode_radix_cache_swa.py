@@ -7,6 +7,13 @@ both multi-turn cache hits and two-pass GSM8K accuracy.
 
 import unittest
 
+import pytest
+import torch
+
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
+
 from test_disaggregation_decode_radix_cache import (
     DisaggregationDecodeRadixCacheTestMixin,
 )

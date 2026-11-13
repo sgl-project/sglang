@@ -11,6 +11,7 @@ register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-s
 register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("shape", [(1, 128), (2, 7, 512), (1, 4096, 13824)])
 def test_bias_gelu_tanh_is_bit_exact(dtype: torch.dtype, shape: tuple[int, ...]):
@@ -28,6 +29,7 @@ def test_bias_gelu_tanh_is_bit_exact(dtype: torch.dtype, shape: tuple[int, ...])
     assert torch.equal(actual, expected)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_bias_gelu_tanh_rejects_unsupported_width():
     input = torch.randn(2, 127, device="cuda", dtype=torch.bfloat16)
     bias = torch.randn(127, device="cuda", dtype=torch.bfloat16)
@@ -36,6 +38,7 @@ def test_bias_gelu_tanh_rejects_unsupported_width():
         bias_gelu_tanh(input, bias)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_bias_gelu_tanh_rejects_unsupported_dtype():
     input = torch.ones(2, 128, device="cuda", dtype=torch.int32)
     bias = torch.ones(128, device="cuda", dtype=torch.int32)

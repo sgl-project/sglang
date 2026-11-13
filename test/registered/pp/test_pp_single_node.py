@@ -13,7 +13,15 @@ import time
 import unittest
 from types import SimpleNamespace
 
+import pytest
+import torch
+
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
+
 import requests
+import torch
 
 from sglang.benchmark.one_batch_server import BenchArgs as OneBatchBenchArgs
 from sglang.srt.server_args import ServerArgs
@@ -35,6 +43,7 @@ register_cuda_ci(est_time=312, stage="base-c", runner_config="4-gpu-h100")
 register_amd_ci(est_time=500, suite="stage-c-test-4-gpu-amd")
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestPPAccuracy(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -102,6 +111,7 @@ class TestPPAccuracy(unittest.TestCase):
 
 
 @unittest.skipIf(is_in_amd_ci(), "MLA model with DP attention not yet supported on AMD")
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestDPAttentionDP2PP2(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -140,6 +150,7 @@ class TestDPAttentionDP2PP2(CustomTestCase):
         self.assertGreater(metrics["score"], 0.8)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestPPMixedChunk(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -186,6 +197,7 @@ class TestPPMixedChunk(CustomTestCase):
         time.sleep(4)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestFixedBugs(unittest.TestCase):
     def test_chunked_prefill_with_small_bs(self):
         model = DEFAULT_MODEL_NAME_FOR_TEST

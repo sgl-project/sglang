@@ -34,6 +34,7 @@ register_cuda_ci(est_time=65, stage="nightly", runner_config="2-gpu-large")
 LOGPROB_EPS = 7e-04
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestMoELoRATP2Logprobs(CustomTestCase):
     def test_moe_lora_tp2_matches_vllm_reference(self):
         tp2 = run_moe_lora_tp_generation(tp_size=2, prompts=MOE_LORA_TEST_PROMPTS)

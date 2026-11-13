@@ -59,6 +59,7 @@ def _reference_values(x: torch.Tensor, scale_u8: torch.Tensor) -> torch.Tensor:
     return q.clamp(-448.0, 448.0).to(torch.float8_e4m3fn).view(m, k)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("dtype", DTYPES)
 @pytest.mark.parametrize("shape", SHAPES)
 def test_matches_reference(dtype, shape):
@@ -78,6 +79,7 @@ def test_matches_reference(dtype, shape):
     assert torch.equal(q.view(torch.uint8), expected_q.view(torch.uint8))
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("dtype", DTYPES)
 def test_edge_blocks(dtype):
     x = torch.randn((4, 128), device="cuda").to(dtype)
@@ -94,6 +96,7 @@ def test_edge_blocks(dtype):
     assert ((x.float().abs() / d)[nonzero] <= 448.0).all()
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_tiny_fp32_values():
     # Block amax below 448 * 2^-126 makes the dequant scale an fp32 subnormal.
     x = (torch.randn((16, 64), device="cuda") * 1e-38).float()
@@ -105,6 +108,7 @@ def test_tiny_fp32_values():
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_bitwise_matches_triton_kernels():
     mxfp = pytest.importorskip("triton_kernels.numerics_details.mxfp")
     for dtype in DTYPES:
@@ -119,6 +123,7 @@ def test_bitwise_matches_triton_kernels():
             assert torch.equal(q.view(torch.uint8), ref_q.view(torch.uint8))
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_rejects_bad_hidden():
     x = torch.randn((4, 48), device="cuda", dtype=torch.bfloat16)
     with pytest.raises(Exception, match="multiple of 32"):

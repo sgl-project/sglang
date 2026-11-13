@@ -1,6 +1,13 @@
 import unittest
 from types import SimpleNamespace
 
+import pytest
+import torch
+
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
+
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin
@@ -20,6 +27,7 @@ register_cuda_ci(est_time=276, stage="weekly", runner_config="2-gpu-large")
 KIMI_LINEAR_MODEL = "moonshotai/Kimi-Linear-48B-A3B-Instruct"
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestKimiLinear(CustomTestCase):
     @classmethod
     def setUpClass(cls):

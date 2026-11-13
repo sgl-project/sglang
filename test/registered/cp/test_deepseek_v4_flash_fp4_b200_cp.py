@@ -10,6 +10,13 @@ Registry: extra-b-test-4-gpu-b200 (label-gated extra CI, 4x B200)
 
 import unittest
 
+import pytest
+import torch
+
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
+
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.basic_decode_correctness_kit import BasicDecodeCorrectnessMixin
@@ -33,6 +40,7 @@ _MEGAMOE_ENV = {
 }
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestDSV4FlashFP4B200Balanced_CP_Megamoe(
     BasicDecodeCorrectnessMixin,
     GSM8KMixin,

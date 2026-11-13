@@ -49,6 +49,7 @@ DECODE_ATTENTION_BACKEND = "flashinfer"
 KL_THRESHOLD = 1.5e-2
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestLoRAKimiK25LogprobDiff(CustomTestCase):
     def test_lora_kimi_k25_logprob_accuracy(self):
         adapter_path = snapshot_download(

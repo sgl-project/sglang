@@ -79,6 +79,7 @@ def _run_and_check(num_experts, m, k, masked, expected_rows, column_major_scales
 
 # 7168: fills every tile of scale groups (the DeepSeek-V3 hidden size).
 # 3584 / 1152: only 128-aligned, so the last tile is partially masked.
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("k", [7168, 3584, 1152])
 # None: shape-independent grid; 4 and 64: both ends of the m-grid heuristic.
 @pytest.mark.parametrize("expected_rows", [None, 4, 64])
@@ -96,6 +97,7 @@ def test_masked_rows_and_group_tail(k, expected_rows, column_major_scales):
 
 # Row estimates chosen so the expert-count cap binds: 40 experts cap at 16
 # programs, 128 at 8; uncapped these would be 32 and 16.
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("num_experts,expected_rows", [(40, 32), (128, 16)])
 def test_many_experts(num_experts, expected_rows):
     m = 48
@@ -114,6 +116,7 @@ def test_many_experts(num_experts, expected_rows):
 # The wrapper only launches the running vendor's tile, so drive the kernel
 # directly across every width either vendor can pick, plus the degenerate
 # single-group tile.
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("g_block", [1, 8, 16, 32])
 @pytest.mark.parametrize("k", [7168, 3584])
 @pytest.mark.parametrize("m_grid", [1, 4, 32])
@@ -153,6 +156,7 @@ def test_every_launch_geometry_agrees(g_block, k, m_grid, row_cap):
 
 # Experts with no live rows must be stepped over by the prefix-sum mapping,
 # the case most likely to be off by one.
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize(
     "masked", [[0, 0, 0, 0], [0, 5, 0, 7], [9, 0, 0, 0], [0, 0, 0, 9]]
 )

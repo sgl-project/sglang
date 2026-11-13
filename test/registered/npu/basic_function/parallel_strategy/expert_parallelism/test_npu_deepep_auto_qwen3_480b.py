@@ -1,6 +1,13 @@
 import os
 import unittest
 
+import pytest
+import torch
+
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
+
 from sglang.test.ascend.gsm8k_ascend_mixin import GSM8KAscendMixin
 from sglang.test.ascend.test_ascend_utils import (
     QWEN3_CODER_480B_A35B_INSTRUCT_W8A8_QUAROT_WEIGHTS_PATH,
@@ -12,6 +19,7 @@ from sglang.test.test_utils import CustomTestCase
 register_npu_ci(est_time=200, suite="full-16-npu-a3", nightly=True)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestDeepEpQwen(GSM8KAscendMixin, TestMMLU, CustomTestCase):
     """
     Testcase:Test the Qwen3-Coder-480B-A35B-Instruct-w8a8-QuaRot model with DeepEP's auto mode enabled,

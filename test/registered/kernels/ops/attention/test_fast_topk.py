@@ -30,6 +30,7 @@ def _check_topk_values(score, lengths, indices, topk, row_starts):
         ), f"row {b}: top-{topk} value multiset mismatch"
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("topk", [512, 2048])
 @pytest.mark.parametrize(
     "batch,length",
@@ -49,6 +50,7 @@ def test_fast_topk_long_rows(topk, batch, length):
     _check_topk_values(score, lengths, indices, topk, None)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("topk", [512, 2048])
 def test_fast_topk_short_and_mixed_rows(topk):
     torch.manual_seed(0)
@@ -63,6 +65,7 @@ def test_fast_topk_short_and_mixed_rows(topk):
     _check_topk_values(score, lengths, indices, topk, None)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("topk", [512, 2048])
 def test_fast_topk_ragged_with_row_starts(topk):
     torch.manual_seed(0)
@@ -78,6 +81,7 @@ def test_fast_topk_ragged_with_row_starts(topk):
     _check_topk_values(score, lengths, indices, topk, row_starts)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("topk", [512, 2048])
 def test_fast_topk_row_stride(topk):
     torch.manual_seed(0)
@@ -90,6 +94,7 @@ def test_fast_topk_row_stride(topk):
     _check_topk_values(score, lengths, indices, topk, None)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("topk", [512, 2048])
 @pytest.mark.parametrize(
     "fill",
@@ -115,6 +120,7 @@ def test_fast_topk_duplicate_heavy(topk, fill):
     _check_topk_values(score, lengths, indices, topk, None)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("topk", [512, 2048])
 def test_fast_topk_negative_and_zero(topk):
     torch.manual_seed(0)
@@ -128,6 +134,7 @@ def test_fast_topk_negative_and_zero(topk):
     _check_topk_values(score, lengths, indices, topk, None)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_fast_topk_unsupported_k():
     score = torch.randn(2, 4096, dtype=torch.float32, device="cuda")
     lengths = torch.full((2,), 4096, dtype=torch.int32, device="cuda")

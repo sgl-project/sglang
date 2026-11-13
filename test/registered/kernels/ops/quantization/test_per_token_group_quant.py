@@ -21,6 +21,10 @@ import itertools
 import pytest
 import torch
 
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
+
 from sglang.kernels.jit.utils import get_ci_test_range, should_run_full_tests
 from sglang.kernels.ops.activation.activation import silu_and_mul
 from sglang.kernels.ops.quantization.fp8_kernel import (
@@ -290,6 +294,7 @@ UE8M0_CASES = get_ci_test_range(
 )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("dtype,num_tokens,hidden", UE8M0_CASES)
 def test_ue8m0_bitexact(dtype, num_tokens, hidden):
     """Col-major packed UE8M0: fp8 codes and decoded exponent bytes are
@@ -309,6 +314,7 @@ def test_ue8m0_bitexact(dtype, num_tokens, hidden):
     assert torch.equal(exp, exp_ref), "exponent bytes differ"
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize(
     "group_size", get_ci_test_range([16, 32, 64, 128], [16, 32, 64])
 )
@@ -341,6 +347,7 @@ def test_ue8m0_group_sizes(group_size):
 
 # hidden 4096 -> 32 groups (aligned); 768 -> 6 groups (6 % 4 = 2, unaligned:
 # the last int32 holds 2 real exponent bytes + 2 zero-padded tail bytes).
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("hidden", [4096, 768])
 def test_ue8m0_row_packed_bitexact(hidden):
     """Row-major packed UE8M0 (int32 [T, ceil(G/4)] contiguous, the minimax
@@ -385,6 +392,7 @@ FP32_SCALE_CASES = get_ci_test_range(
 )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("dtype,column_major,hidden", FP32_SCALE_CASES)
 def test_fp32_scale(dtype, column_major, hidden):
     """fp32 scale (row-major contiguous / col-major TMA view): the stored scale
@@ -410,6 +418,7 @@ def test_fp32_scale(dtype, column_major, hidden):
     assert _dequant_rel_err(x_q, x_s, x, G) < 0.05
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("column_major", [False, True])
 def test_int8_scale(column_major):
     """int8 output (row-major / col-major fp32 scale): exact stored scale
@@ -433,6 +442,7 @@ def test_int8_scale(column_major):
     assert _dequant_rel_err(x_q, x_s, x, G) < 0.08
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_group_size_256_roundtrip():
     """Group 256 (32 lanes on H100, 16 on Blackwell) is above v2's old cap of
     128. Pin the derived property: the fp32 scale equals absmax/FMAX and dequant
@@ -462,6 +472,7 @@ def _ref_silu_mul(x, hidden):
     return torch.nn.functional.silu(gate.float()).to(x.dtype) * up
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("group_size,hidden", [(32, 1792), (32, 6144), (128, 1024)])
 @pytest.mark.parametrize("swiglu_limit", [None, 10.0])
 def test_fp32_silu_post_quant(group_size, hidden, swiglu_limit):
@@ -560,6 +571,7 @@ def test_fp32_silu_post_quant(group_size, hidden, swiglu_limit):
             assert mismatch.item() < 1e-4
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("counts_kind", ["all_zero", "one_hot", "uneven", "full"])
 @pytest.mark.parametrize("transposed", [False, True])
 def test_masked_post_quant_writes_exactly_the_real_rows(transposed, counts_kind):
@@ -640,6 +652,7 @@ def test_masked_post_quant_writes_exactly_the_real_rows(transposed, counts_kind)
             assert (scale[expert, count:] == sentinel).all()
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("column_major", [True, False])
 @pytest.mark.parametrize("scale_ue8m0", [True, False])
 def test_fused_silu(scale_ue8m0, column_major):
@@ -688,6 +701,7 @@ def _check_dense_silu(x, scale_ue8m0, column_major):
     assert torch.equal(x.view(torch.int16), original)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize(
     "dtype,scale_ue8m0,column_major",
     get_ci_test_range(
@@ -756,6 +770,7 @@ def test_dense_silu_extended():
                 _check_dense_silu(x, ue8m0, column)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_dense_silu_graph_replay():
     """Replays must use new input values and retain the allocated output buffers."""
     x = torch.randn(3, 1536, device="cuda", dtype=torch.bfloat16)
@@ -776,6 +791,7 @@ def test_dense_silu_graph_replay():
         assert torch.equal(s, expected_s)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize(
     "overrides",
     [
@@ -812,6 +828,7 @@ MASKED_TEST_CASES = get_ci_test_range(
 )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("shape,expected_m,masked_m_dtype", MASKED_TEST_CASES)
 def test_masked(shape, expected_m, masked_m_dtype):
     """Masked EP-MoE schedule (col-packed ue8m0, plain quant -- no silu, so the
@@ -868,6 +885,7 @@ AUTO_ALLOC_CASES = [
 ]
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_masked_fused():
     """The production EP-MoE path: masked schedule + fuse_silu_and_mul +
     col-packed ue8m0. silu is not bit-reproducible, so check the written rows
@@ -898,6 +916,7 @@ def test_masked_fused():
         assert torch.all(x_q[e, m:].view(torch.int8) == 0), "padding touched"
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("column_major", [False, True])
 def test_sorted_rows(column_major):
     """Sorted MoE layout (TMA down input): rows the MoE GEMM never reads are
@@ -956,6 +975,7 @@ NON_FINITE_CASES = get_ci_test_range(
 )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("poison,scale_ue8m0,masked", NON_FINITE_CASES)
 def test_fp16_non_finite_inputs_are_sanitized(poison, scale_ue8m0, masked):
     """FP16 scaling can overflow for finite inputs; retain its sanitization."""
@@ -987,6 +1007,7 @@ def test_fp16_non_finite_inputs_are_sanitized(poison, scale_ue8m0, masked):
     assert not torch.isnan(written.float()).any(), "quant emitted fp8 NaN codes"
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("fused", [False, True], ids=["plain", "fused"])
 @pytest.mark.parametrize("scale_ue8m0", [False, True])
 @pytest.mark.parametrize("masked", [False, True])
@@ -1036,6 +1057,7 @@ def test_bf16_nan_inputs_are_preserved(fused, scale_ue8m0, masked):
     assert torch.equal(torch.isnan(x_q.float()), expected_nan), "NaN positions changed"
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize(
     "capture_nan", [False, True], ids=["finite-capture", "dirty-capture"]
 )
@@ -1114,6 +1136,7 @@ def test_mn_major_tma_aligned_transform_keeps_ownership():
     torch.testing.assert_close(out2, row_major)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("out_dtype,column_major_scales,scale_ue8m0", AUTO_ALLOC_CASES)
 def test_auto_allocation(out_dtype, column_major_scales, scale_ue8m0):
     """Omitting output_q/output_s allocates them per out_dtype / major mode /

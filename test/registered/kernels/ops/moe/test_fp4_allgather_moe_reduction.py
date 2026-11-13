@@ -105,6 +105,7 @@ def _values_per_rank(output: torch.Tensor) -> list:
     return [rank_output.unique().tolist() for rank_output in gathered]
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 def test_combined_output_is_not_reduced_again(world_size):
     assert should_use_flashinfer_cutlass_moe_fp4_allgather()
     rank = get_parallel().tp_rank
@@ -135,6 +136,7 @@ def test_combined_output_is_not_reduced_again(world_size):
     assert _values_per_rank(output) == [[j + 1.0] for j in range(world_size)]
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_without_the_route_the_ep_sum_still_runs(world_size):
     rank = get_parallel().tp_rank
     with get_flags().moe.override(disable_fp4_allgather=True):

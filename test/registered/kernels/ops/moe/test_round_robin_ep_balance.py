@@ -96,6 +96,7 @@ def _sharded_ids(counts: list[int], *, layer_id: int = 0) -> torch.Tensor:
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize(
     "num_ranks, num_shards, tokens, topk, layer_id, dtype",
     [
@@ -132,6 +133,7 @@ def test_kernel_matches_reference_on_every_shard(
         assert torch.equal(weights, torch.full_like(weights, 1.0 / topk))
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 def test_kernel_masks_padded_rows_and_scales_weights():
     tokens, real, scale = 300, 250, 1.5
     ids = torch.zeros((tokens, TOPK), dtype=torch.int64, device="cuda")
@@ -153,6 +155,7 @@ def test_kernel_masks_padded_rows_and_scales_weights():
     assert torch.equal(weights[real:], torch.zeros_like(weights[real:]))
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("num_tokens", [1, 2, 4, 300])
 @pytest.mark.parametrize("num_ranks", [4, 8, 16])
 def test_single_shard_balances_within_one_slot(num_tokens, num_ranks):
@@ -162,6 +165,7 @@ def test_single_shard_balances_within_one_slot(num_tokens, num_ranks):
     assert all(row.unique().numel() == TOPK for row in ids)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("tokens_per_shard", [1, 2, 64])
 @pytest.mark.parametrize("layer_id", [0, 5])
 def test_equal_shards_balance_exactly(tokens_per_shard, layer_id):
@@ -171,6 +175,7 @@ def test_equal_shards_balance_exactly(tokens_per_shard, layer_id):
     assert torch.equal(loads, torch.full_like(loads, tokens_per_shard * TOPK))
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize(
     "counts",
     [
@@ -192,6 +197,7 @@ def test_uneven_shards_spread_is_at_most_one_slot_per_partial_shard(counts):
     assert int(loads.sum()) == sum(counts) * TOPK
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 def test_small_batches_spread_over_experts_within_each_rank():
     # Sixteen 1-token shards: the expert rotation keeps them from all landing on
     # the first expert of every rank (which would make weight-bandwidth-bound
@@ -258,12 +264,14 @@ def _select(
         )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 def test_select_experts_gathered_single_rank_deals_experts_in_order():
     output = _select(num_tokens=4, ep_size=1, scattered=False)
     expected = _reference(4, num_ranks=1)
     assert torch.equal(output.topk_ids.long(), expected)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 def test_select_experts_scattered_dp_shards_tile_the_ranks():
     ids = torch.cat(
         [
@@ -275,6 +283,7 @@ def test_select_experts_scattered_dp_shards_tile_the_ranks():
     assert torch.equal(loads, torch.full_like(loads, TOPK))
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("flag", ["attn_tp_sequence_sharded", "attn_input_scattered"])
 def test_select_experts_sharded_attention_tp_ranks_are_distinct_shards(flag):
     # DP1 x attention-TP2 with attention-TP-local rows: each attention-TP rank
@@ -288,6 +297,7 @@ def test_select_experts_sharded_attention_tp_ranks_are_distinct_shards(flag):
     assert torch.equal(loads, torch.ones_like(loads))
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 def test_select_experts_replicated_attention_tp_ranks_agree():
     # Without attention-TP-local rows the attention-TP ranks hold the same
     # tokens and must route them identically.
@@ -295,6 +305,7 @@ def test_select_experts_replicated_attention_tp_ranks_agree():
     assert torch.equal(outputs[0], outputs[1])
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("uniform", [False, True])
 def test_select_experts_preserves_fused_shared_expert_column(uniform):
     output = _select(TOPK + 1, num_fused_shared_experts=1, uniform=uniform)

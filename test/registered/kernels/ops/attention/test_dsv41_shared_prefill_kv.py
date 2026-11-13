@@ -20,6 +20,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_shared_compressed_dequant_lifetime():
     device = "cuda"
     obj = object.__new__(backend.DeepseekV4AttnBackend)
@@ -242,6 +243,7 @@ def test_h200_cp_sparse_gate_keeps_unsupported_combinations_paged(unsupported):
         assert not obj._use_sparse_prefill(batch, num_qo_tokens=16)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("cp,rank", [(2, 0), (2, 1), *[(8, rank) for rank in range(8)]])
 def test_cp_cache_uses_local_queries_and_global_prefix_positions(cp, rank):
     device = "cuda"

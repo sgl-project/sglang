@@ -15,6 +15,10 @@ from contextlib import nullcontext
 
 import pytest
 import torch
+
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
 from flashinfer import trtllm_fp4_block_scale_moe
 
 from sglang.srt.utils import is_sm100_supported

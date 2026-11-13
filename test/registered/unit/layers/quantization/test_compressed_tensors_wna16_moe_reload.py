@@ -3,7 +3,12 @@
 import unittest
 from contextlib import contextmanager
 
+import pytest
 import torch
+
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
 
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (

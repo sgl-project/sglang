@@ -17,6 +17,13 @@
 import multiprocessing as mp
 import unittest
 
+import pytest
+import torch
+
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
+
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.lora_utils import (
     CI_MULTI_LORA_MODELS,
@@ -34,6 +41,7 @@ register_cuda_ci(est_time=105, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=65, suite="stage-b-test-1-gpu-small-amd")
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestMultiLoRABackend(CustomTestCase):
     def test_ci_lora_models_multi_batch(self):
         for model_case in CI_MULTI_LORA_MODELS:

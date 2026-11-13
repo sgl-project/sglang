@@ -6,6 +6,10 @@ from unittest.mock import patch
 
 import pytest
 import torch
+
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
 from sgl_kernel.scalar_type import scalar_types
 
 from sglang.kernels.ops.moe.moe_wna16_marlin import moe_wna16_marlin_gemm
@@ -182,6 +186,7 @@ def generate_test_cases():
 TEST_CASES = generate_test_cases()
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize(
     "m,n,k,e,topk,dtype,group_size,act_order,quant_type",
     TEST_CASES,
@@ -270,6 +275,7 @@ def test_moe_wna16_marlin_gemm(
     torch.testing.assert_close(c_jit, expected, atol=2e-2, rtol=2e-2)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.skipif(
     not (is_sm80_supported() or is_sm90_supported()),
     reason="Non-gated NVFP4 Marlin fallback test requires CUDA SM8X/SM9X",
@@ -333,6 +339,7 @@ def test_fused_marlin_moe_non_gated_relu2():
     torch.testing.assert_close(output, output_ref, rtol=0.04, atol=0.04)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("m", [123, 2304])
 @pytest.mark.parametrize("has_bias", [False, True])
 def test_fused_marlin_moe_large_non_ep_schedule(m, has_bias):
@@ -410,6 +417,7 @@ def test_fused_marlin_moe_large_non_ep_schedule(m, has_bias):
     torch.testing.assert_close(output, output_ref.to(dtype), rtol=0.04, atol=0.06)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.skipif(
     not (is_sm80_supported() or is_sm90_supported()),
     reason="NVFP4 Marlin MoE padding test requires CUDA SM8X/SM9X",
@@ -506,6 +514,7 @@ def test_fused_marlin_moe_nvfp4_non_gated_padded_intermediate_launches():
     assert out.shape == (m, hidden_size)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.skipif(
     not (is_sm80_supported() or is_sm90_supported()),
     reason="NVFP4 Marlin MoE numeric test requires CUDA SM80, SM86, or SM90",
@@ -619,6 +628,7 @@ def _dequant_mxfp4_reference(packed, scales):
     return fp4[codes.long()] * scales.double().repeat_interleave(32, -1)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.skipif(not is_sm90_supported(), reason="Hopper MXFP4 decode tile")
 @pytest.mark.parametrize("m", [1, 4])
 def test_mxfp4_tp8_gate_decode(m):
@@ -710,6 +720,7 @@ def test_mxfp4_tp8_gate_decode(m):
         )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.skipif(not is_sm90_supported(), reason="Hopper MXFP4 weight loading")
 @pytest.mark.parametrize("tp_rank", [0, 7])
 def test_mxfp4_tp8_load_before_padding(tp_rank):
@@ -839,6 +850,7 @@ def _marlin_inactive_weights(experts, output_size, input_size, quant_type):
     return result
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize(
     "rows,experts,intermediate",
     [(1, 8, 128), (4, 128, 128), (16, 8, 256), (64, 128, 128)],
@@ -854,12 +866,14 @@ def test_fused_marlin_moe_inactive_routes(
     _check_marlin_inactive_routes(rows, experts, intermediate, quant_type, num_bits)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 def test_stock_marlin_lora_inactive_routes():
     if torch.cuda.get_device_capability()[0] < 9:
         pytest.skip("Stock Marlin LoRA requires SM90 or newer")
     _check_marlin_inactive_routes(4, 8, 128, scalar_types.uint4b8, 4, "stock_lora")
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 def test_factored_marlin_lora_inactive_routes():
     if torch.cuda.get_device_capability()[0] < 9:
         pytest.skip("Experimental Marlin LoRA requires SM90 or newer")
@@ -1082,6 +1096,7 @@ def _check_marlin_inactive_routes(
             assert projections == [False, True] * 4
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("has_inactive_prefix_count", [False, True])
 def test_moe_wna16_marlin_inactive_output_ownership(has_inactive_prefix_count):
     """Inactive-output policy honors sorted/EP routing and ignores unused tails."""

@@ -114,6 +114,7 @@ def _run_one(rng: random.Random, *, wide: bool) -> None:
     assert bool((out_kernel[invalid] == 0).all())
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("seed", FUZZ_SEEDS_PR)
 def test_canary_info_kernel_per_row_matches_reference(seed: int) -> None:
     """Match ordinary sampling against the host reference."""
@@ -122,6 +123,7 @@ def test_canary_info_kernel_per_row_matches_reference(seed: int) -> None:
         _run_one(rng, wide=False)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("seed", FUZZ_SEEDS_PR)
 def test_canary_info_kernel_linear_acceptance_matches_reference(seed: int) -> None:
     """Match variable accepted prefixes against the host reference."""

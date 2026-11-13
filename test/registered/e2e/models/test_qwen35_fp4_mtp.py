@@ -2,6 +2,7 @@ import unittest
 from types import SimpleNamespace
 
 import requests
+import torch
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -85,6 +86,7 @@ def _run_mtp_gsm8k(test_case):
     test_case.assertGreater(avg_spec_accept_length, 3.3)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestQwen35FP4MTP(ReasoningTokenUsageMixin, CustomTestCase):
     reasoning_parser_name = "qwen3"
 
@@ -108,6 +110,7 @@ class TestQwen35FP4MTP(ReasoningTokenUsageMixin, CustomTestCase):
         _run_mtp_gsm8k(self)
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestQwen35FP4MTPReplaySSM(ReasoningTokenUsageMixin, CustomTestCase):
     """MTP with the ReplaySSM spec-verify fold protocol.
 

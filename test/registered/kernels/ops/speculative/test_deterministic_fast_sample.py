@@ -29,6 +29,7 @@ class TestDeterministicFastSample(CustomTestCase):
         self.seeds = [101, 202, 303, 404, 505, 606, 707, 808]
         self.positions = [11, 12, 13, 14, 15, 16, 17, 18]
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_replay_is_bitwise_reproducible(self):
         p_a, index_a = _sample(self.probs, self.seeds, self.positions)
         p_b, index_b = _sample(self.probs, self.seeds, self.positions)
@@ -36,6 +37,7 @@ class TestDeterministicFastSample(CustomTestCase):
         self.assertTrue(torch.equal(index_a, index_b))
         self.assertTrue(torch.equal(p_a, p_b))
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_cuda_graph_replay_and_input_updates(self):
         seeds = torch.tensor(self.seeds, device="cuda", dtype=torch.int64)
         positions = torch.tensor(self.positions, device="cuda", dtype=torch.int64)
@@ -73,6 +75,7 @@ class TestDeterministicFastSample(CustomTestCase):
         self.assertTrue(torch.equal(updated_p, expected_p))
         self.assertTrue(torch.equal(updated_index, expected_index))
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_batch_permutation_and_split_are_invariant(self):
         p_ref, index_ref = _sample(self.probs, self.seeds, self.positions)
 
@@ -99,6 +102,7 @@ class TestDeterministicFastSample(CustomTestCase):
         self.assertTrue(torch.equal(index_ref, torch.cat(split_indices)))
         self.assertTrue(torch.equal(p_ref, torch.cat(split_probs)))
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_seed_position_and_draft_step_select_separate_streams(self):
         uniform_probs = torch.full((64, 4096), 1 / 4096, device="cuda")
         seeds = list(range(64))
@@ -119,6 +123,7 @@ class TestDeterministicFastSample(CustomTestCase):
         # Adjacent request seeds must not alias adjacent draft-step streams.
         self.assertFalse(torch.equal(changed_seed, changed_step))
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_seeded_samples_follow_categorical_distribution(self):
         num_samples = 100_000
         expected = torch.tensor([0.1, 0.2, 0.7], device="cuda")
@@ -138,6 +143,7 @@ class TestDeterministicFastSample(CustomTestCase):
             f"Expected frequencies near {expected.tolist()}, got {observed.tolist()}",
         )
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_hash_endpoints_produce_finite_ordering(self):
         probs = torch.tensor(
             [[0.01, 0.09, 0.90], [0.80, 0.15, 0.05]],
@@ -171,6 +177,7 @@ class TestDeterministicFastSample(CustomTestCase):
                     )
                 )
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_requires_matching_seed_position_rows(self):
         with self.assertRaisesRegex(ValueError, "matching shapes"):
             fast_sample(

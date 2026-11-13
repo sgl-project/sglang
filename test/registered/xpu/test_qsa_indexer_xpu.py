@@ -10,7 +10,12 @@ dummy checkpoint used for local validation (neither is published).
 import unittest
 from types import SimpleNamespace
 
+import pytest
 import torch
+
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
 
 from sglang.srt.layers.attention.qsa.qsa_indexer import QSAIndexer
 from sglang.test.ci.ci_register import register_xpu_ci

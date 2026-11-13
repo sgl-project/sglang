@@ -49,6 +49,7 @@ def test_out_of_place_qknorm_rope_matches_inplace_and_keeps_inputs() -> None:
 # H3's own config both ways, the FP32-cache, FP16, int32 and rope-width paths, then
 # the other layouts that run two rows per warp (FLUX / Qwen-Image / FLUX 3 / Krea2 /
 # Joy take the interleaved FP32 path; LongCat the rounded interleaved full-width one)
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize(
     "out_of_place,rope_dim,is_neox,round_norm,full_width,dtype,cache_dtype,pos_dtype",
     [

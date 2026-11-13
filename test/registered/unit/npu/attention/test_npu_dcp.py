@@ -13,7 +13,12 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pytest
 import torch
+
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
 
 # Loaded before the torch_npu mock below: importing transformers runs
 # accelerate's find_spec("torch_npu"), which fails on a mock without __spec__.

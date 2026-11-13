@@ -16,6 +16,7 @@ from sglang.test.kernels.sam import make_windows, window_unpartition_add_referen
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("batch,height,width", [(1, 40, 40), (8, 40, 40), (2, 64, 64)])
 def test_window_unpartition_add_bit_identity(batch: int, height: int, width: int):
     torch.manual_seed(20260923)
@@ -57,6 +58,8 @@ def _inputs(dtype=torch.bfloat16, hidden=768, device="cuda"):
 )
 def test_unsupported_inputs_take_the_eager_path(case: str):
     """Inputs the kernel rejects must take the eager unpartition + add."""
+    if case != "cpu" and not torch.cuda.is_available():
+        pytest.skip("Test requires CUDA")
     if case == "fp16":
         windows, shortcut = _inputs(dtype=torch.float16)
     elif case == "fp32":
@@ -80,6 +83,7 @@ def test_unsupported_inputs_take_the_eager_path(case: str):
     assert not can_use_window_unpartition_add(windows, shortcut, 14)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_kernel_rejects_non_bf16_inputs():
     windows, shortcut = _inputs(dtype=torch.float16)
     with pytest.raises(Exception, match="dtype|Tensor match failed"):

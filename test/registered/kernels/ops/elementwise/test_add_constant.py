@@ -10,6 +10,7 @@ register_cuda_ci(est_time=45, stage="base-b-kernel-unit", runner_config="1-gpu-s
 register_amd_ci(est_time=8, stage="jit-kernel-unit", runner_config="amd")
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("size", [1, 2, 127, 128, 1024, 1025, 4096, 4097])
 @pytest.mark.parametrize("constant", [0, 1, 7, 1024, -3])
 def test_add_constant(size: int, constant: int) -> None:
@@ -18,12 +19,14 @@ def test_add_constant(size: int, constant: int) -> None:
     assert torch.all(dst == src + constant)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_add_constant_unaligned_input() -> None:
     src = torch.arange(0, 4098, dtype=torch.int32, device="cuda")[1:]
     dst = add_constant(src, 7)
     assert torch.all(dst == src + 7)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("size", [2**20, 2**20 + 3])
 def test_add_constant_large_aligned_input(size: int) -> None:
     src = torch.arange(0, size, dtype=torch.int32, device="cuda")
@@ -31,6 +34,7 @@ def test_add_constant_large_aligned_input(size: int) -> None:
     assert torch.all(dst == src - 3)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_add_constant_large_unaligned_input() -> None:
     src = torch.arange(0, 2**20 + 4, dtype=torch.int32, device="cuda")[1:]
     dst = add_constant(src, 7)

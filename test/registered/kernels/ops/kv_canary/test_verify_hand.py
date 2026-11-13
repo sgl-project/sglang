@@ -231,6 +231,7 @@ def _stamp_clean_kv_chain(
 
 
 class TestChain:
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     def test_chain_head_anchor(self) -> None:
         """``prev_slot_idx == -1`` → kernel uses ``splitmix64(consts.CANARY_CHAIN_ANCHOR)`` as the expected prev_hash."""
         # Step 1: stamp slot 5 such that stored.prev_hash already equals splitmix64(consts.CANARY_CHAIN_ANCHOR).
@@ -242,6 +243,7 @@ class TestChain:
         cuda_log, _ = run_verify_diff(buf_pair=buf_pair, plan_pair=plan_pair)
         assert _n_violations(cuda_log) == 0
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     def test_chain_link_byte_equal_5_step(self) -> None:
         """5-step chain, CUDA vs ref byte-equal across ring / counters / canary_buf (read-only)."""
         cuda_buf, ref_buf = _buf_pair()
@@ -264,6 +266,7 @@ class TestChain:
         cuda_log, _ = run_verify_diff(buf_pair=(cuda_buf, ref_buf), plan_pair=plan_pair)
         assert _n_violations(cuda_log) == 0
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     def test_chain_link_byte_equal_5_step_hardcoded(self) -> None:
         """5-step chain with hand-computed splitmix64 expected sequence; defends against ref + CUDA co-drift."""
         tokens = [101, 202, 303, 404, 505]
@@ -345,6 +348,7 @@ class TestChain:
                 f"expected={expected:#x} actual={actual:#x}"
             )
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     def test_chain_head_anchored_on_constant(self) -> None:
         """prev_slot==-1 + stored prev_hash != splitmix64(ANCHOR) → CHAIN_HASH bit set."""
         buf_pair = _buf_pair()
@@ -356,6 +360,7 @@ class TestChain:
         assert _n_violations(cuda_log) == 1
         assert _fail_bits(cuda_log) & consts.FailReason.VERIFY_CHAIN_HASH_MISMATCH
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     def test_chain_head_prev_hash_equals_splitmix64_anchor_random_50(self) -> None:
         random.seed(0)
         expected_prev_hash_signed = to_signed_int64(
@@ -385,6 +390,7 @@ class TestChain:
                 f"unexpected violation at iteration token={token} position={position} slot={slot_idx}"
             )
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     def test_prev_slot_padding_skips_chain_check_arbitrary_stored_hash(self) -> None:
         """prev_slot_idx == TOKEN_TO_KV_SLOT_PADDING → chain check is skipped, regardless of stored chain hash."""
         buf_pair = _buf_pair()
@@ -405,6 +411,7 @@ class TestChain:
         cuda_log, _ = run_verify_diff(buf_pair=buf_pair, plan_pair=plan_pair)
         assert _n_violations(cuda_log) == 0
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     def test_prev_slot_padding_does_not_mask_position_check(self) -> None:
         """prev_slot == padding skips ONLY the chain check; position mismatch still fires."""
         buf_pair = _buf_pair()
@@ -429,6 +436,7 @@ class TestChain:
 
 
 class TestViolationField:
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     def test_violation_token_mismatch(self) -> None:
         """Stored token differs from a fresh write at the same slot → TOKEN-side accounting via the chain bit."""
         # Verify kernel doesn't have a TOKEN fail bit per se — token mismatch propagates into next-slot
@@ -464,6 +472,7 @@ class TestViolationField:
             _fail_bits(cuda_log), consts.FailReason.VERIFY_CHAIN_HASH_MISMATCH
         )
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     def test_violation_position_mismatch(self) -> None:
         """Stored position differs from what the slot's chain reconstruction would yield → POSITION bit."""
         # Stamp slot 7 with a valid head chain but stored position = 0; ask verify to expect position 5.
@@ -478,6 +487,7 @@ class TestViolationField:
             _fail_bits(cuda_log), consts.FailReason.VERIFY_POSITION_MISMATCH
         )
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     def test_violation_position_diverges_from_plan(self) -> None:
         """Plan-supplied position contradicts stored position → POSITION bit (verify trusts plan, not +1)."""
         # Step: a clean chain head with stored position 0; plan claims position 99 — kernel must flag POSITION.
@@ -491,6 +501,7 @@ class TestViolationField:
             _fail_bits(cuda_log), consts.FailReason.VERIFY_POSITION_MISMATCH
         )
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     def test_violation_prev_hash_mismatch(self) -> None:
         """Stored prev_hash differs from predecessor-derived expectation → CHAIN_HASH bit."""
         cuda_buf, ref_buf = _buf_pair()
@@ -523,6 +534,7 @@ class TestViolationField:
             _fail_bits(cuda_log), consts.FailReason.VERIFY_CHAIN_HASH_MISMATCH
         )
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     def test_violation_real_kv_hash_mismatch(self) -> None:
         """Mutate one byte of a RealKvSource tensor after writing the chain → REAL_KV_HASH bit on verify."""
         buf_pair = _buf_pair()
@@ -556,6 +568,7 @@ class TestViolationField:
             _fail_bits(cuda_log), consts.FailReason.VERIFY_REAL_KV_HASH_MISMATCH
         )
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     @pytest.mark.parametrize("bit_to_trigger", ["POSITION", "PREV_HASH", "REAL_KV"])
     @pytest.mark.parametrize("injection_position", ["head", "mid", "last"])
     @pytest.mark.parametrize("ring_state", ["open", "full"])
@@ -697,6 +710,7 @@ class TestViolationField:
                 "write_index did not advance beyond ring_capacity after overflow"
             )
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     def test_position_mismatch_sets_position_bit_only(self) -> None:
         """Plan.position != stored.position with chain hash correct → only POSITION bit set."""
         buf_pair = _buf_pair()
@@ -716,6 +730,7 @@ class TestViolationField:
 
 
 class TestRealKvHash:
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     def test_real_kv_mode_off_yields_zero(self) -> None:
         """OFF mode → stored real_kv_hash field stays zero post-write; verify with OFF agrees byte-equal."""
         buf_pair = _buf_pair()
@@ -732,6 +747,7 @@ class TestRealKvHash:
 
         assert _n_violations(cuda_log) == 0
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     @pytest.mark.parametrize(
         "mode",
         [
@@ -770,6 +786,7 @@ class TestRealKvHash:
 
         assert _n_violations(cuda_log) == 0
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     @pytest.mark.parametrize("count", [1, 2, 3, 4])
     def test_real_kv_sources_fold_1_to_4(self, count: int) -> None:
         """Fold ``count`` sources sequentially → CUDA matches ref for every count in {1..4}."""
@@ -801,6 +818,7 @@ class TestRealKvHash:
 
         assert _n_violations(cuda_log) == 0
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     @pytest.mark.parametrize(
         "mode,fold_fn,expected_hash",
         [
@@ -901,6 +919,7 @@ class TestRealKvHash:
             _fail_bits(cuda_log2), consts.FailReason.VERIFY_REAL_KV_HASH_MISMATCH
         )
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     def test_real_kv_hash_all_mode_with_multiple_sources(self) -> None:
         """ALL mode with count=2 page=16 bytes=128 sources: chain still verifies clean."""
         buf_pair = _buf_pair(num_slots=32)
@@ -961,6 +980,7 @@ class TestRealKvHash:
         )
         assert _n_violations(cuda_log) == 0
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     def test_real_kv_hash_partial_mode_detects_single_bit_flip(self) -> None:
         """PARTIAL mode + 1-bit flip in source tensor → REAL_KV_HASH bit set in violation row."""
         buf_pair = _buf_pair()
@@ -999,6 +1019,7 @@ class TestRealKvHash:
             f"expected REAL_KV_HASH bit, got {bits:#b}"
         )
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     def test_real_kv_off_does_not_deref_real_kv_sources(self) -> None:
         buf_pair = _buf_pair(num_slots=8)
         _stamp_head(buf_pair, slot_idx=1, token=1)
@@ -1025,6 +1046,7 @@ class TestRealKvHash:
 
 
 class TestRealKvSource:
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     def test_real_kv_source_rejects_zero_read_bytes(self) -> None:
         """RealKvSource has no \"skip me\" sentinel — read_bytes=0 must raise rather than silently pass."""
         with pytest.raises(ValueError, match="read_bytes"):
@@ -1035,6 +1057,7 @@ class TestRealKvSource:
                 read_bytes=0,
             )
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     def test_real_kv_source_rejects_row_narrower_than_page(self) -> None:
         """A row too narrow for its page must raise: neither fold reports it.
 
@@ -1050,6 +1073,7 @@ class TestRealKvSource:
                 read_bytes=16,
             )
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     def test_real_kv_source_padding_below_4(self) -> None:
         """Host wrapper pads to 4 slots when fewer sources are supplied; dummy slots are never dereferenced."""
         buf_pair = _buf_pair()
@@ -1063,6 +1087,7 @@ class TestRealKvSource:
             real_kv_sources_pair=(sources, sources),
         )
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     def test_real_kv_source_above_4_raises(self) -> None:
         """``len(real_kv_sources) > 4`` → host wrapper raises ValueError before launching."""
         canary_buf = make_canary_buf(device=_DEVICE)
@@ -1091,6 +1116,7 @@ class TestRealKvSource:
                 check_verify_expected_token=True,
             )
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     def test_real_kv_source_holey_dim1(self) -> None:
         """``tensor.shape[1] > page_size * num_bytes_per_token`` → trailing bytes are skipped."""
         buf_pair = _buf_pair()
@@ -1132,6 +1158,7 @@ class TestRealKvSource:
 
         assert _n_violations(cuda_log) == 0
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     def test_real_kv_source_strided_rows(self) -> None:
         """A strided source (``stride(0) > shape[1]``) is folded row by ``stride(0)``.
 
@@ -1175,6 +1202,7 @@ class TestRealKvSource:
 
 
 class TestLayoutAndScheduling:
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     def test_page_size_gt_1_access_pattern(self) -> None:
         """``page_size > 1`` → byte access follows ``(row=slot//page, col=(slot%page)*bpt:)``."""
         buf_pair = _buf_pair(num_slots=8)
@@ -1220,6 +1248,7 @@ class TestLayoutAndScheduling:
 
         assert _n_violations(cuda_log) == 0
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     def test_swa_translated_slot_indices(self) -> None:
         """SWA-translated slots already passed in plan; verify kernel does no further translation."""
         # SWA verify plans carry pre-translated slot indices — the verify kernel never sees the FULL slot
@@ -1232,6 +1261,7 @@ class TestLayoutAndScheduling:
         cuda_log, _ = run_verify_diff(buf_pair=buf_pair, plan_pair=plan_pair)
         assert _n_violations(cuda_log) == 0
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     def test_empty_plan_no_op(self) -> None:
         """``verify_num_valid = 0`` → no ring write, no slot_run_counter bump, only kernel_run_counter += 1."""
         buf_pair = _buf_pair()
@@ -1248,6 +1278,7 @@ class TestLayoutAndScheduling:
         assert int(cuda_log.slot_run_counter[0].item()) == 0
         assert int(cuda_log.kernel_run_counter[0].item()) == 1
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     def test_slot_zero_plan_entry_is_skipped(self) -> None:
         """slot 0 is reserved padding: verify skips loads/violations but still counts the submitted entry."""
         canary_buf = make_canary_buf(num_slots=16, slot_stride_bytes=32, device=_DEVICE)
@@ -1288,6 +1319,7 @@ class TestLayoutAndScheduling:
         assert int(log.slot_run_counter[0].item()) == 1
         assert int(log.kernel_run_counter[0].item()) == 1
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     @pytest.mark.parametrize(
         "runner",
         [launch_canary_verify_kernel, launch_canary_verify_kernel_torch_reference],
@@ -1350,6 +1382,7 @@ class TestLayoutAndScheduling:
             == int(kernel_run_before[0].item()) + 1
         )
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     def test_paged_layout_page_size_16(self) -> None:
         """page_size=16: slot→page mapping doesn't change verify chain semantics on a clean chain."""
         buf_pair = _buf_pair(num_slots=64)
@@ -1413,6 +1446,7 @@ class TestLayoutAndScheduling:
         )
         assert _n_violations(cuda_log) == 0
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     def test_empty_plan_keeps_slot_counter_unchanged(self) -> None:
         buf_pair = _buf_pair(num_slots=8)
         _stamp_head(buf_pair, slot_idx=1, token=7)
@@ -1451,6 +1485,7 @@ class TestLayoutAndScheduling:
 
 
 class TestRunCounter:
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     def test_kernel_run_counter_per_call(self) -> None:
         """``kernel_run_counter`` increments by 1 per call, even when ``verify_num_valid == 0``."""
         buf_pair = _buf_pair()
@@ -1473,6 +1508,7 @@ class TestRunCounter:
 
         assert int(cuda_log.kernel_run_counter[0].item()) == 3
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     def test_slot_run_counter_per_entry(self) -> None:
         """``slot_run_counter`` accumulates ``verify_num_valid`` entries per call."""
         cuda_buf, ref_buf = _buf_pair()
@@ -1497,6 +1533,7 @@ class TestRunCounter:
 
         assert int(cuda_log.slot_run_counter[0].item()) == 4
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     def test_grid_stride_processes_entries_beyond_grid_size(self) -> None:
         """``verify_num_valid`` exceeding the persistent grid thread count is fully processed via grid-stride."""
         n_active = 40000
@@ -1525,6 +1562,7 @@ class TestRunCounter:
         assert int(cuda_log.slot_run_counter[0].item()) == n_active
         assert int(cuda_log.kernel_run_counter[0].item()) == 1
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     def test_replay_does_not_double_count_run_counters(self) -> None:
         """Two consecutive runs on same plan: slot_run_counter += 2N, kernel_run_counter += 2."""
         cuda_buf, ref_buf = _buf_pair()
@@ -1556,6 +1594,7 @@ class TestRunCounter:
         assert int(cuda_log.slot_run_counter[0].item()) == 2 * len(slot_indices)
         assert int(cuda_log.kernel_run_counter[0].item()) == 2
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     def test_slot_run_counter_delta_equals_active_entries_across_random_plans(
         self,
     ) -> None:
@@ -1604,6 +1643,7 @@ class TestRunCounter:
             after = int(cuda_log.slot_run_counter[0].item())
             assert after - before == n_entries
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     def test_kernel_run_counter_per_call_invariant_50_calls(self) -> None:
         buf_pair = _buf_pair(num_slots=8)
         _stamp_head(buf_pair, slot_idx=1)
@@ -1622,6 +1662,7 @@ class TestRunCounter:
 
 
 class TestViolationRing:
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     def test_violation_ring_fill_once_first_row(self) -> None:
         """First violation lands at ring[0]; subsequent violations advance ``violation_write_index``."""
         buf_pair = _buf_pair()
@@ -1643,6 +1684,7 @@ class TestViolationRing:
         # row 0 is filled (slot 1 → POSITION bit).
         assert _fail_bits(cuda_log) & consts.FailReason.VERIFY_POSITION_MISMATCH
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     def test_violation_ring_overflow_counter_still_increments(self) -> None:
         """Ring capacity exceeded → rows beyond are dropped but ``write_index`` still grows."""
         buf_pair = _buf_pair()
@@ -1672,6 +1714,7 @@ class TestViolationRing:
         # byte-equal — we relax the ring-contents check here.
         assert torch.equal(cuda_log.write_index, ref_log.write_index)
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     def test_kernel_kind_stamped_into_row(self) -> None:
         """Different ``CanaryLaunchTag`` values → violation row.kernel_kind reflects each."""
         buf_pair = _buf_pair()
@@ -1685,6 +1728,7 @@ class TestViolationRing:
             kk = int(cuda_log.ring[0, consts.VIOLATION_FIELD_KERNEL_KIND].item())
             assert kk == int(tag)
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     def test_violation_ring_row_byte_layout_hardcoded(self) -> None:
         buf_pair = _buf_pair()
         anchor_hash_signed = chain_anchor_signed()
@@ -1755,6 +1799,7 @@ class TestViolationRing:
                 "violation_ring row binary layout mismatch:\n" + "\n".join(mismatches)
             )
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     def test_violation_ring_atomic_with_many_violations(self) -> None:
         """50 simultaneously-corrupted entries → write_index == 50 (no atomicity loss)."""
         n = 50
@@ -1784,6 +1829,7 @@ class TestViolationRing:
         assert _n_violations(cuda_log) == n
         assert _n_violations(ref_log) == n
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     def test_violation_rows_have_valid_kernel_kind_and_slot(self) -> None:
         """Each violation row's kernel_kind matches the launch tag; slot_idx is one of the plan slots."""
         buf_pair = _buf_pair()
@@ -1809,6 +1855,7 @@ class TestViolationRing:
             slot = int(cuda_log.ring[row, 1].item())
             assert slot in plan_slot_set, f"row {row} slot {slot} not in plan"
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     def test_clear_resets_ring_and_write_index_zero(self) -> None:
         buf_pair = _buf_pair(num_slots=8)
         for slot_idx in range(1, 4):
@@ -1832,6 +1879,7 @@ class TestViolationRing:
 
 
 class TestBoundarySweep:
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     @pytest.mark.parametrize(
         "token_val",
         [0, 1, 0xFFFFFFFF, -1, 0x80000000, 0x7FFFFFFF],
@@ -1844,6 +1892,7 @@ class TestBoundarySweep:
             )
         )
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     @pytest.mark.parametrize(
         "position_val",
         [0, 1, 127, 128, 129, 0x7FFFFFFF],
@@ -1856,6 +1905,7 @@ class TestBoundarySweep:
             )
         )
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     @pytest.mark.parametrize(
         "prev_hash_val",
         [
@@ -1877,6 +1927,7 @@ class TestBoundarySweep:
             )
         )
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     @pytest.mark.parametrize(
         "stored_rkv_val",
         [0, 1, 0xFFFFFFFFFFFFFFFF, 0x8000000000000000],
@@ -1916,16 +1967,19 @@ class TestVerifyExpectedInputIds:
         )
         return cuda_log
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     def test_sentinel_skips_token_check(self) -> None:
         """``expected_input_id == -1`` must not fire even if stored token differs."""
         log = self._run(stored_token=42, expected_input_id=-1)
         assert _n_violations(log) == 0
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     def test_match_records_no_violation(self) -> None:
         """Matching stored vs expected token: zero violations."""
         log = self._run(stored_token=42, expected_input_id=42)
         assert _n_violations(log) == 0
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     def test_mismatch_fires_verify_token_bit(self) -> None:
         """Mismatch: kVerifyTokenMismatch bit set; expected_token field populated."""
         log = self._run(stored_token=42, expected_input_id=99)
@@ -1938,6 +1992,7 @@ class TestVerifyExpectedInputIds:
         assert int(row[consts.VIOLATION_FIELD_STORED_TOKEN]) == 42
         assert int(row[consts.VIOLATION_FIELD_EXPECTED_TOKEN]) == 99
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     def test_check_disabled_never_raises_token_mismatch(self) -> None:
         """check_verify_expected_token=False: token mismatch is silently ignored byte-equal CUDA vs ref."""
         log = self._run(
@@ -1947,6 +2002,7 @@ class TestVerifyExpectedInputIds:
         )
         assert _n_violations(log) == 0
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     def test_check_disabled_does_not_read_expected_tokens_tensor(self) -> None:
         """check_verify_expected_token=False with garbage expected_input_id: kernel must not deref the tensor."""
         buf_pair = _buf_pair()
@@ -1962,6 +2018,7 @@ class TestVerifyExpectedInputIds:
         )
         assert _n_violations(cuda_log) == 0
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
     def test_token_and_position_both_mismatch_set_both_bits(self) -> None:
         """token mismatch + position mismatch: both fail bits set; expected_token row carries the gathered id."""
         buf_pair = _buf_pair()

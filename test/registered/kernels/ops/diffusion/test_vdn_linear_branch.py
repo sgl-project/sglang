@@ -33,6 +33,7 @@ def _ulp_close(got: torch.Tensor, ref: torch.Tensor) -> bool:
     return (got.float() - ref.float()).abs().max().item() <= 2e-2 * scale
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_temporal_conv_act_matches_eager_chain() -> None:
     g = torch.Generator(device="cpu").manual_seed(4)
     x = torch.randn(FRAMES, TOKENS, HEADS * HEAD_DIM, generator=g).to(
@@ -54,6 +55,7 @@ def test_temporal_conv_act_matches_eager_chain() -> None:
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_silu_l2norm_reads_strided_qkv_views() -> None:
     g = torch.Generator(device="cpu").manual_seed(4)
     tokens = torch.randn(FRAMES * TOKENS, 3 * HEADS * HEAD_DIM, generator=g).to(
@@ -74,6 +76,7 @@ def test_silu_l2norm_reads_strided_qkv_views() -> None:
         vdn_silu_l2norm(strided, True, per_frame=TOKENS + 1)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_frame_stats_prep_is_bit_exact() -> None:
     g = torch.Generator(device="cpu").manual_seed(4)
     key = torch.randn(FRAMES * TOKENS, HEADS, HEAD_DIM, generator=g).to(
@@ -94,6 +97,7 @@ def test_frame_stats_prep_is_bit_exact() -> None:
     assert torch.equal(vb, (vf * bf.unsqueeze(-1).to(vf.dtype)).contiguous())
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_linear_epilogue_matches_eager_chain() -> None:
     g = torch.Generator(device="cpu").manual_seed(4)
     readout = torch.randn(FRAMES, HEADS, TOKENS, HEAD_DIM, generator=g).to(
@@ -108,6 +112,7 @@ def test_linear_epilogue_matches_eager_chain() -> None:
     assert _ulp_close(got, vdn.linear_epilogue(readout, weight, gate, 1e-6))
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("bridge", ["alpha", "none"])
 @pytest.mark.parametrize("with_text_state", [False, True])
 def test_gather_linear_state_matches_eager(bridge: str, with_text_state: bool) -> None:
@@ -126,6 +131,7 @@ def test_gather_linear_state_matches_eager(bridge: str, with_text_state: bool) -
     torch.testing.assert_close(got, ref, atol=1e-5, rtol=1e-5)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_predicates_reject_unsupported_inputs() -> None:
     fp16 = torch.randn(4, 2, 32, device="cuda", dtype=torch.float16)
     assert not can_use_vdn_silu_l2norm(fp16)

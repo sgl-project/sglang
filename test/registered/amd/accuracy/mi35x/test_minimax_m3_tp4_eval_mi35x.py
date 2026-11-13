@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
 import numpy as np
+import torch
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci
@@ -196,6 +197,7 @@ def run_gsm8k_benchmark(
     return acc, invalid, latency
 
 
+@unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestMiniMaxM3TP4EvalMI35x(unittest.TestCase):
     """MiniMax-M3 MXFP8 TP=4 GSM8K Chat+Thinking Evaluation Test for AMD MI35x."""
 

@@ -12,6 +12,7 @@ register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-s
 register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("rows", [1, 3, 200, 4096])
 @pytest.mark.parametrize("inner", [8, 256, 16384])
 @pytest.mark.parametrize("strided", [False, True])

@@ -22,6 +22,7 @@ class TestDSAIndexerFp4(CustomTestCase):
     _create_forward_batch = base.TestDSAIndexer._create_forward_batch
     _verify_topk_output = base.TestDSAIndexer._verify_topk_output
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def test_forward_extend_then_decode_fp4(self):
         if torch.cuda.get_device_capability()[0] != 10:
             self.skipTest("DeepGEMM FP4 MQA requires SM100")

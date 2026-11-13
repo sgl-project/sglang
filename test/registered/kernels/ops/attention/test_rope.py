@@ -214,6 +214,7 @@ FUSED_ROPE_STORE_CASES = get_ci_test_range(
 )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize(
     "batch_size,gqa_ratio,num_kv_heads,rope_dim,is_neox,dtype", ROPE_CASES
 )
@@ -244,6 +245,7 @@ def test_rope(
     triton.testing.assert_close(k_fi, k_jit, atol=atol, rtol=rtol)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
 def test_rope_position_dtypes(dtype: torch.dtype) -> None:
     """Ensure both int32 and int64 position tensors work correctly."""
@@ -266,6 +268,7 @@ def test_rope_position_dtypes(dtype: torch.dtype) -> None:
     triton.testing.assert_close(k_fi, k_jit, atol=atol, rtol=rtol)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("is_neox", IS_NEOX_LIST)
 @pytest.mark.parametrize("rope_dim", get_ci_test_range([64, 128], [64]))
 def test_rope_mixed_q_dtype(is_neox: bool, rope_dim: int) -> None:
@@ -296,6 +299,7 @@ def test_rope_mixed_q_dtype(is_neox: bool, rope_dim: int) -> None:
     assert torch.equal(k_mixed, k_ref)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("is_neox", IS_NEOX_LIST)
 def test_rope_store_mixed_q_dtype(is_neox: bool) -> None:
     """Fused RoPE + KV store with fp16 q + bf16 k: q bitwise vs the all-fp16
@@ -350,6 +354,7 @@ def test_rope_store_mixed_q_dtype(is_neox: bool) -> None:
     assert torch.equal(vc_mixed, vc_ref)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("batch_size,is_neox,rope_dim,head_dim", PARTIAL_ROPE_CASES)
 def test_partial_rope(batch_size: int, is_neox: bool, rope_dim: int, head_dim: int):
     if head_dim < rope_dim:
@@ -373,6 +378,7 @@ def test_partial_rope(batch_size: int, is_neox: bool, rope_dim: int, head_dim: i
     triton.testing.assert_close(k_fi, k_jit, atol=atol, rtol=rtol)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize(
     "batch_size,gqa_ratio,num_kv_heads,rope_dim,is_neox", FUSED_ROPE_STORE_CASES
 )

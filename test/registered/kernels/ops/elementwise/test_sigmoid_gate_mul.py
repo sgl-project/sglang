@@ -15,6 +15,7 @@ def reference_sigmoid_gate_mul(x, gate):
     return x * torch.sigmoid(gate)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16, torch.float32])
 @pytest.mark.parametrize(
     "shape",
@@ -42,6 +43,7 @@ def test_sigmoid_gate_mul_correctness(shape, dtype):
     torch.testing.assert_close(out, ref, rtol=rtol, atol=atol)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("shape", [(4, 4096), (1, 128)])
 def test_sigmoid_gate_mul_does_not_modify_inputs(shape):
     from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
@@ -58,6 +60,7 @@ def test_sigmoid_gate_mul_does_not_modify_inputs(shape):
     torch.testing.assert_close(gate, gate_orig, rtol=0, atol=0)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_sigmoid_gate_mul_output_dtype():
     from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
 
@@ -68,6 +71,7 @@ def test_sigmoid_gate_mul_output_dtype():
         assert out.dtype == dtype, f"Expected {dtype}, got {out.dtype}"
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_sigmoid_gate_mul_contiguous_output():
     from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
 
@@ -77,6 +81,7 @@ def test_sigmoid_gate_mul_contiguous_output():
     assert out.is_contiguous()
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_sigmoid_gate_mul_strided_gate_round_sigmoid_is_bit_exact():
     num_tokens = 300
     # The gate is the tail columns of a merged [q_up | gate] GEMM output.

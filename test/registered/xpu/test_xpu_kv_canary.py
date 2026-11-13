@@ -14,6 +14,13 @@ from __future__ import annotations
 
 import unittest
 
+import pytest
+import torch
+
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
+
 from sglang.srt.kv_canary.config import CanaryMode
 from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.kv_canary.e2e_base import CanaryE2EBase

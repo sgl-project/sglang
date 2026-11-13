@@ -2,6 +2,13 @@
 
 import unittest
 
+import pytest
+import torch
+
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
+
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.glm53_flash_common import COMMON_SERVER_ARGS, _GLM53FlashH200Base
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin

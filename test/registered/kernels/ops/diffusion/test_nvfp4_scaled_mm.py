@@ -1,5 +1,12 @@
 import sys
 
+import pytest
+import torch
+
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
+
 import flashinfer
 import pytest
 import torch
@@ -315,6 +322,7 @@ def _build_layer(
     return method, layer
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.skipif(
     not _nvfp4_supported(),
     reason="Diffusion NVFP4 fused SwiGLU correctness requires Blackwell GPUs",
@@ -408,6 +416,7 @@ def _resolve_mode(mode: str):
     raise ValueError(f"Unknown mode: {mode}")
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.skipif(
     not _nvfp4_supported(),
     reason="Diffusion NVFP4 scaled mm correctness requires Blackwell GPUs",
@@ -478,6 +487,7 @@ def test_flux2_shape_correctness(mode: str) -> None:
     assert diff < DEEPGEMM_FP4_MAX_DIFF, f"{mode=}, {m=}, {n=}, {k=}, {diff=:.6f}"
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.skipif(
     not _nvfp4_supported(),
     reason="Diffusion NVFP4 scaled mm correctness requires Blackwell GPUs",
@@ -524,6 +534,7 @@ def test_flux2_shape_correctness_flashinfer_trtllm(
     assert diff < DEEPGEMM_FP4_MAX_DIFF, f"{m=}, {n=}, {k=}, {diff=:.6f}"
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.skipif(
     not _nvfp4_supported(),
     reason="Diffusion NVFP4 scaled mm correctness requires Blackwell GPUs",
@@ -558,6 +569,7 @@ def test_prequantized_input_matches_regular_apply(
     assert torch.equal(actual, expected)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.skipif(
     not _nvfp4_supported(),
     reason="Diffusion NVFP4 scaled mm correctness requires Blackwell GPUs",
@@ -609,6 +621,7 @@ def test_flux2_swizzled_scale_checkpoint_flashinfer_trtllm_matches_cudnn(
     assert diff < DEEPGEMM_FP4_MAX_DIFF, f"{m=}, {n=}, {k=}, {diff=:.6f}"
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.skipif(
     not _nvfp4_supported(),
     reason="Diffusion NVFP4 scaled mm correctness requires Blackwell GPUs",

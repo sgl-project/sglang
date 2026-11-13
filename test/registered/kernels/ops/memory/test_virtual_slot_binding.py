@@ -17,6 +17,7 @@ register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-s
 
 
 class TestVirtualSlotBinding(CustomTestCase):
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_prefix_alignment_does_not_specialize_bind_kernels(self):
         """Taking one int64 page from a free list changes its pointer's 16-byte
         alignment. Copy-elided prefill must reuse the warmed bind kernel."""

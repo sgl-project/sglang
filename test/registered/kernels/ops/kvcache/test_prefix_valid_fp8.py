@@ -19,6 +19,7 @@ SOURCE_DTYPES = (torch.bfloat16, torch.float16, torch.float32)
 
 
 class TestPrefixValidFp8Kernel(CustomTestCase):
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_matches_eager_bytes_and_preserves_uncommitted_slots(self):
         """Cover tile branches, noncontiguous inputs, tails and mixed commit lengths."""
         batch_size, block_size = 3, 5
@@ -46,6 +47,7 @@ class TestPrefixValidFp8Kernel(CustomTestCase):
                             k, v, k_cache, v_cache, 0.375, 1.75, loc, lengths, row_dim
                         )
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_matches_eager_at_fp8_boundaries(self):
         """Representable limits, NaNs and signed zero follow eager FP8 casting."""
         fp8_max = torch.finfo(fp8_dtype).max
@@ -78,6 +80,7 @@ class TestPrefixValidFp8Kernel(CustomTestCase):
                         k, v, k_cache, v_cache, 1.0, 1.0, loc, lengths, len(values)
                     )
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_scale_division_at_rounding_boundaries(self):
         """Host and GPU scales must retain their distinct eager rounding semantics."""
         loc = torch.tensor([[0]], device=DEVICE)

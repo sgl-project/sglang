@@ -14,6 +14,13 @@ mixing actually engages.
 
 import unittest
 
+import pytest
+import torch
+
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
+
 from sglang.srt.environ import envs
 from sglang.srt.utils import is_sm100_supported, kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci

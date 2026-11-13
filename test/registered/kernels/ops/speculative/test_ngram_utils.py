@@ -10,6 +10,7 @@ register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-s
 register_amd_ci(est_time=15, stage="jit-kernel-unit", runner_config="amd")
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_reconstruct_indices_from_tree_mask():
     bs = 1
     num_branch_token = 4

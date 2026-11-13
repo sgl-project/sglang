@@ -8,6 +8,13 @@ from types import SimpleNamespace
 from typing import List, Type
 from urllib.parse import urlparse
 
+import pytest
+import torch
+
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
+
 import requests
 
 from sglang.test.ascend.disaggregation_utils import TestDisaggregationBase

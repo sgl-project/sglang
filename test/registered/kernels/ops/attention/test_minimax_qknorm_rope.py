@@ -52,6 +52,7 @@ def _ref(q, k, wq, wk, cache, positions, nq, nk):
     return rope(norm(q, wq, nq)).reshape(T, -1), rope(norm(k, wk, nk)).reshape(T, -1)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("nq,nk", [(8, 1), (64, 8), (16, 2)])
 @pytest.mark.parametrize("T", [1, 7, 64, 1024, 4096])
 @pytest.mark.parametrize("pos_dtype", [torch.int32, torch.int64])
@@ -78,6 +79,7 @@ def test_fused_qknorm_rope(nq, nk, T, pos_dtype):
     assert (vf.float() - v.float()).abs().max().item() == 0.0  # V untouched
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 def test_index_branch_shapes():
     # idx_q (nq=num_idx_heads, nk=0) and idx_k (nq=1) in-place calls.
     torch.manual_seed(0)
@@ -107,6 +109,7 @@ def _norm_rope_one(x_heads, w, cache, positions):
     return torch.cat([o1, o2, y[..., 64:]], dim=-1)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize("nq,nkv,niq", [(8, 1, 1), (8, 1, 4), (16, 2, 2)])
 @pytest.mark.parametrize("idx_v", [0, 1])
 @pytest.mark.parametrize("T", [1, 7, 64, 1024])
@@ -175,6 +178,7 @@ def test_combined_main_index_grouped(nq, nkv, niq, idx_v, T, pos_dtype):
 
 # Input scale cancels in the norm, so the Q gain is what reaches the E4M3 edges:
 # 1000 pushes most values past 448, -1 + 2^-8 puts them in the subnormal range.
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Test requires CUDA")
 @pytest.mark.parametrize(
     "nq,nk,niq,q_gain",
     [(8, 1, 4, 1000.0), (8, 1, 4, -1.0 + 2**-8), (64, 8, 16, None)],

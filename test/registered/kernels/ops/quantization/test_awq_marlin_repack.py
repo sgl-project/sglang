@@ -2,6 +2,10 @@ import sys
 
 import pytest
 import torch
+
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
 from sgl_kernel.scalar_type import scalar_types
 
 from sglang.kernels.ops.quantization.awq_marlin_repack import (

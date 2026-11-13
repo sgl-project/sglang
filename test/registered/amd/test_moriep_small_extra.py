@@ -2,6 +2,13 @@ import os
 import unittest
 from types import SimpleNamespace
 
+import pytest
+import torch
+
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
+
 import requests
 from test_moriep_small import common_args, eplb_args, mtp_args, wait_all_ports_release
 

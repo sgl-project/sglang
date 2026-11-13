@@ -41,6 +41,7 @@ else:
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("batch_size", [1, 99, 989])
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
 @pytest.mark.parametrize("k", [10, 100, 500])
@@ -76,6 +77,7 @@ def test_top_k_renorm_probs(batch_size, vocab_size, k):
         )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("batch_size", [1, 99, 989])
 @pytest.mark.parametrize("vocab_size", [111, 32000, 128256])
 @pytest.mark.parametrize("p", [0.1, 0.5, 0.9])
@@ -124,6 +126,7 @@ def _flat_distribution(batch_size: int, vocab_size: int) -> torch.Tensor:
     return torch.softmax(logits, dim=-1)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.skipif(is_hip(), reason="CUDA-only: exercises the flashinfer dispatch")
 @pytest.mark.parametrize("batch_size,vocab_size", [(256, 128256)])
 def test_top_p_renorm_probs_is_deterministic(batch_size, vocab_size):
@@ -139,6 +142,7 @@ def test_top_p_renorm_probs_is_deterministic(batch_size, vocab_size):
         assert torch.equal(top_p_renorm_prob(probs, top_p), ref)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.skipif(is_hip(), reason="CUDA-only: exercises the flashinfer dispatch")
 @pytest.mark.parametrize("batch_size,vocab_size,k", [(256, 128256, 40)])
 def test_top_k_renorm_probs_is_deterministic(batch_size, vocab_size, k):

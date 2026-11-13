@@ -5,7 +5,12 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import pytest
 import torch
+
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
 from safetensors.torch import save_file
 from torch import nn
 from transformers import GemmaConfig, SiglipVisionConfig
@@ -96,6 +101,7 @@ class TestPi05ModelOptFp8CUDA(CustomTestCase):
     def tearDownClass(cls):
         restore_context(cls.saved_context)
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_calibrated_checkpoint_loader_and_mutable_graph_input(self):
         import modelopt.torch.quantization as mtq
 

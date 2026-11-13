@@ -14,6 +14,11 @@ import unittest
 from unittest.mock import patch
 
 import torch
+import pytest
+
+if not torch.cuda.is_available():
+    pytest.skip("Test requires CUDA", allow_module_level=True)
+
 
 from sglang.srt.environ import envs
 from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
