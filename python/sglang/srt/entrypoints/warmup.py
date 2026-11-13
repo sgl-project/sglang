@@ -162,11 +162,7 @@ async def prefill_shapes(disaggregation_mode: str, tokenizer_manager: TokenizerM
 
 
 def _drawn_page(title: str) -> str:
-    """A white page with a title and numbered lines, as a PNG data URL.
-
-    Pillow's built-in bitmap font is enough: the warmup only needs the image
-    path to run, not readable text.
-    """
+    """A white page with a title and numbered lines, as a PNG data URL."""
     import base64
     import io
 
@@ -174,6 +170,7 @@ def _drawn_page(title: str) -> str:
 
     image = Image.new("RGB", (980, 1400), "white")
     draw = ImageDraw.Draw(image)
+    # Default font: a sized one needs Pillow 10.1, which the pin does not require.
     draw.text((90, 90), title, fill="black")
     for i in range(8):
         draw.text((90, 220 + i * 60), f"{i + 1}. {title} line {i + 1}.", fill="black")
@@ -186,13 +183,9 @@ def _drawn_page(title: str) -> str:
 async def unlimited_ocr_v2(
     disaggregation_mode: str, tokenizer_manager: TokenizerManager
 ):
-    """Run a one-page gundam document through the model; opt in with --warmups.
+    """Run one drawn gundam page through the model; opt in with --warmups.
 
-    The first image request otherwise pays one-time vision and decoder graph
-    compiles. On an Apple M5 this request takes 3.6 s with a warm Metal cache
-    and 12.7 s with an empty one, and cuts the first real request's TTFT from
-    2.4 s to 1.6 s and from 7.5 s to 1.7 s. Adding a two-page gundam and a
-    two-page base document costs another 3.8-4.3 s for at most 0.2 s less TTFT.
+    Moves the first image request's one-time graph compiles to startup.
     """
     req = GenerateReqInput(
         text="<PAGE><image>Multi page parsing.",

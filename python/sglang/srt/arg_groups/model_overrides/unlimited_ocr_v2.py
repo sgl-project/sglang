@@ -98,14 +98,8 @@ def _unlimited_ocr_v2_overrides(server_args: Any, hf_config: Any) -> dict:
     return overrides
 
 
-# Document windows the default KV pool holds, by the Metal working-set limit
-# (torch.mps.recommended_max_memory). Measured on a 16 GB M5 (12,124 MiB limit):
-# MPDocBench at concurrency 8 finished in 506-542 s with pools of 24k-38k
-# tokens, and the server's footprint was 12 GB (9.7 GB GPU) at every size. The
-# default there is two windows (30,336 tokens), under the 32,768 the cookbook
-# recipe uses. A window's KV is about 0.9 GB; each further 2 GiB of limit adds
-# one window, up to eight. A lower or unknown limit keeps one window. Only the
-# 16 GB Mac is measured.
+# Measured on a 16 GB M5 only: two windows at its working-set limit, one below;
+# each further 2 GiB, about twice a window's KV, adds one.
 _MPS_MEASURED_LIMIT_MIB = 12124
 _MPS_MIB_PER_EXTRA_WINDOW = 2 * 1024
 _MPS_MAX_DEFAULT_WINDOWS = 8
@@ -121,12 +115,8 @@ def _mps_window_budget(gpu_mem_mib: Optional[float]) -> int:
 def mps_window_tokens(
     doc_cfg: UocrDocumentConfig, *, chunked_prefill_size: Optional[int], page_size: int
 ) -> int:
-    """KV tokens of one document window: its context plus one prefill chunk.
-
-    The chunk holds the retained tail a follow-up window copies. 2048, the
-    smallest chunk handle_gpu_memory_settings picks, also covers chunking
-    turned off (-1).
-    """
+    """KV tokens of one document window: its context plus one prefill chunk."""
+    # The chunk holds the retained tail a follow-up copies; 2048 if chunking is off.
     tokens = doc_cfg.default_context_length() + max(chunked_prefill_size or 0, 2048)
     return (tokens + page_size - 1) // page_size * page_size
 
