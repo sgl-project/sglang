@@ -38,6 +38,8 @@ class TestPipelineCompletion(unittest.TestCase):
                         use_fused_mhc_post_pre=False,
                         _can_fuse_ffn_mhc=fused,
                         _can_fuse_attn_mhc=False,
+                        _can_overlap_attn_stats=False,
+                        _can_overlap_ffn_stats=False,
                         hc_cfg=SimpleNamespace(hidden=4),
                         mlp=SimpleNamespace(tp_size=2),
                         ffn_hc=object(),
