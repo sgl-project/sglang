@@ -285,7 +285,7 @@ class _SpecRequest:
             metrics_collector=None,
             metrics_reporter=MagicMock(),
             draft_worker=None,
-            model_worker=MagicMock(),
+            model_worker=SimpleNamespace(),
             logprob_result_processor=None,
             output_streamer=MagicMock(),
             abort_request=lambda *args, **kwargs: None,
@@ -473,6 +473,18 @@ class TestSpecDecodeRequestEndState(CustomTestCase):
             with self.subTest(strategy=strategy):
                 states = _spec_request_states(2, strategy, True, 11, (4, 4, 1), 0)
                 self.assertEqual(states, [(16, 16)])
+
+    def test_level3_finish_adds_the_latest_decode_state(self):
+        # The prefill donated the prompt's state at 8; the finish adds the state the
+        # second verify tracked at 16 and keeps both on the path.
+        for strategy, overlap in (
+            ("extra_buffer", True),
+            ("extra_buffer", False),
+            ("extra_buffer_lazy", True),
+        ):
+            with self.subTest(strategy=strategy, overlap=overlap):
+                states = _spec_request_states(3, strategy, overlap, 11, (4, 4, 1), 0)
+                self.assertEqual(states, [(16, 16), (8, 8)])
 
     def test_level2_stop_before_the_crossing_falls_back_to_the_prompt_state(self):
         # The second verify runs 13 -> 17 past 16, but the stop at its first token
