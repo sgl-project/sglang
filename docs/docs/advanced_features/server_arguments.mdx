@@ -11,7 +11,7 @@ You can find all arguments by `python3 -m sglang.launch_server --help`
 
 ## Common launch commands
 
-- To use a configuration file, create a YAML file with your server arguments and specify it with `--config`. CLI arguments will override config file values.
+- To use a configuration file, create a YAML file with your server arguments and specify it with `--config`. CLI arguments will override config file values. A key set to `null` or left empty is treated as unset, so that argument keeps its default.
 
   ```bash Command
   # Create config.yaml
