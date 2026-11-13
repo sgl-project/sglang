@@ -35,6 +35,7 @@ from sglang.srt.arg_groups.arg_utils import (
 )
 from sglang.srt.arg_groups.argparse_actions import (
     DeprecatedAction,
+    DeprecatedAliasStoreAction,
     DeprecatedChoiceToFlagAction,
     DeprecatedStoreTrueAction,
 )
@@ -441,6 +442,16 @@ class ServerArgs:
             help="Deprecated. Use --enable-amd-monokernel instead of "
             "--monokernel-backend amd, and --enable-nvidia-megakernel instead of "
             "--monokernel-backend msa.",
+        )
+        # `mamba_max_states_per_path` is `no_cli=True`; any cap still applies.
+        parser.add_argument(
+            "--mamba-max-states-per-path",
+            action=DeprecatedAliasStoreAction,
+            new_flag="--hybrid-cache-checkpoints-level 2",
+            dest="mamba_max_states_per_path",
+            type=int,
+            default=None,
+            help="Deprecated. Use --hybrid-cache-checkpoints-level 2 instead.",
         )
         for flag in (
             "--disable-outlines-disk-cache",
