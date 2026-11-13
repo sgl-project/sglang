@@ -48,6 +48,7 @@ KF_BKG = 512
 KB_BJ = 16
 KB_LA = 256  # LOWRANK = KB_LA + (LOWRANK - KB_LA); both parts powers of two
 KB_WARPS = 4
+KB_WARPS_BM32 = 2  # four warps would each run the whole 32-row MFMA tile
 KC_BLOCK = 2048
 
 
@@ -459,6 +460,6 @@ def hc_seam(
         BJ=KB_BJ,
         LA=KB_LA,
         LB=LOWRANK - KB_LA,
-        num_warps=KB_WARPS,
+        num_warps=KB_WARPS_BM32 if bm == 32 else KB_WARPS,
     )
     return r_new, mixed, gate_new
