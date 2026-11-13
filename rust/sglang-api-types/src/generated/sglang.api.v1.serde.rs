@@ -438,6 +438,36 @@ impl<'de> ::serde::Deserialize<'de> for OptionalStringList {
     }
 }
 
+impl ::serde::Serialize for OptionalDouble {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.value.serialize(serializer)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for OptionalDouble {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(OptionalDouble {
+            value: <Option<f64> as ::serde::Deserialize>::deserialize(deserializer)?,
+        })
+    }
+}
+
+impl ::serde::Serialize for DoubleList {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.items.iter())
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for DoubleList {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(DoubleList {
+            items: <::prost::alloc::vec::Vec<f64> as ::serde::Deserialize>::deserialize(
+                deserializer,
+            )?,
+        })
+    }
+}
+
 impl ::serde::Serialize for OptionalInt64 {
     fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         self.value.serialize(serializer)
@@ -644,9 +674,7 @@ impl<'de> ::serde::Deserialize<'de> for MatchedTokens {
 impl ::serde::Serialize for FinishStop {
     fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut map = serializer.serialize_map(None)?;
-        if let Some(v) = &self.matched {
-            ::serde::ser::SerializeMap::serialize_entry(&mut map, "matched", v)?;
-        }
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "matched", &self.matched)?;
         ::serde::ser::SerializeMap::end(map)
     }
 }
@@ -689,9 +717,7 @@ impl<'de> ::serde::Deserialize<'de> for FinishStop {
 impl ::serde::Serialize for FinishLength {
     fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut map = serializer.serialize_map(None)?;
-        if let Some(v) = &self.length {
-            ::serde::ser::SerializeMap::serialize_entry(&mut map, "length", v)?;
-        }
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "length", &self.length)?;
         ::serde::ser::SerializeMap::end(map)
     }
 }
@@ -863,7 +889,8 @@ impl<'de> ::serde::Deserialize<'de> for FinishReason {
             Some("length") => {
                 let payload = FinishLength {
                     length: match raw.get("length") {
-                        None | Some(::serde_json::Value::Null) => None,
+                        None => None,
+                        Some(::serde_json::Value::Null) => None,
                         Some(v) => match ::serde_json::from_value::<u64>(v.clone()) {
                             Ok(v) => Some(v),
                             Err(_) => return fallback(raw),
@@ -878,7 +905,8 @@ impl<'de> ::serde::Deserialize<'de> for FinishReason {
                 let payload =
                     FinishAbort {
                         message: match raw.get("message") {
-                            None | Some(::serde_json::Value::Null) => None,
+                            None => None,
+                            Some(::serde_json::Value::Null) => None,
                             Some(v) => match ::serde_json::from_value::<
                                 ::prost::alloc::string::String,
                             >(v.clone())
@@ -888,14 +916,16 @@ impl<'de> ::serde::Deserialize<'de> for FinishReason {
                             },
                         },
                         status_code: match raw.get("status_code") {
-                            None | Some(::serde_json::Value::Null) => None,
+                            None => None,
+                            Some(::serde_json::Value::Null) => None,
                             Some(v) => match ::serde_json::from_value::<u32>(v.clone()) {
                                 Ok(v) => Some(v),
                                 Err(_) => return fallback(raw),
                             },
                         },
                         err_type: match raw.get("err_type") {
-                            None | Some(::serde_json::Value::Null) => None,
+                            None => None,
+                            Some(::serde_json::Value::Null) => None,
                             Some(v) => match ::serde_json::from_value::<
                                 ::prost::alloc::string::String,
                             >(v.clone())
@@ -3571,20 +3601,40 @@ impl<'de> ::serde::Deserialize<'de> for MediaInput {
                 while let Some(v) = seq.next_element::<::serde_json::Value>()? {
                     items.push(v);
                 }
-                let nested = items.first().is_some_and(|f| f.is_array());
+                let shape = match items.first() {
+                    None => "empty",
+                    Some(::serde_json::Value::Array(inner))
+                        if inner.first().is_some_and(|x| x.is_array()) =>
+                    {
+                        "seq2"
+                    }
+                    Some(::serde_json::Value::Array(_)) => "seq",
+                    Some(::serde_json::Value::String(_)) => "str",
+                    Some(::serde_json::Value::Number(n)) if n.is_i64() || n.is_u64() => "int",
+                    Some(::serde_json::Value::Number(_)) => "float",
+                    Some(::serde_json::Value::Object(_)) => "map",
+                    Some(::serde_json::Value::Bool(_)) => "bool",
+                    Some(::serde_json::Value::Null) => "null",
+                };
                 let reparse = ::serde_json::Value::Array(items);
-                if nested {
-                    let v: MediaItemsList =
-                        ::serde_json::from_value(reparse).map_err(::serde::de::Error::custom)?;
-                    Ok(MediaInput {
-                        value: Some(media_input::Value::Nested(v)),
-                    })
-                } else {
-                    let v: MediaItems =
-                        ::serde_json::from_value(reparse).map_err(::serde::de::Error::custom)?;
-                    Ok(MediaInput {
-                        value: Some(media_input::Value::Many(v)),
-                    })
+                match shape {
+                    "str" | "map" | "null" | "empty" => {
+                        let v: MediaItems = ::serde_json::from_value(reparse)
+                            .map_err(::serde::de::Error::custom)?;
+                        Ok(MediaInput {
+                            value: Some(media_input::Value::Many(v)),
+                        })
+                    }
+                    "seq" => {
+                        let v: MediaItemsList = ::serde_json::from_value(reparse)
+                            .map_err(::serde::de::Error::custom)?;
+                        Ok(MediaInput {
+                            value: Some(media_input::Value::Nested(v)),
+                        })
+                    }
+                    other => Err(::serde::de::Error::custom(format!(
+                        "no MediaInput array form takes {other} elements"
+                    ))),
                 }
             }
         }

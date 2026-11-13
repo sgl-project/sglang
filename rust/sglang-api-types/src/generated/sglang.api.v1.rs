@@ -140,6 +140,17 @@ pub struct OptionalStringList {
     #[prost(message, repeated, tag = "1")]
     pub items: ::prost::alloc::vec::Vec<OptionalString>,
 }
+/// A nullable double list element (e.g. a completion token logprob).
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct OptionalDouble {
+    #[prost(double, optional, tag = "1")]
+    pub value: ::core::option::Option<f64>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DoubleList {
+    #[prost(double, repeated, tag = "1")]
+    pub items: ::prost::alloc::vec::Vec<f64>,
+}
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct OptionalInt64 {
     #[prost(int64, optional, tag = "1")]
