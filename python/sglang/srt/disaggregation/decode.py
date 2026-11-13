@@ -1168,8 +1168,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             and result.host_hit_length > 0
             and result.best_match_node is not None
         ):
-            self.tree_cache.borrow_host_prefix(req.rid, result.best_match_node)
-            req.hisparse_borrowed_host_node = result.best_match_node
+            coordinator = self.scheduler.hisparse_coordinator
+            params = self.tree_cache.borrow_host_prefix(result.best_match_node)
+            coordinator.host_ledger.borrow_node(
+                req.kv.req_pool_idx, result.best_match_node, params
+            )
         return self._build_decode_prefix_match(
             req, result, max_prefix_len=max_prefix_len
         )
@@ -3007,19 +3010,22 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
     def _release_host_prefix_ref(self, req: Req) -> None:
         """Drop the match-time host-prefix borrow when it goes unused."""
-        if not self._host_radix:
+        if not self._host_radix or req.kv.req_pool_idx is None:
             return
-        release = getattr(self.tree_cache, "release_host_prefix", None)
-        if release is not None:
-            release(req.rid)
-        req.hisparse_borrowed_host_node = None
+        ledger = self.scheduler.hisparse_coordinator.host_ledger
+        for node_id, params in ledger.pop_nodes(req.kv.req_pool_idx):
+            self.tree_cache.dec_host_lock_ref(node_id, params)
 
     def _gather_hisparse_host_prefix(self, req: Req) -> Optional[torch.Tensor]:
         """Host slot indices of the matched prefix this request will adopt.
 
         Walks the borrowed best-match node's chain; None when nothing was borrowed.
         """
-        node_id = getattr(req, "hisparse_borrowed_host_node", None)
+        if req.kv.req_pool_idx is None:
+            return None
+        node_id = self.scheduler.hisparse_coordinator.host_ledger.borrowed_node(
+            req.kv.req_pool_idx
+        )
         if node_id is None:
             return None
         return self.tree_cache.get_host_prefix_indices(node_id)
@@ -3039,13 +3045,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             and len(host_prefix_indices) >= host_prefix_len
         ), "decode_prefix_len promised to prefill exceeds the adoptable host prefix"
 
-        table = coordinator.req_to_host_pool
-        idx = req.kv.req_pool_idx
-        table[idx, :host_prefix_len] = host_prefix_indices[:host_prefix_len].to(
-            table.device, non_blocking=True
+        coordinator.host_ledger.adopt(
+            req.kv.req_pool_idx, host_prefix_len, host_prefix_indices
         )
-        coordinator.req_to_host_pool_allocated_len[idx] = host_prefix_len
-        req.hisparse_borrowed_prefix_len = host_prefix_len
         return host_prefix_len
 
     def _pre_alloc(
@@ -3166,12 +3168,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             rdma_suffix_host_len = (
                 coordinator.host_token_len(fill_len) - host_prefix_len
             )
-            host_indices = coordinator.mem_pool_host.alloc_paged_token_slots(
-                coordinator.req_to_host_pool,
-                coordinator.req_to_host_pool_allocated_len,
-                req.kv.req_pool_idx,
-                host_prefix_len,
-                rdma_suffix_host_len,
+            host_indices = coordinator.host_ledger.alloc(
+                req.kv.req_pool_idx, host_prefix_len, rdma_suffix_host_len
             )
             if self._host_radix and host_prefix_len:
                 logger.info(
@@ -4242,11 +4240,12 @@ class SchedulerDisaggregationDecodeMixin:
         if key_len == 0:
             return
 
-        token_matched, _node = self.tree_cache.insert_host_prefix(
-            req.rid,
+        token_matched, _node, params = self.tree_cache.insert_host_prefix(
             radix_key[:key_len],
             coordinator.req_to_host_pool[req.kv.req_pool_idx, :key_len],
         )
+        if params is not None:
+            coordinator.host_ledger.borrow_node(req.kv.req_pool_idx, _node, params)
         # record_host_insert accumulates (no clobber of the finish-time entry);
         # also triggers the page-aligned index-K D2H.
         coordinator.record_host_insert(

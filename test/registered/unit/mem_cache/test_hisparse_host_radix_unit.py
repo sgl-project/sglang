@@ -17,6 +17,7 @@ from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.mem_cache.allocator.hisparse import HiSparseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.pool_host.hisparse import HiSparseHostPoolMixin
+from sglang.srt.mem_cache.sparsity.host_ledger import HiSparseHostLedger
 from sglang.srt.mem_cache.unified_cache.component_type import (
     BASE_COMPONENT_TYPE,
     ComponentType,
@@ -74,54 +75,76 @@ class TestGatherHostPrefixIndices(CustomTestCase):
 
 
 class TestRecordHostInsert(CustomTestCase):
-    """HiSparseCoordinator.record_host_insert owned/discard bookkeeping."""
+    """HiSparseCoordinator.record_host_insert -> host_ledger.hand_to_tree."""
 
-    def _coord(self):
+    def _ledger(self, allocated_len=256):
+        pool = _FakeHostPool(0, page_size=4)
+        table = torch.zeros((1, allocated_len), dtype=torch.int64)
+        allocated = torch.tensor([allocated_len])
+        for i in range(allocated_len):
+            table[0, i] = i
+        return HiSparseHostLedger(pool, table, allocated)
+
+    def _coord(self, ledger=None):
         calls = []
-        stub = SimpleNamespace(
+        ledger = ledger or self._ledger()
+        coord = SimpleNamespace(
+            host_ledger=ledger,
             backup_index_k_range=lambda req, s, e, *, written_by_forward: calls.append(
                 (s, e, written_by_forward)
-            )
+            ),
         )
-        return stub, calls
+        return coord, ledger, calls
 
     def _rec(self, coord, req, matched, key_len, wbf=True):
         HiSparseCoordinator.record_host_insert(
             coord, req, matched_len=matched, key_len=key_len, written_by_forward=wbf
         )
 
+    @staticmethod
+    def _req(slot=0):
+        return SimpleNamespace(kv=SimpleNamespace(req_pool_idx=slot))
+
     def test_first_insert_sets_owned_no_discard(self):
-        coord, calls = self._coord()
-        req = SimpleNamespace(hisparse_borrowed_prefix_len=0)
-        self._rec(coord, req, matched=0, key_len=10, wbf=False)
-        self.assertEqual(req._hisparse_host_owned_len, 10)
-        self.assertIsNone(getattr(req, "_hisparse_host_discarded", None))
+        coord, ledger, calls = self._coord()
+        self._rec(coord, self._req(), matched=0, key_len=10, wbf=False)
+        rec = ledger.snapshot()[0]
+        self.assertEqual(rec.owned_len, 10)
+        self.assertEqual(rec.discarded, [])
         self.assertEqual(calls, [(0, 10, False)])  # backup_index_k_range forwarded
 
     def test_rematch_of_own_node_is_not_a_discard(self):
-        coord, _ = self._coord()
-        req = SimpleNamespace(hisparse_borrowed_prefix_len=0)
-        self._rec(coord, req, matched=0, key_len=10, wbf=False)  # own [0,10)
-        self._rec(coord, req, matched=10, key_len=20, wbf=True)  # finish re-matches it
-        self.assertEqual(req._hisparse_host_owned_len, 20)
-        self.assertIsNone(getattr(req, "_hisparse_host_discarded", None))
+        coord, ledger, _ = self._coord()
+        self._rec(coord, self._req(), matched=0, key_len=10, wbf=False)
+        self._rec(coord, self._req(), matched=10, key_len=20, wbf=True)
+        rec = ledger.snapshot()[0]
+        self.assertEqual(rec.owned_len, 20)
+        self.assertEqual(rec.discarded, [])
 
     def test_discard_when_foreign_node_covers_range(self):
-        coord, _ = self._coord()
-        req = SimpleNamespace(hisparse_borrowed_prefix_len=0)
-        self._rec(coord, req, matched=0, key_len=10, wbf=False)  # owned -> 10
+        coord, ledger, _ = self._coord()
+        self._rec(coord, self._req(), matched=0, key_len=10, wbf=False)
         # a node this req did NOT hand over covers [10,16): discard it
-        self._rec(coord, req, matched=16, key_len=24, wbf=True)
-        self.assertEqual(req._hisparse_host_owned_len, 24)
-        self.assertEqual(req._hisparse_host_discarded, [(10, 16)])
+        self._rec(coord, self._req(), matched=16, key_len=24, wbf=True)
+        rec = ledger.snapshot()[0]
+        self.assertEqual(rec.owned_len, 24)
+        self.assertEqual(rec.discarded, [(10, 16)])
 
     def test_borrowed_prefix_rematch_not_discarded(self):
-        coord, _ = self._coord()
-        req = SimpleNamespace(hisparse_borrowed_prefix_len=8)
+        ledger = self._ledger()
+        ledger.adopt(0, 8, torch.arange(8))
+        coord, _, _ = self._coord(ledger)
         # matched==borrowed is a re-match of the borrowed prefix, not a discard
-        self._rec(coord, req, matched=8, key_len=20, wbf=True)
-        self.assertEqual(req._hisparse_host_owned_len, 20)
-        self.assertIsNone(getattr(req, "_hisparse_host_discarded", None))
+        self._rec(coord, self._req(), matched=8, key_len=20, wbf=True)
+        rec = ledger.snapshot()[0]
+        self.assertEqual(rec.owned_len, 20)
+        self.assertEqual(rec.discarded, [])
+
+    def test_ledger_verify_is_clean(self):
+        coord, ledger, _ = self._coord()
+        self._rec(coord, self._req(), matched=0, key_len=10, wbf=False)
+        self._rec(coord, self._req(), matched=16, key_len=24, wbf=True)
+        self.assertEqual(ledger.verify(), [])
 
 
 class TestAllocatedHostIndicesStart(CustomTestCase):
@@ -252,9 +275,22 @@ class _FakeHostPool:
     def __init__(self, available, page_size=4):
         self.available = available
         self.page_size = page_size
+        self._next = 1000
 
     def available_size(self):
         return self.available
+
+    def alloc_paged_token_slots(self, table, allocated, idx, start, num_tokens):
+        """Mirror HiSparseHostPoolMixin: page-granular slots, token-granular view."""
+        allocated_len = int(allocated[idx])
+        page_end = -(-(start + num_tokens) // self.page_size) * self.page_size
+        if page_end > allocated_len:
+            n = page_end - allocated_len
+            locs = torch.arange(self._next, self._next + n, dtype=torch.int64)
+            self._next += n
+            table[idx, allocated_len:page_end] = locs
+            allocated[idx] = page_end
+        return table[idx, start : start + num_tokens]
 
 
 class TestEnsureHostFree(CustomTestCase):
@@ -532,118 +568,103 @@ class TestUsesHisparseHostRadix(CustomTestCase):
 
 
 class TestReleaseHostAfterInsert(CustomTestCase):
-    """The four-range host teardown. Freeing a borrowed or tree-owned range
-    corrupts another request's prefix; skipping the tail leaks host slots."""
+    """HiSparseCoordinator.release_host_after_insert: the ledger names the ranges
+    and the host locks; the coordinator frees and unlocks."""
 
-    def _coord(self, allocated_len):
-        freed = []
+    def _coord(self, allocated_len=256):
+        pool = _FakeHostPool(0, page_size=4)
+        table = torch.zeros((1, allocated_len), dtype=torch.int64)
+        allocated = torch.tensor([allocated_len])
+        for i in range(allocated_len):
+            table[0, i] = i
+        ledger = HiSparseHostLedger(pool, table, allocated)
+        allocated[:] = 0
+        table[:] = -1
+        ledger.alloc(0, 0, allocated_len)
+        ledger._records.clear()
+        freed, dropped = [], []
         coord = SimpleNamespace(
-            req_to_host_pool_allocated_len=torch.tensor([allocated_len]),
-            req_to_host_pool=torch.zeros((1, allocated_len), dtype=torch.int64),
-            _host_borrow_release_fn=None,
-            borrowed_prefix_len=HiSparseCoordinator.borrowed_prefix_len,
+            host_ledger=ledger,
+            req_to_host_pool=table,
+            _host_borrow_release_fn=lambda node, params: dropped.append((node, params)),
             _free_host_range=lambda idx, start, end: (
                 freed.append((start, end)) if end > start else None
             ),
         )
-        return coord, freed
+        return coord, ledger, freed, dropped
 
     @staticmethod
-    def _req(**over):
-        req = SimpleNamespace(
-            rid="r0",
-            kv=SimpleNamespace(req_pool_idx=0),
-            hisparse_borrowed_prefix_len=0,
-            _hisparse_host_owned_len=0,
-            _hisparse_host_discarded=None,
-        )
-        for k, v in over.items():
-            setattr(req, k, v)
-        return req
+    def _req(slot=0):
+        return SimpleNamespace(rid="r0", kv=SimpleNamespace(req_pool_idx=slot))
 
-    def _release(self, coord, req):
-        HiSparseCoordinator.release_host_after_insert(coord, req)
+    def _release(self, coord, req=None, idx=0):
+        HiSparseCoordinator.release_host_after_insert(coord, req or self._req(), idx)
 
     def test_no_insert_no_borrow_frees_everything(self):
-        coord, freed = self._coord(256)
-        self._release(coord, self._req())
+        coord, _, freed, _ = self._coord()
+        self._release(coord)
         self.assertEqual(freed, [(0, 256)])
 
     def test_borrowed_prefix_is_never_freed(self):
-        coord, freed = self._coord(256)
-        self._release(coord, self._req(hisparse_borrowed_prefix_len=64))
+        coord, ledger, freed, _ = self._coord()
+        ledger.adopt(0, 64, torch.arange(64))
+        self._release(coord)
         self.assertEqual(freed, [(64, 256)])
 
     def test_owned_range_is_left_to_evict_host(self):
-        coord, freed = self._coord(256)
-        self._release(coord, self._req(_hisparse_host_owned_len=192))
+        coord, ledger, freed, _ = self._coord()
+        ledger.hand_to_tree(0, 0, 192)
+        self._release(coord)
         self.assertEqual(freed, [(192, 256)])
 
     def test_discarded_holes_are_freed_separately(self):
-        coord, freed = self._coord(256)
-        self._release(
-            coord,
-            self._req(
-                _hisparse_host_owned_len=192,
-                _hisparse_host_discarded=[(64, 128)],
-            ),
-        )
+        coord, ledger, freed, _ = self._coord()
+        ledger.adopt(0, 64, torch.arange(64))
+        ledger.hand_to_tree(0, 128, 192)  # [64,128) skipped by the insert
+        self._release(coord)
         self.assertEqual(freed, [(64, 128), (192, 256)])
 
     def test_discard_past_allocated_is_clamped(self):
         # Defensive: a discard range is always inside the allocated span, but
         # clamping keeps a stale one from freeing slots this request never had.
-        coord, freed = self._coord(256)
-        self._release(
-            coord,
-            self._req(
-                _hisparse_host_owned_len=256,
-                _hisparse_host_discarded=[(128, 4096)],
-            ),
-        )
+        coord, ledger, freed, _ = self._coord()
+        ledger.adopt(0, 128, torch.arange(128))
+        ledger.hand_to_tree(0, 4096, 4096)
+        self._release(coord)
         self.assertEqual(freed, [(128, 256)])
 
     def test_fully_owned_frees_nothing(self):
-        coord, freed = self._coord(256)
-        self._release(coord, self._req(_hisparse_host_owned_len=256))
+        coord, ledger, freed, _ = self._coord()
+        ledger.hand_to_tree(0, 0, 256)
+        self._release(coord)
         self.assertEqual(freed, [])
 
     def test_state_is_reset_for_a_resumed_request(self):
         # A retract-resumed request never re-matches, so a stale borrow length
         # would make the next teardown skip that many live slots.
-        coord, _ = self._coord(256)
-        req = self._req(hisparse_borrowed_prefix_len=64, _hisparse_host_owned_len=128)
-        self._release(coord, req)
-        self.assertEqual(req.hisparse_borrowed_prefix_len, 0)
-        self.assertEqual(req._hisparse_host_owned_len, 0)
-        self.assertIsNone(req._hisparse_host_discarded)
-        self.assertEqual(int(coord.req_to_host_pool_allocated_len[0]), 0)
-        self.assertTrue(bool((coord.req_to_host_pool == -1).all()))
+        coord, ledger, _, _ = self._coord()
+        ledger.adopt(0, 64, torch.arange(64))
+        ledger.hand_to_tree(0, 128, 128)
+        self._release(coord)
+        self.assertFalse(ledger.tracks(0))
+        self.assertEqual(ledger.allocated(0), 0)
 
-    def test_borrow_refs_are_dropped_by_rid(self):
-        coord, _ = self._coord(256)
-        dropped = []
-        coord._host_borrow_release_fn = dropped.append
-        req = self._req(hisparse_borrowed_host_node=7)
-        self._release(coord, req)
-        self.assertEqual(dropped, ["r0"])
+    def test_borrow_refs_are_dropped(self):
+        coord, ledger, _, dropped = self._coord()
+        ledger.borrow_node(0, 7, "receipt")
+        self._release(coord)
+        self.assertEqual(dropped, [(7, "receipt")])
         # The borrow is gone, so the node id must not survive to be gathered.
-        self.assertIsNone(req.hisparse_borrowed_host_node)
+        self.assertIsNone(ledger.borrowed_node(0))
 
-    def test_falls_back_to_the_stashed_pool_index(self):
-        # release_kv_cache nulls req.kv.req_pool_idx before this runs.
-        coord, freed = self._coord(256)
-        req = self._req(_hisparse_host_pool_idx=0)
-        req.kv.req_pool_idx = None
-        self._release(coord, req)
-        self.assertEqual(freed, [(0, 256)])
-
-    def test_missing_pool_index_asserts(self):
-        coord, _ = self._coord(256)
+    def test_caller_passes_the_slot_index(self):
+        # release_kv_cache nulls req.kv.req_pool_idx before this runs, so the
+        # index comes from the caller, not from the request.
+        coord, _, freed, _ = self._coord()
         req = self._req()
         req.kv.req_pool_idx = None
-        with self.assertRaises(AssertionError):
-            self._release(coord, req)
+        self._release(coord, req, idx=0)
+        self.assertEqual(freed, [(0, 256)])
 
 
 class TestRustTreeCoreFallback(CustomTestCase):
@@ -705,12 +726,12 @@ class TestRequestRetirerHostRadixSplit(CustomTestCase):
         def release_request_device(req):
             # A staging request is freed whole, so no host half is owed.
             calls.append("staging" if staging else "device")
-            return not staging
+            return None if staging else 0
 
         coord = SimpleNamespace(
             release_request=lambda req: calls.append("full"),
             release_request_device=release_request_device,
-            release_host_after_insert=lambda req: calls.append("host"),
+            release_host_after_insert=lambda req, idx: calls.append("host"),
         )
         retirer = request_retirer.RequestRetirer(
             tree_cache=SimpleNamespace(),

@@ -505,9 +505,6 @@ class UnifiedRadixCache(BasePrefixCache):
         self.prefetch_loaded_tokens_by_reqid: dict[CacheRequestHandle, int] = {}
         self.prefetch_loaded_storage_start_by_reqid: dict[CacheRequestHandle, int] = {}
         self.ongoing_prefetch: dict[CacheRequestHandle, _OngoingPrefetch] = {}
-        # HiSparse host-prefix locks: req_id -> list of (node, receipt).
-        # eviction can't reclaim slots it still reads or just handed over.
-        self.borrowed_host_nodes: dict[str, list[tuple[NodeId, DecLockRefParams]]] = {}
         self._storage_prefetch_wait: dict[CacheRequestHandle, _StoragePrefetchWait] = {}
         # Rank-agreed L3-hit tokens not yet resolved as usable or unfulfilled.
         # Cache-mode entries survive L3->L2 until H2D succeeds or admission
@@ -1519,34 +1516,31 @@ class UnifiedRadixCache(BasePrefixCache):
             return DecLockRefResult()
         return self.tree_core.dec_host_lock_ref(node_id, params)
 
-    def borrow_host_prefix(self, req_id: str, node_id: NodeId) -> None:
-        # Pin the L2 host prefix a request reuses until it finishes.
-        params = self.inc_host_lock_ref(node_id).to_dec_params()
-        self.borrowed_host_nodes.setdefault(req_id, []).append((node_id, params))
+    def borrow_host_prefix(self, node_id: NodeId) -> DecLockRefParams:
+        """Pin the L2 host prefix a request reuses until it finishes; return the
+        receipt, which the caller's host ledger holds and drops at release."""
+        return self.inc_host_lock_ref(node_id).to_dec_params()
 
-    def insert_host_prefix(self, req_id: str, key: RadixKey, host_value: torch.Tensor):
-        # Publish a request's host slots as host-only tree nodes (value=None).
+    def insert_host_prefix(self, key: RadixKey, host_value: torch.Tensor):
+        """Publish a request's host slots as host-only tree nodes (value=None).
+
+        Return (matched_len, node_id, receipt-or-None); the receipt pins the new
+        node's host slots and is owned by the caller's host ledger.
+        """
         if self.disable or len(key) == 0:
-            return 0, None
+            return 0, None, None
         result = self.tree_core.insert_host(
             self.tree_core.root_node.id, key, host_value, None
         )
         self._apply_cache_actions(result.cache_actions)
         node_id = result.inserted_host_node
+        params = None
         if node_id is not None and node_id != self.tree_core.root_node.id:
             params = self.inc_host_lock_ref(node_id).to_dec_params()
-            self.borrowed_host_nodes.setdefault(req_id, []).append((node_id, params))
-        return result.prefix_len, node_id
+        return result.prefix_len, node_id, params
 
     def get_host_prefix_indices(self, node_id: NodeId) -> torch.Tensor:
         return self.tree_core.gather_host_prefix_indices(node_id)
-
-    def release_host_prefix(self, req_id: str) -> None:
-        # Drop every host lock this request took (borrow + publishes). Idempotent.
-        entries = self.borrowed_host_nodes.pop(req_id, None)
-        if entries:
-            for node_id, params in entries:
-                self.dec_host_lock_ref(node_id, params)
 
     def maybe_hand_to_session(self, req: Req) -> None:
         self.session.take(req)
@@ -1605,9 +1599,11 @@ class UnifiedRadixCache(BasePrefixCache):
         key_len = key_len // self.page_size * self.page_size
         if key_len > 0:
             host_value = coordinator.req_to_host_pool[req_pool_idx, :key_len]
-            token_matched, _node = self.insert_host_prefix(
-                req.rid, radix_key[:key_len], host_value
+            token_matched, _node, params = self.insert_host_prefix(
+                radix_key[:key_len], host_value
             )
+            if params is not None:
+                coordinator.host_ledger.borrow_node(req_pool_idx, _node, params)
             coordinator.record_host_insert(
                 req,
                 matched_len=token_matched,

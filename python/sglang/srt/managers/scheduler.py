@@ -1399,7 +1399,7 @@ class Scheduler(
             self.hisparse_coordinator.set_host_evict_fn(self.tree_cache.evict_host)
             self.tree_cache.hisparse_coordinator = self.hisparse_coordinator
             self.hisparse_coordinator.set_host_borrow_release_fn(
-                self.tree_cache.release_host_prefix
+                self.tree_cache.dec_host_lock_ref
             )
             self.hisparse_coordinator.indexer_host_pool = (
                 self.tree_cache.host_pool_group.get_pool(PoolName.INDEXER)

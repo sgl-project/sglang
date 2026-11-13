@@ -289,6 +289,8 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
             req_to_host_pool_allocated_len=object(),
             host_token_len=MagicMock(side_effect=lambda token_len: token_len // 4),
         )
+        coordinator.host_ledger = MagicMock()
+        coordinator.host_ledger.alloc.return_value = host_indices
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
         queue.req_to_token_pool = req_to_token_pool
         queue.token_to_kv_pool_allocator = allocator
@@ -320,12 +322,8 @@ class TestDeepSeekV4HiSparseAllocator(CustomTestCase):
         self.assertEqual(req.extend_end, fill_len)
         self.assertEqual(len(req_to_token_pool.writes), 1)
         coordinator.host_token_len.assert_called_once_with(fill_len)
-        regular_host_alloc.assert_called_once_with(
-            coordinator.req_to_host_pool,
-            coordinator.req_to_host_pool_allocated_len,
-            req.kv.req_pool_idx,
-            0,
-            len(host_indices),
+        coordinator.host_ledger.alloc.assert_called_once_with(
+            req.kv.req_pool_idx, 0, len(host_indices)
         )
         self.assertTrue(torch.equal(req_to_token_pool.writes[0][1], kv_loc))
 

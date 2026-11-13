@@ -64,6 +64,7 @@ from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool, ReqToTokenPool
 from sglang.srt.mem_cache.memory_pool_host import DeepSeekV4PagedHostPool
 from sglang.srt.mem_cache.pool_host.mha import HiSparseMHATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from sglang.srt.mem_cache.sparsity.host_ledger import HiSparseHostLedger
 from sglang.srt.runtime_context import get_parallel
 
 if TYPE_CHECKING:
@@ -763,6 +764,12 @@ class HiSparseCoordinator:
         )
         self.req_to_host_pool_allocated_len = torch.zeros(
             max_num_req_slots, dtype=torch.int64, device="cpu"
+        )
+        # One owner for host-slot and host-lock lifecycle; see host_ledger.
+        self.host_ledger = HiSparseHostLedger(
+            self.mem_pool_host,
+            self.req_to_host_pool,
+            self.req_to_host_pool_allocated_len,
         )
 
         self.write_staging_stream = device_module.Stream()
@@ -1565,14 +1572,13 @@ class HiSparseCoordinator:
 
         return top_k_indices
 
-    @staticmethod
-    def borrowed_prefix_len(req: Req) -> int:
+    def borrowed_prefix_len(self, req_pool_idx: int) -> int:
         """Length (host slots) of the req_to_host_pool prefix filled from radix.
 
-        Set by the decode-side prefix match when it admits the request from a
-        host-only radix node; 0 means the request allocated all host slots itself.
+        Recorded by the decode-side prefix match when it admits the request from
+        a host-only radix node; 0 means the request allocated all slots itself.
         """
-        return int(getattr(req, "hisparse_borrowed_prefix_len", 0) or 0)
+        return self.host_ledger.borrowed_len(req_pool_idx)
 
     def _resolve_indexer_host_pool(self):
         """The INDEXER sidecar host pool, or None when it is not wired."""
@@ -1692,24 +1698,25 @@ class HiSparseCoordinator:
 
         # Free host memory allocated during admit.
         self.spec_swap.free_unrotated_scratch(req.kv.req_pool_idx)
-        self.release_host_after_insert(req)
+        self.release_host_after_insert(req, req.kv.req_pool_idx)
         self._skip_first_backup[req.kv.req_pool_idx] = False
         req.hisparse_staging = False
 
     def release_request(self, req: Req):
         """Free what a request holds here, whether finished, aborted or retracted."""
-        if self.release_request_device(req):
-            self.release_host_after_insert(req)
+        req_pool_idx = self.release_request_device(req)
+        if req_pool_idx is not None:
+            self.release_host_after_insert(req, req_pool_idx)
 
-    def release_request_device(self, req: Req) -> bool:
-        """Device half of release_request; return whether the host half is still owed.
+    def release_request_device(self, req: Req) -> Optional[int]:
+        """Device half of a release; return the slot index when the host half is owed.
 
         A request still staging is freed whole, host included, so the caller must
-        not release its host slots again.
+        not release its host slots again (None).
         """
         if req.hisparse_staging:
             self._release_staging(req)
-            return False
+            return None
 
         # release resources only after the execution of a potential overlapped batch
         if self.decode_producer_stream is not None:
@@ -1765,9 +1772,9 @@ class HiSparseCoordinator:
         self.spec_swap.clear_scratch(req_pool_idx)
         self._skip_first_backup[req_pool_idx] = False
 
-        # Stash the slot index, release_kv_cache will have nulled req.kv.req_pool_idx.
-        req._hisparse_host_pool_idx = req_pool_idx
-        return True
+        # release_kv_cache nulls req.kv.req_pool_idx, so hand the slot back to
+        # the caller for the host half.
+        return req_pool_idx
 
     # once the decode radix tree exists, the tree owns the borrow/publish receipts,
     _host_borrow_release_fn = None
@@ -1793,16 +1800,9 @@ class HiSparseCoordinator:
         Called once per insert: the early prompt publish right after the P->D RDMA
         lands, and again from the finish-time insert.
         """
-        owned_len = int(getattr(req, "_hisparse_host_owned_len", 0))
-        discard_start = max(owned_len, HiSparseCoordinator.borrowed_prefix_len(req))
-        discard_end = max(discard_start, int(matched_len))
-        if discard_end > discard_start:
-            discarded = getattr(req, "_hisparse_host_discarded", None)
-            if not discarded:
-                discarded = []
-                req._hisparse_host_discarded = discarded
-            discarded.append((discard_start, discard_end))
-        req._hisparse_host_owned_len = max(owned_len, int(key_len))
+        self.host_ledger.hand_to_tree(
+            req.kv.req_pool_idx, int(matched_len), int(key_len)
+        )
 
         self.backup_index_k_range(
             req,
@@ -1811,7 +1811,7 @@ class HiSparseCoordinator:
             written_by_forward=written_by_forward,
         )
 
-    def release_host_after_insert(self, req: Req) -> None:
+    def release_host_after_insert(self, req: Req, req_pool_idx: int) -> None:
         """Host-side teardown, split by who owns each req_to_host_pool range.
 
         Three owners, two free points:
@@ -1830,38 +1830,15 @@ class HiSparseCoordinator:
         Private tail  [max(borrowed_prefix_len, owned_len), allocated_len)
             Never taken by the tree -- free it.
         """
-        # On the radix path this runs after release_kv_cache, which has nulled
-        # req.kv.req_pool_idx, so fall back to the stashed index. The
-        # _release_staging path has no device teardown and still holds one.
-        req_pool_idx = req.kv.req_pool_idx
-        if req_pool_idx is None:
-            req_pool_idx = getattr(req, "_hisparse_host_pool_idx", None)
-        assert req_pool_idx is not None, (
-            "release_host_after_insert needs a req_pool_idx: neither req nor the "
-            "release_request_device stash has one, so this request's host slots "
-            "cannot be identified and would leak."
-        )
-        allocated_len = int(self.req_to_host_pool_allocated_len[req_pool_idx])
-        owned_len = int(getattr(req, "_hisparse_host_owned_len", 0))
-
-        for start, end in getattr(req, "_hisparse_host_discarded", None) or ():
-            self._free_host_range(req_pool_idx, start, min(end, allocated_len))
-        self._free_host_range(
-            req_pool_idx, max(self.borrowed_prefix_len(req), owned_len), allocated_len
-        )
-
+        plan = self.host_ledger.release(req_pool_idx)
+        for start, end in plan.free:
+            self._free_host_range(req_pool_idx, start, end)
+        # Borrowed + published host locks go with the slots; the ledger was the
+        # only place that knew them, so a stale node cannot outlive the request.
         if self._host_borrow_release_fn is not None:
-            self._host_borrow_release_fn(req.rid)
-
-        req._hisparse_host_owned_len = 0
-        req._hisparse_host_discarded = None
-        req._hisparse_host_pool_idx = None
-        req.hisparse_borrowed_prefix_len = 0
-        # The borrow is gone with the ref above; a stale NodeId would let a
-        # rebootstrap gather slots the tree no longer pins.
-        req.hisparse_borrowed_host_node = None
+            for node_id, params in plan.nodes:
+                self._host_borrow_release_fn(node_id, params)
         self.req_to_host_pool[req_pool_idx, :] = -1
-        self.req_to_host_pool_allocated_len[req_pool_idx] = 0
 
     def _free_host_range(self, req_pool_idx: int, start: int, end: int) -> None:
         """Free this request's private host slots in [start, end)."""
