@@ -1,6 +1,7 @@
 import heapq
 import logging
 import math
+from functools import lru_cache
 from typing import Any, Dict, List, Optional, Union
 
 from fastapi import Request
@@ -135,6 +136,12 @@ def _get_jinja_env():
     )
 
 
+@lru_cache(maxsize=32)
+def _compile_rerank_template(chat_template: str):
+    # Cache only the template; request data belongs in each render's context.
+    return _get_jinja_env().from_string(chat_template)
+
+
 def _render_jinja_chat_template(
     chat_template: str,
     *,
@@ -143,8 +150,7 @@ def _render_jinja_chat_template(
     instruct: Optional[str],
 ) -> str:
     """Render a loaded Jinja chat template for Qwen3 reranker prompts (text-only)."""
-    env = _get_jinja_env()
-    template = env.from_string(chat_template)
+    template = _compile_rerank_template(chat_template)
 
     # For text-only template, extract text content
     query_text = query if isinstance(query, str) else _extract_text_from_content(query)
@@ -177,8 +183,7 @@ def _render_vl_jinja_template(
     The template expects `query` and `document` as lists of content parts,
     where each part has a `type` field (text, image, video) and corresponding data.
     """
-    env = _get_jinja_env()
-    template = env.from_string(chat_template)
+    template = _compile_rerank_template(chat_template)
 
     render_kwargs = {
         "query": query,
