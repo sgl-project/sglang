@@ -266,6 +266,7 @@ class _ExternalCachePrefetch:
     key: RadixKey
     anchor_node_id: NodeId
     anchor_lock: DecLockRefParams
+    req: Req
     component_transfers: list[tuple[TreeComponent, PoolTransfer]]
     future: Future[bool] | None = None
     timeout_s: float = 0.0
@@ -448,6 +449,7 @@ class UnifiedCacheLinkerWrapper:
             key[:end],
             req.last_node,
             self.cache.inc_lock_ref(req.last_node).to_dec_params(),
+            req,
             [],
             timeout_s=self.cache.prefetch_timeout_base
             + len(hashes) * self.cache.prefetch_timeout_per_page,
@@ -591,6 +593,11 @@ class UnifiedCacheLinkerWrapper:
                 storage.free_state_slots(sub_pool, mamba.device_indices)
             self.cache.prefetch_loaded_tokens_by_reqid[request] = len(full)
             self.cache.prefetch_loaded_storage_start_by_reqid[request] = start
+            # Otherwise the published KV holds no session ref until the request
+            # finishes, and session-aware eviction drops it first while queued.
+            self.cache.session_refs.register_session_ref(
+                state.req, inserted.last_device_node
+            )
         finally:
             self.cache.dec_lock_ref(state.anchor_node_id, state.anchor_lock)
 
