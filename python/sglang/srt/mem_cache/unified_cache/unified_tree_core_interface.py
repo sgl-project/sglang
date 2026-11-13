@@ -382,6 +382,24 @@ class UnifiedTreeCoreInterface(ABC):
     # any other.
     state_units = None
 
+    # GreedyDual-Size: whether this core ranks state units (gds policy), and the
+    # units it ranks while the policy is on. UnifiedRadixCache.__init__ rejects
+    # gds on a core without them.
+    supports_gds_eviction: bool = False
+    gds = None
+
+    def next_gds_victim(self, kv_only: bool = False) -> Optional[NodeId]:
+        """The next node to evict whole, or None when none is left. A TreeCore
+        without a GreedyDual-Size walk raises."""
+        raise NotImplementedError(f"{type(self).__name__} has no GreedyDual-Size walk")
+
+    def evict_gds_victim(self, node_id: NodeId) -> EvictDeviceLeafResult:
+        """Evict a node ``next_gds_victim`` chose."""
+        raise NotImplementedError(f"{type(self).__name__} has no GreedyDual-Size walk")
+
+    def end_gds_eviction(self) -> None:
+        raise NotImplementedError(f"{type(self).__name__} has no GreedyDual-Size walk")
+
     # Joint LRU: whether this core has the joint Full/SWA eviction walk below.
     # UnifiedRadixCache.__init__ rejects joint_lru on a core without it.
     supports_joint_eviction: bool = False

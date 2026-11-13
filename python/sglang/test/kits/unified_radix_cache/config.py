@@ -41,6 +41,7 @@ class CacheConfig:
     head_dim: int = 64
     dtype: torch.dtype = torch.bfloat16
     eviction_policy: str = "lru"
+    eviction_policy_config: Optional[dict] = None
     is_eagle: bool = False
 
     @property

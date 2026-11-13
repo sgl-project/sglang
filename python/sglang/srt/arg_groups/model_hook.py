@@ -1057,6 +1057,11 @@ def handle_mamba_radix_cache(server_args: Any, hf_config: Any):
             "--enable-mamba-unit-eviction evicts a hybrid model's cached Mamba "
             f"states with their KV; {hf_config.architectures[0]} keeps none."
         )
+    if view.radix_eviction_policy == "gds" and not view.uses_mamba_radix_cache:
+        raise ValueError(
+            "--radix-eviction-policy gds ranks a hybrid model's cached Mamba "
+            f"states; {hf_config.architectures[0]} keeps none."
+        )
     if not view.uses_mamba_radix_cache:
         # auto is arch-gated, so only an explicit strategy reaches a non-mamba
         # arch here, where it would arm the mamba paths and crash at prefill.

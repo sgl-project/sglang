@@ -273,6 +273,7 @@ def build_fixture(
         kv_event_lora_names=kv_event_lora_names or KvEventLoraNames(),
         enable_session_radix_cache=enable_session_radix_cache,
         eviction_policy=cfg.eviction_policy,
+        eviction_policy_config=cfg.eviction_policy_config,
         is_eagle=cfg.is_eagle,
         component_registry_override=component_registry_override,
     )

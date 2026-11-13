@@ -223,6 +223,8 @@ class UnifiedRadixCache(BasePrefixCache):
     # Whether eviction walks every component in one joint LRU order; set from the
     # eviction policy at construction (a cache built piecemeal walks per component).
     evicts_by_joint_lru: bool = False
+    # Whether eviction takes state units by GreedyDual-Size score; likewise.
+    evicts_by_gds: bool = False
 
     def __init__(
         self,
@@ -329,6 +331,24 @@ class UnifiedRadixCache(BasePrefixCache):
                 f"SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND={self._tree_core_backend!r} "
                 "has none."
             )
+        self.evicts_by_gds = (
+            not self.disable and tree_params.eviction_policy.lower() == "gds"
+        )
+        if self.evicts_by_gds:
+            if not self.tree_core.supports_gds_eviction:
+                raise ValueError(
+                    "--radix-eviction-policy gds requires a tree core that ranks "
+                    "state units; "
+                    f"SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND={self._tree_core_backend!r} "
+                    "does not."
+                )
+            if set(self.components) != {BASE_COMPONENT_TYPE, ComponentType.MAMBA}:
+                raise ValueError(
+                    "--radix-eviction-policy gds ranks trees of full attention "
+                    "and Mamba states only, got "
+                    f"{sorted(ct.name for ct in self.components)}."
+                )
+            self.tree_core.gds.state_tokens = self._state_slot_kv_tokens()
 
         # Session ref tracking (--enable-session-radix-cache).
         self.session_refs = UnifiedSessionRefTracker(
@@ -1029,6 +1049,8 @@ class UnifiedRadixCache(BasePrefixCache):
             self._evict_by_joint_lru(
                 params, tracker, allocation_reclaim_satisfied=satisfied
             )
+        elif self.evicts_by_gds:
+            self._evict_by_gds(params, tracker, demand=demand, satisfied=satisfied)
         else:
             request_by_type = self._evict_request_by_type(params)
             self._evict_components(
@@ -1381,6 +1403,72 @@ class UnifiedRadixCache(BasePrefixCache):
                     assert leaf_id is None
         finally:
             self.tree_core.end_joint_eviction()
+
+    def _evict_by_gds(
+        self,
+        params: EvictParams,
+        tracker: dict[ComponentType, int],
+        *,
+        demand: Optional[dict[ComponentType, int]] = None,
+        satisfied: Optional[Callable[[], bool]] = None,
+    ) -> None:
+        """Evict units whole, lowest GreedyDual-Size score first, until
+        ``satisfied`` holds or every component's request is met. A request
+        for tokens alone takes only units that free KV."""
+        requested = self._evict_request_by_type(params)
+        state = self.slot_id(TREE_STATE)
+
+        def short(ct: ComponentType) -> bool:
+            if requested.get(ct, 0) <= 0:
+                return False
+            if demand is not None and ct in demand:
+                return self._pool_available(ct) < demand[ct]
+            return tracker[ct] < requested[ct]
+
+        try:
+            while True:
+                if satisfied is not None:
+                    if satisfied():
+                        break
+                    kv_only = False
+                else:
+                    short_token, short_state = short(BASE_COMPONENT_TYPE), short(state)
+                    if not (short_token or short_state):
+                        break
+                    kv_only = not short_state
+                node_id = self.tree_core.next_gds_victim(kv_only=kv_only)
+                if node_id is None:
+                    break
+                result = self.tree_core.evict_gds_victim(node_id)
+                self._apply_eviction_result(result)
+                self._accumulate_tracker(tracker, result.tracker)
+        finally:
+            self.tree_core.end_gds_eviction()
+
+    def _state_slot_kv_tokens(self) -> float:
+        """A state slot's bytes as KV tokens of the token sub-pool: what
+        GreedyDual-Size counts a unit's state as."""
+        from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator
+
+        allocator = self.token_to_kv_pool_allocator
+        if isinstance(allocator, ChainAllocator):
+            from sglang.srt.mem_cache.kv.decl import StateLifetime
+
+            plan = allocator.plan
+            state = plan.of_lifetime(StateLifetime)
+            return state.spec.entry_bytes() / plan.owner().spec.entry_bytes()
+        kv_pool = allocator.get_kvcache()
+        kv_bytes = kv_pool.get_kv_size_bytes()
+        if isinstance(kv_bytes, tuple):
+            kv_bytes = sum(kv_bytes)
+        mamba_pool = self.req_to_token_pool.mamba_pool
+        state_bytes = mamba_pool.get_kv_size_bytes()
+        if not (kv_bytes > 0 and state_bytes > 0):
+            raise ValueError(
+                "--radix-eviction-policy gds cannot size a state slot from these "
+                f"pools: {kv_bytes} KV bytes and {state_bytes} state bytes."
+            )
+        return (state_bytes / mamba_pool.size) / (kv_bytes / kv_pool.size)
 
     def _evict_leaf_with_backup(
         self, node_id: NodeId, tracker: dict[ComponentType, int]

@@ -163,6 +163,9 @@ class MambaComponent(TreeComponent):
             case LRURefreshPhase.MATCH_END:
                 if node.component_data[ct].value is not None:
                     self.tree_core.lru_lists[ct].reset_node_mru(node)
+                    gds = self.tree_core.gds
+                    if gds is not None:
+                        gds.used(node)
             case LRURefreshPhase.INSERT_END:
                 return
             case _:
@@ -391,6 +394,7 @@ class MambaComponent(TreeComponent):
             result.mamba_exist = True
             return
         assert params.mamba_value is not None
+        gds = self.tree_core.gds
         if is_new_leaf:
             node.component_data[self.component_type].value = params.mamba_value
             self.tree_core.lru_lists[self.component_type].insert_mru(node)
@@ -400,6 +404,8 @@ class MambaComponent(TreeComponent):
             units = self.tree_core.state_units
             if units is not None:
                 units.state_changed(node)
+            if gds is not None:
+                gds.added(node)
             self._emit_excess_path_states_eviction(node, cache_actions)
             return
         if node.component_data[self.component_type].value is None:
@@ -412,6 +418,8 @@ class MambaComponent(TreeComponent):
         self.tree_core.lru_lists[self.component_type].reset_node_mru(node)
         node.last_access_time = get_and_increase_time_counter()
         result.mamba_exist = True
+        if gds is not None:
+            gds.used(node)
 
     def _emit_excess_path_states_eviction(
         self,
@@ -458,6 +466,7 @@ class MambaComponent(TreeComponent):
             return
 
         tracker = {component: 0 for component in self.cache.tree_components}
+        gds = self.tree_core.gds
         for node in reversed(holders):
             if excess <= 0 or node is tail:
                 break
@@ -488,6 +497,9 @@ class MambaComponent(TreeComponent):
                 cache_actions=cache_actions,
                 target=target,
             )
+            if gds is not None:
+                # The units below now gain and hold KV from further up.
+                gds.push_units_below(node)
             excess -= 1
 
     def redistribute_on_node_split(
@@ -523,6 +535,9 @@ class MambaComponent(TreeComponent):
             freed = self.reclaimable_value_len(node)
             self.tree_core.component_evictable_size_[self.component_type] -= freed
             cd.value = None
+            gds = self.tree_core.gds
+            if gds is not None:
+                gds.removed(node)
 
         # Host layer
         host_lru = self.tree_core.host_lru_lists[self.component_type]

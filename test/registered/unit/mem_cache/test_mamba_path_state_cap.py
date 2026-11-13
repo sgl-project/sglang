@@ -55,6 +55,8 @@ class _FakeTreeCore:
         self.joint_window_type = None
         # No unit eviction: the counts of states below each node stay unkept.
         self.state_units = None
+        # No GreedyDual-Size units: the eviction policy is LRU.
+        self.gds = None
         # The real eviction helper reports unbacked FULL evictions to the
         # write-through drop counter; this fake never tracks a walk.
         self._is_tracking_unbacked_tokens = False

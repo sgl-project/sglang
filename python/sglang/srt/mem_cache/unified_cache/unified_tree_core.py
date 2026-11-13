@@ -40,6 +40,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     _dfs_weight_order,
 )
 from sglang.srt.mem_cache.events import KVCacheEventRecorder
+from sglang.srt.mem_cache.evict_policy import GreedyDualSizeStrategy
 from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
@@ -71,6 +72,7 @@ from sglang.srt.mem_cache.unified_cache.components import (
     node_component_records,
     windows_stand_alone,
 )
+from sglang.srt.mem_cache.unified_cache.gds import GreedyDualSizeUnits
 from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     BufferBackupSnapshot,
     BufferBackupState,
@@ -519,9 +521,19 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         # The node _tlru_* lens are read only by TLRUStrategy.get_priority;
         # every other policy skips the per-insert bookkeeping entirely.
         self.tlru_bookkeeping = params.eviction_policy.lower() == "tlru"
+        self.gds: Optional[GreedyDualSizeUnits] = None
+        if isinstance(self.eviction_strategy, GreedyDualSizeStrategy):
+            if TREE_STATE not in self._family_slot_ids:
+                raise ValueError(
+                    "--radix-eviction-policy gds ranks a hybrid model's cached "
+                    "states; this model's radix tree keeps none."
+                )
+            self.gds = GreedyDualSizeUnits(self, self.eviction_strategy)
+        # GreedyDual-Size evicts a state with the KV only it serves.
         self.state_units: Optional[StateUnits] = (
             StateUnits(self)
-            if params.enable_mamba_unit_eviction and TREE_STATE in self._family_slot_ids
+            if (params.enable_mamba_unit_eviction or self.gds is not None)
+            and TREE_STATE in self._family_slot_ids
             else None
         )
 
@@ -578,6 +590,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self._pending_internal_evictions: dict[ComponentType, NodeId] = {}
         if self.state_units is not None:
             self.state_units.reset()
+        if self.gds is not None:
+            self.gds.reset()
         # Maintains the NodeId -> active tree node mapping.
         self._node_arena: dict[NodeId, UnifiedTreeNode] = {}
         self.joint_lru = JointLRU() if self._keeps_joint_lru else None
@@ -822,6 +836,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self._node_arena.pop(node.id, None)
         if self.joint_lru is not None:
             self.joint_lru.drop_swa(node)
+        if self.gds is not None:
+            self.gds.forget(node)
 
     def inc_lock_ref(
         self, node_id: NodeId, skip_lock_components: Sequence[ComponentType] = ()
@@ -1907,6 +1923,66 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         assert self._joint_walk is not None, "joint eviction not started"
         self.evict_device_end(self.joint_window_type)
         self._joint_walk = None
+
+    supports_gds_eviction = True
+
+    def next_gds_victim(self, kv_only: bool = False) -> Optional[NodeId]:
+        """The next node to evict whole: KV that no state serves, least recent
+        first (unit eviction's queue), then the state units by score; with
+        ``kv_only``, one that frees KV."""
+        node = self.state_units.next_dead_leaf()
+        if node is None:
+            node = self.gds.next_victim(kv_only=kv_only, evictable=self._gds_evictable)
+        return None if node is None else node.id
+
+    def _gds_evictable(self, node: UnifiedTreeNode) -> bool:
+        cd = node.component_data[self.slot_id(TREE_STATE)]
+        return (
+            cd.lock_ref == 0
+            and cd.session_ref == 0
+            and node.load_back_pending_id is None
+            and node.write_through_pending_id is None
+        )
+
+    def evict_gds_victim(self, node_id: NodeId) -> EvictDeviceLeafResult:
+        """Evict a node ``next_gds_victim`` chose: a device leaf whole, else
+        its state, each with the KV no state needs any more."""
+        node = self.node_by_id(node_id)
+        if node in self.evictable_device_leaves:
+            survivor = node.parent
+            result = self.evict_device_leaf(node_id, is_write_back=False)
+        else:
+            survivor = node
+            result = EvictDeviceLeafResult()
+            state = self.component_of(TREE_STATE)
+            self._begin_tracking_unbacked_tokens()
+            try:
+                self._evict_component_and_detach_lru(
+                    node,
+                    state,
+                    target=EvictLayer.DEVICE,
+                    tracker=result.tracker,
+                    device_frees=result.device_frees,
+                    host_frees=result.host_frees,
+                    cache_actions=result.cache_actions,
+                )
+                self._cascade_evict(
+                    node,
+                    state,
+                    result.tracker,
+                    device_frees=result.device_frees,
+                    host_frees=result.host_frees,
+                    cache_actions=result.cache_actions,
+                )
+            finally:
+                result.unbacked_tokens = self._finish_tracking_unbacked_tokens()
+        while survivor is not self.root_node and survivor.id not in self._node_arena:
+            survivor = survivor.parent
+        self.gds.after_eviction(survivor)
+        return result
+
+    def end_gds_eviction(self) -> None:
+        self.gds.end_walk()
 
     def evict_device_start(
         self, component_type: ComponentType, request_cnt: int
@@ -3373,6 +3449,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         units = self.state_units
         if units is not None and component_type == units.state_component:
             units.state_changed(node)
+        if self.gds is not None and component_type == self.slot_id(TREE_STATE):
+            self.gds.added(node)
 
     def adjust_component_size(
         self, node_id: NodeId, component_type: ComponentType, delta: int
@@ -3667,6 +3745,8 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         # -- PART 6: Eviction bookkeeping of hybrid-model states --
         if self.state_units is not None:
             self.state_units.check(E)
+        if self.gds is not None:
+            self.gds.check(E)
 
         if errors:
             msg = (

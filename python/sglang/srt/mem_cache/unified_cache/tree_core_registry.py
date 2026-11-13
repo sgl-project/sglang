@@ -70,6 +70,8 @@ def _rust_fallback_reason(params: CacheInitParams) -> Optional[str]:
         return "session-aware caching requires the Python TreeCore"
     if params.enable_mamba_unit_eviction:
         return "Mamba unit eviction requires the Python TreeCore"
+    if params.eviction_policy.lower() == "gds":
+        return "GreedyDual-Size eviction requires the Python TreeCore"
     if params.tree_slots is not None and several_window_slots(params.tree_slots):
         return "a tree with several window slots requires the Python TreeCore"
     if params.tree_slots is not None and non_native_slots(params.tree_slots):

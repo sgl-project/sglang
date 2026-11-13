@@ -192,7 +192,15 @@ FP4_GEMM_RUNNER_BACKEND_CHOICES = [
     "marlin",
 ]
 
-RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru", "priority", "tlru", "joint_lru"]
+RADIX_EVICTION_POLICY_CHOICES = [
+    "lru",
+    "lfu",
+    "slru",
+    "priority",
+    "tlru",
+    "joint_lru",
+    "gds",
+]
 
 RL_ON_POLICY_TARGET_CHOICES = ["fsdp"]
 

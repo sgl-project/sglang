@@ -8,6 +8,7 @@ slots, and with the switch off the cache behaves as before.
 
 from array import array
 
+from sglang.srt.mem_cache.allocation import alloc_token_slots
 from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     InsertParams,
@@ -30,6 +31,7 @@ from sglang.test.unified_allocator_fixtures import (
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
 FULL, MAMBA = ComponentType.FULL, ComponentType.MAMBA
+GDS = {"prefill_cost": [1e-5, 0.0]}
 
 
 class _UnifiedCache:
@@ -111,6 +113,30 @@ class TestUnitEvictionOnUnifiedPool(CustomTestCase):
     def test_without_the_switch_the_kv_stays_cached(self):
         tree, _ = self._evict_interior_state(unit_eviction=False)
         self.assertEqual(tree.match(self.PREFIX + self.TAIL).full_kv_hit_length, 16)
+
+
+class TestGreedyDualSizeOnUnifiedPool(CustomTestCase):
+    def test_the_unit_whose_hits_save_least_goes_first(self):
+        tree = _UnifiedCache(eviction_policy="gds", eviction_policy_config=GDS)
+        short, long = _tokens(100, 4), _tokens(300, 40)
+        tree.insert(long)
+        tree.insert(short)
+        tree.cache.evict(EvictParams(num_tokens=1))
+        tree.cache.sanity_check()
+        self.assertEqual(tree.match(short).device_prefix_len, 0)
+        self.assertEqual(tree.match(long).device_prefix_len, 40)
+
+    def test_allocation_pressure_evicts_by_score_until_the_demand_fits(self):
+        tree = _UnifiedCache(eviction_policy="gds", eviction_policy_config=GDS)
+        short, long = _tokens(100, 8), _tokens(300, 40)
+        tree.insert(long)
+        tree.insert(short)
+        need = tree.free_kv() + 4
+        slots = alloc_token_slots(tree.cache, need)
+        self.assertIsNotNone(slots)
+        self.assertEqual(len(slots), need)
+        self.assertEqual(tree.match(short).device_prefix_len, 0)
+        self.assertEqual(tree.match(long).device_prefix_len, 40)
 
 
 if __name__ == "__main__":
