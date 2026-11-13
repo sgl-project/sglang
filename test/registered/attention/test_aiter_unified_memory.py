@@ -23,7 +23,7 @@ _DTYPE = torch.bfloat16
     "requires SGLANG_ENABLE_AITER_UNIFIED_MEMORY=1 and the documented AITER fixes",
 )
 @unittest.skipUnless(torch.cuda.is_available() and torch.version.hip, "requires ROCm")
-class TestAiterUnifiedMemory(CustomTestCase):
+class _AiterUnifiedMemoryMixin:
     page_size = 1
     window = None
     query_heads = _HEADS
@@ -647,6 +647,8 @@ class TestAiterUnifiedMemory(CustomTestCase):
             for cache in self.pool.layer_router.read(layer.layer_id).kv():
                 self.assertTrue(torch.isfinite(cache[0].float()).all().item())
 
+
+class _SinkSafeWriterRefusalMixin:
     def test_unavailable_sink_safe_writer_is_rejected(self):
         from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
 
@@ -661,44 +663,34 @@ class TestAiterUnifiedMemory(CustomTestCase):
             AiterAttnBackend(self.runner)
 
 
-class TestAiterUnifiedWindowPage1(TestAiterUnifiedMemory):
+class TestAiterUnifiedMemory(
+    _SinkSafeWriterRefusalMixin, _AiterUnifiedMemoryMixin, CustomTestCase
+):
+    pass
+
+
+class TestAiterUnifiedWindowPage1(
+    _SinkSafeWriterRefusalMixin, _AiterUnifiedMemoryMixin, CustomTestCase
+):
     window = 32
 
 
-class TestAiterUnifiedWindowPage16(TestAiterUnifiedWindowPage1):
+class TestAiterUnifiedWindowPage16(_AiterUnifiedMemoryMixin, CustomTestCase):
+    window = 32
     page_size = 16
 
 
-class TestAiterUnifiedWindowPage64(TestAiterUnifiedWindowPage1):
+class TestAiterUnifiedWindowPage64(_AiterUnifiedMemoryMixin, CustomTestCase):
+    window = 32
     page_size = 64
 
 
-class TestAiterUnifiedWindowPage16MHA(TestAiterUnifiedWindowPage16):
-    query_heads = _KV_HEADS
-
-
-class TestAiterUnifiedFP8Page1(TestAiterUnifiedMemory):
+class TestAiterUnifiedFP8Page1(_AiterUnifiedMemoryMixin, CustomTestCase):
     fp8 = True
 
 
 class TestAiterUnifiedFP8Page16(TestAiterUnifiedFP8Page1):
     page_size = 16
-
-
-class TestAiterUnifiedFP8Page64(TestAiterUnifiedFP8Page1):
-    page_size = 64
-
-
-class TestAiterUnifiedFP8Page1MHA(TestAiterUnifiedFP8Page1):
-    query_heads = _KV_HEADS
-
-
-class TestAiterUnifiedFP8Page16MHA(TestAiterUnifiedFP8Page16):
-    query_heads = _KV_HEADS
-
-
-class TestAiterUnifiedFP8Page64MHA(TestAiterUnifiedFP8Page64):
-    query_heads = _KV_HEADS
 
 
 class TestAiterUnifiedFP8WindowPage1(TestAiterUnifiedFP8Page1):
@@ -718,18 +710,6 @@ class TestAiterUnifiedFP8WindowPage16NonunitScales(TestAiterUnifiedFP8WindowPage
 
 class TestAiterUnifiedFP8WindowPage64(TestAiterUnifiedFP8WindowPage1):
     page_size = 64
-
-
-class TestAiterUnifiedFP8WindowPage1MHA(TestAiterUnifiedFP8WindowPage1):
-    query_heads = _KV_HEADS
-
-
-class TestAiterUnifiedFP8WindowPage16MHA(TestAiterUnifiedFP8WindowPage16):
-    query_heads = _KV_HEADS
-
-
-class TestAiterUnifiedFP8WindowPage64MHA(TestAiterUnifiedFP8WindowPage64):
-    query_heads = _KV_HEADS
 
 
 if __name__ == "__main__":
