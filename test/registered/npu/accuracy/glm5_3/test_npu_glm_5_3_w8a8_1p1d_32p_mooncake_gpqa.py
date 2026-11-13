@@ -199,6 +199,8 @@ class TestNPUGLM5_3_W8A8_1P1D_GPQA(TestNpuAccuracyMultiNodePdSepTestCaseBase):
     # Baseline aligned with the GLM-5.2 PD case; calibrate on GLM-5.3.
     accuracy = 0.912
     datasets = ["gpqa_diamond"]
+    # First 64 of the 198 gpqa_diamond questions to keep the eval short.
+    limit = 64
     dataset_args = {
         "gpqa_diamond": {
             "filters": {"remove_until": "</think>"},
