@@ -361,6 +361,7 @@ class TestPleFileTableGatherOnDevice(CustomTestCase):
                 tp_vocab_start=0,
                 tp_vocab_end=rows,
                 is_fp8=False,
+                fp8_native=False,
                 BLOCK_D=triton.next_power_of_2(dim),
             )
             torch.cuda.synchronize()
