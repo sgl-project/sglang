@@ -48,7 +48,7 @@ from sglang.srt.mem_cache.unified_cache.components.base import (
 from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     BaseEvictionResult,
 )
-from sglang.srt.runtime_context import get_exec
+from sglang.srt.runtime_context import get_disagg, get_exec
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -97,7 +97,8 @@ class MambaComponent(TreeComponent):
         self.mamba_checkpoint_grid = math.lcm(
             slot.checkpoint_interval, params.page_size
         )
-        self.mamba_max_states_per_path = get_exec().mamba.mamba_max_states_per_path
+        self.mamba_max_states_per_path = get_exec().mamba.mamba_path_state_cap
+        self.checkpoints_level = get_exec().mamba.hybrid_cache_checkpoints_level
         from sglang.srt.mem_cache.kv_cache_configurator import (
             host_only_mamba_checkpoint,
         )
@@ -222,6 +223,10 @@ class MambaComponent(TreeComponent):
             result.best_match_node, self.component_type
         )
         if src_index is None:
+            # A source from an earlier match of an unadmitted request may have
+            # been evicted and its slot reused since; never carry it over.
+            if params.req is not None:
+                params.req.kv.mamba_cow_src_index = None
             return result
         req = params.req
         assert req is not None
@@ -782,6 +787,26 @@ class MambaComponent(TreeComponent):
             return None
         return previous_cache_len, pool.get_mamba_ping_pong_other_idx(keep_idx)
 
+    def _defers_checkpoint(
+        self, req: Req, token_ids_len: int, checkpoint_len: int
+    ) -> bool:
+        """Below checkpoint level 3 a running request publishes a state only at
+        its branching point or, on a PD prefill worker, once its prompt is complete.
+        A sliding-window tree keeps every chunk: prefill frees window rows only
+        behind a checkpoint the tree takes."""
+        if self.checkpoints_level >= 3 or self.cache.is_swa_enabled:
+            return False
+        # TODO: Publish streaming sessions' first-prompt FULL KV when KV-only
+        # checkpoints are supported. Session handoff bypasses final insertion,
+        # so deferred prompts currently remain private to their session.
+        branching_seqlen = req.mamba_branching_seqlen
+        if branching_seqlen is not None and checkpoint_len == branching_seqlen:
+            return False
+        return not (
+            get_disagg().disaggregation_mode == "prefill"
+            and token_ids_len >= len(req.origin_input_ids)
+        )
+
     def prepare_for_caching_req(
         self,
         req: Req,
@@ -827,6 +852,9 @@ class MambaComponent(TreeComponent):
             return cache_len
         else:
             if cache_len is None:
+                return 0
+            if self._defers_checkpoint(req, token_ids_len, cache_len):
+                insert_params.mamba_checkpoint_deferred = True
                 return 0
             if self._mamba_host_only_checkpoint():
                 if self.cache.enable_mamba_extra_buffer:
@@ -918,6 +946,8 @@ class MambaComponent(TreeComponent):
                 storage, sub_pool = self._state()
                 storage.release_state(sub_pool, req)
         else:
+            if insert_params.mamba_checkpoint_deferred:
+                return
             if insert_params.mamba_value is not None and (
                 insert_result is None or insert_result.mamba_exist
             ):

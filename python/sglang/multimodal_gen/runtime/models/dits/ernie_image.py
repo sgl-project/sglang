@@ -63,6 +63,7 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     RowParallelLinear,
 )
 from sglang.multimodal_gen.runtime.layers.quantization import QuantizationConfig
+from sglang.multimodal_gen.runtime.layers.rotary_embedding import RotaryEmbedding
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
@@ -257,6 +258,12 @@ class ErnieImageSelfAttention(nn.Module):
         if qk_layernorm:
             self.norm_q = RMSNorm(head_dim, eps=eps)
             self.norm_k = RMSNorm(head_dim, eps=eps)
+        self.rotary_emb = RotaryEmbedding(
+            head_size=head_dim,
+            rotary_dim=head_dim,
+            is_neox_style=True,
+            use_precomputed_cache=False,
+        )
 
         self.attn = USPAttention(
             num_heads=self.num_local_heads,
@@ -276,6 +283,9 @@ class ErnieImageSelfAttention(nn.Module):
         attn_mask_meta: dict | None = None,
         num_replicated_suffix: int = 0,
         use_sp: bool = False,
+        *,
+        shared_rope_cos: torch.Tensor,
+        shared_rope_sin: torch.Tensor,
     ) -> torch.Tensor:
         B, S, H = x.shape
 
@@ -287,7 +297,7 @@ class ErnieImageSelfAttention(nn.Module):
         k = k.view(B, S, self.num_local_heads, self.head_dim)
         v = v.view(B, S, self.num_local_heads, self.head_dim)
 
-        if self.qk_layernorm:
+        if self.qk_layernorm and q.is_cuda:
             q, k = _ernie_qknorm_rope(
                 q,
                 k,
@@ -298,6 +308,18 @@ class ErnieImageSelfAttention(nn.Module):
                 rope_sin,
                 rope_cache,
                 rope_positions,
+            )
+        elif self.qk_layernorm:
+            # The full-width fused QKNorm+RoPE kernel is CUDA/ROCm-only; skip its gate.
+            q, k = _ernie_qknorm_rotary(
+                q,
+                k,
+                self.norm_q,
+                self.norm_k,
+                self.head_dim,
+                rotary_emb=self.rotary_emb,
+                shared_rope_cos=shared_rope_cos,
+                shared_rope_sin=shared_rope_sin,
             )
         else:
             q = _ernie_rope(q, rope_cos, rope_sin)
@@ -390,6 +412,9 @@ class ErnieImageSharedAdaLNBlock(nn.Module):
         attn_mask_meta: dict | None = None,
         num_replicated_suffix: int = 0,
         use_sp: bool = False,
+        *,
+        shared_rope_cos: torch.Tensor,
+        shared_rope_sin: torch.Tensor,
     ) -> torch.Tensor:
         residual = x
         x = _ernie_norm_scale_shift(self.adaLN_sa_ln, x, scale_msa, shift_msa)
@@ -401,6 +426,8 @@ class ErnieImageSharedAdaLNBlock(nn.Module):
             rope_positions,
             attn_mask=attn_mask,
             attn_mask_meta=attn_mask_meta,
+            shared_rope_cos=shared_rope_cos,
+            shared_rope_sin=shared_rope_sin,
             num_replicated_suffix=num_replicated_suffix,
             use_sp=use_sp,
         )
@@ -475,6 +502,22 @@ def _ernie_qknorm_rope_reference(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     q, k = apply_qk_norm(q, k, q_norm, k_norm, head_dim)
     return _ernie_rope(q, rope_cos, rope_sin), _ernie_rope(k, rope_cos, rope_sin)
+
+
+def _ernie_qknorm_rotary(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_norm: RMSNorm,
+    k_norm: RMSNorm,
+    head_dim: int,
+    *,
+    rotary_emb: RotaryEmbedding,
+    shared_rope_cos: torch.Tensor,
+    shared_rope_sin: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """QK RMSNorm and RoPE through the class, for devices without the fused kernel."""
+    q, k = apply_qk_norm(q, k, q_norm, k_norm, head_dim)
+    return rotary_emb(query=q, key=k, cos=shared_rope_cos, sin=shared_rope_sin)
 
 
 def _ernie_qknorm_rope(
@@ -763,6 +806,10 @@ class ErnieImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin)
                 ).flatten(0, 1)
                 for rope in (rope_cos, rope_sin)
             )
+        # ids are expanded over B, so every batch row block is identical; the
+        # first local [S, rot] block broadcasts over B inside RotaryEmbedding.
+        shared_rope_cos = rope_cos.view(B, -1, rope_cos.shape[-1])[0]
+        shared_rope_sin = rope_sin.view(B, -1, rope_sin.shape[-1])[0]
         rope_cache = torch.cat((rope_cos, rope_sin), dim=-1).contiguous()
         rope_positions = torch.arange(
             rope_cache.shape[0], device=device, dtype=torch.long
@@ -805,6 +852,8 @@ class ErnieImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin)
                 gate_mlp,
                 attn_mask=attn_mask,
                 attn_mask_meta=attn_mask_meta,
+                shared_rope_cos=shared_rope_cos,
+                shared_rope_sin=shared_rope_sin,
                 num_replicated_suffix=Tmax if use_sp else 0,
                 use_sp=use_sp,
             )
