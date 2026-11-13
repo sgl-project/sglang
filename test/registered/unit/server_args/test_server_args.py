@@ -2186,7 +2186,7 @@ class TestContextParallelServerArgs(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "--cp-strategy"):
             handle_context_parallelism(server_args)
 
-    @override_platform(is_hip=False, is_npu=False)
+    @override_platform(is_hip=False, is_npu=False, is_xpu=False)
     def test_deepseek_v32_prefill_cp_rejects_zigzag(self):
         server_args = self._new_cp_args(
             model_path="deepseek-ai/DeepSeek-V3.2",
@@ -2200,6 +2200,27 @@ class TestContextParallelServerArgs(CustomTestCase):
         )
 
         with self.assertRaisesRegex(ValueError, "DeepSeek V3.2.*interleave"):
+            handle_context_parallelism(server_args)
+
+    @override_platform(is_hip=False, is_npu=False, is_xpu=True)
+    def test_xpu_prefill_cp_is_validated_on_the_launch_path(self):
+        """intel_xpu only implements zigzag CP; the launch path must refuse other
+        strategies instead of computing attention that ignores the CP split."""
+        server_args = self._new_cp_args(
+            model_path="Qwen/Qwen3-8B",
+            enable_prefill_cp=True,
+            cp_strategy="interleave",
+            attn_cp_size=2,
+            tp_size=2,
+            device="xpu",
+            attention_backend="intel_xpu",
+        )
+        server_args._model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(architectures=["Qwen3ForCausalLM"]),
+            hf_text_config=SimpleNamespace(model_type="qwen3"),
+            is_multimodal=False,
+        )
+        with self.assertRaisesRegex(ValueError, "zigzag only"):
             handle_context_parallelism(server_args)
 
     def test_sharded_padded_cp_kv_layout_refuses_unified_memory(self):
@@ -4894,13 +4915,15 @@ class TestKvCacheShardingCompatibility(CustomTestCase):
                 with self.assertRaisesRegex(ValueError, error):
                     validate_kv_shard_attention_backend(args, view)
 
-    def test_xpu_admits_only_intel_xpu_plain_tp_mla(self):
-        # (prefill backend, is_mla, attn_cp_size, expected error or None)
+    def test_xpu_admits_intel_xpu_tp_mla_and_cp_gqa(self):
+        # (prefill backend, is_mla, attn_cp_size, expected error or None).
+        # GQA's own CP requirement is checked later in handle_kv_cache_sharding.
         cases = (
             ("intel_xpu", True, 1, None),
-            ("intel_xpu", False, 1, "supports MLA models only"),
+            ("intel_xpu", False, 2, None),
             ("intel_xpu", True, 2, "supports plain-TP MLA only"),
             ("fa3", True, 1, "requires the intel_xpu prefill"),
+            ("intel_xpu", "dsa", 1, "DSA KV sharding is not supported on XPU"),
         )
         for backend, is_mla, attn_cp_size, error in cases:
             with self.subTest(backend=backend, is_mla=is_mla, cp=attn_cp_size):
@@ -4908,6 +4931,10 @@ class TestKvCacheShardingCompatibility(CustomTestCase):
                 args._model_config.attention_arch = (
                     AttentionArch.MLA if is_mla else AttentionArch.MHA
                 )
+                if is_mla == "dsa":
+                    args._model_config.hf_config = SimpleNamespace(
+                        architectures=["DeepseekV32ForCausalLM"], index_topk=2048
+                    )
                 view = SimpleNamespace(
                     attn_cp_size=attn_cp_size,
                     disable_chunked_prefix_cache=False,
@@ -4917,6 +4944,32 @@ class TestKvCacheShardingCompatibility(CustomTestCase):
                 else:
                     with self.assertRaisesRegex(ValueError, error):
                         validate_kv_shard_attention_backend(args, view)
+
+    def test_xpu_prefill_cp_admits_only_dense_zigzag_on_intel_xpu(self):
+        """Other CP combinations would ignore the CP split on XPU and compute
+        wrong attention, so they must be refused at startup."""
+        from sglang.srt.arg_groups.parallel_hook import _validate_xpu_prefill_cp
+
+        # (prefill backend, is_mla, cp strategy, dcp size, expected error or None)
+        cases = (
+            ("intel_xpu", False, "zigzag", 1, None),
+            ("triton", False, "zigzag", 1, "requires the intel_xpu prefill"),
+            ("intel_xpu", False, "interleave", 1, "zigzag only"),
+            ("intel_xpu", True, "zigzag", 1, "does not support MLA"),
+            ("intel_xpu", False, "zigzag", 2, "decode context parallelism"),
+        )
+        for backend, is_mla, strategy, dcp_size, error in cases:
+            with self.subTest(backend=backend, mla=is_mla, s=strategy, dcp=dcp_size):
+                args = self._args(attention_backend=backend, device="xpu")
+                args._model_config.attention_arch = (
+                    AttentionArch.MLA if is_mla else AttentionArch.MHA
+                )
+                view = SimpleNamespace(cp_strategy=strategy, dcp_size=dcp_size)
+                if error is None:
+                    _validate_xpu_prefill_cp(args, view)
+                else:
+                    with self.assertRaisesRegex(ValueError, error):
+                        _validate_xpu_prefill_cp(args, view)
 
     def test_hisparse_allocator_is_rejected(self):
         args = self._args(enable_hisparse=True)

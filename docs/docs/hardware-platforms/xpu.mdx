@@ -491,10 +491,29 @@ curl http://127.0.0.1:8000/v1/completions \
 
 `--enable-kv-cache-sharding` on a PD prefill server stripes KV pages across the
 prefill ranks, so each rank stores and sends only its own pages and a request's KV
-can exceed one rank's pool. On XPU it supports MLA models over attention TP
-(`--attention-backend intel_xpu`, no attention CP). Each layer's prefix is
-all-gathered over XCCL into a scratch buffer that attention reads. GQA models are
-refused, because their sharding needs prefill context parallelism, which
-`intel_xpu` does not support. DSA models are refused too. Use the Mooncake or NIXL
-transfer backend, and set `SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=python` on the
-prefill server. It has not been validated on XPU hardware yet.
+can exceed one rank's pool. On XPU, with `--attention-backend intel_xpu`, it
+supports:
+
+- MLA models, striped over attention TP (no attention CP).
+- GQA models, striped over zigzag prefill CP ranks (see below).
+
+Each layer's prefix is all-gathered over XCCL into a scratch buffer that attention
+reads. DSA models are refused. Use the Mooncake or NIXL transfer backend, and set
+`SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=python` on the prefill server. It has not
+been validated on XPU hardware yet.
+
+### Prefill context parallelism
+
+`--enable-prefill-cp --cp-strategy zigzag --attn-cp-size N` splits each prefill
+across N ranks on XPU for dense GQA/MHA models with `--attention-backend intel_xpu`:
+
+```bash
+python -m sglang.launch_server --model-path <dense GQA model> --device xpu \
+    --attention-backend intel_xpu --tp-size 2 --attn-cp-size 2 \
+    --enable-prefill-cp --cp-strategy zigzag
+```
+
+Each rank all-gathers the chunk's K/V into its pool and attends its two zigzag
+segments against the full cache. The server refuses MLA models, other CP
+strategies, other attention backends and decode context parallelism (`--dcp-size`).
+Sliding-window, local, cross and bidirectional attention fail at the first prefill.

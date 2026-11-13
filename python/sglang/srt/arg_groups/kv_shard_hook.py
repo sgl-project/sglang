@@ -60,7 +60,8 @@ def kv_shard_storage_backend_supported(name: Optional[str]) -> bool:
 
 
 def _validate_kv_shard_xpu_backend(server_args: Any, cfg: Any, prefill_backend) -> None:
-    """XPU shards MLA latent KV over attention TP, read through intel_xpu."""
+    """XPU shards MLA latent KV over attention TP, and GQA KV over prefill CP
+    ranks (checked with the other CP requirements below), through intel_xpu."""
     if prefill_backend != "intel_xpu":
         raise ValueError(
             "--enable-kv-cache-sharding on XPU requires the intel_xpu prefill "
@@ -68,16 +69,10 @@ def _validate_kv_shard_xpu_backend(server_args: Any, cfg: Any, prefill_backend) 
         )
     if is_deepseek_dsa(model_config_of(server_args).hf_config):
         raise ValueError("DSA KV sharding is not supported on XPU.")
-    if not use_mla_backend(server_args):
-        raise ValueError(
-            "--enable-kv-cache-sharding on XPU supports MLA models only: GQA "
-            "sharding needs prefill context parallelism, which intel_xpu does "
-            "not support."
-        )
-    if cfg.attn_cp_size > 1:
+    if use_mla_backend(server_args) and cfg.attn_cp_size > 1:
         raise ValueError(
             "--enable-kv-cache-sharding on XPU supports plain-TP MLA only "
-            "(attn_cp_size must be 1)."
+            "(attn_cp_size must be 1): intel_xpu has no MLA prefill CP."
         )
 
 
