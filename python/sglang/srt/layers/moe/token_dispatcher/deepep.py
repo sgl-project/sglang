@@ -184,21 +184,27 @@ class DeepEPBuffer:
     itself lives on ``ctx.resources`` (one entry per process)."""
 
     @classmethod
-    def _state(cls):
+    def _registry(cls):
         from types import SimpleNamespace
 
         buffers = get_resources().buffers
-        state = buffers.get("deepep_ep_state")
-        if state is None:
-            state = SimpleNamespace(
-                buffer=None,
-                dispatch_mode=None,
-                hidden_size=None,
-                num_max_dispatch_tokens_per_rank=None,
-                num_experts=None,
-            )
-            buffers["deepep_ep_state"] = state
-        return state
+        reg = buffers.get("deepep_ep_registry")
+        if reg is None:
+            reg = SimpleNamespace(by_key={}, dispatch_mode=None)
+            buffers["deepep_ep_registry"] = reg
+        return reg
+
+    @staticmethod
+    def _buffer_key(
+        num_experts: int,
+        hidden_size: int,
+        num_max_dispatch_tokens_per_rank: int,
+    ):
+        return (
+            int(num_experts),
+            int(hidden_size),
+            int(num_max_dispatch_tokens_per_rank),
+        )
 
     @classmethod
     def get_deepep_buffer(
@@ -210,13 +216,15 @@ class DeepEPBuffer:
         num_max_dispatch_tokens_per_rank: int = -1,
         num_experts: int = -1,
     ):
-        state = cls._state()
-        if state.buffer is not None:
-            return state.buffer
+        from types import SimpleNamespace
 
-        state.hidden_size = hidden_size
-        state.num_max_dispatch_tokens_per_rank = num_max_dispatch_tokens_per_rank
-        state.num_experts = num_experts
+        reg = cls._registry()
+        key = cls._buffer_key(
+            num_experts, hidden_size, num_max_dispatch_tokens_per_rank
+        )
+        entry = reg.by_key.get(key)
+        if entry is not None and entry.buffer is not None:
+            return entry.buffer
 
         num_nvl_bytes, num_rdma_bytes = 0, 0
         if deepep_mode.enable_normal():
@@ -301,30 +309,46 @@ class DeepEPBuffer:
         if not is_cu12 and use_mnnvl_fabric:
             buffer_kwargs["use_fabric"] = True
 
-        state.buffer = Buffer(group, num_nvl_bytes, num_rdma_bytes, **buffer_kwargs)
-        return state.buffer
+        if reg.by_key:
+            logger.info(
+                "Allocating additional DeepEP buffer for num_experts=%s "
+                "(existing keys=%s). Typical for target and speculative draft model "
+                "with different number of experts.",
+                num_experts,
+                list(reg.by_key.keys()),
+            )
+
+        entry = SimpleNamespace(
+            buffer=Buffer(group, num_nvl_bytes, num_rdma_bytes, **buffer_kwargs),
+            hidden_size=hidden_size,
+            num_max_dispatch_tokens_per_rank=num_max_dispatch_tokens_per_rank,
+            num_experts=num_experts,
+        )
+        reg.by_key[key] = entry
+        return entry.buffer
 
     @classmethod
     def clean_buffer(cls):
-        state = cls._state()
-        if not state.buffer.low_latency_mode:
-            return
-        state.buffer.clean_low_latency_buffer(
-            state.num_max_dispatch_tokens_per_rank,
-            state.hidden_size,
-            state.num_experts,
-        )
+        reg = cls._registry()
+        for entry in reg.by_key.values():
+            if entry.buffer is None or not entry.buffer.low_latency_mode:
+                continue
+            entry.buffer.clean_low_latency_buffer(
+                entry.num_max_dispatch_tokens_per_rank,
+                entry.hidden_size,
+                entry.num_experts,
+            )
 
     @classmethod
     def set_dispatch_mode_as_normal(cls):
-        cls._state().dispatch_mode = DeepEPDispatchMode.NORMAL
+        cls._registry().dispatch_mode = DeepEPDispatchMode.NORMAL
 
     @classmethod
     def set_dispatch_mode_as_low_latency(cls):
-        state = cls._state()
-        if state.dispatch_mode == DeepEPDispatchMode.NORMAL:
+        reg = cls._registry()
+        if reg.dispatch_mode == DeepEPDispatchMode.NORMAL:
             cls.clean_buffer()
-        state.dispatch_mode = DeepEPDispatchMode.LOW_LATENCY
+        reg.dispatch_mode = DeepEPDispatchMode.LOW_LATENCY
 
     @classmethod
     def set_dispatch_mode(cls, mode: DeepEPMode):
