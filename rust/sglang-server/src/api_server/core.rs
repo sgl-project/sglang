@@ -1,9 +1,10 @@
 //! What the transport-neutral handlers (`api_server::handlers`) are built from:
 //! the error categories, the semantic [`CoreEvent`]s and their rendering into
 //! the generated `api.v1` response types, the DP-rank fan-out and its peers,
-//! media prefetch, and a model package's admission check. Deliberately knows
-//! nothing about Axum, SSE framing, or Tonic.
+//! media prefetch, and a model package's admission check and abort hook.
+//! Deliberately knows nothing about Axum, SSE framing, or Tonic.
 
+mod abort_hook;
 mod drain;
 mod error;
 pub(crate) mod fanout;
@@ -14,6 +15,7 @@ pub(crate) mod prefetch;
 mod request_log;
 mod validator;
 
+pub use abort_hook::AbortHook;
 pub(crate) use drain::{DrainEnd, DrainState, InFlight};
 pub(crate) use error::{CoreError, CoreErrorKind, STREAM_INVALID_REQUEST_ERROR};
 #[cfg(test)]

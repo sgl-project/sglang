@@ -372,6 +372,7 @@ mod tests {
                     metrics: None,
                     request_log: None,
                     generate_validator: None,
+                    abort_hook: None,
                 },
             );
             Self {
@@ -778,6 +779,7 @@ mod tests {
                 metrics: None,
                 request_log: None,
                 generate_validator: None,
+                abort_hook: None,
             },
         );
         let service = GrpcService::for_test(core, None, false, Duration::from_secs(1));
@@ -845,6 +847,7 @@ mod tests {
                 metrics: None,
                 request_log: None,
                 generate_validator: Some(Arc::new(crate::api_server::core::TopLogprobsCap)),
+                abort_hook: None,
             },
         );
         let service = GrpcService::for_test(core, None, false, Duration::from_secs(1));

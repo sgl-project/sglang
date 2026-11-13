@@ -313,6 +313,7 @@ mod tests {
                 request_log: None,
                 peer_endpoints: Vec::new(),
                 generate_validator: None,
+                abort_hook: None,
             },
         );
         let (failure_tx, failure_rx) = flume::bounded(1);
@@ -366,6 +367,7 @@ mod tests {
                     request_log: None,
                     peer_endpoints: Vec::new(),
                     generate_validator: None,
+                    abort_hook: None,
                 },
             );
             let (failure_tx, failure_rx) = flume::bounded(1);
@@ -450,6 +452,7 @@ mod tests {
                 request_log: None,
                 peer_endpoints: Vec::new(),
                 generate_validator: None,
+                abort_hook: None,
             },
         );
         core.hold_for_custom_warmups();

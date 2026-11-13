@@ -39,6 +39,9 @@ pub trait Runnable: Send + 'static {
     fn run(self);
 }
 
+#[cfg(feature = "test-support")]
+pub mod test_support;
+
 /// Live runtime. Held by the pyo3 bridge; the Python boundary reads the `to_scheduler_rx` channel,
 /// and write to `from_scheduler_tx` channel. `request_shutdown` (also run on `Drop`) stops every stage.
 pub struct Runtime {
@@ -538,6 +541,7 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
             metrics,
             request_log: crate::api_server::core::RequestLog::from_server_args(&cfg.server_args)?,
             generate_validator: cfg.generate_validator.clone(),
+            abort_hook: cfg.abort_hook.clone(),
         },
     );
     core.set_graceful_close_timeout(cfg.rust_server_args.graceful_close_timeout);
@@ -693,6 +697,7 @@ mod tests {
             server_args: Arc::new(test_server_args()),
             generate_hook: None,
             generate_validator: None,
+            abort_hook: None,
             server_info_state_keys: Vec::new(),
         }
     }
@@ -1231,6 +1236,7 @@ mod tests {
             server_args: Arc::new(server_args),
             generate_hook: None,
             generate_validator: None,
+            abort_hook: None,
             server_info_state_keys: Vec::new(),
         };
         // Bind is synchronous in `start`, so the port is already accepting.
@@ -1381,6 +1387,7 @@ mod tests {
             server_args: Arc::new(server_args),
             generate_hook: None,
             generate_validator: None,
+            abort_hook: None,
             server_info_state_keys: Vec::new(),
         };
         let rt = start(cfg, None).expect("start runtime");
@@ -1458,6 +1465,7 @@ mod tests {
             server_args: Arc::new(server_args),
             generate_hook: None,
             generate_validator: None,
+            abort_hook: None,
             server_info_state_keys: Vec::new(),
         };
         let rt = start(cfg, None).expect("start runtime");
@@ -1866,6 +1874,7 @@ mod tests {
             server_args: Arc::new(server_args),
             generate_hook: None,
             generate_validator: None,
+            abort_hook: None,
             server_info_state_keys: Vec::new(),
         };
         let err = match start(cfg, None) {
@@ -2213,5 +2222,75 @@ mod tests {
         );
         assert!(std::net::TcpStream::connect(http_addr).is_err());
         assert!(std::net::TcpStream::connect(grpc_addr).is_err());
+    }
+
+    /// Every abort by rid reaches the package's abort hook, from each entry:
+    /// `/abort_request`, an abort another DP rank's listener relays
+    /// (`/internal/peer`), and the gRPC `Abort`. An `abort_all` or an empty
+    /// rid names no request, and does not.
+    #[test]
+    fn every_abort_by_rid_reaches_the_abort_hook() {
+        use crate::message::ids::Rid;
+        use crate::message::io_struct::{AbortReq, ControlRequest};
+        use std::io::Write;
+
+        #[derive(Debug, Default)]
+        struct Named(Mutex<Vec<String>>);
+        impl crate::AbortHook for Named {
+            fn named_abort(&self, rid: &str) {
+                self.0.lock().unwrap().push(rid.to_owned());
+            }
+        }
+
+        let (http_addr, grpc_addr) = free_loopback_addrs();
+        let named = Arc::new(Named::default());
+        let cfg = RuntimeConfig {
+            abort_hook: Some(named.clone()),
+            ..test_config(http_addr, Some(grpc_addr))
+        };
+        let rt = start(cfg, None).expect("start runtime");
+        for body in [
+            r#"{"rid":"http"}"#,
+            r#"{"rid":""}"#,
+            r#"{"rid":"all","abort_all":true}"#,
+        ] {
+            let response = read_response(send_http(http_addr, "POST", "/abort_request", body));
+            assert!(response.starts_with("HTTP/1.1 200"), "{body}: {response}");
+        }
+        for abort in [
+            AbortReq::new("relayed".into(), false),
+            AbortReq::new(Rid::new().to_string(), true),
+        ] {
+            let body = ControlRequest::AbortReq(abort).encode().unwrap();
+            let mut conn = std::net::TcpStream::connect(http_addr).unwrap();
+            write!(
+                conn,
+                "POST /internal/peer HTTP/1.1\r\nHost: t\r\nContent-Length: {}\r\n\
+                 Connection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            conn.write_all(&body).unwrap();
+            // The reply body is msgpack.
+            let mut response = Vec::new();
+            std::io::Read::read_to_end(&mut conn, &mut response).unwrap();
+            assert!(response.starts_with(b"HTTP/1.1 200"));
+        }
+        let client_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        client_runtime.block_on(async {
+            let mut client = connect_grpc(grpc_addr).await;
+            for (rid, abort_all) in [("grpc", false), ("", true)] {
+                let request = proto::AbortRequest {
+                    rid: rid.into(),
+                    abort_all,
+                };
+                client.abort(request).await.expect("Abort RPC");
+            }
+        });
+        assert_eq!(*named.0.lock().unwrap(), ["http", "relayed", "grpc"]);
+        rt.request_shutdown();
     }
 }

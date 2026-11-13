@@ -92,6 +92,7 @@ mod tests {
                     metrics: frontend,
                     request_log: None,
                     generate_validator: None,
+                    abort_hook: None,
                 },
             ),
             generation_policy: crate::message::request::GenerationPolicy::from(
