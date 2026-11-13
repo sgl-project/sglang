@@ -324,7 +324,61 @@ class ConfigManager:
                     **options,
                 )
 
-            raise ValueError("native SimOpus provider requires DeepSeek-V4.1-Flash")
+            from sglang_simulator.time_predictor.simopus import (
+                SimOpusTimePredictor,
+            )
+
+            obsolete_fields = sorted(
+                {"contract_version", "reduction_policy"} & predictor_config.keys()
+            )
+            if obsolete_fields:
+                raise ValueError(
+                    "obsolete SimOpus predictor configuration fields: "
+                    + ", ".join(obsolete_fields)
+                )
+
+            supported_fields = {
+                "name",
+                "model_id",
+                "systems_root",
+                "database_mode",
+                "attn_kernel_impl",
+                "decode_attn_kernel_impl",
+                "attn_dtype",
+                "kv_cache_dtype",
+                "model_revision",
+                "provider_revision",
+                "execution_profile",
+                "decode_execution_profile",
+            }
+            unknown_fields = sorted(predictor_config.keys() - supported_fields)
+            if unknown_fields:
+                raise ValueError(
+                    "unknown SimOpus predictor configuration fields: "
+                    + ", ".join(unknown_fields)
+                )
+
+            return SimOpusTimePredictor(
+                model,
+                hw=hw,
+                config=sched_config,
+                model_id=predictor_config.get("model_id"),
+                system=config.get("platform", {}).get("accelerator", {}).get("name"),
+                systems_root=cls.resolve_simopus_path(
+                    predictor_config.get("systems_root")
+                ),
+                database_mode=predictor_config.get("database_mode", "SILICON"),
+                attn_kernel_impl=predictor_config.get("attn_kernel_impl"),
+                decode_attn_kernel_impl=predictor_config.get("decode_attn_kernel_impl"),
+                attn_dtype=predictor_config.get("attn_dtype"),
+                kv_cache_dtype=predictor_config.get("kv_cache_dtype"),
+                model_revision=predictor_config.get("model_revision"),
+                provider_revision=predictor_config.get("provider_revision"),
+                execution_profile=predictor_config.get("execution_profile"),
+                decode_execution_profile=predictor_config.get(
+                    "decode_execution_profile"
+                ),
+            )
         else:
             name = predictor_config.get("name")
             if name == "aiconfigurator":

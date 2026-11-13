@@ -144,6 +144,64 @@ def _request_prefix_len(req):
     return _host_int(value)
 
 
+def build_predictor_batch(batch) -> SimulationScheduleBatch:
+    """Copy prepared SGLang forward metadata into the predictor contract."""
+    mode = getattr(getattr(batch, "forward_mode", None), "name", None)
+    batch_size = len(batch.reqs)
+
+    if mode in {"EXTEND", "MIXED"}:
+        extend_lens = getattr(batch, "extend_lens", None)
+        prefix_lens = getattr(batch, "prefix_lens", None)
+        if (
+            extend_lens is None
+            or prefix_lens is None
+            or len(extend_lens) != batch_size
+            or len(prefix_lens) != batch_size
+        ):
+            raise PredictorError(
+                "invalid_batch",
+                "prepared extend and prefix lengths must match batch size",
+                forward_mode=mode,
+                batch_size=batch_size,
+            )
+        reqs = [
+            ScheduleRequest(
+                extend_length=_host_int(extend),
+                past_kv_length=_host_int(prefix),
+            )
+            for extend, prefix in zip(extend_lens, prefix_lens)
+        ]
+    elif mode == "DECODE":
+        seq_lens = getattr(batch, "seq_lens_cpu", None)
+        if seq_lens is None or len(seq_lens) != batch_size:
+            raise PredictorError(
+                "invalid_batch",
+                "prepared decode lengths must match batch size",
+                forward_mode=mode,
+                batch_size=batch_size,
+            )
+        reqs = [
+            ScheduleRequest(
+                extend_length=1,
+                # prepare_for_decode increments seq_lens_cpu for the token
+                # entering this forward. SimOpus history is the KV length
+                # before that token.
+                past_kv_length=_host_int(seq_len) - 1,
+            )
+            for seq_len in seq_lens
+        ]
+    elif mode == "IDLE":
+        reqs = []
+    else:
+        raise PredictorError(
+            "unsupported_forward_mode",
+            f"unsupported SGLang forward mode {mode!r}",
+            forward_mode=mode,
+        )
+
+    return SimulationScheduleBatch(reqs=reqs, forward_mode=mode)
+
+
 def effective_l2_load_delay(
     load_duration: float,
     last_inference_duration: float,
