@@ -24,7 +24,10 @@ class RingSimpleAllReduce:
 
     Each block runs one ring (channel) over a contiguous share of the tensor:
     every chunk goes to the next rank only, through a FIFO of chunk-sized slices
-    in that rank's memory, behind 64-bit counters.
+    in that rank's memory, behind 64-bit counters. The ring keeps each SoC's
+    partitions next to each other: they share the SoC's fabric bandwidth, so
+    with DPX partners apart every hop crosses the fabric and the ring runs
+    1.5-1.8x slower from 64 MB.
     """
 
     @staticmethod
@@ -63,17 +66,21 @@ class RingSimpleAllReduce:
         slot_bytes: int,
     ) -> None:
         """The plane lives on a symmetric buffer of its own, which starts zeroed."""
+        from .gfx1250_fabric import probe_soc_ring_order
+
+        order = probe_soc_ring_order(group, device)
         self._buffer = SymmetricBuffer(
             group,
             device,
             self.workspace_bytes(num_channels=num_channels, slot_bytes=slot_bytes),
         )
-        slabs = self._buffer.slabs
+        # the plane's ranks are ring positions
+        slabs = [self._buffer.slabs[r] for r in order]
         sem_bytes = num_channels * _SEMAPHORE_BYTES
         self.fifo_shape = [num_channels, _SLOTS, slot_bytes]
         fifo_bytes = num_channels * _SLOTS * slot_bytes
         self._plane: Optional[RingPlane] = RingPlane(
-            rank,
+            order.index(rank),
             world_size,
             workspaces=[
                 s[sem_bytes : sem_bytes + fifo_bytes].view(self.fifo_shape)
@@ -85,10 +92,12 @@ class RingSimpleAllReduce:
         )
         if rank == 0:
             logger.info(
-                "Custom all-reduce v2 ring_simple: %.2f MB, channels = %d, slot = %d B",
+                "Custom all-reduce v2 ring_simple: %.2f MB, channels = %d, slot = %d B, "
+                "order = %s",
                 self._buffer.slabs[rank].numel() / (1 << 20),
                 num_channels,
                 slot_bytes,
+                order,
             )
 
     def all_reduce(self, input: torch.Tensor) -> torch.Tensor:
