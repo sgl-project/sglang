@@ -308,6 +308,7 @@ def test_import_stays_metadata_only():
         "import sys, sglang.kernels.ops; "
         "print('DIRTY' if any(m in sys.modules for m in "
         "('sgl_kernel', 'cutlass', 'flydsl', 'aiter', "
+        "'utlx_plugin', 'sglang.kernels.ops.attention.tlx.paged', "
         "'sglang.kernels.ops.gemm.kimi_k3', "
         "'sglang.kernels.ops.activation.softcap', "
         "'sglang.kernels.ops.attention.dllm_kv_pack', "

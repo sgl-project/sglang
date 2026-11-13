@@ -3797,6 +3797,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             _fa4_page_constraint,
             _intel_xpu_page_constraint,
             _mla_backend_page_constraints,
+            _tlx_page_constraint,
         )
 
         def _view(**kw):
@@ -3873,6 +3874,16 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 ),
                 {},
             )
+
+        # tlx copies whole 16/64/128-token pages; other sizes snap to 16
+        self.assertEqual(
+            _tlx_page_constraint(_view(attention_backend="tlx")), {"page_size": 16}
+        )
+        self.assertEqual(
+            _tlx_page_constraint(_view(decode_attention_backend="tlx", page_size=64)),
+            {},
+        )
+        self.assertEqual(_tlx_page_constraint(_view(attention_backend="aiter")), {})
 
         # page_size 1 is accepted: the flat page table runs the non-paged varlen
         # kernel.
