@@ -33,7 +33,7 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
-def _ep_dispatcher(*, moe_ep_rank: int, num_shared: int = 0, runner_backend=None):
+def _ep_dispatcher(*, moe_ep_rank: int, num_shared: int = 0):
     dispatcher = object.__new__(StandardDispatcher)
     dispatcher.moe_ep_size = 2
     dispatcher.moe_ep_rank = moe_ep_rank
@@ -42,14 +42,17 @@ def _ep_dispatcher(*, moe_ep_rank: int, num_shared: int = 0, runner_backend=None
     dispatcher.num_local_routed_experts = 4
     dispatcher.num_local_experts = 4 + num_shared
     dispatcher.skip_local_expert_mapping = False
-    dispatcher.runner_backend = runner_backend
     dispatcher.use_aiter_moe_runner = False
     dispatcher.local_expert_mapping = None
     dispatcher.expert_mask_gpu = None
     return dispatcher
 
 
-class _ProtocolDispatcher(BaseDispatcher):
+class _LazyDispatcher(BaseDispatcher):
+    """No ``prebuild`` override: builds its state at the first dispatch."""
+
+    prebuild_pending = True
+
     def dispatch(self, hidden_states, topk_output):
         raise NotImplementedError
 
@@ -57,47 +60,21 @@ class _ProtocolDispatcher(BaseDispatcher):
         raise NotImplementedError
 
 
-class _LazyDispatcher(_ProtocolDispatcher):
-    """Builds its state at the first dispatch, as a new backend would."""
-
-    @property
-    def prebuild_pending(self):
-        return True
-
-
-class _PrebuiltDispatcher(_ProtocolDispatcher):
-    built = False
-
-    @property
-    def prebuild_pending(self):
-        return not self.built
-
-    def prebuild(self):
-        self.built = True
-
-
 class TestStandardDispatcherPrebuild(CustomTestCase):
     def setUp(self):
+        standard = "sglang.srt.layers.moe.token_dispatcher.standard."
+        self.enterContext(patch(standard + "get_device", return_value="cpu"))
         self.enterContext(
             patch(
-                "sglang.srt.layers.moe.token_dispatcher.standard.get_device",
-                return_value="cpu",
-            )
-        )
-        self.enterContext(
-            patch(
-                "sglang.srt.layers.moe.token_dispatcher.standard."
-                "should_use_flashinfer_cutlass_moe_fp4_allgather",
+                standard + "should_use_flashinfer_cutlass_moe_fp4_allgather",
                 return_value=False,
             )
         )
 
     def test_prebuilt_mapping_matches_the_first_dispatch(self):
         """Regression for EP2 garbage routing when the mapping fill was recorded
-        inside a capture: the mapping prebuilt before capture must equal the one
-        the first EP dispatch builds and survive later dispatches and prebuilds.
-        Layouts whose dispatch never builds the mapping must stay unbuilt, since
-        a set mapping changes how dispatch routes."""
+        inside a capture: the prebuilt mapping must equal the one the first EP
+        dispatch builds, and layouts that never build it must stay unbuilt."""
         topk_ids = torch.tensor([[0, 5], [8, 3]], dtype=torch.int32)
         topk_output = StandardTopKOutput(
             topk_weights=torch.ones_like(topk_ids, dtype=torch.float32),
@@ -112,63 +89,43 @@ class TestStandardDispatcherPrebuild(CustomTestCase):
                 self.assertTrue(eager.prebuild_pending)
                 eager.prebuild()
                 self.assertFalse(eager.prebuild_pending)
-                self.assertTrue(
-                    torch.equal(eager.local_expert_mapping, lazy.local_expert_mapping)
-                )
                 mapping = eager.local_expert_mapping
-                eager.prebuild()
+                self.assertTrue(torch.equal(mapping, lazy.local_expert_mapping))
                 out = eager.dispatch(torch.ones((2, 4)), topk_output)
                 self.assertIs(eager.local_expert_mapping, mapping)
-                local = mapping[topk_ids.long()]
-                self.assertTrue(torch.equal(out.topk_output.topk_ids, local))
-
-        cases = {
-            "ep1": dict(moe_ep_size=1),
-            "global_ids": dict(skip_local_expert_mapping=True),
-        }
-        for name, fields in cases.items():
-            with self.subTest(unbuilt_layout=name):
+                self.assertTrue(
+                    torch.equal(out.topk_output.topk_ids, mapping[topk_ids.long()])
+                )
+        for field, value in (("moe_ep_size", 1), ("skip_local_expert_mapping", True)):
+            with self.subTest(unbuilt_layout=field):
                 dispatcher = _ep_dispatcher(moe_ep_rank=0)
-                for field, value in fields.items():
-                    setattr(dispatcher, field, value)
+                setattr(dispatcher, field, value)
                 self.assertFalse(dispatcher.prebuild_pending)
                 dispatcher.prebuild()
                 self.assertIsNone(dispatcher.local_expert_mapping)
 
     def test_model_walk_prebuilds_every_dispatcher(self):
-        """Every dispatcher a module holds must be prebuilt, whatever the
-        attribute is named, including the two-batch-overlap wrapper's inners."""
+        """Every dispatcher a module holds is prebuilt once, whatever the attribute
+        is named, including the two-batch-overlap wrapper's inners; one without a
+        ``prebuild`` override keeps its lazy build."""
         plain = _ep_dispatcher(moe_ep_rank=0)
         inners = [_ep_dispatcher(moe_ep_rank=1), _ep_dispatcher(moe_ep_rank=1)]
         wrapper = object.__new__(MaybeTboDeepEPDispatcher)
         wrapper._inners = inners
         model = torch.nn.Module()
-        model.moe = torch.nn.Module()
-        model.moe.dispatcher = plain
-        model.custom = torch.nn.Module()
-        model.custom.deepep_dispatcher = wrapper
-        # A LoRA wrapper shares its base layer's dispatcher.
-        model.lora = torch.nn.Module()
-        model.lora.dispatcher = plain
+        for name, dispatcher in (
+            ("moe", plain),
+            ("custom", wrapper),
+            ("lora", plain),  # a LoRA wrapper shares its base layer's dispatcher
+            ("lazy", _LazyDispatcher()),
+        ):
+            setattr(model, name, torch.nn.Module())
+            setattr(getattr(model, name), f"{name}_dispatcher", dispatcher)
 
+        self.assertFalse(model.lazy.lazy_dispatcher.implements_prebuild)
         self.assertEqual(prebuild_dispatchers(model), 2)
         for dispatcher in [plain, *inners]:
             self.assertIsNotNone(dispatcher.local_expert_mapping)
-        self.assertEqual(prebuild_dispatchers(model), 0)
-
-    def test_prebuild_protocol_is_opt_in(self):
-        """A dispatcher without an overridden ``prebuild`` keeps its lazy build
-        natively, even when it reports pending state; without it a new backend
-        would be prebuilt through a no-op or have its state built under capture."""
-        self.assertFalse(_LazyDispatcher().implements_prebuild)
-        self.assertTrue(_PrebuiltDispatcher().implements_prebuild)
-        model = torch.nn.Module()
-        model.lazy = torch.nn.Module()
-        model.lazy.dispatcher = _LazyDispatcher()
-        model.prebuilt = torch.nn.Module()
-        model.prebuilt.dispatcher = _PrebuiltDispatcher()
-        self.assertEqual(prebuild_dispatchers(model), 1)
-        self.assertTrue(model.prebuilt.dispatcher.built)
         self.assertEqual(prebuild_dispatchers(model), 0)
 
 

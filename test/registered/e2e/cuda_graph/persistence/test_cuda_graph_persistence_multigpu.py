@@ -52,7 +52,6 @@ _DEEPEP = [
 
 class TestFoundryGraphPersistenceTP2(e2e.TestFoundryGraphPersistence):
     model = _MODEL
-    decode_bs = [1, 2, 4, 8]
     extra_server_args = ["--tp-size", "2", "--load-format", "dummy"] + _COLLECTIVES
 
 
@@ -62,7 +61,6 @@ _HAS_DEEPEP = importlib.util.find_spec("deep_ep") is not None
 @unittest.skipUnless(_HAS_DEEPEP, "DeepEP (deep_ep) is not installed")
 class TestFoundryGraphPersistenceEP2(e2e.TestFoundryGraphPersistence):
     model = _MODEL
-    decode_bs = [1, 2, 4, 8]
     compare_batched = False
     native_failure_skips = True
     extra_env = _EP_ENV
@@ -85,7 +83,6 @@ class TestFoundryGraphPersistenceEP2(e2e.TestFoundryGraphPersistence):
 @unittest.skipUnless(_HAS_DEEPEP, "DeepEP (deep_ep) is not installed")
 class TestFoundryGraphPersistenceTP2EP2(e2e.TestFoundryGraphPersistence):
     model = _MODEL
-    decode_bs = [1, 2, 4, 8]
     native_failure_skips = True
     extra_env = _EP_ENV
     extra_server_args = (
