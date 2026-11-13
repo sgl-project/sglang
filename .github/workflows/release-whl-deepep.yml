@@ -19,6 +19,9 @@ concurrency:
 
 env:
   TORCH_VERSION: "2.14.1"
+  # The cu134 wheels are built against, and require, this torch from the PyTorch cu134 index.
+  # They are published only to the cu134 wheel index, not to PyPI.
+  TORCH_VERSION_CU134: "2.15.0"
 
 jobs:
   build-cu130-matrix:
@@ -75,11 +78,60 @@ jobs:
           path: DeepEP-source/dist-pypi/*.whl
           if-no-files-found: error
 
+  build-cu134-matrix:
+    if: github.repository == 'sgl-project/sglang'
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+        arch: [x86_64, aarch64]
+        include:
+          - arch: x86_64
+            runner: x64-kernel-build-node
+          - arch: aarch64
+            runner: arm-kernel-build-node
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Clean workspace
+        run: |
+          docker run --rm -v "${{ github.workspace }}:/workspace" alpine:3 \
+            sh -c 'rm -rf /workspace/..?* /workspace/.[!.]* /workspace/*' || true
+
+      - name: Checkout SGLang
+        uses: actions/checkout@v4
+
+      - name: Checkout DeepEP
+        uses: actions/checkout@v4
+        with:
+          repository: sgl-project/DeepEP
+          ref: ${{ inputs['deepep-ref'] || 'sgl-deepep' }}
+          path: DeepEP-source
+          submodules: recursive
+
+      - name: Build wheels
+        env:
+          SGL_DEEP_EP_VERSION: ${{ inputs.version }}
+          TORCH_VERSION: ${{ env.TORCH_VERSION_CU134 }}
+        run: |
+          bash scripts/build_sgl_deepep.sh \
+            "${{ matrix.python-version }}" \
+            "13.4" \
+            "${{ github.workspace }}/DeepEP-source" \
+            "${{ matrix.arch }}"
+
+      - name: Upload CUDA-tagged wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: deepep-wheel-cu134-py${{ matrix.python-version }}-${{ matrix.arch }}
+          path: DeepEP-source/dist/*.whl
+          if-no-files-found: error
+
   release-whl:
-    needs: build-cu130-matrix
+    needs: [build-cu130-matrix, build-cu134-matrix]
     if: |
       github.repository == 'sgl-project/sglang' &&
-      needs.build-cu130-matrix.result == 'success'
+      needs.build-cu130-matrix.result == 'success' &&
+      needs.build-cu134-matrix.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout SGLang
@@ -109,7 +161,9 @@ jobs:
             "https://oauth2:${WHL_TOKEN}@github.com/sgl-project/whl.git" sgl-whl
 
       - name: Update wheel index
-        run: python3 scripts/update_deepep_whl_index.py --cuda 130
+        run: |
+          python3 scripts/update_deepep_whl_index.py --cuda 130
+          python3 scripts/update_deepep_whl_index.py --cuda 134
 
       - name: Push wheel indexes
         env:
