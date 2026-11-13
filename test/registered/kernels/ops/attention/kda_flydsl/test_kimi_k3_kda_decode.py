@@ -521,7 +521,7 @@ def test_pre_rename_names_still_select(new_name, old_name, old_value, new_value)
     # drops the copy the alias fallback writes to it.
     with field.override(None), temp_set_env(allow_sglang=True, **{old_name: old_value}):
         field.clear()
-        with pytest.warns(DeprecationWarning, match=old_name):
+        with pytest.warns(FutureWarning, match=old_name):
             assert field.get() == old_value
     with (
         field.override(new_value),
