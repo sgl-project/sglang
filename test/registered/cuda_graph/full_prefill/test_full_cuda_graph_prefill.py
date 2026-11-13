@@ -15,6 +15,7 @@ implement it; the FA4 case is restricted to Blackwell.
 
 import re
 import unittest
+from types import SimpleNamespace
 
 import requests
 
@@ -27,13 +28,12 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
-    SimpleNamespace,
     popen_launch_server,
 )
 
 # OSS FA4 coverage requires Blackwell. The PP test uses two GPUs; the other
 # tests use one GPU.
-register_cuda_ci(est_time=258, stage="base-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=258, stage="extra-b", runner_config="4-gpu-b200")
 
 
 def _prefill_graph_count(base_url: str) -> float:

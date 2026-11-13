@@ -8,10 +8,8 @@ import torch
 from sglang.multimodal_gen.configs.models.dits.qwenimage21 import QwenImage21DitConfig
 from sglang.multimodal_gen.configs.models.encoders.qwen3vl import Qwen3VLConfig
 from sglang.multimodal_gen.configs.models.vaes.qwenimage21 import QwenImage21VAEConfig
-from sglang.multimodal_gen.configs.pipeline_configs.base import (
-    ImagePipelineConfig,
-    ModelTaskType,
-)
+from sglang.multimodal_gen.configs.pipeline_configs.base import ImagePipelineConfig
+from sglang.multimodal_gen.configs.task_type import ModelTaskType
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -100,9 +98,10 @@ class QwenImage21PipelineConfig(ImagePipelineConfig):
         # decode consumes only target latents, not the condition prefix or its KV cache
         batch.extra.pop("qwen21_positive", None)
         batch.extra.pop("qwen21_negative", None)
-        return latents.transpose(1, 2).reshape(
-            latents.shape[0], -1, 1, batch.height // 16, batch.width // 16
+        height, width = batch.extra.pop(
+            "qwen21_latent_hw", (batch.height // 16, batch.width // 16)
         )
+        return latents.transpose(1, 2).reshape(latents.shape[0], -1, 1, height, width)
 
     def get_decode_scale_and_shift(self, device, dtype, vae):
         ac = self.vae_config.arch_config

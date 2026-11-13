@@ -106,7 +106,7 @@ class TopkCaptureOutput:
 
     out_cache_loc: torch.Tensor
     topk: torch.Tensor
-    host_cache: BaseHostCache
+    host_cache: Optional[BaseHostCache]
 
     def map_device_tensors(self, fn):
         # Device-tensor fields only; caller injects the copy+safety primitive
@@ -128,30 +128,54 @@ class BaseTopkCapturer:
         device: str,
         name: str,
         device_topk_size: Optional[int] = None,
+        allocate_host_cache: bool = True,
+        allocate_device_cache: bool = True,
     ):
         """device_topk_size defaults to topk_size; pass a different value when
         the device buffer needs extra columns (e.g. fused shared experts) that
         are dropped before writing to host_cache via [:topk_size] truncation.
+        Without a device cache, forwards capture and copy nothing; without a
+        host cache, callers must check has_host_cache before get_topk.
         """
         self.num_layers = num_layers
         self.topk_size = topk_size
+        self.device_topk_size = (
+            device_topk_size if device_topk_size is not None else topk_size
+        )
 
-        self.host_cache = BaseHostCache(
-            num_tokens, num_layers, topk_size, name=name, device=device
+        self.host_cache = (
+            BaseHostCache(
+                num_tokens=num_tokens,
+                num_layers=num_layers,
+                topk_size=topk_size,
+                name=name,
+                device=device,
+            )
+            if allocate_host_cache
+            else None
         )
-        self.device_cache = BaseDeviceCache(
-            max_batch_size,
-            num_layers,
-            device_topk_size if device_topk_size is not None else topk_size,
-            device,
-            name=name,
+        self.device_cache = (
+            BaseDeviceCache(
+                max_batch_size=max_batch_size,
+                num_layers=num_layers,
+                topk_size=self.device_topk_size,
+                device=device,
+                name=name,
+            )
+            if allocate_device_cache
+            else None
         )
+
+    @property
+    def has_host_cache(self) -> bool:
+        return self.host_cache is not None
 
     def capture(self, layer_id: int, topk_indices: torch.Tensor):
         self.device_cache.capture(layer_id, topk_indices)
 
     def destroy(self):
-        self.host_cache.destroy()
+        if self.has_host_cache:
+            self.host_cache.destroy()
 
     def _get_local_slice(
         self,
@@ -177,6 +201,11 @@ class BaseTopkCapturer:
         req_to_token_pool: ReqToTokenPool,
         start_len: int = 0,
     ) -> torch.Tensor:
+        if not self.has_host_cache:
+            raise RuntimeError(
+                f"{type(self).__name__} keeps no host cache on this rank; "
+                "check has_host_cache before get_topk."
+            )
         if start_len < 0:
             raise ValueError(f"{start_len=} must be non-negative")
         start_len = min(start_len, seqlen - 1)
@@ -198,6 +227,8 @@ class BaseTopkCapturer:
         the overlap thread can do non-blocking D2H + finalize itself. Otherwise sync
         D2H inline and return None (legacy non-overlap path).
         """
+        if self.device_cache is None:
+            return None
         slice_gpu = self._get_local_slice(
             forward_batch, can_run_graph, cuda_graph_batch
         )
