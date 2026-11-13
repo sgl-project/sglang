@@ -336,8 +336,10 @@ class SWAKVPool(BaseSWAKVPool):
                 layer_id_override=layer_id_pool,
             )
         else:
+            # Pass layer so a quantized sub-pool reads the scale at the global layer id;
+            # layer_id_override indexes the sub-pool buffers.
             pool.set_kv_buffer(
-                None,
+                layer,
                 loc,
                 cache_k,
                 cache_v,
