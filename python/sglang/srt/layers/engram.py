@@ -715,6 +715,42 @@ def _registered_device_ptr(host_ptr: int) -> int:
     return device_ptr.value
 
 
+def _memfd_create(name: str, *, use_os: Optional[bool] = None) -> int:
+    """Create an anonymous shared memory file.
+
+    ``os.memfd_create`` only exists when CPython was built against a libc that
+    declares the wrapper, which not every distribution of the interpreter does,
+    so the syscall is issued through libc when the helper is missing.
+
+    Args:
+        name: Name the descriptor shows up under in ``/proc/<pid>/fd``.
+        use_os: Force one path; defaults to whichever this interpreter has.
+            Tests use it to cover the libc path where both exist.
+
+    Returns:
+        An open read/write descriptor.
+    """
+    if use_os is None:
+        use_os = hasattr(os, "memfd_create")
+    if use_os:
+        return os.memfd_create(name, 0)
+    libc = ctypes.CDLL(None, use_errno=True)
+    fn = getattr(libc, "memfd_create", None)
+    if fn is None:
+        # /dev/shm is not an option here: these tables are tens of GiB and the
+        # container tmpfs is usually far smaller.
+        raise RuntimeError(
+            "engram host table: neither os.memfd_create nor libc memfd_create is "
+            "available, so replication 'per_node' cannot be backed by shared memory"
+        )
+    fn.restype = ctypes.c_int
+    fn.argtypes = (ctypes.c_char_p, ctypes.c_uint)
+    fd = fn(name.encode(), 0)
+    if fd < 0:
+        raise OSError(ctypes.get_errno(), f"memfd_create({name!r}) failed")
+    return fd
+
+
 class _HostTable:
     """Host-memory backing for one engram table: one shard per rank, or with
     replication per_node one whole table shared by the TP group.
@@ -765,7 +801,7 @@ class _HostTable:
     def _open_shared_fd(self, nbytes: int, name: str) -> int:
         owner = None
         if self.group.rank_in_group == 0:
-            fd = os.memfd_create(name, 0)
+            fd = _memfd_create(name)
             os.ftruncate(fd, nbytes)
             owner = (os.getpid(), fd)
         pid, owner_fd = self.group.broadcast_object(owner, src=0)
