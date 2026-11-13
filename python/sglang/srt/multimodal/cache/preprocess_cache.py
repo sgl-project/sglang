@@ -72,7 +72,9 @@ class CacheSizeProvider(Protocol):
 
 def estimate_cache_size_bytes(value: Any) -> Optional[int]:
     """Estimate owned CPU bytes, returning None for GPU-backed artifacts."""
-    seen: set[int] = set()
+    # Keep visited objects alive so temporary cache_size_items() ids are not recycled.
+    seen: dict[int, Any] = {}
+    seen_storages: set[int] = set()
 
     def visit(item: Any) -> Optional[int]:
         if item is None or isinstance(item, (bool, int, float)):
@@ -80,12 +82,20 @@ def estimate_cache_size_bytes(value: Any) -> Optional[int]:
         item_id = id(item)
         if item_id in seen:
             return 0
-        seen.add(item_id)
+        seen[item_id] = item
 
         if isinstance(item, torch.Tensor):
             if item.device.type != "cpu":
                 return None
-            return item.untyped_storage().nbytes()
+            storage = item.untyped_storage()
+            nbytes = storage.nbytes()
+            if nbytes == 0:
+                return 0
+            storage_ptr = storage.data_ptr()
+            if storage_ptr in seen_storages:
+                return 0
+            seen_storages.add(storage_ptr)
+            return nbytes
         if isinstance(item, np.ndarray):
             return int(item.nbytes)
         if isinstance(item, Image.Image):
