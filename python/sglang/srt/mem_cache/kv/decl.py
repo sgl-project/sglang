@@ -44,7 +44,17 @@ class StateLifetime(msgspec.Struct, frozen=True, tag="state"):
         return (self.rank, 0)
 
 
-KVLifetime = Union[FullLifetime, WindowLifetime, StateLifetime]
+class RequestLifetime(msgspec.Struct, frozen=True, tag="request"):
+    """One unit per request row, held while the row is bound and never cached
+    by the prefix tree. Ranked with the windows, so it floats in the chain."""
+
+    rank: ClassVar[int] = 1
+
+    def retention(self) -> Tuple[int, float]:
+        return (self.rank, 0)
+
+
+KVLifetime = Union[FullLifetime, WindowLifetime, StateLifetime, RequestLifetime]
 
 
 def declares_lifetime_beside_full(model_config) -> bool:
@@ -97,6 +107,8 @@ class StateGeometry(msgspec.Struct, frozen=True, kw_only=True):
     temporal_dtype: torch.dtype
     conv_slice_axis: int = 0
     extra_parts: Tuple["TensorPartDecl", ...] = ()
+    # Payload a running request owns beside its slot and the prefix tree never
+    # caches; planned as the request sub-pool's entry (`RequestGeometry`).
     request_parts: Tuple["TensorPartDecl", ...] = ()
     scratch_parts: Tuple["TensorPartDecl", ...] = ()
     replay: Optional[StateReplay] = None
@@ -115,7 +127,13 @@ class StateGeometry(msgspec.Struct, frozen=True, kw_only=True):
         )
 
 
-PartGeometry = Union[MHAGeometry, MLAGeometry, StateGeometry]
+class RequestGeometry(msgspec.Struct, frozen=True, kw_only=True):
+    """One request row's entry: the parts, each over its layers."""
+
+    parts: Tuple["TensorPartDecl", ...]
+
+
+PartGeometry = Union[MHAGeometry, MLAGeometry, StateGeometry, RequestGeometry]
 
 
 class KVPartDecl(msgspec.Struct, frozen=True, kw_only=True):
@@ -210,10 +228,6 @@ def kv_layer_decls(
     )
 
 
-class RequestLifetime(msgspec.Struct, frozen=True, tag="request"):
-    """A row owned by a request, reset when the row is acquired again."""
-
-
 class TensorPartDecl(msgspec.Struct, frozen=True, kw_only=True):
     """One typed payload per id, optionally repeated over model layers.
 
@@ -254,15 +268,6 @@ class ScratchDecl(msgspec.Struct, frozen=True, kw_only=True):
     """Captured workspace with one row per active request, outside the chain."""
 
     part: TensorPartDecl
-
-
-class RequestPartDecl(msgspec.Struct, frozen=True, kw_only=True):
-    """Persistent request-row payload, including preallocated transfer rows."""
-
-    part: TensorPartDecl
-    lifetime: RequestLifetime = RequestLifetime()
-    # Parts with the same wire name form one transfer component, in declaration order.
-    wire: Optional[str] = None
 
 
 class DerivedPartDecl(msgspec.Struct, frozen=True, kw_only=True):
@@ -366,16 +371,19 @@ def with_state_replay(
             )
         )
     extras, requests = list(geometry.extra_parts), list(geometry.request_parts)
-    if replay.speculative and not replay.is_kda:
+    if replay.speculative:
+        # A verify's ring never enters a checkpoint (each commit folds what it
+        # accepted into the state): it is the request's, not the slot's.
         requests.extend(ring)
-        requests.extend(
-            TensorPartDecl(name=name, shape=(), dtype=dtype)
-            for name, dtype in (
-                ("replayssm_spec_write_pos", torch.int32),
-                ("replayssm_cache_base", torch.int32),
-                ("replayssm_is_flush", torch.int8),
+        if not replay.is_kda:
+            requests.extend(
+                TensorPartDecl(name=name, shape=(), dtype=dtype)
+                for name, dtype in (
+                    ("replayssm_spec_write_pos", torch.int32),
+                    ("replayssm_cache_base", torch.int32),
+                    ("replayssm_is_flush", torch.int8),
+                )
             )
-        )
     else:
         extras.extend(ring)
     if replay.decode:

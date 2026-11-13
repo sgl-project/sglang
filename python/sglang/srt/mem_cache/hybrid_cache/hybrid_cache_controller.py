@@ -918,6 +918,10 @@ class HybridCacheController(BaseHiCacheController):
             num_pages = len(transfer.keys or [])
             if transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES:
                 num_pages = min(num_pages or 1, sidecar_hit_pages)
+            elif transfer.hit_policy == PoolHitPolicy.BLOCK_GROUPS:
+                # One buffer page per complete block of the hit.
+                block = max(1, int(transfer.block_pages))
+                num_pages = min(num_pages, sidecar_hit_pages // block)
             requests.append((transfer.name, num_pages * entry.host_pool.page_size))
             independent_transfers.append(transfer)
         return requests, independent_transfers
@@ -950,7 +954,10 @@ class HybridCacheController(BaseHiCacheController):
         """Atomically allocate every prefetch slice from a shared arena."""
         anchor = self.mem_pool_host.anchor_entry
         if not uses_shared_host_layout(anchor.host_pool):
-            return super().alloc_prefetch_host_buffers(operation, need_size)
+            host_indices = super().alloc_prefetch_host_buffers(operation, need_size)
+            if host_indices is not None:
+                self._sync_prefetch_trailing_keys(operation, need_size)
+            return host_indices
 
         requests, independent_transfers = self._shared_prefetch_requests(
             operation, need_size
@@ -959,6 +966,16 @@ class HybridCacheController(BaseHiCacheController):
         allocated = self._alloc_shared_host_requests_with_reclaim(requests)
         if allocated is None:
             return None
+        self._sync_prefetch_trailing_keys(operation, need_size)
+        for transfer, indices in zip(independent_transfers, allocated[1:], strict=True):
+            transfer.host_indices = indices
+        return allocated[0]
+
+    def _sync_prefetch_trailing_keys(
+        self, operation: StorageOperation, need_size: int
+    ) -> None:
+        # Scheduler thread, rank-agreed hit: a rank whose KV read falls short
+        # skips the sidecar read, yet its discard must heal the same keys.
         self._sync_trailing_keys(
             operation.pool_transfers or [],
             operation.sidecar_hash_values or operation.hash_value,
@@ -968,9 +985,6 @@ class HybridCacheController(BaseHiCacheController):
                 else need_size // self.page_size
             ),
         )
-        for transfer, indices in zip(independent_transfers, allocated[1:], strict=True):
-            transfer.host_indices = indices
-        return allocated[0]
 
     def allocate_storage_hit(
         self,
@@ -2120,10 +2134,18 @@ class HybridCacheController(BaseHiCacheController):
         is a sliding window of the last N hit pages.
         """
         for transfer in pool_transfers:
-            if transfer.hit_policy != PoolHitPolicy.TRAILING_PAGES:
+            if transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES:
+                trailing_n = len(transfer.keys) if transfer.keys else 1
+                transfer.keys = all_hashes[
+                    max(0, kv_hit_pages - trailing_n) : kv_hit_pages
+                ]
+            elif transfer.hit_policy == PoolHitPolicy.BLOCK_GROUPS:
+                # One key per complete block: the page that ends each block.
+                block = max(1, int(transfer.block_pages))
+                blocks = min(len(transfer.keys or ()), kv_hit_pages // block)
+                transfer.keys = [all_hashes[(i + 1) * block - 1] for i in range(blocks)]
+            else:
                 continue
-            trailing_n = len(transfer.keys) if transfer.keys else 1
-            transfer.keys = all_hashes[max(0, kv_hit_pages - trailing_n) : kv_hit_pages]
             if transfer.host_indices is None or transfer.indices_from_pool is not None:
                 continue
             entry = self.mem_pool_host.entry_map.get(transfer.name)

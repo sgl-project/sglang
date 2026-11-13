@@ -38,25 +38,6 @@ def _resolve_tuple2(x: _Tuple2) -> tuple[int, int]:
     return (x, x)
 
 
-def calculate_mel_frames_dasheng(
-    audio_length_samples: int,
-    n_fft: int = 512,
-    hop_size: int = 160,
-    dasheng_subsampling: int = 4,
-    center=True,
-    model_subsampling: int = 5,
-) -> int:
-    """Calculate the number of Mel-spectrogram frames."""
-    if center:
-        audio_length_samples = audio_length_samples + n_fft
-
-    return (
-        int(1 + ((audio_length_samples - n_fft) / hop_size))
-        // dasheng_subsampling
-        // model_subsampling
-    )
-
-
 class AudioPatchEmbed(nn.Module):
     def __init__(
         self,

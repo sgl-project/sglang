@@ -374,6 +374,19 @@ def host_only_mamba_checkpoint() -> bool:
     return True
 
 
+def _draft_quant_config(draft_model_config: ModelConfig):
+    """The quant config the draft model keeps once built, which its `auto` KV
+    cache dtype resolves from; read before the draft loads."""
+    from sglang.srt.configs.load_config import LoadConfig
+    from sglang.srt.model_loader.loader import built_quant_config
+
+    load_config = LoadConfig(
+        download_dir=get_model().download_dir,
+        model_loader_extra_config=get_model().model_loader_extra_config,
+    )
+    return built_quant_config(draft_model_config, load_config)
+
+
 def draft_loc_space_scale(*, hf_config, use_mla_backend: bool, dcp_size: int) -> int:
     execution_width = (
         mla_attention_dcp_size(hf_config, dcp_size=dcp_size, is_nextn=True)
@@ -956,9 +969,10 @@ class KVCacheConfigurator:
                 raise ValueError(
                     f"Fused draft KV: the draft resolved its KV cache dtype to "
                     f"{self.kv_cache_dtype}, but its region inside the target's "
-                    f"pages holds {region_kv_dtype}. Set "
-                    "--speculative-draft-kv-cache-dtype explicitly so the region "
-                    "is sized in the draft's KV dtype."
+                    f"pages holds {region_kv_dtype}: the draft model keeps a "
+                    "quant config other than the one its class declares through "
+                    "own_quant_config. Set --speculative-draft-kv-cache-dtype "
+                    "explicitly so the region is sized in the draft's KV dtype."
                 )
         return placement
 
@@ -1058,17 +1072,6 @@ class KVCacheConfigurator:
             replay_spec = mamba.enable_linear_replayssm_spec and (
                 self.hybrid_gdn_config is not None or self.hybrid_kda_config is not None
             )
-            if (
-                replay_spec
-                and cache_params.is_kda
-                and get_disagg().disaggregation_mode != "null"
-            ):
-                raise ValueError(
-                    "Unified KDA speculative ReplaySSM does not support PD "
-                    "disaggregation: prefill and decode have different state "
-                    "entry layouts. Disable --enable-linear-replayssm-spec "
-                    "or --enable-unified-memory."
-                )
             if mamba.enable_linear_replayssm or replay_spec:
                 geometry = with_state_replay(
                     geometry,
@@ -1187,11 +1190,7 @@ class KVCacheConfigurator:
                 else 0
             )
             return extra_max_context_len, pre_alloc_size
-        pre_alloc_size = 0
-        if disagg.disaggregation_mode == "decode" or disagg.enable_pd_role_switch:
-            # A flip-capable prefill needs the decode pool shape.
-            pre_alloc_size = disagg.disaggregation_decode_extra_slots or 0
-        return get_req_to_token_extra_context_len(), pre_alloc_size
+        return get_req_to_token_extra_context_len(), self._req_pool_pre_alloc_size()
 
     def _unified_swa_head_geometry(self) -> _UnifiedSWAHeadGeometry:
         """Head geometry of a hybrid-SWA host's full and SWA sub-pools."""
@@ -1342,25 +1341,21 @@ class KVCacheConfigurator:
             if self.model_config.is_multi_layer_eagle
             else 1
         )
-        # The region holds the draft's own KV, in the dtype the draft runner
-        # resolves for itself by the same rules: its explicit dtype, else the
-        # host's dtype standing in for an `auto` (given or by default) that the
-        # draft resolves from its own quant config only when it loads (checked
-        # when the draft binds). A region has typed views of its own, so a
-        # draft dtype other than the host's still fuses.
-        from sglang.srt.mem_cache.kv_cache_dtype import (
-            TORCH_DTYPE_TO_KV_CACHE_STR,
-            configure_kv_cache_dtype,
-        )
+        # The region holds the draft's KV in the dtype its runner will resolve
+        # (rechecked at bind); regions have their own typed views, so it may
+        # differ from the host's.
+        from sglang.srt.mem_cache.kv_cache_dtype import configure_kv_cache_dtype
 
+        kv_cache_dtype = get_model().kv_cache_dtype
         draft_kv_cache_dtype = get_spec().speculative_draft_kv_cache_dtype
-        if draft_kv_cache_dtype == "auto":
-            draft_kv_cache_dtype = None
+        resolves_auto = (
+            draft_kv_cache_dtype if draft_kv_cache_dtype is not None else kv_cache_dtype
+        ) == "auto"
         _, region_kv_dtype = configure_kv_cache_dtype(
-            server_args_kv_cache_dtype=TORCH_DTYPE_TO_KV_CACHE_STR.get(
-                self.kv_cache_dtype, "auto"
+            server_args_kv_cache_dtype=kv_cache_dtype,
+            quant_config=(
+                _draft_quant_config(aux.draft_model_config) if resolves_auto else None
             ),
-            model=None,
             model_dtype=aux.draft_model_config.dtype,
             is_draft_worker=True,
             is_dflash=self.spec_algorithm.is_dflash_family(),
@@ -1493,16 +1488,23 @@ class KVCacheConfigurator:
             return 2 * max_running_requests
         return max_running_requests
 
+    def _req_pool_pre_alloc_size(self) -> int:
+        """Pre-alloc rows of a PD decode req pool (0 for any other pool)."""
+        disagg = get_disagg()
+        # A flip-capable prefill needs the decode pool shape, and the extra-slot
+        # default is only computed for a decode launch.
+        if disagg.enable_pd_role_switch:
+            return disagg.disaggregation_decode_extra_slots or 0
+        if disagg.disaggregation_mode == "decode":
+            return disagg.disaggregation_decode_extra_slots
+        return 0
+
     def _build_req_to_token_pool(self, *, max_num_reqs: int) -> ReqToTokenPool:
         extra_max_context_len = get_req_to_token_extra_context_len()
 
         disagg = get_disagg()
         if disagg.disaggregation_mode == "decode" or disagg.enable_pd_role_switch:
-            # A flip-capable prefill needs the decode pool shape, and the extra-slot
-            # default is only computed for a decode launch.
-            pre_alloc_size = disagg.disaggregation_decode_extra_slots
-            if disagg.enable_pd_role_switch:
-                pre_alloc_size = pre_alloc_size or 0
+            pre_alloc_size = self._req_pool_pre_alloc_size()
             if self.mambaish_config:
                 return self._build_hybrid_mamba_decode_req_pool(
                     max_num_reqs=max_num_reqs,
@@ -2669,6 +2671,20 @@ class KVCacheConfigurator:
             mla_pool_class=mla_pool_class,
             dsa_pool_class=dsa_pool_class,
         )
+        if (
+            extra_args.get("use_dsa")
+            and not self.is_draft_worker
+            and get_memory().enable_hisparse
+        ):
+            reject_out_of_tree_path(
+                current_platform, subsystem="the HiSparse DSA KV pool"
+            )
+            from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+
+            full_pool_class = HiSparseDSATokenToKVPool
+            extra_args["host_to_device_ratio"] = (
+                parse_hisparse_config().host_to_device_ratio
+            )
         from sglang.srt.layers.attention.qsa.config import (
             parse_qsa_profile,
         )
@@ -2736,9 +2752,10 @@ class KVCacheConfigurator:
         page_size = get_schedule().page_size * self.dflash_draft_loc_space_scale
         rows = draft_kv_ring_pool_rows_from_config(
             self.spec_aux_config.draft_model_config.hf_config,
-            # Request rows plus the padding row: the ring is off under PD, so no
-            # pre-alloc rows.
-            req_to_token_rows=self._req_pool_rows(max_num_reqs) + 1,
+            # Request rows, PD pre-alloc rows and the padding row.
+            req_to_token_rows=(
+                self._req_pool_rows(max_num_reqs) + self._req_pool_pre_alloc_size() + 1
+            ),
             page_size=page_size,
         )
         # The pool adds one padding page.
