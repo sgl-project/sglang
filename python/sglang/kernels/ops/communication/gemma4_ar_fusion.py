@@ -17,7 +17,9 @@ place; it is never exchanged.
 ``partial``, ``out`` and ``scales`` are this rank's views of symmetric,
 multicast-bound buffers whose multicast VAs the caller passes alongside (a
 :func:`~sglang.srt.layers.communication.gemma4_ar_fusion.symm_buffer`). Every
-rank must call with the same shapes and ``num_blocks``.
+rank must call with the same shapes and ``num_blocks``. ``scales`` may be
+strided, e.g. DeepGEMM's column-major layout with 16-byte aligned columns; it
+must start at the address its multicast VA maps.
 
 The hidden size and the block width are compiled in; :func:`threads_for` picks
 the width. Needs :func:`register_comm` once per process.

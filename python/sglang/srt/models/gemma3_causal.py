@@ -117,10 +117,13 @@ class Gemma3MLP(nn.Module):
         self.act_fn = GeluAndMul()
         self.prefix = prefix
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, output_tensor: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        """``output_tensor``: optional caller-owned storage for down_proj's result."""
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
+        x, _ = self.down_proj(x, output_tensor=output_tensor)
         return x
 
 

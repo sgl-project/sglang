@@ -1,12 +1,13 @@
 """One Gemma-4 layer site, fused (NVLS all-reduce + norm -> residual add -> norm ->
 per-128 FP8 quant in one kernel) against the stock chain (the TP all-reduce
 the model runs today: CustomAllReduceV2 within its tuned size bands, NCCL
-above them; then gemma_rmsnorm_residual_scalar + RMSNorm +
-per_token_group_quant_fp8), per token count. ``fused-nocopy`` leaves out the
-staging copy into the symmetric buffer, the cost a producer writing straight
-into it would save. Multi-GPU only; relaunches under torchrun.
+above them; then gemma_rmsnorm_residual_scalar + the SM90 RMSNorm kernel +
+per_token_group_quant_fp8), per token count, from decode batch sizes up to
+prefill chunks. ``fused-nocopy`` leaves out the staging copy into the
+symmetric buffer, which the model path avoids by having the GEMM write it.
+Multi-GPU only; relaunches under torchrun.
 
-The per-TP-size defaults of DEFAULT_MIN_TOKENS
+The per-TP-size defaults of DEFAULT_MIN_TOKENS and DEFAULT_DECODE_MIN_TOKENS
 (srt/layers/communication/gemma4_ar_fusion.py) come from this sweep.
 """
 
@@ -17,6 +18,7 @@ import os
 
 import torch
 import torch.distributed as dist
+from sgl_kernel import rmsnorm
 from torch._C._distributed_c10d import _SymmetricMemory
 
 import sglang.srt.distributed.parallel_state as ps
@@ -43,7 +45,9 @@ register_cuda_ci(
 HIDDEN = 5376  # Gemma-4 31B
 EPS = 1e-6
 GROUP = gemma4_ar_fusion.GROUP
-NUM_TOKENS = get_benchmark_range([128, 256, 512, 1024, 2048, 4096, 8192], [512, 4096])
+NUM_TOKENS = get_benchmark_range(
+    [1, 4, 8, 16, 32, 64, 128, 160, 256, 512, 1024, 2048, 4096, 8192], [32, 512, 4096]
+)
 MAX_TOKENS = max(NUM_TOKENS)
 PROVIDERS = ["stock", "fused", "fused-nocopy"]
 
@@ -112,7 +116,7 @@ def benchmark(num_tokens: int, provider: str):
         def fn(x):
             x = _stock_all_reduce(comm, coord.device_group, x)
             r = gemma_rmsnorm_residual_scalar(x, w_a, residual, scalar, EPS)
-            y = torch.nn.functional.rms_norm(r, (HIDDEN,), w_b, EPS)
+            y = rmsnorm(r, w_b, EPS)  # what RMSNorm.forward_cuda runs on SM90
             return per_token_group_quant_fp8(y, GROUP)
 
     else:
@@ -122,6 +126,9 @@ def benchmark(num_tokens: int, provider: str):
         rows = max(0, min(num_tokens, row0 + per_rank) - row0)
         mine = residual[row0 : row0 + rows].clone()
         copy = provider == "fused"
+        # the model's scale layout: column-major, 16-byte aligned columns
+        groups, ld = HIDDEN // GROUP, (num_tokens + 3) // 4 * 4
+        scales = s_t.view(-1)[: groups * ld].view(groups, ld).t()[:num_tokens]
 
         def fn(x):
             if copy:
@@ -131,7 +138,7 @@ def benchmark(num_tokens: int, provider: str):
                 p_mc,
                 o_t[:num_tokens],
                 o_mc,
-                s_t[:num_tokens],
+                scales,
                 s_mc,
                 mine,
                 w_a,
@@ -143,7 +150,7 @@ def benchmark(num_tokens: int, provider: str):
                 False,
                 world_size=world_size,
             )
-            return o_t[:num_tokens], s_t[:num_tokens]
+            return o_t[:num_tokens], scales
 
     return marker.do_bench(
         fn,

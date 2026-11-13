@@ -1739,9 +1739,25 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
     bias: Optional[torch.Tensor] = None,
     act_scale_ue8m0: bool = False,
     weight_bf16: Optional[torch.Tensor] = None,
+    output: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    """``output``: optional caller-owned storage of the result's shape. DeepGEMM
+    writes a contiguous bf16 one directly; every other case computes and copies."""
     output_dtype = torch.bfloat16 if input_scale is not None else input.dtype
+    if output is not None:
+        assert output.shape == (*input.shape[:-1], weight.shape[0])
     input_2d = input.view(-1, input.shape[-1])
+    # DeepGEMM's result is bf16; it can land in the caller's storage as is
+    direct = (
+        output is not None
+        and output.dtype == output_dtype == torch.bfloat16
+        and output.is_contiguous()
+    )
+    gemm_out = output.view(-1, weight.shape[0]) if direct else None
+
+    def _finish(result: torch.Tensor) -> torch.Tensor:
+        return result if output is None else output.copy_(result)
+
     if (
         input_scale is not None
         and input_scale.dtype == torch.float32
@@ -1750,20 +1766,20 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
         and input_scale.is_contiguous()
         and _use_fp8_block_gemv(input_2d, weight, weight_scale, block_size)
     ):
-        output = hopper_fp8_block_gemv(input_2d, input_scale, weight, weight_scale)
+        result = hopper_fp8_block_gemv(input_2d, input_scale, weight, weight_scale)
         if bias is not None:
-            output += bias
-        return output.view(*input.shape[:-1], weight.shape[0])
+            result += bias
+        return _finish(result.view(*input.shape[:-1], weight.shape[0]))
     if input_scale is None and _use_fp8_block_gemv(
         input_2d, weight, weight_scale, block_size
     ):
         q_input, x_scale = sglang_per_token_group_quant_fp8(
             input_2d, block_size[1], scale_ue8m0=act_scale_ue8m0
         )
-        output = hopper_fp8_block_gemv(q_input, x_scale, weight, weight_scale)
+        result = hopper_fp8_block_gemv(q_input, x_scale, weight, weight_scale)
         if bias is not None:
-            output += bias
-        return output.view(*input.shape[:-1], weight.shape[0])
+            result += bias
+        return _finish(result.view(*input.shape[:-1], weight.shape[0]))
 
     # DeepGEMM accepts a partial final K block when both operands carry ceil(K / 128)
     # scales; its TMA descriptors need 16-byte-aligned base pointers and fp8 row strides.
@@ -1816,32 +1832,37 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
             weight_scale = _unpack_ue8m0_scale_for_triton(
                 weight_scale, weight.shape, block_size
             )
-        return triton_w8a8_block_fp8_linear(
-            input,
-            weight,
-            block_size,
-            weight_scale,
-            input_scale,
-            bias,
-            act_scale_ue8m0=act_scale_ue8m0,
-            weight_bf16=weight_bf16,
+        return _finish(
+            triton_w8a8_block_fp8_linear(
+                input,
+                weight,
+                block_size,
+                weight_scale,
+                input_scale,
+                bias,
+                act_scale_ue8m0=act_scale_ue8m0,
+                weight_bf16=weight_bf16,
+            )
         )
 
     if input_scale is not None:
         # Pre-quantized activations retain their group size and scale format.
         # DeepGEMM aligns fp32 scale storage for TMA when needed.
         input_2d = input.view(-1, input.shape[-1])
-        output = w8a8_block_fp8_matmul_deepgemm(
+        result = w8a8_block_fp8_matmul_deepgemm(
             input_2d,
             weight,
             input_scale,
             weight_scale,
             block_size,
             output_dtype=output_dtype,
+            output=gemm_out,
         )
         if bias is not None:
-            output += bias
-        return output.view(*input.shape[:-1], weight.shape[0])
+            result += bias
+        if direct:
+            return output
+        return _finish(result.view(*input.shape[:-1], weight.shape[0]))
 
     input_2d = input.view(-1, input.shape[-1])
     output_shape = [*input.shape[:-1], weight.shape[0]]
@@ -1866,12 +1887,20 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
             block_size[1],
         )
 
-    output = w8a8_block_fp8_matmul_deepgemm(
-        q_input, weight, x_scale, weight_scale, block_size, output_dtype=output_dtype
+    result = w8a8_block_fp8_matmul_deepgemm(
+        q_input,
+        weight,
+        x_scale,
+        weight_scale,
+        block_size,
+        output_dtype=output_dtype,
+        output=gemm_out,
     )
     if bias is not None:
-        output += bias
-    return output.to(dtype=output_dtype).view(*output_shape)
+        result += bias
+    if direct:
+        return output
+    return _finish(result.to(dtype=output_dtype).view(*output_shape))
 
 
 def _unpack_ue8m0_scale_for_triton(
