@@ -18,7 +18,6 @@ import requests
 
 from sglang.benchmark.serving import run_benchmark
 from sglang.srt.utils import kill_process_tree
-from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -741,38 +740,6 @@ def run_and_check_memory_leak(
     assert not has_leak
     if assert_has_abort:
         assert has_abort
-
-
-def run_mmlu_test(
-    disable_radix_cache=False,
-    enable_mixed_chunk=False,
-    disable_overlap=False,
-    chunked_prefill_size=32,
-):
-    def workload_func(base_url, model):
-        # Run the eval
-        args = SimpleNamespace(
-            base_url=base_url,
-            model=model,
-            eval_name="mmlu",
-            num_examples=128,
-            num_threads=128,
-        )
-
-        try:
-            metrics = run_sgl_eval(args)
-            assert metrics["score"] >= 0.65, f"{metrics=}"
-        finally:
-            pass
-
-    run_and_check_memory_leak(
-        workload_func,
-        disable_radix_cache,
-        enable_mixed_chunk,
-        disable_overlap,
-        chunked_prefill_size,
-        assert_has_abort=False,
-    )
 
 
 def send_concurrent_requests(
