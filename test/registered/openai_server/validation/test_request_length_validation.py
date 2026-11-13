@@ -154,6 +154,25 @@ class TestRequestLengthValidation(CustomTestCase):
         self.assertEqual(response.status_code, 400)
         self.assertIn("out-of-vocabulary", response.text)
 
+    def test_empty_prompt_rejected(self):
+        # A zero-token prompt passed the input_ids check (it is tokenized
+        # text) and crashed the scheduler in the model forward.
+        headers = {"Authorization": f"Bearer {self.api_key}"}
+        for text in ("", ["hi", ""]):
+            response = requests.post(
+                f"{self.base_url}/generate",
+                headers=headers,
+                json={"text": text, "sampling_params": {"max_new_tokens": 1}},
+            )
+            self.assertEqual(response.status_code, 400)
+            self.assertIn("input is empty", response.text)
+        response = requests.post(
+            f"{self.base_url}/generate",
+            headers=headers,
+            json={"text": "hi", "sampling_params": {"max_new_tokens": 1}},
+        )
+        self.assertEqual(response.status_code, 200)
+
     def test_token_ids_logprob_valid(self):
         headers = {"Authorization": f"Bearer {self.api_key}"}
         response = requests.post(
