@@ -22,7 +22,6 @@ from sglang.test.ascend.test_npu_rl_utils import (
     health,
     load_checkpoint_tensor,
     logprob_signature,
-    npu_device_count,
     npu_rl_env,
     npu_server,
     serialize_named_tensors,
@@ -271,12 +270,9 @@ def _make_suite(case):
     name = "TestNpuUpdateWeightsFromTensor_" + case.id.replace("-", "_").replace(
         ".", "_"
     )
-    suite = type(
+    return type(
         name, (_TensorSuite, CustomTestCase), {"CASE": case, "__module__": __name__}
     )
-    return unittest.skipUnless(
-        npu_device_count() >= TP_SIZE, f"requires at least {TP_SIZE} Ascend NPUs"
-    )(suite)
 
 
 for _case in weights.MODEL_CASES:

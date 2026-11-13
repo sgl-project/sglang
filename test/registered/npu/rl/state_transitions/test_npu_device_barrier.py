@@ -26,7 +26,6 @@ from sglang.test.ascend.test_npu_rl_utils import (
     end_weight_update,
     generate,
     load_checkpoint_tensor,
-    npu_device_count,
     npu_rl_env,
     npu_server,
     pause_generation,
@@ -170,7 +169,6 @@ class TestNpuDeviceBarrier(CustomTestCase):
         # resume_memory_occupation has no device-wide synchronize today; this
         # test locks the barrier/restore ordering that the current code provides.
 
-    @unittest.skipUnless(npu_device_count() >= 2, "requires at least 2 Ascend NPUs")
     def test_02_dp_pause_returns_after_all_ranks_drain(self):
         with npu_server(MODEL, extra_args=DP_ARGS, env=npu_rl_env()) as base_url:
             requests_ = [
