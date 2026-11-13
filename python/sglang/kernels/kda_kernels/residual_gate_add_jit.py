@@ -8,6 +8,7 @@ import triton.language as tl
 
 from sglang.kernels.jit.utils import cache_once, load_jit, make_cpp_args
 from sglang.kernels.kda_kernels import _cuda_source
+from sglang.kernels.ops.diffusion.common.fast_launch import replay_launches
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -269,6 +270,87 @@ def _is_transposed_dense_residual(
     )
 
 
+@triton.jit
+def _rga_sum2(
+    out_ptr,
+    residual_ptr,
+    a_ptr,
+    b_ptr,
+    gate_ptr,
+    gate_row_stride,
+    seq_len,
+    dim: tl.constexpr,
+    block_dim: tl.constexpr,
+):
+    # residual_gate_value on update = a + b. Each sum and product is rounded by
+    # its own instruction, as there: a plain cast would let the multiply and
+    # the add contract into one fma with a single rounding.
+    row = tl.program_id(0)
+    offsets = tl.arange(0, block_dim)
+    mask = offsets < dim
+    a = tl.load(a_ptr + row * dim + offsets, mask=mask, other=0.0)
+    b = tl.load(b_ptr + row * dim + offsets, mask=mask, other=0.0)
+    update = _round16_f32(a.to(tl.float32) + b.to(tl.float32), True)
+    gate = tl.load(
+        gate_ptr + (row // seq_len) * gate_row_stride + offsets, mask=mask, other=0.0
+    )
+    residual = tl.load(residual_ptr + row * dim + offsets, mask=mask, other=0.0)
+    product = _round16_f32(update * gate.to(tl.float32), True)
+    out = _round16_f32(residual.to(tl.float32) + product, True)
+    tl.store(out_ptr + row * dim + offsets, out.to(tl.bfloat16), mask=mask)
+
+
+@replay_launches
+def residual_gate_add_sum2(
+    residual: torch.Tensor, a: torch.Tensor, b: torch.Tensor, gate: torch.Tensor
+) -> torch.Tensor | None:
+    """``residual_gate_add(residual, a + b, gate)`` in one kernel, or ``None``.
+
+    ``a`` and ``b`` are a row-parallel layer's two partial sums as contiguous
+    ``[rows, dim]``; either may be mapped from another device. ``gate`` is one
+    ``[batch, 1, dim]`` row per sample.
+    """
+    if not (
+        torch.version.hip is None
+        and residual.dtype == torch.bfloat16
+        and residual.is_cuda
+        # cvt.rn.bf16.f32
+        and torch.cuda.get_device_capability(residual.device) >= (9, 0)
+        and residual.dim() == 3
+        and residual.numel() > 0
+        and residual.is_contiguous()
+        and 0 < residual.shape[-1] <= 8192
+    ):
+        return None
+    batch, tokens, dim = residual.shape
+    rows = batch * tokens
+    if not (
+        a.shape == b.shape == (rows, dim)
+        and a.dtype == b.dtype == gate.dtype == residual.dtype
+        and a.device == b.device == gate.device == residual.device
+        and a.is_contiguous()
+        and b.is_contiguous()
+        and gate.shape == (batch, 1, dim)
+        and gate.stride(-1) == 1
+    ):
+        return None
+    out = torch.empty_like(residual)
+    with torch.cuda.device(residual.device):
+        _rga_sum2[(rows,)](
+            out,
+            residual,
+            a,
+            b,
+            gate,
+            gate.stride(0),
+            tokens,
+            dim,
+            block_dim=triton.next_power_of_2(dim),
+            num_warps=8,
+        )
+    return out
+
+
 def can_use_residual_gate_add_cuda(
     residual: torch.Tensor, update: torch.Tensor, gate: torch.Tensor
 ) -> bool:
@@ -299,4 +381,5 @@ __all__ = [
     "can_use_residual_gate_add_cuda",
     "residual_gate_add",
     "residual_gate_add_cuda",
+    "residual_gate_add_sum2",
 ]
