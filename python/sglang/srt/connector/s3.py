@@ -88,7 +88,6 @@ class S3Connector(BaseFileConnector):
         Pull files from S3 storage into the temporary directory.
 
         Args:
-            s3_model_path: The S3 path of the model.
             allow_pattern: A list of patterns of which files to pull.
             ignore_pattern: A list of patterns of which files not to pull.
 
