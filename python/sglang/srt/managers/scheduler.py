@@ -6053,6 +6053,12 @@ class Scheduler(
             if self.enable_unified_cache_external_linker:
                 idle &= not self.tree_cache.linker.prefetches
 
+            # Wait for asynchronous linker loads and stores to drain.
+            if self.enable_unified_cache_external_linker:
+                linker = self.tree_cache.linker
+                if linker is not None:
+                    idle &= not linker.has_pending_operations()
+
         return idle
 
     def _pp_microbatches_drained(self) -> bool:
