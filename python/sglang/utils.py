@@ -7,6 +7,7 @@ import random
 import ssl
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.request
 import weakref
@@ -279,7 +280,7 @@ def encode_video_base64(video_path: str, num_frames: int = 16):
 def download_and_cache_file(url: str, filename: Optional[str] = None):
     """Read and cache a file from a url."""
     if filename is None:
-        filename = os.path.join("/tmp", url.split("/")[-1])
+        filename = os.path.join(tempfile.gettempdir(), url.split("/")[-1])
 
     # Check if the cache file already exists
     if os.path.exists(filename):
