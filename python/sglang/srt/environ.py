@@ -311,6 +311,10 @@ class Envs:
     SGLANG_QWEN4_PLE_FILE_DIR = EnvStr(lambda: _default_cache_subdir("ple"))
     SGLANG_QWEN4_PLE_FILE_PREFETCH = EnvBool(True)
     SGLANG_QWEN4_PLE_FILE_SKIP_DEVICE_CHECK = EnvBool(False)
+    # Skip rewriting a shard whose bytes are already on disk, verified by
+    # sampling random 4 KiB windows per shard (not by name, mtime or size).
+    SGLANG_QWEN4_PLE_FILE_REUSE = EnvBool(True)
+    SGLANG_QWEN4_PLE_FILE_REUSE_WINDOWS = EnvInt(32)
     # Faulting rows in maps whole page-cache folios, so the mapping creeps
     # towards full residency (~45 KB/token) and eats the free memory that
     # sizes the KV pool. Cap its resident set; 0 disables the trim.
