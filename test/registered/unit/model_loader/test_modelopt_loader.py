@@ -33,6 +33,9 @@ from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptMixedPrecisionConfig,
     ModelOptNvFp4A16LinearMethod,
 )
+from sglang.srt.layers.quantization.nvfp4_online import (
+    ModelOptNvFp4OnlineFusedMoEMethod,
+)
 from sglang.srt.model_loader.loader import (
     DefaultModelLoader,
     ModelOptModelLoader,
@@ -512,6 +515,71 @@ class TestModelOptMixedPrecisionConfig(CustomTestCase):
                     "packed_modules_mapping": {},
                 }
             )
+
+    def _draft_mixed_quant_config(self, *, is_explicit, draft_quantization):
+        model_config = SimpleNamespace(
+            quantization="modelopt_mixed",
+            hf_config=PretrainedConfig(
+                quantization_config={
+                    "quant_method": "modelopt_mixed",
+                    "quant_algo": "MIXED_PRECISION",
+                    "kv_cache_quant_algo": None,
+                    "exclude_modules": [],
+                    "quantized_layers": {
+                        "model.language_model.layers.0.mlp.experts": {
+                            "quant_algo": "NVFP4",
+                            "group_size": 16,
+                        },
+                        "mtp.layers.0.mlp.experts": {
+                            "quant_algo": "FP8_BLOCK_SCALES",
+                            "group_size": 128,
+                        },
+                    },
+                }
+            ),
+            model_path="target-model",
+            revision=None,
+            is_draft_model=True,
+            is_draft_quantization_explicit=is_explicit,
+        )
+        spec = SimpleNamespace(speculative_draft_model_quantization=draft_quantization)
+        with patch("sglang.srt.model_loader.weight_utils.get_spec", return_value=spec):
+            return get_quant_config(model_config, LoadConfig(), {})
+
+    def test_explicit_modelopt_fp4_draft_converts_block_fp8_experts(self):
+        quant_config = self._draft_mixed_quant_config(
+            is_explicit=True, draft_quantization="modelopt_fp4"
+        )
+        online_config = quant_config.block_fp8_moe_online_config
+        self.assertEqual(online_config.get_name(), "modelopt_fp4")
+        self.assertTrue(online_config.is_checkpoint_fp8_serialized)
+        self.assertEqual(online_config.weight_block_size, [128, 128])
+        self.assertFalse(online_config.use_per_token_activation)
+
+        # Type dispatch only; the NVFP4 MoE method needs a Blackwell runtime.
+        layer = FusedMoE.__new__(FusedMoE)
+        with patch.object(
+            ModelOptNvFp4OnlineFusedMoEMethod, "__init__", return_value=None
+        ):
+            method = quant_config.get_quant_method(layer, "mtp.layers.0.mlp.experts")
+        self.assertIsInstance(method, ModelOptNvFp4OnlineFusedMoEMethod)
+
+    def test_other_draft_requests_keep_native_block_fp8_experts(self):
+        cases = (
+            ("inherited target quantization", False, "modelopt_fp4"),
+            ("explicit other quantization", True, "fp8"),
+        )
+        for name, is_explicit, draft_quantization in cases:
+            with self.subTest(name=name):
+                quant_config = self._draft_mixed_quant_config(
+                    is_explicit=is_explicit, draft_quantization=draft_quantization
+                )
+                self.assertIsNone(quant_config.block_fp8_moe_online_config)
+                layer = FusedMoE.__new__(FusedMoE)
+                method = quant_config.get_quant_method(
+                    layer, "mtp.layers.0.mlp.experts"
+                )
+                self.assertIsInstance(method, Fp8MoEMethod)
 
     def test_incomplete_inline_config_falls_back_to_hf_quant_config_file(self):
         packed_modules_mapping = {

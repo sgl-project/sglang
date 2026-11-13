@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import uuid
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
 
@@ -146,17 +145,6 @@ class OpenAIServingBase(ABC):
         """Generate request ID based on request type"""
         pass
 
-    def _generate_request_id_base(self, request: OpenAIServingRequest) -> Optional[str]:
-        """Generate request ID based on request type"""
-        return None
-
-        # TODO(chang): the rid is used in io_strcut check and often violates `The rid should be a list` AssertionError
-        # Temporarily return None in this function until the rid logic is clear.
-        if rid := getattr(request, "rid", None):
-            return rid
-
-        return f"{self._request_id_prefix()}{uuid.uuid4().hex}"
-
     @abstractmethod
     def _convert_to_internal_request(
         self,
@@ -201,6 +189,12 @@ class OpenAIServingBase(ABC):
     def _validate_request(self, _: OpenAIServingRequest) -> Optional[str]:
         """Validate request"""
         pass
+
+    def _top_logprobs_error(self, field: str, value: Optional[int]) -> Optional[str]:
+        vocab_size = self.tokenizer_manager.model_config.vocab_size
+        if value is not None and not 0 <= value <= vocab_size:
+            return f"{field} must be in [0, {vocab_size}], got {value}."
+        return None
 
     def create_error_response(
         self,
