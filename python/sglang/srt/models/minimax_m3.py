@@ -1879,8 +1879,11 @@ class MiniMaxM3Model(nn.Module):
     ) -> None:
         super().__init__()
 
-        if uses_minimax_m3_nvfp4_native_stack(
-            quant_config.get_name() if quant_config is not None else None
+        # One rank per node builds; the others load from the shared JIT cache.
+        if get_parallel().world_group.local_rank == 0 and (
+            uses_minimax_m3_nvfp4_native_stack(
+                quant_config.get_name() if quant_config is not None else None
+            )
         ):
             from sglang.srt.layers.attention.minimax_sparse_ops.msa_plan import (
                 start_msa_v1_prebuild,
