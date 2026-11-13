@@ -49,16 +49,16 @@ from typing import List, Optional, Sequence, Tuple, Union
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers.activations import ACT2FN
 from transformers.modeling_utils import PreTrainedModel
 
-from sglang.srt.configs import MoonViTConfig
+from sglang.srt.configs.kimi_vl_moonvit import MoonViTConfig
 from sglang.srt.layers.attention.vision import (
     VisionAttention,
     VisionAttentionMetadata,
     prepare_vision_attention_metadata,
 )
 from sglang.srt.layers.conv import Conv2dLayer
+from sglang.srt.layers.dp_attention import reject_attn_tp_shard_with_tp_reduce
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
     ReplicatedLinear,
@@ -66,8 +66,9 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import add_prefix, get_device
+from sglang.srt.utils import get_device
 
 _MAX_INFERENCE_POS_EMB_CACHE_ENTRIES = 256
 
@@ -289,33 +290,6 @@ class Rope2DPosEmb(nn.Module):
         )
         return freqs_cis
 
-    def get_freqs_cis_by_idx(
-        self, pos_idx: torch.Tensor, pos_idx_mask: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        Args:
-            pos_idx: tensor of shape (..., 2), It contains the (h, w) position indices of each 2D token.
-            pos_idx_mask: a mask of shape (...), the leading dimensions should be the same as pos_idx.
-                Rope will only be applied to the tokens with True mask. `freqs_cis` for the tokens with False mask with be ones.
-        Return:
-            freqs_cis: tensor of shape (..., dim//2)
-        """
-        assert (
-            pos_idx.shape[:-1] == pos_idx_mask.shape
-            and pos_idx.shape[-1] == 2
-            and pos_idx.ndim == pos_idx_mask.ndim + 1
-        ), (pos_idx.shape, pos_idx_mask.shape)
-        assert pos_idx_mask.dtype == torch.bool, pos_idx_mask.dtype
-
-        shp = pos_idx_mask.shape + (self.dim // 2,)  # ..., head_dim/2
-        freqs_cis = torch.ones(
-            shp, dtype=torch.complex64, device=self.device
-        )  # ..., head_dim/2
-        freqs_cis[pos_idx_mask] = self.precomputed_freqs_cis[
-            pos_idx[..., 0][pos_idx_mask], pos_idx[..., 1][pos_idx_mask]
-        ]
-        return freqs_cis
-
 
 class MLP2(nn.Module):
     """
@@ -340,7 +314,6 @@ class MLP2(nn.Module):
         self.quant_config = quant_config
         use_tensor_parallel = use_tensor_parallel and not use_data_parallel
         tp_size = get_parallel().attn_tp_size if use_tensor_parallel else 1
-        tp_rank = get_parallel().attn_tp_rank if use_tensor_parallel else 0
         if isinstance(self.quant_config, ModelSlimConfig):
             self.fc0 = ReplicatedLinear(
                 dims[0],
@@ -357,21 +330,29 @@ class MLP2(nn.Module):
                 prefix=add_prefix("fc1", prefix),
             )
         elif use_tensor_parallel:
+            # TODO: these layers shard over attention TP but reduce over the full
+            # TP group; reduce over the attention-TP group so attention DP and
+            # attention CP narrower than TP can run them.
+            reject_attn_tp_shard_with_tp_reduce(
+                type(self).__name__,
+                shard_tp_size=tp_size,
+                reduces_over_attn_tp=False,
+                multimodal_encoder=True,
+                hint=", or --mm-enable-dp-encoder where the model supports it",
+            )
             self.fc0 = ColumnParallelLinear(
                 dims[0],
                 dims[1],
                 bias=bias,
                 prefix=add_prefix("fc0", prefix),
-                tp_rank=tp_rank,
-                tp_size=tp_size,
+                parallel_group="attn_tp",
             )
             self.fc1 = RowParallelLinear(
                 dims[1],
                 dims[2],
                 bias=bias,
                 prefix=add_prefix("fc1", prefix),
-                tp_rank=tp_rank,
-                tp_size=tp_size,
+                parallel_group="attn_tp",
             )
         else:
             self.fc0 = nn.Linear(dims[0], dims[1], bias=bias)
@@ -597,31 +578,6 @@ def tpool_patch_merger(
         pre_sum += t * h * w
 
     return outputs
-
-
-class MoonVitVLProjector(nn.Module):
-    def __init__(
-        self,
-        in_channels: int,
-        merge_kernel_size: list[int, int],
-        hidden_act: str = "gelu",
-        ln_eps: float = 1e-5,
-        out_dim: int = 4096,
-    ):
-        super().__init__()
-        self.hidden_size = in_channels * merge_kernel_size[0] * merge_kernel_size[1]
-
-        self.pre_norm = nn.nn.LayerNorm(in_channels, eps=ln_eps)
-        self.linear_1 = nn.Linear(self.hidden_size, self.hidden_size, bias=True)
-        self.act = ACT2FN[hidden_act]
-        self.linear_2 = nn.Linear(self.hidden_size, out_dim, bias=True)
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        hidden_states = self.pre_norm(hidden_states).view(-1, self.hidden_size)
-        hidden_states = self.linear_1(hidden_states)
-        hidden_states = self.act(hidden_states)
-        hidden_states = self.linear_2(hidden_states)
-        return hidden_states
 
 
 class MoonVitPretrainedModel(PreTrainedModel):

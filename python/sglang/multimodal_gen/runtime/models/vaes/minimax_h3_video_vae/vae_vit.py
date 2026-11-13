@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# ViT3D decoder for the MiniMax H3 visual VAE (inference-only bundle).
+# ViT3D video and 2D image decoders for the MiniMax H3 visual VAE.
 from contextlib import nullcontext
 
 import torch
@@ -9,7 +9,10 @@ from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 from diffusers.utils import logging
 
-from .base_module import RotaryEmbeddingND, TransformerBlock
+from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import VaeFastPathGate
+from sglang.multimodal_gen.runtime.platforms import current_platform
+
+from .base_module import RotaryEmbeddingND, TransformerBlock, _scaled_residual_add
 from .vit_utils import create_token_ids, prepare_rotary_pos_emb
 
 logger = logging.get_logger(__name__)
@@ -26,6 +29,79 @@ def _linear_with_module_dtype(linear, tensor, out_dtype=None):
 
 def _cuda_autocast_disabled(tensor: torch.Tensor):
     return torch.autocast("cuda", enabled=False) if tensor.is_cuda else nullcontext()
+
+
+def _fused_blocks_available(blocks, hidden_states) -> bool:
+    # The fused Triton norms decode to all-NaN on ROCm (MI300), where
+    # tensor.is_cuda is also true; keep ROCm on the unfused fp32-norm path.
+    if not current_platform.is_cuda():
+        return False
+    if (
+        not hidden_states.is_cuda
+        or hidden_states.dim() != 3
+        or hidden_states.dtype not in (torch.float16, torch.bfloat16, torch.float32)
+        or torch.is_grad_enabled()
+        or torch.compiler.is_compiling()
+        or len(blocks) == 0
+        or hidden_states.shape[-1] > 4096
+    ):
+        return False
+    dim = hidden_states.shape[-1]
+    for block in blocks:
+        if type(block) is not TransformerBlock or not block.use_scale:
+            return False
+        norm1, norm2 = block.norm1, block.norm2
+        if not isinstance(norm1, nn.RMSNorm) or not isinstance(norm2, nn.RMSNorm):
+            return False
+        if (
+            norm1.weight is None
+            or norm2.weight is None
+            # offloaded parameters are placeholders until the block's pre-hook
+            or norm1.normalized_shape != (dim,)
+            or norm2.normalized_shape != (dim,)
+        ):
+            return False
+    return True
+
+
+_FUSED_BLOCKS_LOGGED = False
+
+
+def _run_fused_transformer_blocks(blocks, hidden_states, rotary_pos_emb):
+    global _FUSED_BLOCKS_LOGGED
+
+    if not _FUSED_BLOCKS_LOGGED:
+        _FUSED_BLOCKS_LOGGED = True
+        logger.info(
+            "MiniMax H3 video VAE decoder fuses each scaled residual add into the next RMSNorm"
+        )
+    pending = None
+    pending_scale = None
+    for block in blocks:
+        hidden_states, pending, pending_scale = block(
+            hidden_states,
+            rotary_pos_emb,
+            fused_norm=True,
+            pending=pending,
+            pending_scale=pending_scale,
+        )
+    return _scaled_residual_add(hidden_states, pending, pending_scale)
+
+
+def _expand_rotary_batch(rotary_pos_emb, batch: int):
+    """Broadcast a batch-1 rotary cache across stacked spatial tiles."""
+    cos, sin, *extra = rotary_pos_emb
+    if cos.shape[0] == batch:
+        return rotary_pos_emb
+    if cos.shape[0] != 1:
+        raise ValueError(
+            f"MiniMax H3 VAE rotary cache batch must be 1 or {batch}, got {cos.shape[0]}"
+        )
+    return (
+        cos.expand(batch, -1, -1, -1),
+        sin.expand(batch, -1, -1, -1),
+        *extra,
+    )
 
 
 def _pack_tensors_3d(tensors, patch_size, patch_size_t):
@@ -73,6 +149,10 @@ class ViTBase(ModelMixin, ConfigMixin):
     """Base class for ViT Encoder and Decoder with common functionality."""
 
     _no_split_modules = ["TransformerBlock"]
+    # Set by minimax_h3_vae_cuda_opt at load and enabled per request by the
+    # decode stage from the quality tier; the fused residual add + RMSNorm is not
+    # bit-exact, so None (or "exact") keeps the unfused blocks.
+    _sgl_gate: VaeFastPathGate | None = None
 
     def _init_weights(self):
         def basic_init(m):
@@ -134,6 +214,14 @@ class ViTBase(ModelMixin, ConfigMixin):
         return hidden_states, img_ids
 
     def forward_transformer_blocks(self, hidden_states, rotary_pos_emb):
+        if (
+            self._sgl_gate is not None
+            and self._sgl_gate.enabled
+            and _fused_blocks_available(self.transformer_blocks, hidden_states)
+        ):
+            return _run_fused_transformer_blocks(
+                self.transformer_blocks, hidden_states, rotary_pos_emb
+            )
         for block in self.transformer_blocks:
             hidden_states = block(hidden_states, rotary_pos_emb)
         return hidden_states
@@ -148,6 +236,9 @@ class ViTBase(ModelMixin, ConfigMixin):
 
 class ViT3DDecoder(ViTBase):
     """Vision Transformer Video Decoder using TransformerBlock."""
+
+    # Trailing latent axes that receive RoPE token ids.
+    _rope_n_dim = 3
 
     @register_to_config
     def __init__(
@@ -183,7 +274,7 @@ class ViT3DDecoder(ViTBase):
         rope_apply_dim = int(dim_head * rope_dim_ratio)
 
         self.pos_embed = RotaryEmbeddingND(
-            rope_apply_dim, rope_theta, n_dim=3, use_angle=True
+            rope_apply_dim, rope_theta, n_dim=self._rope_n_dim, use_angle=True
         )
 
         self.x_embedder = nn.Linear(in_channels, dim)
@@ -260,13 +351,16 @@ class ViT3DDecoder(ViTBase):
         self._autocast_linear_dtype = dtype
         return converted
 
+    def _pack_latents(self, x: torch.Tensor) -> torch.Tensor:
+        return _pack_tensors_3d(x, 1, 1)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, C, latent_T, latent_H, latent_W = x.shape
         patch_size = self.config.patch_size
         patch_size_t = self.config.patch_size_t
         num_suffix = 1 + self.num_register_tokens
 
-        hidden_states = _pack_tensors_3d(x, 1, 1)
+        hidden_states = self._pack_latents(x)
         latent_size = (latent_T, latent_H, latent_W)
 
         with _cuda_autocast_disabled(hidden_states):
@@ -312,9 +406,10 @@ class ViT3DDecoder(ViTBase):
         if cache_hit:
             img_ids = cache_record[1]
         else:
-            img_ids = create_token_ids(latent_size, x.device, x.dtype).expand(B, -1, -1)
+            id_dims = latent_size[len(latent_size) - self._rope_n_dim :]
+            img_ids = create_token_ids(id_dims, x.device, x.dtype).expand(B, -1, -1)
             suffix_ids = torch.zeros(
-                (B, num_suffix, 3), device=x.device, dtype=img_ids.dtype
+                (B, num_suffix, self._rope_n_dim), device=x.device, dtype=img_ids.dtype
             )
             img_ids = torch.cat([img_ids, suffix_ids], dim=1)
 
@@ -326,10 +421,16 @@ class ViT3DDecoder(ViTBase):
         if cache_hit:
             rotary_pos_emb = cache_record[2]
         else:
+            # Every stacked tile has the same coordinates, so one rotary
+            # table is broadcast across the batch. That keeps the fused
+            # NeoX kernel, which indexes a single sequence, on the batched path.
             rotary_pos_emb = prepare_rotary_pos_emb(
-                self.pos_embed(img_ids),
+                self.pos_embed(img_ids[:1]),
                 dtype=rotary_dtype,
+                batch=B,
             )
+            if B > 1:
+                rotary_pos_emb = _expand_rotary_batch(rotary_pos_emb, B)
             if cache_enabled:
                 self._rotary_pos_emb_cache = (
                     cache_key,
@@ -337,8 +438,7 @@ class ViT3DDecoder(ViTBase):
                     rotary_pos_emb,
                 )
 
-        for block in self.transformer_blocks:
-            hidden_states = block(hidden_states, rotary_pos_emb)
+        hidden_states = self.forward_transformer_blocks(hidden_states, rotary_pos_emb)
 
         hidden_states = self.norm_out(hidden_states)
 
@@ -359,3 +459,23 @@ class ViT3DDecoder(ViTBase):
         )
 
         return output
+
+
+class ViT2DDecoder(ViT3DDecoder):
+    """2D image decoder on the shared ViT3D stack.
+
+    Build with ``patch_size_t=1``. Tokens carry 2D (H, W) RoPE ids; forward
+    maps BCHW latents to BCHW pixels.
+    """
+
+    _rope_n_dim = 2
+
+    def _pack_latents(self, x: torch.Tensor) -> torch.Tensor:
+        # Contiguous tokens: the low-precision x_embedder GEMM's rounding
+        # depends on the input strides.
+        return super()._pack_latents(x).contiguous()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim != 4 or self.config.patch_size_t != 1:
+            raise ValueError("ViT2DDecoder decodes BCHW latents with patch_size_t=1")
+        return super().forward(x.unsqueeze(2)).squeeze(2)

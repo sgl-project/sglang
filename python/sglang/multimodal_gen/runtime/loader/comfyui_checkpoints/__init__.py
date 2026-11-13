@@ -7,8 +7,10 @@ module registers one DiT family. Importing this package registers every spec.
 
 from sglang.multimodal_gen.runtime.loader.comfyui_checkpoints import (  # noqa: F401
     flux,
+    ltx_2,
     minimax_h3,
     qwen_image,
+    qwen_image21,
     zimage,
 )
 from sglang.multimodal_gen.runtime.loader.comfyui_checkpoints.spec import (

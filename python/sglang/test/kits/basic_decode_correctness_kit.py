@@ -40,7 +40,10 @@ class BasicDecodeCorrectnessMixin:
         self.assertIn("paris", out.lower())
 
     def test_basic_math(self):
+        # Qwen3 greedy is a near-tie between narrating and answering at the first
+        # token; a one-shot exemplar makes the bare answer the clear greedy choice.
         out = self._decode_generate(
+            "Q: What is 12 multiplied by 12? Reply with just the number.\nA: 144\n"
             "Q: What is 17 multiplied by 23? Reply with just the number.\nA:",
             self.sanity_max_new_tokens_short,
         )

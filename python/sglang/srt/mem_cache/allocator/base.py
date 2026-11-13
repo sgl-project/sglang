@@ -16,29 +16,43 @@ limitations under the License.
 from __future__ import annotations
 
 import abc
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Dict, Mapping, Optional, Tuple
 
 import torch
 
+from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
+
 if TYPE_CHECKING:
+    from sglang.srt.mem_cache.kv.alloc.forward_steps import ForwardSteps
+    from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace
+    from sglang.srt.mem_cache.kv.state_storage import StateStorage
+    from sglang.srt.mem_cache.kv.storage import KVStorage
     from sglang.srt.mem_cache.memory_pool import KVCache
 
 
-class MambaFullCacheDonor(Protocol):
-    """Allocator capability for reclaiming Full KV on Mamba byte pressure."""
-
-    def flush_deferred_full_frees(self) -> None: ...
-
-    def full_tokens_before_mamba_recheck(self, target_size: int) -> int:
-        """Lower bound on new Full tokens before preparation can help."""
-        ...
-
-    def prepare_mamba_allocation(self, target_size: int) -> None:
-        """Expose layout-specific reclaim so Mamba capacity is queryable."""
-        ...
-
-
 class BaseTokenToKVPoolAllocator(abc.ABC):
+    # Whether every pool takes its rows from one shared memory, so the prefix
+    # cache reclaims an allocation's demand as one; else each pool is its own.
+    pools_share_memory = False
+    # Ids handed out index a virtual space the allocator translates to physical
+    # rows (a unified pool's chain), not the pool's rows themselves.
+    hands_out_virtual_ids = False
+    # A request's recurrent state and its slots, when the model has them; the
+    # KV cache configurator binds the request table's.
+    state: Optional[StateStorage] = None
+    # A unified pool's sub-pools as host and peer transfers read them.
+    storage: Optional[KVStorage] = None
+    # The steps a lazily compacting unified pool's freed pages wait for.
+    forward_steps: Optional[ForwardSteps] = None
+
+    @property
+    def state_slots(self):
+        """The state slot allocator, or None without recurrent state."""
+        return None if self.state is None else self.state.slots
+
+    # Whether freed pages can wait for in-flight KV writes before PD reuse.
+    supports_reuse_guard = False
+
     @abc.abstractmethod
     def __init__(
         self,
@@ -65,9 +79,29 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     def size_full(self):
         return self.size
 
+    @property
+    def has_window_pool(self) -> bool:
+        """Whether a sliding-window pool sits beside the full-attention one,
+        with the window allocation surface (`free_swa`, `swa_available_size`, ...)."""
+        return False
+
+    def state_id_spaces(self) -> Dict[str, IdSpace]:
+        """The id space of each recurrent-state sub-pool whose slots this
+        allocator hands out, keyed by sub-pool name. Empty when the slot ids the
+        request table holds index the state pool as they are."""
+        return {}
+
+    def state_ids(self, sub_pool: str) -> IdSpace:
+        """How the state sub-pool ``sub_pool`` indexes the slot ids the request
+        table holds, for a consumer outside a forward (the tree, PD transfers)."""
+        from sglang.srt.mem_cache.kv.alloc.id_space import state_id_space
+
+        return state_id_space(self.state_id_spaces(), sub_pool)
+
     # -- scheduler-facing capacity hooks --
     # The scheduler calls these unconditionally, with no allocator-type branches
-    # on its side; byte-accounted composites override the token-count defaults.
+    # on its side; the byte-accounted chain allocator overrides the token-count
+    # defaults.
 
     def create_prefill_budget(self, tree_cache, *, num_mixed_decode_tokens=0):
         from sglang.srt.mem_cache.prefill_budget import PrefillBudget
@@ -75,6 +109,15 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         return PrefillBudget(
             self, tree_cache, num_mixed_decode_tokens=num_mixed_decode_tokens
         )
+
+    def request_slot_reserve(
+        self, *, has_req_pool_slot: bool, prefill_tokens: int = 0
+    ) -> int:
+        """Extra KV slots beyond prefill, including request-owned workspace.
+
+        ``prefill_tokens`` includes the cached prefix and selected extension.
+        """
+        return 0
 
     def max_new_tokens_for_memory(
         self,
@@ -84,53 +127,114 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         token_capacity: int,
         sliding_window_size: int | None,
         chunk_size: int | None,
+        prefill_retire_lag: int,
+        eviction_interval: int,
+        checkpoint_interval: int = 0,
+        decode_retire_lag: int = 0,
+        chunk_align: int | None = None,
     ) -> int | None:
         """Clip generation to the empty-pool budget; None means prompt cannot fit.
 
         token_capacity is the scheduler's configured capacity, including its
         distributed token scaling. Shared pools use their physical byte layout.
+        The window retirement inputs (`demand.window_retirement`, and the
+        cache's `window_checkpoint_interval`) matter only to pools that keep
+        windows.
         """
         paged_input = -(-input_tokens // self.page_size) * self.page_size
         return max(
             0, min(max_new_tokens, token_capacity - paged_input - self.page_size - 1)
         )
 
-    def prealloc_fits_assumes_reclaim(self) -> bool:
-        """Whether `prealloc_fits` answers about the state reachable AFTER
-        reclaiming the evictable pages, so admitting on it still owes the
-        reclaim. False when the answer describes the pool as it stands.
-        """
-        return False
+    def window_pool_names(self) -> Tuple[str, ...]:
+        """The window pools this allocator keeps, by the names a
+        `KVDemand` uses for them; none for a pool without windows."""
+        return ()
 
-    def prealloc_ceiling_fits(self, full_tokens: int, swa_tokens: int) -> bool | None:
-        """Whether a demand this size could EVER be preallocated, or None when
-        this pool has no ceiling of its own and the caller's token capacity is
-        the only bound.
+    def target_window_pool(self) -> Optional[str]:
+        """The window pool a reader that sizes one window reads (the scheduler's
+        window budget, a running request's retention): the target model's own
+        window, or None without windows."""
+        names = self.window_pool_names()
+        return names[0] if names else None
+
+    def prealloc_ceiling_fits(self, demand: KVDemand) -> bool | None:
+        """Whether ``demand`` could EVER be preallocated, or None when this
+        pool has no ceiling of its own and the caller's token capacity is the
+        only bound.
         """
         return None
 
+    def window_capacity_and_available(self, sub_pool: str) -> Tuple[int, int]:
+        """Window sub-pool ``sub_pool``'s token capacity and what a take from it
+        can serve now, as the scheduler's window budget reads them."""
+        if sub_pool not in self.window_pool_names():
+            raise KeyError(f"no window sub-pool {sub_pool!r}")
+        _, window = self.swa_capacity_and_available(
+            full_capacity=self.size_full, swa_capacity=self.size_swa
+        )
+        return window
+
     def prealloc_fits(
         self,
-        tree_cache,
-        full_tokens: int,
-        swa_tokens: int,
+        demand: KVDemand,
         *,
+        evictable: Mapping[str, int],
         full_budget_tokens: int,
-        swa_budget_tokens: int | None = None,
+        window_budget_tokens: Optional[Mapping[str, int]] = None,
     ) -> bool:
         """Whether a decode-node preallocation of this size fits.
 
-        The budgets are the scheduler's policy: what each side has left once
-        decode headroom and retraction are reserved. Separate buffers make the
-        two sides independent, so each is checked against its own budget and
-        ``tree_cache`` is never read -- what it could reclaim is already
-        inside that budget. A pool that cuts both sides from one buffer
-        overrides this to price them together, since a per-side token budget
-        cannot express a shared byte envelope.
+        The budgets are what the owner and each window (by sub-pool name) have
+        left once decode headroom and retraction are reserved. Separate buffers
+        check each side against its own budget, which already holds what
+        ``evictable`` could free; state slots live in a pool of their own. A
+        pool cutting every side from one buffer overrides this.
         """
-        return full_tokens <= full_budget_tokens and (
-            swa_budget_tokens is None or swa_tokens <= swa_budget_tokens
+        demand = demand.checked(self.window_pool_names())
+        budgets = window_budget_tokens or {}
+        return demand.full_tokens <= full_budget_tokens and all(
+            tokens <= budgets[name]
+            for name, tokens in demand.window_tokens.items()
+            if name in budgets
         )
+
+    def admit_preallocation(
+        self,
+        tree_cache,
+        admission: KVDemand,
+        take: KVDemand,
+        *,
+        evictable: Mapping[str, int],
+        full_budget_tokens: int,
+        window_budget_tokens: Optional[Mapping[str, int]] = None,
+    ) -> bool:
+        """Whether a decode-node preallocation is admitted (``admission``,
+        with its decode reservation) and its rows (``take``) can be taken
+        now. Separate buffers hold the room their budgets count, so nothing
+        is reclaimed here: admission is the whole answer."""
+        return self.prealloc_fits(
+            admission,
+            evictable=evictable,
+            full_budget_tokens=full_budget_tokens,
+            window_budget_tokens=window_budget_tokens,
+        )
+
+    def get_extend_allocation_demand(
+        self,
+        prefix_lens_cpu: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        *,
+        conservative_num_tokens: int,
+        shard_size: int,
+    ) -> int:
+        """Token demand for eviction before paged extend."""
+        return conservative_num_tokens
+
+    def reclaim_for_load_back(self, tree_cache, demand: KVDemand) -> Optional[str]:
+        """Make room before a host load takes ``demand``'s rows; None means
+        ready. Separate buffers reclaim nothing here."""
+        return None
 
     def evict_to_free_tokens(self, tree_cache, num_tokens: int) -> bool | None:
         """Evict unlocked prefix-cache entries until this allocator can serve
@@ -138,14 +242,13 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
 
         Return whether capacity was realized, or None if it still needs checking.
         """
-        from sglang.srt.mem_cache.base_prefix_cache import EvictParams
         from sglang.srt.mem_cache.common import _evict_until_allocatable
+        from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 
-        if tree_cache is None or tree_cache.is_chunk_cache():
+        if tree_cache is None or not tree_cache.supports_prefix_sharing():
             return
-        shortfall = num_tokens - self.available_size()
-        if shortfall > 0:
-            tree_cache.evict_for_alloc(EvictParams(num_tokens=shortfall))
+        if self.available_size() < num_tokens:
+            tree_cache.evict_for_alloc(KVDemand(full_tokens=num_tokens))
             _evict_until_allocatable(tree_cache, self, num_tokens)
 
     def check_decode_capacity(
@@ -169,9 +272,15 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         violation strings, empty when healthy. Static pools have no byte model."""
         return []
 
-    def mamba_full_cache_donor(self) -> MambaFullCacheDonor | None:
-        """Return the shared-pool donor capability, if this allocator has one."""
-        return None
+    def window_available_size(self, sub_pool: str) -> int:
+        """What a take from window pool ``sub_pool`` can serve now; a pool
+        keeping one window serves it under any name."""
+        return self.swa_available_size()
+
+    def sub_pool_roles(self) -> Tuple[str, Tuple[str, ...], Optional[str]]:
+        """The token pool's name, every window pool's, and the state pool's
+        (None when state slots are not taken from this allocator's memory)."""
+        return ("kv", self.window_pool_names(), None)
 
     def debug_print(self) -> str:
         return ""
@@ -179,8 +288,19 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     def available_size(self):
         return (len(self.free_pages) + len(self.release_pages)) * self.page_size
 
+    def owner_available_size(self):
+        """What the token pool can serve now; an allocator keeping a window
+        pool beside it answers for its full-attention side."""
+        return self.available_size()
+
     def get_kvcache(self):
         return self._kvcache
+
+    @property
+    def cpu_copy_carries_mamba(self) -> bool:
+        """Whether `get_cpu_copy` carries a request's recurrent state; else the
+        scheduler backs the state up on its own."""
+        return self._kvcache.cpu_copy_carries_mamba
 
     def get_all_free_pages(self):
         # Debug / invariant census; None when the pool has no page free list.

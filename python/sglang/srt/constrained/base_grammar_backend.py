@@ -18,7 +18,7 @@ import logging
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Dict, List, NamedTuple, Optional, Tuple
+from typing import Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple
 
 import torch
 
@@ -116,34 +116,6 @@ class BaseGrammarObject:
     def finished(self, finished):
         self._finished = finished
 
-    def try_jump_forward(self, tokenizer) -> Optional[Tuple[List[int], str]]:
-        """
-        Try to jump forward in the grammar.
-
-        Returns:
-            A jump forward helper which may be used in `jump_forward_str_state`.
-            None if the jump forward is not possible.
-        """
-        raise NotImplementedError()
-
-    def jump_forward_str_state(self, helper: Tuple[List[int], str]) -> Tuple[str, int]:
-        """
-        Jump forward for the grammar.
-
-        Returns:
-            A tuple of the jump forward string and the next state of the grammar
-            (which can be used in `jump_and_retokenize` if needed).
-        """
-        raise NotImplementedError()
-
-    def jump_and_retokenize(
-        self, old_output_ids: List[int], new_output_ids: List[int], next_state: int
-    ) -> None:
-        """
-        Jump forward occurs, and update the grammar state if needed.
-        """
-        raise NotImplementedError()
-
 
 class GrammarMask(NamedTuple):
     """A filled vocab_mask plus the backend that applies it.
@@ -222,6 +194,27 @@ class BaseGrammarBackend:
     @property
     def enable_strict_thinking(self):
         return self._enable_strict_thinking
+
+    def get_request_grammar_key(
+        self,
+        key: Tuple[str, str],
+        *,
+        input_ids: Sequence[int],
+        thinking_budget: Optional[int],
+    ) -> Tuple[str, str]:
+        """Cache key for this request's grammar; may depend on how the prompt ends
+        and on the request's thinking budget."""
+        return key
+
+    def reserve_framing_tokens(self, token_ids: Sequence[int]) -> None:
+        """Let ``token_ids`` match only token-level framing, never grammar text."""
+
+    def compile_framed_grammar(
+        self, grammar: BaseGrammarObject, frame: Callable[[dict], dict]
+    ) -> Optional[BaseGrammarObject]:
+        """Compile ``frame(content)``, an XGrammar structural tag embedding ``grammar``
+        as content; None if the backend cannot embed it."""
+        return None
 
     @property
     def is_support_token_filter(self):
@@ -328,19 +321,6 @@ def register_vocab_mask_buffer(
 
     buffers[name] = vocab_mask
     return vocab_mask
-
-
-def get_vocab_mask_buffer(name: str, rows: int) -> Optional[torch.Tensor]:
-    """Return the active rows of a registered mask buffer, if available."""
-    vocab_mask = get_resources().buffers.get(name)
-    if vocab_mask is None:
-        return None
-    if rows > vocab_mask.shape[0]:
-        raise ValueError(
-            f"Grammar batch needs {rows} mask rows, exceeding initialized "
-            f"capacity {vocab_mask.shape[0]} for {name!r}"
-        )
-    return vocab_mask[:rows]
 
 
 def register_grammar_backend(name, init_func):

@@ -9,11 +9,10 @@ Two families with different oracles:
   ``round_norm_before_rope=True`` the fused kernel reproduces the split
   rounding exactly and ``torch.equal`` applies. Full-width interleaved caches
   use the Diffusers float32 RoPE chain as their oracle.
-The LTX-2 split-RoPE kernel lives in ``test_rope_ltx2.py``: it is validated on
-B200 and registered on that lane alone, which the cases here cannot share --
-their oracle is the *split* baseline (a separate qknorm kernel plus sgl_kernel
-or FlashInfer RoPE), whose dispatch differs on Blackwell, so the bit-exact
-assertions below do not hold there.
+The LTX-2 split-RoPE kernel lives in ``test_rope_ltx2.py``.
+
+Anima split-half RoPE is compared against its FP32 eager expression, with
+exact equality after the final FP16/BF16 cast.
 """
 
 import itertools
@@ -26,12 +25,15 @@ import triton
 from sglang.kernels.jit.utils import get_ci_test_range
 from sglang.kernels.ops.diffusion import (
     can_use_fused_inplace_qknorm_rope,
+    can_use_fused_rope_rotate_half_fp32,
     fused_inplace_qknorm_rope,
     fused_qknorm_rope_pack_kv,
+    fused_rope_rotate_half_fp32,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=18, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=18, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 # Nightly is not redundant: it sets SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1, which
 # expands the get_ci_test_range sweeps below.
 register_cuda_ci(est_time=220, stage="nightly", runner_config="1-gpu-large")
@@ -591,6 +593,56 @@ def test_qknorm_rope_accepts_empty_token_dimension() -> None:
         rope_dim=head_dim,
     )
     assert q.numel() == k.numel() == 0
+
+
+def _anima_rope_inputs(shape=(2, 17, 3, 128), dtype=torch.bfloat16):
+    generator = torch.Generator(device="cuda").manual_seed(42)
+    q, k = [
+        torch.randn(shape, device="cuda", dtype=dtype, generator=generator)
+        for _ in range(2)
+    ]
+    angles = torch.randn(shape[1], shape[-1], device="cuda", generator=generator)
+    return q, k, angles.cos(), angles.sin()
+
+
+def _anima_rope_reference(x, cos, sin):
+    x1, x2 = x.chunk(2, dim=-1)
+    rotated = torch.cat((-x2, x1), dim=-1)
+    return (
+        x.float() * cos[None, :, None, :] + rotated.float() * sin[None, :, None, :]
+    ).to(x.dtype)
+
+
+@pytest.mark.skipif(torch.version.hip is not None, reason="NVIDIA CUDA required")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("shape", [(1, 1, 1, 128), (2, 17, 3, 128), (1, 4096, 16, 128)])
+def test_anima_rope_bit_exact(shape, dtype):
+    q, k, cos, sin = args = _anima_rope_inputs(shape, dtype)
+    saved = [t.clone() for t in args]
+    outputs = fused_rope_rotate_half_fp32(*args)
+    for output, x in zip(outputs, (q, k)):
+        assert output.dtype == x.dtype and output.shape == x.shape
+        assert torch.equal(output, _anima_rope_reference(x, cos, sin))
+        assert output.data_ptr() not in (q.data_ptr(), k.data_ptr())
+    assert all(torch.equal(t, original) for t, original in zip(args, saved))
+
+
+@pytest.mark.skipif(torch.version.hip is not None, reason="NVIDIA CUDA required")
+def test_anima_rope_input_guards():
+    q, k, cos, sin = args = _anima_rope_inputs()
+    assert can_use_fused_rope_rotate_half_fp32(*args)
+    unsupported = [
+        (q.float(), k.float(), cos, sin),
+        (q[:, :, ::2], k[:, :, ::2], cos, sin),
+        _anima_rope_inputs((1, 17, 3, 64)),
+        (q, k, cos.bfloat16(), sin.bfloat16()),
+        (q, k, cos[:-1], sin[:-1]),
+        tuple(t.cpu() for t in args),
+    ]
+    for inputs in unsupported:
+        assert not can_use_fused_rope_rotate_half_fp32(*inputs)
+        with pytest.raises(ValueError, match="Expected contiguous CUDA"):
+            fused_rope_rotate_half_fp32(*inputs)
 
 
 if __name__ == "__main__":

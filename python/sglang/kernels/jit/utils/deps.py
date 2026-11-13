@@ -28,6 +28,26 @@ def register_dependency(name: str):
     return decorator
 
 
+@register_dependency("aiter")
+def get_aiter_include_paths() -> List[str]:
+    """aiter's C++ headers, for ROCm kernels that must compute exactly what aiter
+    computes (hip_reduce.h, opus/opus.hpp)."""
+    aiter_root = _find_package_root("aiter")
+    if aiter_root is None:
+        raise RuntimeError(
+            "Cannot find the aiter package. Install aiter to get the required"
+            " headers for JIT compilation."
+        )
+
+    include = aiter_root.parent / "csrc" / "include"
+    if not (include / "hip_reduce.h").is_file():
+        raise RuntimeError(
+            f"aiter C++ headers not found under {include}; a kernel that includes"
+            " them cannot be built against this aiter installation."
+        )
+    return [str(include)]
+
+
 @register_dependency("flashinfer")
 def get_flashinfer_include_paths() -> List[str]:
     include_paths: List[str] = []

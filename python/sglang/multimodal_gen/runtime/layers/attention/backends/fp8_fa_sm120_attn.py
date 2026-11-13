@@ -29,8 +29,6 @@ logger = init_logger(__name__)
 
 
 class FP8FlashAttentionSM120Backend(AttentionBackend):
-    accept_output_buffer: bool = False
-
     @staticmethod
     def get_supported_head_sizes() -> list[int]:
         return [HEAD_DIM]
@@ -68,7 +66,6 @@ class FP8FlashAttentionSM120Impl(AttentionImpl):
             prefix=prefix,
             **extra_impl_args,
         )
-        self._reported_fallbacks: set[str] = set()
 
     # --- dispatch -------------------------------------------------------------
 
@@ -89,10 +86,7 @@ class FP8FlashAttentionSM120Impl(AttentionImpl):
         return None
 
     def _report_fallback(self, reason: str) -> None:
-        if reason in self._reported_fallbacks:
-            return
-        self._reported_fallbacks.add(reason)
-        logger.warning(
+        logger.warning_once(
             "fp8_fa_sm120 attention: %s; using cuDNN SDPA for these calls.", reason
         )
 
