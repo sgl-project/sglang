@@ -56,15 +56,18 @@ def _expect_bool(v: Any, expected: str) -> bool:
     raise _invalid_type(v, expected=expected)
 
 
-def _expect_int(v: Any, expected: str) -> int:
+def _expect_int(v: Any, expected: str, *, bits: int) -> int:
     if _is_int(v):
+        limit = 1 << (bits - 1)
+        if v < -limit or v >= limit:
+            raise JsonContractError(f"invalid value: integer `{v}`, expected {expected}")
         return v
     raise _invalid_type(v, expected=expected)
 
 
-def _expect_uint(v: Any, expected: str) -> int:
+def _expect_uint(v: Any, expected: str, *, bits: int) -> int:
     if _is_int(v):
-        if v < 0:
+        if v < 0 or v >= (1 << bits):
             raise JsonContractError(f"invalid value: integer `{v}`, expected {expected}")
         return v
     raise _invalid_type(v, expected=expected)
@@ -980,7 +983,7 @@ KvHintsEnvelopeOrList = Union[KvHintsEnvelope, KvHintsEnvelopeList]
 
 
 def decode_TokenIds(value: Any) -> TokenIds:
-    return [_expect_int(e, expected="i64") for e in _expect_seq(value, expected="a sequence")]
+    return [_expect_int(e, expected="i64", bits=64) for e in _expect_seq(value, expected="a sequence")]
 
 
 def encode_TokenIds(v: TokenIds) -> List[Any]:
@@ -1053,7 +1056,7 @@ def encode_BoolList(v: BoolList) -> List[Any]:
 def decode_Int64OrList(value: Any) -> Int64OrList:
     if isinstance(value, list):
         return decode_Int64List(value)
-    return _expect_int(value, expected="a value or an array of values for Int64OrList")
+    return _expect_int(value, expected="a value or an array of values for Int64OrList", bits=64)
 
 
 def encode_Int64OrList(v: Int64OrList) -> Any:
@@ -1063,7 +1066,7 @@ def encode_Int64OrList(v: Int64OrList) -> Any:
 
 
 def decode_Int64List(value: Any) -> Int64List:
-    return [_expect_int(e, expected="i64") for e in _expect_seq(value, expected="a sequence")]
+    return [_expect_int(e, expected="i64", bits=64) for e in _expect_seq(value, expected="a sequence")]
 
 
 def encode_Int64List(v: Int64List) -> List[Any]:
@@ -1122,7 +1125,7 @@ def encode_OptionalStringList(v: OptionalStringList) -> List[Any]:
 
 
 def decode_OptionalInt64(value: Any) -> OptionalInt64:
-    return None if value is None else _expect_int(value, expected="i64")
+    return None if value is None else _expect_int(value, expected="i64", bits=64)
 
 
 def encode_OptionalInt64(v: OptionalInt64) -> Any:
@@ -1132,7 +1135,7 @@ def encode_OptionalInt64(v: OptionalInt64) -> Any:
 def decode_OptionalInt64OrList(value: Any) -> OptionalInt64OrList:
     if isinstance(value, list):
         return decode_OptionalInt64List(value)
-    return _expect_int(value, expected="a value or an array of values for OptionalInt64OrList")
+    return _expect_int(value, expected="a value or an array of values for OptionalInt64OrList", bits=64)
 
 
 def encode_OptionalInt64OrList(v: OptionalInt64OrList) -> Any:
@@ -1156,7 +1159,7 @@ def decode_ErrorBody(value: Any) -> ErrorBody:
         if key == "message":
             kw["message"] = _expect_str(x, expected="a string")
         elif key == "code":
-            kw["code"] = _expect_uint(x, expected="u32")
+            kw["code"] = _expect_uint(x, expected="u32", bits=32)
     return ErrorBody(**kw)
 
 
@@ -1169,9 +1172,9 @@ def encode_ErrorBody(v: ErrorBody) -> Dict[str, Any]:
 
 def decode_Matched(value: Any) -> Matched:
     if isinstance(value, str):
-        return value
+        return _expect_str(value, expected="a string")
     if _is_int(value):
-        return value
+        return _expect_int(value, expected="i64", bits=64)
     if isinstance(value, list):
         return decode_MatchedTokens(value)
     raise _invalid_type(value, expected="one of the Matched shapes")
@@ -1188,7 +1191,7 @@ def encode_Matched(v: Matched) -> Any:
 
 
 def decode_MatchedTokens(value: Any) -> MatchedTokens:
-    return [_expect_int(e, expected="i64") for e in _expect_seq(value, expected="a sequence")]
+    return [_expect_int(e, expected="i64", bits=64) for e in _expect_seq(value, expected="a sequence")]
 
 
 def encode_MatchedTokens(v: MatchedTokens) -> List[Any]:
@@ -1216,7 +1219,7 @@ def decode_FinishLength(value: Any) -> FinishLength:
     kw: Dict[str, Any] = {}
     for key, x in m.items():
         if key == "length":
-            kw["length"] = None if x is None else _expect_uint(x, expected="u64")
+            kw["length"] = None if x is None else _expect_uint(x, expected="u64", bits=64)
     return FinishLength(**kw)
 
 
@@ -1234,7 +1237,7 @@ def decode_FinishAbort(value: Any) -> FinishAbort:
         if key == "message":
             kw["message"] = None if x is None else _expect_str(x, expected="a string")
         elif key == "status_code":
-            kw["status_code"] = None if x is None else _expect_uint(x, expected="u32")
+            kw["status_code"] = None if x is None else _expect_uint(x, expected="u32", bits=32)
         elif key == "err_type":
             kw["err_type"] = None if x is None else _expect_str(x, expected="a string")
     return FinishAbort(**kw)
@@ -1261,7 +1264,7 @@ def decode_FinishReason(value: Any) -> FinishReason:
     elif tag == "length":
         try:
             return FinishLength(
-                length=None if raw.get("length") is None else _expect_uint(raw["length"], expected="u64"),
+                length=None if raw.get("length") is None else _expect_uint(raw["length"], expected="u64", bits=64),
             )
         except JsonContractError:
             return dict(raw)
@@ -1269,7 +1272,7 @@ def decode_FinishReason(value: Any) -> FinishReason:
         try:
             return FinishAbort(
                 message=None if raw.get("message") is None else _expect_str(raw["message"], expected="a string"),
-                status_code=None if raw.get("status_code") is None else _expect_uint(raw["status_code"], expected="u32"),
+                status_code=None if raw.get("status_code") is None else _expect_uint(raw["status_code"], expected="u32", bits=32),
                 err_type=None if raw.get("err_type") is None else _expect_str(raw["err_type"], expected="a string"),
             )
         except JsonContractError:
@@ -1305,7 +1308,7 @@ def decode_SamplingParams(value: Any) -> SamplingParams:
     kw: Dict[str, Any] = {}
     for key, x in m.items():
         if key == "max_new_tokens":
-            kw["max_new_tokens"] = None if x is None else _expect_int(x, expected="i64")
+            kw["max_new_tokens"] = None if x is None else _expect_int(x, expected="i64", bits=64)
         elif key == "stop":
             kw["stop"] = None if x is None else decode_StringOrList(x)
         elif key == "stop_token_ids":
@@ -1317,7 +1320,7 @@ def decode_SamplingParams(value: Any) -> SamplingParams:
         elif key == "top_p":
             kw["top_p"] = 1.0 if x is None else _expect_float(x, expected="f64")
         elif key == "top_k":
-            kw["top_k"] = 1073741824 if x is None else _expect_int(x, expected="i64")
+            kw["top_k"] = 1073741824 if x is None else _expect_int(x, expected="i64", bits=64)
         elif key == "min_p":
             kw["min_p"] = 0.0 if x is None else _expect_float(x, expected="f64")
         elif key == "frequency_penalty":
@@ -1327,9 +1330,9 @@ def decode_SamplingParams(value: Any) -> SamplingParams:
         elif key == "repetition_penalty":
             kw["repetition_penalty"] = 1.0 if x is None else _expect_float(x, expected="f64")
         elif key == "min_new_tokens":
-            kw["min_new_tokens"] = 0 if x is None else _expect_int(x, expected="i64")
+            kw["min_new_tokens"] = 0 if x is None else _expect_int(x, expected="i64", bits=64)
         elif key == "n":
-            kw["n"] = 1 if x is None else _expect_int(x, expected="i64")
+            kw["n"] = 1 if x is None else _expect_int(x, expected="i64", bits=64)
         elif key == "json_schema":
             kw["json_schema"] = None if x is None else _expect_str(x, expected="a string")
         elif key == "regex":
@@ -1347,15 +1350,15 @@ def decode_SamplingParams(value: Any) -> SamplingParams:
         elif key == "no_stop_trim":
             kw["no_stop_trim"] = False if x is None else _expect_bool(x, expected="a boolean")
         elif key == "stream_interval":
-            kw["stream_interval"] = None if x is None else _expect_int(x, expected="i64")
+            kw["stream_interval"] = None if x is None else _expect_int(x, expected="i64", bits=64)
         elif key == "logit_bias":
             kw["logit_bias"] = {} if x is None else {k: _expect_float(e, expected="f64") for k, e in _expect_map(x, expected="a map").items()}
         elif key == "sampling_seed":
-            kw["sampling_seed"] = None if x is None else _expect_int(x, expected="i64")
+            kw["sampling_seed"] = None if x is None else _expect_int(x, expected="i64", bits=64)
         elif key == "custom_params":
             kw["custom_params"] = x
         elif key == "beam_width":
-            kw["beam_width"] = None if x is None else _expect_int(x, expected="i64")
+            kw["beam_width"] = None if x is None else _expect_int(x, expected="i64", bits=64)
         elif key == "watermark":
             kw["watermark"] = None if x is None else decode_WatermarkRequestConfig(x)
         elif key == "choice":
@@ -1437,7 +1440,7 @@ def decode_WatermarkRequestConfig(value: Any) -> WatermarkRequestConfig:
         elif key == "key":
             kw["key"] = None if x is None else _expect_str(x, expected="a string")
         elif key == "context_window":
-            kw["context_window"] = None if x is None else _expect_int(x, expected="i64")
+            kw["context_window"] = None if x is None else _expect_int(x, expected="i64", bits=64)
         else:
             raise _unknown_field(key, fields=_FIELDS_WatermarkRequestConfig)
     return WatermarkRequestConfig(**kw)
@@ -1491,9 +1494,9 @@ def decode_GenerateRequest(value: Any) -> GenerateRequest:
         elif key == "decode_tp_size":
             kw["decode_tp_size"] = None if x is None else decode_OptionalInt64OrList(x)
         elif key == "routed_dp_rank":
-            kw["routed_dp_rank"] = None if x is None else _expect_int(x, expected="i64")
+            kw["routed_dp_rank"] = None if x is None else _expect_int(x, expected="i64", bits=64)
         elif key == "disagg_prefill_dp_rank":
-            kw["disagg_prefill_dp_rank"] = None if x is None else _expect_int(x, expected="i64")
+            kw["disagg_prefill_dp_rank"] = None if x is None else _expect_int(x, expected="i64", bits=64)
         elif key == "image_data":
             kw["image_data"] = None if x is None else decode_MediaInput(x)
         elif key == "mm_hashes":
@@ -1505,7 +1508,7 @@ def decode_GenerateRequest(value: Any) -> GenerateRequest:
         elif key == "extra_key":
             kw["extra_key"] = None if x is None else decode_StringOrList(x)
         elif key == "priority":
-            kw["priority"] = None if x is None else _expect_int(x, expected="i64")
+            kw["priority"] = None if x is None else _expect_int(x, expected="i64", bits=64)
         elif key == "cache_salt":
             kw["cache_salt"] = None if x is None else decode_StringOrList(x)
         elif key == "require_reasoning":
@@ -1519,7 +1522,7 @@ def decode_GenerateRequest(value: Any) -> GenerateRequest:
         elif key == "routing_key":
             kw["routing_key"] = None if x is None else _expect_str(x, expected="a string")
         elif key == "max_thinking_tokens":
-            kw["max_thinking_tokens"] = None if x is None else _expect_uint(x, expected="u64")
+            kw["max_thinking_tokens"] = None if x is None else _expect_uint(x, expected="u64", bits=64)
         elif key == "session_id":
             kw["session_id"] = None if x is None else _expect_str(x, expected="a string")
         elif key == "custom_logit_processor":
@@ -1531,7 +1534,7 @@ def decode_GenerateRequest(value: Any) -> GenerateRequest:
         elif key == "return_prompt_token_ids":
             kw["return_prompt_token_ids"] = _expect_bool(x, expected="a boolean")
         elif key == "routed_experts_start_len":
-            kw["routed_experts_start_len"] = _expect_int(x, expected="i64")
+            kw["routed_experts_start_len"] = _expect_int(x, expected="i64", bits=64)
         elif key == "return_sampling_mask":
             kw["return_sampling_mask"] = None if x is None else decode_BoolOrList(x)
         elif key == "modalities":
@@ -1740,7 +1743,7 @@ def decode_LogprobEntry(value: Any) -> LogprobEntry:
         raise JsonContractError(f"invalid length {len(s)}, expected a 3-element tuple")
     return LogprobEntry(
         logprob=None if s[0] is None else _expect_float(s[0], expected="f64"),
-        token_id=_expect_int(s[1], expected="i64"),
+        token_id=_expect_int(s[1], expected="i64", bits=64),
         text=None if s[2] is None else _expect_str(s[2], expected="a string"),
     )
 
@@ -1792,9 +1795,9 @@ def decode_GenerateMetaInfo(value: Any) -> GenerateMetaInfo:
         if key == "id":
             kw["id"] = _expect_str(x, expected="a string")
         elif key == "prompt_tokens":
-            kw["prompt_tokens"] = _expect_uint(x, expected="u32")
+            kw["prompt_tokens"] = _expect_uint(x, expected="u32", bits=32)
         elif key == "completion_tokens":
-            kw["completion_tokens"] = _expect_uint(x, expected="u64")
+            kw["completion_tokens"] = _expect_uint(x, expected="u64", bits=64)
         elif key == "finish_reason":
             kw["finish_reason"] = None if x is None else decode_FinishReason(x)
         elif key == "output_token_logprobs":
@@ -1814,25 +1817,25 @@ def decode_GenerateMetaInfo(value: Any) -> GenerateMetaInfo:
         elif key == "e2e_latency":
             kw["e2e_latency"] = None if x is None else _expect_float(x, expected="f64")
         elif key == "cached_tokens":
-            kw["cached_tokens"] = _expect_uint(x, expected="u32")
+            kw["cached_tokens"] = _expect_uint(x, expected="u32", bits=32)
         elif key == "reasoning_tokens":
-            kw["reasoning_tokens"] = _expect_uint(x, expected="u64")
+            kw["reasoning_tokens"] = _expect_uint(x, expected="u64", bits=64)
         elif key == "output_token_logprobs_length":
-            kw["output_token_logprobs_length"] = None if x is None else _expect_uint(x, expected="u64")
+            kw["output_token_logprobs_length"] = None if x is None else _expect_uint(x, expected="u64", bits=64)
         elif key == "weight_version":
             kw["weight_version"] = None if x is None else _expect_str(x, expected="a string")
         elif key == "weight_versions":
             kw["weight_versions"] = [] if x is None else [decode_WeightVersionSpan(e) for e in _expect_seq(x, expected="a sequence")]
         elif key == "image_tokens":
-            kw["image_tokens"] = None if x is None else _expect_uint(x, expected="u32")
+            kw["image_tokens"] = None if x is None else _expect_uint(x, expected="u32", bits=32)
         elif key == "audio_tokens":
-            kw["audio_tokens"] = None if x is None else _expect_uint(x, expected="u32")
+            kw["audio_tokens"] = None if x is None else _expect_uint(x, expected="u32", bits=32)
         elif key == "video_tokens":
-            kw["video_tokens"] = None if x is None else _expect_uint(x, expected="u32")
+            kw["video_tokens"] = None if x is None else _expect_uint(x, expected="u32", bits=32)
         elif key == "cached_tokens_details":
             kw["cached_tokens_details"] = None if x is None else decode_CachedTokensDetails(x)
         elif key == "dp_rank":
-            kw["dp_rank"] = None if x is None else _expect_uint(x, expected="u32")
+            kw["dp_rank"] = None if x is None else _expect_uint(x, expected="u32", bits=32)
     return GenerateMetaInfo(**kw)
 
 
@@ -1884,9 +1887,9 @@ def decode_WeightVersionSpan(value: Any) -> WeightVersionSpan:
         if key == "version":
             kw["version"] = _expect_str(x, expected="a string")
         elif key == "start":
-            kw["start"] = _expect_int(x, expected="i64")
+            kw["start"] = _expect_int(x, expected="i64", bits=64)
         elif key == "end":
-            kw["end"] = _expect_int(x, expected="i64")
+            kw["end"] = _expect_int(x, expected="i64", bits=64)
     return WeightVersionSpan(**kw)
 
 
@@ -1903,11 +1906,11 @@ def decode_CachedTokensDetails(value: Any) -> CachedTokensDetails:
     kw: Dict[str, Any] = {}
     for key, x in m.items():
         if key == "device":
-            kw["device"] = _expect_uint(x, expected="u32")
+            kw["device"] = _expect_uint(x, expected="u32", bits=32)
         elif key == "host":
-            kw["host"] = _expect_uint(x, expected="u32")
+            kw["host"] = _expect_uint(x, expected="u32", bits=32)
         elif key == "storage":
-            kw["storage"] = None if x is None else _expect_uint(x, expected="u32")
+            kw["storage"] = None if x is None else _expect_uint(x, expected="u32", bits=32)
         elif key == "storage_backend":
             kw["storage_backend"] = None if x is None else _expect_str(x, expected="a string")
     return CachedTokensDetails(**kw)
@@ -1935,7 +1938,7 @@ def decode_GenerateResponse(value: Any) -> GenerateResponse:
         elif key == "output_ids":
             kw["output_ids"] = None if x is None else decode_TokenIds(x)
         elif key == "index":
-            kw["index"] = None if x is None else _expect_uint(x, expected="u32")
+            kw["index"] = None if x is None else _expect_uint(x, expected="u32", bits=32)
         elif key == "prompt_token_ids":
             kw["prompt_token_ids"] = None if x is None else decode_TokenIds(x)
     return GenerateResponse(**kw)
@@ -1962,7 +1965,7 @@ def decode_GenerateStreamError(value: Any) -> GenerateStreamError:
         if key == "error":
             kw["error"] = None if x is None else decode_ErrorBody(x)
         elif key == "index":
-            kw["index"] = None if x is None else _expect_uint(x, expected="u32")
+            kw["index"] = None if x is None else _expect_uint(x, expected="u32", bits=32)
     return GenerateStreamError(**kw)
 
 
@@ -1987,27 +1990,27 @@ def decode_MediaRef(value: Any) -> MediaRef:
         elif key == "detail":
             kw["detail"] = None if x is None else _expect_str(x, expected="a string")
         elif key == "max_dynamic_patch":
-            kw["max_dynamic_patch"] = None if x is None else _expect_int(x, expected="i64")
+            kw["max_dynamic_patch"] = None if x is None else _expect_int(x, expected="i64", bits=64)
         elif key == "content_hash":
             kw["content_hash"] = None if x is None else _expect_str(x, expected="a string")
         elif key == "min_pixels":
-            kw["min_pixels"] = None if x is None else _expect_int(x, expected="i64")
+            kw["min_pixels"] = None if x is None else _expect_int(x, expected="i64", bits=64)
         elif key == "max_pixels":
-            kw["max_pixels"] = None if x is None else _expect_int(x, expected="i64")
+            kw["max_pixels"] = None if x is None else _expect_int(x, expected="i64", bits=64)
         elif key == "total_max_pixels":
-            kw["total_max_pixels"] = None if x is None else _expect_int(x, expected="i64")
+            kw["total_max_pixels"] = None if x is None else _expect_int(x, expected="i64", bits=64)
         elif key == "fps":
             kw["fps"] = None if x is None else _expect_float(x, expected="f64")
         elif key == "num_frames":
-            kw["num_frames"] = None if x is None else _expect_int(x, expected="i64")
+            kw["num_frames"] = None if x is None else _expect_int(x, expected="i64", bits=64)
         elif key == "min_frames":
-            kw["min_frames"] = None if x is None else _expect_int(x, expected="i64")
+            kw["min_frames"] = None if x is None else _expect_int(x, expected="i64", bits=64)
         elif key == "max_frames":
-            kw["max_frames"] = None if x is None else _expect_int(x, expected="i64")
+            kw["max_frames"] = None if x is None else _expect_int(x, expected="i64", bits=64)
         elif key == "max_tokens_per_frame":
-            kw["max_tokens_per_frame"] = None if x is None else _expect_int(x, expected="i64")
+            kw["max_tokens_per_frame"] = None if x is None else _expect_int(x, expected="i64", bits=64)
         elif key == "max_image_tokens":
-            kw["max_image_tokens"] = None if x is None else _expect_int(x, expected="i64")
+            kw["max_image_tokens"] = None if x is None else _expect_int(x, expected="i64", bits=64)
         elif key == "use_audio":
             kw["use_audio"] = None if x is None else _expect_bool(x, expected="a boolean")
         elif key == "image_grid_thw":
@@ -2061,7 +2064,7 @@ def encode_ImageGridThw(v: ImageGridThw) -> List[Any]:
 
 def decode_MediaItem(value: Any) -> MediaItem:
     if isinstance(value, str):
-        return value
+        return _expect_str(value, expected="a string")
     if isinstance(value, dict):
         return decode_MediaRef(value)
     raise _invalid_type(value, expected="one of the MediaItem shapes")
@@ -2266,7 +2269,7 @@ def decode_ModelCard(value: Any) -> ModelCard:
         elif key == "parent":
             kw["parent"] = None if x is None else _expect_str(x, expected="a string")
         elif key == "max_model_len":
-            kw["max_model_len"] = _expect_uint(x, expected="u64")
+            kw["max_model_len"] = _expect_uint(x, expected="u64", bits=64)
     return ModelCard(**kw)
 
 
@@ -2285,7 +2288,7 @@ def decode_DetokenizeRequest(value: Any) -> DetokenizeRequest:
     kw: Dict[str, Any] = {}
     for key, x in m.items():
         if key == "tokens":
-            kw["tokens"] = [] if x is None else [_expect_int(e, expected="i64") for e in _expect_seq(x, expected="a sequence")]
+            kw["tokens"] = [] if x is None else [_expect_int(e, expected="i64", bits=64) for e in _expect_seq(x, expected="a sequence")]
     return DetokenizeRequest(**kw)
 
 
@@ -2446,9 +2449,9 @@ def decode_GetServerInfoResponse(value: Any) -> GetServerInfoResponse:
         elif key == "tokenizer_path":
             kw["tokenizer_path"] = _expect_str(x, expected="a string")
         elif key == "max_context_length":
-            kw["max_context_length"] = _expect_uint(x, expected="u32")
+            kw["max_context_length"] = _expect_uint(x, expected="u32", bits=32)
         elif key == "max_total_num_tokens":
-            kw["max_total_num_tokens"] = None if x is None else _expect_uint(x, expected="u64")
+            kw["max_total_num_tokens"] = None if x is None else _expect_uint(x, expected="u64", bits=64)
         elif key == "version":
             kw["version"] = _expect_str(x, expected="a string")
         elif key == "internal_states":
@@ -2456,7 +2459,7 @@ def decode_GetServerInfoResponse(value: Any) -> GetServerInfoResponse:
         elif key == "host":
             kw["host"] = _expect_str(x, expected="a string")
         elif key == "port":
-            kw["port"] = _expect_uint(x, expected="u32")
+            kw["port"] = _expect_uint(x, expected="u32", bits=32)
         elif key == "incremental_streaming_output":
             kw["incremental_streaming_output"] = _expect_bool(x, expected="a boolean")
         elif key == "disaggregation_mode":
@@ -2468,7 +2471,7 @@ def decode_GetServerInfoResponse(value: Any) -> GetServerInfoResponse:
         elif key == "skip_tokenizer_init":
             kw["skip_tokenizer_init"] = _expect_bool(x, expected="a boolean")
         elif key == "num_reserved_tokens":
-            kw["num_reserved_tokens"] = _expect_uint(x, expected="u64")
+            kw["num_reserved_tokens"] = _expect_uint(x, expected="u64", bits=64)
     return GetServerInfoResponse(**kw)
 
 
@@ -2500,27 +2503,27 @@ def decode_DeploymentInfo(value: Any) -> DeploymentInfo:
     kw: Dict[str, Any] = {}
     for key, x in m.items():
         if key == "disaggregation_bootstrap_port":
-            kw["disaggregation_bootstrap_port"] = None if x is None else _expect_uint(x, expected="u32")
+            kw["disaggregation_bootstrap_port"] = None if x is None else _expect_uint(x, expected="u32", bits=32)
         elif key == "node_rank":
-            kw["node_rank"] = _expect_uint(x, expected="u32")
+            kw["node_rank"] = _expect_uint(x, expected="u32", bits=32)
         elif key == "nnodes":
-            kw["nnodes"] = _expect_uint(x, expected="u32")
+            kw["nnodes"] = _expect_uint(x, expected="u32", bits=32)
         elif key == "dp_size":
-            kw["dp_size"] = _expect_uint(x, expected="u32")
+            kw["dp_size"] = _expect_uint(x, expected="u32", bits=32)
         elif key == "dp_rank":
-            kw["dp_rank"] = None if x is None else _expect_uint(x, expected="u32")
+            kw["dp_rank"] = None if x is None else _expect_uint(x, expected="u32", bits=32)
         elif key == "dist_init_addr":
             kw["dist_init_addr"] = None if x is None else _expect_str(x, expected="a string")
         elif key == "base_gpu_id":
-            kw["base_gpu_id"] = _expect_uint(x, expected="u32")
+            kw["base_gpu_id"] = _expect_uint(x, expected="u32", bits=32)
         elif key == "page_size":
-            kw["page_size"] = None if x is None else _expect_uint(x, expected="u32")
+            kw["page_size"] = None if x is None else _expect_uint(x, expected="u32", bits=32)
         elif key == "dcp_size":
-            kw["dcp_size"] = _expect_uint(x, expected="u32")
+            kw["dcp_size"] = _expect_uint(x, expected="u32", bits=32)
         elif key == "max_running_requests":
-            kw["max_running_requests"] = None if x is None else _expect_uint(x, expected="u64")
+            kw["max_running_requests"] = None if x is None else _expect_uint(x, expected="u64", bits=64)
         elif key == "max_prefill_tokens":
-            kw["max_prefill_tokens"] = _expect_uint(x, expected="u64")
+            kw["max_prefill_tokens"] = _expect_uint(x, expected="u64", bits=64)
         elif key == "enable_dp_attention":
             kw["enable_dp_attention"] = _expect_bool(x, expected="a boolean")
         elif key == "speculative_algorithm":
@@ -2530,11 +2533,11 @@ def decode_DeploymentInfo(value: Any) -> DeploymentInfo:
         elif key == "hicache_ratio":
             kw["hicache_ratio"] = None if x is None else _expect_float(x, expected="f64")
         elif key == "hicache_size":
-            kw["hicache_size"] = _expect_uint(x, expected="u64")
+            kw["hicache_size"] = _expect_uint(x, expected="u64", bits=64)
         elif key == "hicache_write_policy":
             kw["hicache_write_policy"] = None if x is None else _expect_str(x, expected="a string")
         elif key == "hicache_host_total_tokens":
-            kw["hicache_host_total_tokens"] = None if x is None else _expect_uint(x, expected="u64")
+            kw["hicache_host_total_tokens"] = None if x is None else _expect_uint(x, expected="u64", bits=64)
         elif key == "kv_event_sources":
             kw["kv_event_sources"] = [] if x is None else [decode_KvEventSource(e) for e in _expect_seq(x, expected="a sequence")]
         elif key == "node_listeners":
@@ -2583,13 +2586,13 @@ def decode_NodeRustListener(value: Any) -> NodeRustListener:
     kw: Dict[str, Any] = {}
     for key, x in m.items():
         if key == "port_offset":
-            kw["port_offset"] = _expect_uint(x, expected="u32")
+            kw["port_offset"] = _expect_uint(x, expected="u32", bits=32)
         elif key == "dp_rank":
-            kw["dp_rank"] = _expect_uint(x, expected="u32")
+            kw["dp_rank"] = _expect_uint(x, expected="u32", bits=32)
         elif key == "http_port":
-            kw["http_port"] = _expect_uint(x, expected="u32")
+            kw["http_port"] = _expect_uint(x, expected="u32", bits=32)
         elif key == "grpc_port":
-            kw["grpc_port"] = None if x is None else _expect_uint(x, expected="u32")
+            kw["grpc_port"] = None if x is None else _expect_uint(x, expected="u32", bits=32)
     return NodeRustListener(**kw)
 
 
@@ -2608,13 +2611,13 @@ def decode_KvEventSource(value: Any) -> KvEventSource:
     kw: Dict[str, Any] = {}
     for key, x in m.items():
         if key == "dp_rank":
-            kw["dp_rank"] = _expect_uint(x, expected="u32")
+            kw["dp_rank"] = _expect_uint(x, expected="u32", bits=32)
         elif key == "endpoint":
             kw["endpoint"] = _expect_str(x, expected="a string")
         elif key == "topic":
             kw["topic"] = _expect_str(x, expected="a string")
         elif key == "block_size":
-            kw["block_size"] = _expect_uint(x, expected="u32")
+            kw["block_size"] = _expect_uint(x, expected="u32", bits=32)
     return KvEventSource(**kw)
 
 
