@@ -792,7 +792,6 @@ class XPUAttentionBackend(AttentionBackend):
         is_hybrid_swa = (
             layer.sliding_window_size is not None and layer.sliding_window_size > -1
         )
-        window_size = (layer.sliding_window_size, 0) if is_hybrid_swa else (-1, -1)
 
         # currently no FP8 KV cache supported
         k_descale, v_descale = None, None
@@ -813,6 +812,14 @@ class XPUAttentionBackend(AttentionBackend):
             layer.is_cross_attention
             or layer.attn_type
             in (AttentionType.ENCODER_ONLY, AttentionType.DECODER_BIDIRECTIONAL)
+        )
+        # The window tuple is (left, right) even when causal=False, so a right
+        # bound of 0 would hide every later token: bidirectional layers need the
+        # same local context on both sides (as in FlashAttentionBackend).
+        window_size = (
+            (layer.sliding_window_size, 0 if causal else layer.sliding_window_size)
+            if is_hybrid_swa
+            else (-1, -1)
         )
 
         if self.dcp_size > 1:

@@ -76,7 +76,7 @@ class Gemma4Renoise(DllmAlgorithm):
     requires_separate_context_encoding = True
     required_attention_backend = "triton"
     reuse_forward_metadata = True
-    supported_attention_backends = ("triton", "fa4")
+    supported_attention_backends = ("triton", "fa4", "intel_xpu")
     capture_input_preparation = True
 
     @classmethod
