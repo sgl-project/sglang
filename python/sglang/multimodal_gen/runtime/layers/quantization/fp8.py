@@ -534,11 +534,8 @@ class Fp8LinearMethod(LinearMethodBase):
             # Activations not quantized for marlin.
             del layer.input_scale
 
-    _apply_fp8_linear = staticmethod(apply_fp8_linear)
-
     def accepts_per_token_fp8_input(self, layer: Module) -> bool:
         # Keep schemes with a different apply contract on their existing path.
-        # Subclasses that only specialize GEMM dispatch retain this contract.
         return (
             type(self).apply is Fp8LinearMethod.apply
             and _is_cuda
@@ -573,7 +570,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 raise ValueError(
                     "requires E4M3 rows and contiguous FP32 per-token scales on the weight device"
                 )
-            return self._apply_fp8_linear(
+            return apply_fp8_linear(
                 input=qinput,
                 weight=layer.weight,
                 weight_scale=layer.weight_scale,
@@ -602,7 +599,7 @@ class Fp8LinearMethod(LinearMethodBase):
             input_scale = layer.input_scale
             if input_scale is not None:
                 input_scale = input_scale.float().clamp(min=1e-8)
-            return self._apply_fp8_linear(
+            return apply_fp8_linear(
                 input=x,
                 weight=layer.weight,
                 weight_scale=layer.weight_scale,
@@ -654,7 +651,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 bias=bias,
             )
 
-        return self._apply_fp8_linear(
+        return apply_fp8_linear(
             input=x,
             weight=layer.weight,
             weight_scale=layer.weight_scale,

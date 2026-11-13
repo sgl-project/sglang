@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Optional
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.fused_op import BaseFusedOp, register_fused_op
 from sglang.kernels.registry import register_kernel
 from sglang.kernels.selector import _platform, get_kernel
@@ -110,7 +111,16 @@ def _prefer_torch_rowwise_fp8(
     # SM90 benchmarks show repeatable NVJet wins only for large prefill M with
     # either a wide output or a broad down projection. Keep decode, narrow TP8
     # projections, and shapes outside that measured envelope on the AOT kernel.
-    return m >= 8192 and ((k >= 4096 and n >= 6144) or (k >= 7168 and n >= 5376))
+    if m >= 8192 and ((k >= 4096 and n >= 6144) or (k >= 7168 and n >= 5376)):
+        return True
+
+    # H200 measurements also favor NVJet for these MiniMax-H3 projection
+    # shapes at 4K-8K rows. Other SM90 GPUs retain the existing crossover.
+    return (
+        4096 <= m < 8192
+        and (k, n) in ((5376, 21504), (7168, 5376), (5376, 28672), (14336, 5376))
+        and "H200" in current_arch().name.split()
+    )
 
 
 class Fp8ScaledMMOp(BaseFusedOp):

@@ -148,6 +148,27 @@ def rmsnorm_scale_shift_per_token(
 
 
 @triton.jit
+def _rmsnorm_indexed_scale_shift_row(
+    x_ptr,
+    w_ptr,
+    scale_ptr,
+    shift_ptr,
+    mod_ptr,
+    row,
+    cols,
+    DIM: tl.constexpr,
+    EPS: tl.constexpr,
+):
+    mask = cols < DIM
+    x = tl.load(x_ptr + row * DIM + cols, mask=mask, other=0.0).to(tl.float32)
+    rstd = tl.math.rsqrt(tl.sum(x * x, axis=0) / DIM + EPS)
+    w = tl.load(w_ptr + cols, mask=mask).to(tl.float32)
+    scale = tl.load(scale_ptr + mod_ptr, mask=mask).to(tl.float32)
+    shift = tl.load(shift_ptr + mod_ptr, mask=mask).to(tl.float32)
+    return (x * rstd * w) * (1.0 + scale) + shift
+
+
+@triton.jit
 def _rmsnorm_indexed_scale_shift_kernel(
     y_ptr,
     x_ptr,
@@ -166,12 +187,9 @@ def _rmsnorm_indexed_scale_shift_kernel(
     mask = cols < DIM
     mod_ptr = tl.load(idx_ptr + row * idx_stride) * mod_row_stride + cols
 
-    x = tl.load(x_ptr + row * DIM + cols, mask=mask, other=0.0).to(tl.float32)
-    rstd = tl.math.rsqrt(tl.sum(x * x, axis=0) / DIM + EPS)
-    w = tl.load(w_ptr + cols, mask=mask).to(tl.float32)
-    scale = tl.load(scale_ptr + mod_ptr, mask=mask).to(tl.float32)
-    shift = tl.load(shift_ptr + mod_ptr, mask=mask).to(tl.float32)
-    y = (x * rstd * w) * (1.0 + scale) + shift
+    y = _rmsnorm_indexed_scale_shift_row(
+        x_ptr, w_ptr, scale_ptr, shift_ptr, mod_ptr, row, cols, DIM, EPS
+    )
     tl.store(y_ptr + row * DIM + cols, y, mask=mask)
 
 

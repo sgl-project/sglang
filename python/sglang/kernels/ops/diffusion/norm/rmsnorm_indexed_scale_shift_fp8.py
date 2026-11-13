@@ -5,7 +5,10 @@ import torch
 import triton
 import triton.language as tl
 
-from .rmsnorm_scale_shift_triton import can_use_rmsnorm_indexed_scale_shift
+from .rmsnorm_scale_shift_triton import (
+    _rmsnorm_indexed_scale_shift_row,
+    can_use_rmsnorm_indexed_scale_shift,
+)
 
 
 def can_use_rmsnorm_indexed_scale_shift_fp8(x, weight, shift, scale, indices) -> bool:
@@ -46,13 +49,11 @@ def _rmsnorm_indexed_scale_shift_fp8_kernel(
     cols = tl.arange(0, BLOCK)
     mask = cols < DIM
     mod = tl.load(IDX + row * IDX_STRIDE).to(tl.int64) * MOD_STRIDE + cols
-    x = tl.load(X + row * DIM + cols, mask, other=0).to(tl.float32)
-    rstd = tl.rsqrt(tl.sum(x * x, 0) / DIM + EPS)
-    w = tl.load(W + cols, mask, other=0).to(tl.float32)
-    scale = tl.load(SCALE + mod, mask, other=0).to(tl.float32)
-    shift = tl.load(SHIFT + mod, mask, other=0).to(tl.float32)
-    # Identical expression / reduction layout to the lossless H3 producer.
-    value = ((x * rstd * w) * (1.0 + scale) + shift).to(tl.bfloat16).to(tl.float32)
+    value = (
+        _rmsnorm_indexed_scale_shift_row(X, W, SCALE, SHIFT, mod, row, cols, DIM, EPS)
+        .to(tl.bfloat16)
+        .to(tl.float32)
+    )
     value = tl.where(mask, value, 0.0)
     if KEEP_BF16:
         tl.store(Y + row * DIM + cols, value, mask)

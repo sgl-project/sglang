@@ -105,9 +105,6 @@ from sglang.multimodal_gen.runtime.layers.linear import (
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
 )
-from sglang.multimodal_gen.runtime.layers.quantization.minimax_h3_fp8 import (
-    specialize_h3_fp8_config,
-)
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     RotaryEmbedding,
 )
@@ -2594,7 +2591,6 @@ class MiniMaxH3DiTModel(SpectrumMixin, BaseDiT, LayerwiseOffloadableModuleMixin)
     ) -> None:
         super().__init__(config=config, hf_config=hf_config)
         arch = self.config
-        quant_config = specialize_h3_fp8_config(quant_config)
         if (
             (adaln_cache_path is not None or adaln_weight_files is not None)
             and quant_config is not None

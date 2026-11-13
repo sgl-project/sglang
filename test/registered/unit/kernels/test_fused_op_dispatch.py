@@ -17,12 +17,14 @@ Platform detection is mocked, so everything here runs on a CPU-only box.
 """
 
 import warnings
+from types import SimpleNamespace
 
 import pytest
 import torch
 from torch import nn
 
 import sglang.kernels.fused_op as fo
+import sglang.kernels.ops.gemm as gemm
 from sglang.kernels.fused_op import BaseFusedOp
 from sglang.kernels.spec import CapabilityRequirement as Cap
 from sglang.kernels.spec import KernelBackend, PlatformInfo
@@ -471,6 +473,88 @@ def test_backend_eligible_override_gates_per_call(monkeypatch):
     assert op(torch.zeros(4)) == "jit"
     assert op(torch.zeros(3)) == "native"  # same instance, per-call bounce
     assert op(torch.zeros(8)) == "jit"
+
+
+@pytest.fixture
+def _fp8_dispatch(monkeypatch):
+    # GPU metadata is fake; selection still runs the production FP8 dispatcher.
+    from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode
+
+    class _Probe(gemm.Fp8ScaledMMOp):
+        def forward_native(self, *args, **kwargs):
+            return "torch"
+
+        def forward_aot(self, *args, **kwargs):
+            return "aot"
+
+    _mock_platform(monkeypatch, key="cuda", info=_CUDA)
+    monkeypatch.setattr(gemm, "_platform", lambda: _CUDA)
+    monkeypatch.setattr(
+        gemm, "current_arch", lambda: SimpleNamespace(name="NVIDIA H200")
+    )
+    mode = FakeTensorMode()
+
+    def inputs(m=4144, k=5376, n=21504):
+        def fake(shape, dtype):
+            meta = torch.empty(shape, dtype=dtype, device="meta")
+            return FakeTensor(mode, meta, torch.device("cuda:0"))
+
+        return (
+            fake((m, k), torch.float8_e4m3fn),
+            fake((n, k), torch.float8_e4m3fn).t(),
+            fake((m, 1), torch.float32),
+            fake((1, n), torch.float32),
+        )
+
+    return _Probe(), inputs
+
+
+@pytest.mark.parametrize(
+    "m,k,n,expected",
+    [
+        (4144, 5376, 21504, "torch"),
+        (4144, 7168, 5376, "torch"),
+        (4144, 5376, 28672, "torch"),
+        (4144, 14336, 5376, "torch"),
+        (4095, 5376, 21504, "aot"),
+        (4096, 5376, 21504, "torch"),
+        (8191, 5376, 21504, "torch"),
+        (8192, 5376, 21504, "torch"),
+        (4144, 5376, 10752, "aot"),
+    ],
+)
+def test_fp8_h200_shape_dispatch(_fp8_dispatch, m, k, n, expected):
+    op, inputs = _fp8_dispatch
+    assert op(*inputs(m, k, n), out_dtype=torch.bfloat16) == expected
+
+
+@pytest.mark.parametrize("name", ["NVIDIA H100", "NVIDIA GH200", "NVIDIA H200 NVL"])
+def test_fp8_h200_rule_preserves_other_sm90_dispatch(monkeypatch, _fp8_dispatch, name):
+    op, inputs = _fp8_dispatch
+    monkeypatch.setattr(gemm, "current_arch", lambda: SimpleNamespace(name=name))
+    expected = "torch" if name == "NVIDIA H200 NVL" else "aot"
+    assert op(*inputs(), out_dtype=torch.bfloat16) == expected
+    # The pre-existing large-M crossover applies to all SM90 devices.
+    assert op(*inputs(m=8192), out_dtype=torch.bfloat16) == "torch"
+
+
+def test_fp8_h200_rule_keeps_contract_guards_and_backend_overrides(_fp8_dispatch):
+    op, inputs = _fp8_dispatch
+    a, b, sa, sb = inputs()
+    assert op(a, b, sa, sb, out_dtype=torch.bfloat16) == "torch"
+    assert op(a, b, sa, sb, out_dtype=torch.float16) == "aot"
+    assert op(a, b, sa[:1], sb, out_dtype=torch.bfloat16) == "aot"
+    assert op(a, b, sa, sb, out_dtype=torch.bfloat16, bias=sb[0]) == "aot"
+    fo.set_fused_op_backend(KernelBackend.AOT)
+    assert op(a, b, sa, sb, out_dtype=torch.bfloat16) == "aot"
+    assert (
+        op(a, b, sa, sb, out_dtype=torch.bfloat16, backend=KernelBackend.TORCH)
+        == "torch"
+    )
+    fo.set_fused_op_backend(KernelBackend.TORCH)
+    assert (
+        op(a, b, sa, sb, out_dtype=torch.bfloat16, backend=KernelBackend.AOT) == "aot"
+    )
 
 
 # --- torch.compile protocol -----------------------------------------------------
