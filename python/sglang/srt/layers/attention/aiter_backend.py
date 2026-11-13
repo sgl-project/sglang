@@ -419,12 +419,12 @@ def _kv_cache_is_vectorized_5d(pool) -> bool:
 
 
 def _require_untranslated_storage(*pools) -> None:
-    """This backend reads a pool's K/V as dense ``(pages, page_size, H, D)``
-    caches, gathers their indices straight from the request table, and maps
+    """The legacy routes read a pool's K/V as dense ``(pages, page_size, H, D)``
+    caches, gather their indices straight from the request table, and map
     window layers through a static full -> window slot table. A pool whose
     views take physical write ids (the unified pool, or a draft fused into it)
     needs translated indices and strided entry views, for full and window
-    layers alike, so the backend cannot read it."""
+    layers alike, so these routes cannot read it."""
     for pool in pools:
         if pool is not None and pool.requires_physical_write_loc:
             raise ValueError(
@@ -646,6 +646,7 @@ class AiterAttnBackend(AttentionBackend):
     # Set in __init__; declared here for tests that build the backend without it
     # (test_aiter_fp8_kv_scales_paths.py).
     deterministic_prefill_max_q: Optional[int] = None
+    use_unified_memory: bool = False
 
     def __init__(
         self,
@@ -825,9 +826,48 @@ class AiterAttnBackend(AttentionBackend):
         self.kv_cache_is_vectorized_5d = _kv_cache_is_vectorized_5d(
             model_runner.token_to_kv_pool
         )
-        _require_untranslated_storage(model_runner.token_to_kv_pool, self.swa_kv_pool)
+        self.use_unified_memory = self.token_to_kv_pool.requires_physical_write_loc
+        if self.use_unified_memory:
+            if not envs.SGLANG_ENABLE_AITER_UNIFIED_MEMORY.get():
+                raise RuntimeError(
+                    "AITER unified memory is experimental and disabled by default. "
+                    "Set SGLANG_ENABLE_AITER_UNIFIED_MEMORY=1 only with the AITER "
+                    "fixes listed in the unified-memory documentation."
+                )
+            if (
+                not self.runner_ids.reads_are_translated
+                or self.runner_ids.is_fused_draft
+                or self.use_mla
+                or self.kv_cache_is_vectorized_5d
+                or self.input_dtype != torch.bfloat16
+                or self.kv_cache_dtype not in (torch.bfloat16, fp8_dtype)
+                or self.head_dim != self.v_head_dim
+            ):
+                raise ValueError(
+                    "AITER unified memory requires translated MHA, BF16 queries "
+                    "and BF16 or native FP8 KV, "
+                    "equal K/V head dimensions; MLA, "
+                    "vectorized and fused-draft caches are not supported."
+                )
+            from sglang.kernels.ops.kvcache.kvcache import can_use_store_cache
 
-        if self.use_sliding_window_kv_pool:
+            # Full and window layers can require different writer specializations.
+            for sub_pool in self.kv_layers.sub_pools():
+                if not sub_pool.layer_ids:
+                    continue
+                k, v = self.kv_layers.layer(sub_pool.layer_ids[0]).kv()
+                row_bytes = k[0].numel() * k.element_size()
+                v_row_bytes = v[0].numel() * v.element_size()
+                if not can_use_store_cache(row_bytes, v_row_bytes):
+                    raise RuntimeError(
+                        "AITER unified memory requires the JIT KV writer to preserve "
+                        "the reserved sink. Fix the store_cache build/load failure "
+                        "before enabling this backend."
+                    )
+        else:
+            _require_untranslated_storage(self.token_to_kv_pool, self.swa_kv_pool)
+
+        if self.use_sliding_window_kv_pool or self.use_unified_memory:
             self.use_triton_unified_attention = True
         else:
             self.use_triton_unified_attention = get_bool_env_var(
@@ -882,9 +922,11 @@ class AiterAttnBackend(AttentionBackend):
         # Triton attention. Extend and target verify take the Muse fast paths below
         # (each behind its own SGLANG_ROCM_MUSE_* switch); decode is unchanged.
         # Muse Spark's attention shapes (GQA 8, head_dim 64, sliding window); other models with the
-        # same shapes (gpt-oss) keep the generic paths.
+        # same shapes (gpt-oss) keep the generic paths. The arena also uses the
+        # generic path: Muse metadata gathers assume static full-to-window ids.
         self.use_muse_attention_paths = (
             is_gfx95_supported()
+            and not self.use_unified_memory
             and getattr(model_runner.model_config.hf_config, "model_type", None)
             in ("muse_spark", "muse_spark_text")
             and not self.use_mla
@@ -1662,17 +1704,34 @@ class AiterAttnBackend(AttentionBackend):
 
         return page_table, qo_indptr, draft_num, swa_page_table
 
+    def _unified_memory_page_tables(self, plan: IterationIds, rows: int):
+        # RunnerIds already returns physical PAGE ids in batch-row order.
+        # The static-pool token-to-page conversion would translate these twice.
+        page_table = self.runner_ids.read_table(plan, rows=rows).ids
+        swa_page_table = (
+            self.runner_ids.read_table(
+                plan, kind=IdSpaceKind.SLIDING_WINDOW, rows=rows
+            ).ids
+            if self.use_sliding_window_kv_pool
+            else None
+        )
+        return page_table, swa_page_table
+
     def _build_extend_unified_page_table(
         self,
         bs: int,
         seq_lens: torch.Tensor,
         req_pool_indices: torch.Tensor,
         max_kv_len: int,
+        plan: Optional[IterationIds] = None,
     ):
         """Build the 2D block page_table (+ SWA translation) that
         unified_attention needs for a plain extend/prefill batch. Mirrors the
         target_verify builder with draft_num=0; rows are sized to the batch's own
         longest sequence since extend is never graph-captured."""
+        if self.use_unified_memory:
+            return self._unified_memory_page_tables(plan, bs)
+
         device = seq_lens.device
         page_size = self.page_size
         max_blocks = max((max_kv_len + page_size - 1) // page_size, 1)
@@ -1733,7 +1792,11 @@ class AiterAttnBackend(AttentionBackend):
         else:
             max_kv_len = int(forward_batch.seq_lens_cpu.max().item())
             page_table, swa_page_table = self._build_extend_unified_page_table(
-                bs, forward_batch.seq_lens, forward_batch.req_pool_indices, max_kv_len
+                bs,
+                forward_batch.seq_lens,
+                forward_batch.req_pool_indices,
+                max_kv_len,
+                plan=forward_batch.iteration_ids if self.use_unified_memory else None,
             )
 
             # Build cu_seqlens_q from this batch's extend lengths. The standard
@@ -2679,6 +2742,11 @@ class AiterAttnBackend(AttentionBackend):
                 return num_partitions
         raise ValueError(f"Unknown aiter decode graph variant {label!r}")
 
+    def _get_swa_write_locations(self, forward_batch: ForwardBatch):
+        if self.use_unified_memory:
+            return self.runner_ids.write_ids(forward_batch, IdSpaceKind.SLIDING_WINDOW)
+        return self.swa_space.ids(forward_batch.out_cache_loc)
+
     def init_forward_metadata_out_graph(
         self,
         forward_batch: ForwardBatch,
@@ -2702,6 +2770,7 @@ class AiterAttnBackend(AttentionBackend):
             spec_info=forward_batch.spec_info,
             seq_lens_cpu=seq_lens_cpu,
             verify_tokens_per_req=verify_tokens_per_req,
+            plan=forward_batch.iteration_ids if self.use_unified_memory else None,
         )
         if in_capture and forward_batch.forward_mode.is_decode():
             self.forward_metadata.decode_num_partitions = (
@@ -2717,7 +2786,7 @@ class AiterAttnBackend(AttentionBackend):
                 self.cuda_graph_swa_out_cache_loc[:n].zero_()
             else:
                 self.cuda_graph_swa_out_cache_loc[:n].copy_(
-                    self.swa_space.ids(forward_batch.out_cache_loc)
+                    self._get_swa_write_locations(forward_batch)
                 )
             self.forward_metadata.swa_out_cache_loc = self.cuda_graph_swa_out_cache_loc[
                 :n
@@ -2746,7 +2815,7 @@ class AiterAttnBackend(AttentionBackend):
         swa_page_table = None
         swa_out_cache_loc = None
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
-            swa_out_cache_loc = self.swa_space.ids(forward_batch.out_cache_loc)
+            swa_out_cache_loc = self._get_swa_write_locations(forward_batch)
         # Absent under the sync-free path (needs_cpu_seq_lens=False); unified
         # verify sizes from its page table instead.
         if forward_batch.seq_lens_cpu is not None:
@@ -2793,34 +2862,41 @@ class AiterAttnBackend(AttentionBackend):
                         )
                 else:
                     max_q_len = 1
-                    page_size = self.page_size
-                    max_num_blocks_per_seq = (max_kv_len + page_size - 1) // page_size
-                    kv_indices = torch.zeros(
-                        bs, max_kv_len, dtype=torch.int32, device=self.device
-                    )
+                    if self.use_unified_memory:
+                        kv_indices, swa_page_table = self._unified_memory_page_tables(
+                            forward_batch.iteration_ids, bs
+                        )
+                    else:
+                        kv_indices = torch.zeros(
+                            bs, max_kv_len, dtype=torch.int32, device=self.device
+                        )
 
-                    create_flashmla_kv_indices_triton[
-                        (bs, get_num_kv_index_blocks_flashmla(max_kv_len, 1))
-                    ](
-                        self.req_to_token,
-                        forward_batch.req_pool_indices,
-                        forward_batch.seq_lens,
-                        None,
-                        kv_indices,
-                        self.req_to_token.stride(0),
-                        max_kv_len,
-                        1,
-                    )
+                        create_flashmla_kv_indices_triton[
+                            (bs, get_num_kv_index_blocks_flashmla(max_kv_len, 1))
+                        ](
+                            self.req_to_token,
+                            forward_batch.req_pool_indices,
+                            forward_batch.seq_lens,
+                            None,
+                            kv_indices,
+                            self.req_to_token.stride(0),
+                            max_kv_len,
+                            1,
+                        )
 
-                    if self.use_sliding_window_kv_pool:
-                        # AITER attention kernels require int32 page indices;
-                        # full_to_swa_index_mapping is stored as int64.
-                        swa_page_table = self.swa_space.ids(kv_indices).to(torch.int32)
+                        if self.use_sliding_window_kv_pool:
+                            # AITER attention kernels require int32 page indices;
+                            # full_to_swa_index_mapping is stored as int64.
+                            swa_page_table = self.swa_space.ids(kv_indices).to(
+                                torch.int32
+                            )
 
-                        kv_indices = self._transform_table_1_to_real(kv_indices)
-                        swa_page_table = self._transform_table_1_to_real(swa_page_table)
-                    elif self.page_size > 1:
-                        kv_indices = self._transform_table_1_to_real(kv_indices)
+                            kv_indices = self._transform_table_1_to_real(kv_indices)
+                            swa_page_table = self._transform_table_1_to_real(
+                                swa_page_table
+                            )
+                        elif self.page_size > 1:
+                            kv_indices = self._transform_table_1_to_real(kv_indices)
 
                     qo_indptr = self.qo_indptr_unified_decode[: bs + 1]
 
@@ -3310,7 +3386,7 @@ class AiterAttnBackend(AttentionBackend):
                             max_blocks=max_blocks,
                         )
                     )
-                elif self.use_sliding_window_kv_pool:
+                elif self.use_sliding_window_kv_pool and not self.use_unified_memory:
                     # AITER attention kernels (e.g. mha_batch_prefill_func)
                     # require int32 page indices; full_to_swa_index_mapping is
                     # stored as int64.
@@ -3706,6 +3782,7 @@ class AiterAttnBackend(AttentionBackend):
         spec_info: Optional[SpecInput],
         seq_lens_cpu: Optional[torch.Tensor],
         verify_tokens_per_req: Optional[int],
+        plan: Optional[IterationIds] = None,
     ):
         num_kv_splits = None
         # num_kv_splits_indptr = None
@@ -3782,7 +3859,21 @@ class AiterAttnBackend(AttentionBackend):
                     if self.use_sliding_window_kv_pool:
                         swa_page_table = self.cuda_graph_swa_page_table
 
-                    if spec_info is not None:
+                    if self.use_unified_memory:
+                        for kind, out in (
+                            (IdSpaceKind.FULL, kv_indices),
+                            (IdSpaceKind.SLIDING_WINDOW, swa_page_table),
+                        ):
+                            if out is None:
+                                continue
+                            self.runner_ids.copy_page_table(plan, kind=kind, out=out)
+                            table = self.runner_ids.read_table(
+                                plan, kind=kind, rows=out.shape[0]
+                            )
+                            # Preserve a cached table that aliases this buffer.
+                            # The producer clears interior tails and padded rows.
+                            out[:, table.ids.shape[1] :].zero_()
+                    elif spec_info is not None:
                         self._build_unified_page_table_from_spec(
                             spec_info,
                             bs,
@@ -4214,9 +4305,11 @@ class AiterAttnBackend(AttentionBackend):
 
     def _use_fused_fp8_kv_write(self, layer: RadixAttention) -> bool:
         # Fused write reuses K's num_heads/head_dim for V, so it needs FP8,
-        # non-MLA, non-SWA, and matching K/V head count + head_dim.
+        # non-MLA, non-SWA, and matching K/V head count + head_dim. The arena
+        # uses the shared writer, which preserves its reserved padding sink.
         return (
             self.kv_cache_dtype == fp8_dtype
+            and not self.use_unified_memory
             and not self.use_mla
             and not self.use_sliding_window_kv_pool
             and layer.tp_k_head_num == layer.tp_v_head_num
@@ -4536,6 +4629,7 @@ class AiterAttnBackend(AttentionBackend):
                 elif (
                     self.use_triton_unified_attention
                     and self.use_sliding_window_kv_pool
+                    and not self.use_unified_memory
                 ):
                     token_to_kv_pool = self.token_to_kv_pool
                     k_cache, v_cache = self.kv_layers.read(layer.layer_id).kv()
@@ -5552,7 +5646,11 @@ class AiterAttnBackend(AttentionBackend):
             # Non-SWA models (e.g. Qwen3-VL) enabled via SGLANG_USE_AITER_UNIFIED_ATTN
             # use standard set_kv_buffer, as they lack SWA-specific attributes
             # like full_to_swa_index_mapping.
-            elif self.use_triton_unified_attention and self.use_sliding_window_kv_pool:
+            elif (
+                self.use_triton_unified_attention
+                and self.use_sliding_window_kv_pool
+                and not self.use_unified_memory
+            ):
                 token_to_kv_pool = self.token_to_kv_pool
                 k_cache, v_cache = self.kv_layers.read(layer.layer_id).kv()
                 slot_mapping_swa = token_to_kv_pool.full_to_swa_index_mapping
@@ -5820,14 +5918,15 @@ class AiterIndicesUpdaterPrefill:
                 dtype=torch.int32,
                 device=req_pool_indices.device,
             )
-            create_flashinfer_kv_indices_triton[(bs,)](
-                self.req_to_token,
-                req_pool_indices,
-                paged_kernel_lens,
-                kv_indptr,
-                kv_start_idx,
-                kv_indices,
-                self.req_to_token.shape[1],
+            # FP8 context-prefill gathers consume physical token slots, just
+            # like the page-table readers. Let RunnerIds translate arena ids.
+            self.runner_ids.pack_read_stream(
+                plan,
+                req_pool_indices=req_pool_indices,
+                seq_lens=paged_kernel_lens,
+                indptr=kv_indptr,
+                out=kv_indices,
+                kv_start_idx=kv_start_idx,
             )
 
             # Pad past the real total kv_indptr[bs] (seq_lens_sum may be an upper bound)

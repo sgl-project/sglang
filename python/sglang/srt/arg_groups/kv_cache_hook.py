@@ -851,6 +851,30 @@ def handle_page_major_kv_layout(server_args: Any):
         }
     backends = set(attention_backends_of(resolved_view(server_args)))
     backends.discard(None)
+    if "aiter" in backends and not use_mla_backend(server_args):
+        assert envs.SGLANG_ENABLE_AITER_UNIFIED_MEMORY.get(), (
+            "AITER unified memory is experimental and disabled by default. "
+            "Set SGLANG_ENABLE_AITER_UNIFIED_MEMORY=1 only with the AITER "
+            "fixes listed in the unified-memory documentation."
+        )
+        # Unified attention consumes translated full and window page tables.
+        assert not model_config.has_asymmetric_kv, (
+            "--enable-unified-memory with aiter requires equal K/V head dimensions."
+        )
+        # Auto is checked against the actual query/KV dtypes by the backend.
+        assert cfg.dtype in ("auto", "bfloat16") and cfg.kv_cache_dtype in (
+            "auto",
+            "bf16",
+            "bfloat16",
+            "fp8_e4m3",
+            "fp8_e5m2",
+        ), (
+            "--enable-unified-memory with aiter requires BF16 queries and BF16 or native FP8 KV."
+        )
+        assert cfg.speculative_algorithm is None, (
+            "--enable-unified-memory with aiter does not support speculative decoding."
+        )
+        allowed_full.add("aiter")
     assert backends <= allowed_full, (
         "--enable-page-major-kv-layout: the resolved attention backends "
         f"{sorted(backends)} are not in the allowed set "

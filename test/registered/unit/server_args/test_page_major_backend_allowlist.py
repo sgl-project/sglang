@@ -41,6 +41,8 @@ from sglang.srt.arg_groups.kv_cache_hook import (
     handle_page_major_kv_layout,
 )
 from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.environ import envs
+from sglang.srt.model_executor.cuda_graph_config import Backend, CudaGraphConfig
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -55,7 +57,9 @@ def _accepts(
     linear_decode: str | None = None,
     linear_prefill: str | None = None,
     has_asymmetric_kv: bool = False,
+    is_hybrid_swa: bool = False,
     draft_backend: str | None = None,
+    **overrides,
 ) -> bool:
     """Run just `handle_page_major_kv_layout` against a minimal stand-in, since
     ServerArgs' real constructor pulls in a model config."""
@@ -73,6 +77,11 @@ def _accepts(
         "linear_attn_prefill_backend": linear_prefill,
         "mamba_backend": "triton",
         "speculative_draft_attention_backend": draft_backend,
+        "page_size": 1,
+        "cuda_graph_config": CudaGraphConfig.from_dict(
+            {"prefill": {"backend": Backend.DISABLED}}
+        ),
+        **overrides,
     }.items():
         msgspec.Struct.__setattr__(sa, name, value)
     setattr(
@@ -81,6 +90,7 @@ def _accepts(
         SimpleNamespace(
             attention_arch=AttentionArch.MLA if use_mla else AttentionArch.MHA,
             has_asymmetric_kv=has_asymmetric_kv,
+            is_hybrid_swa=is_hybrid_swa,
             head_dim=192 if has_asymmetric_kv else 128,
             v_head_dim=128,
             swa_head_dim=128,
@@ -107,8 +117,6 @@ class TestPageMajorBackendAllowlist(unittest.TestCase):
     PER_LAYER_VIEW_MHA_BACKENDS = ("fa3", "fa4", "flashinfer", "trtllm_mha")
     # MLA-family kernels that must never leak into the MHA arm.
     MLA_ONLY_BACKENDS = ("trtllm_mla", "cutedsl_mla", "flashmla")
-    # No virtual-to-physical id wiring anywhere: must stay rejected until they get one.
-    UNWIRED_BACKENDS = ("aiter",)
 
     def test_explicit_flashinfer_gdn_prefill_matches_the_default(self):
         """Pinning the automatically selected GDN prefill backend must not
@@ -228,13 +236,143 @@ class TestPageMajorBackendAllowlist(unittest.TestCase):
                     f"{backend} must stay rejected without --enable-unified-memory",
                 )
 
-    def test_unwired_backends_always_rejected(self):
-        for backend in self.UNWIRED_BACKENDS:
-            for use_mla in (True, False):
-                self.assertFalse(
-                    _accepts(backend, use_mla=use_mla),
-                    f"{backend} has no virtual-to-physical id wiring and must be rejected",
+    def test_aiter_arena_requires_explicit_opt_in(self):
+        with envs.SGLANG_ENABLE_AITER_UNIFIED_MEMORY.override(False):
+            envs.SGLANG_ENABLE_AITER_UNIFIED_MEMORY.clear()
+            self.assertFalse(_accepts("aiter", use_mla=False))
+        with envs.SGLANG_ENABLE_AITER_UNIFIED_MEMORY.override("0"):
+            self.assertFalse(_accepts("aiter", use_mla=False))
+            self.assertFalse(
+                _accepts("triton", use_mla=False, decode_attention_backend="aiter")
+            )
+            self.assertTrue(_accepts("triton", use_mla=False))
+
+    def test_aiter_bf16_mha_and_swa_pages(self):
+        with envs.SGLANG_ENABLE_AITER_UNIFIED_MEMORY.override("1"):
+            for is_hybrid_swa in (False, True):
+                for page_size in (1, 16, 64):
+                    with self.subTest(swa=is_hybrid_swa, page_size=page_size):
+                        self.assertTrue(
+                            _accepts(
+                                "aiter",
+                                use_mla=False,
+                                is_hybrid_swa=is_hybrid_swa,
+                                page_size=page_size,
+                            )
+                        )
+            self.assertTrue(
+                _accepts(
+                    "aiter", use_mla=False, dtype="bfloat16", kv_cache_dtype="bf16"
                 )
+            )
+            # Judge both resolved phases, including a mixed-backend configuration.
+            self.assertTrue(
+                _accepts("triton", use_mla=False, decode_attention_backend="aiter")
+            )
+
+    def test_aiter_defers_prefill_graph_policy_to_unified_handler(self):
+        with envs.SGLANG_ENABLE_AITER_UNIFIED_MEMORY.override(True):
+            for backend in (Backend.FULL, Backend.BREAKABLE):
+                with self.subTest(prefill=backend):
+                    self.assertTrue(
+                        _accepts(
+                            "aiter",
+                            use_mla=False,
+                            cuda_graph_config=CudaGraphConfig.from_dict(
+                                {"prefill": {"backend": backend}}
+                            ),
+                        )
+                    )
+
+    def test_aiter_fp8_mha_and_swa_pages(self):
+        # Both CLI FP8 spellings resolve to the native E4M3 dtype on HIP.
+        with envs.SGLANG_ENABLE_AITER_UNIFIED_MEMORY.override(True):
+            for kv_cache_dtype in ("fp8_e4m3", "fp8_e5m2"):
+                for is_hybrid_swa in (False, True):
+                    for page_size in (1, 16, 64):
+                        with self.subTest(
+                            dtype=kv_cache_dtype,
+                            swa=is_hybrid_swa,
+                            page_size=page_size,
+                        ):
+                            self.assertTrue(
+                                _accepts(
+                                    "aiter",
+                                    use_mla=False,
+                                    dtype="bfloat16",
+                                    kv_cache_dtype=kv_cache_dtype,
+                                    is_hybrid_swa=is_hybrid_swa,
+                                    page_size=page_size,
+                                )
+                            )
+
+    def test_aiter_bf16_hicache_pages(self):
+        with envs.SGLANG_ENABLE_AITER_UNIFIED_MEMORY.override(True):
+            for page_size in (1, 16):
+                with self.subTest(page_size=page_size):
+                    self.assertTrue(
+                        _accepts(
+                            "aiter",
+                            use_mla=False,
+                            dtype="bfloat16",
+                            kv_cache_dtype="bf16",
+                            page_size=page_size,
+                            enable_hierarchical_cache=True,
+                        )
+                    )
+
+    def test_aiter_pd_backend_admission_with_or_without_hicache(self):
+        with envs.SGLANG_ENABLE_AITER_UNIFIED_MEMORY.override(True):
+            for mode in ("prefill", "decode"):
+                for hicache in (False, True):
+                    for is_hybrid_swa in (False, True):
+                        for page_size in (1, 16):
+                            with self.subTest(
+                                mode=mode,
+                                hicache=hicache,
+                                swa=is_hybrid_swa,
+                                page_size=page_size,
+                            ):
+                                self.assertTrue(
+                                    _accepts(
+                                        "aiter",
+                                        use_mla=False,
+                                        dtype="bfloat16",
+                                        kv_cache_dtype="bf16",
+                                        disaggregation_mode=mode,
+                                        enable_hierarchical_cache=hicache,
+                                        is_hybrid_swa=is_hybrid_swa,
+                                        page_size=page_size,
+                                    )
+                                )
+
+    def test_aiter_rejects_unimplemented_arena_contracts(self):
+        cases = [
+            {"use_mla": True},
+            {"has_asymmetric_kv": True},
+            {"unified": False},
+            {"dtype": "float16"},
+            {"kv_cache_dtype": "mxfp8"},
+            {"kv_cache_dtype": "nvfp4"},
+            {"speculative_algorithm": "EAGLE"},
+        ]
+        with envs.SGLANG_ENABLE_AITER_UNIFIED_MEMORY.override(True):
+            for case in cases:
+                with self.subTest(case=case):
+                    self.assertFalse(_accepts("aiter", **{"use_mla": False, **case}))
+
+    def test_aiter_defers_parallelism_and_determinism_to_existing_validation(self):
+        # This handler admits the reader; shared configuration and the existing
+        # AITER backend retain their parallelism/determinism restrictions.
+        with envs.SGLANG_ENABLE_AITER_UNIFIED_MEMORY.override(True):
+            for case in (
+                {"dcp_size": 2},
+                {"attn_cp_size": 2},
+                {"enable_prefill_cp": True},
+                {"enable_deterministic_inference": True},
+            ):
+                with self.subTest(case=case):
+                    self.assertTrue(_accepts("aiter", use_mla=False, **case))
 
     def test_helion_linear_attention_is_kda_only(self):
         for phase in ("decode", "prefill"):
