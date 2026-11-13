@@ -101,7 +101,7 @@ pub(crate) fn render(
 
 /// The kwargs SGLang renders with: the request's, over its effort, filled in by
 /// the server's defaults.
-fn template_args(
+pub(super) fn template_args(
     request: &Value,
     defaults: &HashMap<String, Value>,
 ) -> Result<HashMap<String, Value>, RenderError> {

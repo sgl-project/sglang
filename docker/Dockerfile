@@ -1,3 +1,7 @@
+# syntax=docker/dockerfile:1
+
+ARG ENABLE_SGL_NVIDIA_MEGA=1
+
 ARG CUDA_VERSION=13.0.3
 ARG UV_VERSION=latest
 ARG PYTHON_VERSION=3.12
@@ -18,7 +22,7 @@ ARG PIP_DEFAULT_INDEX
 ARG UBUNTU_MIRROR
 ARG GITHUB_ARTIFACTORY=github.com
 ARG INSTALL_FLASHINFER_JIT_CACHE=0
-ARG FLASHINFER_VERSION=0.7.3
+ARG FLASHINFER_VERSION=0.7.4
 ARG MOONCAKE_VERSION=0.3.14
 ARG MSCCLPP_VERSION=sglang-v0.10.1
 
@@ -594,6 +598,21 @@ RUN --mount=type=cache,target=/var/cache/apt,id=framework-apt \
 FROM scratch AS local_src
 COPY . /src
 
+# A Git ADD resolves main before cache lookup, unlike RUN git clone. Select the
+# empty stage when disabled so those builds do not need access to the Mega repo.
+FROM scratch AS mega_source_0
+WORKDIR /src
+
+FROM scratch AS mega_source_1
+ARG SGL_NVIDIA_MEGA_REPO="https://github.com/sgl-project/sgl-nvidia-mega.git"
+# Keep the legacy commit argument as a fallback for existing build scripts.
+ARG SGL_NVIDIA_MEGA_COMMIT
+# Explicit REF takes precedence; otherwise use the legacy commit or main.
+ARG SGL_NVIDIA_MEGA_REF=${SGL_NVIDIA_MEGA_COMMIT:-main}
+ADD --keep-git-dir=true ${SGL_NVIDIA_MEGA_REPO}#${SGL_NVIDIA_MEGA_REF} /src/
+
+FROM mega_source_${ENABLE_SGL_NVIDIA_MEGA} AS mega_source
+
 FROM framework AS framework_final
 
 ARG BRANCH_TYPE
@@ -637,18 +656,19 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # sgl-nvidia-mega: the NVIDIA megakernel plugin, inert unless a server passes
 # --enable-nvidia-megakernel. Installed with CUDA >= 12.9 only (its kernels are
 # SM103, compiled at runtime); disable with --build-arg ENABLE_SGL_NVIDIA_MEGA=0.
-ARG ENABLE_SGL_NVIDIA_MEGA=1
-ARG SGL_NVIDIA_MEGA_REPO="https://github.com/sgl-project/sgl-nvidia-mega.git"
-ARG SGL_NVIDIA_MEGA_COMMIT="77360f1fd74dc46010056ebdac0ed5e0b87d3978"
-RUN --mount=type=cache,target=/root/.cache/uv \
+ARG ENABLE_SGL_NVIDIA_MEGA
+RUN --mount=type=bind,from=mega_source,source=/src,target=/tmp/mega-src \
+    --mount=type=cache,target=/root/.cache/uv \
     if [ "${ENABLE_SGL_NVIDIA_MEGA}" != "1" ]; then \
         echo "[sgl-nvidia-mega] skip (ENABLE_SGL_NVIDIA_MEGA=${ENABLE_SGL_NVIDIA_MEGA})"; \
     elif ! printf '%s\n' 12.9 "${CUDA_VERSION}" | sort -V -C; then \
         echo "[sgl-nvidia-mega] skip (CUDA_VERSION=${CUDA_VERSION} < 12.9)"; \
     else \
-        git clone "${SGL_NVIDIA_MEGA_REPO}" /sgl-workspace/sgl-nvidia-mega \
+        mkdir -p /sgl-workspace/sgl-nvidia-mega \
+        && cp -a /tmp/mega-src/. /sgl-workspace/sgl-nvidia-mega/ \
         && cd /sgl-workspace/sgl-nvidia-mega \
-        && git checkout -f "${SGL_NVIDIA_MEGA_COMMIT}" \
+        && git rev-parse HEAD > /sgl-workspace/sgl-nvidia-mega.commit \
+        && echo "[sgl-nvidia-mega] revision=$(cat /sgl-workspace/sgl-nvidia-mega.commit)" \
         && uv pip install --no-deps -e . \
         && cd / \
         && python3 -c "from importlib.metadata import entry_points; assert any(e.name == 'nvidia_megakernel' for e in entry_points(group='sglang.srt.plugins')), 'sgl-nvidia-mega plugin not registered'"; \
