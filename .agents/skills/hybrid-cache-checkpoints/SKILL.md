@@ -10,9 +10,9 @@ A hybrid model can resume a prefix only from a position where the tree holds a r
 | Level | Checkpoints taken | Per-path cap |
 |---|---|---|
 | `3` | Every prefill chunk and every `--mamba-track-interval` decode boundary, plus fork points and request ends. | Unlimited (or `--mamba-max-states-per-path N`). |
-| `2` (default) | Fork points (`mamba_branching_seqlen`) and request ends. A PD prefill worker treats the complete prompt as the request end. | 1 (or `--mamba-max-states-per-path N`). |
+| `2` (default) | Fork points (`mamba_branching_seqlen`) and request ends. A PD prefill worker treats the complete prompt as the request end. | Soft cap of 1 (or `--mamba-max-states-per-path N`). |
 
-`--mamba-max-states-per-path` is deprecated; an explicit value still sets the cap at either level (`-1` = unlimited). Its old meaning is the cap only; level 2 additionally stops creating interior checkpoints.
+`--mamba-max-states-per-path` is deprecated; an explicit value still sets the soft cap at either level (`-1` = unlimited). Its old meaning is the cap only; level 2 additionally skips intermediate checkpoints except on the paths described below. The cap is a pruning target, not a hard bound: tail, fork, locked, and device-leaf states can be preserved. Budget and measure retained checkpoints as well as running states; do not assume one state slot per session.
 
 ## Where it lives
 
@@ -22,11 +22,13 @@ A hybrid model can resume a prefix only from a position where the tree holds a r
 
 ## Choosing a level
 
-- **Level 2** when reuse is continuation: multi-turn chat, agents, tool loops, where the next request extends the previous request's full context. Measured hit rates match level 3; host and L3 receive only request-end states, which cuts their write traffic and stops interior checkpoints from flushing other sessions' tails.
-- **Level 3** when reuse forks from the *middle* of an earlier prompt that has not forked before: a shared system prompt or few-shot block whose first user arrives alone, regenerating from an earlier turn, exact re-sends of a finished prompt. Under level 2 the late arrival finds KV but no state at that depth and recomputes from the nearest state (often the root). Once a second request diverges there, the fork point gets a state and later siblings hit.
-- At level 2 a prompt's KV joins the tree when its request finishes (the tree only inserts KV up to a state), so concurrent requests cannot share a long prompt while it is still prefilling.
+- **Level 2** when reuse is continuation: multi-turn chat, agents, tool loops, where the next request extends the previous request's full context. Level 2 preserves request-end checkpointing for this reuse pattern. Actual hits depend on checkpoint placement, KV and state capacity, eviction, and usable host backups. Host and L3 receive published checkpoints, including fork and request-end states; skipping intermediate checkpoints can reduce write traffic and pressure on other sessions' tails, but does not guarantee equal hit rates or higher throughput.
+- **Level 3** when reuse forks from the *middle* of an earlier prompt that has not forked before: a shared system prompt or few-shot block whose first user arrives alone, regenerating from an earlier turn, exact re-sends of a finished prompt. If level 2 has no usable checkpoint at the shared-prefix boundary, the late arrival recomputes from the nearest usable earlier state (possibly the root), even if more KV is cached. An eligible fork checkpoint can help later siblings while it and its KV remain available. Level 3 provides more intermediate restore positions, not a checkpoint at every possible split.
+- At level 2 ordinary requests defer intermediate tree insertion until request finish, except at eligible fork points, the PD prefill prompt end, and the sliding-window path. This limits sharing with concurrent requests during prefill; the tree only inserts KV up to a published state.
 
 ## Measured (B300)
+
+Historical observations from [#49886](https://github.com/sgl-project/sglang/pull/49886), specific to the listed traffic and cache configurations. Do not generalize them into guaranteed equal continuation hits, write reductions, or throughput gains. Evaluate the benefit against late-fork recomputation on the target workload.
 
 | Model / setting | Continuation hit | Late-fork hit | Mamba states written to host | Throughput |
 |---|---|---|---|---|
@@ -43,11 +45,11 @@ Prefix-cache claims need path evidence, not just a hit rate.
 1. Launch with `--enable-metrics --enable-cache-report` (and HiCache / the linker as deployed), once per level, same flags otherwise.
 2. Drive multi-turn sessions where each turn extends the previous turn's prompt plus output, with filler traffic between turns when you want the device copy gone. Then send a late fork: half of an earlier first prompt plus a new suffix.
 3. Report per-turn `cached_tokens`, the late-fork `cached_tokens`, and the `/metrics` deltas: `sglang:hicache_backup_tokens_total{pool=...}`, `sglang:load_back_tokens_total{pool=...}`, `sglang:hicache_host_mamba_used_states`, `sglang:storage_prefetch_hit_tokens_total`.
-4. Expected: continuation hits equal across levels; the mamba backup count drops at level 2 when prompts span several chunks; late-fork hits drop to the nearest earlier state at level 2.
-5. Size the host pool from the boot line `Allocating kv hierarchical KV host pool: N tokens`: a small `--hicache-size` leaves the KV host pool smaller than the probe's footprint and every host hit becomes 0 at both levels, which looks like a bug and is not.
+4. Compare rather than require equal continuation hit rates. If they differ, inspect checkpoint placement, residency, eviction, and host restore coverage. Where level 2 skips intermediate checkpoints, check whether Mamba backup counts decrease; late forks without a matching checkpoint should resume from the nearest usable earlier state. Neither write reduction nor throughput improvement is guaranteed.
+5. Size the host pool from the boot line `Allocating kv hierarchical KV host pool: N tokens`: a `--hicache-size` that leaves the host pool smaller than the probe's working set can cause eviction before reuse and zero host hits at both levels. Check occupancy and eviction before attributing zero hits to checkpoint placement.
 
 ## Pitfalls
 
-- `--mamba-max-states-per-path -1` is an explicit "unlimited", not "unset"; it overrides level 2's cap of 1.
+- `--mamba-max-states-per-path -1` is an explicit "unlimited", not "unset"; it overrides level 2's soft cap of 1.
 - The PD prefill exception keys on `len(origin_input_ids)`: the insert that covers the whole prompt keeps its state.
-- AgentX-tuned pool splits (see the `compute-mamba-ratio` skill) were measured at level 2; re-measure before reusing one at level 3.
+- Pool splits tuned on AgentX (see the `compute-mamba-ratio` skill) depend on the workload and checkpoint configuration. Recheck both state and KV residency when changing levels; do not copy a tuned split without validation.
