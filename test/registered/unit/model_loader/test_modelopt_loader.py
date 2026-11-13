@@ -336,6 +336,52 @@ class TestParseQuantHfConfig(CustomTestCase):
         # eligible MoE experts; this test stops at quantization-method routing.
         self.assertEqual(self.model_config.quantization, "modelopt_fp4")
 
+    def test_modelopt_fp4_on_hybrid_fp8_nvfp4_checkpoint_loads_serialized_experts(
+        self,
+    ):
+        """modelopt_fp4 on a hybrid FP8+NVFP4 checkpoint must not requantize
+        its already-packed NVFP4 experts online."""
+        hybrid_quant_cfg = {
+            "quant_method": "fp8",
+            "activation_scheme": "dynamic",
+            "quant_algo": "MIXED_PRECISION",
+            "moe_quant_algo": "NVFP4",
+            "group_size": 16,
+            "fmt": "e4m3",
+            "weight_block_size": [128, 128],
+            "ignore": ["*.attn.*", "head"],
+        }
+        self.model_config.quantization = "modelopt_fp4"
+        self.model_config.nvfp4_moe_meta = {
+            "group_size": 16,
+            "exclude_modules": hybrid_quant_cfg["ignore"],
+        }
+        with (
+            patch.object(
+                self.model_config,
+                "_parse_quant_hf_config",
+                return_value=hybrid_quant_cfg,
+            ),
+            patch.object(
+                self.model_config, "_find_quant_modelslim_config", return_value=None
+            ),
+        ):
+            self.model_config._verify_quantization()
+
+        self.assertEqual(self.model_config.quantization, "fp8")
+        quant_config = get_quant_config(
+            SimpleNamespace(
+                model_path="hybrid-model",
+                quantization=self.model_config.quantization,
+                is_draft_model=False,
+                hf_config=PretrainedConfig(quantization_config=hybrid_quant_cfg),
+            ),
+            LoadConfig(),
+            {},
+        )
+        # The loader wraps an Fp8Config with the serialized NVFP4 MoE config.
+        self.assertIsInstance(quant_config, Fp8Config)
+
 
 class TestModelOptFp4LoaderSelection(CustomTestCase):
     def test_draft_modelopt_fp4_uses_checkpoint_exclusions(self):
