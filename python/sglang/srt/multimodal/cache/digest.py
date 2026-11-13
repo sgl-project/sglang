@@ -13,7 +13,6 @@ from collections.abc import Mapping
 from enum import Enum
 from operator import attrgetter
 
-import blake3
 import numpy as np
 import torch
 from PIL import Image
@@ -54,6 +53,8 @@ def _gpu_leaves(value, batches):
 
 
 def _encode(value, gpu_digests) -> bytes:
+    import blake3
+
     if value is None:
         return b"none"
     if isinstance(value, Enum):
@@ -148,6 +149,8 @@ def structured_digest(value) -> bytes:
     GPU leaves are hashed independently and only their digests leave the GPU.
     One host synchronization per device also covers nested multi-image inputs.
     """
+    import blake3
+
     batches = defaultdict(dict)
     _gpu_leaves(value, batches)
     gpu_digests = {}

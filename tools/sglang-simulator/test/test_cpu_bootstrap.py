@@ -131,3 +131,31 @@ for method, hf in [('unknown', None), ('awq', {'quant_method': 'fp8'})]:
         bootstrap=True,
         cpu=True,
     )
+
+
+@requires_cpu_runtime
+def test_text_scheduler_defers_optional_multimodal_hashing():
+    run_python(
+        """
+import importlib.abc
+import sys
+
+class BlockMultimodalHash(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname.split('.')[0] == 'blake3':
+            raise ModuleNotFoundError('multimodal hash dependency blocked', name=fullname)
+
+sys.meta_path.insert(0, BlockMultimodalHash())
+from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.multimodal.cache.digest import structured_digest
+assert ScheduleBatch is not None and 'blake3' not in sys.modules
+try:
+    structured_digest(None)
+except ModuleNotFoundError as error:
+    assert error.name == 'blake3'
+else:
+    raise AssertionError('selected multimodal hashing must require its real dependency')
+""",
+        bootstrap=True,
+        cpu=True,
+    )
