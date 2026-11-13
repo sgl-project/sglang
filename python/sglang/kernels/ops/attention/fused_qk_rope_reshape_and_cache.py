@@ -161,6 +161,7 @@ def _fused_qk_rope_reshape_and_cache_kernel(
     HAVE_V_SCALE: tl.constexpr = False,
     HAVE_ZEROS: tl.constexpr = False,
     HAS_SWA: tl.constexpr = False,
+    RESERVED_SKIP_INDEX: tl.constexpr = -1,
 ):
     # ============================================================
     # Stage 0: Static stride assumptions for Triton compiler
@@ -333,7 +334,7 @@ def _fused_qk_rope_reshape_and_cache_kernel(
             # ------------------------------------------------
             # Stage 3.2: Apply RoPE to K
             # ------------------------------------------------
-            if pid_slot >= 0:
+            if pid_slot >= 0 and pid_slot != RESERVED_SKIP_INDEX:
                 pid_t_slot = pid_slot // BLOCK_SIZE
                 pid_b = pid_slot % BLOCK_SIZE
                 pid_hk = pid_hq // QH_PER_KH
@@ -460,7 +461,7 @@ def _fused_qk_rope_reshape_and_cache_kernel(
             if HAS_SWA:
                 pid_slot = tl.load(swa_slot_mapping_ptr + pid_slot)
 
-            if pid_slot >= 0:
+            if pid_slot >= 0 and pid_slot != RESERVED_SKIP_INDEX:
                 pid_t_slot = pid_slot // BLOCK_SIZE
                 pid_b = pid_slot % BLOCK_SIZE
                 if HAVE_K_SCALE:
@@ -563,6 +564,7 @@ def fused_qk_rope_reshape_and_cache(
     output_zeros: bool = True,
     zeros_out: torch.Tensor = None,
     swa_slot_mapping=None,
+    reserved_skip_index: int = -1,
 ):
     """
     Perform RoPE on q and k and along the last dimension and copy k and v in to key_cache and value_cache inplace
@@ -578,6 +580,8 @@ def fused_qk_rope_reshape_and_cache(
     -     key_cache: shape (T_cache, KH, D // x, block_size, x).
     -     value_cache: shape (T_cache, KH, D, block_size).
     - slot_mapping: shape (T_slot, ).
+    - reserved_skip_index: Skip this destination slot; -1 preserves the static
+      pool behavior. Unified arenas reserve slot 0 for graph padding.
 
     T is the number of decode tokens, T_cahce * block_size is the max number of tokens of kv_cache
     QH must be multiple of KH
@@ -728,6 +732,7 @@ def fused_qk_rope_reshape_and_cache(
         HAVE_V_SCALE=(v_scale is not None and apply_scale),
         HAVE_ZEROS=output_zeros,
         HAS_SWA=(swa_slot_mapping is not None),
+        RESERVED_SKIP_INDEX=reserved_skip_index,
         num_warps=1,
     )
 

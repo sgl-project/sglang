@@ -28,6 +28,7 @@ class TestAiterUnifiedMemory(CustomTestCase):
     window = None
     query_heads = _HEADS
     fp8 = False
+    kv_scales = ((0.25, 0.5), (0.5, 0.125))
 
     def setUp(self):
         super().setUp()
@@ -138,9 +139,7 @@ class TestAiterUnifiedMemory(CustomTestCase):
         ]
         if self.fp8:
             self.backend.q_scale = torch.tensor([0.25], device="cuda")
-            for layer, (k_scale, v_scale) in zip(
-                self.layers, ((0.25, 0.5), (0.5, 0.125))
-            ):
+            for layer, (k_scale, v_scale) in zip(self.layers, self.kv_scales):
                 layer.k_scale = torch.tensor(k_scale, device="cuda")
                 layer.v_scale = torch.tensor(v_scale, device="cuda")
         lengths = (37, 31, 131, 85) if self.window else (37, 31, 67, 53)
@@ -228,9 +227,11 @@ class TestAiterUnifiedMemory(CustomTestCase):
             return values
         layer = self.layers[layer_index]
         scale = layer.k_scale if key else layer.v_scale
-        # The shared writer scales BF16 inputs before storing their FP8 values.
-        # Reconstruct that representation independently of the physical cache.
-        return (values.float() / scale).to(_DTYPE).to(self.cache_dtype)
+        # GPU tensor division promotes a 0-D device scale to the BF16 input's
+        # dtype before FP32 arithmetic. Preserve that divisor rounding when
+        # independently reconstructing the shared writer's BF16 -> FP8 result.
+        divisor = scale.to(torch.result_type(values, scale)).float()
+        return (values.float() / divisor).to(_DTYPE).to(self.cache_dtype)
 
     def _cache_rows(self, cache, physical):
         if self.fp8:
@@ -706,6 +707,13 @@ class TestAiterUnifiedFP8WindowPage1(TestAiterUnifiedFP8Page1):
 
 class TestAiterUnifiedFP8WindowPage16(TestAiterUnifiedFP8WindowPage1):
     page_size = 16
+
+
+class TestAiterUnifiedFP8WindowPage16NonunitScales(TestAiterUnifiedFP8WindowPage16):
+    # Exercise the shared writer's BF16-rounded scale division, which differs
+    # from FP32-divide fusion at non-power-of-two scales. The independent packed
+    # oracle validates this encoding contract, not static-model bitwise parity.
+    kv_scales = ((0.3, 0.7), (0.7, 0.3))
 
 
 class TestAiterUnifiedFP8WindowPage64(TestAiterUnifiedFP8WindowPage1):
