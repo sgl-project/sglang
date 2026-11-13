@@ -36,6 +36,7 @@ from sglang.kernels.ops.communication.all_reduce import (
 from sglang.srt.distributed.comm_cleanup import register_comm_cleanup
 from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
     CustomAllReduceV2,
+    choose_algo,
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -220,7 +221,7 @@ def _check_custom_all_reduce(
 ) -> None:
     nccl_group = _init_nccl_group_once()
     device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
-    comm.override_algo = algo
+    comm.forced_algo = algo
 
     if use_graph:
         graph = torch.cuda.CUDAGraph()
@@ -278,11 +279,11 @@ def test_custom_all_reduce_tuned_eager(size: int, dtype: torch.dtype) -> None:
     """Without an override, eager calls launch the tuned algorithm (cached per size)."""
     nccl_group = _init_nccl_group_once()
     comm = _init_comm_once()
-    comm.override_algo = None
+    comm.forced_algo = None
     device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
     inp = torch.randint(0, 16, (TEST_LAYERS, size), dtype=dtype, device=device)
     nbytes = inp[0].numel() * inp.element_size()
-    tuned = comm._pick_config(nbytes, False) is not None
+    tuned = choose_algo(comm.config, nbytes, can_use_graph=False) is not None
     assert comm.should_custom_ar(inp[0]) == tuned
     if not tuned:
         return
@@ -299,7 +300,7 @@ def test_custom_all_reduce_eager_plan_follows_config() -> None:
     """The cached eager launch is rebuilt when the config object is replaced."""
     nccl_group = _init_nccl_group_once()
     comm = _init_comm_once()
-    comm.override_algo = None
+    comm.forced_algo = None
     device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
     inp = torch.randint(0, 16, (TEST_LAYERS, 1024), dtype=torch.bfloat16, device=device)
     assert comm.should_custom_ar(inp[0])  # cached under the tuned config
