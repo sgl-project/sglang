@@ -195,6 +195,7 @@ class PlannedPart(msgspec.Struct, frozen=True, kw_only=True):
     layer_ids: Tuple[int, ...]
 
 
+# Omitting defaults from repr keeps existing plans' storage format tags stable.
 class PlannedSubPool(
     msgspec.Struct, frozen=True, kw_only=True, repr_omit_defaults=True
 ):
