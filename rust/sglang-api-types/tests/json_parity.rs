@@ -94,6 +94,12 @@ fn fixtures_decode_to_their_canonical_bytes() {
             "ParseFunctionCallResponse" => {
                 check::<api::ParseFunctionCallResponse>(&name, input, canonical)
             }
+            "AddExternalCorpusRequest" => {
+                check::<api::AddExternalCorpusRequest>(&name, input, canonical)
+            }
+            "ListExternalCorporaResponse" => {
+                check::<api::ListExternalCorporaResponse>(&name, input, canonical)
+            }
             "PauseGenerationRequest" => {
                 check::<api::PauseGenerationRequest>(&name, input, canonical)
             }

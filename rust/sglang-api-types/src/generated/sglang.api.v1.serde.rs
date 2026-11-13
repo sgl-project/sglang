@@ -1765,6 +1765,366 @@ impl<'de> ::serde::Deserialize<'de> for UpdateWeightVersionResponse {
     }
 }
 
+impl ::serde::Serialize for AddExternalCorpusRequest {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        if let Some(v) = &self.corpus_id {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "corpus_id", v)?;
+        }
+        if let Some(v) = &self.file_path {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "file_path", v)?;
+        }
+        if let Some(v) = &self.documents {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "documents", v)?;
+        }
+        if let Some(v) = &self.token_chunks {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "token_chunks", v)?;
+        }
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for AddExternalCorpusRequest {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = AddExternalCorpusRequest;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct AddExternalCorpusRequest")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_corpus_id = None;
+                let mut f_file_path = None;
+                let mut f_documents = None;
+                let mut f_token_chunks = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "corpus_id" => {
+                            if f_corpus_id.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("corpus_id"));
+                            }
+                            f_corpus_id =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        "file_path" => {
+                            if f_file_path.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("file_path"));
+                            }
+                            f_file_path =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        "documents" => {
+                            if f_documents.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("documents"));
+                            }
+                            f_documents = Some(map.next_value::<Option<StringList>>()?);
+                        }
+                        "token_chunks" => {
+                            if f_token_chunks.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("token_chunks"));
+                            }
+                            f_token_chunks = Some(map.next_value::<Option<TokenIdsList>>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(AddExternalCorpusRequest {
+                    corpus_id: f_corpus_id.flatten(),
+                    file_path: f_file_path.flatten(),
+                    documents: f_documents.flatten(),
+                    token_chunks: f_token_chunks.flatten(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for AddExternalCorpusResponse {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "success", &self.success)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "corpus_id", &self.corpus_id)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "message", &self.message)?;
+        ::serde::ser::SerializeMap::serialize_entry(
+            &mut map,
+            "loaded_token_count",
+            &self.loaded_token_count,
+        )?;
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for AddExternalCorpusResponse {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = AddExternalCorpusResponse;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct AddExternalCorpusResponse")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_success = None;
+                let mut f_corpus_id = None;
+                let mut f_message = None;
+                let mut f_loaded_token_count = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "success" => {
+                            if f_success.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("success"));
+                            }
+                            f_success = Some(map.next_value::<bool>()?);
+                        }
+                        "corpus_id" => {
+                            if f_corpus_id.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("corpus_id"));
+                            }
+                            f_corpus_id = Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        "message" => {
+                            if f_message.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("message"));
+                            }
+                            f_message = Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        "loaded_token_count" => {
+                            if f_loaded_token_count.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "loaded_token_count",
+                                ));
+                            }
+                            f_loaded_token_count = Some(map.next_value::<i64>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(AddExternalCorpusResponse {
+                    success: f_success.unwrap_or_default(),
+                    corpus_id: f_corpus_id.unwrap_or_default(),
+                    message: f_message.unwrap_or_default(),
+                    loaded_token_count: f_loaded_token_count.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for RemoveExternalCorpusRequest {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        if let Some(v) = &self.corpus_id {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "corpus_id", v)?;
+        }
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for RemoveExternalCorpusRequest {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = RemoveExternalCorpusRequest;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct RemoveExternalCorpusRequest")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_corpus_id = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "corpus_id" => {
+                            if f_corpus_id.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("corpus_id"));
+                            }
+                            f_corpus_id =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(RemoveExternalCorpusRequest {
+                    corpus_id: f_corpus_id.flatten(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for RemoveExternalCorpusResponse {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "success", &self.success)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "message", &self.message)?;
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for RemoveExternalCorpusResponse {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = RemoveExternalCorpusResponse;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct RemoveExternalCorpusResponse")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_success = None;
+                let mut f_message = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "success" => {
+                            if f_success.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("success"));
+                            }
+                            f_success = Some(map.next_value::<bool>()?);
+                        }
+                        "message" => {
+                            if f_message.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("message"));
+                            }
+                            f_message = Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(RemoveExternalCorpusResponse {
+                    success: f_success.unwrap_or_default(),
+                    message: f_message.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for ListExternalCorporaRequest {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for ListExternalCorporaRequest {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = ListExternalCorporaRequest;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct ListExternalCorporaRequest")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(ListExternalCorporaRequest {})
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for ListExternalCorporaResponse {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "success", &self.success)?;
+        if !self.corpus_token_counts.is_empty() {
+            ::serde::ser::SerializeMap::serialize_entry(
+                &mut map,
+                "corpus_token_counts",
+                &self.corpus_token_counts,
+            )?;
+        }
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "message", &self.message)?;
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for ListExternalCorporaResponse {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = ListExternalCorporaResponse;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct ListExternalCorporaResponse")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_success = None;
+                let mut f_corpus_token_counts = None;
+                let mut f_message = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "success" => {
+                            if f_success.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("success"));
+                            }
+                            f_success = Some(map.next_value::<bool>()?);
+                        }
+                        "corpus_token_counts" => {
+                            if f_corpus_token_counts.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "corpus_token_counts",
+                                ));
+                            }
+                            f_corpus_token_counts = Some(
+                                map.next_value::<Option<::std::collections::HashMap<String, i64>>>(
+                                )?
+                                .unwrap_or_default(),
+                            );
+                        }
+                        "message" => {
+                            if f_message.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("message"));
+                            }
+                            f_message = Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(ListExternalCorporaResponse {
+                    success: f_success.unwrap_or_default(),
+                    corpus_token_counts: f_corpus_token_counts.unwrap_or_default(),
+                    message: f_message.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
 impl ::serde::Serialize for Matched {
     fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         match &self.value {
