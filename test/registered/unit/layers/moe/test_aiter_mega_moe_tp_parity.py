@@ -18,7 +18,7 @@ import torch.distributed as dist
 import sglang.srt.layers.moe.aiter_mega_moe_tp as mmtp
 from sglang.srt.environ import envs
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.quant_ref_utils import break_fp4_bytes
 from sglang.test.test_utils import run_distributed_test

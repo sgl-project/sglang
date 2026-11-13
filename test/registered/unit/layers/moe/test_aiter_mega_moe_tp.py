@@ -14,7 +14,7 @@ import pytest
 import torch
 
 import sglang.srt.layers.moe.aiter_mega_moe_tp as mmtp
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.utils.log_utils import print_info_once
 from sglang.test.ci.ci_register import register_cpu_ci
 
