@@ -107,6 +107,7 @@ def _buffers(hidden: int):
 
 def _gather(t: torch.Tensor) -> list[torch.Tensor]:
     coord = _init()
+    t = t.contiguous()
     out = [torch.empty_like(t) for _ in range(coord.world_size)]
     dist.all_gather(out, t, group=coord.device_group)
     return out
@@ -143,10 +144,20 @@ def _inputs(rows: int, hidden: int, seed: int):
     return residual, w_a, w_b, scalar
 
 
+def _scales_view(scales_buf, rows: int, layout: str) -> torch.Tensor:
+    """[rows, groups] scales at the buffer's base: row-major, or column-major
+    with 16-byte aligned columns (DeepGEMM's layout, what the model passes)."""
+    if layout == "row":
+        return scales_buf.tensor[:rows]
+    groups, ld = scales_buf.tensor.shape[1], (rows + 3) // 4 * 4
+    return scales_buf.tensor.view(-1)[: groups * ld].view(groups, ld).t()[:rows]
+
+
 @pytest.mark.parametrize("hidden", HIDDENS)
 @pytest.mark.parametrize("rows", ROWS)
 @pytest.mark.parametrize("round_a", [True, False])
-def test_site(hidden: int, rows: int, round_a: bool):
+@pytest.mark.parametrize("layout", ["row", "col"])
+def test_site(hidden: int, rows: int, round_a: bool, layout: str):
     coord = _init()
     partial_buf, out_buf, scales_buf = _buffers(hidden)
     residual_all, w_a, w_b, scalar = _inputs(rows, hidden, 0)
@@ -154,12 +165,13 @@ def test_site(hidden: int, rows: int, round_a: bool):
     row0, mine = _rows(rows, coord.rank, coord.world_size)
     residual = residual_all[row0 : row0 + mine].clone()
     partial_buf.tensor[:rows].copy_(partial)
+    scales_view = _scales_view(scales_buf, rows, layout)
     gemma4_ar_fusion.site(
         partial_buf.tensor[:rows],
         partial_buf.mc,
         out_buf.tensor[:rows],
         out_buf.mc,
-        scales_buf.tensor[:rows],
+        scales_view,
         scales_buf.mc,
         residual,
         w_a,
@@ -172,7 +184,7 @@ def test_site(hidden: int, rows: int, round_a: bool):
         world_size=coord.world_size,
     )
     torch.cuda.synchronize()
-    out, scales = out_buf.tensor[:rows].clone(), scales_buf.tensor[:rows].clone()
+    out, scales = out_buf.tensor[:rows].clone(), scales_view.contiguous()
 
     ref_res, ref_y = _reference(
         _gather(partial), residual_all, w_a, w_b, scalar, round_a
@@ -290,6 +302,46 @@ def test_site_reads_a_gemm_written_partial(rows: int):
         assert torch.equal(other, out), f"out differs on rank {i}"
 
 
+@pytest.mark.parametrize("rows", [1, 5, 8, 160, 512])
+def test_deepgemm_reads_the_sites_scale_layout(rows: int):
+    """Gemma4ArFusion hands the block-FP8 GEMM column-major scales with 16-byte
+    aligned columns (DeepGEMM's own layout, so it does not reformat them); the
+    GEMM result is the same as with row-major scales."""
+    if not deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
+        pytest.skip("DeepGEMM unavailable")
+    hidden, n = HIDDENS[0], 1024
+    _init()
+    _, _, scales_buf = _buffers(hidden)
+    fusion = object.__new__(fusion_glue.Gemma4ArFusion)
+    groups = hidden // GROUP
+    ld = (MAX_ROWS + 3) // 4 * 4
+    storage = scales_buf.tensor.view(-1)[: groups * ld].view(groups, ld)
+    fusion.scales = fusion_glue._Symm(storage, scales_buf.mc)
+    view = fusion._scales_out(rows)
+    aligned = (rows + 3) // 4 * 4
+    assert view.shape == (rows, groups) and view.stride() == (1, aligned)
+    assert view.data_ptr() == scales_buf.tensor.data_ptr()
+
+    g = torch.Generator(device="cuda").manual_seed(5)
+    x = torch.randn(rows, hidden, device="cuda", generator=g).bfloat16()
+    q, row_major = per_token_group_quant_fp8(x, GROUP)
+    view.copy_(row_major)
+    weight = (40 * torch.randn(n, hidden, device="cuda", generator=g)).to(
+        torch.float8_e4m3fn
+    )
+    gemm = dict(
+        input=q,
+        weight=weight,
+        block_size=[GROUP, GROUP],
+        weight_scale=torch.full((n // GROUP, groups), 1e-3, device="cuda"),
+    )
+    ref = deepgemm_w8a8_block_fp8_linear_with_fallback(
+        **gemm, input_scale=row_major.contiguous()
+    )
+    got = deepgemm_w8a8_block_fp8_linear_with_fallback(**gemm, input_scale=view)
+    assert torch.equal(got, ref)
+
+
 def test_stage_skips_the_copy_for_its_own_buffer():
     """Gemma4ArFusion stages a foreign partial by copy and takes one already in
     its buffer (``partial_out``) as is."""
@@ -368,7 +420,7 @@ def test_decode_graphs_match_nccl_and_stock_kernels():
                 partial_buf.mc,
                 out_buf.tensor[:bs],
                 out_buf.mc,
-                scales_buf.tensor[:bs],
+                _scales_view(scales_buf, bs, "col"),  # the model's layout
                 scales_buf.mc,
                 st["res"],
                 w_a,
@@ -381,7 +433,12 @@ def test_decode_graphs_match_nccl_and_stock_kernels():
                 world_size=world_size,
             )
             # the next GEMM consumes them before the next site overwrites the buffers
-            outs.append((out_buf.tensor[:bs].clone(), scales_buf.tensor[:bs].clone()))
+            outs.append(
+                (
+                    out_buf.tensor[:bs].clone(),
+                    _scales_view(scales_buf, bs, "col").clone(),
+                )
+            )
         partial_buf.tensor[:bs].copy_(st["p"][2])
         gemma4_ar_fusion.final(
             partial_buf.tensor[:bs],
