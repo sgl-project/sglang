@@ -7,6 +7,8 @@ import triton
 import triton.language as tl
 from einops import rearrange
 
+from sglang.kernels.arch import current_arch
+
 
 @triton.jit
 def _fwd_diag_kernel(
@@ -401,8 +403,7 @@ class _attention(torch.autograd.Function):
         s = s.contiguous()
 
         # Check CUDA compute capability
-        capability = torch.cuda.get_device_capability()
-        if capability[0] < 8:
+        if current_arch().props.major < 8:
             raise RuntimeError(
                 "Flash attention currently only supported",
                 "for compute capability >= 80",

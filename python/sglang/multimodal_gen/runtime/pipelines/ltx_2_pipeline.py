@@ -19,9 +19,11 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader imp
     PipelineComponentLoader,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
-    ComponentResidencyStrategy,
     ComponentUse,
     ResidencyState,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_strategies import (
+    ComponentResidencyStrategy,
 )
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
@@ -415,6 +417,18 @@ class _BaseLTX2Pipeline(LoRAPipeline):
         entry = model_index.get(component_name)
         # model_index.json records absent optional components as [null, null].
         return bool(entry) and entry[0] is not None
+
+    def create_comfyui_stages(self, server_args: ServerArgs) -> None:
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ltx_2.comfyui_step import (
+            LTX2ComfyUIStepStage,
+        )
+
+        self.add_stage(
+            LTX2ComfyUIStepStage(
+                transformer=self.get_module("transformer"),
+                model_path=server_args.model_path,
+            )
+        )
 
     def initialize_pipeline(self, server_args: ServerArgs):
         orig = self.get_module("scheduler")

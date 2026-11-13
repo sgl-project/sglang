@@ -119,7 +119,7 @@ class OpenAIServingTranscription(OpenAIServingBase):
             # soundfile can't parse some containers (e.g. mp3 on older
             # libsndfile builds); fall back to a full decode.
             try:
-                from sglang.srt.utils import load_audio
+                from sglang.srt.multimodal.media_io import load_audio
 
                 audio = load_audio(audio_data, sr=16000, mono=True)
                 return audio.shape[-1] / 16000.0

@@ -20,8 +20,8 @@ from sglang.srt.mem_cache.storage.hf3fs.storage_hf3fs import HiCacheHF3FS
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=202, stage="base-b", runner_config="2-gpu-large")
-register_amd_ci(est_time=300, suite="base-b-test-2-gpu-large")
+register_cuda_ci(est_time=202, stage="extra-a", runner_config="2-gpu-large")
+register_amd_ci(est_time=300, suite="extra-a-test-2-gpu-large-amd")
 
 
 PAGE_BYTES = 16
