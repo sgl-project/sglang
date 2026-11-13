@@ -1068,6 +1068,9 @@ class Envs:
     # insertion. Requires an AITER build with the fp8_e4m3_unit cache contract.
     # Enabled by default for supported configurations; set to 0 to disable.
     SGLANG_M3_USE_AITER_FUSED_QKNORM = EnvBool(True)
+    # Use AITER block selection for supported gfx950 FP8 index caches.
+    SGLANG_M3_USE_AITER_INDEXER = EnvBool(True)
+    SGLANG_M3_USE_AITER_PREFILL_INDEXER = EnvBool(True)
     SGLANG_USE_AITER_AG = EnvBool(True)
     # Run the gfx950 TP4 quick all-reduce on the JIT build (quick_all_reduce_hip) instead of
     # sgl-kernel's; off by default, MiniMax-M3.1 turns it on at TP4 under INT4 or INT8.
