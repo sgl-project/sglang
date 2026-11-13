@@ -173,7 +173,7 @@ jobs:
             --load \
             -t "$IMAGE" \
             -f docker/Dockerfile \
-            --build-arg CUDA_VERSION=13.0.3 \
+            --build-arg CUDA_VERSION=13.4.1 \
             --build-arg BUILD_TYPE=all \
             --build-arg INSTALL_FLASHINFER_JIT_CACHE=1 \
             ${{ needs.prepare.outputs.extra_build_args }} \
