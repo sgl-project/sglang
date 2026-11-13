@@ -26,7 +26,7 @@ from sglang.srt.layers.quantization.fp8_activation import (
     aiter_takes_fp8_group_input,
     fp8_group_quant_fusion_allowed,
 )
-from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.rotary_embedding import RotaryEmbedding, get_rope
 from sglang.srt.layers.rotary_embedding.mrope import MRotaryEmbedding
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
@@ -989,4 +989,15 @@ class Qwen3ForCausalLM(nn.Module):
         self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
 
-EntryClass = Qwen3ForCausalLM
+class PPLXQwen3Model(Qwen3ForCausalLM):
+    """perplexity-ai/pplx-embed-v1: Qwen3 with bidirectional attention and mean pooling."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.pooler = Pooler(pooling_type=PoolingType.MEAN, normalize=True)
+        for layer in self.model.layers:
+            if isinstance(layer, Qwen3DecoderLayer):
+                layer.self_attn.attn.attn_type = AttentionType.ENCODER_ONLY
+
+
+EntryClass = [Qwen3ForCausalLM, PPLXQwen3Model]
