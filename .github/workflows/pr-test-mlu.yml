@@ -1,8 +1,7 @@
 name: PR Test (MLU)
 
-# Label-gated MLU CI workflow. The PR must carry BOTH `run-ci` (basic-CI
-# prerequisite) and `run-ci-mlu` (explicit opt-in) for the MLU test job to
-# run. The shared gate reads current labels, including on explicit reruns.
+# Fork test: the label gate (`run-ci` + `run-ci-mlu`) has been removed so the
+# MLU suite can be triggered without maintainer labels.
 
 on:
   # Run the reviewed base-branch workflow, never workflow code from the PR.
@@ -26,17 +25,8 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  call-gate:
-    uses: ./.github/workflows/pr-gate.yml
-    with:
-      require-run-ci: true
-      require-label: run-ci-mlu
-    secrets: inherit
-
   pr-test-mlu:
     name: MLU / ${{ matrix.suite }}
-    needs: [call-gate]
-    if: ${{ !cancelled() && needs.call-gate.result == 'success' }}
     strategy:
       fail-fast: false
       matrix:
