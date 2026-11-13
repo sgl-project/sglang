@@ -151,7 +151,7 @@ def apply_deepseek_v4_defaults(server_args: ServerArgs, model_arch: str) -> None
     # (MI355X), which breaks the disaggregation nightly. Keep the previous
     # (dense prefill) behavior on ROCm until the sparse kernel is validated
     # there;
-    if get_platform().is_hip:
+    if get_platform().is_hip and not envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.is_set():
         logger.warning(
             "Disabling SGLANG_OPT_FLASHMLA_SPARSE_PREFILL by default on ROCm/HIP "
             f"for {model_arch}; set it explicitly to override."
@@ -465,6 +465,11 @@ def validate_deepseek_v41_features(server_args: ServerArgs) -> None:
             )
 
     incompatible = (
+        (
+            "prefill CP with the prefill CUDA graph",
+            (cfg.enable_prefill_cp or cfg.attn_cp_size != 1)
+            and cfg.cuda_graph_config.prefill.backend != Backend.DISABLED,
+        ),
         (
             "the prefill CUDA graph",
             cfg.cuda_graph_config.prefill.backend

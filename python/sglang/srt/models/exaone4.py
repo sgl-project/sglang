@@ -1,3 +1,5 @@
+import logging
+import traceback
 from collections.abc import Iterable
 from typing import Any, List, Optional, Tuple, Union
 
@@ -40,7 +42,8 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.runtime_context import get_parallel
-from sglang.utils import get_exception_traceback, logger
+
+logger = logging.getLogger(__name__)
 
 
 # Aligned with HF's implementation, using sliding window inclusive with the last token
@@ -655,7 +658,7 @@ class Exaone4ForCausalLM(nn.Module):
 
         except Exception:
             logger.error(
-                f"Error getting weights by name {name} in Exaone4ForCausalLM: {get_exception_traceback()}"
+                f"Error getting weights by name {name} in Exaone4ForCausalLM: {traceback.format_exc()}"
             )
             return None
 

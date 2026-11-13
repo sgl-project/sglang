@@ -10,6 +10,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.gemm.router_gate_matvec import (
     ROUTER_GATE_MATVEC_MAX_M,
     router_gate_matvec,
@@ -1625,7 +1626,7 @@ class BailingMoeV3ForCausalLM(nn.Module):
                     ):
                         if (
                             deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-                            and not deep_gemm_wrapper.DEEPGEMM_BLACKWELL
+                            and current_arch().is_sm(9)
                             and envs.SGLANG_USE_DEEPGEMM_BMM.get()
                         ):
                             block_scale = weight_scale
@@ -2034,16 +2035,6 @@ class BailingMoeV3ForCausalLM(nn.Module):
         self.post_load_weights(is_nextn=is_nextn, weight_names=weight_names)
 
         return loaded_params
-
-    def post_process_weights_if_quant(self):
-        for name, module in self.named_modules():
-            quant_method = getattr(module, "quant_method", None)
-            if quant_method is not None:
-                post_process = getattr(
-                    quant_method, "process_weights_after_loading", None
-                )
-                if post_process is not None:
-                    post_process(module)
 
     def get_embed_and_head(self):
         return self.model.word_embeddings.weight, self.lm_head.weight

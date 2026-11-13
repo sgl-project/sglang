@@ -17,6 +17,7 @@
 
 """Inference-only deci model compatible with HuggingFace weights."""
 
+import logging
 from typing import Iterable, Optional, Tuple, Type, Union
 
 import torch
@@ -48,7 +49,8 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.llama import LlamaAttention, LlamaMLP
 from sglang.srt.runtime_context import get_parallel
-from sglang.utils import logger
+
+logger = logging.getLogger(__name__)
 
 
 def _ffn_mult_to_intermediate_size(ffn_mult: float, n_embd: int) -> int:

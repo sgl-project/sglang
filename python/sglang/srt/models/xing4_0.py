@@ -342,7 +342,6 @@ class Xing4_0DecoderLayer(nn.Module):
             ).residual_ops()
 
         self.is_layer_sparse = self._is_layer_sparse(layer_id)
-        is_next_layer_sparse = self._is_layer_sparse(layer_id + 1)
 
         attn, ffn = self.stage_facts(config, layer_id, mhc=mhc)
         self.attn_boundary, self.ffn_boundary = append_stages(

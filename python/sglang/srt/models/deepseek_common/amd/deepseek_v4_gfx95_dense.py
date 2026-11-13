@@ -178,14 +178,9 @@ def post_attention_norm(layer, x: torch.Tensor, coefficients=None) -> torch.Tens
     return out
 
 
-_FFN_NORM_EMIT_MXFP8 = envs.SGLANG_HIP_FFN_NORM_MXFP8.get()
-
-
 def _ffn_norm_emits_mxfp8(layer, num_tokens: int) -> bool:
-    """SGLANG_HIP_FFN_NORM_MXFP8: whether the FFN norm launch also emits fp8 + ue8m0 for the
-    shared expert's gate_up (its route consumes them at this token count)."""
-    if not _FFN_NORM_EMIT_MXFP8:
-        return False
+    """Whether the FFN norm launch also emits fp8 + ue8m0 for the shared expert's
+    gate_up (its route consumes them at this token count)."""
     consumer = getattr(layer, "_ffn_shared_mxfp8_consumer", None)
     if consumer is None:
         shared = getattr(getattr(layer, "mlp", None), "shared_experts", None)
@@ -220,13 +215,10 @@ def wo_b_takes_fp8_grid(attn) -> bool:
     return attn._wo_b_fp8_grid_operand
 
 
-_WO_A_EMIT_MXFP8 = envs.SGLANG_HIP_WO_A_MXFP8.get()
-
-
 def wo_b_emits_mxfp8(attn, num_tokens: int) -> bool:
-    """SGLANG_HIP_WO_A_MXFP8: whether the wo_a GEMM hands wo_b fp8 + ue8m0 from its epilogue
-    (wo_b's route consumes them at this token count) instead of bf16 plus a separate quant."""
-    if not _WO_A_EMIT_MXFP8 or _wo_a_fp8_grid_gemm is None:
+    """Whether the wo_a GEMM hands wo_b fp8 + ue8m0 from its epilogue (wo_b's route
+    consumes them at this token count) instead of bf16 plus a separate quant."""
+    if _wo_a_fp8_grid_gemm is None:
         return False
     consumer = getattr(attn, "_wo_b_mxfp8_consumer", None)
     if consumer is None:

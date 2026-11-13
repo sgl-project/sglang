@@ -47,6 +47,8 @@ from typing import (
     List,
     Optional,
     Sequence,
+    Tuple,
+    Type,
     TypeVar,
     Union,
 )
@@ -232,57 +234,6 @@ class DynamicGradMode(_DecoratorContextManager):
             return self.__class__(self.mode)
         else:
             return self.__class__()
-
-
-show_time_cost = False
-time_infos = {}
-
-
-def enable_show_time_cost():
-    global show_time_cost
-    show_time_cost = True
-
-
-class TimeInfo:
-    def __init__(self, name, interval=0.1, color=0, indent=0):
-        self.name = name
-        self.interval = interval
-        self.color = color
-        self.indent = indent
-
-        self.acc_time = 0
-        self.last_acc_time = 0
-
-    def check(self):
-        if self.acc_time - self.last_acc_time > self.interval:
-            self.last_acc_time = self.acc_time
-            return True
-        return False
-
-    def pretty_print(self):
-        print(f"\x1b[{self.color}m", end="")
-        print("-" * self.indent * 2, end="")
-        print(f"{self.name}: {self.acc_time:.3f}s\x1b[0m")
-
-
-def mark_start(name, interval=0.1, color=0, indent=0):
-    global time_infos, show_time_cost
-    if not show_time_cost:
-        return
-    torch.cuda.synchronize()
-    if time_infos.get(name, None) is None:
-        time_infos[name] = TimeInfo(name, interval, color, indent)
-    time_infos[name].acc_time -= time.perf_counter()
-
-
-def mark_end(name):
-    global time_infos, show_time_cost
-    if not show_time_cost:
-        return
-    torch.cuda.synchronize()
-    time_infos[name].acc_time += time.perf_counter()
-    if time_infos[name].check():
-        time_infos[name].pretty_print()
 
 
 def set_random_seed(seed: int) -> None:
@@ -804,16 +755,6 @@ def calc_diff(x, y):
     return 1 - sim
 
 
-def raise_error_or_warn(obj, strict, counter_name, message, log_interval=1000):
-    if strict:
-        raise ValueError(message)
-    else:
-        count = getattr(obj, counter_name, 0)
-        if count % log_interval == 0:
-            logger.warning(message)
-        setattr(obj, counter_name, count + 1)
-
-
 def get_or_create_event_loop():
     """Gets the running event loop or creates a new one if it doesn't exist."""
     try:
@@ -822,3 +763,49 @@ def get_or_create_event_loop():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         return loop
+
+
+class TypeBasedDispatcher:
+    def __init__(self, mapping: List[Tuple[Type, Callable]]):
+        # Use dictionary for fast exact type matching, using OrderedDict(mapping)
+        # to maintains registration order
+        self._mapping = OrderedDict(mapping)
+        # MRO cache for inheritance-based matching
+        self._mro_cache = {}
+        self._fallback_fn = None
+
+    def add_fallback_fn(self, fallback_fn: Callable):
+        self._fallback_fn = fallback_fn
+
+    def __iadd__(self, other: TypeBasedDispatcher):
+        for ty, fn in other._mapping.items():
+            if ty not in self._mapping:
+                self._mapping[ty] = fn
+
+        self._mro_cache.clear()
+        return self
+
+    def __call__(self, obj: Any):
+        obj_type = type(obj)
+        # 1. First try exact match(o(1))
+        fn = self._mapping.get(obj_type)
+        if fn is not None:
+            return fn(obj)
+
+        # 2. If exact match fails, check MRO cache
+        cached_fn = self._mro_cache.get(obj_type)
+        if cached_fn is not None:
+            return cached_fn(obj)
+
+        # 3.search in registration order for compatible type(maintains origin behavior)
+        for ty, fn in self._mapping.items():
+            if isinstance(obj, ty):
+                self._mro_cache[obj_type] = fn
+                return fn(obj)
+
+        # 4. if no matching type found, cache this result
+        self._mro_cache[obj_type] = None
+
+        if self._fallback_fn is not None:
+            return self._fallback_fn(obj)
+        raise ValueError(f"Invalid object: {obj}")

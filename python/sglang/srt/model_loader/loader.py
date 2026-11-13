@@ -172,6 +172,20 @@ def device_loading_context(module: torch.nn.Module, target_device: torch.device)
 
 logger = logging.getLogger(__name__)
 
+# The checkpoint files the default loader read, as (folder, files), by the weight source's
+# (model id or path, revision): state derived from the loaded weights (Paged Experts' expert
+# cache) keys on the files this start read, wherever they were found (a hub cache,
+# --download-dir, ModelScope).
+_checkpoint_files: Dict[Tuple[str, Optional[str]], Tuple[str, Tuple[str, ...]]] = {}
+
+
+def loaded_checkpoint_files(
+    model_or_path: str, revision: Optional[str]
+) -> Optional[Tuple[str, Tuple[str, ...]]]:
+    """The folder and the files the default loader read the weights of ``model_or_path`` at
+    ``revision`` from in this process, or None if it did not load them."""
+    return _checkpoint_files.get((model_or_path, revision))
+
 
 def _get_quantization_config(
     model_config: ModelConfig,
@@ -640,6 +654,10 @@ class DefaultModelLoader(BaseModelLoader):
             hf_folder = resolved_source.hf_folder
             hf_weights_files = list(resolved_source.weight_files)
             use_safetensors = resolved_source.use_safetensors
+        _checkpoint_files[(source.model_or_path, source.revision)] = (
+            hf_folder,
+            tuple(hf_weights_files),
+        )
 
         if self.load_config.load_format == LoadFormat.NPCACHE:
             # Currently np_cache only support *.bin checkpoints
@@ -882,11 +900,6 @@ class DefaultModelLoader(BaseModelLoader):
             for _, module in model.named_modules():
                 quant_method = getattr(module, "quant_method", None)
                 if quant_method is None:
-                    continue
-                if (
-                    hasattr(module, "is_weights_quantized")
-                    and module.is_weights_quantized()
-                ):
                     continue
                 quant_method.process_weights_after_loading(module)
         return model.eval()
@@ -1532,12 +1545,6 @@ class DummyModelLoader(BaseModelLoader):
             for _, module in model.named_modules():
                 quant_method = getattr(module, "quant_method", None)
                 if quant_method is not None:
-                    # Skip FusedMoE layers already quantized during init (FP8 or FP4)
-                    if (
-                        hasattr(module, "is_weights_quantized")
-                        and module.is_weights_quantized()
-                    ):
-                        continue
                     quant_method.process_weights_after_loading(module)
 
         return model.eval()
@@ -4216,23 +4223,6 @@ def get_model_loader(
         in ["modelopt_fp8", "modelopt_fp4", "modelopt_mixed", "modelopt"]
     ):
         logger.info("Using ModelOptModelLoader due to ModelOpt quantization config.")
-        return ModelOptModelLoader(load_config)
-
-    # Use ModelOptModelLoader for unified quantization flags
-    if (
-        model_optloader_allowed
-        and hasattr(model_config, "quantization")
-        and model_config.quantization
-        in ["modelopt_fp8", "modelopt_fp4", "modelopt_mixed"]
-    ):
-        if model_config._is_already_quantized():
-            logger.info(
-                f"Using ModelOptModelLoader for pre-quantized model: {model_config.quantization}"
-            )
-        else:
-            logger.info(
-                f"Using ModelOptModelLoader for quantization: {model_config.quantization}"
-            )
         return ModelOptModelLoader(load_config)
 
     if load_config.load_format == LoadFormat.SHARDED_STATE:

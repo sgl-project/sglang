@@ -1,5 +1,6 @@
 import asyncio
 import os
+import traceback
 from concurrent.futures.process import BrokenProcessPool
 from typing import Dict, List, Optional, Union
 
@@ -33,7 +34,6 @@ from sglang.srt.multimodal.mm_utils import (
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
 from sglang.srt.utils import logger
-from sglang.utils import get_exception_traceback
 
 
 class LlavaImageProcessor(BaseMultimodalProcessor):
@@ -100,13 +100,13 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
         except CLIENT_MEDIA_EXCEPTIONS as error:
             raise ValueError(f"Error while processing image: {error}") from error
         except Exception:
-            logger.error("Exception in TokenizerManager:\n" + get_exception_traceback())
+            logger.error("Exception in TokenizerManager:\n" + traceback.format_exc())
             raise
 
     async def _fetch_remote_image_bytes(self, url):
         # Fetch a remote image's compressed bytes in the io thread pool, retrying
-        # only transient network failures. Each attempt is bounded by
-        # REQUEST_TIMEOUT inside download_remote_media, so total time is bounded.
+        # only transient network failures. Each attempt is bounded by the media
+        # URL timeout inside download_remote_media, so total time is bounded.
         loop = asyncio.get_running_loop()
         max_retries = max(0, int(os.environ.get("SGLANG_MM_LOAD_MAX_RETRIES", "2")))
         delay = 0.5
