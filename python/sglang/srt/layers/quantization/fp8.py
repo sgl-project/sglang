@@ -416,9 +416,7 @@ class Fp8Config(QuantizationConfig):
             if is_layer_skipped(
                 prefix, self.ignored_layers, fused_mapping=self.packed_modules_mapping
             ):
-                return UnquantizedFusedMoEMethod(
-                    layer.use_triton_kernels, layer.use_flashinfer_trtllm_moe
-                )
+                return UnquantizedFusedMoEMethod(layer.use_flashinfer_trtllm_moe)
 
             if is_npu() and self.use_mxfp8:
                 from sglang.srt.hardware_backend.npu.quantization.online_moe_methods import (
@@ -3071,7 +3069,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             # ROCm (_use_aiter): using column-wise scaling
             layer.w13_weight_scale1 *= layer.w13_weight_scale.unsqueeze(-1)
             layer.w2_weight_scale1 *= layer.w2_weight_scale.unsqueeze(-1)
-        elif get_bool_env_var("SGLANG_MOE_PADDING"):
+        elif padding_size:
             # If ROCm, apply weight padding (min. Mem channel contention) only if set
             layer.w13_weight = torch.nn.Parameter(
                 F.pad(layer.w13_weight.data, (0, padding_size), "constant", 0),
