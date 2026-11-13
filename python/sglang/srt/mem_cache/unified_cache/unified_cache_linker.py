@@ -34,6 +34,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, NamedTuple, Optional
 
+import msgspec
 import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import (
@@ -152,6 +153,25 @@ class TransferReady(NamedTuple):
             stream.wait_event(event)
 
 
+class PrefetchContext(msgspec.Struct, frozen=True, kw_only=True):
+    """CPU request identity captured before an asynchronous prefetch lookup.
+
+    The request handle, not the rid alone, pairs lookup, load and release:
+    a resubmitted rid gets a new ``attempt_id``.
+    """
+
+    request: CacheRequestHandle
+    # Copied from the request, so a backend worker never reads mutable Req state.
+    token_ids: bytes
+    local_hit_tokens: int
+    max_restore_tokens: int
+    page_size: int
+    extra_key: Optional[str] = None
+    cache_salt: Optional[str] = None
+    is_bigram: bool = False
+    features: frozenset[str] = frozenset()
+
+
 class UnifiedCacheLinker(ABC):
     """External KV store reached directly from the device pools.
 
@@ -191,8 +211,49 @@ class UnifiedCacheLinker(ABC):
     def submit_lookup(
         self, rid: str, transfers: list[PoolTransfer]
     ) -> Future[list[int]] | None:
-        """Submit a non-blocking lookup for prefetch mode."""
-        return None
+        """Submit a non-blocking lookup for prefetch mode.
+
+        The default runs the synchronous ``lookup`` and returns its result as a
+        completed future, so a backend implementing only ``lookup`` and
+        ``prefetch`` keeps prefetching on the scheduler thread.
+        """
+        future: Future[list[int]] = Future()
+        future.set_result(self.lookup(rid, transfers))
+        return future
+
+    # Opt-in request-aware prefetch. When False the wrapper uses
+    # submit_lookup/prefetch and never calls the methods below.
+    request_prefetch = False
+
+    def submit_prefetch_lookup(
+        self, context: PrefetchContext, transfers: list[PoolTransfer]
+    ) -> Future[list[int]] | None:
+        """Nonblocking lookup; no device slots are allocated yet.
+
+        Every accepted lookup is paired with exactly one
+        ``release_prefetch_request(context.request)``, including after a
+        TP-wide rejection, a zero-page agreement or a cancellation.
+        """
+        raise NotImplementedError
+
+    def prefetch_request(
+        self, request: CacheRequestHandle, transfers: list[PoolTransfer]
+    ) -> Future[bool] | None:
+        """Load the pages found by this request's lookup.
+
+        The future completes only after every device write has stopped.
+        Raising or returning None certifies that no write was accepted.
+        """
+        raise NotImplementedError
+
+    def cancel_prefetch_request(self, request: CacheRequestHandle) -> None:
+        """Stop publication early; in-flight writes keep their slots until done."""
+
+    def release_prefetch_request(self, request: CacheRequestHandle) -> None:
+        """Release lookup state after rejection or terminal consumption."""
+
+    def poll_prefetch(self) -> None:
+        """Bounded owner-thread progress; must not wait for RPCs or CUDA."""
 
     @abstractmethod
     def lookup(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
@@ -249,11 +310,18 @@ class UnifiedCacheLinker(ABC):
 
     @abstractmethod
     def reset(self) -> None:
-        """Quiesce all transfers and reset backend state before returning."""
+        """Quiesce all transfers and reset backend state before returning.
+
+        Every lookup and prefetch future handed out must be done on return;
+        the wrapper then finishes them without publishing.
+        """
 
     @abstractmethod
     def close(self) -> None:
-        """Quiesce all transfers and release backend resources."""
+        """Quiesce all transfers and release backend resources.
+
+        Same future contract as ``reset``.
+        """
 
 
 class ExternalCacheHitMarker(NamedTuple):
@@ -280,6 +348,11 @@ class _ExternalCachePrefetch:
     timeout_s: float = 0.0
     wait_started: float | None = None
     discard: bool = False
+    # Every rank keeps the lookup phase in lockstep; a request-aware rank whose
+    # submission was rejected locally has no lookup_future.
+    looking_up: bool = True
+    # This rank's request-aware backend accepted the lookup and awaits release.
+    backend_owned: bool = False
 
 
 class _PendingOffload(NamedTuple):
@@ -329,6 +402,11 @@ class UnifiedCacheLinkerWrapper:
         # rid -> what match found, consumed by the next init_load_back.
         self.hit_markers: dict[str, ExternalCacheHitMarker] = {}
         self.prefetches: dict[CacheRequestHandle, _ExternalCachePrefetch] = {}
+        # Request-aware restores stay locked until admission takes its own lock.
+        self.prefetch_holds: dict[
+            CacheRequestHandle, tuple[NodeId, DecLockRefParams]
+        ] = {}
+        self.request_prefetch = cache_linker.request_prefetch is True
         # Requests loading in the batch being built, then its counter index once
         # the batch starts; finish_loads consumes both after its forward.
         self.inflight_load_rids: list[str] = []
@@ -417,6 +495,9 @@ class UnifiedCacheLinkerWrapper:
         for previous in self.prefetches:
             if previous.rid == request.rid and previous != request:
                 self._cancel_prefetch(previous)
+        for previous in list(self.prefetch_holds):
+            if previous.rid == request.rid and previous != request:
+                self._release_prefetch_hold(previous)
         if self.cache.disable or request in self.prefetches:
             return
         req.init_next_round_input(self.cache, cow_mamba=False)
@@ -444,7 +525,15 @@ class UnifiedCacheLinkerWrapper:
         anchor_node_id = req.last_node
         anchor_lock = self.cache.inc_lock_ref(anchor_node_id).to_dec_params()
         try:
-            lookup_future = self.cache_linker.submit_lookup(req.rid, lookups)
+            if self.request_prefetch:
+                context = self._prefetch_context(
+                    req, request, local_hit_tokens=start, max_restore_tokens=len(key)
+                )
+                lookup_future = self.cache_linker.submit_prefetch_lookup(
+                    context, lookups
+                )
+            else:
+                lookup_future = self.cache_linker.submit_lookup(req.rid, lookups)
         except Exception:
             logger.warning(
                 "External linker prefetch lookup submission failed", exc_info=True
@@ -452,6 +541,21 @@ class UnifiedCacheLinkerWrapper:
             lookup_future = None
         accepted = torch.tensor([lookup_future is not None], dtype=torch.int)
         self.cache._all_reduce_attn_groups(accepted, torch.distributed.ReduceOp.MIN)
+        if not accepted.item() and self.request_prefetch:
+            # A rank that accepted owns backend lookup state until the lookup
+            # ends; every rank keeps a discarded entry so release stays paired.
+            self.prefetches[request] = _ExternalCachePrefetch(
+                key=key,
+                hashes=hashes,
+                device_hit_len=start,
+                anchor_node_id=anchor_node_id,
+                anchor_lock=anchor_lock,
+                lookup_future=lookup_future,
+                component_transfers=[],
+                backend_owned=lookup_future is not None,
+            )
+            self._cancel_prefetch(request)
+            return
         if not accepted.item():
             if lookup_future is not None:
                 lookup_future.cancel()
@@ -465,10 +569,45 @@ class UnifiedCacheLinkerWrapper:
             anchor_lock=anchor_lock,
             lookup_future=lookup_future,
             component_transfers=[],
+            backend_owned=self.request_prefetch,
             timeout_s=self.cache.prefetch_timeout_base
             + len(hashes) * self.cache.prefetch_timeout_per_page,
         )
         self.prefetches[request] = state
+
+    def _prefetch_context(
+        self,
+        req: Req,
+        request: CacheRequestHandle,
+        *,
+        local_hit_tokens: int,
+        max_restore_tokens: int,
+    ) -> PrefetchContext:
+        # Request kinds a backend may refuse to restore; it sees no Req object.
+        features = {
+            name
+            for name, present in (
+                ("session", req.session is not None),
+                ("multimodal_inputs", req.multimodal_inputs is not None),
+                ("input_embeds", req.input_embeds is not None),
+                ("dllm", req.is_dllm()),
+                ("beam_group", req.beam_group is not None),
+                ("return_logprob", bool(req.return_logprob)),
+                ("holds_kv", req.kv.holds_kv),
+            )
+            if present
+        }
+        return PrefetchContext(
+            request=request,
+            token_ids=req.full_untruncated_fill_ids.tobytes(),
+            local_hit_tokens=local_hit_tokens,
+            max_restore_tokens=max_restore_tokens,
+            page_size=self.cache.page_size,
+            extra_key=req.extra_key,
+            cache_salt=req.cache_salt,
+            is_bigram=self.cache.tree_core.is_eagle,
+            features=frozenset(features),
+        )
 
     def check_prefetch_progress(self, request: CacheRequestHandle) -> bool:
         state = self.prefetches.get(request)
@@ -499,6 +638,8 @@ class UnifiedCacheLinkerWrapper:
         state = self.prefetches.get(request)
         if state is not None:
             state.discard = True
+            if state.backend_owned:
+                self.cache_linker.cancel_prefetch_request(request)
             future = state.lookup_future or state.load_future
             if future is not None:
                 future.cancel()
@@ -513,16 +654,21 @@ class UnifiedCacheLinkerWrapper:
         )
 
     def check_prefetch_events(self) -> None:
+        if self.request_prefetch:
+            self.cache_linker.poll_prefetch()
         if not self.prefetches:
             return
         lookup_pending = [
             (request, state)
             for request, state in self.prefetches.items()
-            if state.lookup_future is not None
+            if state.looking_up
         ]
         if lookup_pending:
             ready = torch.tensor(
-                [state.lookup_future.done() for _, state in lookup_pending],
+                [
+                    state.lookup_future is None or state.lookup_future.done()
+                    for _, state in lookup_pending
+                ],
                 dtype=torch.int,
             )
             self.cache._all_reduce_attn_groups(ready, torch.distributed.ReduceOp.MIN)
@@ -535,7 +681,7 @@ class UnifiedCacheLinkerWrapper:
         pending = [
             (request, state)
             for request, state in self.prefetches.items()
-            if state.lookup_future is None
+            if not state.looking_up
         ]
         if not pending:
             return
@@ -560,17 +706,16 @@ class UnifiedCacheLinkerWrapper:
 
     def _finish_prefetch_lookup(self, request: CacheRequestHandle) -> None:
         state = self.prefetches.get(request)
-        if state is None or state.lookup_future is None:
+        if state is None or not state.looking_up:
             return
         future = state.lookup_future
-        assert future.done()
-        try:
-            restorable = [] if future.cancelled() else future.result()
-        except Exception:
-            logger.warning("External linker prefetch lookup failed", exc_info=True)
-            restorable = []
-        if state.discard:
-            restorable = []
+        restorable = []
+        if future is not None and not state.discard:
+            assert future.done()
+            try:
+                restorable = [] if future.cancelled() else future.result()
+            except Exception:
+                logger.warning("External linker prefetch lookup failed", exc_info=True)
 
         pages = self._sync_restorable_prefix(
             restorable, num_pages=len(state.hashes), device_hit_pages=0
@@ -580,6 +725,7 @@ class UnifiedCacheLinkerWrapper:
             return
 
         state.lookup_future = None
+        state.looking_up = False
         end = state.device_hit_len + pages * self.cache.page_size
         state.key = state.key[:end]
         try:
@@ -591,9 +737,13 @@ class UnifiedCacheLinkerWrapper:
                     break
                 state.component_transfers.append((component, transfer))
             if len(state.component_transfers) == len(self._components):
-                state.load_future = self.cache_linker.prefetch(
-                    [transfer for _, transfer in state.component_transfers]
-                )
+                transfers = [transfer for _, transfer in state.component_transfers]
+                if self.request_prefetch:
+                    state.load_future = self.cache_linker.prefetch_request(
+                        request, transfers
+                    )
+                else:
+                    state.load_future = self.cache_linker.prefetch(transfers)
         except Exception:
             logger.warning("External linker prefetch submission failed", exc_info=True)
         accepted = torch.tensor([state.load_future is not None], dtype=torch.int)
@@ -654,10 +804,32 @@ class UnifiedCacheLinkerWrapper:
             )
             if mamba is not None and inserted.mamba_exist:
                 storage.free_state_slots(sub_pool, mamba.device_indices)
+            if self.request_prefetch:
+                node = inserted.last_device_node
+                self.prefetch_holds[request] = (
+                    node,
+                    self.cache.inc_lock_ref(node).to_dec_params(),
+                )
             self.cache.prefetch_loaded_tokens_by_reqid[request] = len(full)
             self.cache.prefetch_loaded_storage_start_by_reqid[request] = start
         finally:
             self.cache.dec_lock_ref(state.anchor_node_id, state.anchor_lock)
+            if state.backend_owned:
+                self.cache_linker.release_prefetch_request(request)
+
+    def adopt_prefetch(self, req: Req) -> None:
+        """Drop the publication hold once admission owns the request's lock."""
+        request = req.cache_request_handle
+        if request not in self.prefetch_holds:
+            return
+        if req.lock is None:
+            raise RuntimeError("prefetch adoption requires the admitted request lock")
+        self._release_prefetch_hold(request)
+
+    def _release_prefetch_hold(self, request: CacheRequestHandle) -> None:
+        held = self.prefetch_holds.pop(request, None)
+        if held is not None:
+            self.cache.dec_lock_ref(*held)
 
     def _sync_restorable_prefix(
         self, restorable: list[int], *, num_pages: int, device_hit_pages: int
@@ -956,6 +1128,8 @@ class UnifiedCacheLinkerWrapper:
     def _clear_state(self) -> None:
         for request in list(self.prefetches):
             self._finish_prefetch(request, publish=False)
+        for request in list(self.prefetch_holds):
+            self._release_prefetch_hold(request)
         self.hit_markers.clear()
         self.inflight_load_rids.clear()
         self.private_load_indices.clear()
@@ -969,6 +1143,7 @@ class UnifiedCacheLinkerWrapper:
 
     def release_request(self, request: CacheRequestHandle) -> None:
         rid = request.rid
+        self._release_prefetch_hold(request)
         self.hit_markers.pop(rid, None)
         self._cancel_prefetch(request)
         # A queued load targets slots the request owns and is about to free.
