@@ -1890,17 +1890,17 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         if x.shape[0] == 0:
             output = x.new_empty((0, layer.w2_weight.shape[1]))
         else:
-            # A remote slot keeps its row's expert id at weight 0: fused_experts
-            # miscomputes the whole row if any id in it is negative. Sorting the
-            # local slots forward and trimming is slower here, because a
-            # dispatched row usually has a local expert in most of its slots.
-            remote = topk_ids < 0
-            topk_ids = topk_ids.clamp(min=0).to(torch.int32)
-            topk_weights = topk_weights.masked_fill(remote, 0.0).to(torch.float32)
             if moe_runner_config.apply_router_weight_on_input:
                 assert topk_ids.shape[1] == 1
                 x = x * topk_weights.to(x.dtype)
-                topk_weights = (~remote).to(torch.float32)
+                topk_weights = torch.ones_like(topk_weights)
+            # Remote slots (-1) keep a local id at weight 0, rather than sorting
+            # local slots forward: a dispatched row usually has few remote slots.
+            topk_weights, topk_ids = route_dropped_experts_to_local(
+                topk_weights=topk_weights, topk_ids=topk_ids
+            )
+            topk_ids = topk_ids.to(torch.int32)
+            topk_weights = topk_weights.to(torch.float32)
             output = _xpu_fused_experts_in_row_chunks(
                 fused_experts,
                 x,
@@ -1956,7 +1956,8 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase, BaseFusedOp):
         # Combine only reads the valid rows of each expert, so the rest stay unset.
         output = x.new_empty((num_local_experts, num_slots, layer.w2_weight.shape[1]))
         if rows.numel() > 0:
-            row_output = fused_experts(
+            row_output = _xpu_fused_experts_in_row_chunks(
+                fused_experts,
                 x.view(-1, hidden).index_select(0, rows),
                 layer.w13_weight,
                 layer.w2_weight,

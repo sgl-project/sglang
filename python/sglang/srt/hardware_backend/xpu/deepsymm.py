@@ -7,7 +7,7 @@ DEEPSYMM_DIST_NAME = "deep-symm"
 DEEPSYMM_PACKAGE = "applications.ai.gpu.deepsymm"
 # deep-symm is built from source, and its version is 0.0.1+<git revision>, so
 # there is no ordered version to compare against; name what this path was tested on.
-DEEPSYMM_TESTED_REVISION = "6d18e46"
+DEEPSYMM_TESTED_REVISION = "ba83deb"
 DEEPSYMM_SOURCE_HINT = (
     f"{DEEPSYMM_PACKAGE} is not on PyPI; build it from source (revision "
     f"{DEEPSYMM_TESTED_REVISION} was tested) into the same environment as SGLang"

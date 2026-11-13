@@ -22,7 +22,7 @@ from types import SimpleNamespace
 import torch
 
 from sglang.benchmark.serving import run_benchmark
-from sglang.test.ci.ci_register import register_cuda_ci, register_xpu_ci
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.perf_bench_kit import check_perf, reported
 from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
@@ -34,14 +34,8 @@ from sglang.test.test_utils import (
     terminate_and_kill_process_tree,
 )
 
+# No XPU lane: applications.ai.gpu.deepsymm is not in the XPU CI image; run by hand on XPU.
 register_cuda_ci(est_time=1800, stage="nightly", runner_config="4-gpu-h100")
-# applications.ai.gpu.deepsymm is not yet in the public XPU CI image.
-register_xpu_ci(
-    est_time=1800,
-    suite="nightly-xpu-kernel-main-4-gpu",
-    nightly=True,
-    disabled="applications.ai.gpu.deepsymm not installed in XPU CI image",
-)
 
 MODEL = "Qwen/Qwen3-30B-A3B"
 DEVICE = auto_config_device()
