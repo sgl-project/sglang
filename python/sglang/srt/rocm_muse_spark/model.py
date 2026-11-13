@@ -3,7 +3,8 @@
 
 BF16 checkpoints run a plain ``torch.nn.functional.linear`` expert loop on CUDA
 and a fused grouped GEMM on ROCm (``ops/muse_moe_triton.py``, or
-``ops/muse_moe_flydsl.py`` when ``MUSE_MOE_BACKEND=flydsl``).
+``ops/muse_moe_flydsl.py`` when ``MUSE_MOE_BACKEND=flydsl``, or the vendored
+``tlx.ops.moe`` in ``sglang.kernels.ops.moe.tlx`` when ``MUSE_MOE_BACKEND=tlx``).
 Serialized ModelOpt NVFP4 expert weights stay packed and are executed by the
 public FlashInfer TRT-LLM MoE kernel via the public ModelOpt quant method. Muse
 applies its post-expert norm between GEMM2 and the top-k combine, which that
@@ -152,9 +153,9 @@ def _is_rocm() -> bool:
 
 def _moe_backend() -> str:
     backend = os.environ.get("MUSE_MOE_BACKEND", "auto").lower()
-    if backend not in {"auto", "native", "triton", "flydsl"}:
+    if backend not in {"auto", "native", "triton", "flydsl", "tlx"}:
         raise ValueError(
-            "MUSE_MOE_BACKEND must be one of auto, native, triton, or flydsl; "
+            "MUSE_MOE_BACKEND must be one of auto, native, triton, flydsl, or tlx; "
             f"got {backend!r}"
         )
     if backend == "auto":
@@ -173,8 +174,50 @@ def _want_triton_moe() -> bool:
 
 
 def _want_fused_moe() -> bool:
-    """Grouped GEMM expert path that keeps Triton weight layouts (Triton or FlyDSL)."""
-    return _moe_backend() in {"triton", "flydsl"}
+    """Grouped GEMM expert path that keeps Triton weight layouts (Triton, FlyDSL or TLX)."""
+    return _moe_backend() in {"triton", "flydsl", "tlx"}
+
+
+@functools.cache
+def _warn_tlx_moe_fallback(reason: str) -> None:
+    logger.warning("MUSE_MOE_BACKEND=tlx: %s; using FlyDSL", reason)
+
+
+def _run_tlx_moe(
+    hidden_states: torch.Tensor,
+    topk_scores: torch.Tensor,
+    topk_ids: torch.Tensor,
+    w13: torch.Tensor,
+    w2: torch.Tensor,
+    local_expert_start: int,
+    post_expert_norm: nn.Module | None,
+) -> torch.Tensor | None:
+    """BF16 experts through the vendored ``tlx.ops.moe``; None when unsupported."""
+    from sglang.kernels.ops.moe import tlx as tlx_moe
+
+    weight, gain, has_norm = _post_expert_norm_args(post_expert_norm)
+    # tlx.ops.moe reads a None weight as "no post-norm", not as an unweighted norm.
+    if has_norm and weight is None:
+        _warn_tlx_moe_fallback("post-expert norm without a weight")
+        return None
+    if not tlx_moe.moe_supported(hidden_states, topk_ids, w13, w2):
+        _warn_tlx_moe_fallback(
+            f"unsupported shapes w13={tuple(w13.shape)} w2={tuple(w2.shape)}"
+        )
+        return None
+    eps = float(post_expert_norm.eps) if post_expert_norm is not None else 0.0
+    return tlx_moe.moe(
+        hidden_states,
+        topk_scores,
+        topk_ids,
+        w13,
+        w2,
+        local_expert_start,
+        weight,
+        eps,
+        gain,
+        None,
+    )
 
 
 def _run_fused_moe(
@@ -188,7 +231,22 @@ def _run_fused_moe(
     w13_scale: torch.Tensor | None = None,
     w2_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    if _moe_backend() == "flydsl":
+    if _moe_backend() == "tlx":
+        if w13_scale is None and w2_scale is None:
+            out = _run_tlx_moe(
+                hidden_states,
+                topk_scores,
+                topk_ids,
+                w13,
+                w2,
+                local_expert_start,
+                post_expert_norm,
+            )
+            if out is not None:
+                return out
+        else:
+            _warn_tlx_moe_fallback("MXFP4 experts are not supported")
+    if _moe_backend() in {"flydsl", "tlx"}:
         from sglang.srt.rocm_muse_spark.muse_moe_flydsl import (
             muse_moe_flydsl as fused_moe,
         )
@@ -922,7 +980,7 @@ class MuseSpark1xMxfp4Experts(nn.Module):
             return hidden_states
         if not _want_fused_moe():
             raise RuntimeError(
-                "Quark MXFP4 experts require MUSE_MOE_BACKEND=triton or flydsl"
+                "Quark MXFP4 experts require MUSE_MOE_BACKEND=triton, flydsl, or tlx"
             )
         return _run_fused_moe(
             hidden_states,
