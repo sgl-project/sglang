@@ -1847,3 +1847,84 @@ async fn heartbeats_stop_when_the_backend_drops() {
     let after = MockState::lock(&state).reports.len();
     assert_eq!(after, before, "no reports after the backend is dropped");
 }
+
+#[tokio::test]
+async fn tair_kvcache_poc_reporter_incarnation_and_instance_scope() {
+    let state = Arc::new(Mutex::new(MockState::default()));
+    let addr = start_mock_tair_kvcache_manager(Arc::clone(&state)).await;
+    let mut a_config = backend_config(addr);
+    a_config.instance_id = "glm-layout-domain-a".into();
+    let mut b_config = backend_config(addr);
+    b_config.instance_id = "glm-layout-domain-b".into();
+    assert!(a_config.auto_register.is_none());
+    assert_eq!(
+        a_config.report_tiers,
+        [sgl_kv_indexer::pb::TierType::TierHbm]
+    );
+    let a = TairKVCacheIndexerBackend::new(a_config).unwrap();
+    let b = TairKVCacheIndexerBackend::new(b_config).unwrap();
+    let reporter_a = "engine-a.boot-a.tp0";
+    let reporter_b = "engine-b.boot-b.tp0";
+    for (backend, reporter, address) in [
+        (&a, reporter_a, "http://router-a:30000"),
+        (&b, reporter_b, "http://router-b:30000"),
+    ] {
+        backend
+            .apply_external_kv_batch(apply_request(
+                reporter,
+                address,
+                1,
+                vec![action(
+                    ExternalKvActionType::ActionReport,
+                    hbm(),
+                    &[i64::MIN, -1],
+                )],
+            ))
+            .await
+            .unwrap();
+    }
+    {
+        let mut state = MockState::lock(&state);
+        // The mock deliberately returns foreign and stale reporters too: only
+        // exact locally recorded identities may join to routing addresses.
+        state.hosts = vec![
+            host_match(reporter_a, 2),
+            host_match(reporter_b, 2),
+            host_match("engine-a.old-boot.tp0", 2),
+            host_match("router-a:30000", 2),
+        ];
+    }
+    for (backend, expected_address) in
+        [(&a, "http://router-a:30000"), (&b, "http://router-b:30000")]
+    {
+        let answer = backend
+            .match_external_kv_prefix(MatchExternalKvPrefixRequest {
+                hashes: vec![i64::MIN, -1],
+                max_blocks: 0,
+            })
+            .await
+            .unwrap();
+        assert_eq!(answer.matches.len(), 1);
+        assert_eq!(answer.matches[0].worker_address, expected_address);
+        assert_eq!(answer.matches[0].matched_prefix_blocks, 2);
+    }
+    let state = MockState::lock(&state);
+    assert!(
+        state.registrations.is_empty(),
+        "POC never auto-registers a deployment"
+    );
+    assert_eq!(state.reports[0].instance_id, "glm-layout-domain-a");
+    assert_eq!(state.reports[0].host_ip_port, reporter_a);
+    assert_eq!(state.reports[1].instance_id, "glm-layout-domain-b");
+    assert_eq!(state.reports[1].host_ip_port, reporter_b);
+    for (query, instance) in state
+        .queries
+        .iter()
+        .zip(["glm-layout-domain-a", "glm-layout-domain-b"])
+    {
+        assert_eq!(query.instance_id, instance);
+        assert_eq!(query.medium, ["hbm"]);
+        assert_eq!(query.block_cache_keys, [i64::MIN, -1]);
+        assert_eq!(query.p2p_host_count, 0);
+    }
+}
