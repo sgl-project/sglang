@@ -1380,7 +1380,6 @@ class DeepseekV4AscendAttnBackend(
 
         if ragged_layout is not None:
             metadata.actual_seq_lengths_q_pa = ragged_layout.qo_indptr_device
-            metadata.actual_seq_lengths_q_pa_cpu = None
             n_tok = int(ragged_layout.graph_num_tokens)
         else:
             metadata.actual_seq_lengths_q_pa = torch.arange(
@@ -2097,7 +2096,6 @@ class DeepseekV4AscendAttnBackend(
                 device=device, dtype=torch.int32
             )
             fm.actual_seq_lengths_q = fm.actual_seq_lengths_q_pa[1:]
-            fm.actual_seq_lengths_q_pa_cpu = None
         elif (
             forward_batch.forward_mode.is_target_verify()
             or forward_batch.forward_mode.is_draft_extend_v2()
