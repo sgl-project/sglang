@@ -340,6 +340,36 @@ impl SglangService for Mock {
     ) -> Result<Response<api::LoraUpdateResponse>, Status> {
         Err(Status::unimplemented("unload_lora_adapter"))
     }
+    async fn get_hi_cache_l3_cache_layout(
+        &self,
+        _: Request<api::GetHiCacheL3CacheLayoutRequest>,
+    ) -> Result<Response<api::GetHiCacheL3CacheLayoutResponse>, Status> {
+        Err(Status::unimplemented("get_hi_cache_l3_cache_layout"))
+    }
+    async fn configure_logging(
+        &self,
+        _: Request<api::ConfigureLoggingRequest>,
+    ) -> Result<Response<api::ConfigureLoggingResponse>, Status> {
+        Err(Status::unimplemented("configure_logging"))
+    }
+    async fn dumper_control(
+        &self,
+        _: Request<api::DumperControlRequest>,
+    ) -> Result<Response<api::DumperControlResponse>, Status> {
+        Err(Status::unimplemented("dumper_control"))
+    }
+    async fn scale_elastic_ep(
+        &self,
+        _: Request<api::ScaleElasticEpRequest>,
+    ) -> Result<Response<api::ScaleElasticEpResponse>, Status> {
+        Err(Status::unimplemented("scale_elastic_ep"))
+    }
+    async fn get_elastic_ep_state(
+        &self,
+        _: Request<api::ElasticEpStateRequest>,
+    ) -> Result<Response<api::ElasticEpStateResponse>, Status> {
+        Err(Status::unimplemented("get_elastic_ep_state"))
+    }
     async fn open_session(
         &self,
         _: Request<api::OpenSessionRequest>,

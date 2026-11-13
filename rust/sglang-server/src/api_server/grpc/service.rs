@@ -13,8 +13,9 @@ use tonic::{Request, Response, Status};
 use super::{info, native_api};
 use crate::api_server::core::{HealthStatus, ReceivedAs};
 use crate::api_server::handlers::{
-    AbortEnding, CoreHandle, CorpusSource, HiCacheError, HiCacheManager, LORA_DISABLED, ToolSpec,
-    WeightGroupOutcome, WeightUpdateOutcome, parse_function_call, separate_reasoning,
+    AbortEnding, CoreHandle, CorpusSource, DumperOutcome, ElasticEpState, HiCacheError,
+    HiCacheManager, LORA_DISABLED, ToolSpec, WeightGroupOutcome, WeightUpdateOutcome,
+    parse_function_call, separate_reasoning,
 };
 use crate::api_server::http::weights::{decode_payloads, json_object};
 use crate::message::config::{
@@ -22,8 +23,8 @@ use crate::message::config::{
 };
 use crate::message::io_struct::{
     DiskWeightUpdate, DistributedWeightUpdate, ExpertDistributionAction, IpcWeightUpdate,
-    PdRoleSwitch, PluginWeightUpdate, ProfileOptions, SessionOpen, TensorWeightUpdate,
-    WeightsSendGroup, WeightsUpdateGroup,
+    LoggingConfig, PdRoleSwitch, PluginWeightUpdate, ProfileOptions, SessionOpen,
+    TensorWeightUpdate, WeightsSendGroup, WeightsUpdateGroup,
 };
 use crate::message::request::{GenerationPolicy, into_requests};
 use crate::message::wire::{ClientMaxNewTokens, fill_preferred_sampling};
@@ -839,6 +840,105 @@ impl SglangService for GrpcService {
             .await
             .map_err(native_api::status)?;
         Ok(Response::new(api::CloseSessionResponse {}))
+    }
+
+    async fn get_hi_cache_l3_cache_layout(
+        &self,
+        _request: Request<api::GetHiCacheL3CacheLayoutRequest>,
+    ) -> Result<Response<api::GetHiCacheL3CacheLayoutResponse>, Status> {
+        let layout = self
+            .core
+            .hicache_l3_cache_layout()
+            .await
+            .map_err(native_api::status)?;
+        Ok(Response::new(api::GetHiCacheL3CacheLayoutResponse {
+            layout: Some(layout.to_string()),
+        }))
+    }
+
+    async fn configure_logging(
+        &self,
+        request: Request<api::ConfigureLoggingRequest>,
+    ) -> Result<Response<api::ConfigureLoggingResponse>, Status> {
+        let request = request.into_inner();
+        self.core
+            .configure_logging(LoggingConfig {
+                log_requests: request.log_requests,
+                log_requests_level: request.log_requests_level,
+                log_requests_format: request.log_requests_format,
+                log_level: request.log_level,
+                dump_requests_folder: request.dump_requests_folder,
+                dump_requests_threshold: request.dump_requests_threshold,
+                crash_dump_folder: request.crash_dump_folder,
+                dump_requests_exclude_meta_keys: request
+                    .dump_requests_exclude_meta_keys
+                    .map(|list| list.items),
+            })
+            .await
+            .map_err(native_api::status)?;
+        Ok(Response::new(api::ConfigureLoggingResponse {}))
+    }
+
+    /// Served whatever `DUMPER_SERVER_PORT` says: the HTTP mount gate is
+    /// Python's route-level choice, not the dumper's.
+    async fn dumper_control(
+        &self,
+        request: Request<api::DumperControlRequest>,
+    ) -> Result<Response<api::DumperControlResponse>, Status> {
+        let request = request.into_inner();
+        let body = json_object("body", request.body.as_deref())
+            .map_err(Status::invalid_argument)?
+            .unwrap_or_default();
+        match self
+            .core
+            .dumper_control(request.method, body)
+            .await
+            .map_err(native_api::status)?
+        {
+            DumperOutcome::Responses(responses) => Ok(Response::new(api::DumperControlResponse {
+                responses: Some(serde_json::Value::Array(responses).to_string()),
+            })),
+            DumperOutcome::Failed(errors) => Err(Status::failed_precondition(errors.join(" | "))),
+        }
+    }
+
+    async fn scale_elastic_ep(
+        &self,
+        request: Request<api::ScaleElasticEpRequest>,
+    ) -> Result<Response<api::ScaleElasticEpResponse>, Status> {
+        if request.into_inner().new_ep_size <= 0 {
+            return Err(Status::invalid_argument(
+                "new_ep_size must be a positive integer",
+            ));
+        }
+        if self.core.elastic_ep_state().is_none() {
+            return Err(Status::not_found(
+                "elastic EP is not enabled (set --elastic-ep-backend)",
+            ));
+        }
+        Err(Status::failed_precondition(
+            "elastic EP scaling is not served by the Rust frontend",
+        ))
+    }
+
+    async fn get_elastic_ep_state(
+        &self,
+        _request: Request<api::ElasticEpStateRequest>,
+    ) -> Result<Response<api::ElasticEpStateResponse>, Status> {
+        match self.core.elastic_ep_state() {
+            None => Err(Status::not_found(
+                "elastic EP is not enabled (set --elastic-ep-backend)",
+            )),
+            Some(ElasticEpState { effective_ep_size }) => {
+                Ok(Response::new(api::ElasticEpStateResponse {
+                    is_scaling_elastic_ep: false,
+                    effective_ep_size,
+                    pending_ep_size: None,
+                    scale_phase: "idle".into(),
+                    last_error: None,
+                }))
+            }
+        }
     }
 
     async fn get_remote_instance_transfer_engine_info(

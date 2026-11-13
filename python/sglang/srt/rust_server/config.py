@@ -37,6 +37,7 @@ from sglang.srt.observability.utils import generate_buckets
 from sglang.srt.runtime_context import (
     get_device,
     get_disagg,
+    get_exec,
     get_lora,
     get_memory,
     get_mm,
@@ -115,6 +116,7 @@ def _build_server_args(
         "speculative_ngram_external_corpus_max_tokens": get_spec().speculative_ngram_external_corpus_max_tokens,
         "gc_threshold": get_device().gc_threshold,
         "enable_pd_role_switch": get_disagg().enable_pd_role_switch,
+        "elastic_ep_backend": get_exec().moe.elastic_ep_backend,
         "enable_streaming_session": get_serving().enable_streaming_session,
         "engine_info_bootstrap_url": scheduler.server_args.engine_info_bootstrap_url,
         "enable_hierarchical_cache": get_memory().enable_hierarchical_cache,
