@@ -119,11 +119,20 @@ def _resolve_engram_config(server_args: ServerArgs) -> None:
         config = EngramConfig.from_dict(raw)
     if config.lookup == EngramLookup.PEER_READ and not get_platform().is_cuda:
         raise ValueError("--engram-config: lookup 'peer_read' needs CUDA.")
+    cp_all_to_all = (
+        config.lookup == EngramLookup.ALL_TO_ALL
+        and cfg.enable_prefill_cp
+        and cfg.tp_size > 1
+        and context_parallel_attn_dp_size(cfg, "Engram CP lookup") == 1
+        and config.placement == EngramPlacement.CPU
+        and config.replication == EngramReplication.NONE
+    )
     if config.lookup in (EngramLookup.REDUCE_SCATTER, EngramLookup.ALL_TO_ALL) and (
-        cfg.attn_dp_size <= 1 or not get_platform().is_cuda
+        (cfg.attn_dp_size <= 1 and not cp_all_to_all) or not get_platform().is_cuda
     ):
         raise ValueError(
-            f"--engram-config: lookup {config.lookup!r} applies to DP attention on CUDA."
+            f"--engram-config: lookup {config.lookup!r} needs DP attention on CUDA "
+            "or, for all_to_all, TP-sized prefill CP with per-rank CPU tables."
         )
     if config.lookup == EngramLookup.ALL_TO_ALL:
         text_config = model_config_of(server_args).hf_text_config

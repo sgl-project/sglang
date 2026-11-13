@@ -52,7 +52,7 @@ from sglang.srt.distributed import tensor_model_parallel_all_reduce
 from sglang.srt.distributed.device_communicators.cuda_wrapper import (
     find_loaded_library,
 )
-from sglang.srt.distributed.parallel_state import inplace_all_reduce
+from sglang.srt.distributed.parallel_state import GroupCoordinator, inplace_all_reduce
 from sglang.srt.environ import envs
 from sglang.srt.hf_transformers.tokenizer import get_tokenizer
 from sglang.srt.layers.dp_attention import (
@@ -1247,11 +1247,60 @@ class EngramEmbedding(nn.Module):
                 (parallel.attn_cp_size * local_rows, *indices.shape[1:])
             )
             attn_cp_all_gather_into_tensor(all_indices, indices.contiguous())
+            if self._cp_all_to_all_enabled(forward_batch):
+                out = self._all_to_all_lookup(
+                    all_indices,
+                    [local_rows] * parallel.attn_cp_size,
+                    parallel.attn_cp_group,
+                    parallel.attn_cp_rank,
+                )
+                # The old SUM adds +0 from unowned shards, normalizing -0.
+                out.add_(0)
+                return out.view(*indices.shape, self.dim)
             start = parallel.attn_cp_rank * local_rows
             return self._lookup(all_indices)[start : start + local_rows]
         if self.tp_size > 1 and get_parallel().attn_dp_size > 1:
             return self._dp_sharded_lookup(indices, forward_batch)
         return self._lookup(indices)
+
+    def _cp_all_to_all_enabled(self, batch: Optional[ForwardBatch]) -> bool:
+        """Uniform, unpadded eager CP whose rank order matches the table shards.
+
+        CP pads hash rows with zeros rather than valid per-column IDs. Keep those
+        batches on the original lookup, using metadata shared by every CP rank.
+        """
+        parallel = get_parallel()
+        if (
+            self.lookup != EngramLookup.ALL_TO_ALL
+            or _is_hip
+            or self.host_table is None
+            or self._shared
+            or self._cols_per_rank is None
+            or parallel.attn_cp_size != self.tp_size
+            or parallel.attn_cp_group.ranks != parallel.tp_group.ranks
+            or batch is None
+            or not batch.forward_mode.is_extend_without_speculative()
+            or batch.attn_cp_metadata is None
+            or batch.extend_seq_lens_cpu is None
+            or is_in_breakable_cuda_graph()
+            or torch.cuda.is_current_stream_capturing()
+        ):
+            return False
+        metadata = batch.attn_cp_metadata
+        counts = metadata.per_rank_actual_token
+        padded = metadata.max_rank_len
+        return (
+            counts is not None
+            and padded is not None
+            and len(counts) == self.tp_size
+            and len(padded) == self.tp_size
+            # Small CP batches are launch-bound; retain the cheaper reduction.
+            and counts[0] >= 64
+            and all(n == counts[0] for n in counts)
+            and list(padded) == list(counts)
+            and sum(counts) == metadata.total_seq_lens
+            and sum(batch.extend_seq_lens_cpu) == metadata.total_seq_lens
+        )
 
     def dequant_staged(
         self,
@@ -1356,7 +1405,10 @@ class EngramEmbedding(nn.Module):
         if self.lookup == EngramLookup.REDUCE_SCATTER:
             out = self._dp_reduce_scatter_lookup(ids, sizes)
         else:
-            out = self._dp_all_to_all_lookup(ids, sizes)
+            parallel = get_parallel()
+            out = self._all_to_all_lookup(
+                ids, sizes, parallel.tp_group, parallel.attn_dp_rank
+            )
         return out.view(*indices.shape, self.dim)
 
     def _dp_reduce_scatter_lookup(
@@ -1373,16 +1425,20 @@ class EngramEmbedding(nn.Module):
         group.reduce_scatter_tensor(local, values)
         return local
 
-    def _dp_all_to_all_lookup(
-        self, ids: torch.Tensor, sizes: list[int]
+    def _all_to_all_lookup(
+        self,
+        ids: torch.Tensor,
+        sizes: list[int],
+        group: GroupCoordinator,
+        rank: int,
     ) -> torch.Tensor:
         """Look up this rank's own hash columns for every token, then send each rank
         its part, 1/tp of the bytes a reduce-scatter moves. Hash ids are [token,
-        n-gram size, head], so the columns are in that order."""
-        parallel = get_parallel()
-        group = parallel.tp_group
-        k, n = self._cols_per_rank, sizes[parallel.attn_dp_rank]
-        start = parallel.tp_rank * k
+        n-gram size, head], so the columns are in that order. ``sizes`` and
+        ``rank`` describe token ownership in group order; that order must also
+        match the TP column shards established by the checkpoint loader."""
+        k, n = self._cols_per_rank, sizes[rank]
+        start = group.rank_in_group * k
         own = ids.flatten(1)[:, start : start + k].contiguous()
         values = self._owned_rows(own).view(own.shape[0], -1)
         recv = values.new_empty((self.tp_size * n, values.shape[1]))
