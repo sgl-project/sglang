@@ -1,12 +1,15 @@
 import os
 import socket
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from sglang.srt.utils.network import (
     _get_addrinfos_for_bind,
     bind_port,
+    find_process_using_port,
     get_free_port,
+    get_free_port_block,
     get_open_port,
     is_port_available,
     try_bind_socket,
@@ -152,6 +155,58 @@ class TestSocketUtilities(CustomTestCase):
                 self.assertGreater(port, occupied_port)
         finally:
             sock.close()
+
+
+# Pin the host's ephemeral floor so these do not depend on its
+# ip_local_port_range.
+@patch("sglang.srt.utils.network._ephemeral_port_low", return_value=32768)
+class TestFreePortBlock(CustomTestCase):
+    def test_block_is_free_and_below_ephemeral(self, _):
+        base = get_free_port_block(7)
+        self.assertIsNotNone(base)
+        self.assertGreaterEqual(base, 22000)
+        self.assertLessEqual(base + 6, 29999)
+        for port in range(base, base + 7):
+            self.assertTrue(is_port_available(port))
+
+    def test_held_and_avoided_ports_are_skipped(self, _):
+        low = get_free_port_block(10)
+        if low is None:
+            self.skipTest("no ten free ports below the ephemeral range")
+        # low..low+9 holds 8 three-port blocks; all 8 bases are tried.
+        held = bind_port(low + 1)
+        try:
+            base = get_free_port_block(
+                3, avoid={low + 5}, low=low, high=low + 9, attempts=8
+            )
+        finally:
+            held.close()
+        self.assertIn(base, {low + 2, low + 6, low + 7})
+
+    def test_ephemeral_range_from_1024_still_gives_a_block(self, mock_floor):
+        # Nothing in 22000-29999 is below this floor; the block comes from the
+        # whole range rather than from no block at all.
+        mock_floor.return_value = 1024
+        base = get_free_port_block(7)
+        self.assertIsNotNone(base)
+        self.assertGreaterEqual(base, 22000)
+        self.assertLessEqual(base + 6, 29999)
+
+    def test_no_free_block_returns_none(self, _):
+        # The caller then keeps its deterministic port plan.
+        self.assertIsNone(
+            get_free_port_block(3, avoid=range(22000, 22010), low=22000, high=22009)
+        )
+
+
+class TestFindProcessUsingPort(CustomTestCase):
+    def test_owner_in_another_pid_namespace_is_not_the_caller(self):
+        # psutil reports no pid for a socket of a process this one cannot see.
+        conn = SimpleNamespace(laddr=SimpleNamespace(port=12345), pid=None)
+        with patch(
+            "sglang.srt.utils.network.psutil.net_connections", return_value=[conn]
+        ):
+            self.assertIsNone(find_process_using_port(12345))
 
 
 class TestReservePort(CustomTestCase):

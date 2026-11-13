@@ -486,6 +486,10 @@ class DataParallelController:
         Returns:
             List of worker ports (same on all nodes after broadcast).
         """
+        if get_parallel().nnodes == 1 and get_exec().moe.elastic_ep_backend is None:
+            # No other node and no elastic-EP joiner asks for them, so skip the
+            # handshake socket at --port + DP_ATTENTION_HANDSHAKE_PORT_DELTA.
+            return worker_ports
         is_joiner = get_exec().moe.is_ep_scale_joiner
         if get_parallel().dist_init_addr is None or is_joiner:
             na = NetworkAddress(
@@ -713,7 +717,7 @@ class DataParallelController:
                     )
                     # compute zmq ports for this dp rank
                     rank_port_args = PortArgs.init_new(
-                        server_args, dp_rank, worker_ports
+                        server_args, dp_rank, worker_ports, engine_port_args=port_args
                     )
                     if get_exec().moe.is_ep_scale_joiner:
                         # Scale-joiner outputs return through the primary tokenizer.

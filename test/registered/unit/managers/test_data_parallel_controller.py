@@ -20,6 +20,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
 import msgspec.structs
+import zmq
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
@@ -36,6 +37,8 @@ from sglang.srt.managers.data_parallel_controller import (
 from sglang.srt.managers.io_struct import ActiveRanksOutput
 from sglang.srt.managers.load_snapshot import LoadSnapshot
 from sglang.srt.runtime_context import get_context
+from sglang.srt.server_args import DP_ATTENTION_HANDSHAKE_PORT_DELTA
+from sglang.srt.utils.network import try_bind_socket
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
@@ -174,6 +177,24 @@ class TestJoinerWorkerPortAdmission(CustomTestCase):
         self._launch_joiner(parallel, handshake, launch)
 
         self.assertEqual(launch.call_args.args[-1], [1002])
+
+
+class TestSingleNodeWorkerPortHandshake(CustomTestCase):
+    def test_server_on_handshake_port_does_not_block_launch(self):
+        # Another server listens at our --port + DP_ATTENTION_HANDSHAKE_PORT_DELTA.
+        # On one node nothing asks for the worker ports, so that is no conflict.
+        other = try_bind_socket(port=0, listen=True)
+        port = other.getsockname()[1] - DP_ATTENTION_HANDSHAKE_PORT_DELTA
+        controller = DataParallelController.__new__(DataParallelController)
+        controller.context = zmq.Context()
+        try:
+            with get_context().override_server_args(port=port, nnodes=1):
+                ports = controller._broadcast_worker_ports(MagicMock(), [7000, 7001])
+        finally:
+            other.close()
+            # destroy() closes any socket the call left open; term() would wait.
+            controller.context.destroy(linger=0)
+        self.assertEqual(ports, [7000, 7001])
 
 
 class TestLocalKvEventSources(CustomTestCase):
