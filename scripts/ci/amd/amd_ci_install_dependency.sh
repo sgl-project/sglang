@@ -437,6 +437,52 @@ fi
 #############################################
 # 4. Rebuild AITER if needed
 #############################################
+AITER_CACHE_KEY=""
+AITER_CACHE_LOCK=""
+AITER_CACHE_ROOT=/sgl-data/aiter-wheels
+AITER_CACHE_TOOL=/sglang-checkout/scripts/ci/amd/aiter_wheel_cache.py
+if [[ "${NEED_REBUILD}" == "true" && -z "${AITER_COMMIT_OVERRIDE:-}" ]]; then
+    AITER_IMAGE=$(docker inspect --format '{{.Image}}' "$CI_CONTAINER_NAME" 2>/dev/null || true)
+    AITER_CACHE_HOST=$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "/sgl-data"}}{{.Source}}{{end}}{{end}}' "$CI_CONTAINER_NAME" 2>/dev/null || true)
+    AITER_NAMESPACE="${GITHUB_EVENT_NAME:-local}:${GITHUB_REF:-local}"
+    if [[ -n "$AITER_CACHE_HOST" ]] && command -v flock >/dev/null 2>&1; then
+        AITER_ENVIRONMENT=$(docker exec "$CI_CONTAINER_NAME" python3 "$AITER_CACHE_TOOL" environment 2>/dev/null || true)
+        AITER_CACHE_KEY=$(python3 scripts/ci/amd/aiter_wheel_cache.py key \
+            --commit "$REPO_AITER_COMMIT" --image "$AITER_IMAGE" --arch "$IMAGE_GFX" \
+            --namespace "$AITER_NAMESPACE" --abi "$AITER_ENVIRONMENT" \
+            --input scripts/ci/amd/amd_ci_install_dependency.sh \
+            --input scripts/ci/amd/aiter_wheel_cache.py \
+            --input python/sglang/kernels/ops/attention/dsv4/asm/gfx950/mla_v4/mla_a8w8_qh64_qseqlen1_gqaratio64_nm.co \
+            2>/dev/null || true)
+    fi
+    if [[ -n "$AITER_CACHE_KEY" ]]; then
+        if python3 scripts/ci/amd/aiter_wheel_cache.py check-mount \
+            --host-root "$AITER_CACHE_HOST" --container "$CI_CONTAINER_NAME" \
+            && { exec {AITER_CACHE_LOCK}>"$AITER_CACHE_HOST/aiter-wheels/.locks/$AITER_CACHE_KEY"; } \
+            && flock "$AITER_CACHE_LOCK"; then
+            AITER_CACHED_WHEEL=$(docker exec "$CI_CONTAINER_NAME" python3 "$AITER_CACHE_TOOL" validate \
+                --directory "$AITER_CACHE_ROOT/$AITER_CACHE_KEY" --key "$AITER_CACHE_KEY" 2>/dev/null || true)
+            if [[ -n "$AITER_CACHED_WHEEL" ]]; then
+                echo "[CI-AITER-CHECK] Cache hit: $AITER_CACHE_KEY"
+                if docker exec "$CI_CONTAINER_NAME" pip install --no-deps --force-reinstall "$AITER_CACHED_WHEEL" \
+                    && docker exec "$CI_CONTAINER_NAME" rm -rf /sgl-workspace/aiter \
+                    && docker exec "$CI_CONTAINER_NAME" python3 -c 'import aiter, aiter_meta'; then
+                    NEED_REBUILD="false"
+                else
+                    echo "[CI-AITER-CHECK] Cache install failed; rebuilding"
+                    docker exec "$CI_CONTAINER_NAME" rm -rf "$AITER_CACHE_ROOT/$AITER_CACHE_KEY"
+                fi
+            else
+                echo "[CI-AITER-CHECK] Cache miss: $AITER_CACHE_KEY"
+                docker exec "$CI_CONTAINER_NAME" rm -rf "$AITER_CACHE_ROOT/$AITER_CACHE_KEY"
+            fi
+        else
+            echo "[CI-AITER-CHECK] Cache mount or lock unavailable; rebuilding without cache"
+            AITER_CACHE_KEY=""
+        fi
+    fi
+fi
+
 if [[ "${NEED_REBUILD}" == "true" ]]; then
     echo "[CI-AITER-CHECK] === AITER REBUILD START ==="
 
@@ -521,7 +567,33 @@ PY
         "
     fi
 
+    if [[ -n "$AITER_CACHE_KEY" ]]; then
+        if docker exec "$CI_CONTAINER_NAME" bash -c '
+            cd /sgl-workspace/aiter &&
+            rm -rf /tmp/aiter-wheel && mkdir -p /tmp/aiter-wheel &&
+            AITER_USE_SYSTEM_TRITON=1 GPU_ARCHS='"$IMAGE_GFX"' PREBUILD_KERNELS=0 \
+                pip wheel --no-deps --no-build-isolation --wheel-dir /tmp/aiter-wheel .
+        '; then
+            AITER_BUILT_ENVIRONMENT=$(docker exec "$CI_CONTAINER_NAME" python3 "$AITER_CACHE_TOOL" environment 2>/dev/null || true)
+            if [[ "$AITER_BUILT_ENVIRONMENT" != "$AITER_ENVIRONMENT" ]]; then
+                echo "[CI-AITER-CHECK] Build changed dependency ABI; not caching this wheel"
+            elif docker exec "$CI_CONTAINER_NAME" bash -c '
+                python3 '"$AITER_CACHE_TOOL"' publish --root '"$AITER_CACHE_ROOT"' \
+                    --key '"$AITER_CACHE_KEY"' --wheel /tmp/aiter-wheel/*.whl
+            '; then
+                echo "[CI-AITER-CHECK] Published cached wheel: $AITER_CACHE_KEY"
+            else
+                echo "[CI-AITER-CHECK] Wheel cannot be cached; keeping rebuilt installation"
+            fi
+        else
+            echo "[CI-AITER-CHECK] Wheel build failed; keeping rebuilt installation"
+        fi
+    fi
     echo "[CI-AITER-CHECK] === AITER REBUILD COMPLETE ==="
+fi
+
+if [[ -n "$AITER_CACHE_LOCK" ]]; then
+    exec {AITER_CACHE_LOCK}>&-
 fi
 
 echo "[CI-AITER-CHECK] === AITER VERSION CHECK END ==="
