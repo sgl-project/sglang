@@ -1016,8 +1016,8 @@ self-attention. H3 refiners and cross-attention do not inherit its quantized pat
 Use Linux with an Ascend 950 (A5), the CANN toolkit/operator packages, and a
 matching Torch/TorchNPU installation. Activate the Python environment that runs
 SGLang before building: the SDK's native extension uses that environment's Torch
-ABI. Keep SGLang's Torch 2.10 installation; the SDK's root `requirements.txt`
-pins Torch/TorchNPU 2.9 and must not replace it.
+ABI. Keep the Torch/TorchNPU versions required by your SGLang checkout; the SDK's
+root `requirements.txt` pins Torch/TorchNPU 2.9 and must not replace them.
 
 Build the fixed `3.2.0` release in a user-owned directory:
 
