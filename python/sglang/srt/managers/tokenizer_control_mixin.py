@@ -182,6 +182,10 @@ def _lora_load_needs_cleanup(results: List[LoRAUpdateOutput], lora_name: str) ->
     )
 
 
+class ProfileRequestError(RuntimeError):
+    """A profiling request conflicts with the scheduler's profiler state."""
+
+
 class TokenizerControlMixin:
     """Mixin for TokenizerManager's control-plane operations (weights, cache, lora,
     profile, internal state, etc.) -- everything that talks to the scheduler via
@@ -430,6 +434,8 @@ class TokenizerControlMixin:
     async def _execute_profile(self: TokenizerManager, req: ProfileReq):
         result = (await self.profile_communicator(req))[0]
         if not result.success:
+            if result.is_conflict:
+                raise ProfileRequestError(result.message)
             raise RuntimeError(result.message)
         return result
 

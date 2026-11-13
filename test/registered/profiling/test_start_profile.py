@@ -98,6 +98,11 @@ class TestStartProfile(CustomTestCase):
         response = requests.post(
             f"{DEFAULT_URL_FOR_TEST}/stop_profile",
         )
+        self.assertEqual(response.status_code, 200)
+        self._assert_refused(
+            requests.post(f"{DEFAULT_URL_FOR_TEST}/stop_profile"),
+            "Profiling is not in progress. Call /start_profile first.",
+        )
         self._check_non_empty_profile_dir()
 
     def test_start_profile_3(self):
@@ -110,17 +115,21 @@ class TestStartProfile(CustomTestCase):
 
     def test_start_profile_4_refusals(self):
         """A stop with nothing running, and a deferred (start_step) start while
-        a profile runs, are refused with the scheduler's error surfaced as a
-        bare 500; the running profile is unaffected and stops normally. Runs
+        a profile runs, return a conflict with the scheduler's explanation;
+        the running profile is unaffected and stops normally. Runs
         after test_start_profile_3, whose num_steps profile stopped itself."""
-        self._assert_refused(requests.post(f"{DEFAULT_URL_FOR_TEST}/stop_profile"))
+        self._assert_refused(
+            requests.post(f"{DEFAULT_URL_FOR_TEST}/stop_profile"),
+            "Profiling is not in progress. Call /start_profile first.",
+        )
 
         self._start_profile()
         self._assert_refused(
             requests.post(
                 f"{DEFAULT_URL_FOR_TEST}/start_profile",
                 json={"start_step": "1", "num_steps": 1},
-            )
+            ),
+            "Profiling is already in progress. Call /stop_profile first.",
         )
         self._post_request()
         response = requests.get(f"{DEFAULT_URL_FOR_TEST}/stop_profile")
@@ -128,9 +137,9 @@ class TestStartProfile(CustomTestCase):
         self.assertEqual(response.text, "Stop profiling. This will take some time.\n")
         self._check_non_empty_profile_dir()
 
-    def _assert_refused(self, response):
-        self.assertEqual(response.status_code, 500)
-        self.assertEqual(response.text, "Internal Server Error")
+    def _assert_refused(self, response, message):
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(response.json()["message"], message)
 
     def _start_profile(self, **kwargs):
         """Start profiling with optional parameters."""
@@ -181,6 +190,11 @@ class TestStartProfileRustServer(TestStartProfile):
     profile requests to the scheduler itself."""
 
     env = {"SGLANG_RUST_SERVER": "1"}
+
+    def _assert_refused(self, response, message):
+        # The embedded Rust frontend has its own error mapping.
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(response.text, "Internal Server Error")
 
 
 class TestStartProfileWithNsys(CustomTestCase):
