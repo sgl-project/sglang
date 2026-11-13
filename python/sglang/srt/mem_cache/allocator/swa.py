@@ -67,14 +67,17 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         swa_kv_pool = getattr(kvcache, "swa_kv_pool", None)
 
         if page_size == 1:
-            self.full_attn_allocator = TokenToKVPoolAllocator(
+            token_allocator_cls = (
+                current_platform.get_token_allocator_cls() or TokenToKVPoolAllocator
+            )
+            self.full_attn_allocator = token_allocator_cls(
                 size,
                 dtype,
                 device,
                 full_kv_pool,
                 need_sort,
             )
-            self.swa_attn_allocator = TokenToKVPoolAllocator(
+            self.swa_attn_allocator = token_allocator_cls(
                 size_swa,
                 dtype,
                 device,
