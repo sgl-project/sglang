@@ -7,10 +7,12 @@ from dataclasses import dataclass
 
 import torch
 
-try:
-    from vsa import video_sparse_attn
-except ImportError:
-    video_sparse_attn = None
+video_sparse_attn = None
+if torch.cuda.is_available():
+    try:
+        from vsa import video_sparse_attn
+    except ImportError:
+        pass
 
 from typing import Any
 
@@ -123,8 +125,6 @@ def get_non_pad_index(
 
 
 class VideoSparseAttentionBackend(AttentionBackend):
-    accept_output_buffer: bool = True
-
     @staticmethod
     def get_supported_head_sizes() -> list[int]:
         return [64, 128]

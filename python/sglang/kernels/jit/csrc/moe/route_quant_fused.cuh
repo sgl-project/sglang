@@ -32,6 +32,7 @@ using RouteQuantTraitT = QuantTrait<
     fp8_e4m3_t,
     /*kGroupSize=*/32,
     /*kUe8m0=*/true,
+    /*kPackedScale=*/true,
     /*kRowMajor=*/true,
     /*kAligned=*/true,
     /*kFuseSiluAndMul=*/false>;
@@ -82,7 +83,7 @@ struct RouteQuantFusedKernel {
     auto N_ = SymbolicSize{"num_experts"};
     auto K_ = SymbolicSize{"topk"};
     auto device = SymbolicDevice{};
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
 
     auto score_dtype = SymbolicDType{};
     TensorMatcher({M_, N_})
