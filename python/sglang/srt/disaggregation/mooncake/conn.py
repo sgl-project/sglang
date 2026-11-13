@@ -52,9 +52,11 @@ from sglang.srt.disaggregation.mooncake.utils import (
     check_mooncake_custom_mem_pool_enabled,
 )
 from sglang.srt.disaggregation.utils import (
+    align_window_tails,
     build_dsa_tail_transfer_blocks,
     build_transfer_entry_pairs,
     compute_mamba_state_slice_byte_blocks,
+    draft_kv_ring_row_pairs,
     filter_kv_indices_for_shard_rank,
     is_elided_entry,
     resolve_dcp_dst_entry_indices,
@@ -85,6 +87,15 @@ from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.network import NetworkAddress
 
 logger = logging.getLogger(__name__)
+
+_REPLICATED_STATE_TYPES = frozenset(
+    {
+        StateType.QSA_PENDING,
+        StateType.QSA_COMPRESSED,
+        StateType.DRAFT_RING,
+        StateType.REQUEST_ROW,
+    }
+)
 
 FAILED_SESSION_RECOVERIES = Counter(
     "sglang:failed_session_recoveries_total",
@@ -253,9 +264,7 @@ def _uses_flat_entry_layout(
     even on an MHA backend.
     """
     is_single_region_swa = (
-        state_type in (StateType.SWA, StateType.AUXILIARY_SWA)
-        and num_src_entries == 1
-        and num_dst_entries == 1
+        state_type == StateType.SWA and num_src_entries == 1 and num_dst_entries == 1
     )
     return mla_backend or force_flat or has_layer_ids or is_single_region_swa
 
@@ -1066,6 +1075,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             and self.state_tp_size != self.attn_tp_size
             and registration_info.dst_attn_tp_size != self.state_tp_size
             and not registration_info.dst_draft_rows_dcp_collapsed
+            # A DFLASH draft KV ring has no draft KV entries to reslice: it
+            # sends its replicated window rows as a DRAFT_RING state instead.
+            and StateType.DRAFT_RING not in self.kv_args.state_types
         ):
             # Appended draft MHA KV uses physical TP shards, while target MLA
             # KV is replicated. The draft transfer cannot reslice those shards.
@@ -1127,7 +1139,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     dst_item_lens=dst_item_lens,
                     state_type=st,
                     force_flat=(
-                        st in (StateType.QSA_PENDING, StateType.QSA_COMPRESSED)
+                        st in _REPLICATED_STATE_TYPES
                         or get_memory().enable_unified_memory
                     ),
                     src_layer_ids=(
@@ -2167,11 +2179,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         (not the mamba-state path); subclasses extend for hardware components."""
         return st in (
             StateType.SWA,
-            StateType.AUXILIARY_SWA,
             StateType.DSA,
             StateType.QSA_PENDING,
             StateType.QSA_COMPRESSED,
             StateType.SWA_RING,
+            StateType.DRAFT_RING,
             StateType.DSV4_REQUEST_STATE,
             StateType.REQUEST_ROW,
             StateType.BLOCK_SCALE,
@@ -2184,6 +2196,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             StateType.QSA_PENDING,
             StateType.QSA_COMPRESSED,
             StateType.SWA_RING,
+            StateType.DRAFT_RING,
             StateType.DSV4_REQUEST_STATE,
             StateType.REQUEST_ROW,
         )
@@ -2212,6 +2225,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
     ):
         rc = 0
         state_types = getattr(self.kv_args, "state_types", [])
+        prefill_state_indices = align_window_tails(
+            self.kv_args, prefill_state_indices, req.dst_state_indices
+        )
         for i, st in enumerate(state_types):
             indices = (
                 prefill_state_indices[i] if i < len(prefill_state_indices) else None
@@ -2344,6 +2360,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     StateType.QSA_PENDING,
                     StateType.QSA_COMPRESSED,
                 )
+                # Identical on every prefill rank that writes one decode rank: one
+                # region per entry, no head slicing, one elected sender.
+                is_replicated_state = st in _REPLICATED_STATE_TYPES
                 has_heterogeneous_attn_tp = (
                     target_rank_registration_info is not None
                     and self.attn_tp_size
@@ -2353,12 +2372,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     has_heterogeneous_attn_tp
                     and not self.is_mla_backend
                     and not self.is_hybrid_mla_backend
-                    and not is_qwen4_qsa_state
+                    and not is_replicated_state
                 )
-                if slice_kv_heads and st not in (
-                    StateType.SWA,
-                    StateType.AUXILIARY_SWA,
-                ):
+                if slice_kv_heads and st != StateType.SWA:
                     raise RuntimeError(
                         f"PD Disaggregation does NOT support PD different TP sizes for non-MLA {st.upper()} hybrid models yet."
                     )
@@ -2388,7 +2404,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             "prefill and decode entries: "
                             f"{layout_mismatches}"
                         )
-                if has_heterogeneous_attn_tp and is_qwen4_qsa_state:
+                if has_heterogeneous_attn_tp and is_replicated_state:
                     local_tp_rank_in_group = (
                         self.kv_args.engine_rank % self.attn_tp_size
                     )
@@ -2431,6 +2447,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         src_indices = src_indices[: len(dst_indices_local)]
                     else:
                         dst_indices_local = dst_indices_local[: len(src_indices)]
+                if st == StateType.DRAFT_RING:
+                    src_indices, dst_indices_local = draft_kv_ring_row_pairs(
+                        src_indices, dst_indices_local
+                    )
+                    if not src_indices:
+                        continue
                 if slice_kv_heads:
                     rc = (
                         self._send_swa_state_slice(
@@ -2467,8 +2489,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         # MHA branch would compute zero layers and ship nothing
                         # (same reason as in `send_kvcache`).
                         force_flat=(
-                            st in (StateType.QSA_PENDING, StateType.QSA_COMPRESSED)
-                            or get_memory().enable_unified_memory
+                            is_replicated_state or get_memory().enable_unified_memory
                         ),
                         src_layer_ids=src_state_layer_ids,
                         dst_layer_ids=dst_state_layer_ids,
@@ -3129,7 +3150,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 if staging_deferred:
                     continue
 
-                self._staging_outstanding[kv_chunk.room] -= 1
+                # A room started anew since this chunk was counted no longer
+                # counts it: the decrement and the report find nothing.
+                if kv_chunk.room in self._staging_outstanding:
+                    self._staging_outstanding[kv_chunk.room] -= 1
+                self.note_send_finished(kv_chunk.room, kv_chunk.send_record)
                 if self.enable_deferred_decode_kv_release:
                     # In-flight write finished; if aborted and nothing outstanding,
                     # the pages are idle -> release the held ack.
@@ -3166,6 +3191,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 # NOTE(shangming): Remove this when we make sure the transfer thread is bug-free
                 if kv_chunk is not None:
                     self.poison_deferred_ack_room(kv_chunk.room)
+                    # The worker stops: fail its room so that no page move
+                    # waits for a send it will never finish.
+                    self.record_failure(kv_chunk.room, f"Transfer worker failed: {e}")
+                    self.update_status(kv_chunk.room, KVPoll.Failed)
                 raise RuntimeError(
                     f"Transfer thread failed because of {e}. Prefill instance with bootstrap_port={self.bootstrap_port} is dead."
                 )
@@ -3418,8 +3447,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 trace_ctx=trace_ctx,
                 wait_event=wait_event,
                 indices_event=indices_event,
+                send_record=self.send_record(bootstrap_room),
             )
         )
+        self.note_send_enqueued(bootstrap_room)
 
     def get_session_id(self):
         return self.engine.get_session_id()
