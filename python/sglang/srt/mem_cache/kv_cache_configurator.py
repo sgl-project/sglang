@@ -374,6 +374,19 @@ def host_only_mamba_checkpoint() -> bool:
     return True
 
 
+def _draft_quant_config(draft_model_config: ModelConfig):
+    """The quant config the draft model keeps once built, which its `auto` KV
+    cache dtype resolves from; read before the draft loads."""
+    from sglang.srt.configs.load_config import LoadConfig
+    from sglang.srt.model_loader.loader import built_quant_config
+
+    load_config = LoadConfig(
+        download_dir=get_model().download_dir,
+        model_loader_extra_config=get_model().model_loader_extra_config,
+    )
+    return built_quant_config(draft_model_config, load_config)
+
+
 def draft_loc_space_scale(*, hf_config, use_mla_backend: bool, dcp_size: int) -> int:
     execution_width = (
         mla_attention_dcp_size(hf_config, dcp_size=dcp_size, is_nextn=True)
@@ -956,9 +969,10 @@ class KVCacheConfigurator:
                 raise ValueError(
                     f"Fused draft KV: the draft resolved its KV cache dtype to "
                     f"{self.kv_cache_dtype}, but its region inside the target's "
-                    f"pages holds {region_kv_dtype}. Set "
-                    "--speculative-draft-kv-cache-dtype explicitly so the region "
-                    "is sized in the draft's KV dtype."
+                    f"pages holds {region_kv_dtype}: the draft model keeps a "
+                    "quant config other than the one its class declares through "
+                    "own_quant_config. Set --speculative-draft-kv-cache-dtype "
+                    "explicitly so the region is sized in the draft's KV dtype."
                 )
         return placement
 
@@ -1327,25 +1341,21 @@ class KVCacheConfigurator:
             if self.model_config.is_multi_layer_eagle
             else 1
         )
-        # The region holds the draft's own KV, in the dtype the draft runner
-        # resolves for itself by the same rules: its explicit dtype, else the
-        # host's dtype standing in for an `auto` (given or by default) that the
-        # draft resolves from its own quant config only when it loads (checked
-        # when the draft binds). A region has typed views of its own, so a
-        # draft dtype other than the host's still fuses.
-        from sglang.srt.mem_cache.kv_cache_dtype import (
-            TORCH_DTYPE_TO_KV_CACHE_STR,
-            configure_kv_cache_dtype,
-        )
+        # The region holds the draft's KV in the dtype its runner will resolve
+        # (rechecked at bind); regions have their own typed views, so it may
+        # differ from the host's.
+        from sglang.srt.mem_cache.kv_cache_dtype import configure_kv_cache_dtype
 
+        kv_cache_dtype = get_model().kv_cache_dtype
         draft_kv_cache_dtype = get_spec().speculative_draft_kv_cache_dtype
-        if draft_kv_cache_dtype == "auto":
-            draft_kv_cache_dtype = None
+        resolves_auto = (
+            draft_kv_cache_dtype if draft_kv_cache_dtype is not None else kv_cache_dtype
+        ) == "auto"
         _, region_kv_dtype = configure_kv_cache_dtype(
-            server_args_kv_cache_dtype=TORCH_DTYPE_TO_KV_CACHE_STR.get(
-                self.kv_cache_dtype, "auto"
+            server_args_kv_cache_dtype=kv_cache_dtype,
+            quant_config=(
+                _draft_quant_config(aux.draft_model_config) if resolves_auto else None
             ),
-            model=None,
             model_dtype=aux.draft_model_config.dtype,
             is_draft_worker=True,
             is_dflash=self.spec_algorithm.is_dflash_family(),
