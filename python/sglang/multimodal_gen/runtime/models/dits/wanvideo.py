@@ -14,6 +14,7 @@ from sglang.kernels.ops.diffusion import (
     NVFP4_BIAS_GELU,
     BitExactFusionGate,
     can_use_linear_gelu,
+    flashinfer_rmsnorm_diagnostic_hint,
     fused_linear_gelu_tanh,
     fused_temb_table_slices,
     tensors_equal,
@@ -45,6 +46,8 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     RowParallelLinear,
     UnquantizedLinearMethod,
     apply_unquantized_linear,
+    pack_rows_into_one_buffer,
+    rows_of_one_buffer,
 )
 from sglang.multimodal_gen.runtime.layers.mlp import MLP
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
@@ -55,7 +58,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
 )
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     NDRotaryEmbedding,
-    _apply_rotary_emb,
+    RotaryEmbedding,
     apply_flashinfer_rope_qk_inplace,
 )
 from sglang.multimodal_gen.runtime.layers.visual_embedding import (
@@ -66,6 +69,7 @@ from sglang.multimodal_gen.runtime.layers.visual_embedding import (
 from sglang.multimodal_gen.runtime.managers.forward_context import (
     DENOISING_LOOP_STATE,
     get_forward_context,
+    request_allows_lossless,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
@@ -78,7 +82,8 @@ from sglang.multimodal_gen.runtime.platforms import (
 from sglang.multimodal_gen.runtime.platforms.aiter import USE_AITER
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.srt.utils import add_prefix, is_device_stream_capturing
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.utils import is_device_stream_capturing
 
 logger = init_logger(__name__)
 _is_cuda = current_platform.is_cuda()
@@ -403,6 +408,7 @@ class WanI2VCrossAttention(WanSelfAttention):
 
 
 _WAN_TEMB_SLICES = BitExactFusionGate("Wan fused temb-table slices")
+_WAN_QK_NORM_ROPE = BitExactFusionGate("Wan fused q/k RMSNorm+RoPE")
 
 
 def _eager_temb_table_slices(
@@ -438,26 +444,6 @@ def _wan_temb_table_slices(
     return _eager_temb_table_slices(table, temb)
 
 
-def _rows_of_one_buffer(parts: list[torch.Tensor]) -> torch.Tensor | None:
-    """``torch.cat(parts)`` without a copy, when the parts are consecutive equal-shape
-    rows of one buffer"""
-    first = parts[0]
-    start, nbytes = first.data_ptr(), first.nbytes
-    storage = first.untyped_storage()
-    if start + len(parts) * nbytes > storage.data_ptr() + storage.nbytes():
-        return None
-    for i, part in enumerate(parts):
-        if (
-            part.data_ptr() != start + i * nbytes
-            or part.shape != first.shape
-            or not part.is_contiguous()
-        ):
-            return None
-    return first.as_strided(
-        (len(parts) * first.shape[0], *first.shape[1:]), first.stride()
-    )
-
-
 class WanTransformerBlock(nn.Module):
     def __init__(
         self,
@@ -477,11 +463,15 @@ class WanTransformerBlock(nn.Module):
         super().__init__()
 
         # 1. Self-attention
+        # FlyDSL lowers FP32 modulation operands to BF16, so the denoising
+        # stage enables these sites only for quality="high" requests.
+        # SGLANG_USE_ROCM_FLYDSL=1 opts in; the quality gate still applies.
         self.norm1 = LayerNormScaleShift(
             dim,
             eps=eps,
             elementwise_affine=False,
             dtype=torch.float32,
+            rocm_flydsl_high_only=True,
         )
         self.to_q = ColumnParallelLinear(
             dim,
@@ -603,6 +593,14 @@ class WanTransformerBlock(nn.Module):
             eps=eps,
             elementwise_affine=True,
             dtype=torch.float32,
+            rocm_flydsl_high_only=True,
+        )
+
+        self.rotary_emb = RotaryEmbedding(
+            head_size=self.dim_head,
+            rotary_dim=self.dim_head,
+            is_neox_style=False,
+            use_precomputed_cache=False,
         )
 
         # 2. Cross-attention
@@ -636,6 +634,7 @@ class WanTransformerBlock(nn.Module):
             eps=eps,
             elementwise_affine=False,
             dtype=torch.float32,
+            rocm_flydsl_high_only=True,
         )
 
         # 3. Feed-forward
@@ -652,6 +651,7 @@ class WanTransformerBlock(nn.Module):
             eps=eps,
             elementwise_affine=False,
             dtype=torch.float32,
+            rocm_flydsl_high_only=True,
         )
 
         self.scale_shift_table = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
@@ -674,13 +674,8 @@ class WanTransformerBlock(nn.Module):
         )
         if not self.qkv_fusable:
             return
-        with torch.no_grad():
-            weight = torch.cat([layer.weight for layer in layers])
-            bias = torch.cat([layer.bias for layer in layers])
-        rows = self.to_q.weight.shape[0]
-        for i, layer in enumerate(layers):
-            layer.weight.data = weight[i * rows : (i + 1) * rows]
-            layer.bias.data = bias[i * rows : (i + 1) * rows]
+        pack_rows_into_one_buffer([layer.weight for layer in layers])
+        pack_rows_into_one_buffer([layer.bias for layer in layers])
 
     def _fused_qkv(
         self, device: torch.device
@@ -697,8 +692,8 @@ class WanTransformerBlock(nn.Module):
             or self.to_q.weight.device != device
         ):
             return None
-        weight = _rows_of_one_buffer([layer.weight for layer in layers])
-        bias = _rows_of_one_buffer([layer.bias for layer in layers])
+        weight = rows_of_one_buffer([layer.weight for layer in layers])
+        bias = rows_of_one_buffer([layer.bias for layer in layers])
         if weight is None or bias is None:
             return None
         return weight, bias
@@ -723,7 +718,13 @@ class WanTransformerBlock(nn.Module):
     def _project_qkv(
         self, norm_hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        fused = self._fused_qkv(norm_hidden_states.device)
+        # one GEMM over the packed rows rounds apart from the three projections
+        # at some shapes (cuBLAS split-K at small token counts)
+        fused = (
+            self._fused_qkv(norm_hidden_states.device)
+            if request_allows_lossless()
+            else None
+        )
         if fused is not None:
             qkv = apply_unquantized_linear(norm_hidden_states, *fused)
             return qkv.split(self.to_q.weight.shape[0], dim=-1)
@@ -752,7 +753,54 @@ class WanTransformerBlock(nn.Module):
                 )
                 for x, norm in ((query, self.norm_q), (key, self.norm_k))
             )
+            and self._qk_norm_rope_verified(query, key, rope_cos_sin_cache)
         )
+
+    def _qk_norm_rope_verified(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        rope_cos_sin_cache: torch.Tensor,
+    ) -> bool:
+        """Whether the fused q/k norm + RoPE gives the bits of the norm then the
+        RoPE; the first call compares them on copies of this call's q/k."""
+        gate = _WAN_QK_NORM_ROPE
+        if gate.disabled or gate.verified:
+            return not gate.disabled
+        if not gate.can_attempt_once():
+            return False
+        qk_norms = ((query, self.norm_q), (key, self.norm_k))
+
+        def fused():
+            return [
+                fused_rmsnorm_interleaved_rope_(
+                    x.reshape(-1, x.shape[-1]).clone(),
+                    norm.weight,
+                    rope_cos_sin_cache,
+                    norm.variance_epsilon,
+                    self.dim_head,
+                )
+                for x, norm in qk_norms
+            ]
+
+        def reference():
+            q, k = (
+                norm(x).squeeze(1).unflatten(2, (-1, self.dim_head))
+                for x, norm in qk_norms
+            )
+            q, k = apply_flashinfer_rope_qk_inplace(
+                q, k, rope_cos_sin_cache, is_neox=False
+            )
+            return [x.reshape(-1, x.shape[-2] * x.shape[-1]) for x in (q, k)]
+
+        gate.run(
+            fused,
+            reference,
+            equal=tensors_equal,
+            logger=logger,
+            diagnostic_hint=flashinfer_rmsnorm_diagnostic_hint,
+        )
+        return gate.verified
 
     def _attend_qk_filled(
         self,
@@ -940,6 +988,8 @@ class WanTransformerBlock(nn.Module):
         ffn_residual: tuple[torch.Tensor, torch.Tensor] | None = None,
         defer_ffn_residual: bool = False,
         text_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
+        *,
+        complex_freqs: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
         """``ffn_residual`` is the previous block's (ff_output, gate), still to be added
         to ``hidden_states``; ``defer_ffn_residual`` hands this block's back the same way.
@@ -984,7 +1034,12 @@ class WanTransformerBlock(nn.Module):
         attn_output = self._attend_qk_filled(query, key, value, rope_cos_sin_cache)
         if attn_output is None:
             attn_output = self._self_attention(
-                query, key, value, freqs_cis, rope_cos_sin_cache
+                query,
+                key,
+                value,
+                freqs_cis,
+                rope_cos_sin_cache,
+                complex_freqs=complex_freqs,
             )
         attn_output = attn_output.flatten(2)
         return self._cross_and_ffn(
@@ -1007,6 +1062,8 @@ class WanTransformerBlock(nn.Module):
         value: torch.Tensor,
         freqs_cis: tuple[torch.Tensor, torch.Tensor],
         rope_cos_sin_cache: torch.Tensor | None,
+        *,
+        complex_freqs: torch.Tensor | None = None,
     ) -> torch.Tensor:
         query, key, value, roped = self._norm_qk(
             query, key, value, self.local_num_heads, rope_cos_sin_cache
@@ -1016,21 +1073,6 @@ class WanTransformerBlock(nn.Module):
         cos, sin = freqs_cis
         if roped:
             pass
-        elif _is_cuda and query.shape == key.shape:
-            # The concatenated cache only depends on freqs_cis, which is fixed
-            # for the whole forward; the transformer builds it once per call.
-            cos_sin_cache = rope_cos_sin_cache
-            if cos_sin_cache is None:
-                cos_sin_cache = torch.cat(
-                    [
-                        cos.to(dtype=torch.float32).contiguous(),
-                        sin.to(dtype=torch.float32).contiguous(),
-                    ],
-                    dim=-1,
-                )
-            query, key = apply_flashinfer_rope_qk_inplace(
-                query, key, cos_sin_cache, is_neox=False
-            )
         elif USE_AITER:
             query_shape = query.shape
             key_shape = key.shape
@@ -1051,9 +1093,13 @@ class WanTransformerBlock(nn.Module):
             query = q_sbhd.view(query_shape)
             key = k_sbhd.view(key_shape)
         else:
-            query, key = (
-                _apply_rotary_emb(query, cos, sin, is_neox_style=False),
-                _apply_rotary_emb(key, cos, sin, is_neox_style=False),
+            query, key = self.rotary_emb(
+                query=query,
+                key=key,
+                complex_freqs=complex_freqs,
+                cos=cos,
+                sin=sin,
+                cos_sin_cache=rope_cos_sin_cache,
             )
 
         if (
@@ -1166,6 +1212,12 @@ class WanTransformerBlock_VSA(nn.Module):
             dtype=torch.float32,
         )
 
+        self.rotary_emb = RotaryEmbedding(
+            head_size=dim_head,
+            rotary_dim=dim_head,
+            is_neox_style=False,
+            use_precomputed_cache=False,
+        )
         # 2. Cross-attention
         cross_attn_backends = {
             b for b in supported_attention_backends if not b.is_sparse
@@ -1217,6 +1269,8 @@ class WanTransformerBlock_VSA(nn.Module):
         temb: torch.Tensor,
         freqs_cis: tuple[torch.Tensor, torch.Tensor],
         rope_cos_sin_cache: torch.Tensor | None = None,
+        *,
+        complex_freqs: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if hidden_states.dim() == 4:
             hidden_states = hidden_states.squeeze(1)
@@ -1250,22 +1304,7 @@ class WanTransformerBlock_VSA(nn.Module):
 
         # Apply rotary embeddings
         cos, sin = freqs_cis
-        if _is_cuda and query.shape == key.shape:
-            # The concatenated cache only depends on freqs_cis, which is fixed
-            # for the whole forward; the transformer builds it once per call.
-            cos_sin_cache = rope_cos_sin_cache
-            if cos_sin_cache is None:
-                cos_sin_cache = torch.cat(
-                    [
-                        cos.to(dtype=torch.float32).contiguous(),
-                        sin.to(dtype=torch.float32).contiguous(),
-                    ],
-                    dim=-1,
-                )
-            query, key = apply_flashinfer_rope_qk_inplace(
-                query, key, cos_sin_cache, is_neox=False
-            )
-        elif USE_AITER:
+        if USE_AITER:
             query_shape = query.shape
             key_shape = key.shape
             num_tokens = query.shape[:-2].numel()
@@ -1285,9 +1324,13 @@ class WanTransformerBlock_VSA(nn.Module):
             query = q_sbhd.view(query_shape)
             key = k_sbhd.view(key_shape)
         else:
-            query, key = (
-                _apply_rotary_emb(query, cos, sin, is_neox_style=False),
-                _apply_rotary_emb(key, cos, sin, is_neox_style=False),
+            query, key = self.rotary_emb(
+                query=query,
+                key=key,
+                complex_freqs=complex_freqs,
+                cos=cos,
+                sin=sin,
+                cos_sin_cache=rope_cos_sin_cache,
             )
 
         attn_output = self.attn1(query, key, value, gate_compress=gate_compress)
@@ -1382,6 +1425,12 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             eps=config.eps,
             elementwise_affine=False,
             dtype=torch.float32,
+            # norm_out is shared with the VSA block, which has not been validated
+            # with FlyDSL; keep its previous default until that path is tested.
+            rocm_flydsl_high_only=(
+                (get_global_server_args().attention_backend or "").lower()
+                != "video_sparse_attn"
+            ),
         )
         self.proj_out = ColumnParallelLinear(
             inner_dim,
@@ -1599,6 +1648,11 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 if freqs_cos is not None
                 else None
             )
+            complex_freqs = (
+                torch.complex(freqs_cos.float(), freqs_sin.float()).unsqueeze(-2)
+                if freqs_cos is not None
+                else None
+            )
 
         # token-major straight from the patchify GEMM, no [B, C, T, H, W] round trip
         hidden_states = self.patch_embedding(hidden_states, tokens=True).contiguous()
@@ -1631,6 +1685,9 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 hidden_states.device,
             )
             freqs_cis = (freqs_cos.float(), freqs_sin.float())
+            complex_freqs = torch.complex(
+                freqs_cos.float(), freqs_sin.float()
+            ).unsqueeze(-2)
 
         # timestep shape: batch_size, or batch_size, seq_len (wan 2.2 ti2v)
         if timestep.dim() == 2:
@@ -1738,6 +1795,7 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                         rope_cos_sin_cache=rope_cos_sin_cache,
                         ffn_residual=ffn_residual,
                         defer_ffn_residual=True,
+                        complex_freqs=complex_freqs,
                         **kv_kwargs,
                     )
                 hidden_states = self.blocks[-1](
@@ -1747,6 +1805,7 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                     freqs_cis,
                     rope_cos_sin_cache=rope_cos_sin_cache,
                     ffn_residual=ffn_residual,
+                    complex_freqs=complex_freqs,
                     **text_kv_kwargs[-1],
                 )
             else:
@@ -1757,6 +1816,7 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                         timestep_proj,
                         freqs_cis,
                         rope_cos_sin_cache=rope_cos_sin_cache,
+                        complex_freqs=complex_freqs,
                         **kv_kwargs,
                     )
             # if teacache is enabled, we need to cache the original hidden states
