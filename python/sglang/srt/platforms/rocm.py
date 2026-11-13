@@ -19,6 +19,10 @@ class RocmDeviceMixin(CudaDeviceMixin):
     # device_type stays "cuda" — torch.device("cuda") is the only valid
     # device-type string for HIP devices in PyTorch.
 
+    def get_vmm_backend_class(self) -> None:
+        # CudaVmmBackend calls the CUDA driver API, which this platform does not provide
+        return None
+
 
 class RocmSRTPlatform(RocmDeviceMixin, SRTPlatform):
     """Default in-tree ROCm SRT platform."""

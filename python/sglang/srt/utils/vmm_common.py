@@ -218,14 +218,6 @@ def exchange_posix_fds(
             pass
 
 
-def visible_physical_device_ids(env_name: str, device_count: int) -> List[str]:
-    """Physical ids of the devices this process sees, by local ordinal, from a device-visibility variable such as CUDA_VISIBLE_DEVICES."""
-    value = os.environ.get(env_name)
-    if not value:
-        return [str(ordinal) for ordinal in range(device_count)]
-    return [entry.strip() for entry in value.split(",")][:device_count]
-
-
 def exchange_exported_handles(
     fabric_handles: List[bytes],
     local_fds: List[int],
