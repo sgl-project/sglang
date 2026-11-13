@@ -53,6 +53,8 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.layers.utils.layer_list import make_pp_layers
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -61,7 +63,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
-from sglang.srt.utils import LazyValue, add_prefix, is_cuda, make_pp_layers
+from sglang.srt.utils import LazyValue, is_cuda
 
 logger = logging.getLogger(__name__)
 
@@ -197,7 +199,10 @@ class ExaoneMoESparseMoEBlock(nn.Module):
                 prefix=add_prefix("shared_experts", prefix),
                 **(
                     dict(parallel_group="replicated")
-                    if get_moe_a2a_backend().is_deepep()
+                    if (
+                        get_moe_a2a_backend().is_deepep()
+                        or get_moe_a2a_backend().is_ascend_ops()
+                    )
                     else {}
                 ),
             )
@@ -269,7 +274,7 @@ class ExaoneMoESparseMoEBlock(nn.Module):
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
-        if get_moe_a2a_backend().is_deepep():
+        if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_ascend_ops():
             return self._forward_deepep(hidden_states, forward_batch)
 
         if (

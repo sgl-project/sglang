@@ -17,7 +17,7 @@ import logging
 import re
 from array import array
 from functools import lru_cache
-from typing import Iterable, List, Optional, Set, Tuple, TypedDict, Union
+from typing import Iterable, List, Optional, Set, Tuple, Union
 
 import torch
 from torch import nn
@@ -30,6 +30,7 @@ from transformers import (
 )
 
 from sglang.srt.environ import envs
+from sglang.srt.hf_transformers import get_processor
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.layers.layernorm import Gemma4RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
@@ -37,6 +38,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.utils import PPMissingLayer
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.managers.mm_utils import (
     general_mm_embed_routine,
@@ -59,14 +61,7 @@ from sglang.srt.models.gemma4_causal import (
 from sglang.srt.models.gemma4_vision import Gemma4VisionEncoder
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import (
-    add_prefix,
-    cpu_has_amx_support,
-    flatten_nested_list,
-    is_cpu,
-    is_xpu,
-)
-from sglang.srt.utils.hf_transformers import get_processor
+from sglang.srt.utils import cpu_has_amx_support, flatten_nested_list, is_cpu, is_xpu
 
 logger = logging.getLogger(__name__)
 
@@ -74,18 +69,6 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 
 cached_get_processor = lru_cache(get_processor)
-
-
-class Gemma4ImagePixelInputs(TypedDict):
-    pixel_values: torch.Tensor
-    """Shape: `(batch_size * num_images, num_channels, height, width)`"""
-
-
-class Gemma4AudioInputs(TypedDict):
-    input_features_padded: torch.Tensor
-    """Shape: `(batch_size * num_audio, seq_length, num_features)`"""
-    input_features_mask: torch.Tensor
-    """Shape: `(batch_size * num_audio, seq_length)`"""
 
 
 class Gemma4MultimodalEmbedder(nn.Module):
@@ -305,11 +288,6 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
     def get_input_embeddings(self) -> nn.Embedding:
         return self.language_model.get_input_embeddings()
 
-    def get_embed_and_head(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Gemma 4 multimodal ties its LM head to the text embed_tokens
-        embed = self.language_model.embed_tokens.weight
-        return embed, embed
-
     def get_attention_sliding_window_size(self):
         return getattr(self.config.text_config, "sliding_window", -1) - 1
 
@@ -351,7 +329,9 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             return
         attn_backend = get_attn_backend()
         prefill_backend = getattr(attn_backend, "prefill_backend", attn_backend)
-        if getattr(prefill_backend, "fa_impl_ver", None) == 4:
+        if getattr(prefill_backend, "fa_impl_ver", None) == 4 or getattr(
+            prefill_backend, "fa3_upgrades_to_fa4", False
+        ):
             # O(query tokens) metadata instead of a dense Q x KV mask. Keep
             # absolute ranges so cached text prefixes retain the right offset.
             lengths = forward_batch.extend_seq_lens_cpu
@@ -720,6 +700,10 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
                 input_ids,
                 mask_dtype=torch.bool,
             )
+
+        # Graph PLE lookup needs the IDs from before multimodal embedding clamps them.
+        if is_first_rank and forward_batch.contains_mm_inputs():
+            input_ids = input_ids.clone()
 
         # general_mm_embed_routine already handles PP: it skips the embedding
         # work on non-first ranks and forwards pp_proxy_tensors via **kwargs.

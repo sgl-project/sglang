@@ -35,12 +35,31 @@ from typing import Callable, Dict, List, Optional, Tuple, Union
 from typing_extensions import Literal
 
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
-from sglang.srt.utils import (
-    GLM_MEDIA_CONFIG_KEYS,
-    ImageData,
-    VideoData,
-    read_system_prompt_from_file,
-)
+from sglang.srt.multimodal.media_io import GLM_MEDIA_CONFIG_KEYS, ImageData, VideoData
+from sglang.srt.utils.common import find_local_repo_dir
+
+
+def read_system_prompt_from_file(model_name: str) -> str:
+    """Read system prompt from a file in the HuggingFace cache directory.
+
+    Args:
+        model_name: The model name to construct the file path
+
+    Returns:
+        The system prompt content from the file, or empty string if file not found
+    """
+    try:
+        local_repo_dir = find_local_repo_dir(model_name)
+        if local_repo_dir:
+            system_prompt_file = os.path.join(local_repo_dir, "SYSTEM_PROMPT.txt")
+            if os.path.exists(system_prompt_file):
+                with open(system_prompt_file, "r", encoding="utf-8") as f:
+                    return f.read()
+
+        return ""
+    except Exception:
+        # If anything fails, return empty string
+        return ""
 
 
 class SeparatorStyle(IntEnum):
@@ -417,10 +436,6 @@ class Conversation:
         else:
             raise ValueError(f"Invalid style: {self.sep_style}")
 
-    def set_system_message(self, system_message: str):
-        """Set the system message."""
-        self.system_message = system_message
-
     def append_message(self, role: str, message: str):
         """Append a new message."""
         self.messages.append([role, message])
@@ -441,39 +456,6 @@ class Conversation:
     def append_audio(self, audio: str):
         """Append a new audio."""
         self.audio_data.append(audio)
-
-    def update_last_message(self, message: str):
-        """Update the last output.
-
-        The last message is typically set to be None when constructing the prompt,
-        so we need to update it in-place after getting the response from a model.
-        """
-        self.messages[-1][1] = message
-
-    def to_gradio_chatbot(self):
-        """Convert the conversation to gradio chatbot format."""
-        ret = []
-        for i, (role, msg) in enumerate(self.messages[self.offset :]):
-            if i % 2 == 0:
-                ret.append([msg, None])
-            else:
-                ret[-1][-1] = msg
-        return ret
-
-    def to_openai_api_messages(self):
-        """Convert the conversation to OpenAI chat completion format."""
-        if self.system_message == "":
-            ret = []
-        else:
-            ret = [{"role": "system", "content": self.system_message}]
-
-        for i, (_, msg) in enumerate(self.messages[self.offset :]):
-            if i % 2 == 0:
-                ret.append({"role": "user", "content": msg})
-            else:
-                if msg is not None:
-                    ret.append({"role": "assistant", "content": msg})
-        return ret
 
     def copy(self):
         return Conversation(

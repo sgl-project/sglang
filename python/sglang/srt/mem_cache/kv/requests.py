@@ -7,6 +7,9 @@ the tracking slots it cycles through. Ids only: the bytes live in the arena, and
 the allocator's id spaces translate the ids a row holds. Row 0 is padding:
 CUDA-graph padded batches read and write it.
 
+Each usable row is in one `RowState`, changed only by the table's methods, so
+what holds the rows is counted, not derived from the free list's length.
+
 The scheduler, the attention backends and the speculative workers read the
 columns under the names a static request pool gives them, so one request
 table serves both placements.
@@ -14,14 +17,16 @@ table serves both placements.
 
 from __future__ import annotations
 
+import enum
 import logging
 import os
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
 
 import msgspec
 import torch
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
+from sglang.srt.utils.device import async_h2d
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 if TYPE_CHECKING:
@@ -43,6 +48,59 @@ class StateTracking(msgspec.Struct, frozen=True, kw_only=True):
     initial_slots: int
 
 
+class RowResets:
+    """Rows handed out whose request-scoped device state is not reset yet.
+
+    Handing out a reused row only marks it; the next `ModelRunner.forward`
+    resets it on the forward stream, outside every CUDA graph."""
+
+    def __init__(self, reset: Optional[Callable[[List[int]], None]]) -> None:
+        self._reset = reset
+        self._rows: set[int] = set()
+
+    def mark(self, rows: List[int]) -> None:
+        """``rows`` were handed out: reset them before their first forward."""
+        if self._reset is not None:
+            self._rows.update(rows)
+
+    def apply(self) -> None:
+        """Reset the marked rows, on the current stream."""
+        if not self._rows:
+            return
+        rows = sorted(self._rows)
+        self._rows.clear()
+        self._reset(rows)
+
+
+class RowState(enum.IntEnum):
+    """Who holds a request row.
+
+    - FREE: on the free list.
+    - ACTIVE: a request's, running or waiting; a PD decode node's
+      preallocated receive row is one too.
+    - PARKED: a streaming session's between turns: no work runs on it, and it
+      comes back only when the session closes.
+    - HELD: bound to no request (beam search members, a retained document
+      window); it comes back when its holder ends.
+    """
+
+    FREE = 0
+    ACTIVE = 1
+    PARKED = 2
+    HELD = 3
+
+
+_HOLDING = (RowState.ACTIVE, RowState.PARKED, RowState.HELD)
+
+
+class RowUnits(msgspec.Struct, frozen=True, kw_only=True):
+    """What binds the request sub-pools' units to request rows (device ids)
+    and frees them: False from ``bind`` when they do not fit."""
+
+    bind: Callable[[torch.Tensor], bool]
+    free: Callable[[torch.Tensor], None]
+
+
 class RequestTable:
     """The rows requests hold, and in each row the ids of the plan's sub-pools."""
 
@@ -56,6 +114,7 @@ class RequestTable:
         tracking: Optional[StateTracking],
         device: str,
         enable_memory_saver: bool,
+        reserved_rows: Optional[int] = None,
     ):
         assert (state_sub_pool is None) == (tracking is None), (
             "a state sub-pool comes with its tracking, and only then"
@@ -63,7 +122,10 @@ class RequestTable:
         # Running requests; rows for preallocated transfers come on top.
         self.size = size
         self.pre_alloc_size = pre_alloc_size
-        self._num_rows = size + pre_alloc_size + 1
+        self._num_rows = (
+            reserved_rows if reserved_rows is not None else size + pre_alloc_size + 1
+        )
+        assert self._num_rows >= size + pre_alloc_size + 1
         self.max_context_len = max_context_len
         self.device = device
         self.state_sub_pool = state_sub_pool
@@ -74,10 +136,16 @@ class RequestTable:
             self.req_to_token = torch.zeros(
                 (self._num_rows, max_context_len), dtype=torch.int32, device=device
             )
-        self.free_slots = list(range(1, self._num_rows))
+        self._reset_rows()
+        # Run by `clear`, after every row went back: what keeps per-row or
+        # per-request state beside the table forgets it there.
+        self._clear_hooks: List[Callable[[], None]] = []
         # Bumped on every hand-out: a reader detects a reused row by comparing
         # the generation it stored.
         self.req_generation = torch.zeros(self._num_rows, dtype=torch.int64)
+        # Binds and frees the request sub-pools' units of rows, with the rows
+        # (`bind_row_units`); None without request sub-pools.
+        self._row_units: Optional[RowUnits] = None
 
         tracking = tracking or StateTracking(
             extra_buffer=False, lazy=False, track_slots=0, initial_slots=0
@@ -98,6 +166,17 @@ class RequestTable:
                     device=device,
                 )
 
+    def bind_row_units(self, units: RowUnits) -> None:
+        """Every row handed out from now on holds a unit of each request
+        sub-pool until it goes back."""
+        assert self._row_units is None, "the table binds one unit owner"
+        self._row_units = units
+
+    @property
+    def binds_row_units(self) -> bool:
+        """Whether a row handed out takes a unit of every request sub-pool."""
+        return self._row_units is not None
+
     @property
     def holds_state_slots(self) -> bool:
         """Whether a row names its request's state slot."""
@@ -108,9 +187,32 @@ class RequestTable:
     def available_size(self) -> int:
         return len(self.free_slots)
 
+    def count(self, state: RowState) -> int:
+        """How many usable rows are in ``state``."""
+        return self._state_counts[state]
+
+    def state_of(self, row: int) -> RowState:
+        return self._row_state[row]
+
+    def _reset_rows(self) -> None:
+        self.free_slots = list(range(1, self.size + self.pre_alloc_size + 1))
+        self._row_state = [RowState.FREE] * self._num_rows
+        self._state_counts = [0] * len(RowState)
+        self._state_counts[RowState.FREE] = len(self.free_slots)
+
+    def _move(self, row: int, sources: Tuple[RowState, ...], to: RowState) -> None:
+        state = self._row_state[row]
+        assert state in sources, (
+            f"request row {row} is {state.name}, expected "
+            + " or ".join(s.name for s in sources)
+        )
+        self._row_state[row] = to
+        self._state_counts[state] -= 1
+        self._state_counts[to] += 1
+
     def alloc(self, reqs: List[Req]) -> Optional[List[int]]:
-        """Bind a row to each request that holds none (a later chunk keeps its
-        own); None when too few rows are free."""
+        """Bind a row to each request that holds none; None when too few are
+        free. A borrowed parked row stays parked until `unpark`."""
         reusing = [r for r in reqs if r.kv.holds_kv]
         assert all(r.kv.kv_allocated_len > 0 for r in reusing), (
             "a reused row must carry allocated KV"
@@ -124,18 +226,34 @@ class RequestTable:
                 r.kv.req_pool_idx = next(fresh)
         return [r.kv.req_pool_idx for r in reqs]
 
-    def alloc_rows(self, need_size: int) -> Optional[List[int]]:
-        """Take rows from the tail of the free list, with no request bound."""
+    def alloc_rows(
+        self, need_size: int, *, state: RowState = RowState.ACTIVE
+    ) -> Optional[List[int]]:
+        """Take rows from the tail of the free list into ``state``, with no
+        request bound."""
+        assert state is not RowState.FREE
         if need_size > len(self.free_slots):
             return None
         if need_size == 0:
             return []
         rows = self.free_slots[-need_size:]
+        if self._row_units is not None and not self._row_units.bind(
+            async_h2d(rows, dtype=torch.int64, device=self.device)
+        ):
+            return None
         del self.free_slots[-need_size:]
+        for row in rows:
+            self._move(row, (RowState.FREE,), state)
         self.req_generation[rows] += 1
         return rows
 
     def free_rows(self, rows: List[int]) -> None:
+        """Give rows back, from any state but FREE: a second release of a row
+        fails here instead of handing it out twice."""
+        for row in rows:
+            self._move(row, _HOLDING, RowState.FREE)
+        if self._row_units is not None and rows:
+            self._row_units.free(async_h2d(rows, dtype=torch.int64, device=self.device))
         self.free_slots.extend(rows)
 
     def free(self, req: Req) -> None:
@@ -143,17 +261,38 @@ class RequestTable:
         self.free_rows([req.kv.req_pool_idx])
         req.kv.req_pool_idx = None
 
+    def park(self, row: int) -> None:
+        """A streaming session keeps the row between turns (a retracted turn
+        parks it again)."""
+        self._move(row, (RowState.ACTIVE, RowState.PARKED), RowState.PARKED)
+
+    def unpark(self, row: int) -> None:
+        """Work runs on the row again: the next turn was allocated (every
+        chunk of it says so)."""
+        self._move(row, (RowState.PARKED, RowState.ACTIVE), RowState.ACTIVE)
+
+    def hold(self, row: int) -> None:
+        """A request's row passes to a holder that is no request."""
+        self._move(row, (RowState.ACTIVE,), RowState.HELD)
+
+    def add_clear_hook(self, hook: Callable[[], None]) -> None:
+        self._clear_hooks.append(hook)
+
     def write(self, indices, values) -> None:
         self.req_to_token[indices] = values
 
     def clear(self) -> None:
+        """Every row goes back, a session's parked row too (the cache reset
+        forgets the session's record)."""
         logger.info("Reset the request table")
-        self.free_slots = list(range(1, self._num_rows))
+        self._reset_rows()
         # The generation stays monotonic across a reset.
         if self.holds_state_slots:
             self.req_index_to_mamba_index_mapping.zero_()
             if self.enable_mamba_extra_buffer:
                 self.req_index_to_mamba_ping_pong_track_buffer_mapping.zero_()
+        for hook in self._clear_hooks:
+            hook()
 
     # A unified table keeps no auxiliary per-row cache: the scheduler's
     # auxiliary-cache calls are identities here.

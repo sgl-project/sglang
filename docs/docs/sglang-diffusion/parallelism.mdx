@@ -62,7 +62,8 @@ overlapped hops it all-gathers K/V once and computes the local Q rows against
 the full sequence in one shot — fewer, larger transfers, paid for by holding the
 whole K/V per rank. Like ring it splits rows, so it adds no head constraint. When no SP degree is
 set explicitly, `sp_degree=2` defaults to `kv_gather_degree=2` — its
-measured-win zone — and higher degrees default to Ulysses.
+measured-win zone — and higher degrees default to Ulysses when the DiT's
+attention heads divide by `sp_degree`, and to K/V gather otherwise.
 Ulysses groups are laid out on contiguous ranks and ring groups on strided
 ranks, so with a node-major rank mapping, Ulysses traffic stays on intra-node
 NVLink (all-to-all needs full-bisection bandwidth) while ring hops cross the
@@ -81,8 +82,8 @@ mis-mapped layout stays numerically correct and silently loses the performance
   ring adds an outer row split on top of Ulysses's inner one.
 - Ring requires an attention backend that declares
   `supports_ring_rotation()` — the per-hop merge needs the kernel's softmax
-  LSE. `fa` and `sage_attn` declare it; the launcher auto-selects `fa` when
-  unset.
+  LSE. `fa`, `sage_attn` and `aiter` declare it; the launcher auto-selects
+  `fa` when unset.
 - `USPAttention`'s masked/tail-padded text path and its replicated-prefix,
   -suffix, and -kv-prefix paths all support ring: the sharded K/V rotates
   through the ring while the tail-pad or replicated portion is attended
@@ -95,8 +96,11 @@ mis-mapped layout stays numerically correct and silently loses the performance
   `UlyssesAttention` layer, now down to one user (Wan's VSA sparse-attention
   variant) that has no softmax LSE to merge and can't gain ring support
   without a different kernel.
-- The launcher validates `num_gpus` against the product of the degrees and
-  fails fast on any mismatch.
+- The launcher checks that `num_gpus` is divisible by `dp_size × tp_size`
+  (× `cfg_parallel_degree` with CFG parallel) and by `sp_degree`, and that
+  `sp_degree = ulysses_degree × ring_degree` (or equals `kv_gather_degree`);
+  leave `--sp-degree` unset to have it derived so the degrees multiply to
+  `num_gpus`.
 
 ## The Ulysses transport
 
@@ -124,7 +128,7 @@ replicated on every rank (a prefix, a suffix, or a K/V-only prefix), which stay
 out of the exchange. MiniMax-H3's attention uses the same transport. Ring
 attention, uneven sequence shards (`seq_lens`) and the K/V-gather mode keep the
 sequential exchange. The automatic count is the largest of 7, 5, 4, 3 and 2
-that divides the heads per rank while each group's call still fills four waves
+that divides the heads per rank while each group's call still fills three waves
 of 128-row tiles, so short sequences such as a 1024² image keep the sequential
 exchange. Its buffers are one pool per dtype that every shape shares, grown to
 the largest (about 4 × rows per rank × heads × head_dim); a shape that would
