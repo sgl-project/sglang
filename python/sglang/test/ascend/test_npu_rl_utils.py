@@ -31,7 +31,12 @@ from sglang.test.test_utils import (
 )
 
 DEFAULT_TIMEOUT = DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH
-A5_SPEC_ENV = {"ASCEND_USE_FIA": "1"}
+A5_SPEC_ENV = {
+    "ASCEND_USE_FIA": "1",
+    # A5 only allows aclnn operators, so online weight updates cannot copy into
+    # FRACTAL_NZ parameters; keep MoE weights in ND for these servers.
+    "SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT": "1",
+}
 
 
 # ---------------------------------------------------------------------------
