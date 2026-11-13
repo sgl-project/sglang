@@ -944,6 +944,16 @@ def destroy_model_parallel() -> None:
 
     IPC_A2A.reset()
     IPC_A2A_MULTI.reset()
+    from sglang.multimodal_gen.runtime.layers.attention.backends.xpu_deepsymm_ring import (
+        clear_deepsymm_ring_cache,
+    )
+
+    try:
+        clear_deepsymm_ring_cache(forget_groups=True)
+    except Exception as e:
+        # A peer that already exited fails deep_symm's handshake after its control
+        # timeout; log it and still tear the process groups down.
+        logger.warning("DeepSymm ring cache teardown failed: %s", e)
 
     destroyed_groups = []
     for group in (
