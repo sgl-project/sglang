@@ -1,4 +1,4 @@
-"""Muse Spark decode MoE finalize fused with the TP4 all-reduce (MI355X, ``SGLANG_ROCM_MUSE_FINALIZE_AR_PUSH``).
+"""Muse Spark decode MoE finalize fused with the TP4 / TP8 all-reduce (MI355X, ``SGLANG_ROCM_MUSE_FINALIZE_AR_PUSH``).
 
 ``finalize_allreduce.hip`` replaces the FlyDSL finalize + aiter two-stage all-reduce pair of the compact A4
 target-verify MoE with one launch; see its header for the protocol. The code object is built at first use with
@@ -18,12 +18,14 @@ import tempfile
 import torch
 import torch.distributed as dist
 
+from sglang.srt.distributed.device_communicators.cuda_wrapper import find_loaded_library
+
 logger = logging.getLogger(__name__)
 
 _SRC = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "finalize_allreduce.hip"
 )
-_NR = 4
+_MAX_NR = 8
 _HIDDEN = 4096
 _TOPK = 8
 _ROW_BYTES = _HIDDEN * 2
@@ -41,7 +43,7 @@ class _Args(ctypes.Structure):
         ("scores", ctypes.c_void_p),
         ("ids", ctypes.c_void_p),
         ("out", ctypes.c_void_p),
-        ("peers", ctypes.c_void_p * _NR),
+        ("peers", ctypes.c_void_p * _MAX_NR),
         ("row_state", ctypes.c_void_p),
         ("local_start", ctypes.c_int32),
         ("num_local", ctypes.c_int32),
@@ -50,7 +52,7 @@ class _Args(ctypes.Structure):
         ("rank", ctypes.c_int32),
         ("rows", ctypes.c_int32),
         ("max_rows", ctypes.c_uint32),
-        ("pad", ctypes.c_uint32),
+        ("oneshot", ctypes.c_uint32),
     ]
 
 
@@ -58,7 +60,7 @@ class _FillArgs(ctypes.Structure):
     _fields_ = [("p", ctypes.c_void_p), ("n16", ctypes.c_uint64)]
 
 
-assert ctypes.sizeof(_Args) == 112 and ctypes.sizeof(_FillArgs) == 16
+assert ctypes.sizeof(_Args) == 144 and ctypes.sizeof(_FillArgs) == 16
 
 _hip = None
 
@@ -66,7 +68,11 @@ _hip = None
 def _hip_lib():
     global _hip
     if _hip is None:
-        h = ctypes.CDLL("libamdhip64.so")
+        # Bind to the HIP runtime torch already mapped: ROCm 10 ships a second libamdhip64, which an
+        # unversioned CDLL("libamdhip64.so") picks, and every launch on a torch stream then fails with
+        # hipErrorContextIsDestroyed (709).
+        torch.cuda.current_device()
+        h = ctypes.CDLL(find_loaded_library("libamdhip64") or "libamdhip64.so")
         h.hipModuleLoad.argtypes = [ctypes.c_void_p, ctypes.c_char_p]
         h.hipModuleGetFunction.argtypes = [
             ctypes.c_void_p,
@@ -92,13 +98,13 @@ def _check(rc: int, what: str) -> None:
         )
 
 
-def _build(arch: str, sqrt: str) -> str:
+def _build(arch: str, sqrt: str, nr: int) -> str:
     out_dir = tempfile.mkdtemp(prefix="sglang_muse_finalize_ar_")
     co = os.path.join(out_dir, "finalize_allreduce.co")
     hipcc = os.path.join(os.environ.get("ROCM_PATH", "/opt/rocm"), "bin", "hipcc")
     # No FMA contraction: the FlyDSL finalize rounds every multiply and add separately.
     cmd = [hipcc, "--genco", f"--offload-arch={arch}", "-O3", "-ffp-contract=off",
-           f"-DMUSE_SQRT={sqrt}", "-o", co, _SRC]  # fmt: skip
+           f"-DMUSE_SQRT={sqrt}", f"-DNR={nr}", "-o", co, _SRC]  # fmt: skip
     subprocess.run(cmd, check=True, capture_output=True, text=True)
     return co
 
@@ -137,7 +143,7 @@ class _Kernel:
 
 
 class MuseFinalizeAllreduce:
-    """Per-process TP4 finalize + all-reduce; every rank must issue the same sequence of calls."""
+    """Per-process TP4 / TP8 finalize + all-reduce; every rank must issue the same sequence of calls."""
 
     def __init__(
         self,
@@ -147,14 +153,20 @@ class MuseFinalizeAllreduce:
         sqrt: str = "__builtin_amdgcn_sqrtf",
     ):
         self.rank = dist.get_rank(group=cpu_group)
-        if dist.get_world_size(group=cpu_group) != _NR:
-            raise ValueError("finalize_allreduce supports TP4 only")
+        self.nr = dist.get_world_size(group=cpu_group)
+        if self.nr not in (4, 8):
+            raise ValueError("finalize_allreduce supports TP4 and TP8 only")
+        # TP8 rows where this beats FlyDSL finalize + aiter all-reduce (MI355X graph replay): one-shot at 8 rows
+        # (22.1 -> 19.0 us; aiter's one-stage order there), two-stage from 128 (24.4 -> 22.1 us, 39.7 -> 35.5 at
+        # 512). Between, both forms are slower (one-shot 25.9 vs 19.3 us at 32 rows).
+        self.oneshot_below = 16 if self.nr == 8 else 0
+        self.twostage_from = 128 if self.nr == 8 else 0
         self.device = device
         self.max_rows = int(max_rows)
         h = _hip_lib()
         with torch.cuda.device(device):
             arch = torch.cuda.get_device_properties(device).gcnArchName.split(":")[0]
-            co = _build(arch, sqrt)
+            co = _build(arch, sqrt, self.nr)
             module = ctypes.c_void_p()
             try:
                 _check(
@@ -163,20 +175,20 @@ class MuseFinalizeAllreduce:
             finally:
                 shutil.rmtree(os.path.dirname(co), ignore_errors=True)
             self._module = module
-            self._k = _Kernel(module, "muse_finalize_allreduce_tp4")
+            self._k = _Kernel(module, "muse_finalize_allreduce")
             fill = _Kernel(module, "muse_finalize_allreduce_fill")
-            nbytes = 3 * (_NR + 1) * self.max_rows * _ROW_BYTES
+            nbytes = 3 * (self.nr + 1) * self.max_rows * _ROW_BYTES
             ptr = ctypes.c_void_p()
             _check(h.hipMalloc(ctypes.byref(ptr), nbytes), "hipMalloc")
             handle = _IpcHandle()
             _check(
                 h.hipIpcGetMemHandle(ctypes.byref(handle), ptr), "hipIpcGetMemHandle"
             )
-            handles = [None] * _NR
+            handles = [None] * self.nr
             dist.all_gather_object(
                 handles, ctypes.string_at(ctypes.addressof(handle), 64), group=cpu_group
             )
-            self._peers = (ctypes.c_void_p * _NR)()
+            self._peers = (ctypes.c_void_p * _MAX_NR)()
             for i, raw in enumerate(handles):
                 if i == self.rank:
                     self._peers[i] = ptr.value
@@ -202,7 +214,11 @@ class MuseFinalizeAllreduce:
         dist.barrier(group=cpu_group)
 
     def applies(self, rows: int) -> bool:
-        return 0 < rows <= self.max_rows and rows % _NR == 0
+        return (
+            0 < rows <= self.max_rows
+            and rows % self.nr == 0
+            and (rows < self.oneshot_below or rows >= self.twostage_from)
+        )
 
     def __call__(
         self,
@@ -237,7 +253,7 @@ class MuseFinalizeAllreduce:
         args = _Args(
             y.data_ptr(), gamma.data_ptr(), scores.data_ptr(), ids.data_ptr(), out.data_ptr(),
             self._peers, self.row_state.data_ptr(), int(local_start), int(num_local), float(eps), float(gain),
-            self.rank, m, self.max_rows, 0,
+            self.rank, m, self.max_rows, int(m < self.oneshot_below),
         )  # fmt: skip
         self._k.launch(m, args, torch.cuda.current_stream(y.device).cuda_stream)
         return out
@@ -252,7 +268,9 @@ def ensure_finalize_allreduce(cpu_group, device: torch.device) -> MuseFinalizeAl
     if _instance is None:
         _instance = MuseFinalizeAllreduce(cpu_group, device)
         logger.info(
-            "Muse fused finalize + TP4 all-reduce enabled (rank %d)", _instance.rank
+            "Muse fused finalize + TP%d all-reduce enabled (rank %d)",
+            _instance.nr,
+            _instance.rank,
         )
     return _instance
 
