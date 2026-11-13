@@ -57,6 +57,10 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
     save_outputs,
     warm_image_writer,
 )
+from sglang.multimodal_gen.runtime.layers.attention.backends.xpu_deepsymm_ring import (
+    begin_deepsymm_ring_request,
+    clear_deepsymm_ring_cache,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.auto_residency import (
     WarmupMemoryRecord,
     estimate_default_workload_peak_bytes,
@@ -798,6 +802,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 # component storage before its allocated peak is measured.
                 torch.get_device_module().empty_cache()
             self._release_warmup_pool(req)
+            begin_deepsymm_ring_request()
             if not current_platform.is_cpu() and not current_platform.is_mps():
                 torch.get_device_module().reset_peak_memory_stats()
             if measure_server_warmup:
@@ -1291,6 +1296,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
 
         IPC_A2A.drop_staging()
         IPC_A2A_MULTI.drop_staging()
+        clear_deepsymm_ring_cache()
         drop_a2a_staging_buffers()
         torch.get_device_module().empty_cache()
 
