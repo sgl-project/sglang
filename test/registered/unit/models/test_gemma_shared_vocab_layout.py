@@ -99,6 +99,7 @@ def build_source(kind, *, tied=True, vocab=512):
             ),
             audio_config=None,
         )
+        cfg.language_model_only = False
     model_cls = {
         "gemma3": Gemma3ForCausalLM,
         "gemma4": Gemma4ForCausalLM,
