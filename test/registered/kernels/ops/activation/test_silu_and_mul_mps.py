@@ -70,6 +70,38 @@ def test_silu_and_mul_dispatches_to_mps_kernel(monkeypatch):
     assert out.shape == (0, 32)
     assert len(calls) == 1
 
+    # A CPU tensor also takes the native path.
+    x = torch.randn(2, 64, dtype=torch.bfloat16)
+    layer = SiluAndMul()
+    torch.testing.assert_close(layer(x), layer.forward_native(x))
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize(
+    "make_input",
+    [
+        pytest.param(lambda: torch.randn(2, 63, device=DEVICE), id="odd_last_dim"),
+        pytest.param(
+            lambda: torch.ones(2, 64, device=DEVICE, dtype=torch.int32),
+            id="unsupported_dtype",
+        ),
+        pytest.param(lambda: torch.randn(2, 64), id="cpu_tensor"),
+        pytest.param(lambda: torch.randn(0, 64, device=DEVICE), id="empty"),
+        # A stride-0 view reaches 2**32 elements without allocating them.
+        pytest.param(
+            lambda: torch.ones(1, 1, device=DEVICE).expand(2**16, 2**16),
+            id="numel_2_pow_32",
+        ),
+    ],
+)
+def test_silu_and_mul_mps_supported_rejects(make_input):
+    from sglang.kernels.ops.activation.silu_and_mul_mps import (
+        silu_and_mul_mps_supported,
+    )
+
+    assert silu_and_mul_mps_supported(torch.randn(2, 64, device=DEVICE))
+    assert not silu_and_mul_mps_supported(make_input())
+
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v", "-s"]))
