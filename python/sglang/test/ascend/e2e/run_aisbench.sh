@@ -25,7 +25,6 @@ show_usage() {
     echo "  --repeat_rate       Repeat rate for prefix cache test (default: 0)"
     echo "  --dp                Data parallelism for prefix cache test (default: 2)"
     echo "  --seed              Dataset random seed for prefix cache test (optional)"
-    echo "  --prefix-natural-text  Build the shared prefix from a natural GSM8K text pool (default: off)"
     echo "  --generation-kwargs Custom generation kwargs dict string (overrides defaults based on mode)"
     echo "                      Example: 'dict(temperature=0.5, top_k=10, top_p=0.95, seed=None, repetition_penalty=1.03)'"
     echo ""
@@ -54,7 +53,6 @@ REQUEST_RATE=0
 REPEAT_RATE=0
 DP=1
 SEED=""
-PREFIX_NATURAL_TEXT=0
 
 GENERATION_KWARGS=""
 
@@ -135,10 +133,6 @@ while [[ $# -gt 0 ]]; do
         --seed)
             SEED="$2"
             shift 2
-            ;;
-        --prefix-natural-text)
-            PREFIX_NATURAL_TEXT=1
-            shift 1
             ;;
         -h|--help)
             show_usage
@@ -585,13 +579,6 @@ EOF
             # like Kimi-K3 carry custom code, so transformers prompts on
             # stdin (absent in CI) and aborts. Patch the disposable copy.
             sed -i "s/from_pretrained(tokenizer_path)/from_pretrained(tokenizer_path, trust_remote_code=True)/" "${DEST_COPY_DIR}"/*.py
-
-            if [ "$PREFIX_NATURAL_TEXT" == "1" ]; then
-                echo "===== [Patch] Natural-text prefix pool ====="
-                python3 "$(dirname "$0")/patch_prefix_dataset_pool.py" \
-                    --toolkit-dir "${DEST_COPY_DIR}" \
-                    --train-jsonl "${GSM8K_TRAIN_FILE}"
-            fi
 
             echo "===== [Mode] Prefix Cache Test (Hit Rate: $REPEAT_RATE) ====="
             echo "Use dataset: ${DATASET_NAME}, dataset_file: ${dataset_file}"

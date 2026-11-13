@@ -663,7 +663,6 @@ def run_aisbench(
     dp=None,
     generation_kwargs=None,
     seed=None,
-    prefix_natural_text=False,
 ):
 
     if dataset_type == "sharegpt":
@@ -769,8 +768,6 @@ def run_aisbench(
         cmd += f" --dp {dp}"
     if seed is not None:
         cmd += f" --seed {seed}"
-    if prefix_natural_text:
-        cmd += f" --prefix-natural-text"
     if generation_kwargs:
         cmd += f" --generation-kwargs '{generation_kwargs}'"
 
@@ -1197,7 +1194,6 @@ class TestNpuPerformanceTestCaseBase(CustomTestCase):
     mean_e2e_latency = None
     output_token_throughput = None
     request_throughput = None
-    prefix_natural_text = False
     # Baseline for accept_length / speculative-num-draft-tokens; None disables
     # the assertion.
     accept_rate = None
@@ -1385,7 +1381,6 @@ class TestNpuPerformanceTestCaseBase(CustomTestCase):
                 dp=self.dp,
                 generation_kwargs=self.generation_kwargs,
                 seed=self.seed,
-                prefix_natural_text=self.prefix_natural_text,
             )
             assert_metrics(self, metrics)
 
@@ -1450,7 +1445,6 @@ class TestNpuPerfMultiNodePdMixTestCaseBase(CustomTestCase):
     mean_e2e_latency = None
     output_token_throughput = None
     request_throughput = None
-    prefix_natural_text = False
 
     dp = None
     generation_kwargs = None
@@ -1481,7 +1475,21 @@ class TestNpuPerfMultiNodePdMixTestCaseBase(CustomTestCase):
         )
         sglang_thread.start()
 
-        wait_server_ready(f"{cls.base_url}/health")
+        # Poll in slices so a dead launcher fails fast. When a rank is killed
+        # during distributed init, the launch thread raises and the plain
+        # wait_server_ready below would keep polling /health for the full
+        # 3600 s timeout before the job fails.
+        while sglang_thread.is_alive():
+            try:
+                wait_server_ready(f"{cls.base_url}/health", timeout=60)
+                break
+            except RuntimeError:
+                continue
+        else:
+            raise RuntimeError(
+                "sglang launch thread exited before the server became ready; "
+                "check the server logs for the first rank that died"
+            )
 
         logger.info(
             f"Wait {SERVER_INITIALIZATION_DELAY}s, starting run benchmark ......"
@@ -1522,7 +1530,6 @@ class TestNpuPerfMultiNodePdMixTestCaseBase(CustomTestCase):
                 dp=self.dp,
                 generation_kwargs=self.generation_kwargs,
                 seed=self.seed,
-                prefix_natural_text=self.prefix_natural_text,
             )
             assert_metrics(self, metrics)
 
@@ -1587,7 +1594,6 @@ class TestNpuPerfMultiNodePdSepTestCaseBase(CustomTestCase):
     mean_e2e_latency = None
     output_token_throughput = None
     request_throughput = None
-    prefix_natural_text = False
 
     dp = None
     generation_kwargs = None
@@ -1695,7 +1701,6 @@ class TestNpuPerfMultiNodePdSepTestCaseBase(CustomTestCase):
                 dp=self.dp,
                 generation_kwargs=self.generation_kwargs,
                 seed=self.seed,
-                prefix_natural_text=self.prefix_natural_text,
             )
             assert_metrics(self, metrics)
 
