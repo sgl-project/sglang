@@ -64,6 +64,8 @@ class TestBF16AttentionUnderCompile(unittest.TestCase):
         q = torch.randn(1, 8, 4, HEAD_SIZE)
         compiled_forward = torch.compile(impl.forward, backend="eager")
         with (
+            patch.object(aiter_backend, "_use_fp8_attn", False),
+            patch.object(aiter_backend, "USE_AITER_GFX1201", False),
             patch.object(aiter_backend, "USE_AITER_GFX1250", gfx1250),
             patch.object(aiter_backend, "_AITER_ENABLE_CK", enable_ck),
             patch.object(aiter_backend.aiter, "flash_attn_func", fake_flash_attn_func),
