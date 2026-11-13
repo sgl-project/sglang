@@ -1,4 +1,6 @@
+import json
 import os
+import shlex
 
 from sglang.multimodal_gen.test.server.testcase_configs import (
     T2V_PROMPT,
@@ -220,9 +222,11 @@ TWO_NPU_CASES: list[DiffusionTestCase] = [
                 "ascend_sparse_attn",
                 "--attention-backend-config",
                 # Exercise dense fallback before and after the sparse steps.
-                '{"sparse_type":"rf_v3","precision":"bf16","sparsity":0.6,'
-                '"skip_first_steps":2,"skip_last_steps":1,'
-                '"dense_kwargs":{"precision":"bf16"}}',
+                shlex.quote(
+                    '{"sparse_type":"rf_v3","precision":"bf16","sparsity":0.6,'
+                    '"skip_first_steps":2,"skip_last_steps":1,'
+                    '"dense_kwargs":{"precision":"bf16"}}'
+                ),
                 "--component-residency",
                 "text_encoder=layerwise-offload",
             ],
@@ -243,27 +247,31 @@ TWO_NPU_CASES: list[DiffusionTestCase] = [
             expect_audio_output=True,
             num_outputs_per_prompt=1,
             extras={
-                "task": "ref2va",
-                "conditions": [
+                "extra_body": json.dumps(
                     {
-                        "type": "video_audio",
-                        "uri": (
-                            "https://huggingface.co/MiniMaxAI/MiniMax-H3/resolve/"
-                            "42ed227ee7df40d41602854ae760620d6eb651fe/assets/"
-                            "ref2va.mp4"
-                        ),
-                        "role": "reference",
+                        "task": "ref2va",
+                        "conditions": [
+                            {
+                                "type": "video_audio",
+                                "uri": (
+                                    "https://huggingface.co/MiniMaxAI/MiniMax-H3/resolve/"
+                                    "42ed227ee7df40d41602854ae760620d6eb651fe/assets/"
+                                    "ref2va.mp4"
+                                ),
+                                "role": "reference",
+                            }
+                        ],
+                        "target": {
+                            "short_edge": 768,
+                            "aspect_ratio": "16:9",
+                            "duration_seconds": 4.0,
+                        },
+                        "num_inference_steps": 8,
+                        "flow_shift": 12.0,
+                        "audio_flow_shift": 3.0,
+                        "seed": 42,
                     }
-                ],
-                "target": {
-                    "short_edge": 768,
-                    "aspect_ratio": "16:9",
-                    "duration_seconds": 4.0,
-                },
-                "num_inference_steps": 8,
-                "flow_shift": 12.0,
-                "audio_flow_shift": 3.0,
-                "seed": 42,
+                ),
             },
         ),
         perf_repeat_requests=2,
