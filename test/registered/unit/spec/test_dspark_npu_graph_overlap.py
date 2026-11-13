@@ -2,7 +2,6 @@
 
 import ast
 import copy
-from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -10,13 +9,12 @@ from unittest.mock import Mock, patch
 import pytest
 import torch
 
-from sglang.srt.hardware_backend.npu import dspark_dp
 from sglang.srt.managers.overlap_utils import (
     CONFIDENCE_RELAY_RING_DEPTH,
     CONFIDENCE_RELAY_RING_LAG,
     ConfidenceRelay,
 )
-from sglang.srt.speculative.dspark_components import dspark_planner
+from sglang.srt.speculative.dspark_components import dspark_dp, dspark_planner
 from sglang.srt.speculative.dspark_components.dspark_planner import DSparkScheduleConfig
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout, RaggedVerifyMode
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -121,11 +119,7 @@ def test_tp_broadcast_budget_precedes_tier_choice(
         attn_backend=SimpleNamespace(_dspark_dsa_ragged_verify=is_npu)
     )
     planner._verify_hooks = (
-        dspark_planner.DSparkVerifyHooks(
-            sync_budget=partial(
-                dspark_dp.sync_verify_budget, model_runner=planner.model_runner
-            )
-        )
+        dspark_planner.DSparkVerifyHooks(sync_budget=dspark_dp.sync_verify_budget)
         if is_npu
         else None
     )
@@ -166,12 +160,8 @@ def test_sync_budget_uses_runtime_tp_group(is_npu, is_glm):
         attn_backend=SimpleNamespace(_dspark_dsa_ragged_verify=is_glm),
     )
     planner._verify_hooks = (
-        dspark_planner.DSparkVerifyHooks(
-            sync_budget=partial(
-                dspark_dp.sync_verify_budget, model_runner=planner.model_runner
-            )
-        )
-        if is_npu
+        dspark_planner.DSparkVerifyHooks(sync_budget=dspark_dp.sync_verify_budget)
+        if is_npu and is_glm
         else None
     )
     group = SimpleNamespace(broadcast_object=Mock(return_value=6))
@@ -202,7 +192,7 @@ def test_sync_budget_uses_runtime_tp_group(is_npu, is_glm):
 
 
 @pytest.mark.parametrize("mode", [RaggedVerifyMode.STATIC, RaggedVerifyMode.COMPACT])
-def test_planner_constructed_before_backend_detects_glm_after_initialization(mode):
+def test_planner_constructor_does_not_read_backend_or_run_budget_collectives(mode):
     # Match Scheduler: create worker/planner, allocate pools, then initialize
     # attention backends. Constructor must neither read a missing backend nor
     # permanently cache a negative capability result from that startup phase.
@@ -242,11 +232,10 @@ def test_planner_constructed_before_backend_detects_glm_after_initialization(mod
             verify_num_draft_tokens=4,
             tp_sync=Mock(),
             verify_hooks=dspark_planner.DSparkVerifyHooks(
-                sync_budget=partial(dspark_dp.sync_verify_budget, model_runner=runner)
+                sync_budget=dspark_dp.sync_verify_budget
             ),
         )
         assert not hasattr(runner, "attn_backend")
-        assert planner.sync_verify_budget(1) == 1
         runner.req_to_token_pool = SimpleNamespace(req_generation=torch.tensor([0, 0]))
         runner.attn_backend = SimpleNamespace(_dspark_dsa_ragged_verify=True)
         if mode is RaggedVerifyMode.COMPACT:
@@ -264,8 +253,6 @@ def test_planner_constructed_before_backend_detects_glm_after_initialization(mod
                 )
             assert budget == 3
             group.broadcast_object.assert_called_once_with(1, src=0)
-        runner.attn_backend = SimpleNamespace(_dspark_dsa_ragged_verify=False)
-        assert planner.sync_verify_budget(1) == 1
 
 
 def test_confidence_relay_not_ready_generation_and_source_fence():

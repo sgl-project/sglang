@@ -600,8 +600,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # For DP attention (MLP sync sizes)
     original_global_num_tokens_cpu: Optional[List[int]] = None
-    # Packed verify token widths are independent of the local request count.
-    # The execution policy sets this when publishing coordinated DP counts.
+    # Set by opt-in DSpark batch preparation after cross-DP capacity agreement.
+    # global_num_tokens_* then describes execution widths (including sink rows),
+    # not requests * fixed window. Preserve local request rows and packed output
+    # widths; actual per-request work remains in ragged_verify_layout.verify_lens.
     dp_verify_uses_packed_tokens: bool = False
     _original_batch_size: Optional[int] = None
     _original_forward_mode: Optional[ForwardMode] = None

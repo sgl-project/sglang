@@ -4,7 +4,6 @@ These tests do not execute DSA kernels, HCCL/DeepEP, or capture NPU graphs.
 """
 
 from datetime import timedelta
-from functools import partial
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -15,9 +14,8 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.npu import dspark_dp
 from sglang.srt.model_executor import forward_batch_info as fbi
-from sglang.srt.speculative.dspark_components import dspark_planner
+from sglang.srt.speculative.dspark_components import dspark_dp, dspark_planner
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -51,9 +49,7 @@ def _planner(runner=None, *, coordinate=True):
     planner.device = "cpu"
     planner.verify_num_draft_tokens = 9
     planner._verify_hooks = dspark_planner.DSparkVerifyHooks(
-        sync_budget=partial(
-            dspark_dp.sync_verify_budget, model_runner=planner.model_runner
-        ),
+        sync_budget=dspark_dp.sync_verify_budget,
         coordinate_dp_verify=coordinate,
     )
     return planner
@@ -123,6 +119,8 @@ def test_packed_dp_mlp_padding_preserves_local_request_rows(lens):
         out_cache_loc=torch.zeros(8, dtype=torch.long),
         seq_lens_sum=bs * 10,
         positions=torch.arange(8),
+        global_num_token_non_padded=torch.tensor(sum(lens)),
+        global_num_token_non_padded_cpu=sum(lens),
         spec_info=SimpleNamespace(
             ragged_verify_layout=layout,
             num_tokens_per_req=9,
@@ -135,8 +133,11 @@ def test_packed_dp_mlp_padding_preserves_local_request_rows(lens):
     )
     parallel = SimpleNamespace(attn_dp_enabled=True, num_dp_ranks=2, attn_tp_size=2)
     with patch.object(dspark_dp, "get_parallel", return_value=parallel):
-        dspark_dp.prepare_compact_dp_forward_batch(batch, runner)
+        dspark_dp.prepare_compact_dp_forward_batch(batch)
         assert batch.global_num_tokens_cpu == [8, 8]
+        assert batch.global_num_token_non_padded.item() == 8
+        assert batch.global_num_token_non_padded_cpu == 8
+        assert batch.spec_info.ragged_verify_layout.verify_lens.tolist() == lens
         assert batch.global_num_tokens_for_logprob_gpu.tolist() == [8, 8]
         with (
             patch.multiple(
@@ -288,15 +289,12 @@ def test_real_gloo_busy_idle_and_attention_tp_budget_isolation(tmp_path, graph):
     )
 
 
-def test_non_glm_backend_does_not_rewrite_dp_counts():
-    runner = _runner()
-    runner.attn_backend._dspark_dsa_ragged_verify = False
-    batch = SimpleNamespace(global_num_tokens_cpu=[9, 0])
-    with patch.object(
-        dspark_dp, "get_parallel", return_value=SimpleNamespace(attn_dp_enabled=True)
-    ):
-        dspark_dp.prepare_compact_dp_forward_batch(batch, runner)
+def test_uniform_fallback_does_not_rewrite_dp_counts():
+    batch = SimpleNamespace(spec_info=None, global_num_tokens_cpu=[9, 0])
+    with patch.object(dspark_dp, "get_parallel") as parallel:
+        dspark_dp.prepare_compact_dp_forward_batch(batch)
     assert batch.global_num_tokens_cpu == [9, 0]
+    parallel.assert_not_called()
 
 
 @pytest.mark.parametrize("graph", [False, True])
@@ -338,35 +336,56 @@ def test_production_glm_dspark_argument_hook_accepts_attention_dp(graph):
         _handle_dspark(args)
 
 
+@pytest.mark.parametrize("is_npu", [False, True])
 @pytest.mark.parametrize(
-    "architecture", ["GlmMoeDsaForCausalLM", "DeepseekV4ForCausalLM"]
+    "architecture",
+    ["GlmMoeDsaForCausalLM", "DeepseekV4ForCausalLM", "Qwen3ForCausalLM"],
 )
 @pytest.mark.parametrize("mode", ["static", "compact"])
 @pytest.mark.parametrize("dp", [False, True])
-def test_verify_hook_selection_before_backend_init(architecture, mode, dp):
+def test_verify_hook_selection_before_backend_init(is_npu, architecture, mode, dp):
+    from sglang.srt.speculative.dspark_components import dspark_worker_v2
+
     runner = SimpleNamespace(
         model_config=SimpleNamespace(
             hf_config=SimpleNamespace(architectures=[architecture])
         )
     )
     with (
+        patch.object(dspark_worker_v2, "_is_npu", is_npu),
         patch.object(
-            dspark_dp,
+            dspark_worker_v2,
             "get_parallel",
-            return_value=SimpleNamespace(attn_dp_enabled=dp, tp_rank=1),
+            return_value=SimpleNamespace(attn_dp_enabled=dp),
         ),
         envs.SGLANG_RAGGED_VERIFY_MODE.override(mode),
+        patch.object(dspark_dp, "get_dp_tp_group") as group,
     ):
-        hooks = dspark_dp.make_dspark_verify_hooks(runner)
-    if architecture != "GlmMoeDsaForCausalLM":
+        hooks = dspark_worker_v2._make_verify_hooks(runner)
+    group.assert_not_called()
+    assert not hasattr(runner, "attn_backend")
+    if not is_npu or architecture != "GlmMoeDsaForCausalLM" or mode == "static":
         assert hooks is None
         return
     assert hooks.dynamic_tiers_with_dp
-    assert hooks.coordinate_dp_verify == (dp and mode == "compact")
-    assert (hooks.prepare_forward_batch is not None) == hooks.coordinate_dp_verify
-    with patch.object(dspark_dp, "get_dp_tp_group") as group:
-        assert hooks.sync_budget(3) == 3
-    group.assert_not_called()
+    assert hooks.coordinate_dp_verify == dp
+    assert (hooks.prepare_forward_batch is not None) == dp
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_selected_path_rejects_incompatible_backend_before_draft_init(enabled):
+    from sglang.srt.speculative.dspark_components import dspark_worker_v2
+
+    worker = dspark_worker_v2.DSparkWorkerV2.__new__(dspark_worker_v2.DSparkWorkerV2)
+    worker._hosts_draft = True
+    worker._verify_hooks = dspark_dp.make_dspark_verify_hooks(
+        coordinate_dp_verify=enabled
+    )
+    worker.model_runner = SimpleNamespace(attn_backend=object())
+    worker._draft_worker = Mock()
+    with pytest.raises(ValueError, match="GLM DSA ragged metadata support"):
+        worker.init_attention_backends()
+    worker._draft_worker.init_attention_backends.assert_not_called()
 
 
 def test_default_planner_preserves_inputs_without_collectives():

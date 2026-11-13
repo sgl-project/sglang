@@ -247,11 +247,10 @@ def test_dense_worker_constructor_to_draft_sampler_warmup(
         assert worker.gamma == 3 and worker.verify_num_draft_tokens == 4
         assert not hasattr(target_runner, "attn_backend")
         hooks = worker._verify_planner._verify_hooks
-        assert (
-            worker._verify_executor._prepare_verify_forward_batch
-            is hooks.prepare_forward_batch
+        assert worker._verify_executor._prepare_verify_forward_batch is (
+            hooks.prepare_forward_batch if hooks is not None else None
         )
-        assert worker._verify_planner.sync_verify_budget(1) == 1
+        assert (hooks is None) == (mode == "static")
         assert worker._verify_planner.coordinates_dp_verify == (
             mode == "compact" and attn_dp_size > 1
         )
@@ -265,11 +264,16 @@ def test_dense_worker_constructor_to_draft_sampler_warmup(
         draft_runner.attn_backend = SimpleNamespace(_dspark_dsa_ragged_verify=False)
         worker.init_attention_backends()
         with patch(
-            "sglang.srt.hardware_backend.npu.dspark_dp.get_dp_tp_group",
+            "sglang.srt.speculative.dspark_components.dspark_dp.get_dp_tp_group",
             return_value=SimpleNamespace(broadcast_object=Mock(return_value=3)),
         ) as get_group:
-            assert worker._verify_planner.sync_verify_budget(1) == 3
-            get_group.return_value.broadcast_object.assert_called_once_with(1, src=0)
+            assert worker._verify_planner.sync_verify_budget(1) == (3 if hooks else 1)
+            if hooks:
+                get_group.return_value.broadcast_object.assert_called_once_with(
+                    1, src=0
+                )
+            else:
+                get_group.assert_not_called()
         worker.init_cuda_graphs()
         draft_worker.init_cuda_graphs.assert_called_once_with(
             capture_decode_cuda_graph=graph

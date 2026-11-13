@@ -81,7 +81,11 @@ class VerifyTierResolution(msgspec.Struct, frozen=True):
 
 
 class DSparkVerifyHooks(msgspec.Struct, frozen=True):
-    """Optional platform hooks; tier gathering and layout selection stay in the planner."""
+    """Opt-in execution hooks selected by the worker and validated at backend init.
+
+    Budget synchronization is attention-TP-local. Cross-DP capacity gathering
+    and layout selection belong to this planner, not the callbacks.
+    """
 
     sync_budget: Callable[[Optional[int]], Optional[int]]
     prepare_forward_batch: Optional[Callable[[ForwardBatch], None]] = None

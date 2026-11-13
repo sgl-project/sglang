@@ -67,6 +67,7 @@ from sglang.srt.speculative.dspark_components.dspark_observability import (
     InfoSegment,
 )
 from sglang.srt.speculative.dspark_components.dspark_planner import (
+    DSparkVerifyHooks,
     DSparkVerifyPlanner,
     alloc_verify_window,
     dp_global_verify_tier_num_tokens,
@@ -106,6 +107,32 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
+
+
+def _make_verify_hooks(model_runner) -> Optional[DSparkVerifyHooks]:
+    # Select once before attention backends exist. Generic DP helpers must not
+    # silently select a different path later based on model/backend attributes.
+    if not _is_npu:
+        return None
+    from sglang.srt.configs.model_config import is_glm_moe_dsa
+    from sglang.srt.speculative.dspark_components.dspark_dp import (
+        make_dspark_verify_hooks,
+    )
+    from sglang.srt.speculative.ragged_verify import (
+        RaggedVerifyMode,
+        read_ragged_verify_mode,
+    )
+
+    mode = read_ragged_verify_mode()
+    if mode is RaggedVerifyMode.STATIC or not is_glm_moe_dsa(
+        model_runner.model_config.hf_config
+    ):
+        return None
+    return make_dspark_verify_hooks(
+        coordinate_dp_verify=(
+            get_parallel().attn_dp_enabled and mode is RaggedVerifyMode.COMPACT
+        )
+    )
 
 
 @runtime_checkable
@@ -353,13 +380,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
         self._target_hidden_projection_enabled = False
 
-        verify_hooks = None
-        if _is_npu:
-            from sglang.srt.hardware_backend.npu.dspark_dp import (
-                make_dspark_verify_hooks,
-            )
-
-            verify_hooks = make_dspark_verify_hooks(self.model_runner)
+        self._verify_hooks = verify_hooks = _make_verify_hooks(self.model_runner)
         self._verify_planner = DSparkVerifyPlanner(
             draft_model=self.draft_model,
             gamma=self.gamma,
@@ -617,6 +638,24 @@ class DSparkWorkerV2(BaseSpecWorker):
     def init_attention_backends(self):
         if not self._hosts_draft:
             return
+        if self._verify_hooks is not None:
+            # Scheduler initializes the target backend before the draft worker.
+            # Fail before capture/serving if it cannot honor the selected path,
+            # instead of coordinating tiers while silently skipping packed inputs.
+            if not getattr(
+                self.model_runner.attn_backend, "_dspark_dsa_ragged_verify", False
+            ):
+                raise ValueError(
+                    "GLM NPU DSpark ragged verify requires an attention backend "
+                    "with GLM DSA ragged metadata support."
+                )
+            if self._verify_hooks.coordinate_dp_verify and get_parallel().tp_rank == 0:
+                logger.info(
+                    "GLM DSpark compact attention DP enabled (attn_dp=%d, attn_tp=%d, "
+                    "budget_sync=attention-tp, target_tier_sync=tp-cpu).",
+                    get_parallel().attn_dp_size,
+                    get_parallel().attn_tp_size,
+                )
         with draft_pp_context(), self._draft_context():
             self._draft_worker.init_attention_backends()
         self._target_hidden_projection_enabled = _configure_target_hidden_projection(
