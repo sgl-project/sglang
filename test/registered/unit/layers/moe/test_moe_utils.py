@@ -179,8 +179,16 @@ class TestXpuCallSitesNeverPassTheSentinel(CustomTestCase):
             moe_runner_config=MoeRunnerConfig(activation="silu"),
             is_fp4_expert=False,
             block_quant=False,
+            weight_block_size=None,
+            use_mxfp8=False,
         )
-        with self.xpu_branch(fp8_module, _is_xpu=True, _is_npu=False, _is_hip=False):
+        with self.xpu_branch(
+            fp8_module,
+            _is_xpu=True,
+            _is_xe2_supported=True,
+            _is_npu=False,
+            _is_hip=False,
+        ):
             with unittest.mock.patch.object(
                 fp8_module, "use_intel_amx_backend", lambda layer: False
             ):
