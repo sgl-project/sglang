@@ -153,18 +153,25 @@ jobs:
 
       - name: Build image
         run: |
+          set -euo pipefail
           # Fixed tag (no SHA): a new build moves the tag, and the previous
           # image becomes dangling; the prune steps before and after the job
           # remove it so the self-hosted box does not fill up across PRs.
           # --no-cache keeps the CPU image clean (past sgl-eval/accelerate gaps
           # came from stale layers). One build per job, one container per box.
-          PR_REPO=${{ github.event.pull_request.head.repo.clone_url }}
-          PR_HEAD_REF=${{ github.head_ref }}
+          CHECKOUT_SHA=$(git rev-parse HEAD)
+          echo "Building Xeon image from checkout ${CHECKOUT_SHA}"
 
           docker build \
-            ${PR_REPO:+--build-arg SGLANG_REPO=$PR_REPO} \
-            ${PR_HEAD_REF:+--build-arg VER_SGLANG=$PR_HEAD_REF} \
+            --build-arg "SGLANG_REPO=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git" \
+            --build-arg "VER_SGLANG=${CHECKOUT_SHA}" \
             . -f docker/xeon.Dockerfile  -t sglang_xeon --no-cache
+
+          IMAGE_SHA=$(docker run --rm --entrypoint git sglang_xeon rev-parse HEAD)
+          if [[ "$IMAGE_SHA" != "$CHECKOUT_SHA" ]]; then
+            echo "::error::Xeon image source ${IMAGE_SHA} does not match checkout ${CHECKOUT_SHA}"
+            exit 1
+          fi
 
       # ==================== GNR: full machine, TP suite ==================== #
       - name: Run container (GNR)

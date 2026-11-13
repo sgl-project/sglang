@@ -100,6 +100,12 @@ repos:
         language: system
         files: ^\.github/CI_PERMISSIONS\.json$
         pass_filenames: false
+      - id: sort-cookbook-sidebar
+        name: sort Cookbook vendor groups in docs/docs.json
+        entry: python3 scripts/lint/sort_cookbook_sidebar.py
+        language: system
+        files: ^docs/docs\.json$
+        pass_filenames: false
       - id: check-workflow-job-names
         name: check for duplicate workflow job names
         entry: python3 scripts/lint/check_workflow_job_names.py
@@ -129,11 +135,17 @@ repos:
         entry: python3 scripts/lint/check_no_bare_pytest_main.py
         language: system
         files: ^(python|test)/.*\.py$
+      - id: export-cookbook-commands
+        name: regenerate python/sglang/cli/_commands/ from the Cookbook configs
+        entry: node docs/scripts/export_commands.mjs
+        language: system
+        files: ^(docs/src/snippets/(_deployment\.jsx|configs/.*)|docs/cookbook/.*\.mdx|docs/scripts/export_commands\.mjs|python/sglang/cli/_commands/.*)$
+        pass_filenames: false
       - id: check-registered-tests
         name: validate registered test CI registries
         entry: python3 scripts/lint/check_registered_tests.py
         language: system
-        files: ^test/registered/.*\.py$
+        files: ^(test/registered/.*\.py|scripts/ci/runner_configs\.yml)$
         pass_filenames: false
       - id: check-no-registered-tests-in-package
         name: reject CI-registered tests inside the sglang package
