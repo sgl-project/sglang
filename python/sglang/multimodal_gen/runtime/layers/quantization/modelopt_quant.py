@@ -634,6 +634,29 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
     apply = StaticModelOptFp8LinearMethod.apply
 
 
+def valid_modelopt_fp8_linear(linear: torch.nn.Module) -> bool:
+    """Whether ``linear`` is ModelOpt FP8 with one positive fp32 CUDA input scale."""
+    input_scale = getattr(linear, "input_scale", None)
+    return (
+        isinstance(getattr(linear, "quant_method", None), ModelOptFp8LinearMethod)
+        and isinstance(input_scale, torch.Tensor)
+        and input_scale.is_cuda
+        and input_scale.dtype == torch.float32
+        and input_scale.numel() == 1
+        and input_scale.is_contiguous()
+        and bool(torch.isfinite(input_scale).all().item())
+        and bool((input_scale > 0).all().item())
+    )
+
+
+def shared_modelopt_fp8_scale(linears: list[torch.nn.Module]) -> bool:
+    """Whether every linear is valid ModelOpt FP8 and they share one input scale."""
+    if not all(valid_modelopt_fp8_linear(linear) for linear in linears):
+        return False
+    reference = linears[0].input_scale
+    return all(torch.equal(reference, linear.input_scale) for linear in linears[1:])
+
+
 class ModelOptFp4LinearMethod(LinearMethodBase):
     """NVFP4 linear method using the selected FP4 GEMM backend."""
 

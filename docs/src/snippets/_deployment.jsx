@@ -10,7 +10,7 @@
 //                      {id, label, vram, vendor}[] merged into the catalog at render
 //                      (so a model-specific GPU never needs an engine-catalog edit);
 //                      vendor picks the selector group: blackwell | hopper | amd |
-//                      npu | cpu (cpu also drops GPU passthrough from docker run).
+//                      npu | cpu | tpu (cpu and tpu drop GPU passthrough from docker run).
 //                      `multiNodeDockerFlags: string[]` (either source) adds
 //                      `docker run` flags the platform's fabric needs
 //   groupHardware      optional — set false to show one flat hardware row
@@ -944,6 +944,11 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
             // memory transport.
             "docker run --privileged",
             "  --shm-size 32g",
+          ]
+        : vendorOf(sel.hw) === "tpu"
+        ? [
+            "docker run --privileged",
+            "  --shm-size 64g",
           ]
         : [
             "docker run --gpus all",
