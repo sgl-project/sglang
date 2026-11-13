@@ -13,6 +13,9 @@ from sglang.multimodal_gen.csrc.attn.vmoba_attn.vmoba import (
     process_moba_input,
     process_moba_output,
 )
+from sglang.multimodal_gen.csrc.attn.vmoba_attn.vmoba.vmoba import (
+    flash_attn_varlen_func,
+)
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionBackend,
     AttentionImpl,
@@ -45,6 +48,7 @@ class VMOBAAttentionBackend(AttentionBackend):
 
 @dataclass
 class VideoMobaAttentionMetadata(AttentionMetadata):
+    # denoising step index, compared against first_full_step
     current_timestep: int
 
     temporal_chunk_size: int
@@ -65,6 +69,9 @@ class VideoMobaAttentionMetadata(AttentionMetadata):
     temporal_layer: int = 1
     spatial_layer: int = 1
     st_layer: int = 1
+    # Read by the dense backend that cross-attention layers use.
+    max_seqlen_q: int | None = None
+    max_seqlen_k: int | None = None
 
 
 def pad_input(hidden_states, indices, batch, seqlen):
@@ -153,6 +160,7 @@ class VMOBAAttentionImpl(AttentionImpl):
         **extra_impl_args,
     ) -> None:
         self.prefix = prefix
+        self.softmax_scale = softmax_scale
         self.layer_idx = self._get_layer_idx(prefix)
 
         self.pad_input = pad_input
@@ -162,6 +170,30 @@ class VMOBAAttentionImpl(AttentionImpl):
         if not match:
             raise ValueError(f"Invalid prefix: {prefix}")
         return int(match.group(1))
+
+    def _full_attention(
+        self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor
+    ) -> torch.Tensor:
+        batch_size, sequence_length = query.shape[:2]
+        cu_seqlens = torch.arange(
+            0,
+            (batch_size + 1) * sequence_length,
+            sequence_length,
+            dtype=torch.int32,
+            device=query.device,
+        )
+        out = flash_attn_varlen_func(
+            query.flatten(0, 1),
+            key.flatten(0, 1),
+            value.flatten(0, 1),
+            cu_seqlens,
+            cu_seqlens,
+            sequence_length,
+            sequence_length,
+            softmax_scale=self.softmax_scale,
+            causal=False,
+        )
+        return out.view(query.shape)
 
     def forward(
         self,
@@ -177,6 +209,13 @@ class VMOBAAttentionImpl(AttentionImpl):
         attn_metadata: AttentionMetadata
         """
         batch_size, sequence_length, num_heads, head_dim = query.shape
+
+        # Early denoising steps and the leading layers keep full attention.
+        if (
+            attn_metadata.current_timestep < attn_metadata.first_full_step
+            or self.layer_idx < attn_metadata.first_full_layer
+        ):
+            return self._full_attention(query, key, value)
 
         # select chunk type according to layer idx:
         loop_layer_num = (
@@ -239,6 +278,7 @@ class VMOBAAttentionImpl(AttentionImpl):
             select_mode=attn_metadata.moba_select_mode,
             simsum_threshold=attn_metadata.moba_threshold,
             threshold_type=attn_metadata.moba_threshold_type,
+            softmax_scale=self.softmax_scale,
         )
         hidden_states = self.pad_input(
             hidden_states, indices_q, batch_size, sequence_length
