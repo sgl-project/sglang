@@ -26,9 +26,9 @@ pub use self::media::extract_images;
 pub(crate) use self::models::deepseek_v4_thinking;
 pub use self::models::{DeepSeekTokenizer, continues_final_message};
 use self::models::{
-    deep_sort, encode_tools_to_typescript, is_glm53, is_minimax_m3, is_qwen38,
-    prints_arguments_as_xml, render_deepseek_v4, render_glm53, render_kimi_k3, render_minimax_m3,
-    render_qwen38, takes_content_parts,
+    deep_sort, encode_tools_to_typescript, is_glm53, is_minimax_m3, is_qwen38, is_step3p5,
+    preserve_messages, prints_arguments_as_xml, render_deepseek_v4, render_glm53, render_kimi_k3,
+    render_minimax_m3, render_qwen38, render_step3p5, takes_content_parts,
 };
 #[cfg(feature = "openai")]
 pub(crate) use self::models::{
@@ -86,6 +86,16 @@ pub enum ChatFormatter {
         /// SGLang hands the template content parts lists rather than strings.
         content_parts: bool,
     },
+    /// StepFun's Jinja template (Step-3.5-Flash, Step-3.7-Flash, Step-5-Preview),
+    /// which `render_request` renders as SGLang does.
+    Step3p5 {
+        formatter: PromptFormatter,
+        thinking: ThinkingTemplates,
+        /// Python's content format; unknown formats decline parts-list requests.
+        content_parts: Option<bool>,
+        /// Private context key, chosen not to collide with template variables.
+        message_context: String,
+    },
     Legacy(Box<LegacyFormatter>),
 }
 
@@ -106,7 +116,8 @@ impl ChatFormatter {
             ChatFormatter::HuggingFace { formatter, .. }
             | ChatFormatter::Glm53(formatter)
             | ChatFormatter::MiniMaxM3 { formatter, .. }
-            | ChatFormatter::Qwen38 { formatter, .. } => render_oai(formatter, request),
+            | ChatFormatter::Qwen38 { formatter, .. }
+            | ChatFormatter::Step3p5 { formatter, .. } => render_oai(formatter, request),
             ChatFormatter::KimiK25 { formatter, .. } => {
                 let mut args = request.chat_template_args().cloned().unwrap_or_default();
                 if let Some(tools) = request.tools() {
@@ -166,8 +177,8 @@ impl ChatFormatter {
     /// `chat_template_kwargs`, returning the prompt and the
     /// `continue_final_message` prefix SGLang tokenizes separately.
     /// The body must be one SGLang's `ChatCompletionRequest` accepts; it is not
-    /// re-validated. Only DeepSeek-V4, V4.1, GLM-5.3, Kimi K3, MiniMax-M3 and Qwen3.8
-    /// render this way; others use [`Self::render_prompt`].
+    /// re-validated. Only DeepSeek-V4, V4.1, GLM-5.3, Kimi K3, MiniMax-M3, Qwen3.8
+    /// and StepFun render this way; others use [`Self::render_prompt`].
     pub fn render_request(
         &self,
         request: Value,
@@ -205,6 +216,19 @@ impl ChatFormatter {
                 content_parts,
                 ..
             } => render_qwen38(formatter, *content_parts, request, default_kwargs).map(text),
+            ChatFormatter::Step3p5 {
+                formatter,
+                content_parts,
+                message_context,
+                ..
+            } => render_step3p5(
+                formatter,
+                *content_parts,
+                message_context,
+                request,
+                default_kwargs,
+            )
+            .map(text),
             _ => Err(RenderError::Declined("this formatter's requests".into())),
         }
         .map_err(|error| match error {
@@ -264,7 +288,8 @@ impl ChatFormatter {
             | ChatFormatter::Glm53(_)
             | ChatFormatter::KimiK3
             | ChatFormatter::MiniMaxM3 { .. }
-            | ChatFormatter::Qwen38 { .. } => None,
+            | ChatFormatter::Qwen38 { .. }
+            | ChatFormatter::Step3p5 { .. } => None,
             ChatFormatter::Legacy(formatter) => formatter.spec.stop_str.clone(),
         }
     }
@@ -275,7 +300,8 @@ impl ChatFormatter {
         match self {
             ChatFormatter::Glm53(_) => true,
             ChatFormatter::HuggingFace { thinking, .. }
-            | ChatFormatter::KimiK25 { thinking, .. } => {
+            | ChatFormatter::KimiK25 { thinking, .. }
+            | ChatFormatter::Step3p5 { thinking, .. } => {
                 thinking.default_policy() == ThinkingPolicy::Always
             }
             _ => false,
@@ -289,7 +315,8 @@ impl ChatFormatter {
         match self {
             ChatFormatter::Qwen38 { .. } => Some(("enable_thinking", true)),
             ChatFormatter::HuggingFace { thinking, .. }
-            | ChatFormatter::KimiK25 { thinking, .. } => match thinking.default_policy() {
+            | ChatFormatter::KimiK25 { thinking, .. }
+            | ChatFormatter::Step3p5 { thinking, .. } => match thinking.default_policy() {
                 ThinkingPolicy::TemplateToggle {
                     key,
                     default_enabled,
@@ -311,7 +338,8 @@ impl ChatFormatter {
         match self {
             ChatFormatter::HuggingFace { thinking, .. }
             | ChatFormatter::KimiK25 { thinking, .. }
-            | ChatFormatter::Qwen38 { thinking, .. } => thinking
+            | ChatFormatter::Qwen38 { thinking, .. }
+            | ChatFormatter::Step3p5 { thinking, .. } => thinking
                 .for_request(tools_enabled)
                 .apply(args, named_tool_choice),
             ChatFormatter::KimiK3 => ThinkingTemplates::native(true, true)
