@@ -77,21 +77,22 @@ def test_eagle_prefetch_uses_one_hash_value_per_slot_with_raw_boundary():
     )
 
 
-def test_prefetch_stops_at_the_same_window_replay_boundary_as_match():
+@pytest.mark.parametrize("length,expected", [(1024, 896), (96, 0), (128, 0)])
+def test_prefetch_stops_at_the_same_window_replay_boundary_as_match(length, expected):
     launch = Mock()
     cache = NS(
         prefetch_from_storage=launch, window_reprefill_tail_tokens=lambda req: 128
     )
     req = NS(
         init_next_round_input=Mock(),
-        full_untruncated_fill_ids=array("q", range(1024)),
+        full_untruncated_fill_ids=array("q", range(length)),
         _compute_max_prefix_len=lambda length: length - 1,
         cache_request_handle=CacheRequestHandle("bounded", 0),
         extra_key=None,
         cache_salt=None,
     )
     FlexKVCacheLifecycleMixin.prefetch_request(cache, req)
-    assert len(launch.call_args.args[2]) == 896
+    assert len(launch.call_args.args[2]) == expected
 
 
 @pytest.mark.parametrize("explicit_backend", [False, True])

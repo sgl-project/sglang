@@ -282,7 +282,7 @@ class FlexKVCacheLifecycleMixin:
         match_end = req._compute_max_prefix_len(len(fill_ids))
         tail_fn = getattr(self, "window_reprefill_tail_tokens", None)
         if callable(tail_fn):
-            match_end = min(match_end, len(fill_ids) - tail_fn(req))
+            match_end = max(0, min(match_end, len(fill_ids) - tail_fn(req)))
         self.prefetch_from_storage(
             req.cache_request_handle,
             None,
