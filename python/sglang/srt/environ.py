@@ -322,6 +322,11 @@ class Envs:
     # Copy rank-local MoE slices into independent CPU storage before H2D when
     # they reference a larger mmap-backed checkpoint storage.
     SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D = EnvBool(False)
+    # Copy checkpoint tensors to the GPU through pinned host memory while
+    # loading weights. The CPU gather into pinned memory runs on at least
+    # SGLANG_PINNED_WEIGHT_STAGING_THREADS torch threads during the load.
+    SGLANG_PINNED_WEIGHT_STAGING = EnvBool(False)
+    SGLANG_PINNED_WEIGHT_STAGING_THREADS = EnvInt(8)
     SGLANG_LOAD_SNAPSHOT_USE_ZMQ = EnvBool(False)
     SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN = EnvBool(False)
     HF_HUB_DISABLE_XET = EnvBool(False)

@@ -118,6 +118,16 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Block size (in MB) for sequential checkpoint prefetch reads that warm the OS page cache before workers load weights via mmap</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>16</code></td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_PINNED_WEIGHT_STAGING</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Copy checkpoint tensors of at least 1 MiB to the GPU through two 64 MiB pinned host buffers while loading weights (CUDA and ROCm). The CPU gathers the next chunk into one buffer while the previous chunk is copied from the other. Pageable copies from the memory-mapped checkpoint are much slower than pinned ones, but the gather needs several CPU threads to beat them; see <code>SGLANG_PINNED_WEIGHT_STAGING_THREADS</code>.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_PINNED_WEIGHT_STAGING_THREADS</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Minimum number of torch intra-op threads while loading with <code>SGLANG_PINNED_WEIGHT_STAGING</code>. The CPU gather into pinned memory runs on them; the previous thread count is restored after loading.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>8</code></td>
+    </tr>
 </tbody>
 </table>
 
