@@ -52,16 +52,16 @@ impl TokenPieces {
 
 /// GPT-2's `bytes_to_unicode`, inverted for one character.
 fn byte_level_byte(c: char) -> Option<u8> {
-    let printable = |b: u32| matches!(b, 0x21..=0x7E | 0xA1..=0xAC | 0xAE..=0xFF);
     let c = c as u32;
-    if printable(c) {
-        return Some(c as u8);
+    match c {
+        0x21..=0x7E | 0xA1..=0xAC | 0xAE..=0xFF => Some(c as u8),
+        // The remaining bytes (0..=32, 127..=160, 173) map consecutively
+        // to U+0100..=U+0143 in GPT-2's bytes_to_unicode table.
+        0x100..=0x120 => Some((c - 0x100) as u8),
+        0x121..=0x142 => Some((c - 0x121 + 127) as u8),
+        0x143 => Some(173),
+        _ => None,
     }
-    let offset = c.checked_sub(256)? as usize;
-    (0u32..256)
-        .filter(|&b| !printable(b))
-        .nth(offset)
-        .map(|b| b as u8)
 }
 
 #[cfg(test)]
@@ -82,5 +82,40 @@ mod tests {
             None
         );
         assert_eq!(byte_level_byte('Ġ'), Some(b' '));
+    }
+
+    #[test]
+    fn byte_level_piece_recovers_all_256_bytes() {
+        // GPT-2's bytes_to_unicode table, ordered by the original byte.
+        let piece = concat!(
+            "ĀāĂăĄąĆćĈĉĊċČčĎďĐđĒēĔĕĖėĘęĚěĜĝĞğĠ",
+            "!\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~",
+            "ġĢģĤĥĦħĨĩĪīĬĭĮįİıĲĳĴĵĶķĸĹĺĻļĽľĿŀŁł",
+            "¡¢£¤¥¦§¨©ª«¬Ń®¯°±²³´µ¶·¸¹º»¼½¾¿",
+            "ÀÁÂÃÄÅÆÇÈÉÊËÌÍÎÏÐÑÒÓÔÕÖ×ØÙÚÛÜÝÞß",
+            "àáâãäåæçèéêëìíîïðñòóôõö÷øùúûüýþÿ",
+        );
+        let tokenizer = json!({"model": {"vocab": {"!": 0, "\"": 1, "#": 2, piece: 3}}});
+        assert_eq!(
+            TokenPieces::from_tokenizer_json(&tokenizer).byte_level_bytes(3),
+            Some((0..=255).collect()),
+        );
+    }
+
+    #[test]
+    fn byte_level_decoder_rejects_characters_outside_the_table() {
+        for ch in [
+            '\0',
+            ' ',
+            '\u{7f}',
+            '\u{a0}',
+            '\u{ad}',
+            '\u{144}',
+            '中',
+            '🙂',
+            char::MAX,
+        ] {
+            assert_eq!(byte_level_byte(ch), None, "unexpected byte for {ch:?}");
+        }
     }
 }
