@@ -1,11 +1,13 @@
-"""Paged fp8 / fp4 KV cache layouts of the DeepSeek-V4 family sparse MLA decode kernels.
+"""Paged KV cache layout identities used by DeepSeek-V4 sparse attention.
 
 Block-split layouts store a page as ``page_size`` data rows followed by
 ``page_size`` scale rows, and the reader requires the page stride to be a
 multiple of its TMA row stride, which :meth:`KVLayout.page_bytes` pads to. The
 ``_NEW`` layouts (FlashMLA's 2026.09.30 kernels) interleave them instead: each
 token is its data immediately followed by its scales, with no page padding.
-Mirrors ``sgl_kernel/deepseek_v4/kv_layout.cuh``.
+The versioned packed Main-KV layout has its own three-region descriptor in
+``dsv41_main_kv_layout`` and must not use the legacy geometry helpers.
+Mirrors ``sgl_kernel/deepseek_v4/kv_layout_id.cuh``.
 """
 
 from __future__ import annotations
@@ -27,6 +29,16 @@ class KVLayout(str, enum.Enum):
     # V41 / V41_FP4 encodings, each token's scales right after its data.
     V41_NEW = "v41_new"
     V41_FP4_NEW = "v41_fp4_new"
+    # DSV4.1 C1/C2 Main KV only: 448 packed e2m1 noPE values, 28 e4m3
+    # scales plus 4 reserved bytes, and 64 bf16 RoPE values.
+    DSV41_MAIN_KV_E2M1_BLOCK16_ROPE_BF16_V1 = "dsv41_main_kv_e2m1_block16_rope_bf16_v1"
+
+    def _require_legacy_flashmla_layout(self) -> None:
+        if self is KVLayout.DSV41_MAIN_KV_E2M1_BLOCK16_ROPE_BF16_V1:
+            raise ValueError(
+                f"{self.value} uses MainKVLayoutSpec; it is not a legacy "
+                "FlashMLA data/scale layout"
+            )
 
     @functools.cached_property
     def is_interleaved(self) -> bool:
@@ -48,6 +60,7 @@ class KVLayout(str, enum.Enum):
 
     @functools.cached_property
     def data_bytes(self) -> int:
+        self._require_legacy_flashmla_layout()
         return {
             KVLayout.V4: 576,
             KVLayout.V41: 512,
@@ -59,6 +72,7 @@ class KVLayout(str, enum.Enum):
 
     @functools.cached_property
     def scale_bytes(self) -> int:
+        self._require_legacy_flashmla_layout()
         return {
             KVLayout.V4: 8,
             KVLayout.V41: 16,
@@ -71,6 +85,7 @@ class KVLayout(str, enum.Enum):
     @functools.cached_property
     def tile_size(self) -> int:
         """Values sharing one scale."""
+        self._require_legacy_flashmla_layout()
         return {
             KVLayout.V4: 64,
             KVLayout.V41: 32,
@@ -87,6 +102,7 @@ class KVLayout(str, enum.Enum):
     @functools.cached_property
     def page_align(self) -> int:
         """Unit the page stride is padded to: the reader's TMA row stride."""
+        self._require_legacy_flashmla_layout()
         return {
             KVLayout.V4: 576,
             KVLayout.V41: 512,
@@ -98,7 +114,11 @@ class KVLayout(str, enum.Enum):
 
     @functools.cached_property
     def is_fp4(self) -> bool:
-        return self.encoding is KVLayout.V41_FP4
+        return self.encoding is KVLayout.V41_FP4 or self.is_packed_main_kv
+
+    @property
+    def is_packed_main_kv(self) -> bool:
+        return self is KVLayout.DSV41_MAIN_KV_E2M1_BLOCK16_ROPE_BF16_V1
 
     def page_bytes(self, page_size: int) -> int:
         raw = page_size * self.bytes_per_token

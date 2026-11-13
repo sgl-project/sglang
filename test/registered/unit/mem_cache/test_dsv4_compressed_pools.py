@@ -92,6 +92,8 @@ class TestDSV4CompressedPools(CustomTestCase):
 
     def test_native_paged_kv_description_preserves_padding_and_storage(self):
         for layout in KVLayout:
+            if layout.is_packed_main_kv:
+                continue
             with self.subTest(layout=layout):
                 pool = DeepSeekV4SingleKVPool.__new__(DeepSeekV4SingleKVPool)
                 pool.page_size = 64
