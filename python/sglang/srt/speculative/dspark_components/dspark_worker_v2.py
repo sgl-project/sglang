@@ -1192,13 +1192,30 @@ class DSparkWorkerV2(BaseSpecWorker):
             GrammarTree.from_linear_chain(verify_ids_2d) if batch.has_grammar else None
         )
 
+        epilogue = self._verify_executor.verify_epilogue
+        # An epilogue whose static graph also runs the sampled accept (and its
+        # simulated bonus) serves this all-sampled step in the graph.
+        sampled_fold = (
+            epilogue is not None
+            and proposal.folded
+            and not run_compact
+            and self._verify_planner.mode_value == "static"
+            and sampling_info is not None
+            and not batch.has_grammar
+            and not batch.return_logprob
+            and epilogue.serves_sampled_fold(
+                sampling_info=sampling_info,
+                draft_block=draft_block,
+                block_verification=get_spec().speculative_use_block_verification,
+            )
+        )
         fold_eligible = (
-            self._verify_executor.verify_epilogue is not None
+            epilogue is not None
             and proposal.folded
             # The epilogue's in-graph accept is greedy (AcceptGreedy);
             # sampling batches must take the eager accept path even when the
             # draft proposal itself folded.
-            and (sampling_info is None or sampling_info.is_all_greedy)
+            and (sampling_info is None or sampling_info.is_all_greedy or sampled_fold)
             # A live grammar forces the eager path: the folded epilogue accepts inside
             # the cuda graph off its own buffers, where the mask below never lands.
             and verify_logits_adjustments_are_noop(
@@ -1208,9 +1225,17 @@ class DSparkWorkerV2(BaseSpecWorker):
             # only when the epilogue draws it there (SGLANG_DSPARK_SIMULATE_FOLD).
             and (
                 simulate_bonus_sampling_info is None
-                or self._verify_executor.verify_epilogue.simulate_fold
+                or epilogue.simulate_fold
+                or sampled_fold
             )
         )
+        if fold_eligible:
+            epilogue.begin_fold(
+                bs,
+                sampled=sampled_fold,
+                draft_block=draft_block,
+                simulate_bonus_sampling_info=simulate_bonus_sampling_info,
+            )
         if not self._sim_draw_ahead:
             self._verify_executor.begin_simulated_step()
             if fold_eligible and self._verify_executor.verify_epilogue.simulate_fold:

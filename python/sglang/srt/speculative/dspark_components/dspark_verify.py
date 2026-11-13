@@ -729,6 +729,18 @@ class DsparkVerifyEpilogue:
         self.inject_gate_buf.fill_(int(armed))
         self._static_step_state = state
 
+    def serves_sampled_fold(
+        self, *, sampling_info, draft_block, block_verification: bool
+    ) -> bool:
+        """Whether the static graph's accept also serves this all-sampled step; the
+        stock accept is greedy only."""
+        return False
+
+    def begin_fold(
+        self, bs: int, *, sampled: bool, draft_block, simulate_bonus_sampling_info
+    ) -> None:
+        """A folded step's inputs, before replay; the stock greedy accept reads none."""
+
     def begin_sim_bonus(self, bs: int, temperatures: Optional[torch.Tensor]) -> None:
         """The step's bonus temperatures (None: greedy), before replay; the seed is
         TargetVerifyExecutor.begin_simulated_step's."""
