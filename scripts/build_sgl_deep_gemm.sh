@@ -3,12 +3,16 @@
 #
 # Usage: build_sgl_deep_gemm.sh <PYTHON_VERSION> <CUDA_VERSION> <DEEPGEMM_SRC> [ARCH]
 #   PYTHON_VERSION: e.g. 3.12
-#   CUDA_VERSION:   e.g. 13.0
+#   CUDA_VERSION:   13.0 or 13.4
 #   DEEPGEMM_SRC:   path to a checkout of sgl-project/DeepGEMM
 #   ARCH:           x86_64 (default) or aarch64
 #
+# Env:
+#   TORCH_VER: torch the wheel is built against (its _C.so links this torch ABI).
+#              Defaults to 2.14.1 for CUDA 13.0 and 2.15.0 for CUDA 13.4.
+#
 # Writes:
-#   <DEEPGEMM_SRC>/dist/      — wheel(s) tagged +cu130 and manylinux
+#   <DEEPGEMM_SRC>/dist/      — wheel(s) tagged +cu130/+cu134 and manylinux
 #   <DEEPGEMM_SRC>/dist-pypi/ — cu130 only: same wheel(s) with +cu130 stripped
 #                              (PyPI rejects local-version segments)
 set -ex
@@ -24,12 +28,14 @@ DEEPGEMM_SRC="$(cd "$3" && pwd)"
 ARCH="${4:-$(uname -i)}"
 
 case "${CUDA_VERSION}" in
-  13.0) CU_TAG=cu130 ;;
+  13.0) CU_TAG=cu130; DEFAULT_TORCH_VER=2.14.1 ;;
+  13.4) CU_TAG=cu134; DEFAULT_TORCH_VER=2.15.0 ;;
   *)
     echo "Unsupported CUDA_VERSION: ${CUDA_VERSION}" >&2
     exit 1
     ;;
 esac
+TORCH_VER="${TORCH_VER:-${DEFAULT_TORCH_VER}}"
 
 if [ "${ARCH}" = "aarch64" ]; then
   BASE_IMG="pytorch/manylinuxaarch64-builder"
@@ -50,6 +56,7 @@ echo "----------------------------------------"
 echo "PYTHON_VERSION: ${PYTHON_VERSION}"
 echo "CUDA_VERSION:   ${CUDA_VERSION}"
 echo "CU_TAG:         ${CU_TAG}"
+echo "TORCH_VER:      ${TORCH_VER}"
 echo "ARCH:           ${ARCH}"
 echo "BASE_IMG:       ${BASE_IMG}"
 echo "DEEPGEMM_SRC:   ${DEEPGEMM_SRC}"
@@ -63,6 +70,7 @@ docker build \
   --build-arg ARCH="${ARCH}" \
   --build-arg PYTHON_VERSION="${PYTHON_VERSION}" \
   --build-arg PYTHON_TAG="${PY_TAG}" \
+  --build-arg TORCH_VER="${TORCH_VER}" \
   -t "${DEPS_TAG}" \
   --network=host
 
