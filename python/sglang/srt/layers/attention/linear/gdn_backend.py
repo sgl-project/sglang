@@ -1491,7 +1491,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     mamba_pool=mamba_pool,
                     layer_cache=mamba_cache_params,
                     cache_indices=cache_indices,
-                    replay_indices=forward_batch.req_pool_indices,
+                    replay_indices=self.forward_metadata.replayssm_ring_indices,
                     query_start_loc=query_start_loc,
                     draft_token_num=forward_batch.spec_info.draft_token_num,
                 )
