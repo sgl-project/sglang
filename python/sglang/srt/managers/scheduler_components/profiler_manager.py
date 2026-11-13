@@ -21,7 +21,10 @@ from sglang.srt.layers.dp_attention import get_dp_tp_group
 from sglang.srt.managers.io_struct import ProfileReq, ProfileReqOutput, ProfileReqType
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.step_span_utils import set_detailed_annotations_enabled
-from sglang.srt.observability.profile_utils import ProfileManager
+from sglang.srt.observability.profile_utils import (
+    ProfileManager,
+    sanitize_profile_filename_component,
+)
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_device, get_parallel
 from sglang.srt.utils import is_mps, is_npu
@@ -101,6 +104,9 @@ class SchedulerProfilerManager:
         detailed_annotations: bool = False,
         profile_stages: Optional[List[str]] = None,
     ) -> ProfileReqOutput:
+        profile_id = sanitize_profile_filename_component(profile_id)
+        profile_prefix = sanitize_profile_filename_component(profile_prefix)
+
         if envs.SGLANG_PROFILE_V2.get():
             self.detailed_annotations = detailed_annotations
             return self._profile_manager.configure(
