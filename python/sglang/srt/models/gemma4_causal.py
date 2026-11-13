@@ -1044,9 +1044,10 @@ class Gemma4TextModel(PreTrainedModel):
         self, forward_batch, num_tokens, per_layer_inputs, pp_proxy_tensors
     ) -> bool:
         mode = forward_batch.forward_mode
+        decode = mode == ForwardMode.DECODE
         return (
-            (mode == ForwardMode.EXTEND or mode.is_mixed())
-            and self._ar_fusion.applies(num_tokens)
+            (decode or mode == ForwardMode.EXTEND or mode.is_mixed())
+            and self._ar_fusion.applies(num_tokens, decode)
             and per_layer_inputs is None
             and pp_proxy_tensors is None
             and not self.layers_to_capture
@@ -1066,10 +1067,12 @@ class Gemma4TextModel(PreTrainedModel):
         and scales.
         """
         fusion = self._ar_fusion
-        if not fusion.used:
-            fusion.used = True
+        kind = "decode" if forward_batch.forward_mode.is_decode() else "extend"
+        if kind not in fusion.used:
+            fusion.used.add(kind)
             logger.info(
-                "gemma4 all-reduce fusion: first fused forward (%d tokens)",
+                "gemma4 all-reduce fusion: first fused %s forward (%d tokens)",
+                kind,
                 input_embeds.shape[0],
             )
         num_tokens = input_embeds.shape[0]

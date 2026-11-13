@@ -3,10 +3,14 @@
 
 Opt-in with ``SGLANG_GEMMA4_AR_FUSION=1``. Extend batches of
 ``SGLANG_GEMMA4_AR_FUSION_MIN_TOKENS`` (default per TP size, see
-``DEFAULT_MIN_TOKENS``) .. ``_MAX_TOKENS`` tokens run every
+``DEFAULT_MIN_TOKENS``) .. ``_MAX_TOKENS`` tokens, and decode batches of
+``SGLANG_GEMMA4_AR_FUSION_DECODE_MIN_TOKENS`` (``DEFAULT_DECODE_MIN_TOKENS``)
+.. ``_MAX_TOKENS`` tokens, run every
 TP all-reduce + RMSNorm -> residual add (x layer_scalar) -> RMSNorm -> per-128
 FP8 quant of the dense layer stack as one NVLS kernel each; everything else
-takes the regular path. Needs SM90 with NVLink multicast (CustomAllReduceV2
+takes the regular path. A decode batch inside a CUDA graph has the graph's
+batch size, the same on every rank, so a captured graph is fused or stock as
+a whole. Needs SM90 with NVLink multicast (CustomAllReduceV2
 with a multicast pull plane), TP > 1 on one node, and block-FP8 weights whose
 linear takes pre-quantized ``(fp8, scales)`` input.
 """
@@ -35,9 +39,29 @@ logger = logging.getLogger(__name__)
 DEFAULT_MIN_TOKENS = {2: 2048, 4: 128, 8: 128}
 
 
+# Smallest decode batch that takes the fused path, per TP size, unless
+# SGLANG_GEMMA4_AR_FUSION_DECODE_MIN_TOKENS says otherwise; a TP size not listed
+# keeps decode on the stock path. On H200 the fused site (partial written by the
+# GEMM) is 17-39 % faster than CustomAllReduceV2 + the stock norm and quant
+# kernels at 1-160 tokens, yet the TP4 decode step is 1-4 % slower below 8
+# tokens (most likely the next block-FP8 GEMM reformatting the site's row-major
+# scales) and 1-4 % faster from 8 up. At TP2 the step moves by -1.3..+1.6 %, about the
+# run-to-run spread, so TP2 keeps the stock path; TP8 is not measured.
+DEFAULT_DECODE_MIN_TOKENS = {4: 8}
+
+
 def default_min_tokens(world_size: int) -> int:
     # the entry of the nearest TP size at or below world_size
     return DEFAULT_MIN_TOKENS[max(n for n in DEFAULT_MIN_TOKENS if n <= world_size)]
+
+
+def decode_min_tokens(world_size: int) -> Optional[int]:
+    """Smallest fused decode batch: the env value, else the TP size's default;
+    None keeps decode on the stock path."""
+    n = int(envs.SGLANG_GEMMA4_AR_FUSION_DECODE_MIN_TOKENS.get())
+    if n < 0:
+        return None
+    return n or DEFAULT_DECODE_MIN_TOKENS.get(world_size)
 
 
 GROUP = 128
@@ -136,6 +160,7 @@ class Gemma4ArFusion:
             default_min_tokens(self.world_size)
         )
         self.min_tokens = max(min_tokens, self.world_size)
+        self.decode_min_tokens = decode_min_tokens(self.world_size)
         T, H = self.max_tokens, hidden_size
         # partial sums in (bf16); the last layer multicasts the bf16 residual into it
         self.partial = _symm_buffer((T, H), torch.bfloat16, state.group_name)
@@ -143,14 +168,20 @@ class Gemma4ArFusion:
         self.scales = _symm_buffer((T, H // GROUP), torch.float32, state.group_name)
         dev = self.partial.tensor.device
         self.one = torch.ones(1, dtype=torch.float32, device=dev)
-        self.used = False
+        self.used = set()  # "extend" / "decode" once their first fused forward ran
         torch.cuda.synchronize()
         torch.distributed.barrier(state.comm.group)
         logger.info(
-            "gemma4 all-reduce fusion: tp=%d, %d..%d tokens, %.0f MB symmetric memory",
+            "gemma4 all-reduce fusion: tp=%d, extend %d..%d tokens, decode %s, "
+            "%.0f MB symmetric memory",
             self.world_size,
             self.min_tokens,
             self.max_tokens,
+            (
+                "off"
+                if self.decode_min_tokens is None
+                else f"{self.decode_min_tokens}..{self.max_tokens} tokens"
+            ),
             sum(b.tensor.nbytes for b in (self.partial, self.out, self.scales)) / 2**20,
         )
 
@@ -165,8 +196,9 @@ class Gemma4ArFusion:
             logger.warning("SGLANG_GEMMA4_AR_FUSION=1 ignored: %s", e)
             return None
 
-    def applies(self, num_tokens: int) -> bool:
-        return self.min_tokens <= num_tokens <= self.max_tokens
+    def applies(self, num_tokens: int, decode: bool = False) -> bool:
+        low = self.decode_min_tokens if decode else self.min_tokens
+        return low is not None and low <= num_tokens <= self.max_tokens
 
     def rows(self, num_tokens: int) -> Tuple[int, int]:
         """(first row, row count) this rank owns out of ``num_tokens``."""
