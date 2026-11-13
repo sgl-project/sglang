@@ -45,6 +45,21 @@ cd python/sglang/kernels/aot
 python setup_sail.py install
 ```
 
+### Install the Prebuilt Kernel Wheel
+
+CI publishes each released kernel version as a prebuilt SAIL wheel. It carries
+the `+sail` local version and is built for PPU 10 / PPU 15
+(`sglang_kernel-<version>+sail-cp310-abi3-linux_x86_64.whl`), so it can replace
+the `setup_sail.py install` step above:
+
+```bash Command
+python3 -m pip install "sglang-kernel==0.4.10+sail" \
+  --extra-index-url https://docs.sglang.io/whl/sail/
+```
+
+If the index has no wheel for the kernel version this SGLang tracks, build it
+from source as described above.
+
 Launch the server:
 
 ```bash Command
