@@ -14,10 +14,10 @@ test("Muse Glimmer CPU preserves the complete checkpoint and tested command", ()
     HOST_IP: "0.0.0.0", PORT: "30000",
   });
   for (const flag of [
-    "--model meta-models/Muse-Glimmer-30B", "--device cpu", "--tp 6", "--host 0.0.0.0",
+    "--model meta-models/Muse-Glimmer-30B", "--device cpu", "--disable-overlap-schedule", "--tp 6", "--host 0.0.0.0",
   ]) assert.ok(command.includes(flag), flag);
   assert.match(command, /^sglang serve/);
-  assert.doesNotMatch(command, /--revision|--dtype|--max-total-tokens|--port|--trust-remote-code|--disable-overlap-schedule|--language-model-only|--speculative|--reasoning-parser|--tool-call-parser|docker/);
+  assert.doesNotMatch(command, /--revision|--dtype|--max-total-tokens|--port|--trust-remote-code|--language-model-only|--speculative|--reasoning-parser|--tool-call-parser|docker/);
   assert.deepEqual(config.runModes(cell.match), ["python"]);
   assert.deepEqual(config.runModes({ hw: "mac" }), ["python"]);
   assert.deepEqual(config.runModes({ hw: "h200" }), ["python", "docker"]);

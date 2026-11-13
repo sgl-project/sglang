@@ -82,6 +82,7 @@ export const InternS2PreviewDeployment = () => {
       return `sglang serve \\
   --model internLM/Intern-S2-Preview \\
   --device cpu \\
+  --disable-overlap-schedule \\
   --tp 4 \\
   --host 0.0.0.0`;
     }
