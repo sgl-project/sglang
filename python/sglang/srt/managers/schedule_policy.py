@@ -355,6 +355,8 @@ class SchedulePolicy:
     ) -> Set[int]:
         temporary_deprioritized: Set[int] = set()
         self.waiting_queue_radix_tree.reset()
+        # DFS-weight does not use the temporary deprioritization result.
+        check_in_batch_prefix = policy != CacheAwarePolicy.DFS_WEIGHT
 
         for r in waiting_queue:
             prefix_ids = r.origin_input_ids + r.output_ids
@@ -369,7 +371,10 @@ class SchedulePolicy:
             # We prefer to set IN_BATCH_PREFIX_CACHING_CHECK_THRESHOLD > 0 because too small
             # threshold means we cannot use in-batch prefix caching for short prefixes.
             # It is kind of common when the engine is long running (e.g., imagine the prefix "the").
-            if r.prefix_len <= IN_BATCH_PREFIX_CACHING_CHECK_THRESHOLD:
+            if (
+                r.prefix_len <= IN_BATCH_PREFIX_CACHING_CHECK_THRESHOLD
+                and check_in_batch_prefix
+            ):
                 match_result = self.waiting_queue_radix_tree.match_prefix(
                     MatchPrefixParams(
                         key=RadixKey(

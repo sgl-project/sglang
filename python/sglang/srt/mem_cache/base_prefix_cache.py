@@ -438,10 +438,21 @@ def _dfs_weight_order(
     node_handles: Sequence[Any],
     resolve_node_handle: Callable[[Any], Any],
 ) -> list[int]:
+    if not node_handles:
+        return []
+
     last_node_to_indices: dict[Any, list[int]] = {}
     for index, node_handle in enumerate(node_handles):
         node = resolve_node_handle(node_handle)
         last_node_to_indices.setdefault(node, []).append(index)
+
+    # Only paths to waiting requests can contribute weight. Stop at shared
+    # ancestors so each relevant node is collected once, even for deep paths.
+    relevant_nodes: set[Any] = set()
+    for node in last_node_to_indices:
+        while node is not None and node not in relevant_nodes:
+            relevant_nodes.add(node)
+            node = node.parent
 
     node_to_weight: dict[Any, int] = {
         node: len(indices) for node, indices in last_node_to_indices.items()
@@ -457,8 +468,9 @@ def _dfs_weight_order(
             node_to_weight[node] = weight
             continue
         stack.append((node, True))
-        for child in reversed(list(node.children.values())):
-            stack.append((child, False))
+        for child in node.children.values():
+            if child in relevant_nodes:
+                stack.append((child, False))
 
     order: list[int] = []
 
@@ -468,7 +480,9 @@ def _dfs_weight_order(
         if visited:
             order.extend(last_node_to_indices.get(node, ()))
             continue
-        children = list(node.children.values())
+        children = [
+            child for child in node.children.values() if node_to_weight.get(child, 0)
+        ]
         children.sort(key=lambda child: -node_to_weight.get(child, 0))
         stack.append((node, True))
         for child in reversed(children):
