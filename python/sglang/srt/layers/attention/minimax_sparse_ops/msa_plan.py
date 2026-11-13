@@ -213,6 +213,9 @@ def start_msa_v1_prebuild(
         return
     from inference.dequant.nvfp4_to_fp8.jit import load_extension as dequant
     from inference.msa_v1.attention.decode.q8kv4 import jit as decode_attention
+    from inference.msa_v1.attention.decode.q8kv4.interface import (
+        _get_cpp as decode_attention_host,
+    )
     from inference.msa_v1.attention.prefill.q8kv4.jit import (
         load_extension as prefill_attention,
     )
@@ -247,6 +250,7 @@ def start_msa_v1_prebuild(
         lambda: build_decode_attention(True),
         lambda: decode_attention.get_plan_fn(device.index),
         lambda: decode_attention.get_reduction_module(device.index),
+        decode_attention_host,
         lambda: prefill_attention(device),
         lambda: dequant(device),
         topk_select,
