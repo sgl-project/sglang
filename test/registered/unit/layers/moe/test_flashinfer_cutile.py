@@ -77,6 +77,50 @@ class TestFlashInferCuTile(CustomTestCase):
         self._stack.enter_context(_runtime_scope())
         _stub_flashinfer_boundary(self._stack)
 
+    def test_explicit_marlin_selects_portable_experts_on_sm12x(self):
+        for device_sm in (120, 121):
+            with (
+                self.subTest(sm=device_sm),
+                override_platform(device_sm=device_sm, is_blackwell=True),
+                get_flags().moe.override(runner_backend=MoeRunnerBackend.MARLIN),
+            ):
+                scheme = MiniMaxM3Nvfp4MoE()
+                self.assertTrue(scheme.use_marlin)
+                self.assertFalse(scheme.use_flashinfer_cutile)
+                self.assertFalse(scheme.use_flashinfer_trtllm)
+                self.assertFalse(scheme.requantizes_experts)
+
+    def test_marlin_opt_in_preserves_existing_expert_selection(self):
+        cases = (
+            (120, MoeRunnerBackend.FLASHINFER_CUTILE, MoeA2ABackend.NONE, False),
+            (121, MoeRunnerBackend.FLASHINFER_CUTILE, MoeA2ABackend.NONE, False),
+            (90, MoeRunnerBackend.MARLIN, MoeA2ABackend.NONE, True),
+            (100, MoeRunnerBackend.DEEP_GEMM, MoeA2ABackend.MEGAMOE, False),
+            (100, MoeRunnerBackend.MARLIN, MoeA2ABackend.MEGAMOE, False),
+            (120, MoeRunnerBackend.DEEP_GEMM, MoeA2ABackend.MEGAMOE, False),
+        )
+        for device_sm, backend, a2a, use_marlin in cases:
+            with (
+                self.subTest(sm=device_sm, backend=backend),
+                override_platform(device_sm=device_sm, is_blackwell=device_sm >= 100),
+                get_flags().moe.override(runner_backend=backend, a2a_backend=a2a),
+            ):
+                scheme = MiniMaxM3Nvfp4MoE()
+                self.assertEqual(scheme.use_marlin, use_marlin)
+                self.assertEqual(
+                    scheme.use_flashinfer_cutile,
+                    backend == MoeRunnerBackend.FLASHINFER_CUTILE,
+                )
+
+    def test_experimental_marlin_does_not_enable_the_sm12x_opt_in(self):
+        with (
+            get_flags().moe.override(
+                runner_backend=MoeRunnerBackend.EXPERIMENTAL_SGL_MARLIN
+            ),
+            self.assertRaisesRegex(ValueError, "experts require"),
+        ):
+            MiniMaxM3Nvfp4MoE()
+
     def test_weight_preparation_preserves_branch_scale_pairing(self):
         layer = _layer()
         original = {

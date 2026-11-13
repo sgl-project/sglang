@@ -157,6 +157,53 @@ def packed_moe_hf(**quant_overrides):
 
 
 class TestMiniMaxM31ConfigResolution(CustomTestCase):
+    def test_marlin_preserves_explicit_settings_on_sm12x(self):
+        for device_sm in (120, 121):
+            for checkpoint in (NVFP4, packed_moe_hf()):
+                with (
+                    self.subTest(
+                        sm=device_sm, checkpoint=checkpoint.quantization_config
+                    ),
+                    override_platform(
+                        device_sm=device_sm, is_blackwell=True, is_hip=False
+                    ),
+                ):
+                    args = server_args(
+                        moe_runner_backend="marlin",
+                        attention_backend="flashinfer",
+                        kv_cache_dtype="bf16",
+                    )
+                    overrides = _minimax_m3_overrides(args, checkpoint)
+                    self.assertEqual(
+                        overrides,
+                        dict(quantization="minimax_m3_nvfp4", page_size=128),
+                    )
+                    self.assertEqual(args.moe_runner_backend, "marlin")
+                    self.assertEqual(args.moe_a2a_backend, "none")
+                    self.assertEqual(args.attention_backend, "flashinfer")
+                    self.assertEqual(args.kv_cache_dtype, "bf16")
+
+    def test_marlin_sm12x_rejects_unsupported_model_modes(self):
+        cases = (
+            (dict(moe_a2a_backend="megamoe"), "moe-a2a-backend none"),
+            (dict(moe_a2a_backend="deepep"), "moe-a2a-backend none"),
+            (dict(page_size=64), "page-size 128"),
+            (dict(speculative_algorithm="DSPARK"), "speculative decoding"),
+            (dict(speculative_algorithm="DFLASH"), "speculative decoding"),
+        )
+        for device_sm in (120, 121):
+            for settings, error in cases:
+                with (
+                    self.subTest(sm=device_sm, settings=settings),
+                    override_platform(
+                        device_sm=device_sm, is_blackwell=True, is_hip=False
+                    ),
+                    self.assertRaisesRegex(ValueError, error),
+                ):
+                    _minimax_m3_overrides(
+                        server_args(moe_runner_backend="marlin", **settings), NVFP4
+                    )
+
     def test_cutile_preserves_explicit_backend_on_sm12x(self):
         for device_sm in (120, 121):
             for checkpoint in (NVFP4, packed_moe_hf()):
