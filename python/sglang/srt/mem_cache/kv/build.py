@@ -9,24 +9,40 @@ import logging
 from typing import Any, Optional, Sequence
 
 import msgspec
+import torch
 
 from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.decl import (
+    KV_PART,
+    IndexKeyGeometry,
     KVLayerDecl,
+    MLAGeometry,
+    RequestLifetime,
     StateLifetime,
     WindowLifetime,
 )
+from sglang.srt.mem_cache.kv.layout.composite import (
+    CompositeSubPoolSpec,
+    UnitPartGeometry,
+)
+from sglang.srt.mem_cache.kv.layout.index_key import IndexKeyView
 from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec, MHAView
-from sglang.srt.mem_cache.kv.layout.mla import MLASubPoolSpec, MLAView
+from sglang.srt.mem_cache.kv.layout.mla import (
+    LayerMajorMLAView,
+    MLASubPoolSpec,
+    MLAView,
+)
 from sglang.srt.mem_cache.kv.layout.state import NGramView, ShortConvView, StateView
 from sglang.srt.mem_cache.kv.memory.arena import GB, KVArena, plan_bands
 from sglang.srt.mem_cache.kv.memory.fixed import FixedMemory
 from sglang.srt.mem_cache.kv.plan import (
     KVStoragePlan,
+    PlannedPart,
     PlannedSubPool,
     plan_kv_storage,
 )
-from sglang.srt.mem_cache.kv.requests import RequestTable, StateTracking
+from sglang.srt.mem_cache.kv.requests import RequestTable, RowUnits, StateTracking
 from sglang.srt.mem_cache.kv.routed_cache import RoutedKVCache
 from sglang.srt.mem_cache.kv.sizing import (
     KVSizingInputs,
@@ -52,7 +68,7 @@ class UnifiedBuildContext(msgspec.Struct, frozen=True, kw_only=True):
     end_layer: int
     enable_memory_saver: bool
     need_sort: bool
-    lazy_compaction: bool = False
+    lazy_compaction: bool = True
     forward_stream: Optional[Any] = None  # torch.cuda.Stream
     post_capture_active: bool = False
     is_draft_worker: bool = False
@@ -109,12 +125,25 @@ def _build_request_table(
     )
 
 
+def _request_parts_of(
+    plan: KVStoragePlan, arena: KVArena, owner: str
+) -> dict[str, torch.Tensor]:
+    """The request sub-pools' views of the parts sub-pool ``owner`` declared,
+    by their names within ``owner``."""
+    prefix = f"{owner}."
+    return {
+        name.removeprefix(prefix): view
+        for sub_pool in plan.requests()
+        for name, view in sub_pool.spec.part_views(arena).items()
+        if name.startswith(prefix)
+    }
+
+
 def _build_state_storage(
     plan: KVStoragePlan,
     arena: KVArena,
     ctx: UnifiedBuildContext,
     scratch: FixedMemory,
-    request_memory: FixedMemory,
 ) -> StateStorage:
     """The state sub-pool's storage, without its slots: those come from the
     chain allocator's state band (`_wire_mamba_slot_allocator`)."""
@@ -125,11 +154,7 @@ def _build_state_storage(
         spec=state.spec,
         mamba_layer_ids=layer_ids,
         enable_memory_saver=ctx.enable_memory_saver,
-        request_parts={
-            name.removeprefix(f"{state.name}."): tensor
-            for name, tensor in request_memory.tensors.items()
-            if name.startswith(f"{state.name}.")
-        },
+        request_parts=_request_parts_of(plan, arena, state.name),
         intermediate_ssm=scratch.tensors.get(f"{state.name}.intermediate_ssm"),
         intermediate_conv_window=(
             [
@@ -163,7 +188,11 @@ def _build_token_view(
     plan: KVStoragePlan,
     ctx: UnifiedBuildContext,
 ):
-    """A token sub-pool's view in its layout."""
+    """A token sub-pool's view in its layout; a composite's other parts are
+    bound by `_bind_unit_parts`."""
+    if isinstance(sub_pool.spec, CompositeSubPoolSpec):
+        kv = sub_pool.part(KV_PART)
+        return _unit_view(kv, sub_pool, arena, plan)
     if isinstance(sub_pool.spec, MLASubPoolSpec):
         # Addressed by the 0..N-1 index of its layers, so start_layer stays 0.
         return MLAView(
@@ -183,6 +212,51 @@ def _build_token_view(
     )
 
 
+def _unit_view(
+    part: PlannedPart, sub_pool: PlannedSubPool, arena: KVArena, plan: KVStoragePlan
+):
+    """The view a composite sub-pool's part is read through."""
+    geometry = part.geometry
+    if isinstance(geometry, UnitPartGeometry):
+        return geometry.unit_view(
+            arena=arena, spec=sub_pool.spec, part=part, page_size=plan.page_size
+        )
+    if isinstance(geometry, MLAGeometry) and geometry.layer_major:
+        return LayerMajorMLAView(
+            arena=arena,
+            spec=sub_pool.spec,
+            geometry=geometry,
+            page_size=plan.page_size,
+            model_layer_ids=part.layer_ids,
+        )
+    if isinstance(geometry, IndexKeyGeometry):
+        return IndexKeyView(
+            arena=arena,
+            spec=sub_pool.spec,
+            geometry=geometry,
+            page_size=plan.page_size,
+            model_layer_ids=part.layer_ids,
+        )
+    raise NotImplementedError(
+        f"sub-pool {sub_pool.name!r}: no view reads {type(geometry).__name__} "
+        "from a composite unit"
+    )
+
+
+def _bind_unit_parts(router, plan: KVStoragePlan, arena: KVArena) -> None:
+    """Routes each composite sub-pool's non-KV parts by part name."""
+    for sub_pool in plan.sub_pools:
+        for part in sub_pool.parts:
+            if part.name == KV_PART:
+                continue
+            router.bind_part(
+                sub_pool=sub_pool.name,
+                part=part.name,
+                view=_unit_view(part, sub_pool, arena, plan),
+                indices={layer_id: i for i, layer_id in enumerate(part.layer_ids)},
+            )
+
+
 def build_kv_storage(
     plan: KVStoragePlan,
     sized: SizedKVStorage,
@@ -194,7 +268,7 @@ def build_kv_storage(
         "building one of its own"
     )
     owner = plan.owner()
-    window = plan.of_lifetime(WindowLifetime)
+    window = plan.primary_window()
     state = plan.of_lifetime(StateLifetime)
     for s in plan.sub_pools:
         expected = None if plan.fused_draft is None else plan.fused_draft.region(s.name)
@@ -216,12 +290,6 @@ def build_kv_storage(
         device=ctx.device,
         enable_memory_saver=ctx.enable_memory_saver,
     )
-    request_memory = FixedMemory(
-        [d.part for d in plan.request_parts],
-        rows=sized.request_rows,
-        device=ctx.device,
-        enable_memory_saver=ctx.enable_memory_saver,
-    )
     for sub_pool in plan.sub_pools:
         parts = [d.part for d in plan.derived_parts if d.sub_pool == sub_pool.name]
         if parts:
@@ -231,7 +299,11 @@ def build_kv_storage(
                 device=ctx.device,
                 enable_memory_saver=ctx.enable_memory_saver,
             )
-    token_sub_pools = [s for s in plan.owner_first() if s is not state]
+    token_sub_pools = [
+        s
+        for s in plan.owner_first()
+        if s is not state and not isinstance(s.lifetime, RequestLifetime)
+    ]
     views = {s.name: _build_token_view(s, arena, plan, ctx) for s in token_sub_pools}
     # Without a window, capacity uses the configured cap;
     # window chains use the owner's current arena slots.
@@ -257,11 +329,21 @@ def build_kv_storage(
         head_num=owner_spec.head_num if owner_is_mha else ctx.head_num,
         head_dim=owner_spec.head_dim if owner_is_mha else ctx.head_dim,
         bs1_floor_terms=sized.bs1_floor_terms,
+        # Backends ask for the sliding-window layers by their role: the
+        # target's window.
+        roles={} if window is None else {IdSpaceKind.SLIDING_WINDOW: window.name},
+        # Routes carry each window sub-pool's attention window.
+        windows={
+            s.name: s.lifetime.window
+            for s in token_sub_pools
+            if isinstance(s.lifetime, WindowLifetime)
+        },
     )
+    _bind_unit_parts(token_to_kv_pool.layer_router, plan, arena)
     req_to_token_pool = _build_request_table(plan, ctx, sized)
     state_storage = None
     if state is not None:
-        state_storage = _build_state_storage(plan, arena, ctx, scratch, request_memory)
+        state_storage = _build_state_storage(plan, arena, ctx, scratch)
         views[state.name] = state_storage.pool
     legacy_capacities = {}
     if window is not None and state is not None:
@@ -278,6 +360,7 @@ def build_kv_storage(
             windows=tuple(
                 s.name for s in plan.sub_pools if isinstance(s.lifetime, WindowLifetime)
             ),
+            requests=tuple(s.name for s in plan.requests()),
         ),
         kvcache=token_to_kv_pool,
         views=views,
@@ -287,6 +370,7 @@ def build_kv_storage(
         forward_stream=ctx.forward_stream,
         lazy_compaction=ctx.lazy_compaction,
         full_cap_tokens=sized.full_cap_tokens,
+        request_rows=sized.request_rows,
         **legacy_capacities,
     )
     if window is None:
@@ -301,10 +385,19 @@ def build_kv_storage(
         _wire_mamba_slot_allocator(
             mamba_end=allocator.mamba_allocator,
             take=allocator.alloc_state_slots,
+            fits=allocator.state_slots_fit,
+            estimate=allocator.estimated_state_slots_available,
             state=state_storage,
             device=ctx.device,
         )
         allocator.state = state_storage
+    allocator.plan = plan
+    if plan.requests():
+        req_to_token_pool.bind_row_units(
+            RowUnits(
+                bind=allocator.alloc_request_rows, free=allocator.free_request_rows
+            )
+        )
     allocator.storage = KVStorage(
         plan=plan,
         sized=sized,
@@ -313,7 +406,6 @@ def build_kv_storage(
         start_layer=ctx.start_layer,
         requests=req_to_token_pool,
         scratch=scratch,
-        request_memory=request_memory,
     )
     _log_banner(
         "UNIFIED MEMORY POOL ENABLED -- sub-pools %s"

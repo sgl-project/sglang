@@ -609,18 +609,6 @@ class SparseKVCacheManager:
                 )
         actual_stream.synchronize()
 
-    def init_req(self, req: Req) -> None:
-        if getattr(req, "inflight_middle_chunks", getattr(req, "is_chunked", 0)) > 0:
-            return
-        rid = req.kv.req_pool_idx
-        if rid is None:
-            raise RuntimeError(
-                "Cannot initialize sparse KV state before allocating a request pool slot"
-            )
-        current_len = len(req.origin_input_ids)
-        self.host_kv_ctx_len[rid] = current_len
-        self.reset_requests([rid])
-
     def reset_requests(self, req_ids: List[int]) -> None:
         if not req_ids:
             return
@@ -656,7 +644,7 @@ class SparseKVCacheManager:
         setattr(req_to_token_pool, "_sparse_kv_original_clear", original_clear)
 
         def alloc_with_sparse_reset(reqs: list[Req]) -> Optional[List[int]]:
-            newly_allocated = [req.kv.req_pool_idx is None for req in reqs]
+            newly_allocated = [not req.kv.holds_kv for req in reqs]
             req_pool_indices = original_alloc(reqs)
             if req_pool_indices is not None:
                 self.reset_requests(

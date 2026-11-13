@@ -524,11 +524,8 @@ class _FlashAttentionBackendResolver(_CudaAttentionBackendResolver):
 
     @classmethod
     def resolve(cls, platform) -> AttentionBackendEnum:
-        if platform.is_sm120():
-            logger.info(
-                "FlashAttention is not supported on SM12.x in this build; falling back to Torch SDPA."
-            )
-            return AttentionBackendEnum.TORCH_SDPA
+        # Explicit FA requests use the native FA4 preparation on Blackwell.
+        # The SM12.x default remains SDPA in _resolve_default_attn_backend.
         return AttentionBackendEnum.FA
 
 
@@ -595,7 +592,6 @@ class CudaPlatformBase(Platform):
     device_name: str = "cuda"
     device_type: str = "cuda"
     dispatch_key: str = "CUDA"
-    device_control_env_var: str = "CUDA_VISIBLE_DEVICES"
 
     @classmethod
     def get_local_torch_device(cls) -> torch.device:

@@ -376,6 +376,7 @@ class TestSparseKVCacheManager(CustomTestCase):
                 pool.page_size = 128
                 pool.dcp_size = 1
                 pool.is_draft_worker = False
+                pool.use_combined_kv_buffer = False
                 pool.dsa_kv_cache_store_fp8 = False
                 pool.index_head_dim = 2
                 pool.indexer_layer_ids = (1,)
