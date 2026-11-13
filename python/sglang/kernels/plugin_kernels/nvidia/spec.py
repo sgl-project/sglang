@@ -469,6 +469,15 @@ class SupportsPrefillBody(Protocol):
         self, step: Step, original: Callable, *args: Any, **kwargs: Any
     ) -> Any: ...
 
+    def linear_prefill_graph_seqs(self, backend: Any) -> Optional[int]:
+        """Asked by a linear backend whose own chain cannot be captured: the most
+        sequences a bucket holds when this body runs the extend core in the graph on
+        tables of its own, or None to keep the layers' graph breaks."""
+
+    def refill_prefill_graph(self, metadata: Any, forward_batch: Any) -> None:
+        """Before a bucket's capture and each replay, after the backend filled its
+        per-bucket metadata: refill this body's own tables for that bucket."""
+
 
 @runtime_checkable
 class SupportsDraftAux(Protocol):

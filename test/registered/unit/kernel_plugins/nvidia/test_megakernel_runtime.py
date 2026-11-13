@@ -597,6 +597,8 @@ class TestMegakernelRuntime(CustomTestCase):
             else None
         )
         built.forward_body = lambda step, original, *a, **kw: (step, original)
+        built.linear_prefill_graph_seqs = lambda backend: None
+        built.refill_prefill_graph = lambda metadata, forward_batch: None
         for name, value in offers.items():
             setattr(built, name, value)
         spec = replace(

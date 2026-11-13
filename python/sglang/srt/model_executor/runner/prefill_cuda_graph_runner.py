@@ -1362,6 +1362,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             )
             assert self.attn_metadata_buffers is not None
             self.attn_metadata_buffers[shape_key] = metadata
+            body = external_prefill_body(self.model_runner.model)
+            if body is not None and metadata is not None:
+                body.refill_prefill_graph(metadata, forward_batch)
 
     def _prepare_forward_metadata_for_replay(
         self,
@@ -1424,6 +1427,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 forward_batch,
                 static_forward_batch=static_forward_batch,
             )
+            body = external_prefill_body(self.model_runner.model)
+            if body is not None and metadata is not None:
+                body.refill_prefill_graph(metadata, forward_batch)
 
         return attn_backend.resolve_prefill_shared_read_ends(
             forward_batch, build_snapshot=build_snapshot
