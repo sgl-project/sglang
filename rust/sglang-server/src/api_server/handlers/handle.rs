@@ -7,7 +7,7 @@ use std::sync::{
 };
 use std::time::Duration;
 
-use tokio::sync::{SetOnce, mpsc};
+use tokio::sync::{SetOnce, mpsc, watch};
 
 use crate::message::config::{DisaggregationMode, ServerArgs};
 use crate::message::finish_reason::{AbortReason, FinishKind};
@@ -152,6 +152,8 @@ pub(super) struct CoreInner {
     pub(super) response_capacity: usize,
     pub(super) response_activity: ActivityCounter,
     pub(super) startup_ready: AtomicBool,
+    /// `true` while Python runs its `--warmups` through this listener.
+    pub(super) custom_warmups_pending: watch::Sender<bool>,
     pub(super) is_disaggregation: bool,
     pub(super) mm_limits: Vec<(String, usize)>,
     pub(super) multimodal: bool,
@@ -207,6 +209,7 @@ impl CoreHandle {
                 response_capacity: config.response_capacity,
                 response_activity: config.response_activity,
                 startup_ready: AtomicBool::new(config.startup_ready),
+                custom_warmups_pending: watch::Sender::new(false),
                 is_disaggregation: config.is_disaggregation,
                 mm_limits: config.mm_limits,
                 multimodal: config.multimodal,
@@ -237,10 +240,32 @@ impl CoreHandle {
     }
 
     /// Whether health may answer 200: startup warmup finished (or was
-    /// skipped) and, for a multimodal model, the MM pool's processor is
-    /// installed, so a generation would be admitted rather than wait.
+    /// skipped), Python's `--warmups` finished, and, for a multimodal model,
+    /// the MM pool's processor is installed, so a generation would be admitted
+    /// rather than wait.
     pub(crate) fn is_serving(&self) -> bool {
-        self.is_ready() && (!self.inner.multimodal || self.inner.mm_processor.get().is_some())
+        self.is_ready()
+            && !*self.inner.custom_warmups_pending.borrow()
+            && (!self.inner.multimodal || self.inner.mm_processor.get().is_some())
+    }
+
+    /// Hold health at 503 until [`CoreHandle::finish_custom_warmups`]; set at
+    /// boot, before any listener accepts a connection.
+    pub(crate) fn hold_for_custom_warmups(&self) {
+        self.inner.custom_warmups_pending.send_replace(true);
+    }
+
+    /// Python's `--warmups` finished: health may answer 200 once the rest of
+    /// [`CoreHandle::is_serving`] holds.
+    pub(crate) fn finish_custom_warmups(&self) {
+        self.inner.custom_warmups_pending.send_replace(false);
+    }
+
+    /// Wait until Python's `--warmups` finished (at once without them).
+    pub(crate) async fn custom_warmups_finished(&self) {
+        let mut pending = self.inner.custom_warmups_pending.subscribe();
+        // Errs only once the sender is dropped, and `self` holds it.
+        let _ = pending.wait_for(|pending| !*pending).await;
     }
 
     /// The request metrics, when enabled.

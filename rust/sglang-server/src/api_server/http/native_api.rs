@@ -1251,6 +1251,44 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
     }
 
+    /// `/health` answers 503 while Python runs `--warmups` through the
+    /// listener, though startup warmup already finished, so the router sends
+    /// no traffic before the warmups compiled what they exist to compile.
+    #[tokio::test]
+    async fn health_waits_for_custom_warmups() {
+        let state = Arc::new(AppState {
+            core: crate::api_server::handlers::CoreHandle::new(
+                flume::unbounded().0,
+                flume::unbounded().0,
+                crate::api_server::handlers::CoreConfig {
+                    response_capacity: 8,
+                    response_activity: Default::default(),
+                    startup_ready: true,
+                    is_disaggregation: false,
+                    mm_limits: Default::default(),
+                    multimodal: false,
+                    peer_endpoints: Vec::new(),
+                    metadata: crate::api_server::handlers::CoreMetadata::default(),
+                    metrics: None,
+                    request_log: None,
+                    generate_validator: None,
+                },
+            ),
+            server_args: Arc::new(crate::message::config::ServerArgs::default()),
+            generation_policy: GenerationPolicy::default(),
+            chat_formatter: None,
+            generate_hook: None,
+            openai_chat: None,
+        });
+        state.core.hold_for_custom_warmups();
+
+        let response = health_without_generation(State(state.clone())).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        state.core.finish_custom_warmups();
+        let response = health_without_generation(State(state)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
     /// A healthy `/health_generate` carries the configured metadata headers;
     /// `/health` sharing the probe does not.
     #[tokio::test]
