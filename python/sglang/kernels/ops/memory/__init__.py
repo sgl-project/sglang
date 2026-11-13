@@ -6,7 +6,7 @@ The Triton kernels migrated here live in this package
 """
 
 from sglang.kernels.registry import register_kernel
-from sglang.kernels.spec import CapabilityRequirement, KernelBackend, KernelSpec
+from sglang.kernels.spec import CUDA_ONLY, KernelBackend, KernelSpec
 
 # (module, public_fn) migrated from mem_cache/triton_ops.
 _TRITON_KERNELS = [
@@ -36,9 +36,10 @@ __all__ = []
 # Migrated from srt/layers (RFC #29630, Phase 2.5).
 register_kernel(
     KernelSpec(
-        op="memory.gpu_tensor_hash",
+        op="memory.gpu_tensor_blake3",
         backend=KernelBackend.TRITON,
-        target="sglang.kernels.ops.memory.gpu_tensor_hash:gpu_tensor_hash",
+        target="sglang.kernels.ops.memory.gpu_tensor_hash_blake3:gpu_tensor_blake3",
+        capabilities=CUDA_ONLY,
     )
 )
 register_kernel(
@@ -53,26 +54,27 @@ register_kernel(
 # Public entry points inventoried by logical operator group (RFC #29630).
 register_kernel(
     KernelSpec(
-        op="memory.adler32_checksum",
-        backend=KernelBackend.JIT,
-        target="sglang.kernels.ops.memory.adler32:adler32_checksum",
-        capabilities=frozenset({CapabilityRequirement.CUDA}),
+        op="memory.gpu_tensors_blake3",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.memory.gpu_tensor_hash_blake3:gpu_tensors_blake3",
+        capabilities=CUDA_ONLY,
     )
 )
-register_kernel(
-    KernelSpec(
-        op="memory.adler32_regions_checksum",
-        backend=KernelBackend.JIT,
-        target="sglang.kernels.ops.memory.adler32:adler32_regions_checksum",
-        capabilities=frozenset({CapabilityRequirement.CUDA}),
-    )
-)
+
 register_kernel(
     KernelSpec(
         op="memory.adler32_strided_checksum",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.memory.adler32:adler32_strided_checksum",
-        capabilities=frozenset({CapabilityRequirement.CUDA}),
+        capabilities=CUDA_ONLY,
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="memory.small_field_copy",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.memory.small_field_copy:SmallFieldCopyPlan",
+        capabilities=CUDA_ONLY,
     )
 )
 register_kernel(
@@ -80,6 +82,14 @@ register_kernel(
         op="memory.row_compact_bf16",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.memory.row_compact:row_compact_bf16",
-        capabilities=frozenset({CapabilityRequirement.CUDA}),
+        capabilities=CUDA_ONLY,
+    )
+)
+
+register_kernel(
+    KernelSpec(
+        op="memory.interleave_rows",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.memory.interleave_rows:interleave_rows",
     )
 )

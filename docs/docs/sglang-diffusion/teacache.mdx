@@ -4,7 +4,7 @@ description: "Configure TeaCache for temporal similarity-based diffusion acceler
 tag: "approx"
 ---
 
-> **Note**: This is one of two caching strategies available in SGLang.
+> **Note**: This is one of several caching strategies in SGLang (Cache-DiT, TeaCache, Spectrum, plus exact conditioning reuse).
 > For an overview of all caching options, see [caching](./caching-acceleration).
 
 TeaCache (Temporal similarity-based caching) accelerates diffusion inference by detecting when consecutive denoising steps are similar enough to skip computation entirely.
@@ -44,20 +44,24 @@ For models that support CFG cache separation, TeaCache maintains separate caches
 - `previous_modulated_input` / `previous_residual` for positive branch
 - `previous_modulated_input_negative` / `previous_residual_negative` for negative branch
 
-For models that do not support CFG separation, TeaCache is automatically disabled when CFG is enabled.
+Flux and Qwen do not separate CFG caches and do not implement TeaCache yet (see [Supported Models](#supported-models)).
 
 ## Configuration
 
-TeaCache is configured via `TeaCacheParams` in the sampling parameters:
+TeaCache is configured via `TeaCacheParams` in the sampling parameters. Start from the matching model's calibrated parameters; this example changes the threshold for `Wan-AI/Wan2.1-T2V-1.3B-Diffusers` while preserving its coefficients and skip window:
 
-```python
-from sglang.multimodal_gen.configs.sample.teacache import TeaCacheParams
+```python Configuration
+from dataclasses import replace
+from sglang.multimodal_gen.configs.sample.wan import WanT2V_1_3B_SamplingParams
 
-params = TeaCacheParams(
-    teacache_thresh=0.1,           # Threshold for accumulated L1 distance
-    coefficients=[1.0, 0.0, 0.0],  # Polynomial coefficients for L1 rescaling
+params = replace(
+    WanT2V_1_3B_SamplingParams().teacache_params,
+    teacache_thresh=0.1,
 )
+sampling_params_kwargs = {"enable_teacache": True, "teacache_params": params}
 ```
+
+`--enable-teacache` / `enable_teacache` use the model's built-in `TeaCacheParams`. To customize them from Python, pass `sampling_params_kwargs` to `DiffGenerator.generate()`.
 
 ### Parameters
 
@@ -83,7 +87,17 @@ params = TeaCacheParams(
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`coefficients`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>list[float]</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Polynomial coefficients for L1 rescaling. Model-specific tuning</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Polynomial coefficients for L1 rescaling, highest power first (`c[0]*x**4 + c[1]*x**3 + c[2]*x**2 + c[3]*x + c[4]`). Model-specific tuning</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`start_skipping`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>int or float</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Steps before this always compute. A float is a fraction of the denoising steps; a negative int counts back from the end. Default `5`</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`end_skipping`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>int or float</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Skipping stops at this step (exclusive); same encoding as `start_skipping`. Default `-1`</td>
     </tr>
   </tbody>
 </table>
@@ -122,8 +136,8 @@ TeaCache support status by model family:
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Z-Image</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Yes</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Full support</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>—</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Not wired yet; <code>--enable-teacache</code> is accepted but currently no-ops</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>HunyuanVideo</td>

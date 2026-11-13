@@ -9,9 +9,11 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.attention.fla.layernorm_gated import RMSNorm as RMSNormGated
 from sglang.kernels.ops.attention.fla.layernorm_gated import layernorm_fn
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
+from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.activation import SiluAndMul
@@ -49,6 +51,8 @@ from sglang.srt.layers.quantization.int8_utils import (
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.layers.utils.layer_list import make_pp_layers
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -57,7 +61,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA, DeepseekV2MLP
-from sglang.srt.models.utils import WeightsMapper
+from sglang.srt.models.utils import WeightsMapper, bind_or_assign
 from sglang.srt.runtime_context import (
     get_device,
     get_parallel,
@@ -66,8 +70,6 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.utils import (
     BumpAllocator,
-    add_prefix,
-    bind_or_assign,
     cpu_has_amx_support,
     get_bool_env_var,
     get_device_sm,
@@ -77,9 +79,8 @@ from sglang.srt.utils import (
     is_gfx95_supported,
     is_hip,
     is_npu,
-    make_pp_layers,
 )
-from sglang.srt.utils.common import rank0_log
+from sglang.srt.utils.log_utils import rank0_log
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
@@ -95,17 +96,6 @@ _use_aiter_gfx95 = _use_aiter and _is_gfx95_supported
 
 if _use_aiter_gfx95:
     pass
-
-if _is_cuda:
-    from sglang.kernels.ops.quantization.awq_dequantize import awq_dequantize
-elif _is_cpu and _is_cpu_amx_available:
-    pass
-elif _is_hip:
-    from sglang.kernels.ops.quantization.awq_triton import (
-        awq_dequantize_triton as awq_dequantize,
-    )
-else:
-    from vllm._custom_ops import awq_dequantize
 
 if _is_hip:
     pass
@@ -224,10 +214,7 @@ class BailingMoEGate(nn.Module):
             self.expert_bias = None
 
     def forward(self, hidden_states):
-        logits = F.linear(hidden_states.to(self.weight.dtype), self.weight, None).to(
-            hidden_states.dtype
-        )
-        return logits
+        return F.linear(hidden_states.to(self.weight.dtype), self.weight, None)
 
 
 class BailingMoE(nn.Module):
@@ -247,7 +234,9 @@ class BailingMoE(nn.Module):
         self.tp_size = get_parallel().tp_size
 
         self.top_k = config.num_experts_per_tok
-        self.norm_expert_prob = getattr(config, "norm_topk_prob", False)
+        # The reference modeling always renormalizes the top-k weights, and the
+        # Ling-2.5/2.6 configs carry no norm_topk_prob key.
+        self.norm_expert_prob = getattr(config, "norm_topk_prob", True)
         self.hidden_size = config.hidden_size
         self.intermediate_size = config.moe_intermediate_size
         self.num_shared_experts = getattr(config, "num_shared_experts", 0)
@@ -316,6 +305,13 @@ class BailingMoE(nn.Module):
             quant_config=quant_config,
             routed_scaling_factor=self.routed_scaling_factor,
             prefix=f"{prefix}.experts",
+        )
+        self.topk.topk_config.apply_routed_scaling_factor_on_output = (
+            self.experts.should_fuse_routed_scaling_factor_in_topk
+        )
+        self.topk.bind_runner_backend(
+            self.experts.runner_backend,
+            routing_method_type=self.experts.routing_method_type,
         )
 
         if self.num_shared_experts > 0:
@@ -1108,6 +1104,19 @@ class BailingMoELinearForCausalLM(nn.Module):
             if not hasattr(self_attn, "kv_b_proj"):
                 continue
             if hasattr(self_attn.kv_b_proj, "qweight"):
+                if _is_cuda:
+                    from sglang.kernels.ops.quantization.awq_dequantize import (
+                        awq_dequantize,
+                    )
+                elif _is_cpu and _is_cpu_amx_available:
+                    pass
+                elif _is_hip:
+                    from sglang.kernels.ops.quantization.awq_triton import (
+                        awq_dequantize_triton as awq_dequantize,
+                    )
+                else:
+                    from vllm._custom_ops import awq_dequantize
+
                 # AWQ compatible
                 if _is_cuda or _is_hip:
                     w = awq_dequantize(
@@ -1158,8 +1167,8 @@ class BailingMoELinearForCausalLM(nn.Module):
                     ):
                         if (
                             deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-                            and not deep_gemm_wrapper.DEEPGEMM_BLACKWELL
-                            and get_bool_env_var("SGL_USE_DEEPGEMM_BMM", "false")
+                            and current_arch().is_sm(9)
+                            and envs.SGLANG_USE_DEEPGEMM_BMM.get()
                         ):
                             block_scale = weight_scale
                             use_deep_gemm_bmm = True

@@ -18,14 +18,24 @@ SPATIAL_SHARD_PARALLEL_DECODE_MODES = ("spatial_shard", "spatial")
 
 def get_channelwise_decode_scale_and_shift(arch_config, device, dtype):
     """Return reciprocal std and mean broadcast over BCTHW latents."""
-    scaling_factor = 1.0 / torch.tensor(arch_config.latents_std, device=device).view(
-        1, arch_config.z_dim, 1, 1, 1
-    ).to(device, dtype)
-    shift_factor = (
-        torch.tensor(arch_config.latents_mean)
-        .view(1, arch_config.z_dim, 1, 1, 1)
-        .to(device, dtype)
+    return _channelwise_decode_scale_and_shift(
+        tuple(arch_config.latents_mean),
+        tuple(arch_config.latents_std),
+        arch_config.z_dim,
+        device,
+        dtype,
     )
+
+
+@lru_cache(maxsize=8)
+def _channelwise_decode_scale_and_shift(
+    latents_mean, latents_std, z_dim, device, dtype
+):
+    # uploaded once per (device, dtype): a per-request upload blocks the host
+    scaling_factor = 1.0 / torch.tensor(latents_std, device=device).view(
+        1, z_dim, 1, 1, 1
+    ).to(device, dtype)
+    shift_factor = torch.tensor(latents_mean).view(1, z_dim, 1, 1, 1).to(device, dtype)
     return scaling_factor, shift_factor
 
 

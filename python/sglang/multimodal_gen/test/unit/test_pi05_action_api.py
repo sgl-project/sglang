@@ -8,10 +8,8 @@ import numpy as np
 from sglang.multimodal_gen.configs.pipeline_configs.pi05 import Pi05PipelineConfig
 from sglang.multimodal_gen.configs.sample.action import ActionSamplingParams
 from sglang.multimodal_gen.configs.sample.pi05 import Pi05SamplingParams
-from sglang.multimodal_gen.configs.sample.sampling_params import (
-    DataType,
-    SamplingParams,
-)
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.configs.task_type import DataType
 from sglang.multimodal_gen.runtime.entrypoints.action.protocol import (
     action_generation_response,
     action_metadata,
