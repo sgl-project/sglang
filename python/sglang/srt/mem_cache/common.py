@@ -223,6 +223,7 @@ def match_kv_cache(
     req.matched_window_host_hit_lengths = dict(match_result.window_host_hit_lengths)
     max_len = req._compute_max_prefix_len(len(token_ids))
     req.num_matched_prefix_tokens = min(req.prefix_len + req.host_hit_length, max_len)
+    req.full_kv_hit_length = min(match_result.full_kv_hit_length, max_len)
     req.swa_branching_seqlen = match_result.swa_branching_seqlen
     # A probe match keeps what it did not report; a new round resets both.
     if match_result.mamba_branching_seqlen is not None:
