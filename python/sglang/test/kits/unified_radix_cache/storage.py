@@ -253,12 +253,17 @@ class UnifiedRadixCacheStorageFixtures(UnifiedRadixCacheFixtures):
         prefetch_policy: str = "wait_complete",
         storage_extra: Optional[dict] = None,
         context_length: Optional[int] = None,
+        fixture_headroom: bool = True,
     ):
         if self.cfg.has_mamba:
             self.skipTest(
                 "load-back requests here are Mocks; buffer_only Mamba is "
                 "covered by TestUnifiedHybridBufferOnlyBitExact"
             )
+        if context_length is None and fixture_headroom:
+            # Fixture rows are at least as wide as the pool, which leaves no
+            # anchor-lock headroom; half a pool keeps the default 0.5 cap.
+            context_length = self.cfg.kv_size // 2
         self._init_hicache(
             cache,
             storage_backend="file",
