@@ -1,6 +1,5 @@
-"""Nightly coverage of the KDA speculative ReplaySSM ring under unified memory,
-where the ring lives in the arena's request sub-pool and the CuTe DSL verify
-writes it by request row."""
+"""KDA speculative ReplaySSM ring in the unified memory request sub-pool, written
+by request row in the CuTe DSL verify."""
 
 import unittest
 

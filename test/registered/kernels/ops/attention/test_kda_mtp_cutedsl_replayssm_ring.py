@@ -2,7 +2,7 @@
 
 `fused_kda_decode_mtp_dspark(replayssm_*=...)` switches the CuTe DSpARK verify
 kernel to CACHE_RING mode: per draft step it stores post-conv pre-l2norm k,
-post-conv v, the log-decay gate gk, and sigmoid(beta) into the per-slot rings
+post-conv v, the log-decay gate gk, and sigmoid(beta) into the rings
 (and skips the per-step intermediate_ssm snapshots). Each case runs the kernel
 twice on identical inputs — baseline arm producing snapshots, ring arm
 producing rings — folds the ring with `commit_kda_replayssm_spec`, and checks
@@ -68,7 +68,6 @@ def _run(
     num_spec,
     seed,
     onorm=False,
-    pad_last=False,
     pad=0,
     ring_rows=None,
     rings=None,
@@ -98,7 +97,6 @@ def _run(
     h0 = torch.randn(num_slots, H, K, K, device=DEV, dtype=torch.float32)
 
     slots = torch.arange(1, N + 1, device=DEV, dtype=torch.int32)
-    pad = max(pad, int(pad_last))
     if pad:
         slots[N - pad :] = -1
     scratch = torch.arange(N, device=DEV, dtype=torch.int32)
@@ -238,37 +236,13 @@ def test_cutedsl_ring_fold_parity(N, H, num_spec):
 
 
 @pytest.mark.parametrize("N", [4, 32], ids=["small-grid", "large-grid"])
-def test_cutedsl_ring_rows_follow_their_own_index(N):
-    """A request-scoped ring (unified memory) has rows apart from the state
-    slots: each request's records land in its own ring row, as they would in
-    its slot's, and no other row is written."""
-    H, num_spec, seed = 2, 3, 5
-    out_slot, by_slot = _run("ring", N=N, H=H, num_spec=num_spec, seed=seed)
-    ring_rows = torch.arange(2 * N + 2, N + 2, -1, device=DEV, dtype=torch.int32)
-    out_row, by_row = _run(
-        "ring", N=N, H=H, num_spec=num_spec, seed=seed, ring_rows=ring_rows
-    )
-    torch.testing.assert_close(out_row, out_slot, rtol=0, atol=0)
-    written = torch.zeros(by_row["rawv"].shape[0], dtype=torch.bool, device=DEV)
-    written[ring_rows.long()] = True
-    for name in ("rawv", "rawk", "gring", "betar"):
-        torch.testing.assert_close(
-            by_row[name][ring_rows.long()],
-            by_slot[name][by_slot["slots"].long()],
-            rtol=0,
-            atol=0,
-        )
-        assert torch.count_nonzero(by_row[name][~written]).item() == 0
-
-
-@pytest.mark.parametrize("N", [4, 32], ids=["small-grid", "large-grid"])
 def test_cutedsl_ring_rows_in_request_sub_pool_entries_with_graph_padding(N):
     """The production arrangement under unified memory: the rings are strided
     views inside the request sub-pool's per-unit entries (another layer's and
     the decay rings' parts in between), indexed by each request's own unit, and
     a CUDA-graph replay pads the batch with state slot -1 and ring unit -1.
-    Each live request's window lands in its own unit exactly as a contiguous
-    ring records it at the same rows, and no other byte of the entries, nor the
+    Each live request's window lands in its own unit exactly as a slot-indexed
+    ring records it at its slot, and no other byte of the entries, nor the
     entry before unit 0, changes."""
     H, num_spec, seed = 2, 3, 13
     pad = max(1, N // 4)
@@ -310,6 +284,7 @@ def test_cutedsl_ring_rows_in_request_sub_pool_entries_with_graph_padding(N):
         ring_rows=ref_rows,
         ring_count=rows,
     )
+    _, by_slot = _run("ring", N=N, H=H, num_spec=num_spec, seed=seed, pad=pad)
     torch.cuda.synchronize()
     torch.testing.assert_close(out, out_ref, rtol=0, atol=0)
     assert torch.count_nonzero(out[0, live * window :]).item() == 0
@@ -319,7 +294,11 @@ def test_cutedsl_ring_rows_in_request_sub_pool_entries_with_graph_padding(N):
         expected, rows=rows, H=H, num_spec=num_spec, layer=1
     )
     live_rows = ring_rows[:live].long()
+    live_slots = by_slot["slots"][:live].long()
     for name, _ in RING_PARTS:
+        torch.testing.assert_close(
+            ref[name][live_rows], by_slot[name][live_slots], rtol=0, atol=0
+        )
         assert torch.count_nonzero(ref[name][spare]).item() == 0, name
         assert torch.count_nonzero(ref[name][:, :, window:]).item() == 0, name
         assert torch.count_nonzero(ref[name][live_rows, :, :window]).item() > 0, name
@@ -345,7 +324,7 @@ def test_cutedsl_fused_output_norm(N):
 
 @pytest.mark.parametrize("N", [4, 32], ids=["small-grid", "large-grid"])
 def test_cutedsl_cuda_graph_padding_slot_is_safe(N):
-    _, ring = _run("ring", N=N, H=2, num_spec=2, seed=11, pad_last=True)
+    _, ring = _run("ring", N=N, H=2, num_spec=2, seed=11, pad=1)
     torch.cuda.synchronize()
 
     # The last logical request is graph padding. Its original physical slot N
