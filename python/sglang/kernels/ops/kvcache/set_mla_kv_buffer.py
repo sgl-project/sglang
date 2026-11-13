@@ -19,6 +19,7 @@ from sglang.kernels.jit.utils import (
     load_jit,
     make_cpp_args,
 )
+from sglang.kernels.ops.kvcache.paged_rows import paged_layout
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -77,7 +78,9 @@ def set_mla_kv_buffer(
 
     Shapes (last dim is treated as the row payload; any leading singleton dims
     on the source tensors are flattened away):
-        kv_buffer:    [num_pages, total_dim] or [num_pages, 1, total_dim]
+        kv_buffer:    [num_slots, total_dim] or [num_slots, 1, total_dim], or a
+                      paged [num_pages, page_size, 1, total_dim] whose pages are
+                      not packed (`paged_layout`)
         cache_k_nope: [n_loc, nope_dim] or [n_loc, 1, nope_dim]
         cache_k_rope: [n_loc, rope_dim] or [n_loc, 1, rope_dim]
         loc:          [n_loc]
@@ -91,7 +94,19 @@ def set_mla_kv_buffer(
 
     src_nope = cache_k_nope.view(n_loc, -1) if cache_k_nope.dim() != 2 else cache_k_nope
     src_rope = cache_k_rope.view(n_loc, -1) if cache_k_rope.dim() != 2 else cache_k_rope
-    buf = kv_buffer.view(kv_buffer.shape[0], -1) if kv_buffer.dim() != 2 else kv_buffer
+    paged = paged_layout(kv_buffer)
+    if paged is None:
+        page_size, row_stride = 1, 0
+        buf = (
+            kv_buffer.view(kv_buffer.shape[0], -1)
+            if kv_buffer.dim() != 2
+            else kv_buffer
+        )
+    else:
+        # The kernel takes each page's first row, a page stride apart, and
+        # steps a row stride within the page.
+        page_size, _, row_stride = paged
+        buf = kv_buffer[:, 0, 0, :]
 
     nope_bytes = src_nope.shape[-1] * src_nope.element_size()
     rope_bytes = src_rope.shape[-1] * src_rope.element_size()
@@ -106,4 +121,6 @@ def set_mla_kv_buffer(
         src_rope,
         num_warps,
         reserved_skip_index,
+        page_size,
+        row_stride,
     )

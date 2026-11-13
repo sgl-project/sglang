@@ -80,9 +80,9 @@ def _init_comm():
     )
     if comm.disabled or not comm.has_multicast:
         raise RuntimeError("Kimi K3 collectives require multicast symmetric memory")
-    all_reduce.register_comm(comm.obj)
-    sp_collective.register_comm(comm.obj)
-    attn_res_collective.register_comm(comm.obj)
+    all_reduce.register_comm(lambda: comm.obj, world_size=comm.world_size)
+    sp_collective.register_comm(lambda: comm.obj, world_size=comm.world_size)
+    attn_res_collective.register_comm(lambda: comm.obj, world_size=comm.world_size)
     register_comm_cleanup(comm)
     return comm
 
