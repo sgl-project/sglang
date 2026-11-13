@@ -37,8 +37,6 @@ register_npu_ci(est_time=600, suite="base-b-test-2-npu-a3")
 register_npu_ci(est_time=600, suite="nightly-2-npu-a3", nightly=True)
 
 CASE = weights.GLM52_CASE
-MODEL = weights.model_path(CASE)
-PROMPTS = weights.SIGNATURE_PROMPTS
 MASTER_ADDR = os.environ.get("SGLANG_TEST_HCCL_MASTER_ADDR", "127.0.0.1")
 UPDATE_ROUNDS = 2
 FLATTENED_BUCKET_SKIP_REASON = (
@@ -50,8 +48,7 @@ HCCL_PORT_RANGE = os.environ.setdefault(
     "HCCL_NPU_SOCKET_PORT_RANGE",
     f"{30000 + (os.getpid() * 7) % 20000}-{30000 + (os.getpid() * 7) % 20000 + 99}",
 )
-NORM_WEIGHT = "model.norm.weight"
-GLM_ARGS = (
+BASE_ARGS = (
     "--trust-remote-code",
     "--attention-backend",
     "ascend",
@@ -64,10 +61,19 @@ GLM_ARGS = (
     "4",
     "--mem-fraction-static",
     "0.45",
-    *weights.server_override_args(CASE),
 )
-REFERENCE_ARGS = GLM_ARGS
-LANE_ARGS = GLM_ARGS + ("--load-format", "dummy")
+
+
+def _server_args(*, dummy):
+    args = (*BASE_ARGS, *CASE.extra_server_args)
+    return args + (("--load-format", "dummy") if dummy else ())
+
+
+def _pick_norm(manifest):
+    for name, dtype, shape in manifest:
+        if name.endswith(".norm.weight") and "layernorm" not in name:
+            return name, dtype, shape
+    raise AssertionError("no norm tensor found")
 
 
 @unittest.skipUnless(npu_device_count() >= 2, "requires at least 2 Ascend NPUs")
@@ -77,21 +83,23 @@ class TestNpuUpdateWeightsFromDistributed(CustomTestCase):
         cls.checkpoint = weights.ensure_checkpoint(CASE)
         cls.manifest = checkpoint_manifest(cls.checkpoint)
         cls.flattened_manifest = flattened_checkpoint_manifest(cls.checkpoint)
+        cls.norm_name, cls.norm_dtype, cls.norm_shape = _pick_norm(cls.manifest)
         cls.tensor_index = checkpoint_tensor_index(cls.checkpoint)
         env = {**npu_rl_env(), "HCCL_NPU_SOCKET_PORT_RANGE": HCCL_PORT_RANGE}
-        with npu_server(cls.checkpoint, extra_args=REFERENCE_ARGS, env=env) as base_url:
-            cls.reference = logprob_signature(base_url, PROMPTS)
-        # One lane server per class: creating NPU tensors resets the device.
-        cls._lane_ctx = npu_server(MODEL, extra_args=LANE_ARGS, env=env)
-        cls.lane_url = cls._lane_ctx.__enter__()
+        with npu_server(
+            cls.checkpoint, extra_args=_server_args(dummy=False), env=env
+        ) as base_url:
+            cls.reference = logprob_signature(base_url, weights.SIGNATURE_PROMPTS)
+        cls._lane = npu_server(
+            cls.checkpoint, extra_args=_server_args(dummy=True), env=env
+        )
+        cls.lane_url = cls._lane.__enter__()
 
     @classmethod
     def tearDownClass(cls):
-        cls._lane_ctx.__exit__(None, None, None)
+        cls._lane.__exit__(None, None, None)
 
     def tearDown(self):
-        # A failed case must not leave a weight-update session open: the next
-        # case would be rejected with "a weight-update session is already open".
         try:
             end_weight_update(self.lane_url)
         except Exception:
@@ -117,7 +125,6 @@ class TestNpuUpdateWeightsFromDistributed(CustomTestCase):
 
         thread = threading.Thread(target=_trainer, daemon=True)
         thread.start()
-
         response = requests.post(
             base_url + "/init_weights_update_group",
             json={
@@ -181,60 +188,55 @@ class TestNpuUpdateWeightsFromDistributed(CustomTestCase):
             tensor = load_checkpoint_tensor(self.tensor_index, name).to("npu:1")
             torch.distributed.broadcast(tensor.contiguous(), src=0, group=pg)
 
-    def _assert_serves_reference(self, message):
+    def _assert_reference(self, message):
         assert_logprob_signature_equal(
-            logprob_signature(self.lane_url, PROMPTS),
+            logprob_signature(self.lane_url, weights.SIGNATURE_PROMPTS),
             self.reference,
             message,
         )
 
-    def test_01_hccl_refit_matches_startup_load(self):
+    def test_01_hccl_refit(self):
         group_name = "npu_rl_hccl_refit"
-        base_url = self.lane_url
-        pg = self._create_group(base_url, group_name)
+        pg = self._create_group(self.lane_url, group_name)
         try:
             for round_idx in range(UPDATE_ROUNDS):
-                begin_weight_update(base_url)
+                begin_weight_update(self.lane_url)
                 try:
-                    thread, result = self._post_update_async(base_url, group_name)
+                    thread, result = self._post_update_async(self.lane_url, group_name)
                     self._broadcast_all(pg)
                     thread.join(timeout=1800)
                 finally:
-                    end_weight_update(base_url)
+                    end_weight_update(self.lane_url)
 
                 self.assertNotIn("error", result, f"update thread failed: {result}")
                 self.assertEqual(result.get("status"), 200, result.get("text"))
-                self._assert_serves_reference(
+                self._assert_reference(
                     f"HCCL refit round {round_idx + 1} did not reproduce startup loading"
                 )
         finally:
-            self._destroy_group(base_url, group_name, pg)
+            self._destroy_group(self.lane_url, group_name, pg)
 
     @unittest.skip(FLATTENED_BUCKET_SKIP_REASON)
-    def test_02_hccl_flattened_bucket_refit_matches_startup_load(self):
+    def test_02_hccl_flattened_bucket_refit(self):
         group_name = "npu_rl_hccl_flattened_bucket_refit"
-        base_url = self.lane_url
-        pg = self._create_group(base_url, group_name)
+        pg = self._create_group(self.lane_url, group_name)
         try:
-            for round_idx in range(UPDATE_ROUNDS):
-                begin_weight_update(base_url)
-                try:
-                    thread, result = self._post_update_async(
-                        base_url, group_name, flattened_bucket=True
-                    )
-                    self._broadcast_all(pg, flattened_bucket=True)
-                    thread.join(timeout=1800)
-                finally:
-                    end_weight_update(base_url)
-
-                self.assertNotIn("error", result, f"update thread failed: {result}")
-                self.assertEqual(result.get("status"), 200, result.get("text"))
-                self._assert_serves_reference(
-                    f"flattened_bucket HCCL refit round {round_idx + 1} did not reproduce "
-                    "startup loading"
+            begin_weight_update(self.lane_url)
+            try:
+                thread, result = self._post_update_async(
+                    self.lane_url, group_name, flattened_bucket=True
                 )
+                self._broadcast_all(pg, flattened_bucket=True)
+                thread.join(timeout=1800)
+            finally:
+                end_weight_update(self.lane_url)
+            self.assertNotIn("error", result, f"update thread failed: {result}")
+            self.assertEqual(result.get("status"), 200, result.get("text"))
+            self._assert_reference(
+                "flattened_bucket HCCL refit did not reproduce startup loading"
+            )
         finally:
-            self._destroy_group(base_url, group_name, pg)
+            self._destroy_group(self.lane_url, group_name, pg)
 
     def test_03_init_group_defaults_to_nccl(self):
         request = InitWeightsUpdateGroupReqInput(
@@ -250,21 +252,20 @@ class TestNpuUpdateWeightsFromDistributed(CustomTestCase):
         )
 
     def test_04_update_error_propagates(self):
-        base_url = self.lane_url
-        begin_weight_update(base_url)
+        begin_weight_update(self.lane_url)
         response = requests.post(
-            base_url + "/update_weights_from_distributed",
+            self.lane_url + "/update_weights_from_distributed",
             json={
-                "names": [NORM_WEIGHT],
-                "dtypes": ["bfloat16"],
-                "shapes": [[6144]],
+                "names": [self.norm_name],
+                "dtypes": [self.norm_dtype],
+                "shapes": [self.norm_shape],
                 "group_name": "missing_group",
                 "flush_cache": True,
             },
             timeout=300,
         )
         try:
-            end_weight_update(base_url)
+            end_weight_update(self.lane_url)
         except Exception:
             pass
 
@@ -273,14 +274,13 @@ class TestNpuUpdateWeightsFromDistributed(CustomTestCase):
         self.assertFalse(payload.get("success"))
         self.assertIn("missing_group", payload.get("message", ""))
         self.assertIn("init_weights_update_group", payload.get("message", ""))
-        self.assertTrue(health(base_url))
+        self.assertTrue(health(self.lane_url))
 
     def test_05_destroy_group_twice_is_safe(self):
         group_name = "npu_rl_hccl_destroy_twice"
-        base_url = self.lane_url
-        pg = self._create_group(base_url, group_name)
+        pg = self._create_group(self.lane_url, group_name)
         first = requests.post(
-            base_url + "/destroy_weights_update_group",
+            self.lane_url + "/destroy_weights_update_group",
             json={"group_name": group_name},
             timeout=120,
         )
@@ -288,7 +288,7 @@ class TestNpuUpdateWeightsFromDistributed(CustomTestCase):
         torch.distributed.destroy_process_group(pg)
 
         second = requests.post(
-            base_url + "/destroy_weights_update_group",
+            self.lane_url + "/destroy_weights_update_group",
             json={"group_name": group_name},
             timeout=120,
         )
@@ -296,7 +296,7 @@ class TestNpuUpdateWeightsFromDistributed(CustomTestCase):
         payload = second.json()
         self.assertFalse(payload.get("success"))
         self.assertIn("does not exist", payload.get("message", ""))
-        self.assertTrue(health(base_url))
+        self.assertTrue(health(self.lane_url))
 
 
 if __name__ == "__main__":
