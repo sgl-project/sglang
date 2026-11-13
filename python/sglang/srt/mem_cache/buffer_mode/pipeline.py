@@ -1502,7 +1502,7 @@ class BufferModePipeline:
             is_bigram=self._cache.tree_core.is_eagle,
             cache_salt=f.cache_salt,
         )
-        matched_len, node_id, _ = self._cache.tree_core.match_full_device_prefix(key)
+        matched_len, node_id = self._match_full_device_anchor(key)
         if matched_len < f.matched_len:
             logger.warning(
                 "HiCache staged prefetch deferred req=%s reason=shrunk "
@@ -1542,6 +1542,24 @@ class BufferModePipeline:
         req.host_hit_is_storage = True
         req.staged_prefetch_plan = plan
         return True
+
+    def _match_full_device_anchor(self, key: RadixKey) -> tuple[int, NodeId]:
+        """The FULL-only device match of a staged key, with a node ending exactly
+        at it. Admission locks the SWA window ending at that node, and the plan
+        keeps the window's resident rows before the match end; when the match
+        ends inside a longer node, split it there as a joint match would, so the
+        reclaim and allocation that run before publication cannot strip them."""
+        tree_core = self._cache.tree_core
+        matched_len, node_id, node_end = tree_core.match_full_device_prefix(key)
+        if node_end > matched_len:
+            prefix = key[:matched_len]
+            self._cache.match_prefix(MatchPrefixParams(key=prefix))
+            matched_len, node_id, node_end = tree_core.match_full_device_prefix(prefix)
+            assert node_end == matched_len == len(prefix), (
+                f"FULL device anchor not split at {len(prefix)}: "
+                f"matched={matched_len} node_end={node_end}"
+            )
+        return matched_len, node_id
 
     def _window_head_end(self, f: _StagedPrefetch) -> int:
         span_end = f.matched_len + f.num_tokens
