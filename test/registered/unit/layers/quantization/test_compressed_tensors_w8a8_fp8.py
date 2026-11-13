@@ -44,7 +44,11 @@ def _layer(linear, n: int, k: int) -> SimpleNamespace:
     scheme.weight_block_size = BLOCK
     scheme.w8a8_block_fp8_linear = linear
     return SimpleNamespace(
-        weight=weight, weight_scale=scale.contiguous(), input_scale=None, scheme=scheme
+        weight=weight,
+        weight_scale=scale.contiguous(),
+        input_scale=None,
+        scheme=scheme,
+        output_size=n,
     )
 
 

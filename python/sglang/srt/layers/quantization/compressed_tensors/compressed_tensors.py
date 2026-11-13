@@ -1493,11 +1493,14 @@ class CompressedTensorsLinearMethod(LinearMethodBase):
         scheme = layer.scheme
         if scheme is None:
             raise ValueError("A scheme must be defined for each layer")
+        # layer.output_size, not weight.shape[0]: per-tensor / per-channel FP8
+        # transpose the weight to [K, N] after loading
         rows = (x[0] if isinstance(x, tuple) else x).shape[:-1]
-        if output.shape != (*rows, layer.weight.shape[0]):
+        expected = (*rows, layer.output_size)
+        if output.shape != expected:
             raise ValueError(
                 f"caller-owned linear output has shape {tuple(output.shape)}, "
-                f"expected {(*rows, layer.weight.shape[0])}"
+                f"expected {expected}"
             )
         apply_weights_into = getattr(scheme, "apply_weights_into", None)
         if apply_weights_into is not None:

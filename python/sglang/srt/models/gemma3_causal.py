@@ -123,7 +123,9 @@ class Gemma3MLP(nn.Module):
         """``output_tensor``: optional caller-owned storage for down_proj's result."""
         gate_up, _ = self.gate_up_proj(x)
         x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x, output_tensor=output_tensor)
+        # pass output_tensor only when given: LoRA-wrapped layers do not take it
+        kwargs = {} if output_tensor is None else {"output_tensor": output_tensor}
+        x, _ = self.down_proj(x, **kwargs)
         return x
 
 
