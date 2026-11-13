@@ -396,6 +396,7 @@ class AITerImpl(AttentionImpl):
             causal=self.causal,
             return_attn_probs=False,
             return_lse=return_lse,
+            softmax_scale=self.softmax_scale,
             how_v3_bf16_cvt=AITER_BF16_CVT_MODE,
         )
         return tuple(output[:2]) if return_lse else output
