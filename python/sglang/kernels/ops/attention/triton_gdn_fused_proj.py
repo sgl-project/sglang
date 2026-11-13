@@ -675,8 +675,8 @@ def fused_qkv_split_gdn_prefill_kernel(
     FUSE_GATING: tl.constexpr,
     BLOCK_GATE_HEADS: tl.constexpr,
 ):
-    i_t = tl.program_id(0)
-    offsets = tl.arange(0, BLOCK_SIZE)
+    i_t = tl.program_id(0).to(tl.int64)
+    offsets = tl.arange(0, BLOCK_SIZE).to(tl.int64)
 
     q_dim: tl.constexpr = NUM_Q_HEADS * HEAD_Q
     k_dim: tl.constexpr = NUM_K_HEADS * HEAD_K
@@ -687,7 +687,7 @@ def fused_qkv_split_gdn_prefill_kernel(
     if NORMALIZE_QK:
         q_heads = tl.arange(0, BLOCK_Q_HEADS)[:, None]
         q_cols = tl.arange(0, BLOCK_HEAD_Q)[None, :]
-        q_offsets = q_heads * HEAD_Q + q_cols
+        q_offsets = (q_heads * HEAD_Q + q_cols).to(tl.int64)
         q_mask = (q_heads < NUM_Q_HEADS) & (q_cols < HEAD_Q)
         q_values = tl.load(
             mixed_qkv + i_t * MIXED_QKV_STRIDE_T + q_offsets * MIXED_QKV_STRIDE_D,
@@ -706,7 +706,7 @@ def fused_qkv_split_gdn_prefill_kernel(
 
         k_heads = tl.arange(0, BLOCK_K_HEADS)[:, None]
         k_cols = tl.arange(0, BLOCK_HEAD_K)[None, :]
-        k_offsets = k_heads * HEAD_K + k_cols
+        k_offsets = (k_heads * HEAD_K + k_cols).to(tl.int64)
         k_mask = (k_heads < NUM_K_HEADS) & (k_cols < HEAD_K)
         k_values = tl.load(
             mixed_qkv
@@ -723,7 +723,7 @@ def fused_qkv_split_gdn_prefill_kernel(
         tl.store(
             k + i_t * k_dim + k_offsets, k_values.to(k.dtype.element_ty), mask=k_mask
         )
-        v_offsets = tl.arange(0, BLOCK_V)
+        v_offsets = tl.arange(0, BLOCK_V).to(tl.int64)
         v_mask = v_offsets < v_dim
         v_values = tl.load(
             mixed_qkv
@@ -752,8 +752,8 @@ def fused_qkv_split_gdn_prefill_kernel(
         tl.store(v + i_t * v_dim + v_offsets, values, mask=v_mask)
 
     if FUSE_GATING:
-        source_token = tl.load(token_indices + i_t)
-        gate_heads = tl.arange(0, BLOCK_GATE_HEADS)
+        source_token = tl.load(token_indices + i_t).to(tl.int64)
+        gate_heads = tl.arange(0, BLOCK_GATE_HEADS).to(tl.int64)
         gate_mask = gate_heads < NUM_V_HEADS
         gate_a = tl.load(
             a + source_token * STRIDE_A_T + gate_heads * STRIDE_A_H,
