@@ -156,18 +156,18 @@ class TestSamplingMaskValidation(CustomTestCase):
             Qwen3ThinkingBudgetLogitProcessor.to_str(), return_sampling_mask=False
         )
 
-    def test_sampling_logprobs_mode_requires_sampling_mask(self):
-        self._validate(None, return_sampling_mask=False)
-        for mode in ("selected", "support"):
+    def test_only_support_mode_requires_sampling_mask(self):
+        for mode in (None, "selected"):
             with self.subTest(mode=mode):
-                with self.assertRaisesRegex(
-                    ValueError, "can only be set when return_sampling_mask=true"
-                ):
-                    self._validate(
-                        None,
-                        return_sampling_mask=False,
-                        sampling_logprobs_mode=mode,
-                    )
+                self._validate(
+                    None, return_sampling_mask=False, sampling_logprobs_mode=mode
+                )
+        with self.assertRaisesRegex(
+            ValueError, "sampling_logprobs_mode='support' requires return_sampling_mask"
+        ):
+            self._validate(
+                None, return_sampling_mask=False, sampling_logprobs_mode="support"
+            )
 
         for mode in (None, "selected", "support"):
             with self.subTest(mode=mode):

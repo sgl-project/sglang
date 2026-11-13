@@ -3497,7 +3497,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 top_logprobs_val = output_top_logprobs_val[:top_logprobs_num].tolist()
                 top_logprobs_idx = output_top_logprobs_idx[:top_logprobs_num].tolist()
             sampling_mask_idx = sampling_mask_logprobs = None
-            if req.return_sampling_mask:
+            if req.return_sampling_logprobs:
                 assert output_token_sampling_mask_idx is not None, (
                     "sampling mask buffer disabled on decode side"
                 )

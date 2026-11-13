@@ -114,6 +114,7 @@ class _FakeReq(FakeReq):
         self.return_routed_experts = False
         self.return_indexer_topk = False
         self.return_sampling_mask = sampling_mask_rows is not None
+        self.return_sampling_logprobs = sampling_mask_rows is not None
         self.sampling_mask_rows = sampling_mask_rows
         self.mm_image_tokens = 0
         self.mm_audio_tokens = 0

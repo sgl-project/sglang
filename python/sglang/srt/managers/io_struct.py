@@ -289,7 +289,8 @@ class GenerateReqInput:
     # Whether to return each output token's sampling support and behavior logprob.
     return_sampling_mask: Optional[Union[List[bool], bool]] = None
     # Return either the selected token's behavior logprob or behavior logprobs for
-    # the full sampling support. When omitted, selected mode is used if
+    # the full sampling support. Selected mode works without return_sampling_mask;
+    # support mode requires it. When omitted, selected mode is used if
     # return_sampling_mask is enabled.
     sampling_logprobs_mode: Optional[
         Union[List[Optional[SamplingLogprobsMode]], SamplingLogprobsMode]
@@ -1302,9 +1303,9 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # Internal PP control bit, set by PP0 before forwarding the request.
     # Keep tail fields append-only to preserve the positional Rust wire schema.
     pp_prefetch_ticketed: bool = False
-    # Shape of output_token_sampling_logprobs for each output token. This is a
-    # defaulted tail field so older IPC senders decode as selected mode.
-    sampling_logprobs_mode: SamplingLogprobsMode = "selected"
+    # Shape of output_token_sampling_logprobs for each output token, or None when
+    # unset. This is a defaulted tail field so older IPC senders decode as None.
+    sampling_logprobs_mode: Optional[SamplingLogprobsMode] = None
     # LoRA adapter name; KV events namespace this request's blocks by it.
     lora_name: Optional[str] = None
     # GenerateReqInput.mm_routing_labels split by media type ("image",
