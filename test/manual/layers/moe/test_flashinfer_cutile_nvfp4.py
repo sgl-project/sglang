@@ -12,8 +12,10 @@ Latency measurements belong in benchmark/kernels/flashinfer_cutile/.
 No model server or downloads are started.
 """
 
+import gc
 import json
 import unittest
+import weakref
 from pathlib import Path
 
 import torch
@@ -51,19 +53,26 @@ def _quantize_weight(weight):
 
 
 def _activation_reference(values):
-    """Round-trip through NVFP4 with the kernel's unit global scale.
+    """Model cuTile's NVFP4 activation quantization using independent torch ops.
 
-    Both the input and the SwiGLU intermediate are quantized in W4A4. A
-    BF16-only reference would also measure this intentional quantization
-    loss, rather than isolating differences in the MoE computation.
+    FlashInfer 0.7.4's cuTile encoder selects the smaller magnitude at exact
+    E2M1 midpoints. The generic fp4_quantize API uses round-to-nearest-even,
+    so it is not an interchangeable reference: e.g. at unit block scale,
+    0.75 becomes 0.5 here but 1.0 with the generic quantizer. Both inputs and
+    SwiGLU intermediates must use the cuTile rule to isolate integration error.
+    This is a backend-specific reference, not a universal NVFP4 rounding rule.
     """
-    from flashinfer import fp4_quantize
-
-    values = values.bfloat16().contiguous()
-    global_scale = torch.ones(1, device=values.device)
-    packed, scale = fp4_quantize(values, global_scale, 16, False, False)
-    scale = scale.view(torch.float8_e4m3fn).reshape(values.shape[0], -1)
-    return _dequantize(packed.view(torch.uint8), scale, global_scale)
+    groups = values.bfloat16().float().reshape(values.shape[0], -1, 16)
+    scale = (groups.abs().amax(dim=-1) / 6).to(torch.float8_e4m3fn).float()
+    # Match cuTile's minimum nonzero E4M3 divisor. Keep the original scale
+    # for dequantization so a block whose scale rounds to zero stays zero.
+    normalized = groups / scale.clamp_min(2**-9).unsqueeze(-1)
+    codes = torch.zeros_like(normalized, dtype=torch.long)
+    for midpoint in (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0):
+        codes += normalized.abs() > midpoint
+    codes += (normalized < 0).long() * 8
+    lut = torch.tensor(E2M1, device=values.device)
+    return (lut[codes] * scale.unsqueeze(-1)).reshape_as(values)
 
 
 def _layer(parameters, *, top_k):
@@ -216,8 +225,17 @@ def _reference(
         qg, qu = layer.w13_weight_packed[expert].chunk(2, dim=0)
         sg, su = layer.w13_weight_scale[expert].chunk(2, dim=0)
         gg, gu = layer.w13_weight_global_scale[expert]
-        gate = xq[token] @ _dequantize(qg, sg, gg).T
-        up = xq[token] @ _dequantize(qu, su, gu).T
+        if quantize_activations:
+            # cuTile accumulates block-scaled FP4 products in FP32, applies
+            # the expert global scale, then stores BF16 before SwiGLU.
+            # Moving the global scale into the GEMM or omitting this rounding
+            # can change which side of an FP4 midpoint the activation lands on.
+            gate = ((xq[token] @ _dequantize(qg, sg, 1.0).T) / gg).bfloat16().float()
+            up = ((xq[token] @ _dequantize(qu, su, 1.0).T) / gu).bfloat16().float()
+        else:
+            # Preserve the separate BF16-activation quality comparison.
+            gate = xq[token] @ _dequantize(qg, sg, gg).T
+            up = xq[token] @ _dequantize(qu, su, gu).T
         if return_stats:
             clamped += (gate > LIMIT).sum() + (up.abs() > LIMIT).sum()
             total += gate.numel() + up.numel()
@@ -229,12 +247,17 @@ def _reference(
             if quantize_activations
             else hidden.bfloat16().float()
         )
+        global_scale = layer.w2_weight_global_scale[expert]
         down = _dequantize(
             layer.w2_weight_packed[expert],
             layer.w2_weight_scale[expert],
-            layer.w2_weight_global_scale[expert],
+            1.0 if quantize_activations else global_scale,
         )
-        output.index_add_(0, token, (hidden @ down.T) * weights[token, choice, None])
+        expert_output = hidden @ down.T
+        if quantize_activations:
+            # GEMM2 also stores BF16 before the FP32 routing-weight reduction.
+            expert_output = (expert_output / global_scale).bfloat16().float()
+        output.index_add_(0, token, expert_output * weights[token, choice, None])
     if return_stats:
         return output, {"clamped_fraction": clamped.item() / max(total, 1)}
     return output
@@ -567,6 +590,43 @@ class TestFlashInferCuTileNvfp4(CustomTestCase):
         )
         return actual
 
+    def test_activation_reference_midpoints(self):
+        # +/-6 anchors each 16-value block to the chosen E4M3 scale. Explicit
+        # expected values distinguish midpoint ties from either neighbor;
+        # they do not call FlashInfer or the quantizer under test.
+        midpoints = torch.tensor(
+            [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0],
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        anchor = torch.tensor([6.0], device="cuda", dtype=torch.bfloat16)
+        lower = torch.tensor(
+            [0, 0.5, 1, 1.5, 2, 3, 4, 6], device="cuda", dtype=torch.float32
+        )
+        upper = torch.tensor(
+            [0.5, 1, 1.5, 2, 3, 4, 6, 6], device="cuda", dtype=torch.float32
+        )
+        for block_scale in (0.5, 1.0, 2.0):
+            for offset, expected_magnitudes in (
+                (-0.0625, lower),
+                (0.0, lower),
+                (0.0625, upper),
+            ):
+                with self.subTest(block_scale=block_scale, offset=offset):
+                    positive = torch.cat((midpoints + offset, anchor))
+                    values = torch.cat((positive, -positive))[None] * block_scale
+                    expected = (
+                        torch.cat((expected_magnitudes, -expected_magnitudes))[None]
+                        * block_scale
+                    )
+                    torch.testing.assert_close(
+                        _activation_reference(values), expected, rtol=0, atol=0
+                    )
+        zeros = torch.zeros(2, 32, device="cuda", dtype=torch.bfloat16)
+        torch.testing.assert_close(
+            _activation_reference(zeros), zeros.float(), rtol=0, atol=0
+        )
+
     def test_synthetic_eager_graph_and_repeatability(self):
         for tokens in (1, 64, 129):
             with self.subTest(tokens=tokens):
@@ -635,32 +695,43 @@ class TestFlashInferCuTileNvfp4(CustomTestCase):
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
     def test_two_streams_keep_execution_workspaces_separate(self):
-        """Concurrent calls must not overwrite another stream's scratch space."""
+        """Interleaved warmed calls must keep each stream's scratch space separate."""
         layer = _synthetic_layer()
         cfg = layer.moe_runner_config
         prepared = self.adapter.prepare_flashinfer_cutile_nvfp4_weights(layer, cfg)
         runner = self.adapter.FlashInferCuTileRunnerCore(cfg)
         inputs = [_dispatch(layer, 64, input_std=std) for std in (0.5, 1.0)]
-        # Compute sequential expected outputs first. Timing is deliberately
-        # absent: this case verifies stream isolation, not stream speedup.
         expected = [
             runner.run_from_dispatch(item, prepared, cfg).hidden_states.clone()
             for item in inputs
         ]
         streams = [torch.cuda.Stream(), torch.cuda.Stream()]
         executions = []
-        actual = []
+        # Compile and initialize each stream before the interleaved submissions:
+        # cold-start work could otherwise serialize the only calls being checked.
         for stream, dispatch in zip(streams, inputs):
             stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(stream):
                 for _ in range(2):
-                    output = runner.run_from_dispatch(dispatch, prepared, cfg)
+                    runner.run_from_dispatch(dispatch, prepared, cfg)
                 executions.append(runner._get_execution(prepared.device, 64))
-                actual.append(output.hidden_states.clone())
         torch.cuda.synchronize()
         self.assertIsNot(executions[0], executions[1])
-        for observed, wanted in zip(actual, expected):
-            torch.testing.assert_close(observed, wanted, rtol=0, atol=0)
+
+        actual = []
+        # Submit both streams in every round without synchronizing between calls.
+        # This exercises isolation under interleaved submissions; scheduling on
+        # the device may still serialize them, so it does not prove GPU overlap.
+        for _ in range(20):
+            for stream_index, (stream, dispatch) in enumerate(zip(streams, inputs)):
+                with torch.cuda.stream(stream):
+                    output = runner.run_from_dispatch(dispatch, prepared, cfg)
+                    # Retain independent storage for every call until validation;
+                    # later workspace reuse must not overwrite an earlier result.
+                    actual.append((stream_index, output.hidden_states.clone()))
+        torch.cuda.synchronize()
+        for stream_index, observed in actual:
+            torch.testing.assert_close(observed, expected[stream_index], rtol=0, atol=0)
 
     def test_context_reset_rebuilds_execution_and_warmup_state(self):
         """Keep a runner alive while replacing its resource-owning context."""
@@ -694,6 +765,48 @@ class TestFlashInferCuTileNvfp4(CustomTestCase):
             actual = runner.run_from_dispatch(dispatch, prepared, cfg).hidden_states
             torch.testing.assert_close(actual, expected, rtol=0, atol=0)
             self.assertIn(64, new_execution.warmed_token_counts)
+
+    def test_context_reset_releases_execution_after_graph_destruction(self):
+        """A live runner must not retain an execution after its context is reset."""
+        layer = _synthetic_layer()
+        cfg = layer.moe_runner_config
+        prepared = self.adapter.prepare_flashinfer_cutile_nvfp4_weights(layer, cfg)
+        runner = self.adapter.FlashInferCuTileRunnerCore(cfg)
+        dispatch = _dispatch(layer, 64)
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        graph = torch.cuda.CUDAGraph()
+        try:
+            with torch.cuda.stream(stream):
+                expected = runner.run_from_dispatch(
+                    dispatch, prepared, cfg
+                ).hidden_states.clone()
+                old_execution = runner._get_execution(prepared.device, 64)
+                execution_ref = weakref.ref(old_execution)
+                stream.synchronize()
+                with torch.cuda.graph(graph, stream=stream):
+                    captured = runner.run_from_dispatch(
+                        dispatch, prepared, cfg
+                    ).hidden_states
+                graph.replay()
+                torch.testing.assert_close(captured, expected, rtol=0, atol=0)
+        finally:
+            # Even a failed comparison must not leave a live graph pointing into
+            # executions that test cleanup will release through reset_context().
+            torch.cuda.synchronize()
+            graph.reset()
+
+        del graph, captured, expected, old_execution
+        gc.collect()
+        # The context still owns the execution after graph destruction.
+        self.assertIsNotNone(execution_ref())
+        reset_context()
+        gc.collect()
+        torch.cuda.synchronize()
+        # Keep runner alive to detect an accidental runner-local strong cache.
+        # Assert owner reclamation, not reserved bytes: the CUDA allocator may
+        # retain freed blocks, and unrelated JIT caches have separate lifetimes.
+        self.assertIsNone(execution_ref())
 
     def test_tp_weight_slices_match_unsharded_layer(self):
         """Check TP slice arithmetic on one GPU; distributed all-reduce is separate."""

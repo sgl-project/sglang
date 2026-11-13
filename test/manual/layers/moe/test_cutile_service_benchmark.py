@@ -20,12 +20,40 @@ driver = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(driver)
 
 
-def _response():
+def _response(tokens=64):
+    output_ids = list(range(7, 7 + tokens))
     return {
         "text": "answer",
-        "output_ids": [7, 8],
-        "meta_info": {"output_token_logprobs": [[-0.2, 7, None], [-0.3, 8, None]]},
+        "output_ids": output_ids,
+        "meta_info": {
+            "finish_reason": {"type": "length", "length": tokens},
+            "completion_tokens": tokens,
+            "output_token_logprobs": [
+                [-0.2, token_id, None] for token_id in output_ids
+            ],
+        },
     }
+
+
+def _arguments(tokenizer="/already/downloaded", output_dir="/results/new"):
+    return [
+        "--base-url",
+        "http://localhost:30000",
+        "--model",
+        "test",
+        "--tokenizer",
+        tokenizer,
+        "--output-dir",
+        output_dir,
+        "--implementation-label",
+        "candidate",
+        "--server-revision",
+        "a" * 40,
+        "--checkpoint-revision",
+        "b" * 40,
+        "--flashinfer-variant",
+        "stock-0.7.3",
+    ]
 
 
 class _Server:
@@ -100,6 +128,64 @@ class TestCuTileServiceBenchmark(CustomTestCase):
                 )
             self.assertFalse((Path(directory) / "lifecycle-result.json").exists())
         self.assertFalse(server.released)
+
+    def test_lifecycle_requires_complete_generation_before_release(self):
+        for problem, message in (
+            ("abort", "finish by length"),
+            ("missing_finish_reason", "finish by length"),
+            ("wrong_finish_reason", "finish by length"),
+            ("short_output", "expected 64"),
+            ("completion_count", "completion_tokens"),
+            ("logprob_count", "one logprob per token"),
+        ):
+            response = _response(63 if problem == "short_output" else 64)
+            meta = response["meta_info"]
+            if problem == "abort":
+                # The native endpoint can return this abort as HTTP 200.
+                meta["finish_reason"] = {"type": "abort", "message": "cancelled"}
+            elif problem == "missing_finish_reason":
+                del meta["finish_reason"]
+            elif problem == "wrong_finish_reason":
+                meta["finish_reason"] = {"type": "stop"}
+            elif problem == "completion_count":
+                meta["completion_tokens"] = 63
+            elif problem == "logprob_count":
+                meta["output_token_logprobs"].pop()
+
+            class InvalidGenerationServer(_Server):
+                def call(self, path, payload=None):
+                    result = super().call(path, payload)
+                    return response if path == "/generate" else result
+
+            server = InvalidGenerationServer()
+            with (
+                self.subTest(problem=problem),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                with self.assertRaisesRegex(ValueError, message):
+                    driver._lifecycle(
+                        server, SimpleNamespace(logprob_atol=0), Path(directory)
+                    )
+                self.assertEqual(server.release_count, 0)
+                self.assertFalse((Path(directory) / "lifecycle-result.json").exists())
+
+    def test_lifecycle_checks_complete_generation_after_resume(self):
+        class ShortRestoredServer(_Server):
+            def call(self, path, payload=None):
+                result = super().call(path, payload)
+                if path == "/generate" and self.release_count:
+                    return _response(63)
+                return result
+
+        server = ShortRestoredServer()
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ValueError, "expected 64"):
+                driver._lifecycle(
+                    server, SimpleNamespace(logprob_atol=0), Path(directory)
+                )
+            self.assertFalse(server.released)
+            self.assertEqual(server.release_count, 1)
+            self.assertFalse((Path(directory) / "lifecycle-result.json").exists())
 
     def test_confirmed_release_rejection_does_not_resume(self):
         for status, body in (
@@ -296,6 +382,7 @@ class TestCuTileServiceBenchmark(CustomTestCase):
             mode="serving",
             expected_backend="flashinfer_cutile",
             num_prompts=2,
+            case_timeout=12,
         )
         for pilot_fails in (False, True):
             with (
@@ -316,6 +403,7 @@ class TestCuTileServiceBenchmark(CustomTestCase):
                 def run(argv, **kwargs):
                     runs.append(argv[-1])
                     self.assertEqual(kwargs["env"]["HF_HUB_OFFLINE"], "1")
+                    self.assertEqual(kwargs["timeout"], args.case_timeout)
                     pilot = argv[-1].endswith("-pilot.jsonl")
                     result = {key: 1 for key in driver.METRICS}
                     result.update(
@@ -342,27 +430,117 @@ class TestCuTileServiceBenchmark(CustomTestCase):
                         self.assertEqual(len(rows), 1)
                         self.assertEqual(rows[0]["output_throughput"], "222")
 
+    def test_case_timeout_preserves_stage_and_stops_matrix(self):
+        info = {
+            "model_path": "/models/test",
+            "served_model_name": "test",
+            "weight_version": "v1",
+        }
+
+        class BenchmarkServer:
+            def call(self, path):
+                if path == "/model_info":
+                    return info
+                if path == "/server_info":
+                    return {"moe_runner_backend": "flashinfer_cutile"}
+                if path != "/health":
+                    raise AssertionError(f"Unexpected server operation: {path}")
+
+        for timeout_stage in ("pilot", "measured"):
+            with (
+                self.subTest(stage=timeout_stage),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                root = Path(directory)
+                output = root / "results"
+                argv = _arguments(str(root), str(output)) + [
+                    "--input-lens",
+                    "128",
+                    "256",
+                    "--output-lens",
+                    "64",
+                    "--concurrencies",
+                    "1",
+                    "--num-prompts",
+                    "2",
+                    "--case-timeout",
+                    "12",
+                ]
+                calls = []
+
+                def run(command, **kwargs):
+                    calls.append(command)
+                    self.assertEqual(kwargs["timeout"], 12)
+                    stage = (
+                        "pilot" if command[-1].endswith("-pilot.jsonl") else "measured"
+                    )
+                    if stage == timeout_stage:
+                        kwargs["stdout"].write("Diagnostic before client timeout\n")
+                        raise driver.subprocess.TimeoutExpired(
+                            command, kwargs["timeout"]
+                        )
+                    result = {key: 1 for key in driver.METRICS}
+                    result.update(
+                        completed=2,
+                        input_lens=[128, 128],
+                        output_lens=[64, 64],
+                        errors=["", ""],
+                        server_info={"moe_runner_backend": "flashinfer_cutile"},
+                    )
+                    Path(command[-1]).write_text(json.dumps(result) + "\n")
+
+                with (
+                    patch.object(driver.sys, "argv", ["benchmark"] + argv),
+                    patch.object(driver, "_metadata", return_value={}),
+                    patch.object(driver, "Server", return_value=BenchmarkServer()),
+                    patch.object(driver.subprocess, "run", side_effect=run),
+                ):
+                    with self.assertRaisesRegex(TimeoutError, timeout_stage) as caught:
+                        driver.main()
+                self.assertIsInstance(
+                    caught.exception.__cause__, driver.subprocess.TimeoutExpired
+                )
+                self.assertEqual(len(calls), 1 if timeout_stage == "pilot" else 2)
+                status = json.loads((output / "status.json").read_text())
+                self.assertEqual(status["status"], "failed")
+                self.assertIn(timeout_stage, status["error"])
+                self.assertIn("in128-out64-c1", status["error"])
+                timeout_files = list(output.glob("*-timeout.json"))
+                self.assertEqual(len(timeout_files), 1)
+                diagnostic = json.loads(timeout_files[0].read_text())
+                self.assertEqual(diagnostic["case"], "in128-out64-c1")
+                self.assertEqual(diagnostic["stage"], timeout_stage)
+                self.assertEqual(diagnostic["timeout_seconds"], 12)
+                self.assertIn("TimeoutExpired", diagnostic["error"])
+                self.assertIn(
+                    "Diagnostic before client timeout",
+                    Path(diagnostic["log_path"]).read_text(),
+                )
+                self.assertFalse((output / "serving-summary.csv").exists())
+
+    def test_case_timeout_must_be_finite_and_positive(self):
+        for value in ("0", "-1", "nan", "inf"):
+            with (
+                self.subTest(value=value),
+                patch.object(
+                    driver.sys,
+                    "argv",
+                    ["benchmark"]
+                    + _arguments()
+                    + ["--dry-run", "--case-timeout", value],
+                ),
+                patch.object(driver.sys, "stderr", new_callable=io.StringIO) as stderr,
+            ):
+                with self.assertRaises(SystemExit) as caught:
+                    driver.main()
+                self.assertEqual(caught.exception.code, 2)
+                self.assertIn(
+                    "--case-timeout must be finite and positive", stderr.getvalue()
+                )
+
     def test_commands_use_current_module_and_no_download_dataset(self):
-        args = driver._parser().parse_args(
-            [
-                "--base-url",
-                "http://localhost:30000",
-                "--model",
-                "test",
-                "--tokenizer",
-                "/already/downloaded",
-                "--output-dir",
-                "/results/new",
-                "--implementation-label",
-                "candidate",
-                "--server-revision",
-                "a" * 40,
-                "--checkpoint-revision",
-                "b" * 40,
-                "--flashinfer-variant",
-                "stock-0.7.3",
-            ]
-        )
+        args = driver._parser().parse_args(_arguments())
+        self.assertEqual(args.case_timeout, 1800)
         commands = driver._commands(args, Path(args.output_dir))
         self.assertEqual(len(commands), 18)
         argv = commands[0]["argv"]

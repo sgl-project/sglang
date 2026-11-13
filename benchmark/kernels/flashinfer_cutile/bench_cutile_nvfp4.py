@@ -11,6 +11,7 @@ import argparse
 import csv
 import hashlib
 import importlib.metadata
+import importlib.util
 import json
 import math
 import os
@@ -19,8 +20,9 @@ import statistics
 import subprocess
 import sys
 import time
+import traceback
 from contextlib import ExitStack
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -95,6 +97,12 @@ def parse_args(argv=None):
     parser.add_argument("--reference-tokens", type=int, default=64)
     parser.add_argument("--max-relative-l2", type=float, default=0.05)
     parser.add_argument(
+        "--distributed-timeout",
+        type=float,
+        default=600,
+        help="NCCL initialization/collective timeout in seconds; run TP with torchrun",
+    )
+    parser.add_argument(
         "--streams",
         type=int,
         default=2,
@@ -132,6 +140,8 @@ def parse_args(argv=None):
         parser.error("--input-std must be finite and positive")
     if not math.isfinite(args.max_relative_l2) or not 0 < args.max_relative_l2 < 1:
         parser.error("--max-relative-l2 must be between zero and one")
+    if not math.isfinite(args.distributed_timeout) or args.distributed_timeout <= 0:
+        parser.error("--distributed-timeout must be finite and positive")
     if args.layer_index < 0 or args.seed < 0:
         parser.error("layer-index and seed must be nonnegative")
     if args.checkpoint_dir and not args.checkpoint_revision:
@@ -141,6 +151,24 @@ def parse_args(argv=None):
     ):
         parser.error("duplicate backends or execution modes are not allowed")
     return args
+
+
+def load_test_helpers():
+    """Load this checkout's GPU test helpers without importing a top-level test package."""
+    # The repository's test directory is a namespace package. Python's own
+    # regular "test" package can shadow it even with REPO_ROOT first on sys.path.
+    # Use a private module name and a fixed path; leave the existing test package
+    # untouched. Call only after argument parsing so --help stays lightweight.
+    path = REPO_ROOT / "test/manual/layers/moe/test_flashinfer_cutile_nvfp4.py"
+    spec = importlib.util.spec_from_file_location(
+        "_sglang_cutile_nvfp4_test_helpers", path
+    )
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Cannot load benchmark helpers from {path}")
+    helpers = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = helpers
+    spec.loader.exec_module(helpers)
+    return helpers
 
 
 def command_output(argv, cwd=None):
@@ -196,6 +224,72 @@ def create_output_dir(path):
 
 def write_json(path, value):
     path.write_text(json.dumps(value, indent=2, sort_keys=True, allow_nan=False) + "\n")
+
+
+class BenchmarkCheckError(AssertionError):
+    """Retain numerical evidence when a correctness gate stops a run."""
+
+    def __init__(self, message, metrics):
+        super().__init__(message)
+        self.metrics = metrics
+
+
+class RunEvidence:
+    """Write each rank's last stage outside timing, including failed checks."""
+
+    def __init__(self, output, rank):
+        self.path = output / f"status-rank{rank}.json"
+        self.current = {"rank": rank}
+
+    def stage(self, phase, **details):
+        self.current.update(details)
+        self.current["phase"] = phase
+        write_json(self.path, {"complete": False, "running": True, **self.current})
+
+    def fail(self, error):
+        write_json(
+            self.path,
+            {
+                "complete": False,
+                "running": False,
+                **self.current,
+                "error": repr(error),
+                "metrics": getattr(error, "metrics", None),
+            },
+        )
+
+    def succeed(self):
+        write_json(self.path, {"complete": True, "running": False, **self.current})
+
+
+def distributed_timeout(args):
+    return timedelta(seconds=args.distributed_timeout)
+
+
+def exit_distributed_failure():
+    """Let torchrun terminate peers without waiting in NCCL destructors.
+
+    The caller has already saved evidence and printed the original traceback.
+    Do not add a collective or destroy_process_group here: another rank can be
+    stuck in a different operation. CPU tests can check this control flow, but
+    actual watchdog/peer termination still requires GPU fault-injection tests.
+    """
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+    finally:
+        os._exit(1)
+
+
+def report_failure(evidence, error, *, distributed_worker):
+    """Preserve the original exception even if saving evidence itself fails."""
+    try:
+        evidence.fail(error)
+    except Exception as reporting_error:
+        print(f"Could not save failure evidence: {reporting_error!r}", file=sys.stderr)
+    if distributed_worker:
+        traceback.print_exception(type(error), error, error.__traceback__)
+        exit_distributed_failure()
 
 
 def metadata(args, torch, rank, world_size):
@@ -474,7 +568,9 @@ def make_inputs(layer, tokens, seed, input_std, *, sets=4):
                 topk_output=StandardTopKOutput(
                     topk_ids=ids.to(torch.int32).contiguous(),
                     topk_weights=weights,
-                    router_logits=None,
+                    # Retain the actual pre-top-k scores for Marlin's input
+                    # contract; do not fabricate logits or change the routes.
+                    router_logits=scores,
                 ),
             )
         )
@@ -485,6 +581,8 @@ def copy_input(destination, source):
     destination.hidden_states.copy_(source.hidden_states)
     destination.topk_output.topk_ids.copy_(source.topk_output.topk_ids)
     destination.topk_output.topk_weights.copy_(source.topk_output.topk_weights)
+    # Keep captured storage addresses stable while updating the whole route.
+    destination.topk_output.router_logits.copy_(source.topk_output.router_logits)
 
 
 def slice_input(dispatch, tokens):
@@ -493,6 +591,7 @@ def slice_input(dispatch, tokens):
         topk_output=dispatch.topk_output._replace(
             topk_ids=dispatch.topk_output.topk_ids[:tokens],
             topk_weights=dispatch.topk_output.topk_weights[:tokens],
+            router_logits=dispatch.topk_output.router_logits[:tokens],
         ),
     )
 
@@ -530,13 +629,57 @@ def bit_equal(actual, expected):
     )
 
 
+def validate_output(actual, expected_shape):
+    """Check the whole output even when the expensive reference is a prefix."""
+    import torch
+
+    if tuple(actual.shape) != tuple(expected_shape):
+        raise BenchmarkCheckError(
+            "output shape mismatch",
+            {
+                "actual_shape": list(actual.shape),
+                "expected_shape": list(expected_shape),
+            },
+        )
+    finite = torch.isfinite(actual)
+    if not finite.all().item():
+        raise BenchmarkCheckError(
+            "nonfinite output outside or inside the reference prefix",
+            {"nonfinite_elements": (~finite).sum().item()},
+        )
+
+
+def repeat_metrics(name, actual, expected):
+    """Keep the original gates and report every check's numerical difference."""
+    validate_output(actual, expected.shape)
+    metrics = {
+        **error_metrics(actual, expected),
+        "bit_identity": bit_equal(actual, expected),
+    }
+    if name == "marlin":
+        # Atomic reductions permit bounded numerical noise, not arbitrary error.
+        if metrics["relative_l2"] > 0.001:
+            raise BenchmarkCheckError(
+                "Marlin repeat/replay differs beyond reduction noise",
+                {**metrics, "relative_l2_limit": 0.001},
+            )
+    elif not metrics["bit_identity"]:
+        raise BenchmarkCheckError(
+            f"{name}: repeat/replay is not bit-identical", metrics
+        )
+    return metrics
+
+
 def assert_rank_agreement(output, dist, world_size):
 
     if world_size > 1:
         rank_zero = output.clone()
         dist.broadcast(rank_zero, src=0)
         if not bit_equal(output, rank_zero):
-            raise AssertionError("NCCL-reduced outputs differ between ranks")
+            raise BenchmarkCheckError(
+                "NCCL-reduced outputs differ between ranks",
+                {**error_metrics(output, rank_zero), "bit_identity": False},
+            )
 
 
 def reference_cases(layer, inputs, args, helpers, dist, world_size):
@@ -559,7 +702,9 @@ def reference_cases(layer, inputs, args, helpers, dist, world_size):
     return references
 
 
-def measure_backend(name, call, inputs, references, args, dist, world_size, stream):
+def measure_backend(
+    name, call, inputs, references, args, dist, world_size, stream, evidence, on_result
+):
     import torch
 
     static = make_inputs(
@@ -573,22 +718,14 @@ def measure_backend(name, call, inputs, references, args, dist, world_size, stre
     def run_static():
         return reduce_output(call(static), dist, world_size)
 
-    def matches(actual, expected):
-        # Marlin can use atomic reductions. Record bit identity, but do not
-        # reject the W4A16 baseline solely for legal reduction-order noise.
-        if name == "marlin":
-            if error_metrics(actual, expected)["relative_l2"] > 0.001:
-                raise AssertionError(
-                    "Marlin repeat/replay differs beyond reduction noise"
-                )
-        elif not bit_equal(actual, expected):
-            raise AssertionError(f"{name}: repeat/replay is not bit-identical")
-        return bit_equal(actual, expected)
-
     expected, correctness = [], []
-    for source, (quantized, bf16, stats) in zip(inputs, references):
+    for index, (source, (quantized, bf16, stats)) in enumerate(zip(inputs, references)):
+        evidence.stage("reference-check", execution="eager", input_index=index)
         copy_input(static, source)
         actual = run_static().clone()
+        # Stable NaN bit patterns can pass bit_equal; sample-based references
+        # must never hide malformed or nonfinite values later in the batch.
+        validate_output(actual, source.hidden_states.shape)
         assert_rank_agreement(actual, dist, world_size)
         expected.append(actual)
         n = quantized.shape[0]
@@ -596,7 +733,14 @@ def measure_backend(name, call, inputs, references, args, dist, world_size, stre
         bf_error = error_metrics(actual[:n], bf16)
         checked = bf_error if name == "marlin" else q_error
         if checked["relative_l2"] > args.max_relative_l2:
-            raise AssertionError(f"{name} reference failure: {checked}")
+            raise BenchmarkCheckError(
+                f"{name} reference failure",
+                {
+                    **checked,
+                    "reference": "bf16" if name == "marlin" else "w4a4",
+                    "relative_l2_limit": args.max_relative_l2,
+                },
+            )
         correctness.append(
             {
                 "w4a4_reference": q_error,
@@ -608,8 +752,14 @@ def measure_backend(name, call, inputs, references, args, dist, world_size, stre
 
     copy_input(static, inputs[0])
     repeat_identity = True
-    for _ in range(20):
-        repeat_identity = matches(run_static(), expected[0]) and repeat_identity
+    repeat_checks = []
+    for check_index in range(20):
+        evidence.stage(
+            "repeat-check", execution="eager", input_index=0, check_index=check_index
+        )
+        metrics = repeat_metrics(name, run_static(), expected[0])
+        repeat_checks.append(metrics)
+        repeat_identity = metrics["bit_identity"] and repeat_identity
 
     # Performance uses four distinct input addresses, not a copy into one
     # repeatedly warmed buffer. Do not describe this as guaranteed cold-cache
@@ -623,14 +773,19 @@ def measure_backend(name, call, inputs, references, args, dist, world_size, stre
     timed_runs = [make_run(dispatch) for dispatch in inputs]
     rows = []
     for execution in args.execution:
+        evidence.stage(
+            "warmup", execution=execution, input_index=None, check_index=None
+        )
         for run in timed_runs:
             for _ in range(args.warmup):
                 run()
         stream.synchronize()
         graphs, graph_outputs = [], []
         replay_identity = None
+        graph_checks = []
         if execution == "graph":
-            for run in timed_runs:
+            for index, run in enumerate(timed_runs):
+                evidence.stage("capture", input_index=index)
                 graph = torch.cuda.CUDAGraph()
                 with torch.cuda.graph(graph, stream=stream):
                     captured = run()
@@ -640,18 +795,31 @@ def measure_backend(name, call, inputs, references, args, dist, world_size, stre
             # correctness experiment. Restore input 0 before measurement.
             copy_input(static, inputs[0])
             replay_identity = True
-            for source, target in zip(inputs[1:], expected[1:]):
+            for index, (source, target) in enumerate(zip(inputs[1:], expected[1:]), 1):
+                evidence.stage("changed-input-replay", input_index=index)
                 copy_input(inputs[0], source)
                 graphs[0].replay()
-                replay_identity = matches(graph_outputs[0], target) and replay_identity
+                metrics = repeat_metrics(name, graph_outputs[0], target)
+                graph_checks.append(
+                    {"phase": "changed-input-replay", "input_index": index, **metrics}
+                )
+                replay_identity = metrics["bit_identity"] and replay_identity
             copy_input(inputs[0], static)
-            for graph, captured, target in zip(graphs, graph_outputs, expected):
+            for index, (graph, captured, target) in enumerate(
+                zip(graphs, graph_outputs, expected)
+            ):
+                evidence.stage("restored-input-replay", input_index=index)
                 graph.replay()
-                replay_identity = matches(captured, target) and replay_identity
+                metrics = repeat_metrics(name, captured, target)
+                graph_checks.append(
+                    {"phase": "restored-input-replay", "input_index": index, **metrics}
+                )
+                replay_identity = metrics["bit_identity"] and replay_identity
             executors = [graph.replay for graph in graphs]
         else:
             executors = timed_runs
 
+        evidence.stage("timing", input_index=None)
         samples, host_samples = [], []
         for sample in range(args.samples):
             execute = executors[sample % len(executors)]
@@ -670,6 +838,7 @@ def measure_backend(name, call, inputs, references, args, dist, world_size, stre
             host_samples.append((time.perf_counter() - host_start) * 1000)
             samples.append(start.elapsed_time(end))
 
+        evidence.stage("gather-samples")
         all_samples, all_host = [None] * world_size, [None] * world_size
         if world_size > 1:
             dist.all_gather_object(all_samples, samples)
@@ -689,8 +858,20 @@ def measure_backend(name, call, inputs, references, args, dist, world_size, stre
                 "correctness": correctness,
                 "repeat_bit_identity": repeat_identity,
                 "changed_input_graph_bit_identity": replay_identity,
+                "repeat_checks": repeat_checks,
+                "repeat_max_relative_l2": max(
+                    item["relative_l2"] for item in repeat_checks
+                ),
+                "graph_checks": graph_checks,
+                "graph_max_relative_l2": max(
+                    (item["relative_l2"] for item in graph_checks), default=None
+                ),
             }
         )
+        # Persist each completed execution immediately: a later Graph failure
+        # must not discard valid eager samples or mark the whole run successful.
+        evidence.stage("save-execution")
+        on_result(rows[-1])
         stream.synchronize()
         # No graph-referenced workspace is evicted. First destroy all captures,
         # then allow the outer runtime scope to release its execution resources.
@@ -728,6 +909,13 @@ def write_latency_csv(path, rows):
             )
 
 
+def persist_latency_case(output, rows, row):
+    """Checkpoint completed modes without claiming the entire run passed."""
+    rows.append(row)
+    write_json(output / "latency.json", {"complete": False, "cases": rows})
+    write_latency_csv(output / "latency.csv", rows)
+
+
 def input_prefix_hashes(inputs, count=64):
     """Fingerprint x, IDs and weights outside timing; bound host-copy cost."""
     import torch
@@ -757,18 +945,27 @@ def telemetry():
     )
 
 
-def latency_run(layer, args, helpers, dist, rank, world_size, output):
+def latency_run(layer, args, helpers, dist, rank, world_size, output, evidence):
     import torch
 
-    backends = {
-        name: build_backend(name, layer, helpers, args.capacity, args.cutile_api)
-        for name in args.backends
-    }
+    backends = {}
+    for name in args.backends:
+        evidence.stage("prepare-backend", backend=name, execution=None, tokens=None)
+        backends[name] = build_backend(
+            name, layer, helpers, args.capacity, args.cutile_api
+        )
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     rows, direct_comparisons = [], []
     with torch.cuda.stream(stream):
         for case_index, tokens in enumerate(args.tokens):
+            evidence.stage(
+                "prepare-inputs",
+                case_index=case_index,
+                tokens=tokens,
+                backend=None,
+                execution=None,
+            )
             inputs = make_inputs(layer, tokens, args.seed + tokens, args.input_std)
             hashes = input_prefix_hashes(inputs)
             rank_hashes = [None] * world_size
@@ -778,6 +975,7 @@ def latency_run(layer, args, helpers, dist, rank, world_size, output):
                     raise AssertionError(
                         "TP ranks generated different input/routing prefixes"
                     )
+            evidence.stage("compute-reference")
             references = reference_cases(layer, inputs, args, helpers, dist, world_size)
             # Alternate order to reduce systematic warming/thermal bias. Runs
             # across different checkouts must also be alternated externally.
@@ -786,8 +984,32 @@ def latency_run(layer, args, helpers, dist, rank, world_size, output):
             )
             outputs = {}
             for name in names:
+                evidence.stage("backend-checks", backend=name, execution="eager")
                 before_telemetry = telemetry() if rank == 0 else None
-                current, outputs[name] = measure_backend(
+
+                def on_result(row):
+                    row["input_prefix_sha256"] = hashes
+                    row["hashed_tokens"] = min(64, tokens)
+                    if rank == 0:
+                        row["telemetry_before"] = before_telemetry
+                        row["telemetry_after"] = telemetry()
+                        persist_latency_case(output, rows, row)
+                        print(
+                            json.dumps(
+                                {
+                                    "backend": name,
+                                    "tokens": tokens,
+                                    "execution": row["execution"],
+                                    "p50_ms": row["gpu"]["p50_ms"],
+                                    "p95_ms": row["gpu"]["p95_ms"],
+                                }
+                            ),
+                            flush=True,
+                        )
+                    else:
+                        rows.append(row)
+
+                _, outputs[name] = measure_backend(
                     name,
                     backends[name],
                     inputs,
@@ -796,38 +1018,13 @@ def latency_run(layer, args, helpers, dist, rank, world_size, output):
                     dist,
                     world_size,
                     stream,
+                    evidence,
+                    on_result,
                 )
-                for row in current:
-                    row["input_prefix_sha256"] = hashes
-                    row["hashed_tokens"] = min(64, tokens)
-                rows.extend(current)
-                if rank == 0:
-                    after_telemetry = telemetry()
-                    for row in current:
-                        row["telemetry_before"] = before_telemetry
-                        row["telemetry_after"] = after_telemetry
-                    write_json(
-                        output / "latency.json", {"complete": False, "cases": rows}
-                    )
-                    write_latency_csv(output / "latency.csv", rows)
-                    print(
-                        json.dumps(
-                            {
-                                "backend": name,
-                                "tokens": tokens,
-                                "results": [
-                                    {
-                                        "execution": row["execution"],
-                                        "p50_ms": row["gpu"]["p50_ms"],
-                                        "p95_ms": row["gpu"]["p95_ms"],
-                                    }
-                                    for row in current
-                                ],
-                            }
-                        ),
-                        flush=True,
-                    )
             if "cutile" in outputs and "direct" in outputs:
+                evidence.stage(
+                    "direct-comparison", backend="cutile/direct", execution="eager"
+                )
                 comparisons = []
                 for integrated, direct in zip(outputs["cutile"], outputs["direct"]):
                     metrics = error_metrics(integrated, direct)
@@ -837,10 +1034,12 @@ def latency_run(layer, args, helpers, dist, rank, world_size, output):
                     # bit identity expected from the same unchunked kernel.
                     if args.cutile_api == "fused" and tokens > 8192:
                         if metrics["relative_l2"] > args.max_relative_l2:
-                            raise AssertionError(f"chunked/direct mismatch: {metrics}")
+                            raise BenchmarkCheckError(
+                                "chunked/direct mismatch", metrics
+                            )
                     elif not identity:
-                        raise AssertionError(
-                            "adapter/direct same-kernel outputs differ"
+                        raise BenchmarkCheckError(
+                            "adapter/direct same-kernel outputs differ", metrics
                         )
                     comparisons.append({**metrics, "bit_identity": identity})
                 direct_comparisons.append(
@@ -860,13 +1059,14 @@ def latency_run(layer, args, helpers, dist, rank, world_size, output):
         )
 
 
-def workspace_run(layer, args, helpers, dist, rank, world_size, output):
+def workspace_run(layer, args, helpers, dist, rank, world_size, output, evidence):
     import torch
 
     if world_size != 1:
         raise ValueError(
             "workspace mode uses one process/device; run it separately on each GPU"
         )
+    evidence.stage("prepare-backend", backend="cutile", execution="eager")
     call = build_backend("cutile", layer, helpers, args.capacity, args.cutile_api)
     inputs = make_inputs(layer, args.capacity, args.seed, args.input_std, sets=1)[0]
     streams = [torch.cuda.Stream() for _ in range(args.streams)]
@@ -881,6 +1081,9 @@ def workspace_run(layer, args, helpers, dist, rank, world_size, output):
         stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(stream):
             for step, tokens in enumerate(args.tokens):
+                evidence.stage(
+                    "workspace-step", stream=stream_index, step=step, tokens=tokens
+                )
                 dispatch = slice_input(inputs, tokens)
                 torch.cuda.synchronize()
                 before = torch.cuda.memory_allocated()
@@ -949,7 +1152,7 @@ def main(argv=None):
             raise RuntimeError(
                 f"module loaded outside target checkout: {module.__file__}"
             )
-    from test.manual.layers.moe import test_flashinfer_cutile_nvfp4 as helpers
+    helpers = load_test_helpers()
 
     rank = int(os.environ.get("RANK", "0"))
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
@@ -962,7 +1165,11 @@ def main(argv=None):
     if torch.cuda.get_device_capability() not in ((12, 0), (12, 1)):
         raise RuntimeError("requires SM120 or SM121")
     if world_size > 1:
-        dist.init_process_group("nccl", device_id=torch.device("cuda", local_rank))
+        dist.init_process_group(
+            "nccl",
+            device_id=torch.device("cuda", local_rank),
+            timeout=distributed_timeout(args),
+        )
     output = args.output_dir
     directory_error = [None]
     if rank == 0:
@@ -974,7 +1181,10 @@ def main(argv=None):
         dist.broadcast_object_list(directory_error)
     if directory_error[0]:
         raise FileExistsError(directory_error[0])
+    evidence = RunEvidence(output, rank)
+    distributed_worker = world_size > 1 and dist.is_initialized()
     try:
+        evidence.stage("load-weights", run_mode=args.mode)
         with torch.inference_mode(), runtime_scope(args.capacity):
             torch.manual_seed(args.seed)
             # Full synthetic weights use the same seed on every rank before
@@ -998,6 +1208,7 @@ def main(argv=None):
                     tp_rank=rank,
                     tp_size=world_size,
                 )
+            evidence.stage("metadata")
             info = metadata(args, torch, rank, world_size)
             info["geometry"] = {
                 "experts_per_rank": layer.num_experts,
@@ -1009,20 +1220,25 @@ def main(argv=None):
             # evidence even if a later NCCL or kernel operation fails.
             write_json(output / f"metadata-rank{rank}.json", info)
             if args.mode == "latency":
-                latency_run(layer, args, helpers, dist, rank, world_size, output)
+                latency_run(
+                    layer, args, helpers, dist, rank, world_size, output, evidence
+                )
             else:
-                workspace_run(layer, args, helpers, dist, rank, world_size, output)
+                workspace_run(
+                    layer, args, helpers, dist, rank, world_size, output, evidence
+                )
+            evidence.stage("final-synchronize")
             torch.cuda.synchronize()
-            write_json(output / f"status-rank{rank}.json", {"complete": True})
-    except Exception as error:
-        write_json(
-            output / f"status-rank{rank}.json",
-            {"complete": False, "error": repr(error)},
-        )
-        raise
-    finally:
-        if world_size > 1 and dist.is_initialized():
+        if distributed_worker:
+            evidence.stage("distributed-shutdown")
             dist.destroy_process_group()
+        evidence.succeed()
+    except Exception as error:
+        # Do not attempt collective shutdown on an unhealthy communicator.
+        # A hard worker exit lets torchrun terminate ranks blocked elsewhere;
+        # the original exception is retained in both status and the traceback.
+        report_failure(evidence, error, distributed_worker=distributed_worker)
+        raise
 
 
 if __name__ == "__main__":

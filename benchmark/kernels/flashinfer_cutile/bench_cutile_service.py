@@ -209,19 +209,47 @@ def _confirmed_release_rejection(error, server_info):
     )
 
 
-def _signature(response):
+def _signature(response, *, expected_tokens=None):
     if not isinstance(response, dict):
         raise ValueError("Expected a single non-streaming generation response")
     ids = response.get("output_ids")
     meta = response.get("meta_info", {})
+    if not isinstance(meta, dict):
+        raise ValueError("Generation response must contain a meta_info object")
+    # Native /generate can return HTTP 200 for an abort without a status code.
+    # Matching partial outputs before and after resume do not prove a complete
+    # decode worked. These requests ignore EOS and must finish at their limit.
+    finish_reason = meta.get("finish_reason")
+    if not isinstance(finish_reason, dict) or finish_reason.get("type") != "length":
+        raise ValueError(
+            f"Lifecycle generation must finish by length, got {finish_reason!r}"
+        )
     logprobs = meta.get("output_token_logprobs")
-    if not ids or not isinstance(logprobs, list) or len(logprobs) != len(ids):
+    if (
+        not isinstance(ids, list)
+        or not ids
+        or not isinstance(logprobs, list)
+        or len(logprobs) != len(ids)
+    ):
         raise ValueError(
             "Response must contain nonempty output_ids and one logprob per token"
         )
+    if expected_tokens is not None and len(ids) != expected_tokens:
+        raise ValueError(
+            f"Lifecycle generation returned {len(ids)} tokens; "
+            f"expected {expected_tokens}"
+        )
+    if meta.get("completion_tokens") != len(ids):
+        raise ValueError("completion_tokens does not match output_ids length")
     values = []
     for token_id, row in zip(ids, logprobs):
-        if len(row) < 2 or row[1] != token_id or not math.isfinite(row[0]):
+        if (
+            not isinstance(row, (list, tuple))
+            or len(row) < 2
+            or row[1] != token_id
+            or not isinstance(row[0], (int, float))
+            or not math.isfinite(row[0])
+        ):
             raise ValueError("Malformed or non-finite output logprob")
         values.append(float(row[0]))
     return ids, values
@@ -268,7 +296,9 @@ def _lifecycle(server, args, output_dir, *, server_info=None):
             # cache. The baseline uses the same cold-cache request sequence.
             server.call("/flush_cache?timeout=60", {})
             response = server.call("/generate", payload)
-            _signature(response)
+            _signature(
+                response, expected_tokens=payload["sampling_params"]["max_new_tokens"]
+            )
             responses.append(response)
         return responses
 
@@ -452,15 +482,44 @@ def _serving(args, output_dir, commands, server, model_info):
             _validate_server(server.call("/server_info"), args)
             name = case["name"] + ("-pilot" if stage == "pilot" else "")
             print(shlex.join(argv), flush=True)
-            with (output_dir / f"{name}.log").open("w") as log:
-                subprocess.run(
-                    argv,
-                    cwd=REPO_ROOT,
-                    env=environment,
-                    stdout=log,
-                    stderr=subprocess.STDOUT,
-                    check=True,
+            log_path = output_dir / f"{name}.log"
+            try:
+                with log_path.open("w") as log:
+                    # This bounds the whole benchmark client, including its
+                    # internal HTTP calls. --http-timeout only bounds this
+                    # driver's own control requests, not those of the child.
+                    subprocess.run(
+                        argv,
+                        cwd=REPO_ROOT,
+                        env=environment,
+                        stdout=log,
+                        stderr=subprocess.STDOUT,
+                        check=True,
+                        timeout=args.case_timeout,
+                    )
+            except subprocess.TimeoutExpired as exc:
+                # subprocess.run kills and waits for its child on timeout.
+                # The separately launched model server is left running; stop
+                # the matrix so its outstanding work can be inspected first.
+                _write_json(
+                    output_dir / f"{name}-timeout.json",
+                    {
+                        "status": "failed",
+                        "case": case["name"],
+                        "stage": stage,
+                        "timeout_seconds": args.case_timeout,
+                        "argv": argv,
+                        "log_path": str(log_path),
+                        "error": repr(exc),
+                        "note": "Benchmark client timed out; inspect its log and "
+                        "server requests before retrying. The server was not stopped.",
+                    },
                 )
+                raise TimeoutError(
+                    f"Serving case {case['name']} ({stage}) exceeded "
+                    f"--case-timeout={args.case_timeout}s; see {log_path}. "
+                    "The benchmark client was stopped; the server was not stopped."
+                ) from exc
             lines = (output_dir / f"{name}.jsonl").read_text().splitlines()
             if len(lines) != 1:
                 raise AssertionError(
@@ -512,6 +571,13 @@ def _parser():
     parser.add_argument("--warmup-requests", type=int, default=4)
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--http-timeout", type=float, default=600)
+    parser.add_argument(
+        "--case-timeout",
+        type=float,
+        default=1800,
+        help="Seconds allowed for each pilot or measured benchmark subprocess "
+        "separately (default: 1800); does not stop the model server",
+    )
     parser.add_argument("--logprob-atol", type=float, default=0.0)
     parser.add_argument(
         "--dry-run",
@@ -545,6 +611,8 @@ def main():
         parser.error("--logprob-atol must be finite and nonnegative")
     if not math.isfinite(args.http_timeout) or args.http_timeout <= 0:
         parser.error("--http-timeout must be finite and positive")
+    if not math.isfinite(args.case_timeout) or args.case_timeout <= 0:
+        parser.error("--case-timeout must be finite and positive")
     output_dir = Path(args.output_dir).expanduser().resolve()
     commands = _commands(args, output_dir) if args.mode != "lifecycle" else []
     if args.dry_run:
