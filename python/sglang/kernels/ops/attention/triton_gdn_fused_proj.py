@@ -516,8 +516,8 @@ def can_use_fused_qkvzba_causal_conv1d_update_contiguous(
     activation: str | None,
 ) -> tuple[bool, str]:
     """Select the fused decode path for supported dtypes and layouts."""
-    if not mixed_qkvz.is_cuda:
-        return False, "CUDA tensors are required"
+    if mixed_qkvz.is_cpu:
+        return False, "device tensors are required"
     width = conv_weight.shape[-1]
     if width < 2 or width > 4:
         return False, "only Conv1D widths 2 through 4 are supported"

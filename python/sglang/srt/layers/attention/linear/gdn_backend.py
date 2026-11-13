@@ -4,6 +4,12 @@ import msgspec
 import torch
 
 from sglang.kernels.ops.attention.linear.fused_gdn_gating import fused_gdn_gating
+from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
+    can_use_fused_qkvzba_causal_conv1d_update_contiguous,
+    fused_qkv_split_gdn_prefill,
+    fused_qkvzba_causal_conv1d_update_contiguous,
+    fused_qkvzba_split_reshape_cat_contiguous,
+)
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     CAUSAL_CONV1D_FWD_BLOCK_M,
 )
@@ -64,14 +70,6 @@ _is_hip = is_hip()
 if not is_cpu():
     from sglang.kernels.ops.attention.fla.chunk_delta_h import (
         CHUNK_SIZE as FLA_CHUNK_SIZE,
-    )
-
-if is_cuda() or is_hip() or is_xpu():
-    from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
-        can_use_fused_qkvzba_causal_conv1d_update_contiguous,
-        fused_qkv_split_gdn_prefill,
-        fused_qkvzba_causal_conv1d_update_contiguous,
-        fused_qkvzba_split_reshape_cat_contiguous,
     )
 
 MAX_FUSED_QKV_SPLIT_DIM = 8192
