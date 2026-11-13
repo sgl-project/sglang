@@ -85,9 +85,10 @@ class StorageSubPool(msgspec.Struct, frozen=True, kw_only=True):
 
 class SubPoolUsage(msgspec.Struct, frozen=True, kw_only=True):
     """A sub-pool's occupancy as observers report it, in its own units: tokens,
-    or slots for a sub-pool that holds state. ``metrics`` is the family its
-    numbers are published under (``full``, ``window`` or ``mamba``), and
-    ``label`` the name that tells one window's numbers from another's."""
+    slots for a sub-pool that holds state, or request rows for a request
+    sub-pool. ``metrics`` is the family its numbers are published under
+    (``full``, ``window``, ``mamba`` or ``request``), and ``label`` the name
+    that tells one window's numbers from another's."""
 
     name: str
     metrics: str
@@ -133,7 +134,6 @@ class KVStorage:
         start_layer: int,
         requests=None,
         scratch=None,
-        request_memory=None,
     ):
         self._plan = plan
         self.sized = sized
@@ -142,7 +142,6 @@ class KVStorage:
         # The request table: rows, who holds each, and the ids they hold.
         self.requests = requests
         self.scratch = scratch
-        self._request_memory = request_memory
         # Keyed by request identity (`_lifetime`), never ``rid``: a retry may
         # reuse a ``rid`` while the earlier request is in deferred release.
         # Network transfers in flight, per request, one per send or receive:
@@ -166,7 +165,9 @@ class KVStorage:
             allocator.fresh_request_state_slots = state.fresh_request_slots(requests)
         self._views: Dict[str, Any] = {}
         sub_pools = []
-        for s in plan.owner_first():
+        # Request sub-pools are reached through the views that read them.
+        cached = {s.name for s in plan.cached_sub_pools()}
+        for s in (s for s in plan.owner_first() if s.name in cached):
             holds_state = isinstance(s.spec, MambaSubPoolSpec)
             if holds_state:
                 self._views[s.name] = state.pool
@@ -226,11 +227,6 @@ class KVStorage:
         return layout
 
     @property
-    def request_memory(self):
-        """Fixed REQUEST parts, copied together when a request is retracted."""
-        return self._request_memory
-
-    @property
     def allocator(self):
         """The chain allocator, for what does not go through this storage yet:
         admission and eviction (capacity), the tree's frees."""
@@ -260,13 +256,12 @@ class KVStorage:
         `StateSlotsExhausted` surfaces."""
         from sglang.srt.mem_cache.static_kv_storage import acquire_rows
 
-        return acquire_rows(
-            self.requests,
-            self._allocator.state,
-            reqs,
-            request_memory=self._request_memory,
-            reset_request_parts=False,
-        )
+        return acquire_rows(self.requests, self._allocator.state, reqs)
+
+    def reset_new_rows(self) -> None:
+        """Nothing to reset: a request sub-pool's unit is zeroed when a row
+        binds it, and reused only after the forwards that touched it retired
+        (`ChainAllocator.alloc_request_rows`)."""
 
     def take_tokens(
         self,
@@ -448,10 +443,7 @@ class KVStorage:
     def take_rows(self, num_rows: int) -> Optional[List[int]]:
         """Rows bound to no request (beam search members); None when too few
         are free."""
-        rows = self.requests.alloc_rows(num_rows, state=RowState.HELD)
-        if rows is not None and self._request_memory is not None:
-            self._request_memory.reset_rows(rows)
-        return rows
+        return self.requests.alloc_rows(num_rows, state=RowState.HELD)
 
     def release_rows(self, rows: List[int]) -> None:
         """Give back rows `take_rows` handed out; their ids went back before."""
@@ -479,10 +471,15 @@ class KVStorage:
             return self._allocator.full_attn_allocator
         return self._allocator
 
-    def available_units(self, sub_pool: str) -> int:
-        """Units ``take_units`` can hand out without eviction: the planner's
-        answer, which counts the room a relayout makes, as a take does."""
-        return self._allocator.units_available(sub_pool)
+    def units_fit(self, sub_pool: str, count: int) -> bool:
+        """Whether ``take_units`` can hand out ``count`` units (tokens, slots for
+        state) now, counting the room a relayout makes, as a take does."""
+        if count <= 0:
+            return True
+        allocator = self._allocator
+        if sub_pool != allocator.sub_pool_roles()[2]:
+            count = -(-count // allocator.page_size)
+        return allocator.units_fit({sub_pool: count})
 
     def take_units(self, sub_pool: str, count: int) -> Optional[torch.Tensor]:
         """``count`` rows of ``sub_pool`` alone (a load the tree stages); None
@@ -740,7 +737,8 @@ class KVStorage:
         return self._allocator.verify_byte_accounting()
 
     def usage(self) -> Tuple[SubPoolUsage, ...]:
-        """Every sub-pool's capacity and free units now, owner first."""
+        """Every sub-pool's capacity and free units now, owner first, request
+        sub-pools included (they have no view of their own here)."""
         units = self._allocator.usage()
         return tuple(
             SubPoolUsage(
@@ -750,7 +748,7 @@ class KVStorage:
                 capacity=units[s.name][0],
                 available=units[s.name][1],
             )
-            for s in self._sub_pools
+            for s in self._plan.owner_first()
         )
 
     def page_envelope_pair(self) -> Optional[Tuple[str, str]]:
@@ -908,15 +906,8 @@ class KVStorage:
             and (d.part.name == part or d.wire == part)
             and part is not None
         ]
-        request = [
-            d.part
-            for d in self._plan.request_parts
-            if (d.part.name == part or d.wire == part) and part is not None
-        ]
         if derived:
             return self._allocator.arena.page_parts[sub_pool].regions(derived)
-        if request:
-            return self._request_memory.regions(request)
         if part not in (None, "kv", "state"):
             raise KeyError(f"sub-pool {sub_pool!r} has no transfer part {part!r}")
         view = self._views[sub_pool]
@@ -1155,6 +1146,7 @@ class KVStorage:
             forward_done,
             written_tokens,
             state,
+            request_rows=req_pool_indices.reshape(-1).to(torch.int64),
             token_writes_unknown=token_writes_unknown,
             state_writes_unknown=state_writes_unknown,
         )
