@@ -202,6 +202,12 @@ def _load_tensor_parallel_weight(
 class LinearMethodBase(QuantizeMethodBase):
     """Base class for different (maybe quantized) linear methods."""
 
+    def accepts_per_token_fp8_input(self, layer: torch.nn.Module) -> bool:
+        """Whether apply accepts E4M3 rows and FP32 scales [rows] or [rows,1].
+        The per-token tuple contract emits BF16, independent of payload dtype.
+        """
+        return False
+
     def accepts_mxfp8_input(self, layer: torch.nn.Module) -> bool:
         """Whether ``apply`` takes a prequantized ``(e4m3 input, swizzled E8M0
         block scales)`` tuple for this layer."""
@@ -235,7 +241,10 @@ class LinearMethodBase(QuantizeMethodBase):
 
     @abstractmethod
     def apply(
-        self, layer: torch.nn.Module, x: torch.Tensor, bias: torch.Tensor | None = None
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+        bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Apply the weights in layer to the input tensor.
         Expects create_weights to have been called before on the layer."""

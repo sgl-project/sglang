@@ -5,15 +5,21 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from sglang.kernels.ops.activation.activation import (
+    silu_and_mul_with_activation_rounding,
+)
 from sglang.kernels.ops.diffusion import (
     can_use_fp8_rowwise,
     fp8_rowwise,
     fused_packed_swiglu_fp8_rowwise,
+    fused_packed_swiglu_per_token_fp8,
 )
+from sglang.kernels.ops.quantization.fp8_kernel import sglang_per_token_quant_fp8
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=30, stage="base-b", runner_config="diffusion-unit-1-gpu-h100")
 
 
 def reference(x, alignment=16):
@@ -234,6 +240,35 @@ class TestPackedSwiGLUFp8(CustomTestCase):
             use_fast_accum=True,
         )
         self.assertTrue(torch.equal(out, expected))
+
+
+@pytest.mark.parametrize("rows", [4096, 4144, 16432])
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0),
+    reason="per-token FP8 contract targets SM90",
+)
+def test_silu_mul_fp8_bits(rows):
+    torch.manual_seed(17)
+    hidden = torch.randn(rows, 28672, device="cuda", dtype=torch.bfloat16)
+    hidden[0].zero_()
+    hidden[1] *= 1e-12
+    hidden[2, ::127] *= 100
+    # Sweep BF16 gate values in [-16,16], including sigmoid boundaries.
+    hidden[3, :14336] = torch.linspace(-16, 16, 14336, device="cuda")
+    expected = sglang_per_token_quant_fp8(silu_and_mul_with_activation_rounding(hidden))
+    q, scales = fused_packed_swiglu_per_token_fp8(hidden)
+    q3, scales3 = fused_packed_swiglu_per_token_fp8(hidden.unsqueeze(0))
+    assert torch.equal(q.view(torch.uint8), q3.view(torch.uint8))
+    assert torch.equal(scales, scales3)
+    assert scales.shape == (rows,)
+    assert torch.equal(q.view(torch.uint8), expected[0].view(torch.uint8))
+    assert torch.equal(scales, expected[1].view(-1))
+    # Same producer has intentionally different scale semantics on zero/tiny
+    # rows in its default rowwise contract. Neither silently replaces the other.
+    default_q, default_scales = fused_packed_swiglu_fp8_rowwise(hidden.unsqueeze(0), 1)
+    assert default_scales[0] == 1e-12
+    assert scales[0] == 0
+    assert torch.equal(default_q[0].view(torch.uint8), q[0].view(torch.uint8))
 
 
 if __name__ == "__main__":

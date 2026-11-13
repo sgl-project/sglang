@@ -229,6 +229,68 @@ class TestFp8LinearMethodRowwise(unittest.TestCase):
                 )
                 self.assertGreater(cosine.item(), 0.999)
 
+    @unittest.skipUnless(
+        _fp8_capable() and torch.cuda.get_device_capability() == (9, 0), "requires SM90"
+    )
+    def test_linear_prequantized_input_and_capture(self):
+        import pytest
+
+        from sglang.kernels.ops.activation.activation import (
+            silu_and_mul_with_activation_rounding,
+        )
+        from sglang.kernels.ops.diffusion import fused_packed_swiglu_per_token_fp8
+        from sglang.multimodal_gen.runtime.layers.quantization.fp8 import (
+            Fp8Config,
+            Fp8LinearMethod,
+        )
+
+        torch.manual_seed(21)
+        hidden = torch.randn(4144, 28672, device="cuda", dtype=torch.bfloat16)
+        layer = torch.nn.Module()
+        layer.weight = torch.nn.Parameter(
+            torch.randn(128, 14336, device="cuda", dtype=torch.bfloat16)
+            .to(torch.float8_e4m3fn)
+            .t(),
+            requires_grad=False,
+        )
+        layer.weight_scale = torch.nn.Parameter(
+            torch.rand(1, 128, device="cuda") * 0.01, requires_grad=False
+        )
+        layer.input_scale = None
+        method = Fp8LinearMethod(Fp8Config())
+        assert method.accepts_per_token_fp8_input(layer)
+        expected = method.apply(layer, silu_and_mul_with_activation_rounding(hidden))
+        actual = method.apply(
+            layer,
+            fused_packed_swiglu_per_token_fp8(hidden),
+        )
+        assert actual.dtype == torch.bfloat16
+        assert torch.equal(actual, expected)
+        # Warmed producer/consumer must work under CUDA graph replay, too.
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            method.apply(
+                layer,
+                fused_packed_swiglu_per_token_fp8(hidden),
+            )
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            replayed = method.apply(
+                layer,
+                fused_packed_swiglu_per_token_fp8(hidden),
+            )
+        graph.replay()
+        assert torch.equal(replayed, expected)
+        serialized = Fp8LinearMethod(Fp8Config(is_checkpoint_fp8_serialized=True))
+        assert not serialized.accepts_per_token_fp8_input(layer)
+        with pytest.raises(ValueError, match="does not accept"):
+            serialized.apply(
+                layer,
+                fused_packed_swiglu_per_token_fp8(hidden),
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

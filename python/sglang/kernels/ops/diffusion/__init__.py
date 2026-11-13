@@ -58,6 +58,24 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset], ...] = (
         frozenset({CapabilityRequirement.cuda(min_sm=(8, 9))}),
     ),
     (
+        "diffusion.fused_packed_swiglu_per_token_fp8",
+        KernelBackend.TRITON,
+        "activation.swiglu_per_token_fp8:fused_packed_swiglu_per_token_fp8",
+        frozenset({CapabilityRequirement.cuda(min_sm=(9, 0), max_sm=(9, 0))}),
+    ),
+    (
+        "diffusion.rmsnorm_indexed_scale_shift_fp8",
+        KernelBackend.TRITON,
+        "norm.rmsnorm_indexed_scale_shift_fp8:rmsnorm_indexed_scale_shift_fp8",
+        frozenset({CapabilityRequirement.cuda(min_sm=(9, 0), max_sm=(9, 0))}),
+    ),
+    (
+        "diffusion.rmsnorm_indexed_scale_shift",
+        KernelBackend.TRITON,
+        "norm.rmsnorm_scale_shift_triton:rmsnorm_indexed_scale_shift",
+        _CUDA,
+    ),
+    (
         "diffusion.residual_gate_fp32",
         KernelBackend.TRITON,
         "modulate.residual_gate_fp32:residual_gate_fp32",
@@ -668,6 +686,10 @@ for _op, _backend, _target, _caps in _SPECS:
 _EXPORTS: dict[str, str] = {
     "can_use_fused_packed_swiglu_fp8_rowwise": "quantization.swiglu_fp8_rowwise_triton",
     "fused_packed_swiglu_fp8_rowwise": "quantization.swiglu_fp8_rowwise_triton",
+    "can_use_fused_packed_swiglu_per_token_fp8": "activation.swiglu_per_token_fp8",
+    "fused_packed_swiglu_per_token_fp8": "activation.swiglu_per_token_fp8",
+    "can_use_rmsnorm_indexed_scale_shift_fp8": "norm.rmsnorm_indexed_scale_shift_fp8",
+    "rmsnorm_indexed_scale_shift_fp8": "norm.rmsnorm_indexed_scale_shift_fp8",
     "apply_matrix_rope": "rope.matrix_rope",
     "residual_gate_fp32": "modulate.residual_gate_fp32",
     "can_use_fp8_rowwise": "quantization.fp8_rowwise_triton",
