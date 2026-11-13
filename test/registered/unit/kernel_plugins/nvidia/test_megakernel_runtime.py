@@ -1,5 +1,6 @@
 """CPU checks of the megakernel install, dispatch and capture check."""
 
+import inspect
 import sys
 import unittest
 from pathlib import Path
@@ -12,6 +13,10 @@ from msgspec.structs import replace
 from sglang.kernels.plugin_kernels.nvidia import spec as registry
 from sglang.srt.kernel_plugins.nvidia import binding
 from sglang.srt.kernel_plugins.nvidia.binding import MegakernelBinding, PreparationView
+from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
+    _build_layer_model_forward_kwargs,
+    has_external_prefill_body,
+)
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -35,6 +40,26 @@ register_cpu_ci(est_time=5, stage="base-a", runner_config="cpu")
 class OtherBinding:
     def __init__(self, *, model):
         self.model = model
+
+
+class Body(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.layers = torch.nn.ModuleList()
+
+    def forward(self, input_ids, positions, forward_batch, input_embeds=None):
+        return "standard body"
+
+
+class LayeredLm(torch.nn.Module):
+    """A model whose transformer body sits behind .model, as SGLang's LMs do."""
+
+    def __init__(self):
+        super().__init__()
+        self.model = Body()
+
+    def forward(self, input_ids, positions, forward_batch, input_embeds=None):
+        return self.model(input_ids, positions, forward_batch)
 
 
 def install(
@@ -595,6 +620,67 @@ class TestMegakernelRuntime(CustomTestCase):
                 lm(forward_batch.input_ids, None, forward_batch)
             MegakernelBinding.forward_view.assert_called_once_with(forward_batch)
             MegakernelBinding.prefill_view.assert_not_called()
+
+    def _install_body(self, *, prefill_graph=True, **offers):
+        """Install a build that plans no outer step and plans a prefill body of up
+        to 4 rows, on a model with a layer module."""
+        built = FakeBuilt((1, 2, 3, 4))
+        built.plan = lambda *a, **kw: None
+        built.plan_body = lambda ids, fb, *a, **kw: (
+            registry.Step(mode="prefill", rows=int(ids.shape[0]))
+            if ids.shape[0] <= 4
+            else None
+        )
+        built.forward_body = lambda step, original, *a, **kw: (step, original)
+        for name, value in offers.items():
+            setattr(built, name, value)
+        spec = replace(
+            SPEC, build=lambda m, hf, ctx: built, prefill_graph=prefill_graph
+        )
+        return self._install_spec(spec, model=LayeredLm(), tokens=1)
+
+    def test_prefill_graph_routes_the_layer_model_body_with_its_signature(self):
+        """With prefill_graph the layer module's forward runs the planned body with
+        the prefill view, keeping the signature the prefill graph runner binds."""
+        stock = Body.forward
+        lm = self._install_body()
+        params = inspect.signature(lm.model.forward).parameters
+        self.assertEqual(
+            list(params), ["input_ids", "positions", "forward_batch", "input_embeds"]
+        )
+        forward_batch = SimpleNamespace(input_embeds="embeds", **vars(batch(4)))
+        self.assertEqual(
+            _build_layer_model_forward_kwargs(lm.model, forward_batch, None),
+            {"input_embeds": "embeds"},
+        )
+        with (
+            patch.object(MegakernelBinding, "prefill_view", return_value="pview"),
+            patch.object(torch.cuda, "is_current_stream_capturing", return_value=True),
+        ):
+            step, original = lm(forward_batch.input_ids, None, forward_batch)
+        self.assertEqual((step.mode, step.rows, step.view), ("prefill", 4, "pview"))
+        self.assertIs(original.__func__, stock)
+        MegakernelBinding.forward_view.assert_not_called()
+        self.assertTrue(has_external_prefill_body(lm))
+
+    def test_a_declined_body_runs_the_layer_model_forward(self):
+        lm = self._install_body()
+        with (
+            patch.object(MegakernelBinding, "prefill_view") as prefill_view,
+            patch.object(torch.cuda, "is_current_stream_capturing", return_value=False),
+        ):
+            self.assertEqual(lm(batch(6).input_ids, None, batch(6)), "standard body")
+        prefill_view.assert_not_called()
+
+    def test_without_prefill_graph_the_layer_model_keeps_its_forward(self):
+        lm = self._install_body(prefill_graph=False)
+        self.assertNotIn("forward", lm.model.__dict__)
+        self.assertFalse(has_external_prefill_body(lm))
+        self.assertIn("forward", lm.__dict__)
+
+    def test_prefill_graph_without_a_body_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "without plan_body / forward_body"):
+            self._install_body(plan_body=None)
 
 
 if __name__ == "__main__":

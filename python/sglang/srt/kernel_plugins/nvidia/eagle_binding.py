@@ -221,6 +221,9 @@ class LinearPrefillView(msgspec.Struct, frozen=True):
     # batch row of a chunk-unaligned one in a kernel's track-state snapshot
     track_chunk_idx: Optional[torch.Tensor] = None
     track_ssm_h_batch_src: Optional[torch.Tensor] = None
+    # While a breakable prefill graph captures or replays a bucket: the backend's
+    # static tables (GDNPrefillGraphMetadata for GDN).
+    prefill_graph_metadata: Optional[msgspec.Struct] = None
 
 
 class EaglePreparationView(msgspec.Struct, frozen=True):
@@ -344,6 +347,7 @@ class EagleBinding:
             )
         meta = linear.forward_metadata
         kernel = linear.kernel_dispatcher.extend_kernel
+        graph = getattr(linear, "prefill_graph_metadata", None)
         return LinearPrefillView(
             state=self._read("prefill", self._prefill, backend),
             query_start_loc=meta.query_start_loc,
@@ -351,7 +355,7 @@ class EagleBinding:
             conv_block_table=getattr(meta, "conv_block_table", None),
             kernel_id=int(type(kernel).__name__ == "TritonGDNKernel"),
             requires_contiguous_state=linear.requires_contiguous_prefill_state,
-            is_graph=getattr(linear, "prefill_graph_metadata", None) is not None,
+            is_graph=graph is not None,
             has_mis=getattr(linear, "mis_metadata", None) is not None,
             has_track=meta.has_mamba_track_mask,
             track_conv_indices=meta.track_conv_indices,
@@ -371,6 +375,7 @@ class EagleBinding:
             ),
             track_chunk_idx=meta.track_chunk_idx,
             track_ssm_h_batch_src=meta.track_ssm_h_batch_src,
+            prefill_graph_metadata=graph,
         )
 
     def preparation_view(self, model_runner: Any) -> EaglePreparationView:

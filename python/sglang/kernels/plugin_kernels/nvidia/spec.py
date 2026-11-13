@@ -105,7 +105,9 @@ class Step(msgspec.Struct, frozen=True):
       "target_verify" – speculative-decoding target verify; runs in a CUDA graph.
       "draft_extend"  – a draft model's extend over the verified rows; runs in a
                         CUDA graph and gets the same view as "target_verify".
-      "prefill"       – context prefill; runs eagerly (never captured in a graph).
+      "prefill"       – context prefill; runs eagerly. With
+                        MegakernelSpec.prefill_graph, the transformer body it
+                        calls may be captured (SupportsPrefillBody).
     """
 
     mode: str
@@ -435,12 +437,12 @@ class BuiltMegakernel(Protocol):
     ) -> Optional[Step]:
         """The step to run, or None for the model's own forward; host-only, so a
         captured graph replays the decision made at capture.  A "prefill" step
-        is always eager and is never replayed from a captured graph."""
+        runs eagerly; only its body may be captured (SupportsPrefillBody)."""
 
     def forward(self, step: Step, original: Callable, *args: Any, **kwargs: Any) -> Any:
         """Run step in place of original (the model's bound forward), taking and
         returning what it does; capturable in a CUDA graph for decode and
-        target_verify steps (prefill runs eagerly)."""
+        target_verify steps (prefill runs eagerly; see SupportsPrefillBody)."""
 
 
 # The optional entries of a built megakernel, beyond draft_sampler the EAGLE ones
@@ -453,6 +455,31 @@ ENTRIES = (
 # The graph runners a built object's graph_variants may key: the target's verify
 # graphs, the EAGLE draft graphs and the EAGLE draft-extend graphs
 GRAPH_VARIANT_RUNNERS = ("target_verify", "draft_loop", "draft_extend")
+
+
+@runtime_checkable
+class SupportsPrefillBody(Protocol):
+    """A target build that runs the transformer body of a prefill: the forward of
+    the model's layer module, which the outer forward calls after the embedding and
+    a breakable prefill CUDA graph captures per token bucket. Required by
+    MegakernelSpec.prefill_graph; SGLang then routes every call of that forward here.
+
+    plan_body takes the body's arguments as plan takes the model's and returns a
+    "prefill" Step, or None for the layer module's own forward. It is host-only:
+    a captured bucket replays the decision made at its capture. forward_body runs
+    the step in place of original (the layer module's bound forward), taking and
+    returning what it does (setting last_hc_hidden_states where the module does),
+    and is capturable. Its Step.view is the binding's prefill view; one built at a
+    capture holds the linear backend's static per-bucket prefill-graph tables.
+    """
+
+    def plan_body(
+        self, input_ids: Any, forward_batch: Any, *args: Any, **kwargs: Any
+    ) -> Optional[Step]: ...
+
+    def forward_body(
+        self, step: Step, original: Callable, *args: Any, **kwargs: Any
+    ) -> Any: ...
 
 
 @runtime_checkable
@@ -644,6 +671,8 @@ class MegakernelSpec(msgspec.Struct, frozen=True):
     # The binding kind SGLang hands build and forward (BINDING_KINDS in
     # sglang.srt.kernel_plugins.nvidia.binding); empty picks it by architecture.
     binding: str = ""
+    # The build offers SupportsPrefillBody: prefill graphs may capture its body.
+    prefill_graph: bool = False
 
 
 # HF architecture -> the "module:attribute" path of its spec

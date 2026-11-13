@@ -758,9 +758,27 @@ class TestPrefillCudaGraphRunnerLayerLoads(CustomTestCase):
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
         runner._is_full_backend = is_full_backend
         runner.model_runner = SimpleNamespace(
-            token_to_kv_pool=SimpleNamespace(layer_transfer_counter=counter)
+            token_to_kv_pool=SimpleNamespace(layer_transfer_counter=counter),
+            model=torch.nn.Module(),
         )
         return runner
+
+    def test_breakable_replay_of_an_external_body_waits_for_every_layer(self):
+        """An external prefill body reads the pools inside the graph, so its
+        breakable replay waits for every layer's load-back first."""
+        counter = LayerWiseLoadCounter(num_layers=3)
+        counter.set_consumer(counter.update_producer())
+        runner = self._runner(counter, is_full_backend=False)
+        runner_module.set_external_prefill_body(runner.model_runner.model)
+        waiter = threading.Thread(target=runner._wait_for_layer_loads, daemon=True)
+        waiter.start()
+        waiter.join(timeout=0.2)
+        self.assertTrue(waiter.is_alive())
+
+        for layer in range(counter.num_layers):
+            counter.complete(0, layer)
+        waiter.join(timeout=5)
+        self.assertFalse(waiter.is_alive())
 
     def test_replay_waits_for_every_layer_of_an_inflight_load(self):
         """Replay skips per-layer waits, so it must not start while the batch's
