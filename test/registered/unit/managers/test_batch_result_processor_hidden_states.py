@@ -152,10 +152,12 @@ class TestSamplingMaskMaterialization(CustomTestCase):
             reqs=[
                 SimpleNamespace(
                     return_sampling_mask=True,
+                    return_sampling_logprobs=True,
                     sampling_logprobs_mode="selected",
                 ),
                 SimpleNamespace(
                     return_sampling_mask=True,
+                    return_sampling_logprobs=True,
                     sampling_logprobs_mode="support",
                 ),
             ],
@@ -185,6 +187,7 @@ class TestSamplingMaskMaterialization(CustomTestCase):
             reqs=[
                 SimpleNamespace(
                     return_sampling_mask=True,
+                    return_sampling_logprobs=True,
                     sampling_logprobs_mode="selected",
                 )
             ],
@@ -211,6 +214,7 @@ class TestSamplingMaskMaterialization(CustomTestCase):
             reqs=[
                 SimpleNamespace(
                     return_sampling_mask=x,
+                    return_sampling_logprobs=x,
                     sampling_logprobs_mode="support",
                 )
                 for x in (True, False, True)
@@ -245,6 +249,7 @@ class _PrefillReq(FakeReq):
         self.time_stats = Mock()
         self.return_logprob = False
         self.return_sampling_mask = False
+        self.return_sampling_logprobs = False
         self.grammar = None
         self.require_reasoning = False
         self.customized_info = None
@@ -271,6 +276,7 @@ class _DecodeReq(FakeReq):
         self.is_retracted = False
         self.return_logprob = False
         self.return_sampling_mask = False
+        self.return_sampling_logprobs = False
         self.grammar = None
         self.beam_group = None
         self.time_stats = Mock()
@@ -484,6 +490,7 @@ class TestPrefillSkippedOutput(CustomTestCase):
         """A non-token-producing PP chunk may omit its logits output."""
         req = _PrefillReq(rid="middle", return_hidden_states=False)
         req.return_sampling_mask = True
+        req.return_sampling_logprobs = True
         batch = SimpleNamespace(
             reqs=[req],
             chunked_req=req,
@@ -623,6 +630,7 @@ class TestSamplingMaskStatusErrors(CustomTestCase):
         req = _DecodeReq()
         req.output_ids = [7]
         req.return_sampling_mask = True
+        req.return_sampling_logprobs = True
         req.multimodal_inputs = None
         req.update_finish_state = Mock()
         batch = SimpleNamespace(

@@ -155,6 +155,7 @@ class Gemma4Renoise(DllmAlgorithm):
                 ),
                 ("custom_logit_processor", req.custom_logit_processor),
                 ("return_sampling_mask", req.return_sampling_mask),
+                ("sampling_logprobs_mode", req.sampling_logprobs_mode),
             )
             if value
         )

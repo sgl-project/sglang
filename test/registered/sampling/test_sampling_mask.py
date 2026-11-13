@@ -131,6 +131,7 @@ class TestSamplingMaskCapture(CustomTestCase):
             [
                 SimpleNamespace(
                     return_sampling_mask=i in requested_rows,
+                    return_sampling_logprobs=i in requested_rows,
                     sampling_logprobs_mode="support",
                 )
                 for i in range(len(sampled))
@@ -748,6 +749,7 @@ class TestSamplingMaskPacking(CustomTestCase):
             [
                 SimpleNamespace(
                     return_sampling_mask=flag,
+                    return_sampling_logprobs=flag,
                     sampling_logprobs_mode="support",
                 )
                 for flag in (True, False, True)
@@ -768,6 +770,23 @@ class TestSamplingMaskPacking(CustomTestCase):
             ],
             [[0.0], None, [0.0]],
         )
+
+    def test_a_batch_without_returned_support_never_measures_it(self):
+        # Five positive weights would overflow a returned support of at most three.
+        capture = _SamplingMaskCapture(
+            batch_rows=torch.tensor([0]),
+            weights=torch.tensor([[0.2, 0.2, 0.2, 0.2, 0.2]]),
+            token_ids=None,
+            selected_weight=torch.tensor([0.2]),
+        )
+        output = self.sampler._build_sampling_mask_output(
+            torch.tensor([0]),
+            capture,
+            support_capture_indices=None,
+            return_support=False,
+        )
+        self.assertEqual(output.statuses.tolist(), [SamplingMaskStatus.OK])
+        self.assertEqual(output.lengths.tolist(), [0])
 
     def test_overflow_never_materializes_a_partial_mask(self):
         # Simulate a top-k cutoff tie: a nominal top_k below the cap can still
@@ -793,6 +812,7 @@ class TestSamplingMaskPacking(CustomTestCase):
             [
                 SimpleNamespace(
                     return_sampling_mask=True,
+                    return_sampling_logprobs=True,
                     sampling_logprobs_mode="support",
                 )
             ],
@@ -886,6 +906,58 @@ class TestSamplingMaskDeterministic(SamplingMaskTestMixin, CustomTestCase):
             "output_token_sampling_mask_length",
         ):
             self.assertEqual(streamed["meta_info"][key], support["meta_info"][key])
+
+    def _post_selected_without_mask(self, sampling_params, return_logprob=False):
+        payload = {
+            "text": "The capital of France is",
+            "sampling_params": {
+                "temperature": 1.0,
+                "max_new_tokens": _MAX_NEW_TOKENS,
+                "ignore_eos": True,
+                "sampling_seed": _SAMPLING_SEED,
+                **sampling_params,
+            },
+            "sampling_logprobs_mode": "selected",
+            "return_logprob": return_logprob,
+        }
+        response = requests.post(self.base_url + "/generate", json=payload, timeout=60)
+        self.assertEqual(response.status_code, 200, response.text)
+        output = response.json()
+        self.assertNotIn("output_token_sampling_mask", output["meta_info"])
+        return output
+
+    def test_selected_mode_without_mask_matches_mask_request(self):
+        sampling_params = {
+            "top_k": _TOP_K,
+            "top_p": _TOP_P,
+            "sampling_seed": _SAMPLING_SEED,
+        }
+        response = self._post_generate(
+            sampling_params, sampling_logprobs_mode="selected"
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        with_mask = response.json()
+        without_mask = self._post_selected_without_mask(sampling_params)
+        self.assertEqual(without_mask["output_ids"], with_mask["output_ids"])
+        self.assertEqual(
+            without_mask["meta_info"]["output_token_sampling_logprobs"],
+            with_mask["meta_info"]["output_token_sampling_logprobs"],
+        )
+
+    def test_selected_mode_without_mask_ignores_mask_cap(self):
+        # Unbounded sampling keeps the whole vocabulary, far above the server's
+        # --sampling-mask-max-tokens, and its sampling logprobs are the model's.
+        output = self._post_selected_without_mask(
+            {"top_k": -1, "top_p": 1.0}, return_logprob=True
+        )
+        meta_info = output["meta_info"]
+        self.assertEqual(len(output["output_ids"]), _MAX_NEW_TOKENS)
+        for sampling_logprob, (logprob, *_) in zip(
+            meta_info["output_token_sampling_logprobs"],
+            meta_info["output_token_logprobs"],
+            strict=True,
+        ):
+            self.assertAlmostEqual(sampling_logprob, logprob, delta=1e-4)
 
 
 class TestSamplingMaskPytorch(TestSamplingMask):

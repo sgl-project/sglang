@@ -275,7 +275,7 @@ class SchedulerOutputStreamer:
             req.return_indexer_topk for req in reqs if req is not skip_req
         )
         return_sampling_mask = any(
-            req.return_sampling_mask for req in reqs if req is not skip_req
+            req.return_sampling_logprobs for req in reqs if req is not skip_req
         )
 
         acc = _GenerationStreamAccumulator(
@@ -811,7 +811,7 @@ class _GenerationStreamAccumulator:
                 self.output_token_ids_logprobs_idx.append([])
 
         if self.return_sampling_mask:
-            if req.return_sampling_mask:
+            if req.return_sampling_logprobs:
                 self.output_token_sampling_mask.append(req.sampling_mask_rows.take())
             else:
                 self.output_token_sampling_mask.append(None)

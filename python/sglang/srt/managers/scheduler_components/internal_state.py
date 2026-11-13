@@ -257,7 +257,7 @@ class SchedulerInternalStateController:
     def _has_active_sampling_mask_request(self) -> bool:
         """Whether any unfinished live request holds a sampling mask."""
         return any(
-            req.return_sampling_mask and not req.finished()
+            req.return_sampling_logprobs and not req.finished()
             for reqs in self.scheduler.request_lists().values()
             for req in reqs
         )

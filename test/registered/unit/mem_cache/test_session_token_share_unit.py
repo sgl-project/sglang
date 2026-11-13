@@ -56,7 +56,7 @@ def _recv(rid, input_ids, max_new_tokens=8, parent=None):
         top_logprobs_num=0,
         token_ids_logprob=None,
         return_sampling_mask=False,
-        sampling_logprobs_mode="selected",
+        sampling_logprobs_mode=None,
         require_reasoning=False,
         return_hidden_states=False,
         return_routed_experts=False,
