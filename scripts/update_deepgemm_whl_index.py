@@ -1,19 +1,33 @@
 # Generates a PEP 503 simple index for sgl-deep-gemm wheels under
 # sgl-whl/cu<version>/sgl-deep-gemm/index.html. Mirrors the layout used by
 # update_kernel_whl_index.py so consumers can `pip install
-# sgl-deep-gemm --extra-index-url https://...whl/cu130`.
+# sgl-deep-gemm --extra-index-url https://...whl/cu130` (or cu134).
 
 import argparse
 import hashlib
 import pathlib
 import re
 
-SUPPORTED_CUDA_VERSIONS = ["130"]
+SUPPORTED_CUDA_VERSIONS = ["130", "134"]
+
+
+def ensure_root_link(cuda_root):
+    # The cu<version>/index.html root must list the package for pip to find it.
+    root_index = cuda_root / "index.html"
+    link = '<a href="sgl-deep-gemm/">sgl-deep-gemm</a>'
+    lines = root_index.read_text().splitlines() if root_index.exists() else []
+    if link in lines:
+        return
+    doctype = [line for line in lines if line.startswith("<!DOCTYPE")]
+    anchors = [line for line in lines if line.startswith("<a ")]
+    content = [*(doctype or ["<!DOCTYPE html>"]), *sorted({*anchors, link})]
+    root_index.write_text("\n".join(content) + "\n")
 
 
 def update_wheel_index(cuda_version, wheel_dir):
     index_dir = pathlib.Path(f"sgl-whl/cu{cuda_version}/sgl-deep-gemm")
     index_dir.mkdir(exist_ok=True, parents=True)
+    ensure_root_link(index_dir.parent)
     base_url = "https://github.com/sgl-project/whl/releases/download"
 
     suffix = f"+cu{cuda_version}"
