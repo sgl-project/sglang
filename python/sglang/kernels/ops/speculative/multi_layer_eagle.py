@@ -22,7 +22,19 @@ _is_cpu = is_cpu()
 _is_npu = is_npu()
 
 if _is_cpu:
-    from sgl_kernel import rotate_input_ids_cpu
+    try:
+        from sgl_kernel import rotate_input_ids_cpu
+    except ImportError as _e:
+        _import_err = str(_e)
+
+        def rotate_input_ids_cpu(*args, **kwargs):
+                raise RuntimeError(
+                    f"rotate_input_ids_cpu is unavailable: sgl_kernel failed to "
+                    f"import ({_import_err}). CPU hosts need a "
+                    "CPU-enabled sgl-kernel build; the PyPI sgl_kernel "
+                    "wheel is CUDA-only and cannot even import on a "
+                    "GPU-less host."
+                )
 
 
 @triton.jit
