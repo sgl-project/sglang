@@ -124,6 +124,7 @@ from sglang.srt.managers.io_struct import (
     TokenizerWorkerRegistrationReq,
     UpdateWeightFromDiskReqInput,
     UpdateWeightFromDiskReqOutput,
+    abort_error_headers,
     async_sock_recv,
     async_sock_send,
     build_flat_top_logprobs_arrays,
@@ -2111,7 +2112,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if status_code == HTTPStatus.BAD_REQUEST:
                 raise ValueError(finish_reason["message"])
             raise fastapi.HTTPException(
-                status_code=status_code, detail=finish_reason["message"]
+                status_code=status_code,
+                detail=finish_reason["message"],
+                headers=abort_error_headers(finish_reason),
             )
         return out
 

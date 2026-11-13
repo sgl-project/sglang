@@ -172,6 +172,29 @@ class TestQueuedLimitAbort(CustomTestCase):
         self.assertTrue(candidate.finished() and incoming.finished())
         self.assertEqual(s.ipc_channels.send_to_tokenizer.send_output.call_count, 2)
 
+    def _refuse_on_full_queue(self):
+        s = _scheduler([_req("queued", wait_entry=1.0)])
+        s.max_queued_requests = 1
+        s.enable_priority_scheduling = False
+        s.init_request_retirer()
+        self.assertTrue(s._abort_on_queued_limit(_req("incoming", wait_entry=2.0)))
+        abort = s.ipc_channels.send_to_tokenizer.send_output.call_args.args[0]
+        self.assertIsInstance(abort, AbortReq)
+        return abort.finished_reason
+
+    def test_queue_full_refusal_carries_retry_after(self):
+        """A load shed tells the client when to retry: the HTTP layer turns
+        retry_after into a Retry-After header on the 503."""
+        finished_reason = self._refuse_on_full_queue()
+        self.assertEqual(finished_reason["status_code"], 503)
+        self.assertEqual(finished_reason["message"], "The request queue is full.")
+        self.assertEqual(finished_reason["retry_after"], 1)
+
+    def test_queue_full_retry_after_can_be_disabled(self):
+        with envs.SGLANG_QUEUE_FULL_RETRY_AFTER.override(0):
+            finished_reason = self._refuse_on_full_queue()
+        self.assertNotIn("retry_after", finished_reason)
+
 
 class TestWaitingTimeout(CustomTestCase):
     def test_emits_only_reqs_past_the_deadline_and_keeps_queue_intact(self):

@@ -3879,15 +3879,20 @@ class Scheduler(
             return False
         return True
 
-    def _abort_unavailable(self, req: Req, *, message: str) -> None:
+    def _abort_unavailable(
+        self, req: Req, *, message: str, retry_after: int = 0
+    ) -> None:
+        finished_reason = {
+            "type": "abort",
+            "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
+            "message": message,
+        }
+        if retry_after > 0:
+            finished_reason["retry_after"] = retry_after
         self.request_retirer.abort(
             req,
             reason=FINISH_ABORT(message, HTTPStatus.SERVICE_UNAVAILABLE),
-            finished_reason={
-                "type": "abort",
-                "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
-                "message": message,
-            },
+            finished_reason=finished_reason,
         )
         req.time_stats.trace_ctx.abort(abort_info={"reason": message})
 
@@ -3928,13 +3933,18 @@ class Scheduler(
                 self._abort_unavailable(
                     candidate_req,
                     message="The request is aborted by a higher priority request.",
+                    retry_after=envs.SGLANG_QUEUE_FULL_RETRY_AFTER.get(),
                 )
                 # An evicted request sharing the incoming rid refuses it too.
                 if candidate_req.rid != recv_req.rid:
                     return False
 
         # Reject the incoming request by default.
-        self._abort_unavailable(recv_req, message="The request queue is full.")
+        self._abort_unavailable(
+            recv_req,
+            message="The request queue is full.",
+            retry_after=envs.SGLANG_QUEUE_FULL_RETRY_AFTER.get(),
+        )
         return True
 
     def _poll_timeout_aborts(self) -> List[AbortReq]:

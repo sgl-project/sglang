@@ -249,6 +249,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         err_type: str = "invalid_request_error",
         status_code: int = 400,
         param: Optional[str] = None,
+        headers: Optional[dict[str, str]] = None,
     ) -> ORJSONResponse:
         nested_error = {
             "message": message,
@@ -256,7 +257,9 @@ class OpenAIServingResponses(OpenAIServingChat):
             "param": param,
             "code": status_code,
         }
-        return ORJSONResponse(content={"error": nested_error}, status_code=status_code)
+        return ORJSONResponse(
+            content={"error": nested_error}, status_code=status_code, headers=headers
+        )
 
     def create_streaming_error_response(
         self,

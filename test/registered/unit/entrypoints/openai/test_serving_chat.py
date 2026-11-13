@@ -4274,6 +4274,79 @@ class ServingChatTestCase(CustomTestCase):
         self.assertEqual(len(chunks), 2)
         self.assertIn("error", chunks[0])
 
+    def _stream_shed_before_output(self):
+        async def _mock_generate_shed():
+            yield {
+                "text": "",
+                "meta_info": {
+                    "id": "chatcmpl-test",
+                    "prompt_tokens": 10,
+                    "completion_tokens": 0,
+                    "cached_tokens": 0,
+                    "finish_reason": {
+                        "type": "abort",
+                        "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
+                        "message": "The request queue is full.",
+                        "retry_after": 1,
+                    },
+                },
+                "index": 0,
+            }
+
+        self.tm.generate_request.return_value = _mock_generate_shed()
+        self.tm.create_abort_task = Mock(return_value=None)
+        req = ChatCompletionRequest(
+            model="x", messages=[{"role": "user", "content": "Hi?"}], stream=True
+        )
+        with patch(
+            "sglang.srt.entrypoints.openai.serving_chat.generate_chat_conv"
+        ) as conv_mock:
+            conv_ins = Mock()
+            conv_ins.get_prompt.return_value = "Test prompt"
+            conv_mock.return_value = conv_ins
+            adapted_request, processed = self.chat._convert_to_internal_request(
+                req, self.fastapi_request
+            )
+        return get_or_create_event_loop().run_until_complete(
+            self.chat._handle_streaming_request(
+                adapted_request, processed, self.fastapi_request
+            )
+        )
+
+    def test_streaming_queue_full_before_output_is_an_http_503(self):
+        """A stream shed before any output answers like a non-stream request:
+        HTTP 503 with Retry-After, not a 200 carrying the error in SSE."""
+        with self.assertRaises(HTTPException) as ctx:
+            self._stream_shed_before_output()
+        self.assertEqual(ctx.exception.status_code, 503)
+        self.assertEqual(ctx.exception.detail, "The request queue is full.")
+        self.assertEqual(ctx.exception.headers, {"Retry-After": "1"})
+
+    def test_http_exception_headers_reach_the_error_response(self):
+        """handle_request keeps an HTTPException's headers (Retry-After)."""
+        req = ChatCompletionRequest(
+            model="x", messages=[{"role": "user", "content": "Hi?"}], stream=True
+        )
+        shed = HTTPException(
+            status_code=503,
+            detail="The request queue is full.",
+            headers={"Retry-After": "1"},
+        )
+        with (
+            patch.object(
+                self.chat, "_convert_to_internal_request", return_value=(Mock(), req)
+            ),
+            patch.object(self.chat, "_handle_streaming_request", side_effect=shed),
+        ):
+            response = get_or_create_event_loop().run_until_complete(
+                self.chat.handle_request(req, self.fastapi_request)
+            )
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.headers["retry-after"], "1")
+        payload = json.loads(bytes(response.body))
+        self.assertEqual(payload["message"], "The request queue is full.")
+        self.assertEqual(payload["code"], 503)
+
     def test_streaming_abort_with_ids_enabled(self):
         """Test that a terminal abort with input/output ids enabled yields only an error and [DONE]."""
         err_msg = "Aborted by scheduler"

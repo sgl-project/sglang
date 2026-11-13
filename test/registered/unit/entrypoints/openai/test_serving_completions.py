@@ -14,7 +14,7 @@ from http import HTTPStatus
 from typing import Optional
 from unittest.mock import AsyncMock, Mock
 
-from fastapi import Request
+from fastapi import HTTPException, Request
 
 from sglang.srt.entrypoints.openai.protocol import CompletionRequest
 from sglang.srt.entrypoints.openai.serving_completions import OpenAIServingCompletion
@@ -333,6 +333,43 @@ class ServingCompletionTestCase(unittest.TestCase):
         # Check that there is an error chunk and a DONE chunk, and possibly a role chunk
         self.assertGreaterEqual(len(chunks), 2)
         self.assertIn("error", chunks[0])
+
+    def test_streaming_queue_full_before_output_is_an_http_503(self):
+        """A stream shed before any output answers like a non-stream request:
+        HTTP 503 with Retry-After, not a 200 carrying the error in SSE."""
+
+        async def _mock_generate_shed(*args, **kwargs):
+            yield {
+                "text": "",
+                "meta_info": {
+                    "id": "cmpl-test",
+                    "prompt_tokens": 10,
+                    "completion_tokens": 0,
+                    "cached_tokens": 0,
+                    "finish_reason": {
+                        "type": "abort",
+                        "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
+                        "message": "The request queue is full.",
+                        "retry_after": 1,
+                    },
+                },
+                "index": 0,
+            }
+
+        self.sc.tokenizer_manager.generate_request = _mock_generate_shed
+        self.sc.tokenizer_manager.create_abort_task = Mock(return_value=None)
+        req = CompletionRequest(model="x", prompt="Hello world", stream=True)
+        adapted_request, _ = self.sc._convert_to_internal_request(req)
+
+        with self.assertRaises(HTTPException) as ctx:
+            get_or_create_event_loop().run_until_complete(
+                self.sc._handle_streaming_request(
+                    adapted_request, req, self.fastapi_request
+                )
+            )
+        self.assertEqual(ctx.exception.status_code, 503)
+        self.assertEqual(ctx.exception.detail, "The request queue is full.")
+        self.assertEqual(ctx.exception.headers, {"Retry-After": "1"})
 
     def test_echo_with_zero_logprobs_streaming(self):
         """logprobs=0 requests token logprobs without top-logprobs, so the

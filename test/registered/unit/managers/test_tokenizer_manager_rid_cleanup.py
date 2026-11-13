@@ -407,7 +407,28 @@ class TestEngineResponseWait(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(HTTPException) as ctx:
             await self.tm._handle_abort_finish_reason(out, state, is_stream=False)
         self.assertEqual(ctx.exception.status_code, 502)
+        self.assertIsNone(ctx.exception.headers)
         self.assertNotIn(state.obj.rid, self.tm.rid_to_state)
+
+    async def test_non_stream_queue_full_abort_sets_retry_after(self):
+        """A non-stream request shed by a full queue answers 503 with Retry-After."""
+        state = _make_req_state("queue_full")
+        state.obj.stream = False
+        self.tm.rid_to_state[state.obj.rid] = state
+        out = {
+            "meta_info": {
+                "finish_reason": {
+                    "type": "abort",
+                    "status_code": 503,
+                    "message": "The request queue is full.",
+                    "retry_after": 1,
+                }
+            }
+        }
+        with self.assertRaises(HTTPException) as ctx:
+            await self.tm._handle_abort_finish_reason(out, state, is_stream=False)
+        self.assertEqual(ctx.exception.status_code, 503)
+        self.assertEqual(ctx.exception.headers, {"Retry-After": "1"})
 
     async def test_http_timeout_still_checks_disconnection(self):
         request = Mock()

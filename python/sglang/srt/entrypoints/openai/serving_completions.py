@@ -362,6 +362,12 @@ class OpenAIServingCompletion(OpenAIServingBase):
                 if finish_reason_type == "abort" and isinstance(
                     finish_reason.get("status_code"), HTTPStatus
                 ):
+                    # Shed before any output (e.g. queue full): answer with the HTTP
+                    # status, as a non-stream request does.
+                    if not stream_started and not content["meta_info"].get(
+                        "completion_tokens"
+                    ):
+                        raise self.abort_before_stream(finish_reason)
                     code = finish_reason["status_code"]
                     error = self.create_streaming_error_response(
                         finish_reason.get("message", "Generation aborted."),

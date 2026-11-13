@@ -1751,6 +1751,15 @@ CachedTokensDetails = Dict[str, Union[int, str]]
 FinishReasonDict = Dict[str, Optional[Union[str, int, List[int]]]]
 
 
+def abort_error_headers(finish_reason: FinishReasonDict) -> Optional[Dict[str, str]]:
+    """HTTP headers for the error response of an aborted request: Retry-After
+    when the scheduler shed the request under load."""
+    retry_after = finish_reason.get("retry_after")
+    if not retry_after:
+        return None
+    return {"Retry-After": str(retry_after)}
+
+
 class RequestOutputStats(
     msgspec.Struct, frozen=True, kw_only=True, array_like=True, gc=False
 ):

@@ -723,6 +723,8 @@ class Envs:
     SGLANG_KILLPG_ON_SCHEDULER_EXCEPTION = EnvBool(False)
     SGLANG_REQ_WAITING_TIMEOUT = EnvFloat(-1)  # in seconds
     SGLANG_REQ_RUNNING_TIMEOUT = EnvFloat(-1)  # in seconds
+    # Retry-After (seconds) on the 503 of a request shed by --max-queued-requests; 0 omits it.
+    SGLANG_QUEUE_FULL_RETRY_AFTER = EnvInt(1)
     # Non-streaming requests flush intermediate outputs every N decoded tokens.
     SGLANG_FORCE_STREAM_INTERVAL = EnvInt(50)
     # Most per-request states the detokenizer keeps; past it, the oldest is

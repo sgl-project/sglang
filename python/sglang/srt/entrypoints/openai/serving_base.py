@@ -12,7 +12,12 @@ from fastapi.responses import ORJSONResponse, StreamingResponse
 
 from sglang.srt.entrypoints.openai.encoding_dsv32 import DS32EncodingError
 from sglang.srt.entrypoints.openai.protocol import ErrorResponse, OpenAIServingRequest
-from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
+from sglang.srt.managers.io_struct import (
+    EmbeddingReqInput,
+    FinishReasonDict,
+    GenerateReqInput,
+    abort_error_headers,
+)
 from sglang.srt.observability.req_time_stats import monotonic_time
 from sglang.srt.runtime_context import get_observability
 from sglang.srt.server_args import ServerArgs
@@ -117,7 +122,10 @@ class OpenAIServingBase(ABC):
                 )
         except HTTPException as e:
             return self.create_error_response(
-                message=e.detail, err_type=str(e.status_code), status_code=e.status_code
+                message=e.detail,
+                err_type=str(e.status_code),
+                status_code=e.status_code,
+                headers=e.headers,
             )
         except ValueError as e:
             return self.create_error_response(
@@ -202,6 +210,7 @@ class OpenAIServingBase(ABC):
         err_type: str = "BadRequestError",
         status_code: int = 400,
         param: Optional[str] = None,
+        headers: Optional[dict[str, str]] = None,
     ) -> ORJSONResponse:
         """Create an error response"""
         # TODO: remove fastapi dependency in openai and move response handling to the entrypoint
@@ -212,7 +221,21 @@ class OpenAIServingBase(ABC):
             param=param,
             code=status_code,
         )
-        return ORJSONResponse(content=error.model_dump(), status_code=status_code)
+        return ORJSONResponse(
+            content=error.model_dump(), status_code=status_code, headers=headers
+        )
+
+    @staticmethod
+    def abort_before_stream(finish_reason: FinishReasonDict) -> HTTPException:
+        """The error for a stream aborted before it sent anything or generated
+        any token. It answers with the abort's HTTP status (and Retry-After for a
+        load shed), as the non-stream path does, instead of a 200 that carries
+        the error in the SSE body."""
+        return HTTPException(
+            status_code=int(finish_reason["status_code"]),
+            detail=finish_reason.get("message", "Generation aborted."),
+            headers=abort_error_headers(finish_reason),
+        )
 
     def create_streaming_error_response(
         self,

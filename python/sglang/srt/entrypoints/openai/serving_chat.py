@@ -2573,6 +2573,12 @@ class OpenAIServingChat(OpenAIServingBase):
                             finish_reasons[index] = finish_reason
                             interrupted = True
                             break
+                        # Shed before any output (e.g. queue full): answer with the HTTP
+                        # status, as a non-stream request does.
+                        if not stream_started and not content["meta_info"].get(
+                            "completion_tokens"
+                        ):
+                            raise self.abort_before_stream(finish_reason)
                         code = finish_reason["status_code"]
                         error = self.create_streaming_error_response(
                             finish_reason.get("message", "Generation aborted."),
@@ -3181,6 +3187,7 @@ class OpenAIServingChat(OpenAIServingBase):
         err_type: str = "BadRequestError",
         status_code: int = 400,
         param: Optional[str] = None,
+        headers: Optional[dict[str, str]] = None,
     ) -> ORJSONResponse:
         """An error in the shape of this handler's wire."""
         error = ErrorResponse(
@@ -3192,8 +3199,10 @@ class OpenAIServingChat(OpenAIServingBase):
         )
         body = self.chat_wire.error_body(error)
         if body is None:
-            return super().create_error_response(message, err_type, status_code, param)
-        return ORJSONResponse(content=body, status_code=status_code)
+            return super().create_error_response(
+                message, err_type, status_code, param, headers
+            )
+        return ORJSONResponse(content=body, status_code=status_code, headers=headers)
 
     def _process_tool_call_id(
         self,
