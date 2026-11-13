@@ -574,7 +574,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         )
 
         mamba_max_states_per_path = (
-            get_exec().mamba.mamba_max_states_per_path if has_mamba else -1
+            get_exec().mamba.mamba_path_state_cap if has_mamba else -1
         )
 
         self._binding = self._binding_class()(

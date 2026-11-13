@@ -688,7 +688,10 @@ class TestShardedDSAIndexerWrite(unittest.TestCase):
 
 def _attention_backend(pool, req_to_token, device, prefill_impl="flashmla_sparse"):
     from sglang.srt.layers.attention.dsa.dsa_topk_backend import DSATopKBackend
-    from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
+    from sglang.srt.layers.attention.dsa_backend import (
+        DeepseekSparseAttnBackend,
+        _small_heads_prefill_enabled,
+    )
     from sglang.srt.layers.attention.kv_shard_hooks import get_kv_shard_pool
 
     backend = DeepseekSparseAttnBackend.__new__(DeepseekSparseAttnBackend)
@@ -725,6 +728,16 @@ def _attention_backend(pool, req_to_token, device, prefill_impl="flashmla_sparse
         torch.cuda.get_device_capability()[0]
         if torch.device(device).type == "cuda"
         else 0
+    )
+    # Mirrors DeepseekSparseAttnBackend.__init__ so forward_extend sees the
+    # same small-heads FlashMLA prefill choice as a real backend.
+    backend.sparse_prefill_small_heads = _small_heads_prefill_enabled(
+        backend.device_sm_major,
+        backend.kv_cache_dtype,
+        backend.num_q_heads,
+        backend.kv_lora_rank,
+        backend.qk_rope_head_dim,
+        prefill_impl,
     )
     backend._arange_buf = torch.arange(1024, dtype=torch.int32, device=device)
     if prefill_impl == "trtllm":
@@ -932,6 +945,7 @@ def _real_indexer_topk(check, backends, batch, layer_id, query, weights):
         num_init_tokens=0,
         num_local_tokens=0,
         logits_with_pp_recv=False,
+        use_prefill_lite_topk=False,
         sm_count=torch.cuda.get_device_properties(check.device).multi_processor_count,
         _pad_heads_for_deep_gemm=dsa_indexer.Indexer._pad_heads_for_deep_gemm,
     )

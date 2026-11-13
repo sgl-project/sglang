@@ -108,6 +108,9 @@ class MambaAttnBackendBase(AttentionBackend):
         # identity or one gather through the id space's table, both of which
         # `fused_replay_state_indices` reproduces in its own launch.
         self._state_ids = model_runner.runner_ids.state_ids(pool.state_sub_pool)
+        # Request rows as a request-scoped ReplaySSM ring indexes them: the
+        # identity on static pools, the request sub-pool's units under unified.
+        self._ring_ids = model_runner.runner_ids.request_ids()
         self._fused_state_indices_ok = (
             torch.device(self.device).type == "cuda" and pool.holds_state_slots
         )
@@ -156,7 +159,12 @@ class MambaAttnBackendBase(AttentionBackend):
                 "commit writes"
             )
             track = track[:num_requests]
-        return ForwardStateSlots(md.mamba_cache_indices[:num_requests], track)
+        ring = md.replayssm_ring_indices
+        return ForwardStateSlots(
+            md.mamba_cache_indices[:num_requests],
+            track,
+            None if ring is None else ring[:num_requests],
+        )
 
     def state_layer(self, layer_id: int) -> KVLayer:
         """The layer's recurrent-state route, once a layer-wise host load-back
@@ -243,9 +251,9 @@ class MambaAttnBackendBase(AttentionBackend):
         mamba_cache_indices = self._translate_mamba_indices(mamba_cache_indices)
         replayssm_ring_indices = None
         if self._replayssm_request_ring():
-            replayssm_ring_indices = forward_batch.req_pool_indices[:bs].to(
-                dtype=torch.int32
-            )
+            replayssm_ring_indices = self._ring_ids.ids(
+                forward_batch.req_pool_indices[:bs]
+            ).to(dtype=torch.int32)
         if forward_batch.mamba_track_indices is not None:
             forward_batch.mamba_track_indices = self._translate_mamba_indices(
                 forward_batch.mamba_track_indices
@@ -668,7 +676,7 @@ class MambaAttnBackendBase(AttentionBackend):
             return None
         buf = self.replayssm_ring_indices_list[bs - 1]
         n = min(bs, int(req_pool_indices.shape[0]))
-        buf[:n].copy_(req_pool_indices[:n].to(dtype=buf.dtype))
+        buf[:n].copy_(self._ring_ids.ids(req_pool_indices[:n]).to(dtype=buf.dtype))
         if num_padding:
             buf[bs - num_padding : bs].fill_(-1)
         return buf
@@ -1427,11 +1435,6 @@ class HybridLinearAttnBackend(AttentionBackend):
         elif not forward_batch.forward_mode.is_draft_extend_v2():
             self.linear_attn_backend.init_forward_metadata(forward_batch)
 
-    def get_indexer_metadata(self, layer_id: int, forward_batch: ForwardBatch):
-        if layer_id in self.full_attn_layers:
-            return self.full_attn_backend.get_indexer_metadata(layer_id, forward_batch)
-        return None
-
     def on_after_cuda_graph_warmup(self):
         for attn_backend in self.attn_backend_list:
             attn_backend.on_after_cuda_graph_warmup()
@@ -1657,8 +1660,8 @@ class HybridLinearAttnBackend(AttentionBackend):
         mamba_pool = self.linear_attn_backend.state_pool
         mamba_caches = mamba_pool.get_speculative_mamba2_params_all_layers()
 
-        # ReplaySSM-KDA: the accepted drafts live in the per-slot ring (written
-        # during verify); no intermediate_ssm is allocated. Replay the accepted
+        # ReplaySSM-KDA: the accepted drafts live in the ring (written during
+        # verify); no intermediate_ssm is allocated. Replay the accepted
         # prefix into `temporal` instead of scattering an intermediate state.
         # dspark/dflash call this method directly; the generic spec_utils commit
         # handles replayssm before reaching here (returns early), so this branch is
@@ -1671,7 +1674,8 @@ class HybridLinearAttnBackend(AttentionBackend):
 
             ring_indices = None
             if mamba_pool.replayssm_request_ring:
-                ring_indices = req_pool_indices[:request_number]
+                assert state_slots.ring is not None, "request-scoped ring without rows"
+                ring_indices = state_slots.ring[:request_number]
             commit_kda_replayssm_after_verify(
                 spec_state=mamba_caches,
                 state_batch_indices=state_indices_tensor,
@@ -1682,6 +1686,45 @@ class HybridLinearAttnBackend(AttentionBackend):
                 src_indices_raw=src_indices_raw,
                 null_block_id=-1,
                 ring_indices=ring_indices,
+            )
+            return
+
+        # ReplaySSM-GDN (the request cursors exist only there): the verify
+        # appended this window's drafts to the compact request ring and wrote
+        # no snapshots. Fold every accepted window, so `temporal` is the
+        # committed state after each step as with the KDA fold above; radix
+        # donation and state copies read the slot directly. Chain layout only.
+        if getattr(mamba_pool, "replayssm_cache_base", None) is not None:
+            if request_number == 0:
+                return
+            assert state_slots.ring is not None, (
+                "the GDN ReplaySSM commit needs the ring rows its verify resolved"
+            )
+            from sglang.kernels.ops.attention.linear.gdn_replayssm_spec_decode import (
+                commit_gdn_replayssm_after_verify,
+            )
+
+            commit_gdn_replayssm_after_verify(
+                spec_state=mamba_caches,
+                write_pos=mamba_pool.replayssm_spec_write_pos,
+                cache_base=mamba_pool.replayssm_cache_base,
+                is_flush=mamba_pool.replayssm_is_flush,
+                state_batch_indices=state_indices_tensor,
+                replay_indices=state_slots.ring[:request_number],
+                accept_lens=last_correct_step_indices + 1,
+                last_correct_step_indices=last_correct_step_indices,
+                fold_every_commit=True,
+                mamba_track_indices=mamba_track_indices,
+                mamba_steps_to_track=mamba_steps_to_track,
+                src_indices_raw=src_indices_raw,
+                null_block_id=-1,
+            )
+            self._update_ple_state_after_mtp_verify(
+                state_indices_tensor,
+                last_correct_step_indices,
+                mamba_track_indices,
+                mamba_steps_to_track,
+                src_indices_raw,
             )
             return
 
@@ -1711,6 +1754,13 @@ class HybridLinearAttnBackend(AttentionBackend):
             )
             return
 
+        assert (
+            mamba_caches.temporal.numel() == 0
+            or mamba_caches.intermediate_ssm is not None
+        ), (
+            "per-draft SSM snapshots are not allocated (ReplaySSM spec verify), "
+            "but no ReplaySSM commit handled this pool"
+        )
         scatter_mamba_states_after_mtp_verify(
             mamba_caches,
             state_indices_tensor,
@@ -1778,54 +1828,72 @@ class HybridLinearAttnBackend(AttentionBackend):
         mamba_steps_to_track: Optional[torch.Tensor],
         src_indices_raw: Optional[torch.Tensor] = None,
     ):
-        """Roll the accepted per-step PLE side states into their main slots."""
-        router = self.linear_attn_backend.token_to_kv_pool.layer_router
+        commit_ple_states_after_verify(
+            self.linear_attn_backend.token_to_kv_pool.layer_router,
+            state_indices_tensor,
+            last_correct_step_indices,
+            mamba_track_indices,
+            mamba_steps_to_track,
+            src_indices_raw,
+        )
+
+
+def commit_ple_states_after_verify(
+    router,
+    state_indices_tensor: torch.Tensor,
+    last_correct_step_indices: torch.Tensor,
+    mamba_track_indices: Optional[torch.Tensor],
+    mamba_steps_to_track: Optional[torch.Tensor],
+    src_indices_raw: Optional[torch.Tensor] = None,
+):
+    """Roll the accepted per-step PLE side states into their main slots."""
+    if mamba_track_indices is not None:
+        assert mamba_steps_to_track is not None
+
+    state_pairs = []
+    short_conv_pool = router.part_view(SHORT_CONV_PART)
+    if (
+        short_conv_pool is not None
+        and short_conv_pool.conv_state is not None
+        and short_conv_pool.intermediate_conv_state is not None
+    ):
+        state_pairs.append(
+            (
+                short_conv_pool.conv_state,
+                short_conv_pool.intermediate_conv_state,
+            )
+        )
+
+    ngram_pool = router.part_view(NGRAM_PART)
+    if (
+        ngram_pool is not None
+        and ngram_pool.context is not None
+        and ngram_pool.intermediate_context is not None
+    ):
+        state_pairs.append(
+            (
+                ngram_pool.context.unsqueeze(0),
+                ngram_pool.intermediate_context.unsqueeze(0),
+            )
+        )
+
+    scatter = HybridLinearAttnBackend._scatter_speculative_state_with_mask
+    for state, intermediate_state in state_pairs:
+        scatter(
+            state,
+            intermediate_state,
+            state_indices_tensor,
+            last_correct_step_indices,
+            src_indices_raw,
+        )
         if mamba_track_indices is not None:
-            assert mamba_steps_to_track is not None
-
-        state_pairs = []
-        short_conv_pool = router.part_view(SHORT_CONV_PART)
-        if (
-            short_conv_pool is not None
-            and short_conv_pool.conv_state is not None
-            and short_conv_pool.intermediate_conv_state is not None
-        ):
-            state_pairs.append(
-                (
-                    short_conv_pool.conv_state,
-                    short_conv_pool.intermediate_conv_state,
-                )
-            )
-
-        ngram_pool = router.part_view(NGRAM_PART)
-        if (
-            ngram_pool is not None
-            and ngram_pool.context is not None
-            and ngram_pool.intermediate_context is not None
-        ):
-            state_pairs.append(
-                (
-                    ngram_pool.context.unsqueeze(0),
-                    ngram_pool.intermediate_context.unsqueeze(0),
-                )
-            )
-
-        for state, intermediate_state in state_pairs:
-            self._scatter_speculative_state_with_mask(
+            scatter(
                 state,
                 intermediate_state,
-                state_indices_tensor,
-                last_correct_step_indices,
+                mamba_track_indices,
+                mamba_steps_to_track,
                 src_indices_raw,
             )
-            if mamba_track_indices is not None:
-                self._scatter_speculative_state_with_mask(
-                    state,
-                    intermediate_state,
-                    mamba_track_indices,
-                    mamba_steps_to_track,
-                    src_indices_raw,
-                )
 
 
 class ShortConvHybridAttnBackend(HybridLinearAttnBackend):
