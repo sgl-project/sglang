@@ -1450,6 +1450,7 @@ def _entries(built: BuiltMegakernel) -> Mapping[str, Optional[Callable]]:
         "draft_loop": built.draft_loop,
         "draft_extend": built.draft_extend,
         "begin_draft_round": built.begin_draft_round,
+        "draft_step_fold": getattr(built, "draft_step_fold", None),  # optional
     }
 
 

@@ -590,6 +590,14 @@ class TestEagleBinding(CustomTestCase):
 
 
 class TestEagleEntries(CustomTestCase):
+    def test_a_draft_step_fold_is_offered_only_by_a_build_that_has_one(self):
+        fold = object()
+        model = _model(draft_step_fold=fold)
+        self.assertIs(runtime.megakernel_entry(model, "draft_step_fold"), fold)
+        self.assertIsNone(runtime.megakernel_entry(_model(), "draft_step_fold"))
+        # not a draft-loop entry: the stock dispatch stays
+        self.assertIsNone(_init(draft={"draft_step_fold": fold}))
+
     def test_always_present_dispatch_preserves_the_stock_path(self):
         stock_result = object()
         with patch.object(eagle_megakernel, "init_eagle_megakernel", return_value=None):
