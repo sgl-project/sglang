@@ -1211,7 +1211,7 @@ class LayerNorm(BaseFusedOp):
         if (
             _flashinfer_layernorm_available
             and x.dtype == torch.bfloat16
-            and self.dtype == torch.float32
+            and self.weight.dtype == torch.float32
         ):
             return layernorm(x, self.weight, self.bias, self.variance_epsilon)
         else:
@@ -1224,7 +1224,7 @@ class LayerNorm(BaseFusedOp):
         weight = self.weight if self.elementwise_affine else None
         bias = self.bias if self.use_bias else None
         orig_dtype = x.dtype
-        x = x.to(self.dtype)
+        x = x.to(self.weight.dtype)
         return F.layer_norm(
             x,
             (self.hidden_size,),
@@ -1240,7 +1240,7 @@ class LayerNorm(BaseFusedOp):
         if (
             _has_aiter_layer_norm
             and x.dtype in (torch.bfloat16, torch.float16)
-            and x.dtype == self.dtype
+            and x.dtype == self.weight.dtype
         ):
             orig_shape = x.shape
             x = x.reshape(-1, self.hidden_size)
