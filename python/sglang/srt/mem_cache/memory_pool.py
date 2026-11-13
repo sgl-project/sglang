@@ -3059,6 +3059,9 @@ class MHATokenToKVPool(KVCache, MHAKVView):
                 cache_k.div_(k_scale)
             if v_scale is not None:
                 cache_v.div_(v_scale)
+            if self.dtype == fp8_dtype:
+                cache_k = saturate_to_fp8_range(cache_k, self.dtype)
+                cache_v = saturate_to_fp8_range(cache_v, self.dtype)
             cache_k = cache_k.to(self.dtype)
             cache_v = cache_v.to(self.dtype)
 
@@ -5083,6 +5086,8 @@ class MLATokenToKVPool(KVCache, MLAKVView):
             "declared which loc space it emits."
         )
         if cache_k.dtype != self.dtype:
+            if self.dtype == fp8_dtype:
+                cache_k = saturate_to_fp8_range(cache_k, self.dtype)
             cache_k = cache_k.to(self.dtype)
 
         if self.store_dtype != self.dtype:
@@ -5135,8 +5140,12 @@ class MLATokenToKVPool(KVCache, MLAKVView):
             self._scatter_mla_rows(dst_buffer, loc, cache_k_nope_fp8, cache_k_rope_fp8)
         else:
             if cache_k_nope.dtype != self.dtype:
+                if self.dtype == fp8_dtype:
+                    cache_k_nope = saturate_to_fp8_range(cache_k_nope, self.dtype)
                 cache_k_nope = cache_k_nope.to(self.dtype)
                 if cache_k_rope is not None and cache_k_rope.numel() > 0:
+                    if self.dtype == fp8_dtype:
+                        cache_k_rope = saturate_to_fp8_range(cache_k_rope, self.dtype)
                     cache_k_rope = cache_k_rope.to(self.dtype)
             if self.store_dtype != self.dtype:
                 cache_k_nope = cache_k_nope.view(self.store_dtype)
