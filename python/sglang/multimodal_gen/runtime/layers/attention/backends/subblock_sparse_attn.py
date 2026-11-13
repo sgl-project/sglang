@@ -125,13 +125,26 @@ def _dit_layer_index(prefix: str) -> int | None:
 
 
 @functools.lru_cache(maxsize=8)
-def _cached_block_sizes(seq_len: int, device: torch.device) -> torch.Tensor:
+def _block_sizes_cache_entry(
+    seq_len: int, device: torch.device
+) -> tuple[torch.Tensor, torch.cuda.Event]:
     """Per-block real token counts; identical for every layer and step.
 
     Rebuilding it per call costs an arange plus a clamp launch on the critical
     path for a tensor that only depends on the sequence length.
     """
-    return SubBlockRouter.block_sizes(seq_len, device)
+    sizes = SubBlockRouter.block_sizes(seq_len, device)
+    return sizes, torch.cuda.current_stream(device).record_event()
+
+
+def _cached_block_sizes(seq_len: int, device: torch.device) -> torch.Tensor:
+    sizes, ready = _block_sizes_cache_entry(seq_len, device)
+    stream = torch.cuda.current_stream(device)
+    # A cache hit may run on a different head-group stream from the producer.
+    stream.wait_event(ready)
+    # Eviction must not recycle the storage while another stream is reading it.
+    sizes.record_stream(stream)
+    return sizes
 
 
 @functools.lru_cache(maxsize=1)

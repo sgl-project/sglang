@@ -28,6 +28,8 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse.rou
 from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse_attn import (
     SubBlockSparseAttentionImpl,
     SubBlockSparseSchedule,
+    _block_sizes_cache_entry,
+    _cached_block_sizes,
     _dit_layer_index,
     _run_subblock_sparse_attention,
     _sm90_sparse_attention,
@@ -224,6 +226,36 @@ class TestRouterGeometry(unittest.TestCase):
     def test_rejects_non_divisible_block_geometry(self):
         with self.assertRaisesRegex(ValueError, "divisible"):
             SubBlockRouter(n_q=4, n_k=8, block_size_k=100)
+
+
+class TestSubBlockMetadataCache(unittest.TestCase):
+    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA streams")
+    def test_cache_hit_waits_for_producer(self):
+        device = torch.device("cuda", torch.cuda.current_device())
+        producer, consumer = torch.cuda.Stream(), torch.cuda.Stream()
+        expected = torch.tensor([64, 64, 2], dtype=torch.int32, device=device)
+        sizes = torch.full_like(expected, -1)
+        torch.cuda.synchronize()
+
+        def delayed_block_sizes(*_):
+            torch.cuda._sleep(100_000_000)
+            return sizes.copy_(expected)
+
+        _block_sizes_cache_entry.cache_clear()
+        self.addCleanup(_block_sizes_cache_entry.cache_clear)
+        self.addCleanup(torch.cuda.synchronize)
+        with patch.object(
+            SubBlockRouter, "block_sizes", side_effect=delayed_block_sizes
+        ) as build:
+            with torch.cuda.stream(producer):
+                first = _cached_block_sizes(130, device)
+            with torch.cuda.stream(consumer):
+                second = _cached_block_sizes(130, device)
+                observed = second.clone()
+            consumer.synchronize()
+            self.assertIs(first, second)
+            build.assert_called_once_with(130, device)
+            torch.testing.assert_close(observed, expected, rtol=0, atol=0)
 
 
 class TestSubBlockSparseBackend(unittest.TestCase):
