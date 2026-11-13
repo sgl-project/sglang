@@ -11,7 +11,11 @@ from sglang.srt.arg_groups.choices import KV_CACHE_DTYPE_CHOICES
 from sglang.srt.mem_cache import kv_cache_configurator as kcc
 from sglang.srt.mem_cache import platform_kv_cache_dtype
 from sglang.srt.mem_cache.kv_cache_dtype import configure_kv_cache_dtype
-from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+from sglang.srt.mem_cache.memory_pool import (
+    DSATokenToKVPool,
+    MHATokenToKVPool,
+    MLATokenToKVPool,
+)
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -25,8 +29,12 @@ class _PlatformMHAPool(MHATokenToKVPool):
     pass
 
 
-class _PastTheGuard(Exception):
+class _PlatformMLAPool(MLATokenToKVPool):
     pass
+
+
+class _Built(Exception):
+    """Raised where a test stops pool construction once it got that far."""
 
 
 class TestPlatformKVCacheDtype(CustomTestCase):
@@ -67,19 +75,155 @@ class TestPlatformKVCacheDtype(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "Unsupported"):
             self._storage_dtype("unregistered_kv")
 
-    def test_a_registered_dtype_needs_a_platform_pool_for_the_model_kind(self):
-        """No in-tree pool stores a registered dtype, so a kind left to core fails."""
+    def test_only_constructing_a_kind_the_platform_lacks_fails(self):
+        """A registered dtype resolves a missing kind to a class that refuses to be
+        built, so kinds a layout never builds stay harmless."""
+        configurator = _configurator(kv_cache_dtype_str="fp8_e4m3")
+        with patch.object(kcc, "current_platform", _platform(mha=_PlatformMHAPool)):
+            self.assertIs(
+                configurator._resolve_kv_pool_class(
+                    kind="mla", default=MLATokenToKVPool
+                ),
+                MLATokenToKVPool,
+            )
+            platform_kv_cache_dtype.register_kv_cache_dtype(_NAME)
+            configurator.kv_cache_dtype_str = _NAME
+            self.assertIs(
+                configurator._resolve_kv_pool_class(
+                    kind="mha", default=MHATokenToKVPool
+                ),
+                _PlatformMHAPool,
+            )
+            mla_pool_class = configurator._resolve_kv_pool_class(
+                kind="mla", default=MLATokenToKVPool
+            )
+        self.assertTrue(issubclass(mla_pool_class, MLATokenToKVPool))
+        with self.assertRaisesRegex(ValueError, "pool of kind 'mla'"):
+            mla_pool_class(size=8)
+
+    def test_hybrid_dsa_swa_needs_the_platform_mla_pool_for_its_swa_layers(self):
+        """The SWA side of a hybrid DSA model is an MLA pool: a platform that
+        supplies only the DSA pool must be refused, not fall back to the in-tree
+        MLA pool storing the registered dtype."""
         platform_kv_cache_dtype.register_kv_cache_dtype(_NAME)
-        platform = MagicMock()
-        platform.get_kv_pool_cls.side_effect = lambda *, kind: (
-            _PlatformMHAPool if kind == "mha" else None
+        built = []
+        dsa_pool = _recording_pool(DSATokenToKVPool, "dsa", built)
+        mla_pool = _recording_pool(MLATokenToKVPool, "mla", built, stop=True)
+        with self.assertRaisesRegex(ValueError, "pool of kind 'mla'"):
+            self._build_pool(_platform(dsa=dsa_pool), use_mla_backend=True)
+        self.assertEqual(built, ["dsa"])
+        built.clear()
+        with self.assertRaises(_Built):
+            self._build_pool(
+                _platform(dsa=dsa_pool, mla=mla_pool), use_mla_backend=True
+            )
+        self.assertEqual(built, ["dsa", "mla"])
+
+    def test_in_tree_only_pool_paths_refuse_a_registered_dtype(self):
+        """These paths build in-tree pools without consulting get_kv_pool_cls."""
+        platform_kv_cache_dtype.register_kv_cache_dtype(_NAME)
+        platform = _platform(mha=_PlatformMHAPool, mla=_PlatformMLAPool)
+        with (
+            patch.object(
+                kcc.KVCacheConfigurator, "_build_ascend_swa_kv_pool", side_effect=_Built
+            ),
+            patch.object(
+                kcc.KVCacheConfigurator,
+                "_build_unlimited_ocr_v2_kv_pool",
+                side_effect=_Built,
+            ),
+        ):
+            for pool, overrides in (
+                ("Ascend", {"attention_backend": "ascend"}),
+                (
+                    "Unlimited-OCR-v2",
+                    {"is_hybrid_swa": False, "is_unlimited_ocr_v2": True},
+                ),
+            ):
+                with (
+                    self.subTest(pool=pool),
+                    self.assertRaisesRegex(
+                        ValueError, f"cannot use the {pool} KV pool"
+                    ),
+                ):
+                    self._build_pool(platform, use_mla_backend=False, **overrides)
+        configurator = _configurator(kv_cache_dtype_str=_NAME)
+        configurator.use_mla_backend = False
+        configurator.model_config = SimpleNamespace(hf_config=None)
+        with (
+            self.subTest(pool="NPU"),
+            patch.object(kcc, "_is_npu", True),
+            patch.object(kcc, "is_deepseek_dsa", return_value=False),
+            self.assertRaisesRegex(ValueError, "cannot use the NPU KV pool"),
+        ):
+            configurator._hybrid_full_attention_pool_class(
+                mha_pool_class=_PlatformMHAPool,
+                mla_pool_class=_PlatformMLAPool,
+                dsa_pool_class=DSATokenToKVPool,
+            )
+
+    @staticmethod
+    def _build_pool(
+        platform,
+        *,
+        use_mla_backend,
+        attention_backend="triton",
+        is_hybrid_swa=True,
+        is_unlimited_ocr_v2=False,
+    ):
+        """Run the real pool dispatch for a hybrid DSA + SWA layout by default."""
+        configurator = _configurator(kv_cache_dtype_str=_NAME)
+        configurator.use_mla_backend = use_mla_backend
+        configurator.is_hybrid_swa = is_hybrid_swa
+        configurator.mambaish_config = None
+        configurator.device = "cpu"
+        configurator.model_config = SimpleNamespace(
+            hf_config=None,
+            kv_lora_rank=16,
+            qk_rope_head_dim=8,
+            swa_kv_lora_rank=16,
+            swa_qk_rope_head_dim=8,
         )
-        for use_mla_backend, is_dsa_model in ((True, False), (True, True)):
-            with self.subTest(use_mla_backend=use_mla_backend, is_dsa=is_dsa_model):
-                with self.assertRaisesRegex(ValueError, "needs a platform KV pool"):
-                    self._build_pool(platform, use_mla_backend, is_dsa_model)
-        with self.assertRaises(_PastTheGuard):
-            self._build_pool(platform, use_mla_backend=False, is_dsa_model=False)
+        configurator.layer_info = SimpleNamespace(
+            full_attention_layer_ids=[0], swa_attention_layer_ids=[1]
+        )
+        with (
+            patch.object(kcc, "current_platform", platform),
+            patch.object(
+                kcc,
+                "get_memory",
+                return_value=SimpleNamespace(
+                    enable_page_major_kv_layout=False, enable_unified_memory=False
+                ),
+            ),
+            patch.object(
+                kcc,
+                "get_exec",
+                return_value=SimpleNamespace(
+                    kernel=SimpleNamespace(
+                        attention_backend=attention_backend, enable_fp4_indexer=False
+                    ),
+                    features=SimpleNamespace(enable_memory_saver=False),
+                ),
+            ),
+            patch.object(
+                kcc, "get_schedule", return_value=SimpleNamespace(page_size=1)
+            ),
+            patch.object(kcc, "is_minimax_sparse", return_value=False),
+            patch.object(kcc, "is_unlimited_ocr_v2", return_value=is_unlimited_ocr_v2),
+            patch.object(kcc, "get_dsa_index_head_dim", return_value=8),
+            patch.object(kcc, "calculate_mla_kv_cache_dim", return_value=24),
+        ):
+            configurator._build_token_to_kv_pool(
+                sizes=SimpleNamespace(
+                    max_total_num_tokens=8,
+                    full_max_total_num_tokens=8,
+                    swa_max_total_num_tokens=8,
+                ),
+                is_dsa_model=True,
+                is_compressed_kv_model=False,
+                req_to_token_pool=None,
+            )
 
     @staticmethod
     def _storage_dtype(name):
@@ -93,31 +237,31 @@ class TestPlatformKVCacheDtype(CustomTestCase):
         )
         return dtype
 
-    @staticmethod
-    def _build_pool(platform, use_mla_backend, is_dsa_model):
-        configurator = kcc.KVCacheConfigurator.__new__(kcc.KVCacheConfigurator)
-        configurator.is_draft_worker = False
-        configurator.kv_cache_dtype = torch.uint8
-        configurator.kv_cache_dtype_str = _NAME
-        configurator.use_mla_backend = use_mla_backend
-        with (
-            patch.object(kcc, "current_platform", platform),
-            patch.object(
-                kcc,
-                "get_memory",
-                return_value=SimpleNamespace(
-                    enable_page_major_kv_layout=False, enable_unified_memory=False
-                ),
-            ),
-            # The first check after the guard; reaching it means the guard passed.
-            patch.object(kcc, "is_float4_e2m1fn_x2", side_effect=_PastTheGuard),
-        ):
-            configurator._build_token_to_kv_pool(
-                sizes=None,
-                is_dsa_model=is_dsa_model,
-                is_compressed_kv_model=False,
-                req_to_token_pool=None,
-            )
+
+def _configurator(*, kv_cache_dtype_str):
+    configurator = kcc.KVCacheConfigurator.__new__(kcc.KVCacheConfigurator)
+    configurator.is_draft_worker = False
+    configurator.kv_cache_dtype = torch.uint8
+    configurator.kv_cache_dtype_str = kv_cache_dtype_str
+    return configurator
+
+
+def _platform(**pool_classes):
+    platform = MagicMock()
+    platform.get_kv_pool_cls.side_effect = lambda *, kind: pool_classes.get(kind)
+    return platform
+
+
+def _recording_pool(base, kind, built, *, stop=False):
+    """A platform pool class that records its construction and allocates nothing."""
+
+    class RecordingPool(base):
+        def __init__(self, **kwargs):
+            built.append(kind)
+            if stop:
+                raise _Built
+
+    return RecordingPool
 
 
 if __name__ == "__main__":

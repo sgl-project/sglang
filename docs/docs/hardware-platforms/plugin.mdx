@@ -689,7 +689,8 @@ Then override `supports_kv_cache_dtype(name)` to return True for the names your 
 Core rejects a registered value:
 
 - on every in-tree platform, and on any out-of-tree platform that does not declare it;
-- for a model whose pool kind gets `None` from `get_kv_pool_cls`;
+- for a model whose KV layout builds a pool kind that gets `None` from `get_kv_pool_cls` (a hybrid DSA model with sliding-window layers, for example, builds both a `dsa` and an `mla` pool);
+- for model families whose KV pools SGLang builds without consulting `get_kv_pool_cls`;
 - together with PD disaggregation, hierarchical cache, LMCache or `--prefill-only-disable-kv-cache`.
 
 Reject any other combination your platform cannot serve, such as pool kinds, head sizes or speculative decoding.
