@@ -619,39 +619,6 @@ def dcp_pack_q(q_nope: torch.Tensor, q_pe: torch.Tensor, out: torch.Tensor) -> N
 
 
 @triton.jit
-def _dcp_unpack_q_kernel(
-    gathered_ptr,
-    q_nope_ptr,
-    q_pe_ptr,
-    TOKENS: tl.constexpr,
-    HEADS: tl.constexpr,
-    D_NOPE: tl.constexpr,
-    D_PE: tl.constexpr,
-):
-    token = tl.program_id(0).to(tl.int64)
-    head = tl.program_id(1).to(tl.int64)
-    src = gathered_ptr + (head * TOKENS + token) * (D_PE + D_NOPE)
-    row = token * HEADS + head
-    pe = tl.arange(0, D_PE)
-    nope = tl.arange(0, D_NOPE)
-    tl.store(q_pe_ptr + row * D_PE + pe, tl.load(src + pe))
-    tl.store(q_nope_ptr + row * D_NOPE + nope, tl.load(src + D_PE + nope))
-
-
-def dcp_unpack_q(
-    gathered: torch.Tensor, d_nope: int, d_pe: int
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Unpack contiguous head-major DCP Q into two contiguous TND inputs."""
-    heads, tokens, _ = gathered.shape
-    q_nope = gathered.new_empty((tokens, heads, d_nope))
-    q_pe = gathered.new_empty((tokens, heads, d_pe))
-    _dcp_unpack_q_kernel[(tokens, heads)](
-        gathered, q_nope, q_pe, tokens, heads, d_nope, d_pe
-    )
-    return q_nope, q_pe
-
-
-@triton.jit
 def _dcp_lse_combine_kernel(
     recv_output_ptr,
     recv_lse_ptr,

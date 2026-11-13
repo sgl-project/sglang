@@ -33,7 +33,6 @@ from sglang.kernels.ops.attention.dcp_kernels import (
     dcp_lse_combine_triton,
     dcp_pack_a2a_send,
     dcp_pack_q,
-    dcp_unpack_q,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
@@ -288,11 +287,11 @@ def all_gather_q_for_mla_decode(
     *,
     fuse_layout: bool = False,
 ):
-    """All-gather query heads and optionally fuse the NPU layout copies."""
+    """All-gather query heads and optionally fuse the NPU send-side layout copies."""
     group = get_parallel().dcp_group
     d_nope = q_nope_out.size(-1)
     d_pe = q_pe.size(-1)
-    use_fused_layout = (
+    use_fused_pack = (
         fuse_layout
         and dtype is None
         and q_nope_out.device.type == "npu"
@@ -305,14 +304,13 @@ def all_gather_q_for_mla_decode(
         and q_nope_out.size(1) > 0
         and q_nope_out.stride(-1) == q_pe.stride(-1) == 1
     )
-    if use_fused_layout:
+    if use_fused_pack:
         tokens, heads, _ = q_nope_out.shape
         with use_symmetric_memory(group):
             combined = q_nope_out.new_empty((heads, tokens, d_pe + d_nope))
         dcp_pack_q(q_nope_out, q_pe, combined)
         gathered = group.all_gather(combined, dim=0)
-        return dcp_unpack_q(gathered, d_nope, d_pe)
-    if dtype is None or dtype == q_pe.dtype:
+    elif dtype is None or dtype == q_pe.dtype:
         with use_symmetric_memory(group):
             # transpose q_pe and q_nope_out from [B, H, L] to [H, B, L]
             combined = torch.cat(
