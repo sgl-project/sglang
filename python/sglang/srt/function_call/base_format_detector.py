@@ -111,13 +111,17 @@ class BaseFormatDetector(ABC):
 
     def _ends_with_partial_token(self, buffer: str, bot_token: str) -> int:
         """
-        Check if buffer ends with a partial bot_token.
-        Return the length of the partial bot_token.
+        Length of the longest trailing slice of `buffer` that is a strict prefix of
+        `bot_token`, or 0 when there is none. Callers hold that slice back until the
+        next chunk decides whether it completes the marker.
 
-        For some format, the bot_token is not a token in model's vocabulary, such as
-        `[TOOL_CALLS] [` in Mistral.
+        Longest, so a marker whose prefix repeats inside itself is not cut short and
+        does not leak its leading characters into streamed content.
+
+        For some formats the bot_token is not a single token in the model's
+        vocabulary, such as `[TOOL_CALLS] [` in Mistral, so it can straddle chunks.
         """
-        for i in range(1, min(len(buffer) + 1, len(bot_token))):
+        for i in range(min(len(buffer), len(bot_token) - 1), 0, -1):
             if bot_token.startswith(buffer[-i:]):
                 return i
         return 0
