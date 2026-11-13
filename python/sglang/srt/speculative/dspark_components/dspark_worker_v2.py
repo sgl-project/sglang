@@ -289,16 +289,6 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.draft_model = bundle.draft_model
         self._draft_sampler = None
 
-        if _is_npu:
-            from sglang.srt.hardware_backend.npu.dspark_quarot import (
-                log_glm_dspark_quarot_runtime_status,
-            )
-
-            log_glm_dspark_quarot_runtime_status(
-                requested=apply_quarot_to_draft,
-                draft_model=self.draft_model,
-            )
-
         # The mask token is input-only (it is embedded, never sampled), so its
         # bound is the embedding-table row count: the PADDED vocab when the
         # target pads its embedding (e.g. Inkling true vocab 200058, padded

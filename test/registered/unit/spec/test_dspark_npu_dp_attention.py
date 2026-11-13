@@ -298,7 +298,11 @@ def test_uniform_fallback_does_not_rewrite_dp_counts():
 
 
 @pytest.mark.parametrize("graph", [False, True])
-def test_production_glm_dspark_argument_hook_accepts_attention_dp(graph):
+@pytest.mark.parametrize("invalid_option", [None, "lm_head", "tp", "pp"])
+def test_production_glm_dspark_reuses_parallel_and_speculative_validation(
+    graph, invalid_option
+):
+    from sglang.srt.arg_groups.parallel_hook import handle_data_parallelism
     from sglang.srt.arg_groups.speculative_hook import _handle_dspark
     from sglang.srt.model_executor.cuda_graph_config import (
         Backend,
@@ -313,9 +317,12 @@ def test_production_glm_dspark_argument_hook_accepts_attention_dp(graph):
     args.speculative_draft_model_path = "unused-draft"
     args.speculative_dspark_block_size = 8
     args.speculative_num_draft_tokens = 9
-    args.tp_size = 16
+    args.tp_size = 15 if invalid_option == "tp" else 16
+    args.pp_size = 2 if invalid_option == "pp" else 1
     args.attn_dp_size = 4
-    args.enable_dp_lm_head = True
+    # The generic parallel hook runs after prefill defaults are resolved.
+    args.chunked_prefill_size = 2048
+    args.enable_dp_lm_head = invalid_option != "lm_head"
     args.moe_a2a_backend = "deepep"
     args.cuda_graph_config = CudaGraphConfig(
         decode=PhaseConfig(
@@ -333,7 +340,21 @@ def test_production_glm_dspark_argument_hook_accepts_attention_dp(graph):
             return_value=None,
         ),
     ):
-        _handle_dspark(args)
+        if invalid_option == "tp":
+            with pytest.raises(AssertionError):
+                handle_data_parallelism(args)
+            return
+        handle_data_parallelism(args)
+        if invalid_option is not None:
+            message = (
+                "requires --enable-dp-lm-head"
+                if invalid_option == "lm_head"
+                else "pipeline parallelism requires PD prefill"
+            )
+            with pytest.raises(ValueError, match=message):
+                _handle_dspark(args)
+        else:
+            _handle_dspark(args)
 
 
 @pytest.mark.parametrize("is_npu", [False, True])

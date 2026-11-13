@@ -382,11 +382,11 @@ def test_future_map_accepts_scheduler_string_device():
     assert future.npu_confidence_stream is None
 
 
-@pytest.mark.parametrize("idle_seq_len", [0, 1])
-def test_idle_executor_uses_backend_prefix_contract_and_prepare_hook(idle_seq_len):
+def test_idle_executor_keeps_upstream_prefix_and_prepare_hook():
     from sglang.srt.speculative.dspark_components import dspark_verify
 
-    backend = SimpleNamespace(ragged_verify_idle_seq_len=idle_seq_len)
+    idle_seq_len = 1
+    backend = SimpleNamespace()
     runner = SimpleNamespace(device="cpu", attn_backend=backend)
     executor = dspark_verify.TargetVerifyExecutor.__new__(
         dspark_verify.TargetVerifyExecutor

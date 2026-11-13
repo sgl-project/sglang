@@ -113,9 +113,6 @@ class AttentionBackend(ABC):
     # Whether ragged target verify needs the CPU mirror advanced by verify_lens.
     # Device-only backends derive KV lengths from device prefixes and the layout.
     ragged_verify_requires_cpu_seq_lens: bool = True
-    # Synthetic prefix length for idle ragged rows; no real request owns them.
-    # Backends route any padded queries to their own sink metadata.
-    ragged_verify_idle_seq_len: int = 1
     # Bind-time cap on the window sub-pools one runner's layers attend through.
     max_window_sub_pools: int = 1
 

@@ -224,6 +224,7 @@ def test_dense_worker_constructor_to_draft_sampler_warmup(
         patch.object(dspark_worker_v2, "_is_npu", True),
         patch.object(dspark_draft_sampler, "_is_npu", True),
         patch.object(dspark_verify, "_is_npu", True),
+        patch.object(torch, "get_device_module", return_value=torch.cpu),
         patch.object(
             torch.cpu, "is_current_stream_capturing", return_value=False, create=True
         ),
@@ -332,7 +333,7 @@ def test_dense_worker_constructor_to_draft_sampler_warmup(
 
 
 @pytest.mark.parametrize("capturing", [False, True])
-def test_verify_epilogue_queries_output_tensor_device_before_allocation(capturing):
+def test_verify_epilogue_keeps_upstream_capture_guard_before_allocation(capturing):
     epilogue = dspark_verify.DsparkVerifyEpilogue.__new__(
         dspark_verify.DsparkVerifyEpilogue
     )
@@ -349,7 +350,7 @@ def test_verify_epilogue_queries_output_tensor_device_before_allocation(capturin
             result = epilogue._ensure_out(None, compact)
             assert result.shape == (8, 3)
             assert result.device == compact.device and result.dtype == compact.dtype
-        select.assert_called_once_with(compact.device)
+        select.assert_called_once_with()
         device_module.is_current_stream_capturing.assert_called_once_with()
         # Warmup buffers are reused without a capture query or allocation.
         buf = torch.zeros(8, 3)

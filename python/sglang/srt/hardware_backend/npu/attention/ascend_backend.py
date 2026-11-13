@@ -359,7 +359,6 @@ class AscendAttnBackend(AttentionBackend):
         if self._dspark_dsa_ragged_verify:
             self.supports_ragged_verify_graph = True
             self.ragged_verify_requires_cpu_seq_lens = False
-            self.ragged_verify_idle_seq_len = 0
         self.model_dtype = model_runner.model_config.dtype
         self.kv_cache_dtype = model_runner.kv_cache_dtype
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
@@ -664,14 +663,6 @@ class AscendAttnBackend(AttentionBackend):
             return getattr(forward_batch.spec_info, "ragged_verify_layout", None)
         return None
 
-    def _gather_block_tables(
-        self, req_pool_indices: torch.Tensor, max_seq_len: Optional[int] = None
-    ) -> torch.Tensor:
-        return (
-            self.req_to_token[req_pool_indices, : max_seq_len : self.page_size]
-            // self.page_size
-        )
-
     def _allocate_padded_verify_metadata(
         self, bs: int, num_tokens: int
     ) -> ForwardMetadata:
@@ -715,7 +706,10 @@ class AscendAttnBackend(AttentionBackend):
         metadata.seq_lens.zero_()
         metadata.seq_lens[:bs].copy_(torch.where(verify_lens > 0, kv_lens, 0))
         metadata.seq_lens[-1].copy_((layout.graph_num_tokens - q_ends[-1]).clamp(min=1))
-        pages = self._gather_block_tables(req_pool_indices[:bs])
+        pages = (
+            self.req_to_token[req_pool_indices[:bs], :: self.page_size]
+            // self.page_size
+        )
         page_starts = torch.arange(pages.shape[1], device=pages.device) * self.page_size
         metadata.block_tables.zero_()
         metadata.block_tables[:bs, : pages.shape[1]].copy_(
@@ -781,8 +775,11 @@ class AscendAttnBackend(AttentionBackend):
                 seq_lens_max += self.speculative_step_id + 1
             else:
                 seq_lens_max = forward_batch.seq_lens.max()
-            self.forward_metadata.block_tables = self._gather_block_tables(
-                forward_batch.req_pool_indices, seq_lens_max
+            self.forward_metadata.block_tables = (
+                self.req_to_token_pool.req_to_token[
+                    forward_batch.req_pool_indices, :seq_lens_max
+                ][:, :: self.page_size]
+                // self.page_size
             )
             if self.is_hybrid_swa:
                 self.forward_metadata.block_tables_swa = (
@@ -798,8 +795,11 @@ class AscendAttnBackend(AttentionBackend):
                     .contiguous()
                 )
         elif not dense_mla_dcp_partial:
-            self.forward_metadata.block_tables = self._gather_block_tables(
-                forward_batch.req_pool_indices
+            self.forward_metadata.block_tables = (
+                self.req_to_token_pool.req_to_token[
+                    forward_batch.req_pool_indices, :: self.page_size
+                ]
+                // self.page_size
             )
         if self.use_quant_flash_attn:
             metadata = self.forward_metadata
@@ -1414,7 +1414,10 @@ class AscendAttnBackend(AttentionBackend):
 
             if not self.dense_mla_dcp_target:
                 metadata.block_tables[:bs, :max_seq_pages].copy_(
-                    self._gather_block_tables(req_pool_indices[:bs], max_len)
+                    self.req_to_token[
+                        req_pool_indices[:bs], 0 : max_len : self.page_size
+                    ]
+                    // self.page_size
                 )
                 metadata.block_tables[:bs, max_seq_pages:].fill_(0)
         elif max_seq_len_host is not None and not self.dense_mla_dcp_target:
@@ -1431,7 +1434,8 @@ class AscendAttnBackend(AttentionBackend):
                 max_len = max_seq_len_host + self.speculative_num_draft_tokens
             max_seq_pages = (max_len + self.page_size - 1) // self.page_size
             metadata.block_tables[:bs, :max_seq_pages].copy_(
-                self._gather_block_tables(req_pool_indices[:bs], max_len)
+                self.req_to_token[req_pool_indices[:bs], 0 : max_len : self.page_size]
+                // self.page_size
             )
             metadata.block_tables[:bs, max_seq_pages:].fill_(0)
         elif not self.dense_mla_dcp_target:
@@ -1440,9 +1444,11 @@ class AscendAttnBackend(AttentionBackend):
                 (self.req_to_token.shape[1] + self.page_size - 1) // self.page_size,
             )
             metadata.block_tables[:bs, :total_pages].copy_(
-                self._gather_block_tables(
-                    req_pool_indices[:bs], total_pages * self.page_size
-                )
+                self.req_to_token[
+                    req_pool_indices[:bs],
+                    0 : total_pages * self.page_size : self.page_size,
+                ]
+                // self.page_size
             )
             metadata.block_tables[:bs, total_pages:].fill_(0)
 

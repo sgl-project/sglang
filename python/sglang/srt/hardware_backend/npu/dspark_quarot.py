@@ -110,29 +110,6 @@ def prepare_glm_dspark_quarot_scope(
     return glm_dspark_quarot_scope(config)
 
 
-def log_glm_dspark_quarot_runtime_status(*, requested: bool, draft_model) -> None:
-    config = getattr(draft_model, "_glm_dspark_quarot_config", None)
-    enabled = config is not None
-    owns_vocab = bool(getattr(draft_model, "uses_own_vocab_modules", False))
-    local_embedding = (
-        enabled
-        and owns_vocab
-        and getattr(draft_model, "embed_tokens", None) is not None
-    )
-    local_lm_head = (
-        enabled and owns_vocab and getattr(draft_model, "lm_head", None) is not None
-    )
-    logger.info(
-        "GLM DSpark QuaRot runtime: requested=%s enabled=%s q_path=%s "
-        "draft_local_embedding=%s draft_local_lm_head=%s",
-        requested,
-        enabled,
-        config.rotation_path if enabled else None,
-        local_embedding,
-        local_lm_head,
-    )
-
-
 def build_glm_dspark_quarot_config(
     *, device, enabled, target_model_config, target_model
 ) -> Optional[GlmDSparkQuaRotConfig]:

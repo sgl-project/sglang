@@ -285,22 +285,14 @@ class TargetVerifyExecutor:
         )
         if idle_layout is not None:
             num_dummy_slots = int(idle_layout.verify_lens.numel())
-            idle_seq_len = getattr(
-                self.model_runner.attn_backend, "ragged_verify_idle_seq_len", 1
-            )
-            batch.seq_lens = torch.full(
-                (num_dummy_slots,),
-                idle_seq_len,
-                dtype=torch.int64,
-                device=device,
+            batch.seq_lens = torch.ones(
+                (num_dummy_slots,), dtype=torch.int64, device=device
             )
             batch.req_pool_indices = torch.zeros(
                 (num_dummy_slots,), dtype=torch.int64, device=device
             )
-            batch.seq_lens_cpu = torch.full(
-                (num_dummy_slots,), idle_seq_len, dtype=torch.int64
-            )
-            batch.seq_lens_sum = idle_seq_len * num_dummy_slots
+            batch.seq_lens_cpu = torch.ones((num_dummy_slots,), dtype=torch.int64)
+            batch.seq_lens_sum = num_dummy_slots
             batch.forward_mode = ForwardMode.TARGET_VERIFY
         verify_input.live_seq_lens_cpu = batch.seq_lens_cpu
         verify_forward_batch, _ = verify_input.prepare_for_verify(
@@ -994,10 +986,7 @@ class DsparkVerifyEpilogue:
             and buf.shape[1] == compact.shape[1]
         ):
             return buf
-        capturing = torch.get_device_module(
-            compact.device
-        ).is_current_stream_capturing()
-        assert not capturing, (
+        assert not torch.get_device_module().is_current_stream_capturing(), (
             "DsparkVerifyEpilogue output buffers must be allocated during "
             "warmup, not inside graph capture (pool memory is unreadable "
             "post-replay)."

@@ -676,18 +676,14 @@ def _validate_npu_glm_dspark_compact(cfg) -> None:
     if cfg.dp_size != 1:
         unsupported.append("replica DP size 1 (attention DP is supported)")
     if cfg.attn_dp_size > 1:
-        if not cfg.enable_dp_lm_head:
-            unsupported.append("--enable-dp-lm-head for attention DP")
-        if cfg.tp_size % cfg.attn_dp_size:
-            unsupported.append("TP size divisible by attention DP size")
         if envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.get():
             unsupported.append(
                 "DP MLP synchronization and scheduler all-gather enabled"
             )
         if envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.get():
             unsupported.append("DP speculative prefill coordination disabled")
-    if cfg.attn_cp_size != 1 or cfg.pp_size != 1:
-        unsupported.append("attention CP size 1 and PP size 1")
+    if cfg.attn_cp_size != 1:
+        unsupported.append("attention CP size 1")
     if cfg.dcp_size != 1:
         unsupported.append("decode context parallel size 1")
     if cfg.disaggregation_mode != "null":

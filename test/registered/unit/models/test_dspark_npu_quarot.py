@@ -178,29 +178,6 @@ class TestGlmDSparkQuaRot(unittest.TestCase):
                 load_format="auto", weight_cache_mode="daemon"
             )
 
-    def test_runtime_status_logs_effective_modules_and_q_path(self):
-        active = SimpleNamespace(
-            _glm_dspark_quarot_config=self.config,
-            uses_own_vocab_modules=True,
-            embed_tokens=object(),
-            lm_head=object(),
-        )
-        inactive = SimpleNamespace(
-            _glm_dspark_quarot_config=None,
-            embed_tokens=None,
-            lm_head=None,
-        )
-        with patch.object(qr.logger, "info") as log:
-            qr.log_glm_dspark_quarot_runtime_status(requested=True, draft_model=active)
-            args = log.call_args.args
-            self.assertEqual(args[1:], (True, True, str(self.q_path), True, True))
-
-            qr.log_glm_dspark_quarot_runtime_status(
-                requested=False, draft_model=inactive
-            )
-            args = log.call_args.args
-            self.assertEqual(args[1:], (False, False, None, False, False))
-
     def test_enabled_target_rejects_missing_quarot(self):
         self.description["is_rot_used"] = False
         with self.assertRaisesRegex(ValueError, "QuaRot target"):

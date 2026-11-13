@@ -103,7 +103,6 @@ def _backend_method(name="init_forward_metadata", **extra):
 def _bind_metadata_methods(backend):
     for name in (
         "_get_ragged_verify_layout",
-        "_gather_block_tables",
         "_allocate_padded_verify_metadata",
         "_update_ragged_verify_metadata",
         "_init_cuda_graph_metadata",
@@ -121,13 +120,12 @@ class TestNpuCompactMetadata(CustomTestCase):
             device="cpu",
             _dspark_dsa_ragged_verify=True,
             ragged_verify_requires_cpu_seq_lens=False,
-            ragged_verify_idle_seq_len=0,
         )
         _bind_metadata_methods(backend)
         init = _backend_method(
             get_parallel=lambda: SimpleNamespace(attn_dp_enabled=True)
         )
-        for lens, prefixes in (([0], [0]), ([1, 3], [7, 15])):
+        for lens, prefixes in (([0], [0]), ([0], [1]), ([1, 3], [7, 15])):
             layout = RaggedVerifyLayout.from_verify_lens_device(
                 verify_lens=torch.tensor(lens), graph_num_tokens=8
             )
@@ -146,7 +144,9 @@ class TestNpuCompactMetadata(CustomTestCase):
             self.assertFalse(backend.graph_mode)
             self.assertFalse(backend.graph_metadata)
             if lens == [0]:
+                # The upstream idle prefix=1 must not expose request-pool row 0.
                 self.assertFalse(metadata.block_tables.any())
+                self.assertEqual(metadata.actual_seq_lengths_kv.tolist(), [0, 8])
 
     def test_compact_metadata_dispatch_is_glm_verify_only(self):
         layout = layout_for([1, 3])
@@ -216,7 +216,6 @@ class TestNpuCompactMetadata(CustomTestCase):
             device="cpu",
             _dspark_dsa_ragged_verify=True,
             ragged_verify_requires_cpu_seq_lens=False,
-            ragged_verify_idle_seq_len=0,
             needs_cpu_seq_lens=True,
         )
         _bind_metadata_methods(backend)
@@ -284,7 +283,6 @@ class TestNpuCompactMetadata(CustomTestCase):
             graph_mode=False,
             _dspark_dsa_ragged_verify=True,
             ragged_verify_requires_cpu_seq_lens=False,
-            ragged_verify_idle_seq_len=0,
             supports_ragged_verify_graph=True,
             req_to_token_pool=SimpleNamespace(req_to_token=table),
             req_to_token=table,
@@ -388,7 +386,6 @@ class TestNpuCompactExecution(CustomTestCase):
             graph_mode=False,
             _dspark_dsa_ragged_verify=True,
             ragged_verify_requires_cpu_seq_lens=False,
-            ragged_verify_idle_seq_len=0,
             supports_ragged_verify_graph=True,
             req_to_token_pool=SimpleNamespace(req_to_token=table),
             req_to_token=table,
