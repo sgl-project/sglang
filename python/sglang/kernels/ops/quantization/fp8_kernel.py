@@ -872,7 +872,6 @@ def static_quant_fp8(
         x: The input tensor with ndim >= 2.
         x_s: The quantization scale.
         repeat_scale: Whether to broadcast per-tensor scale to per-channel scale.
-        dtype: The dype of output tensor.
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: The quantized tensor and the scaling factor for quantization.
