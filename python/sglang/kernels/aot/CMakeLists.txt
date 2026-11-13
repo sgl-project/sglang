@@ -64,14 +64,6 @@ FetchContent_Declare(
 )
 FetchContent_Populate(repo-fmt)
 
-# Triton kernel
-FetchContent_Declare(
-    repo-triton
-    URL      https://${GITHUB_ARTIFACTORY}/triton-lang/triton/archive/v3.8.0.tar.gz
-    URL_HASH SHA256=d50981f98bf61a5ce21d2a0c6ac067c20b7f741acf3bee4b8370edc3b63fd337
-)
-FetchContent_Populate(repo-triton)
-
 # flashinfer
 FetchContent_Declare(
     repo-flashinfer
@@ -411,27 +403,24 @@ if (SGL_KERNEL_ENABLE_FA3)
         # SM8X Logic
         file(GLOB FA3_SM8X_GEN_SRCS
             "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdim*_sm80.cu")
+        # Each *_softcapall_sm80.cu only #includes the per-softcap files that this glob
+        # already selects, so compiling it as well would build those kernels twice.
+        list(FILTER FA3_SM8X_GEN_SRCS EXCLUDE REGEX "_softcapall_sm80\\.cu$")
     endif()
 
+    # The flash_fwd_hdimdiff_*_sm90.cu files only #include the flash_fwd_hdim{64_256,64_512,192_128}_*
+    # files, which the flash_fwd_hdim[0-9]* globs below already select. Do not add them, or those
+    # kernels are compiled and linked twice.
     file(GLOB FA3_BF16_GEN_SRCS
         "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdim[0-9]*_bf16*_sm90.cu")
-    file(GLOB FA3_BF16_GEN_SRCS_
-        "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdimdiff_bf16*_sm90.cu")
-    list(APPEND FA3_BF16_GEN_SRCS ${FA3_BF16_GEN_SRCS_})
 
     # FP16 source files - use individual hdim files instead of hdimall to avoid ptxas crash
     file(GLOB FA3_FP16_GEN_SRCS
         "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdim[0-9]*_fp16*_sm90.cu")
-    file(GLOB FA3_FP16_GEN_SRCS_
-        "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdimdiff_fp16*_sm90.cu")
-    list(APPEND FA3_FP16_GEN_SRCS ${FA3_FP16_GEN_SRCS_})
 
     # FP8 source files
     file(GLOB FA3_FP8_GEN_SRCS
         "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdim[0-9]*_e4m3*_sm90.cu")
-    file(GLOB FA3_FP8_GEN_SRCS_
-        "${repo-flash-attention_SOURCE_DIR}/hopper/instantiations/flash_fwd_hdimdiff_e4m3*_sm90.cu")
-    list(APPEND FA3_FP8_GEN_SRCS ${FA3_FP8_GEN_SRCS_})
 
     set(FA3_GEN_SRCS ${FA3_BF16_GEN_SRCS} ${FA3_FP16_GEN_SRCS} ${FA3_FP8_GEN_SRCS} ${FA3_SM8X_GEN_SRCS})
 
@@ -531,9 +520,3 @@ target_include_directories(infllm_ops PRIVATE
 find_library(TORCH_PYTHON_LIBRARY torch_python PATHS "${TORCH_INSTALL_PREFIX}/lib" REQUIRED)
 target_link_libraries(infllm_ops PRIVATE ${TORCH_LIBRARIES} ${TORCH_PYTHON_LIBRARY} c10 cuda)
 install(TARGETS infllm_ops LIBRARY DESTINATION "sgl_kernel")
-
-# ============================ Extra Install: triton kernels ============================= #
-install(DIRECTORY "${repo-triton_SOURCE_DIR}/python/triton_kernels/triton_kernels/"
-        DESTINATION "triton_kernels"
-        PATTERN ".git*" EXCLUDE
-        PATTERN "__pycache__" EXCLUDE)
