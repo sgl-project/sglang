@@ -1,10 +1,9 @@
 """End-to-end decode-graph coverage for linear and tree UNO decoding.
 
-On XPU, linear UNO runs on intel_xpu and tree UNO on triton, the only XPU
-attention backend whose graphs support tree verification. The test runs both
-modes on the same prompts. Linear UNO alternates LoRA-draft and clean-target
-variants in one graph runner. Tree UNO uses a private LoRA-draft runner
-before native EAGLE tree verification. Besides the
+On XPU it runs on the intel_xpu attention backend with XPU decode graphs.
+The test runs both modes on the same prompts. Linear UNO alternates
+LoRA-draft and clean-target variants in one graph runner. Tree UNO uses a
+private LoRA-draft runner before native EAGLE tree verification. Besides the
 generation contract, short greedy comparisons guard lossless output parity
 with autoregressive decoding, and stochastic requests guard nontrivial TPF for
 both linear and tree sampling on a small, fixed GSM8K sample.
@@ -135,15 +134,14 @@ class TestUnoCudaGraph(CustomTestCase):
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.adapter_path = _resolve_uno_lora_path()
 
-    def _platform_args(self, config: _UnoConfig | None) -> list[str]:
+    def _platform_args(self) -> list[str]:
         if _is_xpu:
-            tree = config is not None and config.speculative_eagle_topk > 1
             # The BMG cookbook decode setup. The 24 GB card needs a higher
             # static fraction to hold the 16.4 GB model plus the 1.4 GB UNO
             # LoRA pool.
             return [
                 "--attention-backend",
-                "triton" if tree else "intel_xpu",
+                "intel_xpu",
                 "--page-size",
                 "64",
                 "--cuda-graph-backend-decode",
@@ -166,7 +164,7 @@ class TestUnoCudaGraph(CustomTestCase):
         args = [
             "--dtype",
             "bfloat16",
-            *self._platform_args(config),
+            *self._platform_args(),
             "--max-running-requests",
             str(len(PROMPTS)),
             "--disable-radix-cache",

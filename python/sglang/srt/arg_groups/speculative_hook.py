@@ -24,7 +24,6 @@ from sglang.srt.arg_groups.overrides import (
 )
 from sglang.srt.configs.ernie55 import ERNIE5_5_MOE_ARCH
 from sglang.srt.environ import envs
-from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
 
@@ -614,19 +613,6 @@ def _handle_uno(server_args: ServerArgs) -> None:
             "UNO requires the same attention backend for prefill and decode, "
             f"one of {supported_backends} on {cfg.device}; "
             f"got prefill={prefill_backend!r}, decode={decode_backend!r}."
-        )
-    if (
-        is_xpu
-        and candidate_top_k > 1
-        and decode_backend == "intel_xpu"
-        and cfg.cuda_graph_config.decode.backend != Backend.DISABLED
-    ):
-        # intel_xpu builds tree-verify (topk > 1) metadata only eagerly, so a
-        # captured tree verify would read stale cascade metadata.
-        raise ValueError(
-            "UNO tree mode with XPU decode graphs requires "
-            "--attention-backend triton; intel_xpu graphs do not support "
-            "tree verification yet."
         )
 
 
