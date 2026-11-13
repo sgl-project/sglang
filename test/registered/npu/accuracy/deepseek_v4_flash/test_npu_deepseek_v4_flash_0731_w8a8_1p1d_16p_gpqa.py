@@ -8,6 +8,10 @@ from sglang.test.ascend.e2e.test_npu_performance_utils import (
     assert_metrics,
     run_bench_serving,
 )
+from sglang.test.ascend.test_ascend_utils import (
+    get_mooncake_ld_library_path,
+    write_memfabric_tent_conf,
+)
 from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(
@@ -48,6 +52,11 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_COMMON_ENVS = {
     "SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT": "1800",
     "SGLANG_DISAGGREGATION_WAITING_TIMEOUT": "1800",
     "SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER": "1",
+    # Mooncake + TENT + MemFabric
+    "MC_USE_TENT": "1",
+    "MF_PROTOCOL": "device_sdma",
+    "MF_TRANSFER_TIMEOUT": "10000",
+    "ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE": "true",
 }
 
 # Prefill node environment variables for DSV4-Flash-0731 PD-Sep deployment.
@@ -97,7 +106,7 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ARGS = [
     "--disaggregation-mode",
     "prefill",
     "--disaggregation-transfer-backend",
-    "ascend",
+    "mooncake",
     "--mem-fraction-static",
     0.62,
     "--prefill-max-requests",
@@ -159,7 +168,7 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_DECODE_ARGS = [
     "--disaggregation-mode",
     "decode",
     "--disaggregation-transfer-backend",
-    "ascend",
+    "mooncake",
     "--max-running-requests",
     256,
     "--dp-size",
@@ -195,17 +204,6 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_DECODE_ARGS = [
     6,
 ]
 
-# Model config for DSV4-Flash-0731 W8A8 1P+1D PD-Sep deployment.
-DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_MODEL_CONFIG = {
-    "model_path": DEEPSEEK_V4_FLASH_0731_W8A8_MODEL_PATH,
-    "prefill_args": DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ARGS,
-    "decode_args": DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_DECODE_ARGS,
-    "prefill_envs": DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ENVS,
-    "decode_envs": DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_DECODE_ENVS,
-    "router_args": ["--policy", "cache_aware"],
-    "router_envs": {},
-}
-
 # Generation config for Think High mode (thinking=true, reasoning_effort=high).
 DEEPSEEK_V4_FLASH_0731_W8A8_GENERATION_CONFIG_HIGH = {
     "max_tokens": 125000,
@@ -223,7 +221,7 @@ class TestNPUDeepSeekV4Flash0731W8A8PDSEPGPQAHigh(
 ):
     """Test NPU accuracy for DeepSeek-V4-Flash W8A8 16p 1P1D GPQA."""
 
-    model_config = DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_MODEL_CONFIG
+    model_config = None
     # (reference: Flash W8A8 GPQA Diamond baseline is 0.874).
     accuracy = 0.874
     datasets = ["gpqa_diamond"]
@@ -236,6 +234,31 @@ class TestNPUDeepSeekV4Flash0731W8A8PDSEPGPQAHigh(
     generation_config = DEEPSEEK_V4_FLASH_0731_W8A8_GENERATION_CONFIG_HIGH
     eval_batch_size = 128
     min_hit_rate_pcts = {"host": 0}  # percent: L2 host hit rate must exceed 0%
+
+    @classmethod
+    def setUpClass(cls):
+        tent_conf_path = write_memfabric_tent_conf()
+        common_envs = {
+            **DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_COMMON_ENVS,
+            "MC_TENT_CONF": tent_conf_path,
+            "LD_LIBRARY_PATH": get_mooncake_ld_library_path(),
+        }
+        cls.model_config = {
+            "model_path": DEEPSEEK_V4_FLASH_0731_W8A8_MODEL_PATH,
+            "prefill_args": list(DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ARGS),
+            "decode_args": list(DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_DECODE_ARGS),
+            "prefill_envs": {
+                **common_envs,
+                **DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ENVS,
+            },
+            "decode_envs": {
+                **common_envs,
+                **DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_DECODE_ENVS,
+            },
+            "router_args": ["--policy", "cache_aware"],
+            "router_envs": {},
+        }
+        super().setUpClass()
 
     def test_npu_deepseek_v4_flash_0731_w8a8_pd_sep_gpqa_high(self):
         """Run NPU accuracy test for DSV4-Flash-0731 PD-Sep GPQA High mode."""
