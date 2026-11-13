@@ -606,5 +606,60 @@ def test_sparse_verify_gathers_rank_major_shards_with_global_ids(monkeypatch):
     assert gathered == [torch.Size([_SPARSE_WORLD * 4 * 8, 256])]
 
 
+@pytest.mark.parametrize(
+    ("softcap", "tp_size", "expected"),
+    [(20.0, 4, True), (None, 4, False), (20.0, 1, False)],
+)
+def test_sparse_verify_needs_a_softcapped_target_and_tp(
+    softcap, tp_size, expected, monkeypatch
+):
+    """A target without softcap never defers the verify gather; enabling sparse
+    verify there compiled the merge kernel with softcap=None and failed startup."""
+    from sglang.srt.environ import envs
+    from sglang.srt.speculative import dflash_worker_v2 as worker_mod
+
+    monkeypatch.setattr(worker_mod, "is_cuda", lambda: True)
+    with envs.SGLANG_OPT_DFLASH_SPARSE_VERIFY.override(True):
+        enabled = worker_mod._sparse_verify_enabled(
+            target_logits_processor=SimpleNamespace(final_logit_softcapping=softcap),
+            tp_size=tp_size,
+        )
+    assert enabled is expected
+
+
+def test_sparse_support_samples_even_with_a_resolved_argmax(monkeypatch):
+    """The sparse path also hands over the support's argmax as target_predict, which
+    alone means a greedy accept; the support must still route to the sampled accept."""
+    from sglang.srt.speculative import dflash_worker_v2 as worker_mod
+
+    monkeypatch.setattr(worker_mod, "SIMULATE_ACC_LEN", 0)
+    bs, block = 2, 4
+    worker = worker_mod.DFlashWorkerV2.__new__(worker_mod.DFlashWorkerV2)
+    worker._selector_sample = ("ids", "q")
+    worker._tp_sync = SimpleNamespace(sync=lambda site, tensor: None)
+    worker.block_size = block
+    sparse_calls = []
+
+    def fake_sparse_accept(**kwargs):
+        sparse_calls.append(kwargs["support"])
+        return torch.ones(bs, dtype=torch.int32), torch.zeros(bs, dtype=torch.int64)
+
+    worker._selector_sparse_accept = fake_sparse_accept
+    worker._selector_sampling_accept = lambda **kwargs: pytest.fail("dense accept")
+    worker._use_triton_accept_bonus = False
+    accept_len, *_ = worker._accept_block(
+        candidates=torch.zeros(bs, block, dtype=torch.int64),
+        next_token_logits=None,
+        sampling_info=None,
+        draft_input=SimpleNamespace(max_top_k=64),
+        prefix_lens=torch.zeros(bs, dtype=torch.int64),
+        bs=bs,
+        target_predict=torch.zeros(bs, block, dtype=torch.int64),
+        sparse_support="support",
+    )
+    assert sparse_calls == ["support"]
+    assert accept_len.tolist() == [1, 1]
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

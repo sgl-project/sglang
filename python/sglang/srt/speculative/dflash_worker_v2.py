@@ -78,6 +78,7 @@ from sglang.srt.speculative.dflash_utils import (
     apply_dflash_verify_logits_adjustments,
     can_dflash_use_fused_qkv_proj,
     compute_dflash_sampling_correct_drafts_and_bonus,
+    dflash_verify_needs_logits_adjustment,
     get_dflash_attention_sliding_window_size,
     is_dense_head_weight,
     is_dflash_sampling_verify_available,
@@ -135,6 +136,20 @@ logger = logging.getLogger(__name__)
 # Measured at top_k 64. A larger cap widens each row's merge sort to
 # tp_size * next_power_of_2(top_k + 16) keys.
 _SPARSE_VERIFY_MAX_TOP_K = 64
+
+
+def _sparse_verify_enabled(
+    *, target_logits_processor: Optional[LogitsProcessor], tp_size: int
+) -> bool:
+    # Only a softcapped target defers the verify gather to a vocab shard.
+    return (
+        envs.SGLANG_OPT_DFLASH_SPARSE_VERIFY.get()
+        and is_cuda()
+        and target_logits_processor is not None
+        and bool(target_logits_processor.final_logit_softcapping)
+        and tp_size > 1
+    )
+
 
 _FusedKVMaterializeHelper = None
 
@@ -663,12 +678,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             is_hip() and envs.SGLANG_ROCM_MUSE_SHARDED_GREEDY_LOGITS.get()
         )
         self._target_logits_processor = self._defer_target_verify_gather()
-        # The support is built from the deferred verify gather's vocab shards.
-        self._sparse_verify = (
-            envs.SGLANG_OPT_DFLASH_SPARSE_VERIFY.get()
-            and is_cuda()
-            and self._target_logits_processor is not None
-            and get_parallel().tp_group.world_size > 1
+        self._sparse_verify = _sparse_verify_enabled(
+            target_logits_processor=self._target_logits_processor,
+            tp_size=get_parallel().tp_group.world_size,
         )
         if self._sparse_verify and get_parallel().tp_rank == 0:
             logger.info(
@@ -693,13 +705,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             return False
         if sampling_info is None:
             return self._selector_sample is None
-        penalizer = sampling_info.penalizer_orchestrator
         if (
-            sampling_info.has_custom_logit_processor
-            or getattr(sampling_info, "acc_linear_penalties", None) is not None
-            or (penalizer is not None and penalizer.is_required)
-            or getattr(sampling_info, "grammar_mask", None) is not None
-            or getattr(sampling_info, "logit_bias", None) is not None
+            dflash_verify_needs_logits_adjustment(sampling_info)
             or sampling_info.sampling_mask_batch_indices is not None
         ):
             return False
@@ -727,7 +734,6 @@ class DFlashWorkerV2(BaseSpecWorker):
             or batch.return_logprob
         ):
             return False
-        penalizer = sampling_info.penalizer_orchestrator
         return (
             max_top_k <= _SPARSE_VERIFY_MAX_TOP_K
             and not sampling_info.need_top_p_sampling
@@ -735,10 +741,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             and shard_topk_width(max_top_k) <= shard_width
             and get_parallel().tp_group.world_size * shard_width
             == self._target_logits_processor.vocab_size
-            and not sampling_info.has_custom_logit_processor
-            and (penalizer is None or not penalizer.is_required)
-            and sampling_info.logit_bias is None
-            and sampling_info.grammar_mask is None
+            and not dflash_verify_needs_logits_adjustment(sampling_info)
             and sampling_info.sampling_mask_batch_indices is None
         )
 
@@ -2558,27 +2561,30 @@ class DFlashWorkerV2(BaseSpecWorker):
         ] = None,
     ):
         new_seq_lens = None
-        # A resolved argmax (vocab-sharded verify) means the accept is greedy.
-        if target_predict is None and self._selector_sample is not None:
+        if sparse_support is not None:
             selector_candidate_ids, selector_q_rows = self._selector_sample
-            if sparse_support is not None:
-                accept_len, bonus = self._selector_sparse_accept(
-                    candidates=candidates,
-                    support=sparse_support,
-                    candidate_ids=selector_candidate_ids,
-                    q_rows=selector_q_rows,
-                    sampling_info=sampling_info,
-                    draft_input=draft_input,
-                )
-            else:
-                accept_len, bonus = self._selector_sampling_accept(
-                    candidates=candidates,
-                    next_token_logits=next_token_logits,
-                    candidate_ids=selector_candidate_ids,
-                    q_rows=selector_q_rows,
-                    sampling_info=sampling_info,
-                    draft_input=draft_input,
-                )
+            accept_len, bonus = self._selector_sparse_accept(
+                candidates=candidates,
+                support=sparse_support,
+                candidate_ids=selector_candidate_ids,
+                q_rows=selector_q_rows,
+                sampling_info=sampling_info,
+                draft_input=draft_input,
+            )
+            self._tp_sync.sync(SpecTpSyncSite.DFLASH_SELECTOR, accept_len)
+            self._tp_sync.sync(SpecTpSyncSite.DFLASH_SELECTOR, bonus)
+            out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
+        # Otherwise a resolved argmax (vocab-sharded verify) means the accept is greedy.
+        elif target_predict is None and self._selector_sample is not None:
+            selector_candidate_ids, selector_q_rows = self._selector_sample
+            accept_len, bonus = self._selector_sampling_accept(
+                candidates=candidates,
+                next_token_logits=next_token_logits,
+                candidate_ids=selector_candidate_ids,
+                q_rows=selector_q_rows,
+                sampling_info=sampling_info,
+                draft_input=draft_input,
+            )
             self._tp_sync.sync(SpecTpSyncSite.DFLASH_SELECTOR, accept_len)
             self._tp_sync.sync(SpecTpSyncSite.DFLASH_SELECTOR, bonus)
             out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)

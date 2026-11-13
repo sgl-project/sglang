@@ -17,9 +17,7 @@ scans the vocabulary in the chain sampler. Here instead:
 
 Off the support p = 0, so the support holds the whole residual. The final CDF is
 walked in token-id order, the order the dense kernel scans the vocabulary, so both
-pick the same token for the same coin up to fp32 summation order. The accept
-kernel adapts the top-k chain sampler of sgl-project/sglang#41283 to an exactly-k
-top-k and a sparse q.
+pick the same token for the same coin up to fp32 summation order.
 """
 
 from __future__ import annotations
@@ -31,9 +29,12 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
-try:
-    from flashinfer import top_k as _flashinfer_top_k
-except ImportError:
+from sglang._lazy_import import LazyImport
+from sglang.srt.utils import is_flashinfer_available
+
+if is_flashinfer_available():
+    _flashinfer_top_k = LazyImport("flashinfer", "top_k")
+else:
     _flashinfer_top_k = None
 
 

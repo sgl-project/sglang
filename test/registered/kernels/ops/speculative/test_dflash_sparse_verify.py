@@ -10,6 +10,7 @@ import torch
 
 from sglang.kernels.ops.activation.softcap import gathered_softcap_logits
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
+from sglang.srt.speculative import dflash_utils
 from sglang.srt.speculative import dflash_worker_v2 as worker_mod
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -147,6 +148,13 @@ def _dense_full_logits(raw, world):
     return gathered_softcap_logits(gathered, SOFTCAP, full)
 
 
+def _topk_lowest_id_ties(scores, k):
+    """Exact top-k keeping the lowest ids among ties at the k-th place, the sparse
+    support's rule; FlashInfer's radix select may keep other tied ids."""
+    vals, ids = torch.sort(scores, dim=-1, descending=True, stable=True)
+    return vals[:, :k], ids[:, :k]
+
+
 def _check_parity(*, world, bs, top_ks, temperature, trials, seed, **case_kw):
     stats = dict(all_accepted=0, rejected=0)
     for t in range(trials):
@@ -176,7 +184,10 @@ def _check_parity(*, world, bs, top_ks, temperature, trials, seed, **case_kw):
             draft_input=draft_input,
         )
         torch.cuda.manual_seed(1000 + t)
-        dense = _worker()._selector_sampling_accept(next_token_logits=full, **accept_kw)
+        with mock.patch.object(dflash_utils, "radix_topk", _topk_lowest_id_ties):
+            dense = _worker()._selector_sampling_accept(
+                next_token_logits=full, **accept_kw
+            )
         dense_probe = torch.rand(4, device="cuda")
         torch.cuda.manual_seed(1000 + t)
         sparse = _worker()._selector_sparse_accept(support=supports[0], **accept_kw)

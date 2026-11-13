@@ -219,6 +219,19 @@ def resolve_dflash_verify_mask_policy(attn_backend: Any) -> tuple[str, bool]:
     return backend_name, (backend_name not in _DFLASH_VERIFY_SKIP_CUSTOM_MASK_BACKENDS)
 
 
+def dflash_verify_needs_logits_adjustment(sampling_info: Any) -> bool:
+    # apply_dflash_verify_logits_adjustments is a no-op unless this holds; verify
+    # paths that skip it (argmax-only, sparse support) rely on that to stay exact.
+    penalizer = sampling_info.penalizer_orchestrator
+    return (
+        sampling_info.has_custom_logit_processor
+        or getattr(sampling_info, "acc_linear_penalties", None) is not None
+        or (penalizer is not None and penalizer.is_required)
+        or getattr(sampling_info, "grammar_mask", None) is not None
+        or getattr(sampling_info, "logit_bias", None) is not None
+    )
+
+
 def apply_dflash_verify_logits_adjustments(
     *,
     next_token_logits: torch.Tensor,
@@ -246,6 +259,9 @@ def apply_dflash_verify_logits_adjustments(
             "next_token_logits row count mismatch for DFlash verify adjustments. "
             f"Expected {bs * draft_token_num}, got {next_token_logits.shape[0]}."
         )
+
+    if not dflash_verify_needs_logits_adjustment(sampling_info):
+        return
 
     if sampling_info.has_custom_logit_processor:
         apply_custom_logit_processor(
