@@ -23,20 +23,23 @@ def inputs():
     query = torch.zeros(4, 4, 512, dtype=torch.bfloat16)
     rope = torch.zeros(4, 4, 64, dtype=query.dtype)
     metadata = [torch.empty(0, dtype=torch.int32) for _ in range(11)]
+    metadata[3] = torch.zeros(4, 2048, dtype=torch.int32)
+    metadata[4] = torch.zeros_like(metadata[3])
     return [query, rope, torch.empty(0), *metadata, 123, torch.empty_like(query), 0.1]
 
 
 @pytest.mark.parametrize("full_visible", [False, True])
-def test_existing_operator_does_not_receive_a_new_keyword(adapter, full_visible):
+def test_operator_receives_the_native_resident_refresh_contract(adapter, full_visible):
     calls = []
 
-    def legacy_operator(*args, full_visible=False):
-        calls.append((len(args), full_visible))
+    def native_operator(*args, full_visible=False, resident_refresh_tail=False):
+        assert args[6].shape == args[7].shape == (4, 2048)
+        calls.append((len(args), full_visible, resident_refresh_tail))
         args[-2].fill_(2)
 
     args = inputs()
-    adapter(*args, operator=legacy_operator, full_visible=full_visible)
-    assert calls == [(17, full_visible)]
+    adapter(*args, operator=native_operator, full_visible=full_visible)
+    assert calls == [(17, full_visible, False)]
     assert torch.all(args[-2] == 2)
 
 

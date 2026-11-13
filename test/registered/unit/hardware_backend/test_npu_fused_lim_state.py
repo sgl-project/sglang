@@ -261,6 +261,8 @@ class TestLIMState(CustomTestCase):
             self.assertEqual(manager.budget.adapter_bytes, allocated)
             self.assertFalse(hasattr(adapter, "query_scale"))
             self.assertFalse(hasattr(adapter, "key_scale"))
+            for indices in (adapter.source_ids, adapter.device_slots):
+                self.assertEqual(indices.shape, (8 * width, 2048))
 
     def test_plan_alignment_and_limits(self):
         for width in (1, 4):
@@ -396,6 +398,70 @@ class TestLIMState(CustomTestCase):
         with self.assertRaises(ValueError):
             plan.validate_buffers(manager.lim_adapter, plan.adapter_buffers)
         manager.lim_adapter.source_ids = original
+        # Exercise both native boundaries: selecting column zero would silently
+        # truncate the plan, while a framework unsqueeze would break CopySFA's ABI.
+        rows = 2 * manager.max_query_width
+        source_values = torch.arange(rows * 2048, dtype=torch.int32).view(rows, 2048)
+        slot_values = source_values.remainder(manager.cache_capacity)
+
+        def native_lim(*tensors, full_visible=False):
+            self.assertEqual(tensors[11].shape, source_values.shape)
+            self.assertEqual(tensors[12].shape, slot_values.shape)
+            tensors[11].copy_(source_values)
+            tensors[12].copy_(slot_values)
+
+        adapter = manager.lim_adapter
+        adapter.operator = native_lim
+        adapter.request_safe_slots[:2].copy_(torch.tensor([1, 2]))
+        adapter._pre_next_prefix[:2].zero_()
+        adapter._pre_valid[:2].fill_(True)
+        selection = adapter.select(
+            manager,
+            query=torch.zeros(rows, 64, 128, dtype=torch.bfloat16),
+            weights=torch.ones(rows, 64, dtype=torch.bfloat16),
+            key=pool.get_index_k_buffer(1),
+            block_table=torch.zeros(2, 33, dtype=torch.int32),
+            forward_batch=SimpleNamespace(
+                batch_size=2,
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                spec_info=SimpleNamespace(num_tokens_per_req=manager.max_query_width),
+                seq_lens=torch.zeros(2, dtype=torch.int32),
+                positions=torch.arange(rows, dtype=torch.int32),
+                req_pool_indices=torch.tensor([1, 2]),
+            ),
+            layer_id=0,
+        )
+        torch.testing.assert_close(selection.source_ids, source_values)
+        torch.testing.assert_close(selection.device_slots, slot_values)
+        self.assertEqual(selection.source_ids.data_ptr(), adapter.source_ids.data_ptr())
+        self.assertEqual(
+            selection.device_slots.data_ptr(), adapter.device_slots.data_ptr()
+        )
+
+        def native_copy_sfa(*tensors, **kwargs):
+            self.assertEqual(tensors[6].ndim, 2)
+            self.assertEqual(tensors[7].ndim, 2)
+            torch.testing.assert_close(tensors[6], source_values)
+            torch.testing.assert_close(tensors[7], slot_values)
+            tensors[15].fill_(3)
+
+        manager._copy_sfa_operator = native_copy_sfa
+        result = manager.copy_sfa_attention(
+            SimpleNamespace(layer_id=0),
+            torch.zeros(rows, 8, 512, dtype=torch.bfloat16),
+            torch.zeros(rows, 8, 64, dtype=torch.bfloat16),
+            8,
+            0.1,
+            selection,
+            (
+                torch.empty(rows, 1, 576, dtype=torch.bfloat16),
+                torch.arange(rows, dtype=torch.int32),
+                torch.ones(rows, dtype=torch.bool),
+            ),
+        )
+        torch.testing.assert_close(
+            result, torch.full((rows, 8 * 512), 3, dtype=result.dtype)
+        )
         # Use the allocated index pages, including their dummy page, rather
         # than reconstructing the physical capacity from a logical size.
         pool.size = 3968

@@ -122,8 +122,8 @@ class LIMDecodeAdapter:
             0, self.request_safe_slots[:batch].long(), self._pre_next_prefix[:batch]
         )
         return LIMSelection(
-            sources[:, 0],
-            self.device_slots[:rows, 0],
+            sources,
+            self.device_slots[:rows],
             self.topk_misses[:rows],
             self.miss_sources[:batch],
             self.miss_slots[:batch],

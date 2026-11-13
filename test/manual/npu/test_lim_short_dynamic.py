@@ -117,12 +117,15 @@ def test_prefill_attention_and_short_residency():
                 attn_cp_metadata=None,
             )
             backend = SimpleNamespace(
+                graph_mode=False,
                 device="npu",
                 kv_lora_rank=512,
                 qk_rope_head_dim=64,
                 sparse_kv_manager=manager,
                 forward_metadata=SimpleNamespace(
-                    actual_seq_lengths_q=None, actual_seq_lengths_kv=None
+                    actual_seq_lengths_q=None,
+                    actual_seq_lengths_kv=None,
+                    sparse_kv_fused_prefill_plan=None,
                 ),
             )
             query = torch.randn(4, heads, 512, device="npu", dtype=torch.bfloat16)
@@ -142,6 +145,8 @@ def test_prefill_attention_and_short_residency():
                     tp_q_head_num=heads,
                     scaling=576**-0.5,
                 )
+                manager.resident_begin[layer_id][1:3] = 0
+                manager.resident_end[layer_id][1:3] = 1
                 output = forward_fused_sparse_kv_offload(
                     backend,
                     query,
@@ -168,11 +173,13 @@ def test_prefill_attention_and_short_residency():
                     )
                 for row, length in enumerate(lengths[:2]):
                     torch.testing.assert_close(
-                        manager.device_kv_buffer[layer_id][row + 1, :length, 0].cpu(),
+                        host.view(-1, 576)[mapping[row, :length]],
                         payload[mapping[row, :length]],
                         rtol=0,
                         atol=0,
                     )
+                assert manager.resident_begin[layer_id][1:3].cpu().tolist() == [-1, -1]
+                assert manager.resident_end[layer_id][1:3].cpu().tolist() == [-1, -1]
         finally:
             if manager is not None:
                 torch.npu.synchronize()

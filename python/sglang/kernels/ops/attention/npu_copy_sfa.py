@@ -45,7 +45,8 @@ def fused_scatter_copy_sparse_flash_attention(
     """Copy resident KV and attend to selected combined-cache tokens.
 
     Query tensors use contiguous TND ``[T, H, 512|64]`` and request-level
-    cumulative query lengths. The default mode retains the native sparse-plus-
+    cumulative query lengths. ``topk_src_ids`` and ``topk_dst_slots`` use
+    contiguous ``[T, 2048]`` tables. The default mode retains the native sparse-plus-
     tail contract. ``full_visible=True`` selects exactly K=2048 resident slots
     without appending a tail, with a request union miss list of up to 32768
     entries. The query width comes from cumulative query lengths.

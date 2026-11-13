@@ -74,7 +74,7 @@ class TestLIMKernelLoad(CustomTestCase):
 
         def native(*tensors, full_visible=False):
             # Emulate the native boundary, not the framework's tensor ordering.
-            tensors[11].copy_(torch.arange(2048, dtype=torch.int32).view(1, 1, -1))
+            tensors[11].copy_(torch.arange(2048, dtype=torch.int32).view(1, -1))
             tensors[16].copy_(tensors[7])
 
         api.fused_lightning_indexer_manage = native
@@ -87,8 +87,11 @@ class TestLIMKernelLoad(CustomTestCase):
             patch.object(torch.ops, "npu", registration),
         ):
             operator = load_fused_lim_operator()
-        ints = lambda *shape: torch.zeros(*shape, dtype=torch.int32)
-        ids, counts = ints(1, 1, 2048), ints(1)
+
+        def ints(*shape):
+            return torch.zeros(*shape, dtype=torch.int32)
+
+        ids, counts = ints(1, 2048), ints(1)
         fused_lightning_indexer_manage(
             weights=torch.ones(1, 32, dtype=torch.bfloat16),
             query=torch.ones(1, 32, 128, dtype=torch.bfloat16),
@@ -102,7 +105,7 @@ class TestLIMKernelLoad(CustomTestCase):
             request_slots=ints(1),
             slot_pool=ints(1, 4224),
             source_ids=ids,
-            device_slots=ints(1, 1, 2048),
+            device_slots=ints(1, 2048),
             topk_misses=ints(1),
             miss_sources=ints(1, 32768),
             miss_slots=ints(1, 32768),

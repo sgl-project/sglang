@@ -128,10 +128,10 @@ class BudgetPlan:
             )
         self.adapter_buffers = {
             "source_ids": BufferSpec(
-                (batch_capacity * max_query_width, 1, top_k), metadata_dtype
+                (batch_capacity * max_query_width, top_k), metadata_dtype
             ),
             "device_slots": BufferSpec(
-                (batch_capacity * max_query_width, 1, top_k), metadata_dtype
+                (batch_capacity * max_query_width, top_k), metadata_dtype
             ),
             "topk_misses": BufferSpec(
                 (batch_capacity * max_query_width,), metadata_dtype

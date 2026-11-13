@@ -53,6 +53,7 @@ def fused_lightning_indexer_manage(
 ) -> None:
     """Launch BF16/FP16, page-128, TopK-2048 native LIM.
 
+    ``source_ids`` and ``device_slots`` are preallocated ``[T, 2048]`` tables.
     The experimental full-visible mode requires a matching kernel wheel.
     """
     if query.ndim != 3 or query.shape[1] not in (32, 64) or query.shape[2] != 128:
