@@ -30,6 +30,8 @@ from PIL import Image
 from sglang.srt.multimodal import media_io
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
+from sglang.srt.runtime_context import publish, reset_context
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.nvjpeg_decoder import _NvJpegDecoderPool
 from sglang.test.test_utils import CustomTestCase
 
@@ -212,6 +214,80 @@ class TestLoadSingleItemImageDecode(CustomTestCase):
         self.assertIn(":fancy_upsampling=1", decoder.kwargs["options"])
         self.assertIs(pool._decode_params.sample_format, fake_format)
         self.assertFalse(pool._decode_params.apply_exif_orientation)
+
+
+class _DefaultDecodeProcessor(BaseMultimodalProcessor):
+    async def process_mm_data_async(self, *args, **kwargs):
+        raise NotImplementedError
+
+
+class _PinnedDecodeProcessor(_DefaultDecodeProcessor):
+    gpu_image_decode = "nvjpeg_fancy"
+
+
+class TestPilImageProcessorDecodesOnCpu(CustomTestCase):
+    """The PIL image processor needs host images, so JPEGs must not be decoded
+    with nvJPEG: that only copies the image back and leaves a CUDA context in
+    the tokenizer process. CUDA is mocked, so this runs on CPU."""
+
+    def setUp(self):
+        reset_context()
+        self.addCleanup(reset_context)
+
+    def _make(self, processor_cls=_DefaultDecodeProcessor, **server_args_fields):
+        server_args = ServerArgs(
+            model_path="dummy", mm_process_config={}, **server_args_fields
+        )
+        publish(server_args, role="tokenizer")
+        processor = processor_cls(SimpleNamespace(), server_args, Mock(), None)
+        self.addCleanup(processor.shutdown)
+        return processor
+
+    def _load_jpeg(self, processor, data):
+        """Load through the io executor the way requests do, on a mocked CUDA host."""
+        gpu_decoded = torch.zeros((3, 8, 8), dtype=torch.uint8)
+        with (
+            patch.object(media_io, "is_cuda", return_value=True),
+            patch("torchvision.io.decode_jpeg", return_value=gpu_decoded) as decode,
+        ):
+            [(_, _, future)] = processor._submit_mm_data_loading_tasks_simple(
+                [data], Modality.IMAGE, None, True
+            )
+            return future.result(), decode
+
+    def test_pil_backend_decodes_jpeg_on_cpu(self):
+        data = _jpeg_bytes()
+        reference = np.asarray(Image.open(io.BytesIO(data)).convert("RGB"))
+        for fields in (
+            {"disable_fast_image_processor": True},
+            {"image_processor_backend": "pil"},
+        ):
+            with self.subTest(**fields):
+                processor = self._make(**fields)
+                self.assertIs(processor.gpu_image_decode, False)
+                self.assertFalse(
+                    processor.preprocess_fingerprint_payload()["gpu_image_decode"]
+                )
+
+                image, decode = self._load_jpeg(processor, data)
+
+                decode.assert_not_called()
+                self.assertIsInstance(image, Image.Image)
+                np.testing.assert_array_equal(np.asarray(image), reference)
+
+    def test_fast_backend_keeps_gpu_decode(self):
+        processor = self._make()
+        self.assertIs(processor.gpu_image_decode, True)
+
+        image, decode = self._load_jpeg(processor, _jpeg_bytes())
+
+        decode.assert_called_once()
+        self.assertEqual(decode.call_args.kwargs["device"], "cuda")
+        self.assertIsInstance(image, torch.Tensor)
+
+    def test_processor_pinned_decode_mode_is_kept(self):
+        processor = self._make(_PinnedDecodeProcessor, image_processor_backend="pil")
+        self.assertEqual(processor.gpu_image_decode, "nvjpeg_fancy")
 
 
 if __name__ == "__main__":
