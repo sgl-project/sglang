@@ -38,18 +38,24 @@ def resets_swa_window(req) -> bool:
 
 def replay_len(prefix_len: int) -> int:
     """Cached tokens replayed in front of a hit's extend: the last SWA window.
-    The prefill budget, the MLP-sync row count and the fold all read this."""
+    The prefill budget, the MLP-sync row count, the backend's DP prefill-graph
+    vote and the fold all read this."""
     return min(prefix_len, 128)
 
 
-def folded_replay_rows(batch) -> int:
+def folded_replay_lens(batch) -> list[int]:
+    """Replay rows the fold prepends to each request's extend: the last SWA
+    window of every hit whose window this step resets."""
     if not batch.forward_mode.is_extend_without_speculative():
-        return 0
-    return sum(
-        replay_len(end)
+        return [0] * len(batch.prefix_lens)
+    return [
+        replay_len(end) if reset else 0
         for reset, end in zip(batch.encoder_swa_reset, batch.prefix_lens)
-        if reset
-    )
+    ]
+
+
+def folded_replay_rows(batch) -> int:
+    return sum(folded_replay_lens(batch))
 
 
 def apply_folded_extend(folded: FoldedExtend, forward_batch) -> None:

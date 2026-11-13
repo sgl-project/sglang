@@ -129,15 +129,31 @@ class TestPrefillGraphTailCapacity(CustomTestCase):
         backend.model_runner = SimpleNamespace(spec_algorithm=SpeculativeAlgorithm.NONE)
         return backend
 
-    def _both(self, extend_lens, capacity, starts=None, full=False):
+    def _both(
+        self, extend_lens, capacity, starts=None, full=False, prefix=None, resets=None
+    ):
+        """prefix: cached prefix per request. A hit whose SWA window this step
+        resets (resets, default all) reaches the forward batch with its last
+        window of the prefix folded in front of its extend, as the worker's
+        fold_encoder_swa_replay builds it after the vote."""
         hidden = CaptureHiddenMode.FULL if full else CaptureHiddenMode.NULL
-        forward_batch = _batch(extend_lens, starts, capture=hidden)
+        prefix = prefix or [0] * len(extend_lens)
+        resets = resets if resets is not None else [True] * len(extend_lens)
+        replay = [min(p, SWA_WINDOW) if r else 0 for p, r in zip(prefix, resets)]
+        forward_batch = _batch(
+            [n + r for n, r in zip(extend_lens, replay)],
+            None if starts is None else [s + r for s, r in zip(starts, replay)],
+            capture=hidden,
+        )
         forward_batch.seq_lens_cpu = torch.tensor([400] * len(extend_lens))
         schedule_batch = SimpleNamespace(
             extend_lens=extend_lens,
             extend_logprob_start_lens=starts,
             return_logprob=starts is not None,
             reqs=[SimpleNamespace(return_hidden_states_mode=hidden)] * len(extend_lens),
+            forward_mode=ForwardMode.EXTEND,
+            prefix_lens=prefix,
+            encoder_swa_reset=resets,
         )
         backend = self._backend(capacity)
         with (
@@ -161,6 +177,18 @@ class TestPrefillGraphTailCapacity(CustomTestCase):
         self.assertFalse(self._both([300, 300], 256, starts=[0, 300]))
         self.assertTrue(self._both([300, 300], 428, starts=[0, 300]))
         self.assertFalse(self._both([300], 256, full=True))
+
+    def test_folded_replay_rows_count_against_the_tail_block(self):
+        # Prompt-logprob hits on a 1024-token prefix: their 250-row extends fit
+        # a 512-row block, but the folded extends (each hit's 128 replay rows in
+        # front) do not. Every rank must see that at vote time.
+        hits = dict(starts=[0, 0], prefix=[1024, 1024])
+        self.assertFalse(self._both([250, 250], 512, **hits))
+        self.assertTrue(self._both([250, 250], 756, **hits))
+        # Requests that keep their window fold nothing.
+        self.assertTrue(self._both([250, 250], 512, resets=[False, False], **hits))
+        # Without prompt readers a tail stays one window, folded or not.
+        self.assertTrue(self._both([2, 2], 256, prefix=[1024, 1024]))
 
 
 class TestTailReadersCheck(CustomTestCase):
