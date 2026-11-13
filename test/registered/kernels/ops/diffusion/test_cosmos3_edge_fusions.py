@@ -1,4 +1,4 @@
-"""Edge's strided GQA views preserve the split BF16 norm/RoPE and UND cache."""
+"""Cosmos3's strided GQA views preserve the split BF16 norm/RoPE and UND cache."""
 
 import sys
 from unittest.mock import patch
@@ -19,18 +19,27 @@ from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 
+# Edge has 16 query heads and Nano 32, both over 8 KV heads.
+@pytest.mark.parametrize("q_heads", [16, 32])
 @pytest.mark.parametrize(
     "batch,tokens,prefix", [(1, 400, 32), (1, 1024, 64), (2, 401, 33)]
 )
 @torch.inference_mode()
-def test_edge_qk_rope_pack_matches_split(batch, tokens, prefix):
-    if torch.cuda.get_device_capability()[0] != 9:
-        pytest.skip("Split-path bitwise parity covers the newly enabled Hopper path")
+def test_qk_rope_pack_matches_split(q_heads, batch, tokens, prefix):
+    if torch.cuda.get_device_capability()[0] not in (9, 12):
+        pytest.skip("Split-path exact parity covers the Hopper and SM12x paths")
     torch.manual_seed(42)
-    qkv = torch.randn(batch, tokens, 32, 128, device="cuda", dtype=torch.bfloat16)
-    q, k, v = qkv[:, :, :16], qkv[:, :, 16:24], qkv[:, :, 24:]
+    qkv = torch.randn(
+        batch, tokens, q_heads + 16, 128, device="cuda", dtype=torch.bfloat16
+    )
+    q, k, v = (
+        qkv[:, :, :q_heads],
+        qkv[:, :, q_heads : q_heads + 8],
+        qkv[:, :, q_heads + 8 :],
+    )
     k_und = torch.randn(batch, prefix, 8, 128, device="cuda", dtype=torch.bfloat16)
     v_und = torch.randn_like(k_und)
     before = qkv.clone(), k_und.clone(), v_und.clone()
@@ -64,7 +73,7 @@ def test_edge_qk_rope_pack_matches_split(batch, tokens, prefix):
     assert torch.equal(v_out, v_ref)
     # The in-place Q/K suffix belongs to this forward; V and cached UND K/V
     # must remain reusable, including Edge's separately normalized UND keys.
-    assert torch.equal(v, before[0][:, :, 24:])
+    assert torch.equal(v, before[0][:, :, q_heads + 8 :])
     assert torch.equal(k_und, before[1])
     assert torch.equal(v_und, before[2])
 
