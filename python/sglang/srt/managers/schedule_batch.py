@@ -630,6 +630,12 @@ class Req(ReqDllmMixin):
         # time and used to estimate uncached tokens / sort by longest prefix for
         # load reporting.
         self.num_matched_prefix_tokens = 0
+        # Whether the UniBoost gamma-Ada controller already recorded this
+        # request's end-to-end latency (set in uniboost_record_finished).
+        self.uniboost_latency_recorded = False
+        # UniBoost rank-invariant mode (tp or pp > 1); set by SchedulePolicy._uniboost_assign_arrival_seq.
+        self.uniboost_arrival_seq: Optional[int] = None
+        self.uniboost_enqueue_step: Optional[int] = None
         # Tokens loaded from storage backend (L3) during prefetch for this request
         self.storage_hit_length = 0
         self.storage_hit_start: Optional[int] = None

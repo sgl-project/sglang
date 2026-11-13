@@ -115,6 +115,7 @@ def _scheduler():
     s.batch_result_processor = MagicMock()
     s.tree_cache = MagicMock()
     s._record_step_counters = Mock()
+    s.policy = MagicMock()
     s.enable_fpm = False
     s._maybe_clear_mm_inputs = Mock()
     s.maybe_send_health_check_signal = Mock()

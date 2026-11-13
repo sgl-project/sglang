@@ -707,6 +707,16 @@ class Envs:
     # Internal/testing only - users should not need to change this.
     SGLANG_PREFILL_TILE_BUDGET_MODE = EnvStr("compact")
     SGLANG_PREFILL_DELAYER_MAX_PREFILL_BS_WINDOW_SIZE = EnvInt(16)
+    # UniBoost (--schedule-policy uniboost) expert knobs.
+    # Estimated prefill cost per uncached prompt token, in microseconds.
+    SGLANG_UNIBOOST_ALPHA_US_PER_TOKEN = EnvFloat(64.0)
+    # Fall back to fcfs instead of the rank-invariant mode when tp or pp > 1.
+    SGLANG_UNIBOOST_FORCE_FCFS_MULTI_RANK = EnvBool(False)
+    # Rank-invariant mode: pseudo-seconds per arrival sequence step.
+    SGLANG_UNIBOOST_ARRIVAL_STEP_S = EnvFloat(0.01)
+    # Re-match the radix prefix only for the top-K candidates per pass;
+    # <= 0 re-matches the whole queue.
+    SGLANG_UNIBOOST_MATCH_TOPK = EnvInt(64)
 
     # ===================================================================
     # Scheduler polling, timeouts, and output

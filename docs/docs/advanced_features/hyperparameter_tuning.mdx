@@ -80,3 +80,11 @@ Data parallelism is better for throughput. When there is enough GPU memory, alwa
 - Try other quantization (e.g. FP8 quantization with `--quantization fp8`)
 - Try other parallelism strategies (e.g. [expert parallelism](https://lmsys.org/blog/2025-05-05-large-scale-ep/)) or DP attention for deepseek models (with `--attn-dp-size 8`).
 - If the workload has many shared prefixes, try `--schedule-policy lpm`. Here, `lpm` stands for longest prefix match. It reorders requests to encourage more cache hits but introduces more scheduling overhead.
+
+### Reduce tail latency with `--schedule-policy uniboost`
+
+For mixed prompt lengths, such as agentic RL rollouts, `uniboost` admits requests with little uncached prefill work ahead of long ones. Each request gets a bounded boost, so long requests keep their place in line and are not starved.
+
+- `--uniboost-gamma` (default `10.0`) sets the boost decay rate. Lower values behave more like shortest-job-first; higher values behave more like `fcfs`.
+- `--enable-uniboost-gamma-ada` tunes gamma online from the observed p95/p99 latency, so you do not have to pick it per workload.
+- With `--tp-size` or `--pp-size` above 1, the policy switches to a rank-invariant mode so every rank admits the same batch. Set `SGLANG_UNIBOOST_FORCE_FCFS_MULTI_RANK=1` to fall back to `fcfs` instead.

@@ -569,6 +569,8 @@ POSITIONAL_FIELD_ORDER = (
     "allow_local_media_files",
     "layernorm_sp_min_tokens",
     "paged_experts_host_memory_gb",
+    "uniboost_gamma",
+    "enable_uniboost_gamma_ada",
     "_max_running_requests_explicitly_set",
     "hybrid_cache_checkpoints_level",
 )
