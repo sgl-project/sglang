@@ -486,3 +486,15 @@ curl http://127.0.0.1:8000/v1/completions \
 ```
 
 > **Note:** If UCX's shared-memory transport fails to attach a peer's segment (it opens `/proc/<pid>/fd/<fd>`, which needs ptrace rights), set `UCX_POSIX_USE_PROC_LINK=n` to have it open the segment by its `/dev/shm` path instead.
+
+### KV cache sharding on the prefill server
+
+`--enable-kv-cache-sharding` on a PD prefill server stripes KV pages across the
+prefill ranks, so each rank stores and sends only its own pages and a request's KV
+can exceed one rank's pool. On XPU it supports MLA models over attention TP
+(`--attention-backend intel_xpu`, no attention CP). Each layer's prefix is
+all-gathered over XCCL into a scratch buffer that attention reads. GQA models are
+refused, because their sharding needs prefill context parallelism, which
+`intel_xpu` does not support. DSA models are refused too. Use the Mooncake or NIXL
+transfer backend, and set `SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=python` on the
+prefill server. It has not been validated on XPU hardware yet.
