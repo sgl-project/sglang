@@ -1,4 +1,11 @@
-"""Deferred DFLASH ownership, copy/export, release and fold accounting."""
+"""Deferred DFLASH ownership, checkpoint consumers and numerical contract.
+
+The oracle uses float64 sequential conv/gating/GDN, not a replay or fold
+kernel. Its explicit BF16 rounding schedule is derived from accepted lengths
+and the public ring capacity rule. The 2% max-absolute / reference-max budget
+covers BF16 conv, normalization and verify dot-product rounding on this fixed
+fixture; it is not a universal error bound or an eager-equivalence promise.
+"""
 
 import unittest
 from types import SimpleNamespace
@@ -15,11 +22,67 @@ from sglang.srt.mem_cache.gdn_replayssm_commit import (
     read_gdn_commit_stats,
 )
 from sglang.srt.mem_cache.kv.state_storage import StateStorage
+from sglang.srt.mem_cache.kv.storage import KVStorage
 from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=60, stage="base-b", runner_config="1-gpu-large")
+
+
+class _SequentialReference:
+    """Independent full-state oracle; never reads production rings/cursors."""
+
+    def __init__(self, template, layers, slots, *, width=4, capacity=16):
+        self.live = template["temporal"].double()
+        self.checkpoint = self.live.clone()
+        self.conv = template["conv"].double()
+        self.layers = layers
+        self.slots = slots.tolist()
+        self.width, self.capacity = width, capacity
+        self.depth = [0] * len(self.slots)
+        self.base = [0] * len(self.slots)
+
+    def verify_and_accept(self, inputs, accepted, track_steps):
+        outputs, tracked = [], []
+        for layer, (mixed, a, b) in zip(self.layers, inputs):
+            layer_out, layer_track = [], []
+            for i, (slot, count, track) in enumerate(
+                zip(self.slots, accepted, track_steps)
+            ):
+                span = slice(i * self.width, (i + 1) * self.width)
+                out, states, windows = fixture._gdn_reference(
+                    layer,
+                    self.conv[layer.layer_id, slot],
+                    self.live[layer.layer_id, slot],
+                    mixed[span],
+                    a[span],
+                    b[span],
+                )
+                layer_out.append(out[:count])
+                layer_track.append(states[track].bfloat16().double())
+                self.live[layer.layer_id, slot] = states[count - 1]
+                self.conv[layer.layer_id, slot] = windows[count - 1]
+            outputs.append(torch.cat(layer_out))
+            tracked.append(torch.stack(layer_track))
+        for i, (slot, count) in enumerate(zip(self.slots, accepted)):
+            self.depth[i] += count
+            # Reserve the next verify window and its commit scratch. This is
+            # a specification-level calculation, not a production helper.
+            if self.depth[i] + 2 * self.width > self.capacity:
+                self.live[:, slot] = self.live[:, slot].bfloat16().double()
+                self.checkpoint[:, slot] = self.live[:, slot]
+                self.base[i] = (self.base[i] + self.depth[i]) % self.capacity
+                self.depth[i] = 0
+        return outputs, torch.stack(tracked)
+
+    def flush(self):
+        for i, slot in enumerate(self.slots):
+            if self.depth[i]:
+                self.live[:, slot] = self.live[:, slot].bfloat16().double()
+                self.checkpoint[:, slot] = self.live[:, slot]
+                self.base[i] = (self.base[i] + self.depth[i]) % self.capacity
+                self.depth[i] = 0
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
@@ -48,6 +111,7 @@ class TestDeferredGDNCommit(CustomTestCase):
             self.template, replayssm=True, dispatcher=self.dispatcher, ring_len=16
         )
         arm.pool.mamba_cache = arm.state
+        arm.pool.mamba_layer_ids = list(range(fixture.NUM_LAYERS))
         arm.pool.get_speculative_mamba2_params_all_layers = lambda: arm.state
         arm.pool._slot_siblings = []
         arm.pool.replayssm_write_pos = None
@@ -64,6 +128,144 @@ class TestDeferredGDNCommit(CustomTestCase):
             arm.pool.replayssm_deferred_state = DeferredGDNState(arm.pool)
             arm.pool.replayssm_deferred_state.bind(self.rows, self.slots)
         return arm
+
+    def test_sequential_reference_with_capacity_and_external_flush_schedule(self):
+        arm = self.arm()
+        reference = _SequentialReference(self.template, self.layers, self.slots)
+        tracks = torch.arange(7, 13, device="cuda")
+        errors = {name: [] for name in ("output", "checkpoint", "tracked")}
+        for iteration in range(64):
+            # Different accepted prefixes and wrap points in the same batch.
+            accepted = [1 + (iteration + i) % 4 for i in range(6)]
+            track_steps = [max(0, count - 2) for count in accepted]
+            inputs = fixture._dense_inputs()
+            expected_out, expected_track = reference.verify_and_accept(
+                inputs, accepted, track_steps
+            )
+            if iteration % 3 == 1:
+                # The oracle never accepts these tokens. Non-finite rejected
+                # tails must not poison accepted outputs or future history.
+                for mixed, a, b in inputs:
+                    for i, count in enumerate(accepted):
+                        tail = slice(i * 4 + count, (i + 1) * 4)
+                        mixed[tail] = float("nan")
+                        a[tail] = float("inf")
+                        b[tail] = float("nan")
+            out = fixture._verify(
+                arm.hybrid.linear_attn_backend, self.layers, self.batch, inputs
+            )
+            arm.commit(
+                torch.tensor(accepted, device="cuda") - 1,
+                self.rows,
+                tracks,
+                torch.tensor(track_steps, device="cuda"),
+            )
+            for actual, expected in zip(out, expected_out):
+                actual = actual.reshape(-1, fixture.V_HEADS, fixture.HEAD_DIM)
+                actual = torch.cat(
+                    [actual[i * 4 : i * 4 + n] for i, n in enumerate(accepted)]
+                )
+                errors["output"].append(fixture._relative_error(actual, expected))
+            errors["checkpoint"].append(
+                fixture._relative_error(
+                    arm.state.temporal[:, self.slots],
+                    reference.checkpoint[:, self.slots],
+                )
+            )
+            errors["tracked"].append(
+                fixture._relative_error(arm.state.temporal[:, tracks], expected_track)
+            )
+            self.assertEqual(
+                arm.pool.replayssm_spec_write_pos[self.rows].tolist(), reference.depth
+            )
+            self.assertEqual(
+                arm.pool.replayssm_cache_base[self.rows].tolist(), reference.base
+            )
+            self.assertTrue(
+                torch.equal(
+                    arm.state.conv[0][:, self.slots].double(),
+                    reference.conv[:, self.slots],
+                )
+            )
+            if iteration % 11 == 3:
+                arm.pool.replayssm_deferred_state.materialize(
+                    self.slots, reason="oracle"
+                )
+                reference.flush()
+                errors["checkpoint"].append(
+                    fixture._relative_error(
+                        arm.state.temporal[:, self.slots],
+                        reference.checkpoint[:, self.slots],
+                    )
+                )
+                self.assertEqual(
+                    arm.pool.replayssm_spec_write_pos[self.rows].tolist(),
+                    reference.depth,
+                )
+                self.assertEqual(
+                    arm.pool.replayssm_cache_base[self.rows].tolist(), reference.base
+                )
+        print(
+            "\nSchedule-aware float64 reference max relative errors:",
+            {name: max(values) for name, values in errors.items()},
+        )
+        for name, values in errors.items():
+            self.assertLess(max(values), 0.02, name)
+
+    def test_checkpoint_only_forward_flushes_once_and_verify_does_not(self):
+        arm = self.arm()
+        self.dirty(arm)
+        backend = arm.hybrid.linear_attn_backend
+        # Verify consumes history directly, including a graph-padding slot.
+        backend._materialize_deferred_before_state_read(self.layers[0], self.batch)
+        self.assertEqual(int(arm.pool.replayssm_spec_write_pos[self.rows].sum()), 18)
+        for graph_prefill in (False, True):
+            if graph_prefill:
+                self.step([arm])
+            backend.prefill_graph_metadata = (
+                SimpleNamespace(cache_indices=self.padded_slots)
+                if graph_prefill
+                else None
+            )
+            batch = SimpleNamespace(
+                forward_mode=fixture.ForwardMode.EXTEND,
+                batch_size=fixture.NUM_SLOTS,
+            )
+            for layer in self.layers:
+                backend._materialize_deferred_before_state_read(layer, batch)
+            self.assertEqual(int(arm.pool.replayssm_spec_write_pos.sum()), 0)
+        self.assertEqual(
+            read_gdn_commit_stats(arm.pool)["materialize_calls"]["non_verify_forward"],
+            2,
+        )
+
+    def test_explicit_flush_is_idempotent_and_cuda_graph_replay_safe(self):
+        live, reference = self.arm(), self.arm()
+        self.dirty(live, reference)
+        state = live.pool.replayssm_deferred_state
+        # Compile on a side stream; capture itself must not consume history.
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            state.materialize(self.slots, reason="warmup")
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            state.materialize(self.slots, reason="graph")
+        before = live.state.temporal.clone()
+        graph.replay()
+        self.assertTrue(torch.equal(before, live.state.temporal))
+        reference.pool.replayssm_deferred_state.materialize(
+            self.slots, reason="reference"
+        )
+        for _ in range(8):
+            self.step([live, reference])
+            graph.replay()
+            reference.pool.replayssm_deferred_state.materialize(
+                self.slots, reason="reference"
+            )
+            self.assertTrue(torch.equal(live.state.temporal, reference.state.temporal))
+            self.assertEqual(int(live.pool.replayssm_spec_write_pos.sum()), 0)
 
     def step(self, arms, *, steps=None, tracks=None, track_steps=None):
         inputs = fixture._dense_inputs()
@@ -132,6 +334,31 @@ class TestDeferredGDNCommit(CustomTestCase):
             arm.pool.replayssm_spec_write_pos[self.rows].tolist(), [0, 0, 3, 3, 3, 3]
         )
         self.assertEqual(int(arm.state.temporal[:, self.slots[:2]].abs().sum()), 0)
+
+    def test_external_load_discards_history_and_raw_free_forgets_owner(self):
+        arm = self.arm()
+        self.dirty(arm)
+        storage = KVStorage.__new__(KVStorage)
+        storage._allocator = SimpleNamespace(
+            state=SimpleNamespace(pool=arm.pool),
+            state_slots=SimpleNamespace(free=mock.Mock()),
+            state_ids=lambda sub_pool: SimpleNamespace(ids=lambda slots: slots),
+        )
+        # A layer-gated external load replaces the whole checkpoint. Adoption
+        # must discard the old factors, preserving the current row binding.
+        arm.state.temporal[:, self.slots[:1]] = 0.25
+        storage.restart_replay("mamba", self.slots[:1])
+        arm.pool.replayssm_deferred_state.materialize(self.slots[:1], reason="loaded")
+        self.assertTrue(bool((arm.state.temporal[:, self.slots[:1]] == 0.25).all()))
+        self.assertEqual(int(arm.pool.replayssm_spec_write_pos[self.rows[0]]), 0)
+        storage.free_state_slots("mamba", self.slots[1:2])
+        self.assertEqual(int(arm.pool.replayssm_spec_write_pos[self.rows[1]]), 0)
+        self.assertEqual(
+            int(arm.pool.replayssm_deferred_state.slot_to_row[self.slots[1]]), -1
+        )
+        self.assertEqual(
+            arm.pool.replayssm_spec_write_pos[self.rows[2:]].tolist(), [3] * 4
+        )
 
     def test_release_unbinds_active_owner_before_slot_reuse(self):
         arm = self.arm()

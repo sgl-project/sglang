@@ -945,6 +945,26 @@ class GDNAttnBackend(MambaAttnBackendBase):
             retrieve_parent_token
         )
 
+    def _materialize_deferred_before_state_read(self, layer, forward_batch):
+        # Metadata preparation can run on the planning stream. Drain on the
+        # forward stream, once for all layers, before checkpoint-only readers.
+        # Target verify already consumes checkpoint + accepted ring history.
+        if forward_batch.forward_mode.is_target_verify():
+            return
+        pool = getattr(self, "state_pool", None)
+        deferred = getattr(pool, "replayssm_deferred_state", None)
+        if deferred is None or layer.layer_id != pool.mamba_layer_ids[0]:
+            return
+        meta = self.prefill_graph_metadata
+        indices = (
+            meta.cache_indices
+            if meta is not None
+            else self.forward_metadata.mamba_cache_indices
+        )
+        deferred.materialize(
+            indices[: forward_batch.batch_size], reason="non_verify_forward"
+        )
+
     def forward_decode(
         self,
         layer: RadixLinearAttention,
@@ -962,6 +982,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         if _is_hip and isinstance(mixed_qkv, torch.Tensor) and mixed_qkv.shape[0] == 0:
             return mixed_qkv.new_zeros((1, 0, layer.num_v_heads, layer.head_v_dim))
 
+        self._materialize_deferred_before_state_read(layer, forward_batch)
         layer_cache = self.state_layer_cache(layer.layer_id)
         conv_states = layer_cache.conv[0]
         ssm_states = layer_cache.temporal
@@ -1317,6 +1338,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         if _is_hip and seq_len == 0:
             return mixed_qkv.new_zeros((1, 0, layer.num_v_heads, layer.head_v_dim))
 
+        self._materialize_deferred_before_state_read(layer, forward_batch)
         is_target_verify = forward_batch.forward_mode.is_target_verify()
         if self.prefill_graph_metadata is not None and not is_target_verify:
             return self._forward_extend_in_graph(

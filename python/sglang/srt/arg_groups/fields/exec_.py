@@ -641,7 +641,7 @@ class ExecMamba(msgspec.Struct):
     linear_replayssm_spec_commit_policy: A[
         str,
         Arg(
-            help="GDN DFLASH ReplaySSM commit policy. eager materializes every accepted window; deferred retains accepted factors across rounds and changes BF16 rounding frequency. Experimental: BF16, static pool/verify, PP1, no PD, extra_buffer_lazy only.",
+            help="GDN DFLASH ReplaySSM commit policy. eager materializes every accepted window (default); deferred retains accepted factors across rounds, flushing at capacity or checkpoint-only reads. BF16 rounding and generated tokens may differ from eager. Experimental: BF16, static pool/verify, PP1, no PD, extra_buffer_lazy only.",
             choices=["eager", "deferred"],
         ),
     ] = "eager"

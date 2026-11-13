@@ -553,7 +553,8 @@ def handle_linear_attn_backend(server_args: Any):
         elif cfg.linear_replayssm_spec_commit_policy == "deferred":
             logger.warning(
                 "Experimental deferred GDN commit retains accepted history; "
-                "BF16 checkpoint rounding occurs at capacity folds. "
+                "BF16 checkpoint rounding occurs at capacity folds and "
+                "checkpoint-only reads; eager token equivalence is not guaranteed. "
                 "Validate long-generation accuracy and throughput."
             )
         elif cfg.mamba_ssm_dtype != "float32":

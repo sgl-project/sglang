@@ -3,6 +3,18 @@
 The active state is a checkpoint plus request-keyed accepted factors. Cached
 tracking slots remain self-contained checkpoints. Slot operations run on the
 same forward stream as the state pool; CPU export also synchronizes it.
+
+Numerical contract: the GDN recurrence is unchanged, but BF16 checkpoint
+rounding is part of the execution schedule. Deferred commit rounds the active
+checkpoint only at a capacity fold or an external checkpoint-only read. A
+tracking checkpoint is rounded independently and does not drain active history.
+Verify/commit retains only accepted factors; rejected drafts are overwritten.
+An explicit flush is a BF16 rounding boundary, so inserting a flush need not
+preserve subsequent states, logits, or generated tokens bit for bit. Compare
+against a sequential reference with the same flush schedule, not eager's
+different rounding schedule. Kernel arithmetic also has finite precision;
+unit tests bound that error on fixed inputs rather than promise a universal
+model-level accuracy or token-equivalence guarantee.
 """
 
 from collections import Counter
