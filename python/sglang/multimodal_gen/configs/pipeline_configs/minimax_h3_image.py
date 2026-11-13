@@ -56,9 +56,8 @@ class MiniMaxH3ImagePipelineConfig(MiniMaxH3PipelineConfig):
         ModelTaskType.T2I,
         ModelTaskType.I2I,
     )
-    # One checkpoint serves both image tasks, so its prebuilt AdaLN sidecar
-    # names the release itself rather than a video variant; --model-variant
-    # stays rejected below because the release metadata selects the task.
+    # One checkpoint serves both image tasks, so its sidecar names the release
+    # itself; --model-variant stays rejected because metadata selects the task.
     minimax_h3_adaln_cache_variants: ClassVar[tuple[str, ...]] = ("image",)
     # The image decoder runs with BF16 weights under BF16 autocast.
     vae_decode_precision: str = "bf16"
@@ -322,9 +321,8 @@ class MiniMaxH3ImagePipelineConfig(MiniMaxH3PipelineConfig):
 
     def _configure_online_adaln(self, server_args) -> None:
         if server_args.minimax_h3_adaln_cache_path is not None:
-            # A prebuilt sidecar already covers the fixed PDD grid: serving it
-            # must not fall back to the per-request rebuild, which would both
-            # need the adaln_proj weights back and duplicate the plans.
+            # A prebuilt sidecar already covers the fixed PDD grid; falling
+            # back to the rebuild would need the adaln_proj weights again.
             if server_args.minimax_h3_adaln_online:
                 raise ValueError(
                     "--minimax-h3-adaln-online and --minimax-h3-adaln-cache-path "

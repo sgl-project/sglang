@@ -163,8 +163,7 @@ def test_sidecar_resolve_slots_and_block_all_match_per_step_paths(tmp_path):
     cache = MiniMaxH3AdalnCache(_ARCH, path=str(cache_path), model_variant="fl2va")
     cache.load(torch.device("cpu"))
 
-    # A prebuilt sidecar's capacity is what it holds: the warmup planner reads
-    # these two to decide whether the file also covers the other image task.
+    # Capacity must report the file's shape, not the online defaults.
     assert cache.max_plans == 2
     assert cache.max_plan_width == 2
 
@@ -186,12 +185,7 @@ def test_sidecar_resolve_slots_and_block_all_match_per_step_paths(tmp_path):
 
 
 def test_sidecar_capacity_reports_file_shape(tmp_path):
-    """A narrow sidecar must not look wide enough for the other image task.
-
-    Path mode has no rebuild to fall back on, so the warmup planner's "can
-    this file also reserve the other task's grid" check has to read the file's
-    real shape (3 plans x 1 timestep) rather than the online defaults.
-    """
+    """A 3x1 sidecar must not look wide enough for the other image task."""
     cache_path = tmp_path / "adaln.safetensors"
     save_file(
         {

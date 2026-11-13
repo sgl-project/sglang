@@ -450,8 +450,8 @@ class TransformerLoader(OnlineQuantizationComponentLoader):
             cache_variants = server_args.pipeline_config.minimax_h3_adaln_cache_variants
             adaln_cache_variant = component_server_args.model_variant
             if adaln_cache_variant is None and len(cache_variants) == 1:
-                # A release with one implicit variant (MiniMax H3 image) rejects
-                # --model-variant; its sidecar names the release instead.
+                # Image takes no --model-variant; its sidecar names the
+                # release instead.
                 adaln_cache_variant = cache_variants[0]
             if adaln_cache_variant not in cache_variants:
                 raise ValueError(
