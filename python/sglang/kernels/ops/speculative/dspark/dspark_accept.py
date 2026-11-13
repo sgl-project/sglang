@@ -129,9 +129,8 @@ def _accept_sampling_core(
     plain = (
         not sampling_info.need_top_k_sampling and not sampling_info.need_top_p_sampling
     )
-    # FLy rewrites per-token chain-rule draws: block verification has none, and the
-    # NPU sampler lays them out over the candidate width.
-    if block_verification or _is_npu:
+    # FLy rewrites per-token chain-rule draws, which block verification does not use.
+    if block_verification:
         fly = None
     if (
         _SPLIT_ACCEPT

@@ -282,11 +282,9 @@ class DSparkWorkerV2(BaseSpecWorker):
                 entropy_threshold=get_spec().speculative_fly_entropy_threshold,
                 entropy_top_k=get_spec().speculative_fly_entropy_top_k,
             )
-            if get_spec().speculative_use_fly
+            if is_hip() and get_spec().speculative_use_fly
             else None
         )
-        if self._fly is not None:
-            logger.info("DSpark FLy verification on: %s", self._fly)
 
         parallel = get_parallel()
         self._tp_sync = SpecTpSync(get_dp_tp_group())

@@ -309,8 +309,7 @@ def chain_speculative_sampling_split(
     """``chain_speculative_sampling_triton`` from the target logits and the
     requests' temperatures (the softmax folded in), the vocabulary split over
     SPLITS CTAs. ``target_logits`` [bs x num_slots, vocab]; ``draft_probs``
-    [bs, num_slots - 1, vocab]. ``fly`` first zeroes the draws (a copy of
-    ``uniform_samples``) of the slots it defers, inside ``verify_lens`` [bs]."""
+    [bs, num_slots - 1, vocab]."""
     bs, num_slots = candidates.shape
     vocab = target_logits.shape[-1]
     device = candidates.device

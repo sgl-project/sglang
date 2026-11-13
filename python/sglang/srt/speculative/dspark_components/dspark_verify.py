@@ -1335,9 +1335,6 @@ def accept_draft_tokens(
     rejection_noise: Optional[RejectionNoise] = None,
     fly: Optional[FlyConfig] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """``fly`` applies to the greedy accept and the chain-rule sampling accepts (on
-    the vocab shards, split or classic); block verification and block-wise rejection
-    keep their native acceptance."""
     greedy_mask = draft_block.greedy_mask
     cutoff_verify_lens = None if cutoff_layout is None else cutoff_layout.verify_lens
     all_greedy = sampling_info is None or sampling_info.is_all_greedy

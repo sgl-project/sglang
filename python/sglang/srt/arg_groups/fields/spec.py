@@ -124,9 +124,9 @@ class Spec(msgspec.Struct):
     ] = False
     speculative_use_fly: A[
         bool,
-        "DSPARK only. Verify with FLy (entropy-gated deferred verification): a "
-        "rejected draft token is accepted when the target top-k entropy there is at "
-        "least --speculative-fly-entropy-threshold and the next "
+        "DSPARK on ROCm only. Verify with FLy (entropy-gated deferred verification): "
+        "a rejected draft token is accepted when the target top-k entropy there is "
+        "at least --speculative-fly-entropy-threshold and the next "
         "--speculative-fly-window-size drafts all pass native verification. Applies "
         "to greedy requests and to the chain-rule accept of sampled ones (not with "
         "block verification or block-wise rejection). Lossy: it does not preserve "

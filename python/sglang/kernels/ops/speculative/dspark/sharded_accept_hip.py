@@ -102,33 +102,6 @@ def _stats_kernel(
 
 
 @triton.jit
-def _merged_p_q(
-    STATS,
-    b,
-    BS,
-    SLOTS: tl.constexpr,
-    SLOTS_P2: tl.constexpr,
-    WORLD: tl.constexpr,
-    WORLD_P2: tl.constexpr,
-):
-    """Per slot of request b: the ranks' stats merged into (t_m, t_s, d_m, d_s, p(x),
-    q(x)), p and q of the drafted token x."""
-    slot = tl.arange(0, SLOTS_P2)
-    rank = tl.arange(0, WORLD_P2)
-    mask = (slot < SLOTS)[:, None] & (rank < WORLD)[None, :]
-    stats = STATS + (rank[None, :] * BS * SLOTS + b * SLOTS + slot[:, None]) * 6
-    t_m, t_s = _merge(
-        tl.load(stats, mask, -float("inf")), tl.load(stats + 1, mask, 0.0)
-    )
-    d_m, d_s = _merge(
-        tl.load(stats + 3, mask, -float("inf")), tl.load(stats + 4, mask, 0.0)
-    )
-    p_x = tl.exp(tl.max(tl.load(stats + 2, mask, -float("inf")), 1) - t_m) / t_s
-    q_x = tl.exp(tl.max(tl.load(stats + 5, mask, -float("inf")), 1) - d_m) / d_s
-    return t_m, t_s, d_m, d_s, p_x, q_x
-
-
-@triton.jit
 def _fly_kernel(
     STATS,
     TARGET,
@@ -157,8 +130,18 @@ def _fly_kernel(
     the whole target row, so the ranks agree.
     """
     b = tl.program_id(0)
-    _, _, _, _, p_x, q_x = _merged_p_q(STATS, b, BS, SLOTS, SLOTS_P2, WORLD, WORLD_P2)
     slot = tl.arange(0, SLOTS_P2)
+    rank = tl.arange(0, WORLD_P2)
+    mask = (slot < SLOTS)[:, None] & (rank < WORLD)[None, :]
+    stats = STATS + (rank[None, :] * BS * SLOTS + b * SLOTS + slot[:, None]) * 6
+    t_m, t_s = _merge(
+        tl.load(stats, mask, -float("inf")), tl.load(stats + 1, mask, 0.0)
+    )
+    d_m, d_s = _merge(
+        tl.load(stats + 3, mask, -float("inf")), tl.load(stats + 4, mask, 0.0)
+    )
+    p_x = tl.exp(tl.max(tl.load(stats + 2, mask, -float("inf")), 1) - t_m) / t_s
+    q_x = tl.exp(tl.max(tl.load(stats + 5, mask, -float("inf")), 1) - d_m) / d_s
     u, _, _, _ = _philox(KEY, slot, b, _ACCEPT_STEP, OFFSET)
     in_draft = slot < SLOTS - 1
     native = in_draft & (q_x > 0.0) & (tl.uint_to_uniform_float(u) * q_x < p_x)
@@ -237,9 +220,17 @@ def _accept_kernel(
 
     # 1. Merge the ranks' stats into p(x) and q(x).
     slot = tl.arange(0, SLOTS_P2)
-    t_m, t_s, d_m, d_s, p_x, q_x = _merged_p_q(
-        STATS, b, BS, SLOTS, SLOTS_P2, WORLD, WORLD_P2
+    rank = tl.arange(0, WORLD_P2)
+    mask = (slot < SLOTS)[:, None] & (rank < WORLD)[None, :]
+    stats = STATS + (rank[None, :] * BS * SLOTS + b * SLOTS + slot[:, None]) * 6
+    t_m, t_s = _merge(
+        tl.load(stats, mask, -float("inf")), tl.load(stats + 1, mask, 0.0)
     )
+    d_m, d_s = _merge(
+        tl.load(stats + 3, mask, -float("inf")), tl.load(stats + 4, mask, 0.0)
+    )
+    p_x = tl.exp(tl.max(tl.load(stats + 2, mask, -float("inf")), 1) - t_m) / t_s
+    q_x = tl.exp(tl.max(tl.load(stats + 5, mask, -float("inf")), 1) - d_m) / d_s
 
     # 2. Accepted length, capped by VERIFY_LENS; block 0 writes LENS.
     u, _, _, _ = _philox(KEY, slot, b, _ACCEPT_STEP, OFFSET)
