@@ -78,102 +78,6 @@ if _is_npu:
         transfer_kv_per_layer_kv_split_pf_lf,
     )
 
-    # (is_host_pf, is_d2h) -> kv_exchange operator
-    _NPU_KV_SPLIT_IMPLS = {
-        (True, False): transfer_kv_per_layer_kv_split_pf_lf,
-        (False, False): transfer_kv_per_layer_kv_split,
-        (True, True): transfer_kv_all_layer_kv_split_lf_pf,
-        (False, True): transfer_kv_all_layer_kv_split,
-    }
-
-    def transfer_kv_split_npu(
-        device_indices,
-        host_indices,
-        device_k,
-        host_k,
-        device_v,
-        host_v,
-        device_index_k=None,
-        host_index_k=None,
-        device_index_k_scale=None,
-        host_index_k_scale=None,
-        page_size=128,
-        *,
-        is_host_pf,
-        is_d2h,
-        device_layer_id=None,
-        host_layer_id=None,
-        device_index_layer_id=None,
-        host_index_layer_id=None,
-        host_layer_start=0,
-        impl="auto",
-    ):
-        """Dispatches to one of the four split operators by (is_host_pf, is_d2h)
-
-        Compressed pools exchange KV and Indexer in two calls.
-        """
-        impl_op = _NPU_KV_SPLIT_IMPLS[(is_host_pf, is_d2h)]
-        # compressed indexer pages
-        compressed = device_index_k is not None and device_index_k.shape[2] != page_size
-        if is_d2h:
-            layer_kwargs = dict(host_layer_start=host_layer_start)
-            index_layer_kwargs = dict(host_layer_start=0)
-        elif compressed:
-            # Native operators require one page_size for every component:
-            # compressed Indexer pages are exchanged by the second call below.
-            layer_kwargs = dict(
-                device_layer_id=device_layer_id,
-                host_layer_id=host_layer_id,
-            )
-            index_layer_kwargs = dict(
-                device_layer_id=device_index_layer_id,
-                host_layer_id=host_index_layer_id,
-            )
-        else:
-            layer_kwargs = dict(
-                device_layer_id=device_layer_id,
-                host_layer_id=host_layer_id,
-                device_index_layer_id=device_index_layer_id,
-                host_index_layer_id=host_index_layer_id,
-            )
-            index_layer_kwargs = dict(
-                device_layer_id=device_index_layer_id,
-                host_layer_id=host_index_layer_id,
-            )
-        impl_op(
-            device_indices=device_indices,
-            host_indices=host_indices,
-            device_k=device_k,
-            host_k=host_k,
-            device_v=device_v,
-            host_v=host_v,
-            device_index_k=None if compressed else device_index_k,
-            host_index_k=None if compressed else host_index_k,
-            device_index_k_scale=None if compressed else device_index_k_scale,
-            host_index_k_scale=None if compressed else host_index_k_scale,
-            page_size=page_size,
-            **layer_kwargs,
-            impl=impl,
-        )
-        if not compressed or (host_index_k is None and host_index_k_scale is None):
-            return
-        # Indexer only transfer in compressed layout
-        ratio = page_size // device_index_k.shape[2]
-        impl_op(
-            device_indices=device_indices[::ratio] // ratio,
-            host_indices=host_indices[::ratio] // ratio,
-            device_k=device_index_k,
-            host_k=host_index_k,
-            device_v=device_index_k.new_empty(0),
-            host_v=host_k.new_empty(0),
-            device_index_k=device_index_k_scale,
-            host_index_k=host_index_k_scale,
-            page_size=device_index_k.shape[2],
-            **index_layer_kwargs,
-            impl=impl,
-        )
-
-
 logger = logging.getLogger(__name__)
 
 
@@ -765,19 +669,61 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
         elif io_backend == "kernel_ascend":
-            if self.layout not in ("page_first_kv_split", "layer_first_kv_split"):
+            if self.layout == "page_first_kv_split":
+                transfer = transfer_kv_per_layer_kv_split_pf_lf
+            elif self.layout == "layer_first_kv_split":
+                transfer = transfer_kv_per_layer_kv_split
+            else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
             binding = self._npu_layer_bindings[layer_id]
             if binding is None:
                 return
-            transfer_kv_split_npu(
-                device_indices=device_indices,
-                host_indices=host_indices,
-                is_host_pf=self.layout == "page_first_kv_split",
-                is_d2h=False,
-                **binding,
-                impl="auto",
+            compressed = (
+                binding["device_index_k"] is not None
+                and binding["device_index_k"].shape[2] != binding["page_size"]
             )
+            if compressed:
+                # compressed Indexer pages use a different page table
+                transfer(
+                    device_indices=device_indices,
+                    host_indices=host_indices,
+                    **{
+                        key: value
+                        for key, value in binding.items()
+                        if key
+                        not in (
+                            "device_index_k",
+                            "host_index_k",
+                            "device_index_k_scale",
+                            "host_index_k_scale",
+                            "device_index_layer_id",
+                            "host_index_layer_id",
+                        )
+                    },
+                    impl="auto",
+                )
+                ratio = binding["page_size"] // binding["device_index_k"].shape[2]
+                transfer(
+                    device_indices=device_indices[::ratio] // ratio,
+                    host_indices=host_indices[::ratio] // ratio,
+                    device_k=binding["device_index_k"],
+                    host_k=binding["host_index_k"],
+                    device_v=binding["device_index_k"].new_empty(0),
+                    host_v=binding["host_index_k"].new_empty(0),
+                    device_index_k=binding["device_index_k_scale"],
+                    host_index_k=binding["host_index_k_scale"],
+                    page_size=binding["device_index_k"].shape[2],
+                    device_layer_id=binding["device_index_layer_id"],
+                    host_layer_id=binding["host_index_layer_id"],
+                    impl="auto",
+                )
+            else:
+                transfer(
+                    device_indices=device_indices,
+                    host_indices=host_indices,
+                    **binding,
+                    impl="auto",
+                )
         else:
             raise ValueError(f"Unsupported IO backend: {io_backend}")
 
@@ -1102,25 +1048,61 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
         elif io_backend == "kernel_ascend":
-            if self.layout not in ("page_first_kv_split", "layer_first_kv_split"):
+            if self.layout == "page_first_kv_split":
+                transfer = transfer_kv_all_layer_kv_split_lf_pf
+            elif self.layout == "layer_first_kv_split":
+                transfer = transfer_kv_all_layer_kv_split
+            else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
             for native, host_k, host_v, is_target in self._npu_pool_bindings:
-                transfer_kv_split_npu(
-                    device_indices=device_indices,
-                    host_indices=host_indices,
-                    is_host_pf=self.layout == "page_first_kv_split",
-                    is_d2h=True,
-                    device_k=native.k,
-                    host_k=host_k,
-                    device_v=native.v,
-                    host_v=host_v,
-                    device_index_k=native.index_k,
-                    host_index_k=self.index_k_buffer if is_target else None,
-                    device_index_k_scale=native.index_scales,
-                    host_index_k_scale=self.index_k_scale_buffer if is_target else None,
-                    page_size=self.page_size,
-                    impl="auto",
+                compressed = (
+                    native.index_k is not None
+                    and native.index_k.shape[2] != self.page_size
                 )
+                if compressed:
+                    # compressed Indexer pages use a different page table
+                    transfer(
+                        device_indices=device_indices,
+                        host_indices=host_indices,
+                        device_k=native.k,
+                        host_k=host_k,
+                        device_v=native.v,
+                        host_v=host_v,
+                        page_size=self.page_size,
+                        impl="auto",
+                    )
+                    if is_target:
+                        ratio = self.page_size // native.index_k.shape[2]
+                        transfer(
+                            device_indices=device_indices[::ratio] // ratio,
+                            host_indices=host_indices[::ratio] // ratio,
+                            device_k=native.index_k,
+                            host_k=self.index_k_buffer,
+                            device_v=native.index_k.new_empty(0),
+                            host_v=host_k.new_empty(0),
+                            device_index_k=native.index_scales,
+                            host_index_k=self.index_k_scale_buffer,
+                            page_size=native.index_k.shape[2],
+                            host_layer_start=0,
+                            impl="auto",
+                        )
+                else:
+                    transfer(
+                        device_indices=device_indices,
+                        host_indices=host_indices,
+                        device_k=native.k,
+                        host_k=host_k,
+                        device_v=native.v,
+                        host_v=host_v,
+                        device_index_k=native.index_k,
+                        host_index_k=self.index_k_buffer if is_target else None,
+                        device_index_k_scale=native.index_scales,
+                        host_index_k_scale=(
+                            self.index_k_scale_buffer if is_target else None
+                        ),
+                        page_size=self.page_size,
+                        impl="auto",
+                    )
         else:
             raise ValueError(f"Unsupported IO backend: {io_backend}")
 
