@@ -68,8 +68,9 @@ def _rel_l2(a, b):
     return ((a - b).norm() / b.norm()).item()
 
 
-# 1-64 rows run one row tile, 65+ rows several.
-@pytest.mark.parametrize("rows", [1, 17, 64, 65, 193])
+# 1-64 rows run one row tile, 65+ rows several; the reduction's row tile is 1, 2,
+# 4 and 8 rows at 1-8, 9-16, 17-32 and 33+ rows.
+@pytest.mark.parametrize("rows", [1, 9, 17, 64, 65, 193])
 @pytest.mark.parametrize("combine", [True, False])
 def test_hc_seam_matches_fp64_reference(rows, combine):
     gen = torch.Generator(device="cuda").manual_seed(rows)

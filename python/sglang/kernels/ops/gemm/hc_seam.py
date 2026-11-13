@@ -42,7 +42,7 @@ KA_KB = 256  # row chunk per K_a program (divides HS)
 KA_BK = 64
 KA_BN = 64
 KA_WARPS = 4
-KF_BM = 8
+KF_BM = 8  # K_f's largest row tile; _kf_bm(rows) picks the tile per call
 KF_BL = 16
 KF_BKG = 512
 KB_BJ = 16
@@ -333,6 +333,12 @@ def _workspace(device: torch.device):
     return ws
 
 
+def _kf_bm(rows: int) -> int:
+    # next_pow2(rows) / 8 rows per program, 1..KF_BM. A fixed 8-row tile ran one to four row programs at 1-32
+    # rows, where the seam call was 1.2-2.0 us slower (gfx950).
+    return min(KF_BM, max(1, triton.next_power_of_2(rows) // 8))
+
+
 def hc_seam_supported(rows: int, x: torch.Tensor) -> bool:
     return (
         0 < rows <= MAX_ROWS
@@ -413,8 +419,9 @@ def hc_seam(
         num_warps=KA_WARPS,
     )
     nlt = triton.cdiv(LOWRANK, KF_BL)
+    kf_bm = _kf_bm(rows)
     _hc_seam_reduce_kernel[
-        (triton.cdiv(rows, KF_BM), nlt + (KF_BM * HC if has_gate else 0))
+        (triton.cdiv(rows, kf_bm), nlt + (kf_bm * HC if has_gate else 0))
     ](
         ws["p"],
         ws["ss"],
@@ -430,7 +437,7 @@ def hc_seam(
         HS_=HS,
         L=LOWRANK,
         KB=KA_KB,
-        BM=KF_BM,
+        BM=kf_bm,
         BL=KF_BL,
         BKG=KF_BKG,
         NKP=triton.next_power_of_2(HS // KA_KB),
