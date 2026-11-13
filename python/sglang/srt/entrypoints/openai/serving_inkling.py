@@ -16,6 +16,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     FunctionResponse,
     ResponsesRequest,
     ToolCall,
+    ToolChoice,
 )
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.parser.inkling_output import (
@@ -100,9 +101,14 @@ class InklingChatEncodingAdapter:
         if reasoning_effort is None:
             reasoning_effort = self._default_reasoning_effort
         assistant_prefix = _pop_assistant_prefix(messages, request)
+        tool_choice = request.tool_choice
+        if isinstance(tool_choice, ToolChoice):
+            tool_choice = tool_choice.model_dump()
         prompt_ids = render_inkling_messages(
             messages,
             tools=tools,
+            tool_choice=tool_choice,
+            parallel_tool_calls=request.parallel_tool_calls,
             reasoning_effort=reasoning_effort,
             spec=self._spec,
         )

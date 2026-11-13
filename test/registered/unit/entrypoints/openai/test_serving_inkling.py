@@ -100,19 +100,52 @@ class InklingPromptTest(unittest.TestCase):
         publish(ServerArgs(model_path="dummy"), role="tokenizer")
         self.serving = _inkling_serving()
 
-    def _encode(self, messages, **request_kwargs) -> list[int]:
+    def _encode(self, messages, tools=None, **request_kwargs) -> list[int]:
         request = ChatCompletionRequest(
             model="test-model",
             messages=messages,
             reasoning_effort=0.5,
+            tools=tools,
             **request_kwargs,
         )
         return self.serving._encode_messages(
             [message.model_dump() for message in request.messages],
             request,
             thinking_mode=None,
+            tools=[tool.model_dump() for tool in request.tools or ()] or None,
             image_data=[],
         )
+
+    def test_tool_choice_reaches_the_prompt(self):
+        """tool_choice and parallel_tool_calls become the instruction appended to
+        the first system message."""
+        tools = [
+            {
+                "type": "function",
+                "function": {"name": "weather", "parameters": {"type": "object"}},
+            }
+        ]
+        user = {"role": "user", "content": "hi"}
+        tokenizer = load_tml_renderers().tokenizer
+        cases = [
+            (
+                {"tool_choice": {"type": "function", "function": {"name": "weather"}}},
+                'Call the function named "weather" in your next response.',
+            ),
+            (
+                {"tool_choice": "required", "parallel_tool_calls": False},
+                "Call exactly one of the provided functions in your next response.",
+            ),
+        ]
+        for request_kwargs, instruction in cases:
+            with self.subTest(instruction=instruction):
+                prompt = tokenizer.decode(
+                    self._encode([user], tools=tools, **request_kwargs)
+                )
+                self.assertIn(
+                    f"Thinking effort level: 0.5\n\n{instruction}<|end_message|>",
+                    prompt,
+                )
 
     def test_prompt_tail(self):
         """Ordinary requests end at the last closed message; continue_final_message
