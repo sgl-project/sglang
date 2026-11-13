@@ -128,6 +128,26 @@ or pass `--minimax-h3-adaln-online false`, to avoid the rebuild cost. Other
 GPUs keep projection weights by default; explicit online precomputation is
 available through **Precompute**.
 
+The fixed six-step schedule also admits a prebuilt cache, which skips the
+per-process rebuild entirely. Build one from the release's own PDD grid; a
+single file holds both the text-to-image and editing plans.
+
+```bash
+python -m sglang.multimodal_gen.tools.build_minimax_h3_adaln_cache \
+  --transformer-path "$MODEL_PATH/transformer" \
+  --model-variant image \
+  --mode image \
+  --pdd-config "$MODEL_PATH/pdd_config.json" \
+  --output /models/minimax-h3-image-adaln-6step.safetensors
+
+sglang serve --model-path "$MODEL_PATH" \
+  --minimax-h3-adaln-cache-path /models/minimax-h3-image-adaln-6step.safetensors
+```
+
+The image release has one implicit variant, so the server takes no
+`--model-variant`; the cache metadata must name `image`. A text-to-image-only
+cache still serves text-to-image, but editing requests need the two-task file.
+
 `quality=lossless` is the default. It enables shared DiT and VAE QK-norm/RoPE
 fusion, uses cuDNN SDPA in the VAE with a backend fallback, and batches existing
 overlapping VAE decode tiles, with at most 128 samples per tile batch.

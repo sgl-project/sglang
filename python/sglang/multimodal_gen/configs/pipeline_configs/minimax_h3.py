@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import os
 from dataclasses import dataclass, field
+from typing import ClassVar
 
 import torch
 
@@ -46,6 +47,11 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
         "audio_vae",
     )
     task_type: ModelTaskType = ModelTaskType.TI2V
+    # Model variants a prebuilt AdaLN sidecar may name. The loader hands the
+    # resolved variant to the cache, so a sidecar built from other weights
+    # fails at load instead of serving the wrong conditioning. A release that
+    # has one implicit variant (the image pipeline) overrides this.
+    minimax_h3_adaln_cache_variants: ClassVar[tuple[str, ...]] = ("fl2va", "ref2va")
     dit_config: MiniMaxH3DiTConfig = field(default_factory=MiniMaxH3DiTConfig)
     vae_config: MiniMaxH3VideoVAEConfig = field(default_factory=MiniMaxH3VideoVAEConfig)
     audio_vae_config: MiniMaxH3AudioVAEConfig = field(
