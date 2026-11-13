@@ -85,6 +85,7 @@ class _Backend:
     call: Callable[[Any], Any]
     close: Callable[[], None]
     capture: Callable[[], ContextManager] = contextlib.nullcontext
+    prepare: Optional[Callable[[List[int]], None]] = None
     impl: str = ""
     note: str = ""
 
@@ -104,6 +105,29 @@ def _normalize_sizes(sizes: List[int]) -> List[int]:
 # ---------------------------------------------------------------------------
 # Timing
 # ---------------------------------------------------------------------------
+
+
+def _reclaim_size_cache(tries: int = 8) -> None:
+    """Give this size's cached blocks back to the driver.
+
+    Communicator workspaces stay allocated for the whole sweep, so this does
+    not wait for the device to read empty. It stops when ``empty_cache`` no
+    longer shrinks the cache, or after ``tries``.
+    """
+    import gc
+
+    import torch
+
+    gc.collect()
+    torch.cuda.synchronize()
+    previous = None
+    for _ in range(tries):
+        torch.cuda.empty_cache()
+        reserved = torch.cuda.memory_reserved()
+        if reserved <= torch.cuda.memory_allocated() or reserved == previous:
+            return
+        previous = reserved
+        torch.cuda.synchronize()
 
 
 def _time_eager(
@@ -554,20 +578,24 @@ def _open_quick_allreduce(quant, cpu_group, device, cast_bf16_to_fp16: bool):
     )
 
 
-# FlyDSL QuickReduce refuses a payload under this floor, and its buffer window
-# is 4 GiB. Both are properties of the kernel, checked here so a declined size
-# is a skip rather than an exception inside the timed loop.
-_FLYDSL_MIN_BYTES = 128 * 1024
+# FlyDSL INT4 accepts any contiguous bf16 payload up to this window. The
+# check lives here so a declined size is a skip, not an exception in the
+# timed loop. This is a different workspace from HIP QuickReduce.
 _FLYDSL_MAX_BYTES = 4 * 1024**3
 _FLYDSL_ALIGN = 16
+_FLYDSL_WARMUP_BYTES = 1024 * 1024
 
 
-def _open_quick_allreduce_flydsl(cpu_group, device, algorithm: str, codec: str):
-    """AITER FlyDSL QuickReduce. Mesh INT4 is the selection's second QR kernel.
+def _open_quick_allreduce_flydsl(cpu_group, device):
+    """AITER ``QuickAllReduceInt4``, separate from the HIP QuickReduce row.
 
-    The constructor exchanges IPC handles on ``cpu_group``, so every rank
-    calls it. The launch is out of place into a caller-provided buffer and
-    has no capture context, same as HIP QuickReduce.
+    The HIP row opens ``sglang``'s ``QuickAllReduce``. This row opens
+    ``aiter.ops.flydsl.QuickAllReduceInt4`` on its own IPC workspace, so a
+    bf16 payload is timed on FlyDSL without taking the HIP dispatch. The
+    constructor exchanges IPC handles on ``cpu_group``, so every rank calls
+    it. The current class JIT-compiles through ``preload``; the older
+    ``QuickAllReduceInt4`` used ``compile``. Either one runs here, before
+    the timed loop and before a graph capture.
     """
     import torch
     import torch.distributed as dist
@@ -575,32 +603,48 @@ def _open_quick_allreduce_flydsl(cpu_group, device, algorithm: str, codec: str):
     comm = None
     ok = False
     try:
-        from aiter.ops.flydsl import FlyQuickAllReduce
+        from aiter.ops.flydsl import QuickAllReduceInt4
 
-        comm = FlyQuickAllReduce(
+        comm = QuickAllReduceInt4(
             group=cpu_group,
             device=device,
             rank=dist.get_rank(group=cpu_group),
             world_size=dist.get_world_size(group=cpu_group),
-            algorithm=algorithm,
-            rs_codec=codec,
-            ag_codec=codec,
         )
+        # Older QuickAllReduceInt4. Current AITER main aliases that name to
+        # FlyQuickAllReduce, which has preload instead.
+        if hasattr(comm, "compile"):
+            warmup = torch.empty(
+                _FLYDSL_WARMUP_BYTES // 2, dtype=torch.bfloat16, device=device
+            )
+            comm.compile(warmup, torch.empty_like(warmup))
+            torch.cuda.synchronize(device)
         ok = True
     except Exception as e:
-        logger.warning("quick_allreduce flydsl %s failed: %s", codec, e)
+        logger.warning("quick_allreduce flydsl int4 failed: %s", e)
     if not _agree(ok, cpu_group):
         if comm is not None:
             comm.close()
         return None
 
-    floor = int(getattr(comm, "min_bytes", _FLYDSL_MIN_BYTES))
+    floor = int(getattr(comm, "min_bytes", 0))
+
+    def prepare(sizes: List[int]) -> None:
+        if not hasattr(comm, "preload"):
+            return
+        usable = [int(size) for size in sizes if int(size) >= floor]
+        if not usable:
+            return
+        comm.preload(payload_range=(min(usable), max(usable)))
+        torch.cuda.synchronize(device)
 
     def check(tensor) -> Optional[str]:
         if tensor.dtype != torch.bfloat16:
             return "FlyDSL QuickReduce supports bf16"
         if not tensor.is_contiguous():
             return "FlyDSL QuickReduce requires a contiguous tensor"
+        if tensor.data_ptr() % _FLYDSL_ALIGN:
+            return "FlyDSL QuickReduce requires 16-byte alignment"
         nbytes = tensor.numel() * tensor.element_size()
         if nbytes % _FLYDSL_ALIGN:
             return f"{nbytes}B is not a multiple of {_FLYDSL_ALIGN}"
@@ -619,8 +663,9 @@ def _open_quick_allreduce_flydsl(cpu_group, device, algorithm: str, codec: str):
         check=check,
         call=call,
         close=comm.close,
+        prepare=prepare,
         impl=_qualname(type(comm)),
-        note=f"flydsl {algorithm} {codec}",
+        note="flydsl int4",
     )
 
 
@@ -738,6 +783,9 @@ def tune_allreduce(
     backends = _open_backends(
         selection_open_params(selection, cpu_group, device), verbose
     )
+    for backend in backends.values():
+        if backend.prepare is not None:
+            backend.prepare(sizes)
     dtype = torch.bfloat16
     if verbose:
         if selection_config:
@@ -826,7 +874,8 @@ def tune_allreduce(
                 if verbose:
                     print(f"{tag}: best {best_backend:24s} {best_time:8.2f} us", flush=True)
             del tensor
-            torch.cuda.empty_cache()
+            _reclaim_size_cache()
+            barrier()
     finally:
         # Close together: a rank that frees its IPC buffers early can leave a
         # peer still using them.

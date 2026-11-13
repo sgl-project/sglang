@@ -25,10 +25,6 @@ from typing import Any, Dict
 # INT4 is faster than INT8, so the tuner does not compare HIP codecs.
 QR_QUANT_REGIMES = ("FP", "INT8", "INT6", "INT4")
 
-# FlyDSL mesh QuickReduce wire formats. The default schedule is single-codec
-# INT4. INT5 is mesh-only; the ring schedule accepts INT4 and INT6.
-_FLYDSL_CODECS = ("int4", "int6", "int8")
-_FLYDSL_ALGORITHMS = ("mesh", "ring")
 # Opener name to the static keys the tuner passes through, besides the CPU
 # group and the device. ``opener`` and ``impl`` stay out of that call.
 _OPENER_KWARGS = {
@@ -37,7 +33,7 @@ _OPENER_KWARGS = {
     "nccl": (),
     "torch_symm_mem": (),
     "quick_allreduce": ("quant", "cast_bf16_to_fp16"),
-    "quick_allreduce_flydsl": ("algorithm", "codec"),
+    "quick_allreduce_flydsl": (),
 }
 OPENER_NAMES = tuple(_OPENER_KWARGS)
 
@@ -81,8 +77,6 @@ def build_selection(
             "opener": "quick_allreduce_flydsl",
             "impl": "flydsl",
             "quant": "INT4",
-            "algorithm": "mesh",
-            "codec": "int4",
         },
     }
 
@@ -127,19 +121,14 @@ def validate_selection(selection: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
                 entry.get("cast_bf16_to_fp16", True), f"{name}.cast_bf16_to_fp16"
             )
         elif opener == "quick_allreduce_flydsl":
-            algorithm = entry.get("algorithm", "mesh")
-            codec = entry.get("codec", "int4")
-            if algorithm not in _FLYDSL_ALGORITHMS:
+            # QuickAllReduceInt4 has no codec argument. A leftover algorithm
+            # or codec key from an older file is ignored.
+            quant = entry.get("quant", "INT4")
+            if quant != "INT4":
                 raise ValueError(
-                    f"{name}: algorithm must be one of {_FLYDSL_ALGORITHMS}, "
-                    f"got {algorithm!r}"
+                    f"{name}: FlyDSL row is QuickAllReduceInt4, got quant {quant!r}"
                 )
-            if codec not in _FLYDSL_CODECS:
-                raise ValueError(
-                    f"{name}: codec must be one of {_FLYDSL_CODECS}, got {codec!r}"
-                )
-            entry["algorithm"] = algorithm
-            entry["codec"] = codec
+            entry["quant"] = "INT4"
         checked[name] = entry
     return checked
 

@@ -27,8 +27,6 @@
   "quick_allreduce_flydsl_INT4": {
     "opener": "quick_allreduce_flydsl",
     "impl": "flydsl",
-    "quant": "INT4",
-    "algorithm": "mesh",
-    "codec": "int4"
+    "quant": "INT4"
   }
 }

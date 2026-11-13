@@ -48,10 +48,13 @@ torchrun --nproc_per_node=8 -m sglang.auto_tune.run_allreduce \
     --selection-config ar-tune/selection_config.json \
     --tp 8 \
     --graph 1 \
+    --ingraph-calls 10 \
     --median 1 \
-    -n 200 \
+    -n 500 \
     --output-dir ar-tune \
-    --sizes 16384 65536 131072
+    --sizes 6384 65536 131072 262144 524288 1048576 \
+            2097152 4194304 8388608 16777216 33554432 \
+            67108864 134217728 268435456
 ```
 
 ## Both steps
