@@ -13,11 +13,13 @@ from sglang.srt.arg_groups.model_override_base import (
     resolving_view,
 )
 from sglang.srt.arg_groups.overrides import (
+    _FLASHINFER_TRTLLM_ROUTED_QUANTIZATIONS,
     _a2a_backend_overrides,
     _a2a_ep_size,
     _a2a_fusion_adjustments,
     _moe_runner_backend_quant_constraints,
     _moe_runner_fusion_disable,
+    _moe_runner_routed_experts_capture,
     declare_resolution,
     flashinfer_a2a_max_dispatch_tokens_per_rank,
     max_prefill_buffer_tokens,
@@ -88,6 +90,7 @@ def handle_moe_kernel_config(server_args: Any):
             )
 
     run_post_process_pass(server_args, _moe_runner_backend_quant_constraints)
+    run_post_process_pass(server_args, _moe_runner_routed_experts_capture)
 
     view = resolved_view(server_args)
     if view.moe_runner_backend == "flashinfer_cutlass":
@@ -149,15 +152,7 @@ def handle_moe_kernel_config(server_args: Any):
         )
 
     if view.moe_runner_backend == "flashinfer_trtllm_routed":
-        assert view.quantization in [
-            "fp8",
-            "mxfp8",
-            "modelopt_fp4",
-            "modelopt_mixed",
-            "nvfp4_online",
-            "minimax_m3_nvfp4",
-            None,
-        ], (
+        assert view.quantization in _FLASHINFER_TRTLLM_ROUTED_QUANTIZATIONS, (
             f"Invalid quantization '{view.quantization}'. \nFlashInfer TRTLLM routed MOE supports only: 'fp8', 'mxfp8', 'modelopt_fp4', 'modelopt_mixed', 'nvfp4_online', 'minimax_m3_nvfp4', or bfloat16 (None)."
         )
 
