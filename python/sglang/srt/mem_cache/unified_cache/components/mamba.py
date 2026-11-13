@@ -222,10 +222,16 @@ class MambaComponent(TreeComponent):
             result.best_match_node, self.component_type
         )
         if src_index is None:
+            # A source from an earlier match of an unadmitted request may have
+            # been evicted and its slot reused since; never carry it over.
+            if params.req is not None:
+                params.req.kv.mamba_cow_src_index = None
             return result
         req = params.req
         assert req is not None
-        if not req.kv.holds_mamba:
+        # A deferred slot is bound with the row (`StateStorage.acquire`); the
+        # staged copy still runs, as it does into a slot taken here.
+        if not req.kv.holds_mamba and not params.defer_cow_slot:
             storage, sub_pool = self._state()
             dst_index = storage.take_state_slots(sub_pool, 1)
             if dst_index is None:

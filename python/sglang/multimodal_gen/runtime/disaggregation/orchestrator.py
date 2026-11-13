@@ -411,16 +411,20 @@ class DiffusionServer:
         poller.register(frontend, zmq.POLLIN)
         result_roles = {}
         all_sockets = [frontend]
+        # bind fixed listeners before outbound connections can claim their ports
         for role, pool in self._pools.items():
-            for endpoint in pool.endpoints:
-                sock, _ = get_zmq_socket(self._context, zmq.PUSH, endpoint, bind=False)
-                pool.pushes.append(sock)
             result, _ = get_zmq_socket(
                 self._context, zmq.PULL, pool.result_endpoint, bind=True, same_port=True
             )
             poller.register(result, zmq.POLLIN)
             result_roles[result] = role
-            all_sockets.extend([result, *pool.pushes])
+            all_sockets.append(result)
+
+        for pool in self._pools.values():
+            for endpoint in pool.endpoints:
+                sock, _ = get_zmq_socket(self._context, zmq.PUSH, endpoint, bind=False)
+                pool.pushes.append(sock)
+            all_sockets.extend(pool.pushes)
 
         self._encoder_pushes = self._pools[self._input_role].pushes
         self._denoiser_pushes = self._pools[RoleType.DENOISER].pushes
