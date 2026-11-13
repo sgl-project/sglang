@@ -43,15 +43,12 @@ from sglang.srt.runtime_context import (
     get_serving,
 )
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.gauge_histogram import GaugeHistogram
 
 if TYPE_CHECKING:
     from prometheus_client import Gauge
 
     from sglang.srt.managers.schedule_batch import Req
-
-SGLANG_TEST_REQUEST_TIME_STATS = get_bool_env_var("SGLANG_TEST_REQUEST_TIME_STATS")
 
 logger = logging.getLogger(__name__)
 
