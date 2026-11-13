@@ -79,6 +79,7 @@ from sglang.srt.runtime_context import (
     get_spec,
 )
 from sglang.srt.utils import is_flashinfer_available, is_float4_e2m1fn_x2
+from sglang.srt.utils.device import is_sm100_supported
 
 if is_flashinfer_available():
     import flashinfer
@@ -1066,8 +1067,21 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         seq_lens_i32 = (
             seq_lens if seq_lens.dtype == torch.int32 else seq_lens.to(torch.int32)
         )
-        extra_kwargs = {"backend": self.backend} if self.backend != "trtllm-gen" else {}
-        if self.backend == "trtllm-gen":
+        extra_kwargs = {}
+        if self.backend != "trtllm-gen":
+            extra_kwargs["backend"] = self.backend
+        elif (
+            is_sm100_supported()
+            and not (64 < query.size(-2) < 128)
+            and kv_cache.size(-2) in (32, 64)
+        ):
+            # FlashInfer defaults backend="auto", which builds every candidate
+            # runner and runs AutoTuner selection on each eager decode call.
+            # Pass backend="trtllm-gen" and its caller-owned counter buffer
+            # explicitly when trtllm-gen is eligible on SM10x; omit both on
+            # SM12x XQA and 64 < H < 128 / non-(32, 64) page-size fallbacks,
+            # where FlashInfer rejects multi_ctas_kv_counter_buffer.
+            extra_kwargs["backend"] = "trtllm-gen"
             extra_kwargs["multi_ctas_kv_counter_buffer"] = (
                 self._multi_ctas_kv_counter_buffer
             )
