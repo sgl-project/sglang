@@ -83,7 +83,7 @@ response = client.chat.completions.create(
 )
 
 print_highlight(
-    f"reasoing_content: {response.choices[0].message.reasoning_content}\n\ncontent: {response.choices[0].message.content}"
+    f"reasoning_content: {response.choices[0].message.reasoning_content}\n\ncontent: {response.choices[0].message.content}"
 )
 ```
 
@@ -123,7 +123,7 @@ response = client.chat.completions.create(
 )
 
 print_highlight(
-    f"reasoing_content: {response.choices[0].message.reasoning_content}\n\ncontent: {response.choices[0].message.content}"
+    f"reasoning_content: {response.choices[0].message.reasoning_content}\n\ncontent: {response.choices[0].message.content}"
 )
 ```
 
@@ -155,7 +155,7 @@ response = client.chat.completions.create(
 )
 
 print_highlight(
-    f"reasoing_content: {response.choices[0].message.reasoning_content}\n\ncontent: {response.choices[0].message.content}"
+    f"reasoning_content: {response.choices[0].message.reasoning_content}\n\ncontent: {response.choices[0].message.content}"
 )
 ```
 
@@ -175,7 +175,7 @@ response = client.chat.completions.create(
 )
 
 print_highlight(
-    f"reasoing_content: {response.choices[0].message.reasoning_content}\n\ncontent: {response.choices[0].message.content}"
+    f"reasoning_content: {response.choices[0].message.reasoning_content}\n\ncontent: {response.choices[0].message.content}"
 )
 ```
 
@@ -295,7 +295,7 @@ response = client.chat.completions.create(
 )
 
 print_highlight(
-    f"reasoing_content: {response.choices[0].message.reasoning_content}\n\ncontent: {response.choices[0].message.content}"
+    f"reasoning_content: {response.choices[0].message.reasoning_content}\n\ncontent: {response.choices[0].message.content}"
 )
 ```
 
@@ -351,9 +351,9 @@ response = requests.post(
 print(response.json())
 
 
-reasoing_content = response.json()["text"].split("</think>")[0]
+reasoning_content = response.json()["text"].split("</think>")[0]
 content = response.json()["text"].split("</think>")[1]
-print_highlight(f"reasoing_content: {reasoing_content}\n\ncontent: {content}")
+print_highlight(f"reasoning_content: {reasoning_content}\n\ncontent: {content}")
 ```
 
 **JSON Schema Directly**
