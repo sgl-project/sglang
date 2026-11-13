@@ -18,9 +18,19 @@ from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
 from sglang.srt.mem_cache.kv.alloc.forward_steps import ForwardSteps
 from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec, MHAView
 from sglang.srt.mem_cache.kv.layout.mla import MLASubPoolSpec, MLAView
-from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
+from sglang.srt.mem_cache.kv.layout.state import (
+    DraftStateView,
+    MambaSubPoolSpec,
+    StateView,
+)
+from sglang.srt.mem_cache.layout.fused_draft import (
+    DraftStateGeometry,
+    DraftStateRegion,
+    FusedDraftPlacement,
+)
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
+from sglang.test.test_utils import CustomTestCase
 from sglang.test.unified_allocator_fixtures import build_test_unified_pools
 
 BF16_NAN = 0x7FC1  # LE bf16 NaN bit pattern, as SGLANG_DEBUG_POISON_POOL fills
@@ -583,6 +593,72 @@ class TestReuseWaitsAForwardThatReadsTheFreedPage(unittest.TestCase):
             bool((seen == 0x11).all()),
             "the forward read another band's bytes as its attention page",
         )
+
+
+def _build_fused_state(device):
+    """A full + mamba arena whose mamba entries carry a fused draft's state
+    block, with the host's and one draft runner's state views over it."""
+    region = DraftStateRegion(
+        lane_num=1,
+        state=DraftStateGeometry(
+            conv_state_shapes=((2, 4), (2, 4)),
+            conv_dtype=torch.float32,
+            temporal_state_shape=(2,),
+            temporal_dtype=torch.float32,
+        ),
+    )
+    full_spec = MHASubPoolSpec(
+        name="full",
+        layer_num=2,
+        head_num=2,
+        head_dim=4,
+        store_dtype=torch.bfloat16,
+        grow_direction="down",
+    )
+    mamba_spec = MambaSubPoolSpec(
+        name="mamba",
+        layer_num=2,
+        conv_state_shapes=((3, 8),),
+        conv_dtype=torch.bfloat16,
+        temporal_state_shape=(2,),
+        temporal_dtype=torch.float32,
+        grow_direction="up",
+        draft_region=region,
+    )
+    arena = arena_of(
+        [full_spec, mamba_spec],
+        total_bytes=4 * full_spec.entry_bytes() + 8 * mamba_spec.entry_bytes(),
+        device=device,
+        fused_draft=FusedDraftPlacement.from_counts(
+            counts={"mamba": [1]}, regions={"mamba": region}
+        ),
+    )
+    host = StateView(arena=arena, spec=mamba_spec, mamba_layer_ids=[0, 1])
+    draft = DraftStateView(arena=arena, spec=mamba_spec, layer_lanes={4: 0})
+    return arena, host, draft
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA required (sync debug mode)")
+class TestFusedDraftStateClearStaysOnDevice(CustomTestCase):
+    """BUG REGRESSION. A fused draft's state block is cleared on every admission
+    and must not synchronize the stream."""
+
+    def test_draft_clear_slots_does_not_synchronize(self):
+        arena, host, draft = _build_fused_state("cuda")
+        arena.raw.fill_(0x3F)  # every bf16 / fp32 element a normal nonzero
+        idx = torch.tensor([2, 5], device="cuda", dtype=torch.int32)
+        torch.cuda.synchronize()
+        torch.cuda.set_sync_debug_mode("error")
+        try:
+            draft.clear_slots(idx)
+        finally:
+            torch.cuda.set_sync_debug_mode("default")
+        for view in (*draft.mamba_cache.conv, draft.mamba_cache.temporal):
+            self.assertFalse(view[:, idx.long()].any().item())
+            self.assertTrue(view[:, 3].all().item())
+        # The draft's clear spares the host's streams in the same slots.
+        for view in (*host.mamba_cache.conv, host.mamba_cache.temporal):
+            self.assertTrue(view[:, idx.long()].all().item())
 
 
 if __name__ == "__main__":  # pragma: no cover

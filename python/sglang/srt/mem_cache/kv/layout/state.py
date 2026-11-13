@@ -506,9 +506,12 @@ class DraftStateView(StateView):
         takes over the draft's block. The host's whole-entry clear covers the
         block too, but only on a plain extend forward, not on the decode,
         target-verify and draft-extend forwards the draft needs it in."""
+        # index_fill_, not `view[:, indices] = 0`: assigning a Python scalar
+        # through an index tensor synchronizes the host.
+        indices = indices.to(device=self.device, dtype=torch.int64)
         for view in self.mamba_cache.conv:
-            view[:, indices] = 0
-        self.mamba_cache.temporal[:, indices] = 0
+            view.index_fill_(1, indices, 0)
+        self.mamba_cache.temporal.index_fill_(1, indices, 0)
 
     def copy_from(self, src_indices: torch.Tensor, dst_indices: torch.Tensor) -> None:
         """Copy-on-write this runner's state block, the block only."""
