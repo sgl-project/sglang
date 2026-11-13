@@ -1348,6 +1348,12 @@ class Envs:
     # ===================================================================
     SGLANG_IS_FLASHINFER_AVAILABLE = EnvBool(True)
     SGLANG_FLASHINFER_USE_PAGED = EnvBool(False)
+    # Eager FA2 paged prefill only; leave the persistent FP8 KV pool unchanged.
+    # Temporary BF16 K+V memory is bounded by MAX_KV_TOKENS * heads * dim * 4.
+    SGLANG_PREFILL_KV_DEQUANT = EnvBool(False)
+    SGLANG_PREFILL_KV_DEQUANT_MIN_TOKENS = EnvInt(1024)
+    SGLANG_PREFILL_KV_DEQUANT_MIN_KV_TOKENS = EnvInt(16384)
+    SGLANG_PREFILL_KV_DEQUANT_MAX_KV_TOKENS = EnvInt(262144)
     # Force FlashInfer decode on (1) or off (0) tensor cores; unset picks from
     # the KV cache dtype and the GQA group size.
     SGLANG_FLASHINFER_USE_TENSOR_CORE = EnvBool(None)
