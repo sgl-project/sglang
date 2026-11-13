@@ -329,6 +329,8 @@ class Envs:
     # Host-evict a session's finished sub-agent sessions first (needs parent_session_id
     # and a TreeCore with the residency bindings). Opt-in.
     SGLANG_OPT_HICACHE_SUBAGENT_HOST_EVICT_FIRST = EnvRuntimeBool(False)
+    # Pinned PLE host table on transparent huge pages. Opt-in: needs THP.
+    SGLANG_OPT_PLE_PINNED_HUGEPAGE = EnvRuntimeBool(False)
 
     # ===================================================================
     # Model configuration, discovery, and weight loading
