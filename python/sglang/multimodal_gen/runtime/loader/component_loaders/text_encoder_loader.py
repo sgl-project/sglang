@@ -51,6 +51,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.gguf import GGUFConfig
 from sglang.multimodal_gen.runtime.layers.quantization.quanto_int8 import (
     normalize_quanto_int8_weights,
 )
+from sglang.multimodal_gen.runtime.layers.rotary_embedding import RotaryEmbedding
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     ComponentCheckpointUnsupportedError,
     NativeComponentLoaderRequired,
@@ -374,6 +375,19 @@ def _resolve_and_configure_encoder_quantization(
         ignored_layers,
     )
     return model_cls
+
+
+def _build_rope_caches_on(model: nn.Module, device: torch.device) -> None:
+    """Rebuild RoPE caches on ``device`` and keep them where they are.
+
+    CPU and CUDA ``cos``/``sin`` round some entries differently, so an encoder
+    constructed on CPU for offload would otherwise not match a resident one.
+    """
+    for module in model.modules():
+        if isinstance(module, RotaryEmbedding) and module.use_precomputed_cache:
+            with torch.device(device):
+                cache = module._compute_cos_sin_cache().to(module.dtype)
+            module.cos_sin_cache = cache.to(module.cos_sin_cache.device)
 
 
 def _require_quantized_encoder_layers(
@@ -717,6 +731,8 @@ class TextEncoderLoader(OnlineQuantizationComponentLoader):
             model = initialize_model(
                 model_cls, {"config": model_config}, param_dtype, model_device
             )
+            if component_starts_on_cpu:
+                _build_rope_caches_on(model, local_torch_device)
 
             if not isinstance(model, EncoderTensorParallelMixin):
                 raise TypeError(
