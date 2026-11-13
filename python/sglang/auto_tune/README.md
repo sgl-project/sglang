@@ -44,6 +44,8 @@ torchrun --nproc_per_node=8 -m sglang.auto_tune.run_allreduce \
             2097152 4194304 8388608 16777216 33554432 \
             67108864 134217728 268435456
 
+`--ingraph-calls` is how many all-reduces are captured back to back in one graph. The reported time is per call.
+
 torchrun --nproc_per_node=8 -m sglang.auto_tune.run_allreduce \
     --selection-config ar-tune/selection_config.json \
     --tp 8 \
@@ -75,6 +77,21 @@ torchrun --nproc_per_node=8 -m sglang.auto_tune.run_allreduce \
     --graph 0 \
     --output-dir ar-tune \
     --sizes 16384 65536 131072 262144 524288 1048576 \
+            2097152 4194304 8388608 16777216 33554432 \
+            67108864 134217728 268435456
+
+./run_allreduce.sh \
+    --tp 8 \
+    --qr-quant INT4 \
+    --qr-cast-bf16-to-fp16 1 \
+    --ignore-acr-max-size 1 \
+    --ignore-scr-max-size 0 \
+    --median 1 \
+    -n 500 \
+    --graph 1 \
+    --ingraph-calls 10 \
+    --output-dir ar-tune \
+    --sizes 6384 65536 131072 262144 524288 1048576 \
             2097152 4194304 8388608 16777216 33554432 \
             67108864 134217728 268435456
 ```
