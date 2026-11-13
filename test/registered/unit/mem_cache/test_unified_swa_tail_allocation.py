@@ -1,4 +1,7 @@
 import unittest
+from importlib import import_module
+from types import ModuleType, SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -20,6 +23,94 @@ class TestUnifiedSWATailAllocation(CustomTestCase):
         publish(
             ServerArgs(model_path="dummy", enable_unified_memory=True), role="tokenizer"
         )
+
+    def test_flexkv_restore_allocates_named_window_tail_after_eviction(self):
+        """A host restore must bind only its trailing SWA page, including after
+        eviction. Passing the old scalar tail to the real allocator raises
+        before any restored slots can be returned.
+        """
+        # The external transfer package is not needed to allocate destinations.
+        connector = ModuleType("flexkv.integration.sglang.connector")
+        connector.FlexKVConnector = object
+        connector.FlexKVHostReleaseShim = object
+        with patch.dict("sys.modules", {connector.__name__: connector}):
+            cache_type = import_module(
+                "sglang.srt.mem_cache.storage.flexkv.flexkv_hybrid_radix_cache"
+            ).FlexKVHybridRadixCache
+
+        for prefix_len in (0, 18):
+            for pressure in (False, True):
+                with self.subTest(prefix_len=prefix_len, pressure=pressure):
+                    page_size = 16
+                    bundle = build_test_unified_pools(
+                        device="cuda",
+                        kv_cache_dtype=torch.float16,
+                        head_num=1,
+                        head_dim=8,
+                        swa_head_num=1,
+                        swa_head_dim=8,
+                        page_size=page_size,
+                        start_layer=0,
+                        end_layer=2,
+                        full_attention_layer_ids=[0],
+                        swa_attention_layer_ids=[1],
+                        total_bytes=1 << 14,
+                    )
+                    allocator = bundle.token_to_kv_pool_allocator
+                    prefix_capacity = -(-prefix_len // page_size) * page_size
+                    prefix = allocator.alloc(prefix_capacity)[:prefix_len]
+                    prefix_swa = allocator.translate_swa_indices_for_transfer(
+                        prefix
+                    ).clone()
+                    blockers = []
+                    if pressure:
+                        while (block := allocator.alloc(page_size)) is not None:
+                            blockers.append(block)
+                        self.assertTrue(blockers)
+
+                    def evict(_demand):
+                        allocator.free(torch.cat(blockers))
+                        blockers.clear()
+
+                    cache = cache_type.__new__(cache_type)
+                    cache.token_to_kv_pool_allocator = allocator
+                    cache.device = torch.device("cuda")
+                    cache.page_size = page_size
+                    cache._inner_cache = SimpleNamespace(
+                        supports_swa=lambda: True,
+                        path_device_indices=lambda _node: prefix,
+                        window_sub_pools=lambda: tuple(
+                            (name, None) for name in allocator.window_pool_names()
+                        ),
+                        evict_for_alloc=evict,
+                    )
+                    req = SimpleNamespace(last_node=object(), prefix_len=prefix_len)
+                    restored = cache._alloc_restore_slots(req, 64)
+                    self.assertIsNotNone(restored)
+                    self.assertEqual(restored.numel(), 64)
+                    self.assertFalse(blockers)
+                    torch.testing.assert_close(
+                        allocator.translate_swa_indices_for_transfer(prefix), prefix_swa
+                    )
+                    swa = allocator.translate_swa_indices_for_transfer(restored)
+                    self.assertTrue(bool((swa[-page_size:] > 0).all()))
+                    new_pages = restored[
+                        page_size - prefix_len % page_size : -2 * page_size
+                    ]
+                    if new_pages.numel():
+                        self.assertTrue(
+                            bool(
+                                (
+                                    allocator.translate_swa_indices_for_transfer(
+                                        new_pages
+                                    )
+                                    == 0
+                                ).all()
+                            )
+                        )
+                    allocator.free(torch.cat((prefix, restored)))
+                    self.assertEqual(allocator.full_attn_allocator.allocated_count(), 0)
+                    self.assertEqual(allocator.swa_attn_allocator.allocated_count(), 0)
 
     def test_extend_binds_only_new_tail_pages(self):
         """PD tail allocation must leave new FULL-only pages unbound in SWA,

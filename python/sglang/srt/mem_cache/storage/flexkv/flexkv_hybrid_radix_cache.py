@@ -322,7 +322,9 @@ class FlexKVHybridRadixCache(FlexKVCacheLifecycleMixin, BasePrefixCache):
                     sequence_lengths_cpu,
                     last_location,
                     host_hit_length,
-                    swa_tail_length,
+                    window_tail_lens={
+                        name: swa_tail_length for name, _ in self.window_sub_pools()
+                    },
                 )
             else:
                 slots = allocator.alloc_extend(
@@ -388,7 +390,10 @@ class FlexKVHybridRadixCache(FlexKVCacheLifecycleMixin, BasePrefixCache):
                 sequence_lengths_cpu,
                 last_location,
                 host_hit_length,
-                min(self.page_size, host_hit_length),
+                window_tail_lens={
+                    name: min(self.page_size, host_hit_length)
+                    for name, _ in self.window_sub_pools()
+                },
             )
         return allocator.alloc_extend(
             prefix_lengths,
