@@ -10,6 +10,8 @@ import importlib.metadata
 import logging
 import math
 import os
+import time
+from concurrent.futures import Future, ThreadPoolExecutor
 
 import torch
 
@@ -192,6 +194,83 @@ def msa_v1_qmul4_decode_capability() -> tuple[bool, str | None]:
     except Exception as error:
         return False, str(error)
     return True, None
+
+
+_prebuild: tuple[ThreadPoolExecutor, list[Future], float] | None = None
+
+
+def start_msa_v1_prebuild(
+    num_q_heads: int, num_kv_heads: int, query_lengths: tuple[int, ...]
+) -> None:
+    """Build the MSA-v1 JIT extensions on worker threads.
+
+    Each extension is a separate nvcc build of 4-18 s; the first forward
+    otherwise builds them one by one. Started before weight loading so the
+    builds overlap it; joined by ``wait_msa_v1_prebuild``.
+    """
+    global _prebuild
+    if _prebuild is not None or not msa_v1_qmul4_decode_capability()[0]:
+        return
+    from inference.dequant.nvfp4_to_fp8.jit import load_extension as dequant
+    from inference.msa_v1.attention.decode.q8kv4 import jit as decode_attention
+    from inference.msa_v1.attention.prefill.q8kv4.jit import (
+        load_extension as prefill_attention,
+    )
+    from inference.msa_v1.indexer._common.topk_select.build import (
+        load_extension as topk_select,
+    )
+    from inference.msa_v1.indexer.decode.q8kv4.jit import (
+        load_extension as decode_indexer,
+    )
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    gqa_ratio = num_q_heads // num_kv_heads
+
+    def build_decode_indexer():
+        for query_length in query_lengths:
+            decode_indexer(
+                device,
+                num_index_heads=num_kv_heads,
+                query_length=min(query_length, _MAX_DECODE_QUERY_LENGTH),
+            )
+
+    def build_decode_attention(split_kv):
+        # The variant loader holds one lock across builds; build the cache entry
+        # directly so both variants compile at once.
+        decode_attention.gen_jit_spec(
+            topk=_TOPK, split_kv=split_kv, gqa_ratio=gqa_ratio, device=device.index
+        ).build_and_load()
+
+    tasks = [
+        build_decode_indexer,
+        lambda: build_decode_attention(False),
+        lambda: build_decode_attention(True),
+        lambda: decode_attention.get_plan_fn(device.index),
+        lambda: decode_attention.get_reduction_module(device.index),
+        lambda: prefill_attention(device),
+        lambda: dequant(device),
+        topk_select,
+    ]
+    pool = ThreadPoolExecutor(len(tasks), thread_name_prefix="msa-prebuild")
+    _prebuild = (pool, [pool.submit(task) for task in tasks], time.perf_counter())
+
+
+def wait_msa_v1_prebuild() -> None:
+    global _prebuild
+    if _prebuild is None:
+        return
+    pool, futures, started = _prebuild
+    _prebuild = None
+    for future in futures:
+        try:
+            future.result()
+        except Exception as error:
+            # The first forward retries the build and raises from its own call site.
+            logger.warning("MSA-v1 kernel prebuild failed: %s", error)
+    pool.shutdown()
+    logger.info(
+        "MSA-v1 kernel prebuild joined %.1fs after start", time.perf_counter() - started
+    )
 
 
 def _require_available(
