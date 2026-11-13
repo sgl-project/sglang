@@ -87,17 +87,19 @@ def _run_simple_eval(
     repeat: Optional[int] = None,
     api: Optional[str] = None,
     seed: Optional[int] = None,
+    skip_server_launch: bool = False,
 ) -> Tuple[bool, Optional[str], Optional[dict]]:
     """Run ``dataset`` through run_sgl_eval (sgl-eval benchmarks) or run_eval."""
     process = None
     try:
-        process = popen_launch_server(
-            model.model_path,
-            base_url,
-            other_args=model.extra_args,
-            timeout=model.launch_timeout or DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            env=model.env,
-        )
+        if not skip_server_launch:
+            process = popen_launch_server(
+                model.model_path,
+                base_url,
+                other_args=model.extra_args,
+                timeout=model.launch_timeout or DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                env=model.env,
+            )
 
         args = SimpleNamespace(
             base_url=base_url,
@@ -161,6 +163,7 @@ def run_accuracy_test(
     model: ModelLaunchSettings,
     params: AccuracyTestParams,
     base_url: Optional[str] = None,
+    skip_server_launch: bool = False,
 ) -> AccuracyTestResult:
     """Run accuracy test for a single model."""
     base_url = base_url or DEFAULT_URL_FOR_TEST
@@ -187,6 +190,7 @@ def run_accuracy_test(
         repeat=params.repeat,
         api=params.api,
         seed=params.seed,
+        skip_server_launch=skip_server_launch,
     )
 
     if not success:
