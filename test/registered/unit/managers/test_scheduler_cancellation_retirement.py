@@ -396,14 +396,19 @@ class TestSchedulerCancellationRetirement(CustomTestCase):
         target = self._req(scheduler, rid="internal-gen", instance="internal-gen")
         move([target], scheduler.waiting_queue)
 
-        def on_terminal(req):
-            self.assertIs(req, target)
-            self.assertTrue(req.finished())
-            self.assertTrue(req.kv.holds_kv)
-            scheduler._check_cancellation_retirements()
-            self.assertEqual(self.outputs, [])
+        def bind_pre_release_observer(expected_req, completed_baseline):
+            baseline = list(completed_baseline)
 
-        self.abort_observer = on_terminal
+            def on_terminal(req):
+                self.assertIs(req, expected_req)
+                self.assertTrue(req.finished())
+                self.assertTrue(req.kv.holds_kv)
+                scheduler._check_cancellation_retirements()
+                self.assertEqual(self.outputs, baseline)
+
+            self.abort_observer = on_terminal
+
+        bind_pre_release_observer(target, self.outputs)
         control = CancellationRetirementReq(
             rid="rust-control-corr",
             cancellation_id="rust-op-a",
@@ -421,6 +426,7 @@ class TestSchedulerCancellationRetirement(CustomTestCase):
         # HTTP-shaped request without target_rid still uses rid as identity.
         other = self._req(scheduler, rid="http-target", instance="http-instance")
         move([other], scheduler.waiting_queue)
+        bind_pre_release_observer(other, self.outputs)
         http_control = CancellationRetirementReq(
             rid=other.rid,
             cancellation_id="http-op",

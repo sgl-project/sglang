@@ -35,6 +35,7 @@ from sglang.srt.managers.io_struct import (
     msgpack_encode,
 )
 from sglang.srt.managers.scheduler_components.output_sender import SenderWrapper
+from sglang.srt.managers.scheduler_components.request_list import move
 from sglang.srt.managers.tokenizer_manager import ReqState, TokenizerManager
 from sglang.srt.observability.req_time_stats import APIServerReqTimeStats
 from sglang.srt.runtime_context import create_context, use_context
@@ -339,7 +340,7 @@ class TestCancelRetirementFrontend(unittest.IsolatedAsyncioTestCase):
             scheduler, rid="request", instance=state.request_instance_id
         )
         neighbor = allocate_cpu_req(scheduler, rid="neighbor", instance="neighbor")
-        scheduler.waiting_queue.join([target, neighbor])
+        move([target, neighbor], scheduler.waiting_queue)
         self.assertEqual(scheduler.req_to_token_pool.available_size(), 6)
         self.assertEqual(scheduler.token_to_kv_pool_allocator.available_size(), 26)
 
