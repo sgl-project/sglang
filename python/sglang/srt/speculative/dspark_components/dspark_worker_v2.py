@@ -18,7 +18,6 @@ from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.model_loader.weight_utils import get_pp_stage_load_group
-from sglang.srt.models.dflash import DFlashDraftModel
 from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
@@ -247,8 +246,6 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._draft_worker = bundle.draft_worker
         self.draft_model_runner = bundle.draft_model_runner
         self.draft_model = bundle.draft_model
-        if isinstance(self.draft_model, DFlashDraftModel):
-            self.draft_model.enable_split_fc()
         self._draft_sampler = None
 
         # The mask token is input-only (it is embedded, never sampled), so its
@@ -265,7 +262,6 @@ class DSparkWorkerV2(BaseSpecWorker):
         self.draft_model.logits_mup_width_multiplier = getattr(
             target_model_config.hf_text_config, "logits_mup_width_multiplier", None
         )
-        self._target_is_mambaish = mambaish_config(target_model_config) is not None
         runtime_config = resolve_runtime_config(
             draft_hf_config=self.draft_model_runner.model_config.hf_config,
             speculative_num_draft_tokens=get_spec().speculative_num_draft_tokens,

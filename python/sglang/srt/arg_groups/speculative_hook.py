@@ -1099,6 +1099,10 @@ def _resolve_dflash_draft_kv_ring(server_args: ServerArgs) -> None:
         lambda: _load_draft_hf_config(cfg),
         draft_backend=cfg.speculative_draft_attention_backend,
         disaggregation_mode=cfg.disaggregation_mode,
+        disaggregation_transfer_backend=cfg.disaggregation_transfer_backend,
+        disaggregation_decode_host_receive_threshold=(
+            cfg.disaggregation_decode_host_receive_threshold
+        ),
         enable_unified_memory=cfg.enable_unified_memory,
         dcp_size=cfg.dcp_size,
     )

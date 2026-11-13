@@ -71,7 +71,6 @@ logger = init_logger(__name__)
 class Pi05CheckpointManifest:
     model_path: str
     safetensor_files: list[str] = field(default_factory=list)
-    component_keys: dict[str, list[str]] = field(default_factory=dict)
     skipped_lm_head_keys: list[str] = field(default_factory=list)
 
 
@@ -581,7 +580,6 @@ class Pi05PolicyModel(nn.Module):
     ) -> Pi05CheckpointManifest:
         path = Path(model_path)
         safetensor_files = sorted(str(p) for p in path.glob("*.safetensors"))
-        component_keys = {name: [] for name in config.loader_component_map}
         skipped_lm_head_keys: list[str] = []
 
         try:
@@ -590,7 +588,6 @@ class Pi05PolicyModel(nn.Module):
             return Pi05CheckpointManifest(
                 model_path=model_path,
                 safetensor_files=safetensor_files,
-                component_keys=component_keys,
             )
 
         for filename in safetensor_files:
@@ -601,16 +598,10 @@ class Pi05PolicyModel(nn.Module):
                         and key == "paligemma_with_expert.gemma_expert.lm_head.weight"
                     ):
                         skipped_lm_head_keys.append(key)
-                        continue
-                    for component, prefixes in config.loader_component_map.items():
-                        if any(key.startswith(prefix) for prefix in prefixes):
-                            component_keys[component].append(key)
-                            break
 
         return Pi05CheckpointManifest(
             model_path=model_path,
             safetensor_files=safetensor_files,
-            component_keys=component_keys,
             skipped_lm_head_keys=skipped_lm_head_keys,
         )
 

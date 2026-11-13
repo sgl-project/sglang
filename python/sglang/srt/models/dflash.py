@@ -12,7 +12,6 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from sglang.kernels.ops.communication.muse_spark_all_gather import gemm_ag_supported
 from sglang.kernels.ops.sampling.topk import radix_topk
 from sglang.kernels.ops.speculative.dflash import (
     dflash_grouped_conv,
@@ -22,11 +21,13 @@ from sglang.kernels.ops.speculative.lilicorr import lilicorr_topk_lse
 from sglang.srt.arg_groups.choices import DFLASH_MLA_ONLY_DRAFT_BACKENDS
 from sglang.srt.configs.draft_parallel import DraftParallelSpec, DraftTPExecution
 from sglang.srt.configs.laguna import normalize_gating
-from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
+from sglang.srt.distributed.device_communicators.triton_symm_mem_ag import (
+    MultimemAllGatherer,
+    recommended_max_tokens,
+)
 from sglang.srt.environ import envs
 from sglang.srt.hf_transformers import get_rope_config
 from sglang.srt.layers.activation import SiluAndMul
-from sglang.srt.layers.communication.muse_spark_gemm_ag import gemm_ag
 from sglang.srt.layers.layer_boundary import AttentionInputs, get_attn_tp_context
 from sglang.srt.layers.layernorm import GemmaRMSNorm, RMSNorm
 from sglang.srt.layers.linear import (
@@ -57,7 +58,11 @@ from sglang.srt.model_loader.weight_utils import (
     sharded_weight_loader,
 )
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
-from sglang.srt.models.utils import apply_qk_norm, bind_or_assign
+from sglang.srt.models.utils import (
+    apply_qk_norm,
+    bind_or_assign,
+    keeps_no_quant_config,
+)
 from sglang.srt.runtime_context import get_parallel, get_spec
 from sglang.srt.speculative.dflash_utils import (
     can_dflash_slice_qkv_weight,
@@ -179,7 +184,13 @@ def candidate_topk(
             "DFlash candidate top-k requires a dense FP16/BF16/FP32 target lm_head "
             "or a supported lm_head.quant_method."
         )
-    tp = get_parallel().tp_size == 1
+    if lm_head.tp_size > 1 and lm_head.tp_size != get_parallel().tp_size:
+        raise RuntimeError(
+            "DFlash candidate top-k: the target lm_head is vocab-sharded over a "
+            "group other than the draft's; with dp attention, pass "
+            "--enable-dp-lm-head."
+        )
+    tp = lm_head.tp_size == 1
     num_org = (
         int(lm_head.org_vocab_size)
         if tp
@@ -191,9 +202,7 @@ def candidate_topk(
     if merged_unary_transform is not None and not tp and not with_partition:
         multiplier, softcap = merged_unary_transform
         start = int(lm_head.shard_indices.org_vocab_start_index)
-        gathered = tensor_model_parallel_all_gather(
-            topk_packed(logits, k, start), dim=-1
-        )
+        gathered = lm_head.tp_group.all_gather(topk_packed(logits, k, start), dim=-1)
         ids, vals = merge_candidates(
             gathered, k, multiplier=multiplier, softcap=softcap
         )
@@ -207,14 +216,18 @@ def candidate_topk(
     if tp:
         return ids.long(), vals, lse
     global_ids = ids.long() + int(lm_head.shard_indices.org_vocab_start_index)
-    gathered_vals = tensor_model_parallel_all_gather(vals.float(), dim=-1)
-    gathered_ids = tensor_model_parallel_all_gather(global_ids, dim=-1)
+    gathered_vals = lm_head.tp_group.all_gather(vals.float(), dim=-1)
+    gathered_ids = lm_head.tp_group.all_gather(global_ids, dim=-1)
     top_vals, sel = torch.topk(gathered_vals, k, dim=-1)
     if lse is not None:
         lse = torch.logsumexp(
-            tensor_model_parallel_all_gather(lse.unsqueeze(-1), dim=-1), dim=-1
+            lm_head.tp_group.all_gather(lse.unsqueeze(-1), dim=-1), dim=-1
         )
     return torch.gather(gathered_ids, -1, sel).long(), top_vals, lse
+
+
+def _is_pow2_above_one(n: int) -> bool:
+    return n > 1 and n & (n - 1) == 0
 
 
 def _get_dflash_attention_type(config, *, default: AttentionType) -> AttentionType:
@@ -1029,6 +1042,7 @@ class DFlashDraftModel(nn.Module):
     supports_fused_context_kv = True
     # Layer prefixes and a quant_config-aware `fc`, for quantized checkpoints.
     supports_quantization = False
+    own_quant_config = staticmethod(keeps_no_quant_config)
 
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:
         super().__init__()
@@ -1060,8 +1074,6 @@ class DFlashDraftModel(nn.Module):
         self.lilicorr: Optional[nn.Module] = None
         self.is_nemotron_35_draft = is_nemotron_35_draft_config(config)
         self.quantizable = self.supports_quantization or self.is_nemotron_35_draft
-        # Set by the spec worker from the target topology; see enable_split_fc.
-        self.split_fc = False
         self.embed_tokens: Optional[VocabParallelEmbedding] = None
         if self.is_nemotron_35_draft:
             embed_prefix = f"{prefix}.embed_tokens" if prefix else "embed_tokens"
@@ -1122,6 +1134,7 @@ class DFlashDraftModel(nn.Module):
         num_context_features = len(target_layer_ids)
 
         self.num_context_features = int(num_context_features)
+        self._fc_gatherer: Optional[MultimemAllGatherer] = None
         if self.quantizable:
             fc_prefix = f"{prefix}.fc" if prefix else "fc"
             self.fc = ReplicatedLinear(
@@ -1131,12 +1144,29 @@ class DFlashDraftModel(nn.Module):
                 quant_config=quant_config,
                 prefix=fc_prefix,
             )
+        elif (
+            envs.SGLANG_OPT_DFLASH_SPLIT_FC.get()
+            and get_parallel().tp_group.world_size > 1
+            and type(self).project_target_hidden
+            is DFlashDraftModel.project_target_hidden
+        ):
+            # Each rank projects its hidden columns; the gather rebuilds the row. The draft's
+            # TP ranks share token rows (SINGLE_GROUP), as the gather needs.
+            self.fc = ColumnParallelLinear(
+                self.num_context_features * hidden_size,
+                hidden_size,
+                bias=False,
+                gather_output=False,
+                prefix=f"{prefix}.fc" if prefix else "fc",
+            )
+            # Rows are the injected target tokens, up to a prefill chunk.
+            self._fc_gatherer = MultimemAllGatherer(
+                max_tokens=recommended_max_tokens(include_prefill=True, floor=512)
+            )
         else:
             self.fc = nn.Linear(
                 self.num_context_features * hidden_size, hidden_size, bias=False
             )
-            # Inference-only weight; CuTe-DSL GEMMs on the split path cannot export grad tensors.
-            self.fc.weight.requires_grad_(False)
         self.hidden_norm = norm_cls(hidden_size, eps=rms_norm_eps)
 
         # The model loader calls load_weights() before set_block_size(). Build
@@ -1198,7 +1228,11 @@ class DFlashDraftModel(nn.Module):
 
     def project_target_hidden(self, target_hidden: torch.Tensor) -> torch.Tensor:
         """Project concatenated target-layer hidden states into draft hidden_size."""
-        expected = int(self.fc.input_size if self.quantizable else self.fc.in_features)
+        expected = int(
+            self.fc.in_features
+            if isinstance(self.fc, nn.Linear)
+            else self.fc.input_size
+        )
         if target_hidden.ndim != 2 or int(target_hidden.shape[-1]) != expected:
             raise ValueError(
                 "DFLASH target_hidden feature dim mismatch. "
@@ -1208,34 +1242,12 @@ class DFlashDraftModel(nn.Module):
                 "This usually means the target model is capturing a different number of layer features than "
                 "the draft checkpoint/config expects."
             )
-        if self.split_fc:
-            projected = self._fc_split_gather(target_hidden)
-        else:
-            projected = self.fc(target_hidden)
-            if self.quantizable:
-                projected = projected[0]
+        projected = self.fc(target_hidden)
+        if self._fc_gatherer is not None:
+            projected = self._fc_gatherer(projected[0])
+        elif self.quantizable:
+            projected = projected[0]
         return self.hidden_norm(projected)
-
-    def _fc_split_gather(self, x: torch.Tensor) -> torch.Tensor:
-        """``self.fc(x)`` as per-rank column slices + one multicast all-gather; plain fc when unsupported."""
-        comm = get_parallel().tp_group.ca_comm
-        if not gemm_ag_supported(comm, x, self.fc.weight):
-            return self.fc(x)
-        return gemm_ag(comm, x, self.fc.weight)
-
-    def enable_split_fc(self) -> None:
-        """Turn on the split fc if the flag is set and the target topology allows it.
-
-        Call outside the draft scope: gemm_ag needs the same fc input on every rank of
-        the TP group, attention DP and prefill CP give ranks different tokens, and the
-        draft scope reads both widths as 1.
-        """
-        self.split_fc = (
-            envs.SGLANG_OPT_DFLASH_SPLIT_FC.get()
-            and isinstance(self.fc, nn.Linear)
-            and get_parallel().attn_dp_size == 1
-            and get_parallel().attn_cp_size == 1
-        )
 
     @torch.no_grad()
     def forward(
@@ -1374,6 +1386,14 @@ class DFlashDraftModel(nn.Module):
                             getattr(param, "pack_factor", None) is None
                             and tuple(loaded_weight.shape) == tuple(param.shape)
                         )
+                    elif self._fc_gatherer is not None:
+                        # This rank holds a row block; the weight_loader shards the full tensor.
+                        expected_shape = (
+                            int(self.config.hidden_size),
+                            int(self.num_context_features * self.config.hidden_size),
+                        )
+                        loaded_shape = tuple(loaded_weight.shape)
+                        shape_matches = loaded_shape == expected_shape
                     else:
                         expected_shape = tuple(param.shape)
                         loaded_shape = tuple(loaded_weight.shape)
@@ -1723,12 +1743,10 @@ class DFlash2DraftModel(DFlashDraftModel):
         self.lm_head: Optional[nn.Module] = None
         # MI355X (SGLANG_ROCM_MUSE_DFLASH_FUSED_CANDIDATES): under TP the ranks' candidates
         # travel in one all-gather and one kernel merges them and applies the transform.
-        tp_size = int(get_parallel().tp_size)
+        # The head's shard count is checked per call: the head is attached later.
         self.merge_candidates_fused = (
             _is_gfx95
             and envs.SGLANG_ROCM_MUSE_DFLASH_FUSED_CANDIDATES.get()
-            and tp_size > 1
-            and tp_size & (tp_size - 1) == 0
             and int(config.vocab_size) < MAX_PACKED_ID
         )
 
@@ -1747,7 +1765,8 @@ class DFlash2DraftModel(DFlashDraftModel):
         """Top-k base candidates via the target lm_head: hidden [N, H] -> global
         candidate_ids / unary_logits [N, K]."""
         assert self.lm_head is not None, "draft_model.lm_head unset before capture"
-        if self.merge_candidates_fused:
+        fused = self.merge_candidates_fused and _is_pow2_above_one(self.lm_head.tp_size)
+        if fused:
             ids, vals, _ = candidate_topk(
                 hidden,
                 self.lm_head,
