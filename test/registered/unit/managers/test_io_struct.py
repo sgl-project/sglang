@@ -10,6 +10,8 @@ import msgspec
 import numpy as np
 import torch
 
+from sglang.srt.entrypoints.openai.protocol import OPENAI_MAX_N
+from sglang.srt.environ import envs
 from sglang.srt.managers import io_struct
 from sglang.srt.managers.io_struct import (
     EmbeddingReqInput,
@@ -120,6 +122,7 @@ class TestTokenizedReqInputMsgpack(unittest.TestCase):
                 "DetachHiCacheStorageReqInput",
                 "AttachHiCacheStorageReqInput",
                 "ProfileReq",
+                "FreezeGCReq",
             },
         )
         for name, body in messages:
@@ -433,6 +436,70 @@ class TestGenerateReqInputNormalization(CustomTestCase):
             rid=["id1", "id2"],
         )
 
+    def test_sampling_params_are_owned_by_each_request(self):
+        """Adjusting one request's token budget must preserve peers and caller defaults."""
+        for n in (1, 2):
+            shared = {"max_new_tokens": 20, "n": n}
+            cases = (None,) if n == 1 else ()
+            cases += (
+                shared,
+                [shared, shared],
+                [shared.copy(), {"max_new_tokens": 30, "n": n}],
+            )
+            for params in cases:
+                params = copy.deepcopy(params)
+                with self.subTest(n=n, params=params):
+                    original = copy.deepcopy(params)
+                    req = GenerateReqInput(
+                        text=["Hello", "World"], sampling_params=params
+                    )
+                    req.normalize_batch_and_arguments()
+                    expected = [dict(item) for item in req.sampling_params]
+                    for i in range(len(req.sampling_params)):
+                        req[i].sampling_params["max_new_tokens"] = 5 + i
+                        expected[i]["max_new_tokens"] = 5 + i
+                        self.assertEqual(req.sampling_params, expected)
+                        self.assertEqual(
+                            req[i].sampling_params["max_new_tokens"], 5 + i
+                        )
+                        self.assertEqual(params, original)
+
+    def test_single_request_preserves_caller_sampling_params(self):
+        """Reusing defaults after a per-request adjustment must keep the original budget."""
+        params = {"max_new_tokens": 20}
+        req = GenerateReqInput(text="Hello", sampling_params=params)
+        req.normalize_batch_and_arguments()
+        req.sampling_params["max_new_tokens"] = 5
+
+        next_req = GenerateReqInput(text="World", sampling_params=params)
+        next_req.normalize_batch_and_arguments()
+        self.assertEqual(next_req.sampling_params["max_new_tokens"], 20)
+
+    def test_single_prompt_parallel_samples_preserve_caller_budget(self):
+        """Fan-out from one prompt must not share mutable completion budgets."""
+        for per_prompt in (False, True):
+            with self.subTest(per_prompt=per_prompt):
+                params = {"max_new_tokens": 20, "n": 2}
+                req = GenerateReqInput(
+                    text="Hello", sampling_params=[params] if per_prompt else params
+                )
+                req.normalize_batch_and_arguments()
+                req[0].sampling_params["max_new_tokens"] = 5
+                self.assertEqual(req[1].sampling_params["max_new_tokens"], 20)
+                self.assertEqual(params, {"max_new_tokens": 20, "n": 2})
+
+    def test_renormalization_refreshes_cached_sampling_params(self):
+        """A cached subrequest must use the batch's current token budget after normalization."""
+        req = GenerateReqInput(
+            text=["Hello", "World"], sampling_params={"max_new_tokens": 20}
+        )
+        req.normalize_batch_and_arguments()
+        req[0]
+        req.normalize_batch_and_arguments()
+        req[0].sampling_params["max_new_tokens"] = 5
+        self.assertEqual(req.sampling_params[0]["max_new_tokens"], 5)
+        self.assertEqual(req[1].sampling_params["max_new_tokens"], 20)
+
     def test_sampling_logprobs_mode_normalization(self):
         default_req = copy.deepcopy(self.base_req)
         default_req.normalize_batch_and_arguments()
@@ -521,6 +588,40 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         # Check modalities
         self.assertEqual(req.modalities, [None, "image"])
 
+    def test_oversized_n_rejected_before_fan_out(self):
+        """An out-of-range n must be rejected before inputs are expanded n times."""
+        with envs.SGLANG_MAX_BATCH_REQS_PER_HTTP_REQ.override(4096):
+            for n in (0, -1, 4097, True, "2", None, 2.0):
+                for sampling_params in ({"n": n}, [{"n": n}, {"n": n}]):
+                    with self.subTest(n=n, sampling_params=sampling_params):
+                        text = (
+                            "Hello" if isinstance(sampling_params, dict) else ["a", "b"]
+                        )
+                        req = GenerateReqInput(
+                            text=text, sampling_params=sampling_params
+                        )
+                        with self.assertRaisesRegex(ValueError, "n must be an integer"):
+                            req.normalize_batch_and_arguments()
+                        self.assertIsNone(req.rid)
+
+            # Native requests are not limited to OpenAI's n.
+            req = GenerateReqInput(
+                text="Hello", sampling_params={"n": OPENAI_MAX_N + 1}
+            )
+            req.normalize_batch_and_arguments()
+            self.assertEqual(len(req.text), OPENAI_MAX_N + 1)
+
+    def test_list_n_validated_for_every_element(self):
+        """A later element equal to the first by value must still be validated."""
+        for later in (True, 2.0):
+            first = 1 if later is True else 2
+            with self.subTest(later=later):
+                req = GenerateReqInput(
+                    text=["a", "b"], sampling_params=[{"n": first}, {"n": later}]
+                )
+                with self.assertRaisesRegex(ValueError, "n must be an integer"):
+                    req.normalize_batch_and_arguments()
+
     def test_expanding_parallel_sample_correlation(self):
         """Test that when expanding with parallel samples, prompts, images and modalities are properly correlated."""
         req = copy.deepcopy(self.base_req)
@@ -549,6 +650,60 @@ class TestGenerateReqInputNormalization(CustomTestCase):
 
         # Ensure that text items are properly duplicated too
         self.assertEqual(req.text, expected_text)
+
+    def test_parallel_sampling_with_empty_media(self):
+        """Empty media must yield one empty entry per sample, not a zero-size batch."""
+        for prompt in (
+            {"text": "hello"},
+            {"input_ids": [1, 2]},
+            {"input_embeds": [[0.1, 0.2]]},
+        ):
+            for n in (2, 3):
+                with self.subTest(prompt=prompt, n=n):
+                    req = GenerateReqInput(
+                        **prompt,
+                        image_data=[],
+                        video_data=[],
+                        audio_data=[],
+                        mm_hashes=[],
+                        mm_content_hashes=[],
+                        sampling_params={"n": n},
+                    )
+                    req.normalize_batch_and_arguments()
+                    for index in range(n):
+                        sample = req[index]
+                        self.assertEqual(sample.image_data, [])
+                        self.assertEqual(sample.video_data, [])
+                        self.assertEqual(sample.audio_data, [])
+                        self.assertEqual(sample.mm_hashes, [])
+                        self.assertEqual(sample.mm_content_hashes, [])
+
+    def test_batched_empty_video_and_audio(self):
+        """Absent video/audio lists must not raise IndexError when splitting a batch."""
+        for n in (1, 2):
+            with self.subTest(n=n):
+                req = GenerateReqInput(
+                    text=["first", "second"],
+                    video_data=[],
+                    audio_data=[],
+                    sampling_params={"n": n},
+                )
+                req.normalize_batch_and_arguments()
+                for index in range(2 * n):
+                    self.assertIsNone(req[index].video_data)
+                    self.assertIsNone(req[index].audio_data)
+
+    def test_parallel_sampling_empty_hashes_still_require_empty_images(self):
+        for hashes in ({"mm_hashes": []}, {"mm_content_hashes": []}):
+            with self.subTest(hashes=hashes):
+                req = GenerateReqInput(
+                    text="hello",
+                    image_data=["a.png", "b.png"],
+                    sampling_params={"n": 2},
+                    **hashes,
+                )
+                with self.assertRaisesRegex(ValueError, "0 entries for 2 images"):
+                    req.normalize_batch_and_arguments()
 
     def test_specific_parallel_n_per_sample(self):
         """Test parallel expansion when different samples have different n values."""
@@ -800,6 +955,13 @@ class TestGenerateReqInputNormalization(CustomTestCase):
             [batch[i].rid for i in range(4)],
             ["batch_0", "batch_1", "batch_2", "batch_3"],
         )
+
+    def test_generate_rids_stay_unpadded(self):
+        # Clients and the Rust server rebuild unpadded `<rid>_<i>` for generate.
+        req = GenerateReqInput(text="x", rid="base", sampling_params={"n": 12})
+        req.normalize_batch_and_arguments()
+        self.assertEqual(req.rid[0], "base_0")
+        self.assertEqual(req.rid[11], "base_11")
 
     def test_audio_data_handling(self):
         """Test handling of audio_data."""
@@ -1369,6 +1531,56 @@ class TestKvHintsTransport(CustomTestCase):
 class TestEmbeddingReqInputGetItem(CustomTestCase):
     """Test EmbeddingReqInput.__getitem__."""
 
+    def test_renormalization_refreshes_cached_sampling_params(self):
+        """Cached embeddings must use the batch's current sampling settings."""
+        cases = (
+            (["Hello", "World"], False),
+            ([["query 1", "doc 1"], ["query 2", "doc 2"]], True),
+        )
+        for text, is_cross_encoder in cases:
+            with self.subTest(cross_encoder=is_cross_encoder):
+                req = EmbeddingReqInput(
+                    text=text,
+                    is_cross_encoder_request=is_cross_encoder,
+                    sampling_params={"temperature": 0.7},
+                )
+                req.normalize_batch_and_arguments()
+                req[0]
+                req.normalize_batch_and_arguments()
+                req[0].sampling_params["temperature"] = 0.2
+                self.assertEqual(req.sampling_params[0]["temperature"], 0.2)
+                self.assertEqual(req[1].sampling_params["temperature"], 0.7)
+
+    def test_embedding_sampling_params_preserve_generation_defaults(self):
+        """Embedding normalization must not zero a caller's generation token budget."""
+        for text in ("Hello", ["Hello", "World"]):
+            shared = {"max_new_tokens": 20, "temperature": 0.7}
+            cases = (None, shared)
+            if isinstance(text, list):
+                cases += ([shared, shared], [shared.copy(), shared.copy()])
+            for params in cases:
+                params = copy.deepcopy(params)
+                with self.subTest(text=text, params=params):
+                    original = copy.deepcopy(params)
+                    req = EmbeddingReqInput(text=text, sampling_params=params)
+                    req.normalize_batch_and_arguments()
+                    self.assertEqual(params, original)
+                    if req.is_single:
+                        self.assertEqual(req.sampling_params["max_new_tokens"], 0)
+                    else:
+                        self.assertEqual(
+                            [
+                                req[i].sampling_params["max_new_tokens"]
+                                for i in range(2)
+                            ],
+                            [0, 0],
+                        )
+                        req[0].sampling_params["temperature"] = 0.2
+                        self.assertEqual(
+                            req[1].sampling_params.get("temperature"),
+                            None if params is None else 0.7,
+                        )
+
     def test_priority_is_preserved(self):
         """Priority must survive the batch split, in both __getitem__ branches."""
         req = EmbeddingReqInput(text=["Hello", "World"], priority=7)
@@ -1450,6 +1662,29 @@ class TestEmbeddingReqInputGetItem(CustomTestCase):
         req = EmbeddingReqInput(text=["t0", "t1", "t2"], image_data=["a.jpg"])
         with self.assertRaisesRegex(ValueError, "image_data has 1 entries"):
             req.normalize_batch_and_arguments()
+
+
+class TestEmbeddingReqInputRid(CustomTestCase):
+    def test_expanded_rids_are_zero_padded(self):
+        # The scheduler aborts by rid prefix, so no sub-rid may prefix another.
+        req = EmbeddingReqInput(text=["t"] * 12, rid="base")
+        req.normalize_batch_and_arguments()
+        self.assertEqual(req.rid[0], "base_00")
+        self.assertEqual(req.rid[11], "base_11")
+        for a in req.rid:
+            for b in req.rid:
+                if a != b:
+                    self.assertFalse(b.startswith(a), f"{a!r} prefixes {b!r}")
+
+    def test_invalid_base_rid_rejected(self):
+        for bad, msg in (
+            ("", "non-empty"),
+            ("HEALTH_CHECK_1", "reserved prefix"),
+        ):
+            with self.subTest(rid=bad):
+                req = EmbeddingReqInput(text=["a", "b"], rid=bad)
+                with self.assertRaisesRegex(ValueError, msg):
+                    req.normalize_batch_and_arguments()
 
 
 if __name__ == "__main__":
