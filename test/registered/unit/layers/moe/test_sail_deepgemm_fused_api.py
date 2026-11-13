@@ -85,7 +85,7 @@ class TestDeepGemmMaskedActivationContract(CustomTestCase):
             patch.object(kernels, "get_device_sm", return_value=89),
             self.assertRaisesRegex(AssertionError, "no MXFP4 e2m1 packing branch"),
         ):
-            kernels.silu_and_mul_masked_post_quant_fwd(
+            kernels.silu_and_mul_masked_post_quant_fwd_sail(
                 torch.ones((2, 3, 256), dtype=torch.bfloat16),
                 torch.empty((2, 3, 64), dtype=torch.uint8),
                 torch.empty((2, 2, 3), dtype=torch.uint16),
@@ -345,7 +345,7 @@ class TestDeepGemmMaskedActivationContract(CustomTestCase):
                     )
                     stack.enter_context(patch.object(kernels, "_is_sail", True))
                     kernel_module, kernel = (
-                        (kernels, "_silu_and_mul_post_quant_kernel")
+                        (kernels, "_silu_and_mul_post_quant_kernel_sail")
                         if variant in ("channel", "int8")
                         else (sail_activations, "_silu_and_mul_masked_kernel")
                     )
@@ -564,7 +564,7 @@ class TestDeepGemmMaskedActivationContract(CustomTestCase):
                 self.subTest(width=width, group=group, int8=int8),
                 patch.object(kernels, "_is_sail", True),
                 patch.object(
-                    kernels, "_silu_and_mul_post_quant_kernel", LaunchBoundary()
+                    kernels, "_silu_and_mul_post_quant_kernel_sail", LaunchBoundary()
                 ),
             ):
                 for capacity in (slots, slots - 1):
@@ -580,12 +580,12 @@ class TestDeepGemmMaskedActivationContract(CustomTestCase):
                         with self.assertRaisesRegex(
                             AssertionError, "output_scale too small"
                         ):
-                            kernels.silu_and_mul_masked_post_quant_fwd(
+                            kernels.silu_and_mul_masked_post_quant_fwd_sail(
                                 x, out, scales, group, counts, **kwargs
                             )
                         self.assertEqual(launches, [])
                         continue
-                    kernels.silu_and_mul_masked_post_quant_fwd(
+                    kernels.silu_and_mul_masked_post_quant_fwd_sail(
                         x, out, scales, group, counts, **kwargs
                     )
                     self.assertEqual(len(launches), 1)

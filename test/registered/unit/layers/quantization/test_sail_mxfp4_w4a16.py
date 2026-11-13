@@ -190,7 +190,7 @@ class TestSailMxfp4W4a16(CustomTestCase):
 
     def test_sail_nopad_gemm_keeps_checkpoint_shapes(self):
         """The SAIL grouped GEMM is the "nopad" variant, so K and N must stay at
-        the checkpoint's sizes even when triton_kernels is importable."""
+        the checkpoint's sizes."""
         method = self._method()
         method.use_deepgemm_mxfp4_w4a16_valu = False
         method.use_deep_gemm = True
@@ -198,10 +198,7 @@ class TestSailMxfp4W4a16(CustomTestCase):
         layer.num_local_experts = 2
         layer.hidden_size = 65
         layer.intermediate_size_per_partition = 129
-        with (
-            patch.object(mxfp4, "_is_sail", True),
-            patch.object(mxfp4, "has_triton_kernels", True),
-        ):
+        with patch.object(mxfp4, "_is_sail", True):
             method.create_weights(layer, 2, 65, 129, torch.bfloat16)
         self.assertEqual(tuple(layer.w13_weight.shape), (2, 258, 32))
         self.assertEqual(tuple(layer.w2_weight.shape), (2, 65, 64))
