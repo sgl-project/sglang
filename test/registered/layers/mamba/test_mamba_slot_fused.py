@@ -22,7 +22,7 @@ from sglang.srt.mem_cache.mamba_slot_fused import (
     warmup_fused_copy_conv_slots,
 )
 from sglang.srt.utils import get_device
-from sglang.srt.utils.common import get_device_module
+from sglang.srt.utils.device import get_device_module
 from sglang.test.ci.ci_register import register_cuda_ci, register_xpu_ci
 from sglang.test.test_utils import CustomTestCase
 

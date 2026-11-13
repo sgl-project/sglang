@@ -24,6 +24,7 @@ import torch.nn.functional as F
 from einops import rearrange
 from transformers import PretrainedConfig
 
+from sglang.srt.hf_transformers import get_processor
 from sglang.srt.layers.activation import QuickGELU
 from sglang.srt.layers.attention.vision import (
     VisionAttention,
@@ -36,6 +37,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.managers.mm_utils import (
     general_mm_embed_routine,
@@ -45,8 +47,6 @@ from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.ernie45_moe_vl import Ernie4_5_VLMoeModel
-from sglang.srt.utils import add_prefix
-from sglang.srt.utils.hf_transformers import get_processor
 
 logger = logging.getLogger(__name__)
 
@@ -347,21 +347,6 @@ class VariableResolutionResamplerModel(nn.Module):
             weight_loader(param, loaded_weight)
             loaded_params.add(name)
         return loaded_params
-
-
-class Ernie4_5_VisionRotaryEmbedding(nn.Module):
-    def __init__(self, dim: int, theta: float = 10000.0) -> None:
-        super().__init__()
-        self.inv_freq = 1.0 / theta ** (
-            torch.arange(start=0, end=dim, step=2, dtype=torch.float32) / dim
-        )
-
-    def forward(self, seqlen: int) -> torch.Tensor:
-        seq = torch.arange(
-            seqlen, device=self.inv_freq.device, dtype=self.inv_freq.dtype
-        )
-        freqs = torch.outer(input=seq, vec2=self.inv_freq)
-        return freqs
 
 
 class Ernie4_5_VisionTransformer(nn.Module):

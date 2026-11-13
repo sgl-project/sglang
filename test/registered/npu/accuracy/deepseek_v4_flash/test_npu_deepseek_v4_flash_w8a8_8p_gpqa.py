@@ -17,7 +17,7 @@ register_npu_ci(est_time=3600, suite="base-c-test-acc-16-npu-a3")
 
 register_npu_ci(
     est_time=3600,
-    suite="nightly-acc-16-npu-a3",
+    suite="full-acc-16-npu-a3",
     nightly=True,
 )
 
@@ -49,7 +49,6 @@ DEEPSEEK_V4_FLASH_W8A8_DSPARK_8P_ENVS = {
     "SGLANG_OPT_USE_TILELANG_MHC_POST": "False",
     # DSPARK
     "SGLANG_RAGGED_VERIFY_MODE": "static",
-    "SGLANG_DSPARK_FAST_KERNEL": "0",
     # mtp
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
     # deepep
