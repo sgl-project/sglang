@@ -27,6 +27,8 @@ impl CoreHandle {
         request: GenerateRequest,
         received: ReceivedAs,
     ) -> Result<CoreCall, CoreError> {
+        // Python holds client generates while paused, before tokenizing.
+        self.inner.frontend.wait_unpaused().await;
         // Counted from admission, media prefetch included: the drain waits
         // for it.
         let in_flight = self.inner.drain.track();
@@ -207,6 +209,8 @@ impl CoreHandle {
         if requests.is_empty() {
             return Ok(Vec::new());
         }
+        // Python holds client generates while paused, before tokenizing.
+        self.inner.frontend.wait_unpaused().await;
         for request in &mut requests {
             self.set_default_priority(request);
         }
@@ -652,6 +656,12 @@ struct Entry {
 }
 
 impl Generations {
+    /// Whether any client generation is between registration and its
+    /// terminal response.
+    pub(super) fn is_empty(&self) -> bool {
+        self.0.lock().unwrap().is_empty()
+    }
+
     fn register(&self, rid: Rid, abort_tx: flume::Sender<AbortSource>) -> Generation {
         let admission = RequestAdmission::pending();
         let (cancelled, cancellation) = oneshot::channel();

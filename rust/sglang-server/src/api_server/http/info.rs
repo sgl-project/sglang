@@ -19,6 +19,7 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::{Map, Value};
+use sglang_api_types::api::v1 as api;
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
@@ -35,6 +36,12 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
         // Control-plane: the core performs the typed operation and this
         // adapter renders its result as one non-streamed JSON response.
         .route("/server_info", get(server_info))
+        .route("/get_server_info", get(get_server_info))
+        // Liveness and readiness flags, no scheduler round-trip: `/ping` is
+        // the SageMaker probe (a paused server still answers 200), `/ready`
+        // also needs the server unpaused.
+        .route("/ping", get(ping))
+        .route("/ready", get(ready))
         // Static config, no scheduler round-trip. `/get_model_info` (+ `/model_info`
         // alias).
         .route("/get_model_info", get(model_info))
@@ -43,10 +50,152 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
         .route("/weights_checker", get(check_weights).post(check_weights))
         .route("/start_profile", get(start_profile).post(start_profile))
         .route("/stop_profile", get(stop_profile).post(stop_profile))
+        .route("/freeze_gc", get(freeze_gc).post(freeze_gc))
+        .route("/pause_generation", post(pause_generation))
+        .route("/continue_generation", post(continue_generation))
         .route("/abort_request", post(abort_request))
         // Listener-to-listener: another DP rank's control request for this
         // rank's scheduler (see `api_server::core::peer`).
         .route(FORWARD_PEER_PATH, post(forward_control_req))
+}
+
+/// Python's `ProfileReq` body for `/start_profile`. `req_type` is accepted
+/// only as one of Python's `ProfileReqType` values and then ignored: the route
+/// always starts.
+#[derive(Deserialize)]
+struct StartProfileBody {
+    #[serde(default)]
+    req_type: Option<u8>,
+    #[serde(flatten)]
+    options: ProfileOptions,
+}
+
+/// `GET|POST /start_profile` — the scheduler ranks start their profilers
+/// with the body's options (Python's defaults for an absent or `null` body);
+/// which ranks under attention DP: see `ProfileReq`.
+/// Python's plain-text 200 once started.
+async fn start_profile(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
+    let options = if body.is_empty() {
+        ProfileOptions::default()
+    } else {
+        match serde_json::from_slice::<Option<StartProfileBody>>(&body) {
+            Ok(None) => ProfileOptions::default(),
+            Ok(Some(StartProfileBody {
+                req_type: None | Some(1 | 2),
+                options,
+            })) => options,
+            Ok(Some(_)) => {
+                return native_error(
+                    StatusCode::BAD_REQUEST,
+                    "req_type: Input should be 1 or 2",
+                    false,
+                );
+            }
+            Err(error) => {
+                return native_error(StatusCode::BAD_REQUEST, &error.to_string(), false);
+            }
+        }
+    };
+    profile_response(
+        state.core.start_profile(options).await,
+        "Start profiling.\n",
+    )
+}
+
+/// `GET|POST /stop_profile` — the scheduler ranks stop their profilers and
+/// write their traces (which ranks under attention DP: see `ProfileReq`);
+/// any body is ignored, as Python ignores it.
+async fn stop_profile(State(state): State<Arc<AppState>>) -> Response {
+    profile_response(
+        state.core.stop_profile().await,
+        "Stop profiling. This will take some time.\n",
+    )
+}
+
+/// Python's responses for both profile routes: 200 with `ok_body` and no
+/// content type. A scheduler refusal (e.g. already profiling) is the
+/// `RuntimeError` Python raises in the route, which reaches the client as the
+/// framework's bare 500 `Internal Server Error`; the reason is only logged.
+fn profile_response(outcome: Result<ProfileOutcome, CoreError>, ok_body: &'static str) -> Response {
+    match outcome {
+        Ok(ProfileOutcome { success: true, .. }) => Response::new(Body::from(ok_body)),
+        Ok(ProfileOutcome { message, .. }) => {
+            tracing::error!(%message, "profile request failed");
+            (StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error").into_response()
+        }
+        Err(CoreError::Unavailable) => native_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "service unavailable",
+            false,
+        ),
+        Err(error) => native_error(error.http_status(), &error.to_string(), false),
+    }
+}
+
+/// Python's `Response(content=<line>)` on success: a bare 200 text body.
+fn text_ack(outcome: Result<(), CoreError>, done: &'static str) -> Response {
+    match outcome {
+        Ok(()) => {
+            let mut response = Response::new(Body::from(done));
+            *response.status_mut() = StatusCode::OK;
+            response
+        }
+        Err(error) => native_error(error.http_status(), &error.to_string(), false),
+    }
+}
+
+async fn freeze_gc(State(state): State<Arc<AppState>>) -> Response {
+    text_ack(
+        state.core.freeze_gc_all().await,
+        "Garbage collection frozen.\n",
+    )
+}
+
+/// `POST /pause_generation` — Python's `{"message", "status": "ok"}` body.
+async fn pause_generation(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<api::PauseGenerationRequest>, JsonRejection>,
+) -> Response {
+    let body = match body {
+        Ok(Json(body)) => body,
+        Err(rejection) => {
+            return native_error(StatusCode::BAD_REQUEST, &rejection.body_text(), false);
+        }
+    };
+    let mode = body.mode.unwrap_or_else(|| "abort".into());
+    match state.core.pause_generation(&mode).await {
+        Ok(()) => Json(api::GenerationPauseResponse {
+            message: "Generation paused successfully.".into(),
+            status: "ok".into(),
+        })
+        .into_response(),
+        Err(error) => native_error(error.http_status(), &error.to_string(), false),
+    }
+}
+
+/// `POST /continue_generation` — the counterpart of `/pause_generation`.
+async fn continue_generation(
+    State(state): State<Arc<AppState>>,
+    body: Result<Json<api::ContinueGenerationRequest>, JsonRejection>,
+) -> Response {
+    let body = match body {
+        Ok(Json(body)) => body,
+        Err(rejection) => {
+            return native_error(StatusCode::BAD_REQUEST, &rejection.body_text(), false);
+        }
+    };
+    match state
+        .core
+        .continue_generation(body.torch_empty_cache.unwrap_or(true))
+        .await
+    {
+        Ok(()) => Json(api::GenerationPauseResponse {
+            message: "Generation continued successfully.".into(),
+            status: "ok".into(),
+        })
+        .into_response(),
+        Err(error) => native_error(error.http_status(), &error.to_string(), false),
+    }
 }
 
 /// `POST /internal/peer` — the body is a control message's wire bytes,
@@ -119,7 +268,7 @@ async fn await_server_info(state: &AppState) -> Result<ServerInfo, Response> {
 /// model metadata, Python's launch-time model fields last (no scheduler
 /// round-trip).
 async fn model_info(State(state): State<Arc<AppState>>) -> Response {
-    let info = state.core.model_info();
+    let info = state.core.model_info().await;
     (
         StatusCode::OK,
         [("content-type", "application/json")],
@@ -151,6 +300,34 @@ async fn server_info(State(state): State<Arc<AppState>>) -> Response {
             )
                 .into_response()
         }
+    }
+}
+
+/// The deprecated alias Python keeps, warning on each use.
+async fn get_server_info(state: State<Arc<AppState>>) -> Response {
+    tracing::warn!(
+        "Endpoint '/get_server_info' is deprecated and will be removed in a future version. \
+         Please use '/server_info' instead."
+    );
+    server_info(state).await
+}
+
+/// `GET /ping` — Python's `is_healthy()`: up and not shutting down; an
+/// intentional pause still answers 200. An empty body either way.
+async fn ping(State(state): State<Arc<AppState>>) -> Response {
+    flag_status(state.core.is_ready() && !state.core.is_draining())
+}
+
+/// `GET /ready` — Python's `is_ready()`: healthy and not paused.
+async fn ready(State(state): State<Arc<AppState>>) -> Response {
+    flag_status(state.core.is_ready() && !state.core.is_draining() && !state.core.is_paused())
+}
+
+fn flag_status(ok: bool) -> Response {
+    if ok {
+        StatusCode::OK.into_response()
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE.into_response()
     }
 }
 
@@ -321,79 +498,6 @@ async fn check_weights(State(state): State<Arc<AppState>>, body: Bytes) -> Respo
         );
     }
     (status, Json(Value::Object(response))).into_response()
-}
-
-/// Python's `ProfileReq` body for `/start_profile`. `req_type` is accepted
-/// only as one of Python's `ProfileReqType` values and then ignored: the route
-/// always starts.
-#[derive(Deserialize)]
-struct StartProfileBody {
-    #[serde(default)]
-    req_type: Option<u8>,
-    #[serde(flatten)]
-    options: ProfileOptions,
-}
-
-/// `GET|POST /start_profile` — the scheduler ranks start their profilers
-/// with the body's options (Python's defaults for an absent or `null` body);
-/// which ranks under attention DP: see `ProfileReq`.
-/// Python's plain-text 200 once started.
-async fn start_profile(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
-    let options = if body.is_empty() {
-        ProfileOptions::default()
-    } else {
-        match serde_json::from_slice::<Option<StartProfileBody>>(&body) {
-            Ok(None) => ProfileOptions::default(),
-            Ok(Some(StartProfileBody {
-                req_type: None | Some(1 | 2),
-                options,
-            })) => options,
-            Ok(Some(_)) => {
-                return native_error(
-                    StatusCode::BAD_REQUEST,
-                    "req_type: Input should be 1 or 2",
-                    false,
-                );
-            }
-            Err(error) => {
-                return native_error(StatusCode::BAD_REQUEST, &error.to_string(), false);
-            }
-        }
-    };
-    profile_response(
-        state.core.start_profile(options).await,
-        "Start profiling.\n",
-    )
-}
-
-/// `GET|POST /stop_profile` — the scheduler ranks stop their profilers and
-/// write their traces (which ranks under attention DP: see `ProfileReq`);
-/// any body is ignored, as Python ignores it.
-async fn stop_profile(State(state): State<Arc<AppState>>) -> Response {
-    profile_response(
-        state.core.stop_profile().await,
-        "Stop profiling. This will take some time.\n",
-    )
-}
-
-/// Python's responses for both profile routes: 200 with `ok_body` and no
-/// content type. A scheduler refusal (e.g. already profiling) is the
-/// `RuntimeError` Python raises in the route, which reaches the client as the
-/// framework's bare 500 `Internal Server Error`; the reason is only logged.
-fn profile_response(outcome: Result<ProfileOutcome, CoreError>, ok_body: &'static str) -> Response {
-    match outcome {
-        Ok(ProfileOutcome { success: true, .. }) => Response::new(Body::from(ok_body)),
-        Ok(ProfileOutcome { message, .. }) => {
-            tracing::error!(%message, "profile request failed");
-            (StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error").into_response()
-        }
-        Err(CoreError::Unavailable) => native_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "service unavailable",
-            false,
-        ),
-        Err(error) => native_error(error.http_status(), &error.to_string(), false),
-    }
 }
 
 /// Python's `AbortReq` body: the fields `/abort_request` reads.
@@ -1865,6 +1969,54 @@ mod tests {
         let _ = response.await;
     }
 
+    /// The pause family answers Python's bodies: `{"message", "status"}` for
+    /// pause and continue, a text line for freeze_gc, and the weight-version
+    /// envelope with the version echoed.
+    #[tokio::test]
+    async fn pause_family_routes_answer_python_shapes() {
+        let bare =
+            Bytes::from(rmp_serde::to_vec_named(&serde_json::json!({"success": true})).unwrap());
+        for (method, uri, body, expected) in [
+            (
+                "POST",
+                "/pause_generation",
+                r#"{"mode": "in_place"}"#,
+                r#"{"message":"Generation paused successfully.","status":"ok"}"#,
+            ),
+            (
+                "POST",
+                "/continue_generation",
+                "{}",
+                r#"{"message":"Generation continued successfully.","status":"ok"}"#,
+            ),
+            ("GET", "/freeze_gc", "", "Garbage collection frozen.\n"),
+        ] {
+            let (state, intake_rx, _abort_rx) = test_state(ServerArgs::default());
+            let mut builder = HttpRequest::builder().method(method).uri(uri);
+            if !body.is_empty() {
+                builder = builder.header(CONTENT_TYPE, "application/json");
+            }
+            let response = tokio::spawn(
+                routes()
+                    .with_state(state)
+                    .oneshot(builder.body(Body::from(body)).unwrap()),
+            );
+            let TmEvent::Intake { request, admission } = intake_rx.recv_async().await.unwrap()
+            else {
+                panic!("{uri}: must submit one control request");
+            };
+            assert!(admission.try_accept());
+            request
+                .sink
+                .try_send(ResponseItem::Control(bare.clone()))
+                .unwrap();
+            let response = response.await.unwrap().unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+            let bytes = to_bytes(response.into_body(), 4096).await.unwrap();
+            assert_eq!(String::from_utf8_lossy(&bytes), expected, "{uri}");
+        }
+    }
+
     /// A forwarded control request reaches the local scheduler under the rid
     /// its sender encoded, and the scheduler's bytes come back as the body.
     #[tokio::test]
@@ -1951,5 +2103,51 @@ mod tests {
             abort_rx.recv_async().await.unwrap(),
             crate::tokenizer_manager::wiring::AbortSource::Guard(aborted) if aborted == rid
         ));
+    }
+
+    /// `/ping` answers the liveness flag and `/ready` the readiness flag,
+    /// both as bare statuses: a pause keeps `/ping` at 200 and turns
+    /// `/ready` to 503; a drain turns both.
+    #[tokio::test]
+    async fn ping_and_ready_answer_bare_flag_statuses() {
+        let (state, _intake_rx, _abort_rx) = test_state(ServerArgs::default());
+        let probe = |uri: &'static str| {
+            let app = routes().with_state(state.clone());
+            async move {
+                app.oneshot(
+                    HttpRequest::builder()
+                        .method("GET")
+                        .uri(uri)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+            }
+        };
+        for uri in ["/ping", "/ready"] {
+            let response = probe(uri).await;
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+            assert!(
+                to_bytes(response.into_body(), 16).await.unwrap().is_empty(),
+                "{uri}: empty body"
+            );
+        }
+        state.core.set_paused_for_test(true);
+        assert_eq!(probe("/ping").await.status(), StatusCode::OK);
+        assert_eq!(
+            probe("/ready").await.status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        state.core.set_paused_for_test(false);
+        state.core.begin_drain(true);
+        assert_eq!(
+            probe("/ping").await.status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            probe("/ready").await.status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
     }
 }

@@ -4,6 +4,7 @@
 //! built from: errors, events, the fan-out, peers, and media prefetch.
 
 mod control;
+mod frontend_state;
 mod generate;
 mod handle;
 mod health;
