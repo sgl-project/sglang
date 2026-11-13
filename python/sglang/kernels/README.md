@@ -32,6 +32,7 @@ sglang/kernels/
   cake_kernels/  # agent-generated kernel backend (Cake, shipped by FlashInfer)
   plugin_kernels/  # plugin kernel backend: contracts of external kernel
                    # libraries, as <hardware>/<model>/
+  tlx_ops/       # fbtriton tlx.ops kernels, vendored unmodified (see its README)
 ```
 
 Operator groups (all populated): `activation`, `attention`, `communication`,
