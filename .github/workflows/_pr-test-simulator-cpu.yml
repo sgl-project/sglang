@@ -116,6 +116,7 @@ jobs:
           python3 -m pytest -q tools/sglang-simulator/test/test_evidence_storage.py
           python3 -m pytest -q tools/sglang-simulator/test/test_simulation_timing_metadata.py
           python3 -m pytest -q tools/sglang-simulator/test/test_simulation_token_events.py
+          python3 -m pytest -q tools/sglang-simulator/test/test_execution_events.py
           python3 -m pytest -q tools/sglang-simulator/test/test_simulation_coordinated_bridge.py
           python3 -m pytest -q tools/sglang-simulator/test/test_simulation_coordinated_serving.py
           python3 -m pytest -q tools/sglang-simulator/test/test_simulation_coordinated_aisimulate.py

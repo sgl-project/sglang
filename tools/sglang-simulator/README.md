@@ -771,3 +771,19 @@ request, `metrics.json.memory_budget` records the same capacity and SDK/model/
 policy/topology provenance. This is a capacity simulation, not a physical OOM
 guarantee; speculative, sliding-window and other unsupported pool layouts still
 fail explicitly.
+
+### Optional native retirement evidence
+
+Set `SGLANG_SIMULATOR_EXECUTION_EVENTS` to a fresh writable JSONL path to export
+the coordinated scheduler's actual processed results. The stream records its
+virtual-clock identity, each result's request IDs and retirement time, and a
+prefix byte count/SHA256. Only the coordinator's drained `FINISHED` grant writes
+the success footer. Failure or interruption closes the stream without sealing it.
+Evaluated phase costs are separate evidence and never become retirement events.
+
+The writer retains a hash, counters and one bounded record on the Python heap;
+it does not retain request histories or token payloads. Export errors propagate.
+This stream is independent of verbose iteration retention, so a client may use
+`SGLANG_SIMULATOR_EVIDENCE_LEVEL=metrics` while preserving original request-to-native
+execution evidence. Neither the observer nor retention mode changes the modeled
+clock, native result, cost, progress policy or workload horizon.

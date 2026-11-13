@@ -2,6 +2,7 @@
 
 import inspect
 import math
+import os
 import time
 from collections.abc import Callable
 from contextlib import contextmanager
@@ -20,6 +21,7 @@ from sglang_simulator.simulation.coordinator import (
 )
 from sglang_simulator.simulation.manager import Envs, StateManager
 from sglang_simulator.simulation.sglang.req_stats_manager import request_stats_manager
+from sglang_simulator.simulation.sglang.execution_events import ExecutionEventRecorder
 from sglang_simulator.simulation.sglang.timing_metadata import attach_timing_output
 from sglang_simulator.simulation.sglang.token_events import TokenEventRecorder
 
@@ -149,6 +151,7 @@ class CoordinatedScheduler:
         self.timeout_s = timeout_s
         self._closed = False
         self._token_events = None
+        self._execution_events = None
         self._watchdogs = []
         self._context = zmq.Context()
         self._socket = self._context.socket(zmq.REP)
@@ -159,6 +162,9 @@ class CoordinatedScheduler:
             token_events_path = Envs.token_events_path()
             if token_events_path is not None:
                 self._token_events = TokenEventRecorder(token_events_path)
+            execution_events_path = os.getenv("SGLANG_SIMULATOR_EXECUTION_EVENTS")
+            if execution_events_path is not None:
+                self._execution_events = ExecutionEventRecorder(execution_events_path)
         except Exception:
             self.close()
             raise
@@ -203,6 +209,8 @@ class CoordinatedScheduler:
         self._watchdogs.clear()
         if self._token_events is not None:
             self._token_events.close()
+        if self._execution_events is not None:
+            self._execution_events.close()
         self._socket.close(linger=0)
         self._context.term()
 
@@ -451,6 +459,8 @@ class CoordinatedScheduler:
         grant = self.clock.grant(finished=finished)
         if finished and self._token_events is not None:
             self._token_events.finish(grant.run_id, grant.now_ns)
+        if finished and self._execution_events is not None:
+            self._execution_events.finish(grant.run_id, grant.now_ns)
         self._socket.send(encode_message(grant))
         self._reply_pending = False
         self._finished = finished
@@ -481,6 +491,8 @@ class CoordinatedScheduler:
                     stats.last_event_time = finish_ns / 1e9
                 if req.finished() and not self.clock.is_terminal(req.rid):
                     self.clock.terminal(req.rid, "COMPLETED")
+            if self._execution_events is not None:
+                self._execution_events.record(finish_ns, (req.rid for req in requests))
             self._finish_result_time()
             return ret
 
