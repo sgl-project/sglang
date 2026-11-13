@@ -20,7 +20,7 @@ ARG TORCH_NPU_VERSION="2.10.0.post6"
 ARG TORCH_NPU_INDEX_URL="https://ascend.devcloud.huaweicloud.com/pypi/simple/"
 ARG SGLANG_TAG=main
 ARG ASCEND_CANN_PATH=/usr/local/Ascend/ascend-toolkit
-ARG SGLANG_KERNEL_NPU_TAG=2026.11.0.post3
+ARG SGLANG_KERNEL_NPU_TAG=2026.11.0.post4
 ARG PIP_INSTALL="python3 -m pip install --no-cache-dir"
 ARG DEVICE_TYPE
 ARG MODELSCOPE_VERSION=""
@@ -138,7 +138,7 @@ RUN set -eux; \
     mkdir /tmp/sgl-kernel-npu; \
     cd /tmp/sgl-kernel-npu; \
     wget \
-      "https://github.com/huangxiaojun15/sgl-kernel-npu/releases/download/${SGLANG_KERNEL_NPU_TAG}/sgl-kernel-npu-${SGLANG_KERNEL_NPU_TAG}-torch${PYTORCH_VERSION}-py312-cann${CANN_VERSION}-${DEVICE_TYPE}-$(arch).zip"; \
+      "https://github.com/sgl-project/sgl-kernel-npu/releases/download/${SGLANG_KERNEL_NPU_TAG}/sgl-kernel-npu-${SGLANG_KERNEL_NPU_TAG}-torch${PYTORCH_VERSION}-py312-cann${CANN_VERSION}-${DEVICE_TYPE}-$(arch).zip"; \
     unzip ./*.zip; \
     ${PIP_INSTALL} \
         ./sgl_kernel_npu*.whl \
