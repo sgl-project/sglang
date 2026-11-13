@@ -377,6 +377,11 @@ class UnifiedTreeCoreInterface(ABC):
 
     # ==== Device eviction (driven step-wise by the Controller's evict()) ====
 
+    # Unit eviction (--enable-mamba-unit-eviction): which subtrees still hold a
+    # state, on a core that evicts a state with the KV only it serves; None on
+    # any other.
+    state_units = None
+
     # Joint LRU: whether this core has the joint Full/SWA eviction walk below.
     # UnifiedRadixCache.__init__ rejects joint_lru on a core without it.
     supports_joint_eviction: bool = False
