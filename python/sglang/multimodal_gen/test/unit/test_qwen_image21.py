@@ -180,6 +180,42 @@ def test_cli_720p_shortcut_preserves_alignment(qwen21_server_args):
     assert (sampling.width, sampling.height) == (1280, 704)
 
 
+@pytest.mark.parametrize(
+    "image_size,fields,expected",
+    [
+        # Diffusers QwenImage21Pipeline: 1024x1024 area at the last image's aspect
+        ((1280, 720), {}, (1376, 768)),
+        ((720, 1280), {}, (768, 1376)),
+        ((1024, 1024), {}, (1024, 1024)),
+        ((1280, 720), {"size": "1024x1024"}, (1024, 1024)),
+        ((1280, 720), {"size": "1280x720"}, (1280, 704)),
+    ],
+)
+def test_edit_output_size_follows_last_reference(
+    qwen21_server_args, tmp_path, image_size, fields, expected
+):
+    image_path = tmp_path / "reference.png"
+    Image.new("RGB", image_size, (200, 120, 40)).save(image_path)
+    with (
+        patch.object(
+            openai_utils, "get_global_server_args", return_value=qwen21_server_args
+        ),
+        patch.object(
+            SamplingParams, "from_pretrained", return_value=QwenImage21SamplingParams()
+        ),
+    ):
+        sampling = openai_utils.build_sampling_params(
+            "edit-size",
+            prompt="make the sky purple",
+            image_path=[str(image_path)],
+            request_data_type=DataType.IMAGE,
+            **fields,
+        )
+    batch = prepare_request(qwen21_server_args, sampling)
+    QwenImage21InputValidationStage().forward(batch, qwen21_server_args)
+    assert (batch.width, batch.height) == expected
+
+
 @pytest.mark.parametrize("dimension", ["width", "height"])
 @pytest.mark.parametrize("value", [0, -1])
 def test_alignment_does_not_make_invalid_dimensions_positive(
@@ -212,7 +248,30 @@ def test_synthetic_warmup_uses_the_same_grid_as_serving(
     assert len(reqs) == 1
     assert (reqs[0].width, reqs[0].height) == (1280, 704)
     QwenImage21InputValidationStage().forward(reqs[0], qwen21_server_args)
+    assert (reqs[0].width, reqs[0].height) == (1280, 704)
     assert (defaults.width, defaults.height) == (1024, 1024)
+
+
+def test_torch_compile_prewarm_keeps_the_warmup_size(qwen21_server_args, tmp_path):
+    image_path = tmp_path / "warmup.png"
+    Image.new("RGB", (64, 64)).save(image_path)
+    qwen21_server_args.enable_torch_compile = True
+    qwen21_server_args.is_arg_explicitly_set = lambda name: False
+    with patch(
+        "sglang.multimodal_gen.runtime.warmup_request_builder.get_model_sampling_defaults",
+        return_value=QwenImage21SamplingParams(),
+    ):
+        reqs = build_warmup_reqs(
+            qwen21_server_args,
+            warmup_resolutions=["1280x720"],
+            warmup_input_path=str(image_path),
+            server_based_warmup=True,
+        )
+    assert len(reqs) > 1
+    for req in reqs:
+        assert req.image_path is not None
+        QwenImage21InputValidationStage().forward(req, qwen21_server_args)
+        assert (req.width, req.height) == (1280, 704)
 
 
 def test_legacy_qwen_keeps_its_720p_resolution():
@@ -492,6 +551,44 @@ def test_encoder_component_offload_preserves_loaded_dtypes(monkeypatch):
         strategy.finish_use(encoder, use, state)
         torch.cuda.synchronize()
         assert encoder.embedding.device.type == "cpu"
+
+
+class _StopBeforePrompt(Exception):
+    pass
+
+
+@pytest.mark.parametrize("output_size", [(1376, 768), (512, 512)])
+def test_reference_sizes_do_not_follow_the_output_size(monkeypatch, output_size):
+    """Diffusers resizes every reference to a 1024x1024 area at its own aspect."""
+    module = "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.qwen_image21"
+    monkeypatch.setattr(f"{module}.get_local_torch_device", lambda: torch.device("cpu"))
+    config = QwenImage21PipelineConfig()
+    z_dim = config.vae_config.arch_config.z_dim
+    vae = Mock()
+    vae.encode.side_effect = lambda pixels: SimpleNamespace(
+        mode=lambda: torch.zeros(1, z_dim, 1, *(s // 16 for s in pixels.shape[-2:]))
+    )
+    stage = object.__new__(QwenImage21EncodingStage)
+    stage.vae, stage.latent_stats = vae, {}
+    stage.use_declared_component = Mock(return_value=nullcontext(vae))
+    resized_sizes = []
+
+    def encode_prompt(prompt, resized, device):
+        resized_sizes.extend(image.size for image in resized)
+        raise _StopBeforePrompt
+
+    stage.encode_prompt = encode_prompt
+    batch = Req(
+        sampling_params=SamplingParams(prompt="edit", seed=0, num_frames=1),
+        condition_image=[
+            Image.new("RGBA", (528, 720), (10, 20, 30, 255)),
+            Image.new("RGBA", (1280, 720), (40, 50, 60, 255)),
+        ],
+    )
+    batch.width, batch.height = output_size
+    with pytest.raises(_StopBeforePrompt):
+        stage.forward(batch, SimpleNamespace(pipeline_config=config))
+    assert resized_sizes == [(864, 1184), (1376, 768)]
 
 
 def test_condition_slots_expand_to_actual_latent_grid():
@@ -804,7 +901,11 @@ def test_condition_pixels_match_reference_preprocessing(monkeypatch, tiling):
         SimpleNamespace(pipeline_config=QwenImage21PipelineConfig(vae_tiling=tiling)),
     )
     assert vae.use_tiling is tiling
-    expected = VaeImageProcessor(vae_scale_factor=16).preprocess(image).unsqueeze(2)
+    # Diffusers resizes the reference to a 1024x1024 area whatever the output size
+    expected = VaeImageProcessor(vae_scale_factor=16).preprocess(
+        image, height=1024, width=1024
+    )
+    expected = expected.unsqueeze(2)
     actual = vae.encode.call_args.args[0]
     torch.testing.assert_close(actual, expected.bfloat16(), atol=0, rtol=0)
     assert actual.stride() == expected.stride()
