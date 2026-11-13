@@ -42,6 +42,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     InsertParams,
     MatchResult,
 )
+from sglang.srt.mem_cache.common import _req_radix_key
 from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
@@ -54,6 +55,7 @@ from sglang.srt.mem_cache.unified_cache.components import (
     TreeComponent,
 )
 from sglang.srt.mem_cache.utils import get_storage_hash_str
+from sglang.srt.runtime_context import get_disagg
 from sglang.srt.session.streaming_session import is_virtual_node
 from sglang.srt.utils import get_device_module
 
@@ -267,6 +269,7 @@ class _ExternalCachePrefetch:
     anchor_node_id: NodeId
     anchor_lock: DecLockRefParams
     component_transfers: list[tuple[TreeComponent, PoolTransfer]]
+    req: Req
     future: Future[bool] | None = None
     timeout_s: float = 0.0
     wait_started: float | None = None
@@ -400,7 +403,7 @@ class UnifiedCacheLinkerWrapper:
             ),
         )
 
-    def prefetch(self, req: Req) -> None:
+    def prefetch(self, req: Req, max_prefix_len=None) -> Optional[int]:
         """Stage a queued request; publish only after all ranks succeed."""
         if self.load_mode != "prefetch":
             return
@@ -410,17 +413,18 @@ class UnifiedCacheLinkerWrapper:
                 self._cancel_prefetch(previous)
         if self.cache.disable or request in self.prefetches:
             return
-        req.init_next_round_input(self.cache, cow_mamba=False)
+        if get_disagg().disaggregation_mode == "decode":
+            token_ids = req.origin_input_ids
+        else:
+            req.init_next_round_input(self.cache, cow_mamba=False)
+            token_ids = req.full_untruncated_fill_ids
+            max_prefix_len = req._compute_max_prefix_len(len(token_ids))
         if is_virtual_node(req.last_node) or req.positional_embed_overrides is not None:
             return
         page = self.cache.page_size
-        key = RadixKey(
-            req.full_untruncated_fill_ids,
-            extra_key=req.extra_key,
-            cache_salt=req.cache_salt,
-            is_bigram=self.cache.tree_core.is_eagle,
-            limit=req._compute_max_prefix_len(len(req.full_untruncated_fill_ids)),
-        ).page_aligned(page)
+        key = _req_radix_key(self.cache, req, token_ids, max_prefix_len)
+        key, _ = key.maybe_to_bigram_view(self.cache.tree_core.is_eagle)
+        key = key.page_aligned(page)
         start = req.prefix_len
         last_hash = self.cache.get_last_hash_value(req.last_node)
         if len(key) <= start or (start and last_hash is None):
@@ -449,6 +453,7 @@ class UnifiedCacheLinkerWrapper:
             req.last_node,
             self.cache.inc_lock_ref(req.last_node).to_dec_params(),
             [],
+            req,
             timeout_s=self.cache.prefetch_timeout_base
             + len(hashes) * self.cache.prefetch_timeout_per_page,
         )
@@ -472,6 +477,8 @@ class UnifiedCacheLinkerWrapper:
         if not accepted.item():
             self._cancel_prefetch(request)
             self.check_prefetch_events()
+            return
+        return end - start
 
     def check_prefetch_progress(self, request: CacheRequestHandle) -> bool:
         state = self.prefetches.get(request)
@@ -589,6 +596,11 @@ class UnifiedCacheLinkerWrapper:
             )
             if mamba is not None and inserted.mamba_exist:
                 storage.free_state_slots(sub_pool, mamba.device_indices)
+            if get_disagg().disaggregation_mode == "decode":
+                new_lock = self.cache.lock(inserted.last_device_node)
+                old_lock = state.req.lock
+                state.req.lock = new_lock
+                self.cache.unlock(old_lock)
             self.cache.prefetch_loaded_tokens_by_reqid[request] = len(full)
             self.cache.prefetch_loaded_storage_start_by_reqid[request] = start
         finally:
