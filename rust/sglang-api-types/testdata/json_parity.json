@@ -1501,6 +1501,202 @@
       "canonical": "{\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"created\":1,\"model\":\"m\",\"choices\":[{\"index\":0,\"delta\":{\"role\":null,\"content\":\"hi\",\"reasoning_content\":null},\"logprobs\":null,\"finish_reason\":null,\"matched_stop\":null}],\"usage\":null}"
     },
     {
+      "type": "OpenAiEmbeddingRequest",
+      "name": "multimodal items as input",
+      "input": {
+        "input": [
+          {
+            "text": "a",
+            "image": "data:x"
+          }
+        ],
+        "model": "m"
+      },
+      "canonical": "{\"input\":[{\"text\":\"a\",\"image\":\"data:x\"}],\"model\":\"m\",\"encoding_format\":\"float\"}"
+    },
+    {
+      "type": "OpenAiEmbeddingRequest",
+      "name": "token-id input",
+      "input": {
+        "input": [
+          1,
+          2,
+          3
+        ]
+      },
+      "canonical": "{\"input\":[1,2,3],\"model\":\"default\",\"encoding_format\":\"float\"}"
+    },
+    {
+      "type": "OpenAiEmbeddingResponse",
+      "name": "float vectors and a usage block",
+      "input": {
+        "data": [
+          {
+            "embedding": [
+              0.5,
+              1.0
+            ],
+            "index": 0,
+            "object": "embedding"
+          }
+        ],
+        "model": "m",
+        "object": "list",
+        "usage": {
+          "prompt_tokens": 2,
+          "total_tokens": 2,
+          "completion_tokens": 0
+        }
+      },
+      "canonical": "{\"data\":[{\"embedding\":[0.5,1.0],\"index\":0,\"object\":\"embedding\"}],\"model\":\"m\",\"object\":\"list\",\"usage\":{\"prompt_tokens\":2,\"total_tokens\":2,\"completion_tokens\":0,\"prompt_tokens_details\":null,\"reasoning_tokens\":0,\"completion_tokens_details\":null}}"
+    },
+    {
+      "type": "OpenAiScoreRequest",
+      "name": "shared label candidates and per-item embed overrides",
+      "input": {
+        "query": "q",
+        "items": [
+          "a",
+          "b"
+        ],
+        "label_token_ids": [
+          1,
+          2
+        ],
+        "item_embed_overrides": [
+          null,
+          [
+            [
+              0.5
+            ]
+          ]
+        ],
+        "apply_softmax": true
+      },
+      "canonical": "{\"query\":\"q\",\"items\":[\"a\",\"b\"],\"item_embed_overrides\":[null,[[0.5]]],\"label_token_ids\":[1,2],\"apply_softmax\":true,\"temperature\":1.0,\"return_token_logprobs\":false,\"item_first\":false,\"return_pooled_hidden_states\":false,\"model\":\"default\"}"
+    },
+    {
+      "type": "OpenAiScoreResponse",
+      "name": "pointwise scores",
+      "input": {
+        "scores": [
+          [
+            0.1,
+            0.9
+          ]
+        ],
+        "model": "m",
+        "object": "scoring"
+      },
+      "canonical": "{\"scores\":[[0.1,0.9]],\"pooled_hidden_states\":null,\"model\":\"m\",\"usage\":null,\"object\":\"scoring\"}"
+    },
+    {
+      "type": "OpenAiScoreResponse",
+      "name": "setwise scores, one matrix per item",
+      "input": {
+        "scores": [
+          [
+            [
+              0.1,
+              0.9
+            ],
+            [
+              0.2,
+              0.8
+            ]
+          ],
+          [
+            [
+              0.5,
+              0.5
+            ]
+          ]
+        ],
+        "model": "m",
+        "object": "scoring"
+      },
+      "canonical": "{\"scores\":[[[0.1,0.9],[0.2,0.8]],[[0.5,0.5]]],\"pooled_hidden_states\":null,\"model\":\"m\",\"usage\":null,\"object\":\"scoring\"}"
+    },
+    {
+      "type": "OpenAiRerankRequest",
+      "name": "text and multimodal documents",
+      "input": {
+        "query": "q",
+        "documents": [
+          "d1",
+          [
+            {
+              "type": "text",
+              "text": "d2"
+            }
+          ]
+        ],
+        "top_n": 1
+      },
+      "canonical": "{\"query\":\"q\",\"documents\":[\"d1\",[{\"type\":\"text\",\"text\":\"d2\"}]],\"top_n\":1,\"return_documents\":true}"
+    },
+    {
+      "type": "OpenAiRerankResponse",
+      "name": "a ranked list; absent documents are left out",
+      "input": [
+        {
+          "score": 0.9,
+          "document": "d1",
+          "index": 0,
+          "meta_info": null
+        },
+        {
+          "score": 0.1,
+          "index": 1,
+          "meta_info": null
+        }
+      ],
+      "canonical": "[{\"score\":0.9,\"document\":\"d1\",\"index\":0,\"meta_info\":null},{\"score\":0.1,\"index\":1,\"meta_info\":null}]"
+    },
+    {
+      "type": "OpenAiTokenizeRequest",
+      "name": "the chat form with tools",
+      "input": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "hi"
+          }
+        ],
+        "tools": [
+          {
+            "function": {
+              "name": "f"
+            }
+          }
+        ],
+        "tool_choice": "auto",
+        "add_special_tokens": false
+      },
+      "canonical": "{\"model\":\"default\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"f\"}}],\"tool_choice\":\"auto\",\"continue_final_message\":false,\"add_special_tokens\":false}"
+    },
+    {
+      "type": "OpenAiTokenizeResponse",
+      "name": "batched counts",
+      "input": {
+        "tokens": [
+          [
+            1,
+            2
+          ],
+          [
+            3
+          ]
+        ],
+        "count": [
+          2,
+          1
+        ],
+        "max_model_len": 4096
+      },
+      "canonical": "{\"tokens\":[[1,2],[3]],\"count\":[2,1],\"max_model_len\":4096}"
+    },
+    {
       "type": "OpenAiErrorResponse",
       "name": "the OpenAI error body",
       "input": {
