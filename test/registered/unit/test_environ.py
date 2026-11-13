@@ -206,10 +206,12 @@ class TestRenamedEnvAliases(unittest.TestCase):
                 os.environ.pop(new, None)
             with envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(False):
                 value = field.get()
-        deprecations = [w for w in caught if issubclass(w.category, DeprecationWarning)]
+        deprecations = [w for w in caught if issubclass(w.category, FutureWarning)]
         return field, value, deprecations
 
-    def test_former_name_applies_with_a_deprecation_warning(self):
+    def test_former_name_applies_with_a_visible_warning(self):
+        """The warning must reach users: a DeprecationWarning raised from library
+        code is filtered out by Python's default warning filters."""
         for new, old in RENAMED_NV_MEGA_RUNTIME_CHILDREN.items():
             with self.subTest(new=new):
                 field, value, deprecations = self._read(new, {old: "1"})
