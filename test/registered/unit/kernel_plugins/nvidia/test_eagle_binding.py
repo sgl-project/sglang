@@ -706,6 +706,30 @@ class TestEagleBinding(CustomTestCase):
 
 
 class TestEagleEntries(CustomTestCase):
+    def test_a_draft_step_fold_is_offered_only_by_a_build_that_has_one(self):
+        fold = object()
+        self.assertIn("draft_step_fold", spec.ENTRIES)
+        self.assertIs(
+            runtime.megakernel_entry(_model(draft_step_fold=fold), "draft_step_fold"),
+            fold,
+        )
+        self.assertIsNone(runtime.megakernel_entry(_model(), "draft_step_fold"))
+        self.assertIsNone(
+            runtime.megakernel_entry(torch.nn.Module(), "draft_step_fold")
+        )
+        # a build that predates the entry offers none
+        self.assertNotIn(
+            "draft_step_fold", _model().__dict__["_megakernel"].built.__dict__
+        )
+        self.assertEqual(
+            runtime._offered_entries(
+                _model(draft_step_fold=fold).__dict__["_megakernel"].built
+            ),
+            ("draft_step_fold",),
+        )
+        # it is not one of the EAGLE draft-loop entries, so it keeps the stock dispatch
+        self.assertIsNone(_init(draft={"draft_step_fold": fold}))
+
     def test_always_present_dispatch_preserves_the_stock_path(self):
         stock_result = object()
         with patch.object(eagle_megakernel, "init_eagle_megakernel", return_value=None):

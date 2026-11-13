@@ -8,6 +8,7 @@ import torch
 
 from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
 from sglang.srt.environ import envs
+from sglang.srt.kernel_plugins.nvidia.binding import megakernel_entry
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
     deployment_attn_dp_size,
@@ -311,6 +312,10 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             batch_sizes=self.specialized_batches,
         )
         self.attention_variant_sizes = self.specialized_batches
+        self.make_draft_step_fold = megakernel_entry(
+            model_runner.model, "draft_step_fold"
+        )
+        self.draft_step_folds = []  # the captured graphs read their buffers
 
         # Capture
         try:
@@ -527,6 +532,15 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             ),
         )
         self.model_runner.runner_ids.bind_runner_slots(forward_batch)
+        if (
+            self.make_draft_step_fold is not None
+            and self.topk == 1
+            and self.captured_req_width == 1
+        ):
+            forward_batch.draft_step_fold = self.make_draft_step_fold(
+                batch_size=num_seqs, num_steps=self.speculative_num_steps
+            )
+            self.draft_step_folds.append(forward_batch.draft_step_fold)
 
         def run_stock():
             output_cache_loc_backup = forward_batch.out_cache_loc

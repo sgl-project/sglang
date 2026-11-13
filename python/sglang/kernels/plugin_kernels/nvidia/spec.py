@@ -400,6 +400,15 @@ class BuiltMegakernel(Protocol):
     SGLang component calls once with its own buffers: like draft_sampler, they return
     bs -> None (SGLang's code at that batch size) or the step to run there, and every
     rank must serve the same sizes. A draft's begin_draft_round is called as it is.
+    A draft's draft_step_fold (optional member) is called before each EAGLE draft
+    graph of a topk-1 chain is captured, with (*, batch_size, num_steps); it returns
+    None or a fold whose finalize(logits, positions, draft_tokens, column,
+    mrope_positions) replaces draft_topk1_postprocess and the M-RoPE + 1 after each
+    draft step of a greedy chain without logprobs: it writes the top-1 to
+    draft_tokens[:, column], advances positions (and mrope_positions, unless None)
+    by one, and returns (topk_p, topk_index). The draft's forward of that round
+    sees the fold as ForwardBatch.draft_step_fold and may return logits in the LM
+    head's dtype. The graph keeps the fold alive.
     The entries a built object offers must agree on every rank.
 
     A built object may also offer graph_variants: None, or a mapping from a
@@ -451,6 +460,7 @@ ENTRIES = (
     "draft_loop",
     "draft_extend",
     "begin_draft_round",
+    "draft_step_fold",
 )
 # The graph runners a built object's graph_variants may key: the target's verify
 # graphs, the EAGLE draft graphs and the EAGLE draft-extend graphs
