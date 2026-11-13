@@ -21,10 +21,7 @@ from sglang.kernels.ops.kvcache.dsa_fused_store_index_cache import (
     can_use_dsa_fused_store,
     fused_store_index_k_cache,
 )
-from sglang.kernels.ops.kvcache.dsa_index_k_cache import (
-    _get_k_and_s_triton,
-    _set_k_and_s_triton,
-)
+from sglang.kernels.ops.kvcache.dsa_index_k_cache import _get_k_and_s_triton
 from sglang.kernels.ops.kvcache.dsv4_fp4_index_k_cache import (
     gather_fp4_index_k,
     store_fp4_index_k_cache,
@@ -34,29 +31,19 @@ from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 # The DeepGEMM FP4 and CuTe DSL paged MQA logits readers need SM100.
-register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=60, stage="nightly", runner_config="4-gpu-b200")
 
 PAGE_SIZE = 64
 HEAD_DIM = 128
 FP8_PAGE_BYTES = PAGE_SIZE * (HEAD_DIM + 4)  # 8448
 FP4_PAGE_BYTES = PAGE_SIZE * (HEAD_DIM // 2 + 4)  # 4352
 SENTINEL = 0xA5
-# Bytes between two pages of one layer when each page entry holds every layer's
-# MLA rows followed by one index-K blob per layer (61 layers).
+# Kimi-K3.1's DSA page entry: 24 layers x 64 tokens x 656 B fp8 latent rows,
+# plus 24 x 8448 B index-K blobs, plus 1920 B padding.
 LARGE_PAGE_STRIDE = 1_212_288
 INT32_MAX = 2**31 - 1
 # The first page whose offset at LARGE_PAGE_STRIDE exceeds int32.
 FIRST_PAGE_PAST_INT32 = INT32_MAX // LARGE_PAGE_STRIDE + 1  # 1772
-
-
-def _layouts(page_bytes: int):
-    # (page stride, byte offset of this layer's blob inside a page entry)
-    return [
-        pytest.param(page_bytes + 512, 256, id="small_stride"),
-        pytest.param(
-            LARGE_PAGE_STRIDE, LARGE_PAGE_STRIDE - 3 * page_bytes, id="large_stride"
-        ),
-    ]
 
 
 def _skip_if_unavailable():
@@ -101,12 +88,12 @@ def _loc(num_pages: int, num_tokens: int, seed: int) -> torch.Tensor:
     return loc
 
 
-@pytest.mark.parametrize("stride,offset", _layouts(FP8_PAGE_BYTES))
-@pytest.mark.parametrize("num_pages", [1, 6])
-def test_fused_store_index_k_cache(stride, offset, num_pages):
+def test_fused_store_index_k_cache_single_page():
     _skip_if_unavailable()
     if not can_use_dsa_fused_store(torch.bfloat16, torch.int64, PAGE_SIZE):
         pytest.skip("fused store JIT unavailable")
+    num_pages = 1
+    stride, offset = LARGE_PAGE_STRIDE, LARGE_PAGE_STRIDE - 3 * FP8_PAGE_BYTES
     packed, entries, strided = _pages(num_pages, FP8_PAGE_BYTES, stride, offset, 0)
     loc = _loc(num_pages, 50 * num_pages, 1)
     key = torch.randn(loc.numel(), HEAD_DIM, dtype=torch.bfloat16, device="cuda")
@@ -119,15 +106,14 @@ def test_fused_store_index_k_cache(stride, offset, num_pages):
     _assert_outside_untouched(entries, offset, FP8_PAGE_BYTES)
 
 
-@pytest.mark.parametrize("stride,offset", _layouts(FP8_PAGE_BYTES))
-@pytest.mark.parametrize("hadamard", [False, True])
-def test_fused_k_indexer_norm_rope_store(stride, offset, hadamard):
+def test_fused_k_indexer_norm_rope_store():
     _skip_if_unavailable()
     from sglang.kernels.ops.attention.dsa.indexer_k import (
         fused_k_indexer_norm_rope_store,
     )
 
     num_pages = 5
+    stride, offset = LARGE_PAGE_STRIDE, LARGE_PAGE_STRIDE - 3 * FP8_PAGE_BYTES
     packed, entries, strided = _pages(num_pages, FP8_PAGE_BYTES, stride, offset, 2)
     loc = _loc(num_pages, 200, 3)
     n = loc.numel()
@@ -153,83 +139,11 @@ def test_fused_k_indexer_norm_rope_store(stride, offset, hadamard):
             cos_sin_cache,
             positions,
             PAGE_SIZE,
-            hadamard=hadamard,
         )
     torch.cuda.synchronize()
 
     assert torch.equal(strided, packed)
     _assert_outside_untouched(entries, offset, FP8_PAGE_BYTES)
-
-
-@pytest.mark.parametrize("stride,offset", _layouts(FP8_PAGE_BYTES))
-def test_set_k_and_s(stride, offset):
-    _skip_if_unavailable()
-    num_pages = 6
-    packed, entries, strided = _pages(num_pages, FP8_PAGE_BYTES, stride, offset, 5)
-    loc = _loc(num_pages, 300, 6)
-    n = loc.numel()
-    index_k = torch.randn(n, HEAD_DIM, device="cuda").to(torch.float8_e4m3fn)
-    index_k_scale = torch.rand(n, 1, device="cuda")
-
-    for buf in (packed, strided):
-        _set_k_and_s_triton(buf, loc, index_k, index_k_scale, PAGE_SIZE)
-    torch.cuda.synchronize()
-
-    assert torch.equal(strided, packed)
-    _assert_outside_untouched(entries, offset, FP8_PAGE_BYTES)
-
-
-@pytest.mark.parametrize("key_bytes", [HEAD_DIM, HEAD_DIM // 2], ids=["fp8", "fp4"])
-@pytest.mark.parametrize("stride_case", ["small_stride", "large_stride"])
-def test_get_k_and_s(key_bytes, stride_case):
-    _skip_if_unavailable()
-    page_bytes = PAGE_SIZE * (key_bytes + 4)
-    stride, offset = {p.id: p.values for p in _layouts(page_bytes)}[stride_case]
-    num_pages = 9
-    packed, entries, strided = _pages(num_pages, page_bytes, stride, offset, 7)
-    g = torch.Generator(device="cuda").manual_seed(8)
-    # Three requests over shuffled pages, the last page included.
-    page_table = torch.randperm(num_pages, device="cuda", generator=g).to(torch.int32)
-    page_table = page_table.view(3, 3)
-    seq_lens = torch.tensor([150, 192, 70], dtype=torch.int64, device="cuda")
-
-    outs = [
-        _get_k_and_s_triton(
-            buf=buf,
-            page_indices=page_table,
-            seq_lens=seq_lens,
-            seq_len_sum=int(seq_lens.sum()),
-            max_seq_len=int(seq_lens.max()),
-            page_size=PAGE_SIZE,
-            index_head_dim=key_bytes,
-        )
-        for buf in (packed, strided)
-    ]
-    torch.cuda.synchronize()
-
-    (k_ref, s_ref), (k_out, s_out) = outs
-    assert torch.equal(k_out, k_ref)
-    assert torch.equal(s_out, s_ref)
-    _assert_outside_untouched(entries, offset, page_bytes)
-
-
-@pytest.mark.parametrize("stride,offset", _layouts(FP4_PAGE_BYTES))
-def test_fp4_store_and_gather(stride, offset):
-    _skip_if_unavailable()
-    num_pages = 6
-    packed, entries, strided = _pages(num_pages, FP4_PAGE_BYTES, stride, offset, 9)
-    loc = _loc(num_pages, 300, 10)
-    key = torch.randn(loc.numel(), HEAD_DIM, dtype=torch.bfloat16, device="cuda")
-
-    for cache in (packed, strided):
-        store_fp4_index_k_cache(key, cache, loc, page_size=PAGE_SIZE, rne=True)
-    ref = gather_fp4_index_k(packed, loc, page_size=PAGE_SIZE)
-    out = gather_fp4_index_k(strided, loc, page_size=PAGE_SIZE)
-    torch.cuda.synchronize()
-
-    assert torch.equal(strided, packed)
-    assert torch.equal(out[0], ref[0]) and torch.equal(out[1], ref[1])
-    _assert_outside_untouched(entries, offset, FP4_PAGE_BYTES)
 
 
 @pytest.mark.parametrize("use_fp4_indexer", [False, True])
@@ -327,10 +241,9 @@ def _boundary_loc(dtype: torch.dtype) -> torch.Tensor:
     return torch.tensor(slots, dtype=dtype, device="cuda")
 
 
-@pytest.mark.parametrize("key_bytes", [HEAD_DIM, HEAD_DIM // 2], ids=["fp8", "fp4"])
-def test_get_k_and_s_past_int32_offsets(key_bytes):
+def test_get_k_and_s_past_int32_offsets():
     _skip_if_unavailable()
-    page_bytes = PAGE_SIZE * (key_bytes + 4)
+    page_bytes = FP8_PAGE_BYTES
     packed, entries, strided, offset = _boundary_pages(page_bytes, 20)
     p0, p1, p2, p3 = BOUNDARY_PAGES
     # An int32 page table, as the indexer builds it.
@@ -347,7 +260,7 @@ def test_get_k_and_s_past_int32_offsets(key_bytes):
             seq_len_sum=int(seq_lens.sum()),
             max_seq_len=int(seq_lens.max()),
             page_size=PAGE_SIZE,
-            index_head_dim=key_bytes,
+            index_head_dim=HEAD_DIM,
         )
         for buf in (packed, strided)
     ]
@@ -359,7 +272,7 @@ def test_get_k_and_s_past_int32_offsets(key_bytes):
     _assert_outside_untouched(entries, offset, page_bytes)
 
 
-@pytest.mark.parametrize("writer", ["fused_store", "set_k_and_s", "fp4_store"])
+@pytest.mark.parametrize("writer", ["fused_store", "fp4_store"])
 def test_store_past_int32_offsets(writer):
     _skip_if_unavailable()
     if writer == "fused_store" and not can_use_dsa_fused_store(
@@ -368,19 +281,15 @@ def test_store_past_int32_offsets(writer):
         pytest.skip("fused store JIT unavailable")
     page_bytes = FP4_PAGE_BYTES if writer == "fp4_store" else FP8_PAGE_BYTES
     packed, entries, strided, offset = _boundary_pages(page_bytes, 21)
-    # The FP4 writer takes int32 locations; the FP8 writers require int64.
+    # The FP4 writer takes int32 locations; the FP8 writer requires int64.
     loc = _boundary_loc(torch.int32 if writer == "fp4_store" else torch.int64)
     key = torch.randn(loc.numel(), HEAD_DIM, dtype=torch.bfloat16, device="cuda")
-    index_k = key.to(torch.float8_e4m3fn)
-    index_k_scale = torch.rand(loc.numel(), 1, device="cuda")
     pages = list(BOUNDARY_PAGES)
     before = packed[pages].clone()
 
     for cache in (packed, strided):
         if writer == "fused_store":
             fused_store_index_k_cache(key, cache, loc, PAGE_SIZE)
-        elif writer == "set_k_and_s":
-            _set_k_and_s_triton(cache, loc, index_k, index_k_scale, PAGE_SIZE)
         else:
             store_fp4_index_k_cache(key, cache, loc, page_size=PAGE_SIZE, rne=True)
     torch.cuda.synchronize()

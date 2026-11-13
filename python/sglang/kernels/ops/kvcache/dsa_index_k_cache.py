@@ -403,7 +403,6 @@ def _get_k_and_s_triton_kernel(
     ).to(tl.int64)
 
     # ===== Load K data =====
-    # The address calculation logic for K: page_index * page stride + K offset of the token within the page.
     k_src_token_offset = token_offset_in_page * index_head_dim
     k_src_base_offset = page_index * buf_page_stride + k_src_token_offset
 
@@ -420,7 +419,6 @@ def _get_k_and_s_triton_kernel(
     tl.store(k_store_addr, k_data, mask=k_mask)
 
     # ===== Load S data =====
-    # The address calculation logic for S: page_index * page stride + starting offset of S within the page + offset of token within S in the page
     s_src_token_offset = s_offset_in_page + token_offset_in_page * 4
     s_src_base_offset = page_index * buf_page_stride + s_src_token_offset
 

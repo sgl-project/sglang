@@ -230,8 +230,7 @@ struct FusedKIndexerNormRopeKernel {
 
 // Indexer K + fused store: LayerNorm + RoPE + fp8 quant + paged store in one
 // launch. Page layout matches fused_store_index_cache.cuh: each page is
-// 132*page_size bytes (128*page_size fp8 keys, then 4*page_size fp32 scales),
-// and consecutive pages are `cache_page_stride` bytes apart.
+// 132*page_size bytes (128*page_size fp8 keys, then 4*page_size fp32 scales).
 struct FusedKIndexerNormRopeStoreParams {
   const void* __restrict__ k_input;         // (B, 128) DType
   void* __restrict__ cache;                 // (num_pages, 132*page_size) uint8

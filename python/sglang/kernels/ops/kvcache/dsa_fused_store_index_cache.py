@@ -81,8 +81,7 @@ def fused_store_index_k_cache(
 
     key:            (num_tokens, 128) bf16 (or reshapeable to it)
     index_k_with_scale:  (num_pages, 64*(128+4)) uint8, one row per page; rows
-                         may be strided (pages that are slices of larger page
-                         entries) and are written in place, never copied
+                         may be strided and are written in place
     out_cache_loc:       (num_tokens,) int64 token indices in TokenToKVPool
     dcp_size, dcp_rank:  under DCP, out_cache_loc holds widened slots; only the
                          rank's own slots are stored, at row slot // dcp_size
