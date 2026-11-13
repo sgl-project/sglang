@@ -1186,6 +1186,9 @@ class C_SchedulerHook(BaseHook):
                         "persisted": False,
                         "omitted_by_policy": True,
                     }
+                memory_budget = ConfigManager.get_memory_budget_metrics()
+                if memory_budget is not None:
+                    metrics["memory_budget"] = memory_budget
 
                 try:
                     with open(f"{output_dir}/metrics.json", "w") as f:

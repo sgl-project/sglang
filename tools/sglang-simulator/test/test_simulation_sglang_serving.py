@@ -30,6 +30,7 @@ class SGLangServingRunner:
         tmp_path: Path,
         mode: str = "offline",
         extra_args: list[str] | None = None,
+        max_total_tokens: int | None = 8192,
     ):
         self.mode = mode
         with socket.socket() as sock:
@@ -57,12 +58,12 @@ class SGLangServingRunner:
             str(self.port),
             "--tokenizer-path",
             str(EXAMPLES / "assets" / "tokenizer"),
-            "--max-total-tokens",
-            "8192",
             "--max-running-requests",
             "8",
             "--disable-overlap-schedule",
         ]
+        if max_total_tokens is not None:
+            cmd.extend(["--max-total-tokens", str(max_total_tokens)])
         cmd.extend(extra_args or [])
         self.server_proc = subprocess.Popen(cmd, env=env, start_new_session=True)
         for _ in range(120):
