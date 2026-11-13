@@ -599,6 +599,3406 @@ impl<'de> ::serde::Deserialize<'de> for ErrorBody {
     }
 }
 
+impl ::serde::Serialize for AnthropicError {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "type", &self.r#type)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "message", &self.message)?;
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for AnthropicError {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = AnthropicError;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct AnthropicError")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_type = None;
+                let mut f_message = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "type" => {
+                            if f_type.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("type"));
+                            }
+                            f_type = Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        "message" => {
+                            if f_message.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("message"));
+                            }
+                            f_message = Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(AnthropicError {
+                    r#type: f_type.unwrap_or_default(),
+                    message: f_message.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for AnthropicErrorResponse {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "type", &self.r#type)?;
+        if let Some(v) = &self.error {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "error", v)?;
+        }
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for AnthropicErrorResponse {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = AnthropicErrorResponse;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct AnthropicErrorResponse")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_type = None;
+                let mut f_error = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "type" => {
+                            if f_type.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("type"));
+                            }
+                            f_type = Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        "error" => {
+                            if f_error.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("error"));
+                            }
+                            f_error = Some(map.next_value::<Option<AnthropicError>>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(AnthropicErrorResponse {
+                    r#type: f_type.unwrap_or_default(),
+                    error: f_error.flatten(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for AnthropicUsage {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        if let Some(v) = &self.input_tokens {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "input_tokens", v)?;
+        }
+        if let Some(v) = &self.output_tokens {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "output_tokens", v)?;
+        }
+        if let Some(v) = &self.cache_creation_input_tokens {
+            ::serde::ser::SerializeMap::serialize_entry(
+                &mut map,
+                "cache_creation_input_tokens",
+                v,
+            )?;
+        }
+        if let Some(v) = &self.cache_read_input_tokens {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "cache_read_input_tokens", v)?;
+        }
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for AnthropicUsage {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = AnthropicUsage;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct AnthropicUsage")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_input_tokens = None;
+                let mut f_output_tokens = None;
+                let mut f_cache_creation_input_tokens = None;
+                let mut f_cache_read_input_tokens = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "input_tokens" => {
+                            if f_input_tokens.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("input_tokens"));
+                            }
+                            f_input_tokens = Some(map.next_value::<Option<i64>>()?);
+                        }
+                        "output_tokens" => {
+                            if f_output_tokens.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("output_tokens"));
+                            }
+                            f_output_tokens = Some(map.next_value::<Option<i64>>()?);
+                        }
+                        "cache_creation_input_tokens" => {
+                            if f_cache_creation_input_tokens.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "cache_creation_input_tokens",
+                                ));
+                            }
+                            f_cache_creation_input_tokens = Some(map.next_value::<Option<i64>>()?);
+                        }
+                        "cache_read_input_tokens" => {
+                            if f_cache_read_input_tokens.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "cache_read_input_tokens",
+                                ));
+                            }
+                            f_cache_read_input_tokens = Some(map.next_value::<Option<i64>>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(AnthropicUsage {
+                    input_tokens: f_input_tokens.flatten(),
+                    output_tokens: f_output_tokens.flatten(),
+                    cache_creation_input_tokens: f_cache_creation_input_tokens.flatten(),
+                    cache_read_input_tokens: f_cache_read_input_tokens.flatten(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for AnthropicContentBlock {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match &self.block {
+            Some(anthropic_content_block::Block::Text(v)) => {
+                let mut map = serializer.serialize_map(None)?;
+                ::serde::ser::SerializeMap::serialize_entry(&mut map, "type", "text")?;
+                ::serde::ser::SerializeMap::serialize_entry(&mut map, "text", &v.text)?;
+                ::serde::ser::SerializeMap::end(map)
+            }
+            Some(anthropic_content_block::Block::Image(v)) => {
+                let mut map = serializer.serialize_map(None)?;
+                ::serde::ser::SerializeMap::serialize_entry(&mut map, "type", "image")?;
+                if let Some(v) = &v.source {
+                    ::serde::ser::SerializeMap::serialize_entry(&mut map, "source", v)?;
+                }
+                ::serde::ser::SerializeMap::end(map)
+            }
+            Some(anthropic_content_block::Block::ToolUse(v)) => {
+                let mut map = serializer.serialize_map(None)?;
+                ::serde::ser::SerializeMap::serialize_entry(&mut map, "type", "tool_use")?;
+                ::serde::ser::SerializeMap::serialize_entry(&mut map, "id", &v.id)?;
+                ::serde::ser::SerializeMap::serialize_entry(&mut map, "name", &v.name)?;
+                if let Some(v) = &v.input {
+                    ::serde::ser::SerializeMap::serialize_entry(
+                        &mut map,
+                        "input",
+                        &::serde_json::from_str::<::serde_json::Value>(v)
+                            .unwrap_or(::serde_json::Value::Null),
+                    )?;
+                }
+                ::serde::ser::SerializeMap::end(map)
+            }
+            Some(anthropic_content_block::Block::ToolResult(v)) => {
+                let mut map = serializer.serialize_map(None)?;
+                ::serde::ser::SerializeMap::serialize_entry(&mut map, "type", "tool_result")?;
+                if let Some(v) = &v.tool_use_id {
+                    ::serde::ser::SerializeMap::serialize_entry(&mut map, "tool_use_id", v)?;
+                }
+                if let Some(v) = &v.id {
+                    ::serde::ser::SerializeMap::serialize_entry(&mut map, "id", v)?;
+                }
+                if let Some(v) = &v.content {
+                    ::serde::ser::SerializeMap::serialize_entry(&mut map, "content", v)?;
+                }
+                if let Some(v) = &v.is_error {
+                    ::serde::ser::SerializeMap::serialize_entry(&mut map, "is_error", v)?;
+                }
+                ::serde::ser::SerializeMap::end(map)
+            }
+            Some(anthropic_content_block::Block::ToolReference(v)) => {
+                let mut map = serializer.serialize_map(None)?;
+                ::serde::ser::SerializeMap::serialize_entry(&mut map, "type", "tool_reference")?;
+                if let Some(v) = &v.name {
+                    ::serde::ser::SerializeMap::serialize_entry(&mut map, "name", v)?;
+                }
+                if let Some(v) = &v.tool_name {
+                    ::serde::ser::SerializeMap::serialize_entry(&mut map, "tool_name", v)?;
+                }
+                if let Some(v) = &v.id {
+                    ::serde::ser::SerializeMap::serialize_entry(&mut map, "id", v)?;
+                }
+                ::serde::ser::SerializeMap::end(map)
+            }
+            Some(anthropic_content_block::Block::SearchResult(v)) => {
+                let mut map = serializer.serialize_map(None)?;
+                ::serde::ser::SerializeMap::serialize_entry(&mut map, "type", "search_result")?;
+                if let Some(v) = &v.source {
+                    ::serde::ser::SerializeMap::serialize_entry(&mut map, "source", v)?;
+                }
+                if let Some(v) = &v.title {
+                    ::serde::ser::SerializeMap::serialize_entry(&mut map, "title", v)?;
+                }
+                if !v.content.is_empty() {
+                    ::serde::ser::SerializeMap::serialize_entry(&mut map, "content", &v.content)?;
+                }
+                ::serde::ser::SerializeMap::end(map)
+            }
+            Some(anthropic_content_block::Block::Thinking(v)) => {
+                let mut map = serializer.serialize_map(None)?;
+                ::serde::ser::SerializeMap::serialize_entry(&mut map, "type", "thinking")?;
+                ::serde::ser::SerializeMap::serialize_entry(&mut map, "thinking", &v.thinking)?;
+                if let Some(v) = &v.signature {
+                    ::serde::ser::SerializeMap::serialize_entry(&mut map, "signature", v)?;
+                }
+                ::serde::ser::SerializeMap::end(map)
+            }
+            Some(anthropic_content_block::Block::RedactedThinking(v)) => {
+                let mut map = serializer.serialize_map(None)?;
+                ::serde::ser::SerializeMap::serialize_entry(&mut map, "type", "redacted_thinking")?;
+                if let Some(v) = &v.data {
+                    ::serde::ser::SerializeMap::serialize_entry(&mut map, "data", v)?;
+                }
+                ::serde::ser::SerializeMap::end(map)
+            }
+            None => serializer.serialize_none(),
+        }
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for AnthropicContentBlock {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        fn fallback<E: ::serde::de::Error>(
+            _raw: ::serde_json::Map<String, ::serde_json::Value>,
+        ) -> Result<AnthropicContentBlock, E> {
+            Err(E::custom("unknown type for AnthropicContentBlock"))
+        }
+        let raw = ::serde_json::Map::<String, ::serde_json::Value>::deserialize(deserializer)?;
+        let tag = raw.get("type").and_then(::serde_json::Value::as_str);
+        #[allow(clippy::redundant_closure_call)]
+        (|raw: ::serde_json::Map<String, ::serde_json::Value>| match tag {
+            Some("text") => {
+                let payload = AnthropicTextBlock {
+                    text: match raw.get("text") {
+                        None => Default::default(),
+                        Some(::serde_json::Value::Null) => return fallback(raw),
+                        Some(v) => {
+                            match ::serde_json::from_value::<::prost::alloc::string::String>(
+                                v.clone(),
+                            ) {
+                                Ok(v) => v,
+                                Err(_) => return fallback(raw),
+                            }
+                        }
+                    },
+                };
+                Ok(AnthropicContentBlock {
+                    block: Some(anthropic_content_block::Block::Text(payload.into())),
+                })
+            }
+            Some("image") => {
+                let payload = AnthropicImageBlock {
+                    source: match raw.get("source") {
+                        None | Some(::serde_json::Value::Null) => None,
+                        Some(v) => {
+                            match ::serde_json::from_value::<AnthropicImageSource>(v.clone()) {
+                                Ok(v) => Some(v),
+                                Err(_) => return fallback(raw),
+                            }
+                        }
+                    },
+                };
+                Ok(AnthropicContentBlock {
+                    block: Some(anthropic_content_block::Block::Image(payload.into())),
+                })
+            }
+            Some("tool_use") => {
+                let payload =
+                    AnthropicToolUseBlock {
+                        id: match raw.get("id") {
+                            None => Default::default(),
+                            Some(::serde_json::Value::Null) => return fallback(raw),
+                            Some(v) => match ::serde_json::from_value::<
+                                ::prost::alloc::string::String,
+                            >(v.clone())
+                            {
+                                Ok(v) => v,
+                                Err(_) => return fallback(raw),
+                            },
+                        },
+                        name: match raw.get("name") {
+                            None => Default::default(),
+                            Some(::serde_json::Value::Null) => return fallback(raw),
+                            Some(v) => match ::serde_json::from_value::<
+                                ::prost::alloc::string::String,
+                            >(v.clone())
+                            {
+                                Ok(v) => v,
+                                Err(_) => return fallback(raw),
+                            },
+                        },
+                        input: match raw.get("input") {
+                            None | Some(::serde_json::Value::Null) => None,
+                            Some(v) => Some(v.to_string()),
+                        },
+                    };
+                Ok(AnthropicContentBlock {
+                    block: Some(anthropic_content_block::Block::ToolUse(payload.into())),
+                })
+            }
+            Some("tool_result") => {
+                let payload = AnthropicToolResultBlock {
+                    tool_use_id: match raw.get("tool_use_id") {
+                        None => None,
+                        Some(::serde_json::Value::Null) => None,
+                        Some(v) => {
+                            match ::serde_json::from_value::<::prost::alloc::string::String>(
+                                v.clone(),
+                            ) {
+                                Ok(v) => Some(v),
+                                Err(_) => return fallback(raw),
+                            }
+                        }
+                    },
+                    id: match raw.get("id") {
+                        None => None,
+                        Some(::serde_json::Value::Null) => None,
+                        Some(v) => {
+                            match ::serde_json::from_value::<::prost::alloc::string::String>(
+                                v.clone(),
+                            ) {
+                                Ok(v) => Some(v),
+                                Err(_) => return fallback(raw),
+                            }
+                        }
+                    },
+                    content: match raw.get("content") {
+                        None | Some(::serde_json::Value::Null) => None,
+                        Some(v) => match ::serde_json::from_value::<AnthropicContent>(v.clone()) {
+                            Ok(v) => Some(v),
+                            Err(_) => return fallback(raw),
+                        },
+                    },
+                    is_error: match raw.get("is_error") {
+                        None => None,
+                        Some(::serde_json::Value::Null) => None,
+                        Some(v) => match ::serde_json::from_value::<bool>(v.clone()) {
+                            Ok(v) => Some(v),
+                            Err(_) => return fallback(raw),
+                        },
+                    },
+                };
+                Ok(AnthropicContentBlock {
+                    block: Some(anthropic_content_block::Block::ToolResult(payload.into())),
+                })
+            }
+            Some("tool_reference") => {
+                let payload =
+                    AnthropicToolReferenceBlock {
+                        name: match raw.get("name") {
+                            None => None,
+                            Some(::serde_json::Value::Null) => None,
+                            Some(v) => match ::serde_json::from_value::<
+                                ::prost::alloc::string::String,
+                            >(v.clone())
+                            {
+                                Ok(v) => Some(v),
+                                Err(_) => return fallback(raw),
+                            },
+                        },
+                        tool_name: match raw.get("tool_name") {
+                            None => None,
+                            Some(::serde_json::Value::Null) => None,
+                            Some(v) => match ::serde_json::from_value::<
+                                ::prost::alloc::string::String,
+                            >(v.clone())
+                            {
+                                Ok(v) => Some(v),
+                                Err(_) => return fallback(raw),
+                            },
+                        },
+                        id: match raw.get("id") {
+                            None => None,
+                            Some(::serde_json::Value::Null) => None,
+                            Some(v) => match ::serde_json::from_value::<
+                                ::prost::alloc::string::String,
+                            >(v.clone())
+                            {
+                                Ok(v) => Some(v),
+                                Err(_) => return fallback(raw),
+                            },
+                        },
+                    };
+                Ok(AnthropicContentBlock {
+                    block: Some(anthropic_content_block::Block::ToolReference(
+                        payload.into(),
+                    )),
+                })
+            }
+            Some("search_result") => {
+                let payload =
+                    AnthropicSearchResultBlock {
+                        source: match raw.get("source") {
+                            None | Some(::serde_json::Value::Null) => None,
+                            Some(v) => {
+                                match ::serde_json::from_value::<AnthropicSearchSource>(v.clone()) {
+                                    Ok(v) => Some(v),
+                                    Err(_) => return fallback(raw),
+                                }
+                            }
+                        },
+                        title: match raw.get("title") {
+                            None => None,
+                            Some(::serde_json::Value::Null) => None,
+                            Some(v) => match ::serde_json::from_value::<
+                                ::prost::alloc::string::String,
+                            >(v.clone())
+                            {
+                                Ok(v) => Some(v),
+                                Err(_) => return fallback(raw),
+                            },
+                        },
+                        content: match raw.get("content") {
+                            None | Some(::serde_json::Value::Null) => Vec::new(),
+                            Some(v) => match ::serde_json::from_value::<
+                                Vec<AnthropicSearchResultItem>,
+                            >(v.clone())
+                            {
+                                Ok(v) => v,
+                                Err(_) => return fallback(raw),
+                            },
+                        },
+                    };
+                Ok(AnthropicContentBlock {
+                    block: Some(anthropic_content_block::Block::SearchResult(payload.into())),
+                })
+            }
+            Some("thinking") => {
+                let payload =
+                    AnthropicThinkingBlock {
+                        thinking: match raw.get("thinking") {
+                            None => Default::default(),
+                            Some(::serde_json::Value::Null) => return fallback(raw),
+                            Some(v) => match ::serde_json::from_value::<
+                                ::prost::alloc::string::String,
+                            >(v.clone())
+                            {
+                                Ok(v) => v,
+                                Err(_) => return fallback(raw),
+                            },
+                        },
+                        signature: match raw.get("signature") {
+                            None => None,
+                            Some(::serde_json::Value::Null) => None,
+                            Some(v) => match ::serde_json::from_value::<
+                                ::prost::alloc::string::String,
+                            >(v.clone())
+                            {
+                                Ok(v) => Some(v),
+                                Err(_) => return fallback(raw),
+                            },
+                        },
+                    };
+                Ok(AnthropicContentBlock {
+                    block: Some(anthropic_content_block::Block::Thinking(payload.into())),
+                })
+            }
+            Some("redacted_thinking") => {
+                let payload = AnthropicRedactedThinkingBlock {
+                    data: match raw.get("data") {
+                        None => None,
+                        Some(::serde_json::Value::Null) => None,
+                        Some(v) => {
+                            match ::serde_json::from_value::<::prost::alloc::string::String>(
+                                v.clone(),
+                            ) {
+                                Ok(v) => Some(v),
+                                Err(_) => return fallback(raw),
+                            }
+                        }
+                    },
+                };
+                Ok(AnthropicContentBlock {
+                    block: Some(anthropic_content_block::Block::RedactedThinking(
+                        payload.into(),
+                    )),
+                })
+            }
+            _ => fallback(raw),
+        })(raw.clone())
+    }
+}
+
+impl ::serde::Serialize for AnthropicContentBlockList {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.items.iter())
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for AnthropicContentBlockList {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(AnthropicContentBlockList {
+            items: <::prost::alloc::vec::Vec<AnthropicContentBlock> as ::serde::Deserialize>::deserialize(deserializer)?,
+        })
+    }
+}
+
+impl ::serde::Serialize for AnthropicContent {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match &self.value {
+            Some(anthropic_content::Value::Text(v)) => v.serialize(serializer),
+            Some(anthropic_content::Value::Blocks(v)) => v.serialize(serializer),
+            None => serializer.serialize_none(),
+        }
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for AnthropicContent {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = AnthropicContent;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("one of the AnthropicContent shapes")
+            }
+            fn visit_str<E: ::serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                Ok(AnthropicContent {
+                    value: Some(anthropic_content::Value::Text(v.to_owned())),
+                })
+            }
+            fn visit_string<E: ::serde::de::Error>(self, v: String) -> Result<Self::Value, E> {
+                Ok(AnthropicContent {
+                    value: Some(anthropic_content::Value::Text(v)),
+                })
+            }
+            fn visit_seq<A: ::serde::de::SeqAccess<'de>>(
+                self,
+                seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                let v = <AnthropicContentBlockList as ::serde::Deserialize>::deserialize(
+                    ::serde::de::value::SeqAccessDeserializer::new(seq),
+                )?;
+                Ok(AnthropicContent {
+                    value: Some(anthropic_content::Value::Blocks(v)),
+                })
+            }
+        }
+        deserializer.deserialize_any(V)
+    }
+}
+
+impl ::serde::Serialize for AnthropicTextBlock {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "text", &self.text)?;
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for AnthropicTextBlock {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = AnthropicTextBlock;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct AnthropicTextBlock")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_text = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "text" => {
+                            if f_text.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("text"));
+                            }
+                            f_text = Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(AnthropicTextBlock {
+                    text: f_text.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for AnthropicImageBlock {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        if let Some(v) = &self.source {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "source", v)?;
+        }
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for AnthropicImageBlock {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = AnthropicImageBlock;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct AnthropicImageBlock")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_source = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "source" => {
+                            if f_source.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("source"));
+                            }
+                            f_source = Some(map.next_value::<Option<AnthropicImageSource>>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(AnthropicImageBlock {
+                    source: f_source.flatten(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for AnthropicImageSource {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match &self.value {
+            Some(anthropic_image_source::Value::Reference(v)) => v.serialize(serializer),
+            Some(anthropic_image_source::Value::Object(v)) => v.serialize(serializer),
+            None => serializer.serialize_none(),
+        }
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for AnthropicImageSource {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = AnthropicImageSource;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("one of the AnthropicImageSource shapes")
+            }
+            fn visit_str<E: ::serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                Ok(AnthropicImageSource {
+                    value: Some(anthropic_image_source::Value::Reference(v.to_owned())),
+                })
+            }
+            fn visit_string<E: ::serde::de::Error>(self, v: String) -> Result<Self::Value, E> {
+                Ok(AnthropicImageSource {
+                    value: Some(anthropic_image_source::Value::Reference(v)),
+                })
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let v = <AnthropicImageSourceObject as ::serde::Deserialize>::deserialize(
+                    ::serde::de::value::MapAccessDeserializer::new(map),
+                )?;
+                Ok(AnthropicImageSource {
+                    value: Some(anthropic_image_source::Value::Object(v)),
+                })
+            }
+        }
+        deserializer.deserialize_any(V)
+    }
+}
+
+impl ::serde::Serialize for AnthropicImageSourceObject {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        if let Some(v) = &self.r#type {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "type", v)?;
+        }
+        if let Some(v) = &self.media_type {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "media_type", v)?;
+        }
+        if let Some(v) = &self.data {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "data", v)?;
+        }
+        if let Some(v) = &self.url {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "url", v)?;
+        }
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for AnthropicImageSourceObject {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = AnthropicImageSourceObject;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct AnthropicImageSourceObject")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_type = None;
+                let mut f_media_type = None;
+                let mut f_data = None;
+                let mut f_url = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "type" => {
+                            if f_type.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("type"));
+                            }
+                            f_type =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        "media_type" => {
+                            if f_media_type.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("media_type"));
+                            }
+                            f_media_type =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        "data" => {
+                            if f_data.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("data"));
+                            }
+                            f_data =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        "url" => {
+                            if f_url.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("url"));
+                            }
+                            f_url =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(AnthropicImageSourceObject {
+                    r#type: f_type.flatten(),
+                    media_type: f_media_type.flatten(),
+                    data: f_data.flatten(),
+                    url: f_url.flatten(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for AnthropicToolUseBlock {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "id", &self.id)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "name", &self.name)?;
+        if let Some(v) = &self.input {
+            ::serde::ser::SerializeMap::serialize_entry(
+                &mut map,
+                "input",
+                &::serde_json::from_str::<::serde_json::Value>(v)
+                    .unwrap_or(::serde_json::Value::Null),
+            )?;
+        }
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for AnthropicToolUseBlock {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = AnthropicToolUseBlock;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct AnthropicToolUseBlock")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_id = None;
+                let mut f_name = None;
+                let mut f_input = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "id" => {
+                            if f_id.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("id"));
+                            }
+                            f_id = Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        "name" => {
+                            if f_name.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("name"));
+                            }
+                            f_name = Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        "input" => {
+                            if f_input.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("input"));
+                            }
+                            f_input = Some(
+                                map.next_value::<Option<::serde_json::Value>>()?
+                                    .map(|v| v.to_string()),
+                            );
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(AnthropicToolUseBlock {
+                    id: f_id.unwrap_or_default(),
+                    name: f_name.unwrap_or_default(),
+                    input: f_input.flatten(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for AnthropicToolResultBlock {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        if let Some(v) = &self.tool_use_id {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "tool_use_id", v)?;
+        }
+        if let Some(v) = &self.id {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "id", v)?;
+        }
+        if let Some(v) = &self.content {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "content", v)?;
+        }
+        if let Some(v) = &self.is_error {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "is_error", v)?;
+        }
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for AnthropicToolResultBlock {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = AnthropicToolResultBlock;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct AnthropicToolResultBlock")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_tool_use_id = None;
+                let mut f_id = None;
+                let mut f_content = None;
+                let mut f_is_error = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "tool_use_id" => {
+                            if f_tool_use_id.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("tool_use_id"));
+                            }
+                            f_tool_use_id =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        "id" => {
+                            if f_id.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("id"));
+                            }
+                            f_id =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        "content" => {
+                            if f_content.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("content"));
+                            }
+                            f_content = Some(map.next_value::<Option<AnthropicContent>>()?);
+                        }
+                        "is_error" => {
+                            if f_is_error.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("is_error"));
+                            }
+                            f_is_error = Some(map.next_value::<Option<bool>>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(AnthropicToolResultBlock {
+                    tool_use_id: f_tool_use_id.flatten(),
+                    id: f_id.flatten(),
+                    content: f_content.flatten(),
+                    is_error: f_is_error.flatten(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for AnthropicToolReferenceBlock {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        if let Some(v) = &self.name {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "name", v)?;
+        }
+        if let Some(v) = &self.tool_name {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "tool_name", v)?;
+        }
+        if let Some(v) = &self.id {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "id", v)?;
+        }
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for AnthropicToolReferenceBlock {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = AnthropicToolReferenceBlock;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct AnthropicToolReferenceBlock")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_name = None;
+                let mut f_tool_name = None;
+                let mut f_id = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "name" => {
+                            if f_name.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("name"));
+                            }
+                            f_name =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        "tool_name" => {
+                            if f_tool_name.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("tool_name"));
+                            }
+                            f_tool_name =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        "id" => {
+                            if f_id.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("id"));
+                            }
+                            f_id =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(AnthropicToolReferenceBlock {
+                    name: f_name.flatten(),
+                    tool_name: f_tool_name.flatten(),
+                    id: f_id.flatten(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for AnthropicSearchResultBlock {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        if let Some(v) = &self.source {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "source", v)?;
+        }
+        if let Some(v) = &self.title {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "title", v)?;
+        }
+        if !self.content.is_empty() {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "content", &self.content)?;
+        }
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for AnthropicSearchResultBlock {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = AnthropicSearchResultBlock;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct AnthropicSearchResultBlock")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_source = None;
+                let mut f_title = None;
+                let mut f_content = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "source" => {
+                            if f_source.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("source"));
+                            }
+                            f_source = Some(map.next_value::<Option<AnthropicSearchSource>>()?);
+                        }
+                        "title" => {
+                            if f_title.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("title"));
+                            }
+                            f_title =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        "content" => {
+                            if f_content.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("content"));
+                            }
+                            f_content = Some(
+                                map.next_value::<Option<Vec<AnthropicSearchResultItem>>>()?
+                                    .unwrap_or_default(),
+                            );
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(AnthropicSearchResultBlock {
+                    source: f_source.flatten(),
+                    title: f_title.flatten(),
+                    content: f_content.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for AnthropicSearchSource {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match &self.value {
+            Some(anthropic_search_source::Value::Reference(v)) => v.serialize(serializer),
+            Some(anthropic_search_source::Value::Object(v)) => v.serialize(serializer),
+            None => serializer.serialize_none(),
+        }
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for AnthropicSearchSource {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = AnthropicSearchSource;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("one of the AnthropicSearchSource shapes")
+            }
+            fn visit_str<E: ::serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                Ok(AnthropicSearchSource {
+                    value: Some(anthropic_search_source::Value::Reference(v.to_owned())),
+                })
+            }
+            fn visit_string<E: ::serde::de::Error>(self, v: String) -> Result<Self::Value, E> {
+                Ok(AnthropicSearchSource {
+                    value: Some(anthropic_search_source::Value::Reference(v)),
+                })
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let v = <AnthropicSearchSourceObject as ::serde::Deserialize>::deserialize(
+                    ::serde::de::value::MapAccessDeserializer::new(map),
+                )?;
+                Ok(AnthropicSearchSource {
+                    value: Some(anthropic_search_source::Value::Object(v)),
+                })
+            }
+        }
+        deserializer.deserialize_any(V)
+    }
+}
+
+impl ::serde::Serialize for AnthropicSearchSourceObject {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        if let Some(v) = &self.url {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "url", v)?;
+        }
+        if let Some(v) = &self.text {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "text", v)?;
+        }
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for AnthropicSearchSourceObject {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = AnthropicSearchSourceObject;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct AnthropicSearchSourceObject")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_url = None;
+                let mut f_text = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "url" => {
+                            if f_url.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("url"));
+                            }
+                            f_url =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        "text" => {
+                            if f_text.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("text"));
+                            }
+                            f_text =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(AnthropicSearchSourceObject {
+                    url: f_url.flatten(),
+                    text: f_text.flatten(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for AnthropicSearchResultItem {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        if let Some(v) = &self.r#type {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "type", v)?;
+        }
+        if let Some(v) = &self.text {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "text", v)?;
+        }
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for AnthropicSearchResultItem {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = AnthropicSearchResultItem;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct AnthropicSearchResultItem")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_type = None;
+                let mut f_text = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "type" => {
+                            if f_type.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("type"));
+                            }
+                            f_type =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        "text" => {
+                            if f_text.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("text"));
+                            }
+                            f_text =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(AnthropicSearchResultItem {
+                    r#type: f_type.flatten(),
+                    text: f_text.flatten(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for AnthropicThinkingBlock {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "thinking", &self.thinking)?;
+        if let Some(v) = &self.signature {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "signature", v)?;
+        }
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for AnthropicThinkingBlock {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = AnthropicThinkingBlock;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct AnthropicThinkingBlock")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_thinking = None;
+                let mut f_signature = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "thinking" => {
+                            if f_thinking.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("thinking"));
+                            }
+                            f_thinking = Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        "signature" => {
+                            if f_signature.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("signature"));
+                            }
+                            f_signature =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(AnthropicThinkingBlock {
+                    thinking: f_thinking.unwrap_or_default(),
+                    signature: f_signature.flatten(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for AnthropicRedactedThinkingBlock {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        if let Some(v) = &self.data {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "data", v)?;
+        }
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for AnthropicRedactedThinkingBlock {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = AnthropicRedactedThinkingBlock;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct AnthropicRedactedThinkingBlock")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_data = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "data" => {
+                            if f_data.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("data"));
+                            }
+                            f_data =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(AnthropicRedactedThinkingBlock {
+                    data: f_data.flatten(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for AnthropicMessage {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "role", &self.role)?;
+        if let Some(v) = &self.content {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "content", v)?;
+        }
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for AnthropicMessage {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = AnthropicMessage;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct AnthropicMessage")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_role = None;
+                let mut f_content = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "role" => {
+                            if f_role.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("role"));
+                            }
+                            f_role = Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        "content" => {
+                            if f_content.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("content"));
+                            }
+                            f_content = Some(map.next_value::<Option<AnthropicContent>>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(AnthropicMessage {
+                    role: f_role.unwrap_or_default(),
+                    content: f_content.flatten(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for AnthropicTool {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        if let Some(v) = &self.r#type {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "type", v)?;
+        }
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "name", &self.name)?;
+        if let Some(v) = &self.description {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "description", v)?;
+        }
+        if let Some(v) = &self.input_schema {
+            ::serde::ser::SerializeMap::serialize_entry(
+                &mut map,
+                "input_schema",
+                &::serde_json::from_str::<::serde_json::Value>(v)
+                    .unwrap_or(::serde_json::Value::Null),
+            )?;
+        }
+        if let Some(v) = &self.defer_loading {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "defer_loading", v)?;
+        }
+        if let Some(v) = &self.max_uses {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "max_uses", v)?;
+        }
+        if !self.allowed_domains.is_empty() {
+            ::serde::ser::SerializeMap::serialize_entry(
+                &mut map,
+                "allowed_domains",
+                &self.allowed_domains,
+            )?;
+        }
+        if !self.blocked_domains.is_empty() {
+            ::serde::ser::SerializeMap::serialize_entry(
+                &mut map,
+                "blocked_domains",
+                &self.blocked_domains,
+            )?;
+        }
+        if let Some(v) = &self.display_width_px {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "display_width_px", v)?;
+        }
+        if let Some(v) = &self.display_height_px {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "display_height_px", v)?;
+        }
+        if let Some(v) = &self.display_number {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "display_number", v)?;
+        }
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for AnthropicTool {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = AnthropicTool;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct AnthropicTool")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_type = None;
+                let mut f_name = None;
+                let mut f_description = None;
+                let mut f_input_schema = None;
+                let mut f_defer_loading = None;
+                let mut f_max_uses = None;
+                let mut f_allowed_domains = None;
+                let mut f_blocked_domains = None;
+                let mut f_display_width_px = None;
+                let mut f_display_height_px = None;
+                let mut f_display_number = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "type" => {
+                            if f_type.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("type"));
+                            }
+                            f_type =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        "name" => {
+                            if f_name.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("name"));
+                            }
+                            f_name = Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        "description" => {
+                            if f_description.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("description"));
+                            }
+                            f_description =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        "input_schema" => {
+                            if f_input_schema.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("input_schema"));
+                            }
+                            f_input_schema = Some(
+                                map.next_value::<Option<::serde_json::Value>>()?
+                                    .map(|v| v.to_string()),
+                            );
+                        }
+                        "defer_loading" => {
+                            if f_defer_loading.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("defer_loading"));
+                            }
+                            f_defer_loading = Some(map.next_value::<Option<bool>>()?);
+                        }
+                        "max_uses" => {
+                            if f_max_uses.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("max_uses"));
+                            }
+                            f_max_uses = Some(map.next_value::<Option<i64>>()?);
+                        }
+                        "allowed_domains" => {
+                            if f_allowed_domains.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("allowed_domains"));
+                            }
+                            f_allowed_domains = Some(
+                                map.next_value::<Option<Vec<::prost::alloc::string::String>>>()?
+                                    .unwrap_or_default(),
+                            );
+                        }
+                        "blocked_domains" => {
+                            if f_blocked_domains.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("blocked_domains"));
+                            }
+                            f_blocked_domains = Some(
+                                map.next_value::<Option<Vec<::prost::alloc::string::String>>>()?
+                                    .unwrap_or_default(),
+                            );
+                        }
+                        "display_width_px" => {
+                            if f_display_width_px.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "display_width_px",
+                                ));
+                            }
+                            f_display_width_px = Some(map.next_value::<Option<i64>>()?);
+                        }
+                        "display_height_px" => {
+                            if f_display_height_px.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "display_height_px",
+                                ));
+                            }
+                            f_display_height_px = Some(map.next_value::<Option<i64>>()?);
+                        }
+                        "display_number" => {
+                            if f_display_number.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("display_number"));
+                            }
+                            f_display_number = Some(map.next_value::<Option<i64>>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(AnthropicTool {
+                    r#type: f_type.flatten(),
+                    name: f_name.unwrap_or_default(),
+                    description: f_description.flatten(),
+                    input_schema: f_input_schema.flatten(),
+                    defer_loading: f_defer_loading.flatten(),
+                    max_uses: f_max_uses.flatten(),
+                    allowed_domains: f_allowed_domains.unwrap_or_default(),
+                    blocked_domains: f_blocked_domains.unwrap_or_default(),
+                    display_width_px: f_display_width_px.flatten(),
+                    display_height_px: f_display_height_px.flatten(),
+                    display_number: f_display_number.flatten(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for AnthropicToolChoice {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "type", &self.r#type)?;
+        if let Some(v) = &self.name {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "name", v)?;
+        }
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for AnthropicToolChoice {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = AnthropicToolChoice;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct AnthropicToolChoice")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_type = None;
+                let mut f_name = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "type" => {
+                            if f_type.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("type"));
+                            }
+                            f_type = Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        "name" => {
+                            if f_name.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("name"));
+                            }
+                            f_name =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(AnthropicToolChoice {
+                    r#type: f_type.unwrap_or_default(),
+                    name: f_name.flatten(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for AnthropicThinkingParam {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "type", &self.r#type)?;
+        if let Some(v) = &self.budget_tokens {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "budget_tokens", v)?;
+        }
+        if let Some(v) = &self.display {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "display", v)?;
+        }
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for AnthropicThinkingParam {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = AnthropicThinkingParam;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct AnthropicThinkingParam")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_type = None;
+                let mut f_budget_tokens = None;
+                let mut f_display = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "type" => {
+                            if f_type.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("type"));
+                            }
+                            f_type = Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        "budget_tokens" => {
+                            if f_budget_tokens.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("budget_tokens"));
+                            }
+                            f_budget_tokens = Some(map.next_value::<Option<i64>>()?);
+                        }
+                        "display" => {
+                            if f_display.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("display"));
+                            }
+                            f_display =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(AnthropicThinkingParam {
+                    r#type: f_type.unwrap_or_default(),
+                    budget_tokens: f_budget_tokens.flatten(),
+                    display: f_display.flatten(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for AnthropicTaskBudget {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "type", &self.r#type)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "total", &self.total)?;
+        if let Some(v) = &self.remaining {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "remaining", v)?;
+        }
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for AnthropicTaskBudget {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = AnthropicTaskBudget;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct AnthropicTaskBudget")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_type = None;
+                let mut f_total = None;
+                let mut f_remaining = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "type" => {
+                            if f_type.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("type"));
+                            }
+                            f_type = Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        "total" => {
+                            if f_total.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("total"));
+                            }
+                            f_total = Some(map.next_value::<i64>()?);
+                        }
+                        "remaining" => {
+                            if f_remaining.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("remaining"));
+                            }
+                            f_remaining = Some(map.next_value::<Option<i64>>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(AnthropicTaskBudget {
+                    r#type: f_type.unwrap_or_default(),
+                    total: f_total.unwrap_or_default(),
+                    remaining: f_remaining.flatten(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for AnthropicOutputConfig {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        if let Some(v) = &self.effort {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "effort", v)?;
+        }
+        if let Some(v) = &self.task_budget {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "task_budget", v)?;
+        }
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for AnthropicOutputConfig {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = AnthropicOutputConfig;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct AnthropicOutputConfig")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_effort = None;
+                let mut f_task_budget = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "effort" => {
+                            if f_effort.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("effort"));
+                            }
+                            f_effort =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        "task_budget" => {
+                            if f_task_budget.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("task_budget"));
+                            }
+                            f_task_budget = Some(map.next_value::<Option<AnthropicTaskBudget>>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(AnthropicOutputConfig {
+                    effort: f_effort.flatten(),
+                    task_budget: f_task_budget.flatten(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl AnthropicMessagesRequest {
+    /// The schema default when unset (protobuf arrival).
+    pub fn stream_or_default(&self) -> bool {
+        self.stream.clone().unwrap_or_else(|| false)
+    }
+    /// Protobuf arrival: unset defaulted fields become their schema
+    /// defaults (JSON arrival already baked them at deserialization).
+    pub fn apply_absent_defaults(&mut self) {
+        if self.stream.is_none() {
+            self.stream = Some(false);
+        }
+    }
+}
+
+impl ::serde::Serialize for AnthropicMessagesRequest {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "model", &self.model)?;
+        if !self.messages.is_empty() {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "messages", &self.messages)?;
+        }
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "max_tokens", &self.max_tokens)?;
+        if let Some(v) = &self.metadata {
+            ::serde::ser::SerializeMap::serialize_entry(
+                &mut map,
+                "metadata",
+                &::serde_json::from_str::<::serde_json::Value>(v)
+                    .unwrap_or(::serde_json::Value::Null),
+            )?;
+        }
+        if !self.stop_sequences.is_empty() {
+            ::serde::ser::SerializeMap::serialize_entry(
+                &mut map,
+                "stop_sequences",
+                &self.stop_sequences,
+            )?;
+        }
+        if let Some(v) = &self.stream {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "stream", v)?;
+        }
+        if let Some(v) = &self.system {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "system", v)?;
+        }
+        if let Some(v) = &self.temperature {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "temperature", v)?;
+        }
+        if let Some(v) = &self.thinking {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "thinking", v)?;
+        }
+        if let Some(v) = &self.tool_choice {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "tool_choice", v)?;
+        }
+        if !self.tools.is_empty() {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "tools", &self.tools)?;
+        }
+        if let Some(v) = &self.top_k {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "top_k", v)?;
+        }
+        if let Some(v) = &self.top_p {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "top_p", v)?;
+        }
+        if let Some(v) = &self.output_config {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "output_config", v)?;
+        }
+        if !self.betas.is_empty() {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "betas", &self.betas)?;
+        }
+        if let Some(v) = &self.bootstrap_host {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "bootstrap_host", v)?;
+        }
+        if let Some(v) = &self.bootstrap_port {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "bootstrap_port", v)?;
+        }
+        if let Some(v) = &self.bootstrap_room {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "bootstrap_room", v)?;
+        }
+        if let Some(v) = &self.routed_dp_rank {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "routed_dp_rank", v)?;
+        }
+        if let Some(v) = &self.disagg_prefill_dp_rank {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "disagg_prefill_dp_rank", v)?;
+        }
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for AnthropicMessagesRequest {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = AnthropicMessagesRequest;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct AnthropicMessagesRequest")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_model = None;
+                let mut f_messages = None;
+                let mut f_max_tokens = None;
+                let mut f_metadata = None;
+                let mut f_stop_sequences = None;
+                let mut f_stream = None;
+                let mut f_system = None;
+                let mut f_temperature = None;
+                let mut f_thinking = None;
+                let mut f_tool_choice = None;
+                let mut f_tools = None;
+                let mut f_top_k = None;
+                let mut f_top_p = None;
+                let mut f_output_config = None;
+                let mut f_betas = None;
+                let mut f_bootstrap_host = None;
+                let mut f_bootstrap_port = None;
+                let mut f_bootstrap_room = None;
+                let mut f_routed_dp_rank = None;
+                let mut f_disagg_prefill_dp_rank = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "model" => {
+                            if f_model.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("model"));
+                            }
+                            f_model = Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        "messages" => {
+                            if f_messages.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("messages"));
+                            }
+                            f_messages = Some(
+                                map.next_value::<Option<Vec<AnthropicMessage>>>()?
+                                    .unwrap_or_default(),
+                            );
+                        }
+                        "max_tokens" => {
+                            if f_max_tokens.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("max_tokens"));
+                            }
+                            f_max_tokens = Some(map.next_value::<i64>()?);
+                        }
+                        "metadata" => {
+                            if f_metadata.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("metadata"));
+                            }
+                            f_metadata = Some(
+                                map.next_value::<Option<::serde_json::Value>>()?
+                                    .map(|v| v.to_string()),
+                            );
+                        }
+                        "stop_sequences" => {
+                            if f_stop_sequences.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("stop_sequences"));
+                            }
+                            f_stop_sequences = Some(
+                                map.next_value::<Option<Vec<::prost::alloc::string::String>>>()?
+                                    .unwrap_or_default(),
+                            );
+                        }
+                        "stream" => {
+                            if f_stream.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("stream"));
+                            }
+                            f_stream = Some(Some(
+                                map.next_value::<Option<bool>>()?.unwrap_or_else(|| false),
+                            ));
+                        }
+                        "system" => {
+                            if f_system.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("system"));
+                            }
+                            f_system = Some(map.next_value::<Option<AnthropicContent>>()?);
+                        }
+                        "temperature" => {
+                            if f_temperature.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("temperature"));
+                            }
+                            f_temperature = Some(map.next_value::<Option<f64>>()?);
+                        }
+                        "thinking" => {
+                            if f_thinking.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("thinking"));
+                            }
+                            f_thinking = Some(map.next_value::<Option<AnthropicThinkingParam>>()?);
+                        }
+                        "tool_choice" => {
+                            if f_tool_choice.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("tool_choice"));
+                            }
+                            f_tool_choice = Some(map.next_value::<Option<AnthropicToolChoice>>()?);
+                        }
+                        "tools" => {
+                            if f_tools.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("tools"));
+                            }
+                            f_tools = Some(
+                                map.next_value::<Option<Vec<AnthropicTool>>>()?
+                                    .unwrap_or_default(),
+                            );
+                        }
+                        "top_k" => {
+                            if f_top_k.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("top_k"));
+                            }
+                            f_top_k = Some(map.next_value::<Option<i64>>()?);
+                        }
+                        "top_p" => {
+                            if f_top_p.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("top_p"));
+                            }
+                            f_top_p = Some(map.next_value::<Option<f64>>()?);
+                        }
+                        "output_config" => {
+                            if f_output_config.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("output_config"));
+                            }
+                            f_output_config =
+                                Some(map.next_value::<Option<AnthropicOutputConfig>>()?);
+                        }
+                        "betas" => {
+                            if f_betas.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("betas"));
+                            }
+                            f_betas = Some(
+                                map.next_value::<Option<Vec<::prost::alloc::string::String>>>()?
+                                    .unwrap_or_default(),
+                            );
+                        }
+                        "bootstrap_host" => {
+                            if f_bootstrap_host.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("bootstrap_host"));
+                            }
+                            f_bootstrap_host = Some(map.next_value::<Option<StringOrList>>()?);
+                        }
+                        "bootstrap_port" => {
+                            if f_bootstrap_port.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("bootstrap_port"));
+                            }
+                            f_bootstrap_port =
+                                Some(map.next_value::<Option<OptionalInt64OrList>>()?);
+                        }
+                        "bootstrap_room" => {
+                            if f_bootstrap_room.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("bootstrap_room"));
+                            }
+                            f_bootstrap_room = Some(map.next_value::<Option<Int64OrList>>()?);
+                        }
+                        "routed_dp_rank" => {
+                            if f_routed_dp_rank.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("routed_dp_rank"));
+                            }
+                            f_routed_dp_rank = Some(map.next_value::<Option<i64>>()?);
+                        }
+                        "disagg_prefill_dp_rank" => {
+                            if f_disagg_prefill_dp_rank.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "disagg_prefill_dp_rank",
+                                ));
+                            }
+                            f_disagg_prefill_dp_rank = Some(map.next_value::<Option<i64>>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(AnthropicMessagesRequest {
+                    model: f_model.unwrap_or_default(),
+                    messages: f_messages.unwrap_or_default(),
+                    max_tokens: f_max_tokens.unwrap_or_default(),
+                    metadata: f_metadata.flatten(),
+                    stop_sequences: f_stop_sequences.unwrap_or_default(),
+                    stream: f_stream.unwrap_or_else(|| Some(false)),
+                    system: f_system.flatten(),
+                    temperature: f_temperature.flatten(),
+                    thinking: f_thinking.flatten(),
+                    tool_choice: f_tool_choice.flatten(),
+                    tools: f_tools.unwrap_or_default(),
+                    top_k: f_top_k.flatten(),
+                    top_p: f_top_p.flatten(),
+                    output_config: f_output_config.flatten(),
+                    betas: f_betas.unwrap_or_default(),
+                    bootstrap_host: f_bootstrap_host.flatten(),
+                    bootstrap_port: f_bootstrap_port.flatten(),
+                    bootstrap_room: f_bootstrap_room.flatten(),
+                    routed_dp_rank: f_routed_dp_rank.flatten(),
+                    disagg_prefill_dp_rank: f_disagg_prefill_dp_rank.flatten(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for AnthropicMessagesResponse {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "id", &self.id)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "type", &self.r#type)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "role", &self.role)?;
+        if let Some(v) = &self.content {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "content", v)?;
+        }
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "model", &self.model)?;
+        if let Some(v) = &self.stop_reason {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "stop_reason", v)?;
+        }
+        if let Some(v) = &self.stop_sequence {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "stop_sequence", v)?;
+        }
+        if let Some(v) = &self.usage {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "usage", v)?;
+        }
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for AnthropicMessagesResponse {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = AnthropicMessagesResponse;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct AnthropicMessagesResponse")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_id = None;
+                let mut f_type = None;
+                let mut f_role = None;
+                let mut f_content = None;
+                let mut f_model = None;
+                let mut f_stop_reason = None;
+                let mut f_stop_sequence = None;
+                let mut f_usage = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "id" => {
+                            if f_id.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("id"));
+                            }
+                            f_id = Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        "type" => {
+                            if f_type.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("type"));
+                            }
+                            f_type = Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        "role" => {
+                            if f_role.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("role"));
+                            }
+                            f_role = Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        "content" => {
+                            if f_content.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("content"));
+                            }
+                            f_content =
+                                Some(map.next_value::<Option<AnthropicContentBlockList>>()?);
+                        }
+                        "model" => {
+                            if f_model.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("model"));
+                            }
+                            f_model = Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        "stop_reason" => {
+                            if f_stop_reason.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("stop_reason"));
+                            }
+                            f_stop_reason =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        "stop_sequence" => {
+                            if f_stop_sequence.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("stop_sequence"));
+                            }
+                            f_stop_sequence =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        "usage" => {
+                            if f_usage.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("usage"));
+                            }
+                            f_usage = Some(map.next_value::<Option<AnthropicUsage>>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(AnthropicMessagesResponse {
+                    id: f_id.unwrap_or_default(),
+                    r#type: f_type.unwrap_or_default(),
+                    role: f_role.unwrap_or_default(),
+                    content: f_content.flatten(),
+                    model: f_model.unwrap_or_default(),
+                    stop_reason: f_stop_reason.flatten(),
+                    stop_sequence: f_stop_sequence.flatten(),
+                    usage: f_usage.flatten(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for AnthropicCountTokensRequest {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "model", &self.model)?;
+        if !self.messages.is_empty() {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "messages", &self.messages)?;
+        }
+        if let Some(v) = &self.system {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "system", v)?;
+        }
+        if let Some(v) = &self.thinking {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "thinking", v)?;
+        }
+        if let Some(v) = &self.tool_choice {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "tool_choice", v)?;
+        }
+        if !self.tools.is_empty() {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "tools", &self.tools)?;
+        }
+        if let Some(v) = &self.output_config {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "output_config", v)?;
+        }
+        if !self.betas.is_empty() {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "betas", &self.betas)?;
+        }
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for AnthropicCountTokensRequest {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = AnthropicCountTokensRequest;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct AnthropicCountTokensRequest")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_model = None;
+                let mut f_messages = None;
+                let mut f_system = None;
+                let mut f_thinking = None;
+                let mut f_tool_choice = None;
+                let mut f_tools = None;
+                let mut f_output_config = None;
+                let mut f_betas = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "model" => {
+                            if f_model.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("model"));
+                            }
+                            f_model = Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        "messages" => {
+                            if f_messages.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("messages"));
+                            }
+                            f_messages = Some(
+                                map.next_value::<Option<Vec<AnthropicMessage>>>()?
+                                    .unwrap_or_default(),
+                            );
+                        }
+                        "system" => {
+                            if f_system.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("system"));
+                            }
+                            f_system = Some(map.next_value::<Option<AnthropicContent>>()?);
+                        }
+                        "thinking" => {
+                            if f_thinking.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("thinking"));
+                            }
+                            f_thinking = Some(map.next_value::<Option<AnthropicThinkingParam>>()?);
+                        }
+                        "tool_choice" => {
+                            if f_tool_choice.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("tool_choice"));
+                            }
+                            f_tool_choice = Some(map.next_value::<Option<AnthropicToolChoice>>()?);
+                        }
+                        "tools" => {
+                            if f_tools.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("tools"));
+                            }
+                            f_tools = Some(
+                                map.next_value::<Option<Vec<AnthropicTool>>>()?
+                                    .unwrap_or_default(),
+                            );
+                        }
+                        "output_config" => {
+                            if f_output_config.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("output_config"));
+                            }
+                            f_output_config =
+                                Some(map.next_value::<Option<AnthropicOutputConfig>>()?);
+                        }
+                        "betas" => {
+                            if f_betas.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("betas"));
+                            }
+                            f_betas = Some(
+                                map.next_value::<Option<Vec<::prost::alloc::string::String>>>()?
+                                    .unwrap_or_default(),
+                            );
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(AnthropicCountTokensRequest {
+                    model: f_model.unwrap_or_default(),
+                    messages: f_messages.unwrap_or_default(),
+                    system: f_system.flatten(),
+                    thinking: f_thinking.flatten(),
+                    tool_choice: f_tool_choice.flatten(),
+                    tools: f_tools.unwrap_or_default(),
+                    output_config: f_output_config.flatten(),
+                    betas: f_betas.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for AnthropicCountTokensResponse {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "input_tokens", &self.input_tokens)?;
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for AnthropicCountTokensResponse {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = AnthropicCountTokensResponse;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct AnthropicCountTokensResponse")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_input_tokens = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "input_tokens" => {
+                            if f_input_tokens.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("input_tokens"));
+                            }
+                            f_input_tokens = Some(map.next_value::<i64>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(AnthropicCountTokensResponse {
+                    input_tokens: f_input_tokens.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for AnthropicStreamEvent {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match &self.event {
+            Some(anthropic_stream_event::Event::MessageStart(v)) => {
+                let mut map = serializer.serialize_map(None)?;
+                ::serde::ser::SerializeMap::serialize_entry(&mut map, "type", "message_start")?;
+                if let Some(v) = &v.message {
+                    ::serde::ser::SerializeMap::serialize_entry(&mut map, "message", v)?;
+                }
+                ::serde::ser::SerializeMap::end(map)
+            }
+            Some(anthropic_stream_event::Event::MessageDelta(v)) => {
+                let mut map = serializer.serialize_map(None)?;
+                ::serde::ser::SerializeMap::serialize_entry(&mut map, "type", "message_delta")?;
+                if let Some(v) = &v.delta {
+                    ::serde::ser::SerializeMap::serialize_entry(&mut map, "delta", v)?;
+                }
+                if let Some(v) = &v.usage {
+                    ::serde::ser::SerializeMap::serialize_entry(&mut map, "usage", v)?;
+                }
+                ::serde::ser::SerializeMap::end(map)
+            }
+            Some(anthropic_stream_event::Event::MessageStop(_)) => {
+                let mut map = serializer.serialize_map(None)?;
+                ::serde::ser::SerializeMap::serialize_entry(&mut map, "type", "message_stop")?;
+                ::serde::ser::SerializeMap::end(map)
+            }
+            Some(anthropic_stream_event::Event::ContentBlockStart(v)) => {
+                let mut map = serializer.serialize_map(None)?;
+                ::serde::ser::SerializeMap::serialize_entry(
+                    &mut map,
+                    "type",
+                    "content_block_start",
+                )?;
+                ::serde::ser::SerializeMap::serialize_entry(&mut map, "index", &v.index)?;
+                if let Some(v) = &v.content_block {
+                    ::serde::ser::SerializeMap::serialize_entry(&mut map, "content_block", v)?;
+                }
+                ::serde::ser::SerializeMap::end(map)
+            }
+            Some(anthropic_stream_event::Event::ContentBlockDelta(v)) => {
+                let mut map = serializer.serialize_map(None)?;
+                ::serde::ser::SerializeMap::serialize_entry(
+                    &mut map,
+                    "type",
+                    "content_block_delta",
+                )?;
+                ::serde::ser::SerializeMap::serialize_entry(&mut map, "index", &v.index)?;
+                if let Some(v) = &v.delta {
+                    ::serde::ser::SerializeMap::serialize_entry(&mut map, "delta", v)?;
+                }
+                ::serde::ser::SerializeMap::end(map)
+            }
+            Some(anthropic_stream_event::Event::ContentBlockStop(v)) => {
+                let mut map = serializer.serialize_map(None)?;
+                ::serde::ser::SerializeMap::serialize_entry(
+                    &mut map,
+                    "type",
+                    "content_block_stop",
+                )?;
+                ::serde::ser::SerializeMap::serialize_entry(&mut map, "index", &v.index)?;
+                ::serde::ser::SerializeMap::end(map)
+            }
+            Some(anthropic_stream_event::Event::Ping(_)) => {
+                let mut map = serializer.serialize_map(None)?;
+                ::serde::ser::SerializeMap::serialize_entry(&mut map, "type", "ping")?;
+                ::serde::ser::SerializeMap::end(map)
+            }
+            Some(anthropic_stream_event::Event::Error(v)) => {
+                let mut map = serializer.serialize_map(None)?;
+                ::serde::ser::SerializeMap::serialize_entry(&mut map, "type", "error")?;
+                if let Some(v) = &v.error {
+                    ::serde::ser::SerializeMap::serialize_entry(&mut map, "error", v)?;
+                }
+                ::serde::ser::SerializeMap::end(map)
+            }
+            None => serializer.serialize_none(),
+        }
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for AnthropicStreamEvent {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        fn fallback<E: ::serde::de::Error>(
+            _raw: ::serde_json::Map<String, ::serde_json::Value>,
+        ) -> Result<AnthropicStreamEvent, E> {
+            Err(E::custom("unknown type for AnthropicStreamEvent"))
+        }
+        let raw = ::serde_json::Map::<String, ::serde_json::Value>::deserialize(deserializer)?;
+        let tag = raw.get("type").and_then(::serde_json::Value::as_str);
+        #[allow(clippy::redundant_closure_call)]
+        (|raw: ::serde_json::Map<String, ::serde_json::Value>| match tag {
+            Some("message_start") => {
+                let payload = AnthropicMessageStartEvent {
+                    message: match raw.get("message") {
+                        None | Some(::serde_json::Value::Null) => None,
+                        Some(v) => {
+                            match ::serde_json::from_value::<AnthropicMessagesResponse>(v.clone()) {
+                                Ok(v) => Some(v),
+                                Err(_) => return fallback(raw),
+                            }
+                        }
+                    },
+                };
+                Ok(AnthropicStreamEvent {
+                    event: Some(anthropic_stream_event::Event::MessageStart(payload.into())),
+                })
+            }
+            Some("message_delta") => {
+                let payload = AnthropicMessageDeltaEvent {
+                    delta: match raw.get("delta") {
+                        None | Some(::serde_json::Value::Null) => None,
+                        Some(v) => {
+                            match ::serde_json::from_value::<AnthropicMessageEndDelta>(v.clone()) {
+                                Ok(v) => Some(v),
+                                Err(_) => return fallback(raw),
+                            }
+                        }
+                    },
+                    usage: match raw.get("usage") {
+                        None | Some(::serde_json::Value::Null) => None,
+                        Some(v) => match ::serde_json::from_value::<AnthropicUsage>(v.clone()) {
+                            Ok(v) => Some(v),
+                            Err(_) => return fallback(raw),
+                        },
+                    },
+                };
+                Ok(AnthropicStreamEvent {
+                    event: Some(anthropic_stream_event::Event::MessageDelta(payload.into())),
+                })
+            }
+            Some("message_stop") => {
+                let payload = AnthropicMessageStopEvent {};
+                Ok(AnthropicStreamEvent {
+                    event: Some(anthropic_stream_event::Event::MessageStop(payload.into())),
+                })
+            }
+            Some("content_block_start") => {
+                let payload = AnthropicContentBlockStartEvent {
+                    index: match raw.get("index") {
+                        None => Default::default(),
+                        Some(::serde_json::Value::Null) => return fallback(raw),
+                        Some(v) => match ::serde_json::from_value::<i64>(v.clone()) {
+                            Ok(v) => v,
+                            Err(_) => return fallback(raw),
+                        },
+                    },
+                    content_block: match raw.get("content_block") {
+                        None | Some(::serde_json::Value::Null) => None,
+                        Some(v) => {
+                            match ::serde_json::from_value::<AnthropicContentBlock>(v.clone()) {
+                                Ok(v) => Some(v),
+                                Err(_) => return fallback(raw),
+                            }
+                        }
+                    },
+                };
+                Ok(AnthropicStreamEvent {
+                    event: Some(anthropic_stream_event::Event::ContentBlockStart(
+                        payload.into(),
+                    )),
+                })
+            }
+            Some("content_block_delta") => {
+                let payload = AnthropicContentBlockDeltaEvent {
+                    index: match raw.get("index") {
+                        None => Default::default(),
+                        Some(::serde_json::Value::Null) => return fallback(raw),
+                        Some(v) => match ::serde_json::from_value::<i64>(v.clone()) {
+                            Ok(v) => v,
+                            Err(_) => return fallback(raw),
+                        },
+                    },
+                    delta: match raw.get("delta") {
+                        None | Some(::serde_json::Value::Null) => None,
+                        Some(v) => {
+                            match ::serde_json::from_value::<AnthropicContentDelta>(v.clone()) {
+                                Ok(v) => Some(v),
+                                Err(_) => return fallback(raw),
+                            }
+                        }
+                    },
+                };
+                Ok(AnthropicStreamEvent {
+                    event: Some(anthropic_stream_event::Event::ContentBlockDelta(
+                        payload.into(),
+                    )),
+                })
+            }
+            Some("content_block_stop") => {
+                let payload = AnthropicContentBlockStopEvent {
+                    index: match raw.get("index") {
+                        None => Default::default(),
+                        Some(::serde_json::Value::Null) => return fallback(raw),
+                        Some(v) => match ::serde_json::from_value::<i64>(v.clone()) {
+                            Ok(v) => v,
+                            Err(_) => return fallback(raw),
+                        },
+                    },
+                };
+                Ok(AnthropicStreamEvent {
+                    event: Some(anthropic_stream_event::Event::ContentBlockStop(
+                        payload.into(),
+                    )),
+                })
+            }
+            Some("ping") => {
+                let payload = AnthropicPingEvent {};
+                Ok(AnthropicStreamEvent {
+                    event: Some(anthropic_stream_event::Event::Ping(payload.into())),
+                })
+            }
+            Some("error") => {
+                let payload = AnthropicErrorEvent {
+                    error: match raw.get("error") {
+                        None | Some(::serde_json::Value::Null) => None,
+                        Some(v) => match ::serde_json::from_value::<AnthropicError>(v.clone()) {
+                            Ok(v) => Some(v),
+                            Err(_) => return fallback(raw),
+                        },
+                    },
+                };
+                Ok(AnthropicStreamEvent {
+                    event: Some(anthropic_stream_event::Event::Error(payload.into())),
+                })
+            }
+            _ => fallback(raw),
+        })(raw.clone())
+    }
+}
+
+impl ::serde::Serialize for AnthropicMessageStartEvent {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        if let Some(v) = &self.message {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "message", v)?;
+        }
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for AnthropicMessageStartEvent {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = AnthropicMessageStartEvent;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct AnthropicMessageStartEvent")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_message = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "message" => {
+                            if f_message.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("message"));
+                            }
+                            f_message =
+                                Some(map.next_value::<Option<AnthropicMessagesResponse>>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(AnthropicMessageStartEvent {
+                    message: f_message.flatten(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for AnthropicMessageDeltaEvent {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        if let Some(v) = &self.delta {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "delta", v)?;
+        }
+        if let Some(v) = &self.usage {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "usage", v)?;
+        }
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for AnthropicMessageDeltaEvent {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = AnthropicMessageDeltaEvent;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct AnthropicMessageDeltaEvent")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_delta = None;
+                let mut f_usage = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "delta" => {
+                            if f_delta.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("delta"));
+                            }
+                            f_delta = Some(map.next_value::<Option<AnthropicMessageEndDelta>>()?);
+                        }
+                        "usage" => {
+                            if f_usage.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("usage"));
+                            }
+                            f_usage = Some(map.next_value::<Option<AnthropicUsage>>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(AnthropicMessageDeltaEvent {
+                    delta: f_delta.flatten(),
+                    usage: f_usage.flatten(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for AnthropicMessageEndDelta {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        if let Some(v) = &self.stop_reason {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "stop_reason", v)?;
+        }
+        if let Some(v) = &self.stop_sequence {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "stop_sequence", v)?;
+        }
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for AnthropicMessageEndDelta {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = AnthropicMessageEndDelta;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct AnthropicMessageEndDelta")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_stop_reason = None;
+                let mut f_stop_sequence = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "stop_reason" => {
+                            if f_stop_reason.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("stop_reason"));
+                            }
+                            f_stop_reason =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        "stop_sequence" => {
+                            if f_stop_sequence.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("stop_sequence"));
+                            }
+                            f_stop_sequence =
+                                Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(AnthropicMessageEndDelta {
+                    stop_reason: f_stop_reason.flatten(),
+                    stop_sequence: f_stop_sequence.flatten(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for AnthropicMessageStopEvent {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for AnthropicMessageStopEvent {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = AnthropicMessageStopEvent;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct AnthropicMessageStopEvent")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(AnthropicMessageStopEvent {})
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for AnthropicContentBlockStartEvent {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "index", &self.index)?;
+        if let Some(v) = &self.content_block {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "content_block", v)?;
+        }
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for AnthropicContentBlockStartEvent {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = AnthropicContentBlockStartEvent;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct AnthropicContentBlockStartEvent")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_index = None;
+                let mut f_content_block = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "index" => {
+                            if f_index.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("index"));
+                            }
+                            f_index = Some(map.next_value::<i64>()?);
+                        }
+                        "content_block" => {
+                            if f_content_block.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("content_block"));
+                            }
+                            f_content_block =
+                                Some(map.next_value::<Option<AnthropicContentBlock>>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(AnthropicContentBlockStartEvent {
+                    index: f_index.unwrap_or_default(),
+                    content_block: f_content_block.flatten(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for AnthropicContentBlockDeltaEvent {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "index", &self.index)?;
+        if let Some(v) = &self.delta {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "delta", v)?;
+        }
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for AnthropicContentBlockDeltaEvent {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = AnthropicContentBlockDeltaEvent;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct AnthropicContentBlockDeltaEvent")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_index = None;
+                let mut f_delta = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "index" => {
+                            if f_index.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("index"));
+                            }
+                            f_index = Some(map.next_value::<i64>()?);
+                        }
+                        "delta" => {
+                            if f_delta.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("delta"));
+                            }
+                            f_delta = Some(map.next_value::<Option<AnthropicContentDelta>>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(AnthropicContentBlockDeltaEvent {
+                    index: f_index.unwrap_or_default(),
+                    delta: f_delta.flatten(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for AnthropicContentBlockStopEvent {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "index", &self.index)?;
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for AnthropicContentBlockStopEvent {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = AnthropicContentBlockStopEvent;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct AnthropicContentBlockStopEvent")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_index = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "index" => {
+                            if f_index.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("index"));
+                            }
+                            f_index = Some(map.next_value::<i64>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(AnthropicContentBlockStopEvent {
+                    index: f_index.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for AnthropicPingEvent {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for AnthropicPingEvent {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = AnthropicPingEvent;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct AnthropicPingEvent")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(AnthropicPingEvent {})
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for AnthropicErrorEvent {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        if let Some(v) = &self.error {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "error", v)?;
+        }
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for AnthropicErrorEvent {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = AnthropicErrorEvent;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct AnthropicErrorEvent")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_error = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "error" => {
+                            if f_error.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("error"));
+                            }
+                            f_error = Some(map.next_value::<Option<AnthropicError>>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(AnthropicErrorEvent {
+                    error: f_error.flatten(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for AnthropicContentDelta {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match &self.delta {
+            Some(anthropic_content_delta::Delta::TextDelta(v)) => {
+                let mut map = serializer.serialize_map(None)?;
+                ::serde::ser::SerializeMap::serialize_entry(&mut map, "type", "text_delta")?;
+                ::serde::ser::SerializeMap::serialize_entry(&mut map, "text", &v.text)?;
+                ::serde::ser::SerializeMap::end(map)
+            }
+            Some(anthropic_content_delta::Delta::InputJsonDelta(v)) => {
+                let mut map = serializer.serialize_map(None)?;
+                ::serde::ser::SerializeMap::serialize_entry(&mut map, "type", "input_json_delta")?;
+                ::serde::ser::SerializeMap::serialize_entry(
+                    &mut map,
+                    "partial_json",
+                    &v.partial_json,
+                )?;
+                ::serde::ser::SerializeMap::end(map)
+            }
+            Some(anthropic_content_delta::Delta::ThinkingDelta(v)) => {
+                let mut map = serializer.serialize_map(None)?;
+                ::serde::ser::SerializeMap::serialize_entry(&mut map, "type", "thinking_delta")?;
+                ::serde::ser::SerializeMap::serialize_entry(&mut map, "thinking", &v.thinking)?;
+                ::serde::ser::SerializeMap::end(map)
+            }
+            Some(anthropic_content_delta::Delta::SignatureDelta(v)) => {
+                let mut map = serializer.serialize_map(None)?;
+                ::serde::ser::SerializeMap::serialize_entry(&mut map, "type", "signature_delta")?;
+                ::serde::ser::SerializeMap::serialize_entry(&mut map, "signature", &v.signature)?;
+                ::serde::ser::SerializeMap::end(map)
+            }
+            None => serializer.serialize_none(),
+        }
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for AnthropicContentDelta {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        fn fallback<E: ::serde::de::Error>(
+            _raw: ::serde_json::Map<String, ::serde_json::Value>,
+        ) -> Result<AnthropicContentDelta, E> {
+            Err(E::custom("unknown type for AnthropicContentDelta"))
+        }
+        let raw = ::serde_json::Map::<String, ::serde_json::Value>::deserialize(deserializer)?;
+        let tag = raw.get("type").and_then(::serde_json::Value::as_str);
+        #[allow(clippy::redundant_closure_call)]
+        (|raw: ::serde_json::Map<String, ::serde_json::Value>| match tag {
+            Some("text_delta") => {
+                let payload = AnthropicTextDelta {
+                    text: match raw.get("text") {
+                        None => Default::default(),
+                        Some(::serde_json::Value::Null) => return fallback(raw),
+                        Some(v) => {
+                            match ::serde_json::from_value::<::prost::alloc::string::String>(
+                                v.clone(),
+                            ) {
+                                Ok(v) => v,
+                                Err(_) => return fallback(raw),
+                            }
+                        }
+                    },
+                };
+                Ok(AnthropicContentDelta {
+                    delta: Some(anthropic_content_delta::Delta::TextDelta(payload.into())),
+                })
+            }
+            Some("input_json_delta") => {
+                let payload = AnthropicInputJsonDelta {
+                    partial_json: match raw.get("partial_json") {
+                        None => Default::default(),
+                        Some(::serde_json::Value::Null) => return fallback(raw),
+                        Some(v) => {
+                            match ::serde_json::from_value::<::prost::alloc::string::String>(
+                                v.clone(),
+                            ) {
+                                Ok(v) => v,
+                                Err(_) => return fallback(raw),
+                            }
+                        }
+                    },
+                };
+                Ok(AnthropicContentDelta {
+                    delta: Some(anthropic_content_delta::Delta::InputJsonDelta(
+                        payload.into(),
+                    )),
+                })
+            }
+            Some("thinking_delta") => {
+                let payload = AnthropicThinkingDelta {
+                    thinking: match raw.get("thinking") {
+                        None => Default::default(),
+                        Some(::serde_json::Value::Null) => return fallback(raw),
+                        Some(v) => {
+                            match ::serde_json::from_value::<::prost::alloc::string::String>(
+                                v.clone(),
+                            ) {
+                                Ok(v) => v,
+                                Err(_) => return fallback(raw),
+                            }
+                        }
+                    },
+                };
+                Ok(AnthropicContentDelta {
+                    delta: Some(anthropic_content_delta::Delta::ThinkingDelta(
+                        payload.into(),
+                    )),
+                })
+            }
+            Some("signature_delta") => {
+                let payload = AnthropicSignatureDelta {
+                    signature: match raw.get("signature") {
+                        None => Default::default(),
+                        Some(::serde_json::Value::Null) => return fallback(raw),
+                        Some(v) => {
+                            match ::serde_json::from_value::<::prost::alloc::string::String>(
+                                v.clone(),
+                            ) {
+                                Ok(v) => v,
+                                Err(_) => return fallback(raw),
+                            }
+                        }
+                    },
+                };
+                Ok(AnthropicContentDelta {
+                    delta: Some(anthropic_content_delta::Delta::SignatureDelta(
+                        payload.into(),
+                    )),
+                })
+            }
+            _ => fallback(raw),
+        })(raw.clone())
+    }
+}
+
+impl ::serde::Serialize for AnthropicTextDelta {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "text", &self.text)?;
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for AnthropicTextDelta {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = AnthropicTextDelta;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct AnthropicTextDelta")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_text = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "text" => {
+                            if f_text.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("text"));
+                            }
+                            f_text = Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(AnthropicTextDelta {
+                    text: f_text.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for AnthropicInputJsonDelta {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "partial_json", &self.partial_json)?;
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for AnthropicInputJsonDelta {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = AnthropicInputJsonDelta;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct AnthropicInputJsonDelta")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_partial_json = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "partial_json" => {
+                            if f_partial_json.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("partial_json"));
+                            }
+                            f_partial_json =
+                                Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(AnthropicInputJsonDelta {
+                    partial_json: f_partial_json.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for AnthropicThinkingDelta {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "thinking", &self.thinking)?;
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for AnthropicThinkingDelta {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = AnthropicThinkingDelta;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct AnthropicThinkingDelta")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_thinking = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "thinking" => {
+                            if f_thinking.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("thinking"));
+                            }
+                            f_thinking = Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(AnthropicThinkingDelta {
+                    thinking: f_thinking.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for AnthropicSignatureDelta {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "signature", &self.signature)?;
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for AnthropicSignatureDelta {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = AnthropicSignatureDelta;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct AnthropicSignatureDelta")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_signature = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "signature" => {
+                            if f_signature.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("signature"));
+                            }
+                            f_signature = Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(AnthropicSignatureDelta {
+                    signature: f_signature.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
 impl ::serde::Serialize for SetInternalStateRequest {
     fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut map = serializer.serialize_map(None)?;

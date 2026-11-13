@@ -186,6 +186,505 @@ pub struct ErrorBody {
     #[prost(uint32, tag = "2")]
     pub code: u32,
 }
+/// `error.type` is one of Anthropic's documented values (invalid_request_error,
+/// authentication_error, permission_error, not_found_error, request_too_large,
+/// rate_limit_error, api_error, overloaded_error); strict SDK clients parse it.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AnthropicError {
+    #[prost(string, tag = "1")]
+    pub r#type: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub message: ::prost::alloc::string::String,
+}
+/// The HTTP error envelope: `{"type": "error", "error": {...}}`.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AnthropicErrorResponse {
+    #[prost(string, tag = "1")]
+    pub r#type: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "2")]
+    pub error: ::core::option::Option<AnthropicError>,
+}
+/// `input_tokens` excludes cached prompt tokens, which go to
+/// `cache_read_input_tokens`. A streamed `message_delta` carries only
+/// `output_tokens`; `message_start` and the unary reply carry both.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AnthropicUsage {
+    #[prost(int64, optional, tag = "1")]
+    pub input_tokens: ::core::option::Option<i64>,
+    #[prost(int64, optional, tag = "2")]
+    pub output_tokens: ::core::option::Option<i64>,
+    #[prost(int64, optional, tag = "3")]
+    pub cache_creation_input_tokens: ::core::option::Option<i64>,
+    #[prost(int64, optional, tag = "4")]
+    pub cache_read_input_tokens: ::core::option::Option<i64>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AnthropicContentBlock {
+    #[prost(
+        oneof = "anthropic_content_block::Block",
+        tags = "1, 2, 3, 4, 5, 6, 7, 8"
+    )]
+    pub block: ::core::option::Option<anthropic_content_block::Block>,
+}
+/// Nested message and enum types in `AnthropicContentBlock`.
+pub mod anthropic_content_block {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Block {
+        #[prost(message, tag = "1")]
+        Text(super::AnthropicTextBlock),
+        #[prost(message, tag = "2")]
+        Image(super::AnthropicImageBlock),
+        #[prost(message, tag = "3")]
+        ToolUse(super::AnthropicToolUseBlock),
+        #[prost(message, tag = "4")]
+        ToolResult(super::AnthropicToolResultBlock),
+        #[prost(message, tag = "5")]
+        ToolReference(super::AnthropicToolReferenceBlock),
+        #[prost(message, tag = "6")]
+        SearchResult(super::AnthropicSearchResultBlock),
+        #[prost(message, tag = "7")]
+        Thinking(super::AnthropicThinkingBlock),
+        #[prost(message, tag = "8")]
+        RedactedThinking(super::AnthropicRedactedThinkingBlock),
+    }
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AnthropicContentBlockList {
+    #[prost(message, repeated, tag = "1")]
+    pub items: ::prost::alloc::vec::Vec<AnthropicContentBlock>,
+}
+/// A message's `content` and the request `system`: a string or a block list.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AnthropicContent {
+    #[prost(oneof = "anthropic_content::Value", tags = "1, 2")]
+    pub value: ::core::option::Option<anthropic_content::Value>,
+}
+/// Nested message and enum types in `AnthropicContent`.
+pub mod anthropic_content {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Value {
+        #[prost(string, tag = "1")]
+        Text(::prost::alloc::string::String),
+        #[prost(message, tag = "2")]
+        Blocks(super::AnthropicContentBlockList),
+    }
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AnthropicTextBlock {
+    #[prost(string, tag = "1")]
+    pub text: ::prost::alloc::string::String,
+}
+/// `source` is `{"type": "base64", "media_type", "data"}` or `{"url"}`; a bare
+/// string is accepted and ignored, as in Python.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AnthropicImageBlock {
+    #[prost(message, optional, tag = "1")]
+    pub source: ::core::option::Option<AnthropicImageSource>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AnthropicImageSource {
+    #[prost(oneof = "anthropic_image_source::Value", tags = "1, 2")]
+    pub value: ::core::option::Option<anthropic_image_source::Value>,
+}
+/// Nested message and enum types in `AnthropicImageSource`.
+pub mod anthropic_image_source {
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum Value {
+        #[prost(string, tag = "1")]
+        Reference(::prost::alloc::string::String),
+        #[prost(message, tag = "2")]
+        Object(super::AnthropicImageSourceObject),
+    }
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AnthropicImageSourceObject {
+    #[prost(string, optional, tag = "1")]
+    pub r#type: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "2")]
+    pub media_type: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "3")]
+    pub data: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "4")]
+    pub url: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// The tool arguments object, passed through as JSON text.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AnthropicToolUseBlock {
+    #[prost(string, tag = "1")]
+    pub id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(string, optional, tag = "3")]
+    pub input: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// `tool_use_id` per the spec; legacy payloads send `id` instead.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AnthropicToolResultBlock {
+    #[prost(string, optional, tag = "1")]
+    pub tool_use_id: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "2")]
+    pub id: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, optional, tag = "3")]
+    pub content: ::core::option::Option<AnthropicContent>,
+    #[prost(bool, optional, tag = "4")]
+    pub is_error: ::core::option::Option<bool>,
+}
+/// SGLang extension: names a deferred-loaded tool (`tool_name` or `name`).
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AnthropicToolReferenceBlock {
+    #[prost(string, optional, tag = "1")]
+    pub name: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "2")]
+    pub tool_name: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "3")]
+    pub id: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AnthropicSearchResultBlock {
+    #[prost(message, optional, tag = "1")]
+    pub source: ::core::option::Option<AnthropicSearchSource>,
+    #[prost(string, optional, tag = "2")]
+    pub title: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, repeated, tag = "3")]
+    pub content: ::prost::alloc::vec::Vec<AnthropicSearchResultItem>,
+}
+/// A URL / identifier string, or an object with `url` or `text`.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AnthropicSearchSource {
+    #[prost(oneof = "anthropic_search_source::Value", tags = "1, 2")]
+    pub value: ::core::option::Option<anthropic_search_source::Value>,
+}
+/// Nested message and enum types in `AnthropicSearchSource`.
+pub mod anthropic_search_source {
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum Value {
+        #[prost(string, tag = "1")]
+        Reference(::prost::alloc::string::String),
+        #[prost(message, tag = "2")]
+        Object(super::AnthropicSearchSourceObject),
+    }
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AnthropicSearchSourceObject {
+    #[prost(string, optional, tag = "1")]
+    pub url: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "2")]
+    pub text: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// Only `type: "text"` items are read.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AnthropicSearchResultItem {
+    #[prost(string, optional, tag = "1")]
+    pub r#type: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "2")]
+    pub text: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// `signature` is omitted when the backend has none; an empty string would
+/// fail downstream signature verifiers.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AnthropicThinkingBlock {
+    #[prost(string, tag = "1")]
+    pub thinking: ::prost::alloc::string::String,
+    #[prost(string, optional, tag = "2")]
+    pub signature: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AnthropicRedactedThinkingBlock {
+    #[prost(string, optional, tag = "1")]
+    pub data: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// `role` is "user", "assistant", or "system".
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AnthropicMessage {
+    #[prost(string, tag = "1")]
+    pub role: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "2")]
+    pub content: ::core::option::Option<AnthropicContent>,
+}
+/// One flat shape for every tool family. A custom tool has no `type` (or
+/// "custom") and an `input_schema`; the server tools (`web_search_*`,
+/// `computer_*`, `bash_*`, `text_editor_*`) carry their own knobs and are
+/// skipped by the server, which has no implementation for them.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AnthropicTool {
+    #[prost(string, optional, tag = "1")]
+    pub r#type: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, tag = "2")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(string, optional, tag = "3")]
+    pub description: ::core::option::Option<::prost::alloc::string::String>,
+    /// The JSON Schema of the arguments; `{"type": "object"}` is filled when the
+    /// schema has no `type`.
+    #[prost(string, optional, tag = "4")]
+    pub input_schema: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(bool, optional, tag = "5")]
+    pub defer_loading: ::core::option::Option<bool>,
+    #[prost(int64, optional, tag = "6")]
+    pub max_uses: ::core::option::Option<i64>,
+    #[prost(string, repeated, tag = "7")]
+    pub allowed_domains: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(string, repeated, tag = "8")]
+    pub blocked_domains: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(int64, optional, tag = "9")]
+    pub display_width_px: ::core::option::Option<i64>,
+    #[prost(int64, optional, tag = "10")]
+    pub display_height_px: ::core::option::Option<i64>,
+    #[prost(int64, optional, tag = "11")]
+    pub display_number: ::core::option::Option<i64>,
+}
+/// `type` is "auto", "any", "tool" (with `name`), or "none".
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AnthropicToolChoice {
+    #[prost(string, tag = "1")]
+    pub r#type: ::prost::alloc::string::String,
+    #[prost(string, optional, tag = "2")]
+    pub name: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// `type` is "enabled" (`budget_tokens` >= 1024 required), "disabled" (no
+/// other field), or "adaptive" (no `budget_tokens`). The budget is accepted
+/// and not enforced; `display` "omitted" cannot hide reasoning here.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AnthropicThinkingParam {
+    #[prost(string, tag = "1")]
+    pub r#type: ::prost::alloc::string::String,
+    #[prost(int64, optional, tag = "2")]
+    pub budget_tokens: ::core::option::Option<i64>,
+    #[prost(string, optional, tag = "3")]
+    pub display: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// A soft hint; `max_tokens` stays the hard cap.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AnthropicTaskBudget {
+    #[prost(string, tag = "1")]
+    pub r#type: ::prost::alloc::string::String,
+    #[prost(int64, tag = "2")]
+    pub total: i64,
+    #[prost(int64, optional, tag = "3")]
+    pub remaining: ::core::option::Option<i64>,
+}
+/// `effort` is "minimal" | "low" | "medium" | "high" | "xhigh" | "max".
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AnthropicOutputConfig {
+    #[prost(string, optional, tag = "1")]
+    pub effort: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, optional, tag = "2")]
+    pub task_budget: ::core::option::Option<AnthropicTaskBudget>,
+}
+/// `POST /v1/messages`. The routing fields are the P/D and DP hints a router
+/// may inject, as on the OpenAI routes.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AnthropicMessagesRequest {
+    #[prost(string, tag = "1")]
+    pub model: ::prost::alloc::string::String,
+    #[prost(message, repeated, tag = "2")]
+    pub messages: ::prost::alloc::vec::Vec<AnthropicMessage>,
+    #[prost(int64, tag = "3")]
+    pub max_tokens: i64,
+    /// Opaque client metadata; accepted and ignored.
+    #[prost(string, optional, tag = "4")]
+    pub metadata: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, repeated, tag = "5")]
+    pub stop_sequences: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(bool, optional, tag = "6")]
+    pub stream: ::core::option::Option<bool>,
+    #[prost(message, optional, tag = "7")]
+    pub system: ::core::option::Option<AnthropicContent>,
+    #[prost(double, optional, tag = "8")]
+    pub temperature: ::core::option::Option<f64>,
+    #[prost(message, optional, tag = "9")]
+    pub thinking: ::core::option::Option<AnthropicThinkingParam>,
+    #[prost(message, optional, tag = "10")]
+    pub tool_choice: ::core::option::Option<AnthropicToolChoice>,
+    #[prost(message, repeated, tag = "11")]
+    pub tools: ::prost::alloc::vec::Vec<AnthropicTool>,
+    #[prost(int64, optional, tag = "12")]
+    pub top_k: ::core::option::Option<i64>,
+    #[prost(double, optional, tag = "13")]
+    pub top_p: ::core::option::Option<f64>,
+    #[prost(message, optional, tag = "14")]
+    pub output_config: ::core::option::Option<AnthropicOutputConfig>,
+    /// SDK beta opt-ins; accepted and ignored.
+    #[prost(string, repeated, tag = "15")]
+    pub betas: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(message, optional, tag = "16")]
+    pub bootstrap_host: ::core::option::Option<StringOrList>,
+    #[prost(message, optional, tag = "17")]
+    pub bootstrap_port: ::core::option::Option<OptionalInt64OrList>,
+    #[prost(message, optional, tag = "18")]
+    pub bootstrap_room: ::core::option::Option<Int64OrList>,
+    #[prost(int64, optional, tag = "19")]
+    pub routed_dp_rank: ::core::option::Option<i64>,
+    #[prost(int64, optional, tag = "20")]
+    pub disagg_prefill_dp_rank: ::core::option::Option<i64>,
+}
+/// The unary reply, and the `message` of a streamed `message_start` (where
+/// `content` is empty and `output_tokens` 0). `stop_reason` is "end_turn",
+/// "max_tokens", "stop_sequence", or "tool_use".
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AnthropicMessagesResponse {
+    #[prost(string, tag = "1")]
+    pub id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub r#type: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub role: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "4")]
+    pub content: ::core::option::Option<AnthropicContentBlockList>,
+    #[prost(string, tag = "5")]
+    pub model: ::prost::alloc::string::String,
+    #[prost(string, optional, tag = "6")]
+    pub stop_reason: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "7")]
+    pub stop_sequence: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, optional, tag = "8")]
+    pub usage: ::core::option::Option<AnthropicUsage>,
+}
+/// `POST /v1/messages/count_tokens`: the rendered prompt's token count.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AnthropicCountTokensRequest {
+    #[prost(string, tag = "1")]
+    pub model: ::prost::alloc::string::String,
+    #[prost(message, repeated, tag = "2")]
+    pub messages: ::prost::alloc::vec::Vec<AnthropicMessage>,
+    #[prost(message, optional, tag = "3")]
+    pub system: ::core::option::Option<AnthropicContent>,
+    #[prost(message, optional, tag = "4")]
+    pub thinking: ::core::option::Option<AnthropicThinkingParam>,
+    #[prost(message, optional, tag = "5")]
+    pub tool_choice: ::core::option::Option<AnthropicToolChoice>,
+    #[prost(message, repeated, tag = "6")]
+    pub tools: ::prost::alloc::vec::Vec<AnthropicTool>,
+    #[prost(message, optional, tag = "7")]
+    pub output_config: ::core::option::Option<AnthropicOutputConfig>,
+    #[prost(string, repeated, tag = "8")]
+    pub betas: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AnthropicCountTokensResponse {
+    #[prost(int64, tag = "1")]
+    pub input_tokens: i64,
+}
+/// One SSE event of a streamed `/v1/messages`; the SSE `event:` name is the
+/// tag. The sequence is message_start, then content_block_start / delta /
+/// stop groups, then message_delta and message_stop; a failure closes any
+/// open block, then emits error and message_stop.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AnthropicStreamEvent {
+    #[prost(
+        oneof = "anthropic_stream_event::Event",
+        tags = "1, 2, 3, 4, 5, 6, 7, 8"
+    )]
+    pub event: ::core::option::Option<anthropic_stream_event::Event>,
+}
+/// Nested message and enum types in `AnthropicStreamEvent`.
+pub mod anthropic_stream_event {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Event {
+        #[prost(message, tag = "1")]
+        MessageStart(super::AnthropicMessageStartEvent),
+        #[prost(message, tag = "2")]
+        MessageDelta(super::AnthropicMessageDeltaEvent),
+        #[prost(message, tag = "3")]
+        MessageStop(super::AnthropicMessageStopEvent),
+        #[prost(message, tag = "4")]
+        ContentBlockStart(super::AnthropicContentBlockStartEvent),
+        #[prost(message, tag = "5")]
+        ContentBlockDelta(super::AnthropicContentBlockDeltaEvent),
+        #[prost(message, tag = "6")]
+        ContentBlockStop(super::AnthropicContentBlockStopEvent),
+        #[prost(message, tag = "7")]
+        Ping(super::AnthropicPingEvent),
+        #[prost(message, tag = "8")]
+        Error(super::AnthropicErrorEvent),
+    }
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AnthropicMessageStartEvent {
+    #[prost(message, optional, tag = "1")]
+    pub message: ::core::option::Option<AnthropicMessagesResponse>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AnthropicMessageDeltaEvent {
+    #[prost(message, optional, tag = "1")]
+    pub delta: ::core::option::Option<AnthropicMessageEndDelta>,
+    #[prost(message, optional, tag = "2")]
+    pub usage: ::core::option::Option<AnthropicUsage>,
+}
+/// No `type` inside: the event name already says message_delta.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AnthropicMessageEndDelta {
+    #[prost(string, optional, tag = "1")]
+    pub stop_reason: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "2")]
+    pub stop_sequence: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AnthropicMessageStopEvent {}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AnthropicContentBlockStartEvent {
+    #[prost(int64, tag = "1")]
+    pub index: i64,
+    #[prost(message, optional, tag = "2")]
+    pub content_block: ::core::option::Option<AnthropicContentBlock>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AnthropicContentBlockDeltaEvent {
+    #[prost(int64, tag = "1")]
+    pub index: i64,
+    #[prost(message, optional, tag = "2")]
+    pub delta: ::core::option::Option<AnthropicContentDelta>,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AnthropicContentBlockStopEvent {
+    #[prost(int64, tag = "1")]
+    pub index: i64,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AnthropicPingEvent {}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AnthropicErrorEvent {
+    #[prost(message, optional, tag = "1")]
+    pub error: ::core::option::Option<AnthropicError>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AnthropicContentDelta {
+    #[prost(oneof = "anthropic_content_delta::Delta", tags = "1, 2, 3, 4")]
+    pub delta: ::core::option::Option<anthropic_content_delta::Delta>,
+}
+/// Nested message and enum types in `AnthropicContentDelta`.
+pub mod anthropic_content_delta {
+    #[derive(Clone, PartialEq, Eq, Hash, ::prost::Oneof)]
+    pub enum Delta {
+        #[prost(message, tag = "1")]
+        TextDelta(super::AnthropicTextDelta),
+        #[prost(message, tag = "2")]
+        InputJsonDelta(super::AnthropicInputJsonDelta),
+        #[prost(message, tag = "3")]
+        ThinkingDelta(super::AnthropicThinkingDelta),
+        #[prost(message, tag = "4")]
+        SignatureDelta(super::AnthropicSignatureDelta),
+    }
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AnthropicTextDelta {
+    #[prost(string, tag = "1")]
+    pub text: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AnthropicInputJsonDelta {
+    #[prost(string, tag = "1")]
+    pub partial_json: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AnthropicThinkingDelta {
+    #[prost(string, tag = "1")]
+    pub thinking: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct AnthropicSignatureDelta {
+    #[prost(string, tag = "1")]
+    pub signature: ::prost::alloc::string::String,
+}
 /// `/set_internal_state`: numeric scheduler knobs to override at runtime.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct SetInternalStateRequest {

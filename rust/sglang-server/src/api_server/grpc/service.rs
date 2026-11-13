@@ -11,6 +11,7 @@ use sglang_api_types::api::v1::sglang_service_server::SglangService;
 use tonic::{Request, Response, Status};
 
 use super::{info, native_api};
+use crate::api_server::anthropic::Anthropic;
 use crate::api_server::core::{HealthStatus, ReceivedAs};
 use crate::api_server::handlers::{
     AbortEnding, CoreHandle, CorpusSource, DumperOutcome, ElasticEpState, HiCacheError,
@@ -169,6 +170,14 @@ fn lora_disabled() -> Result<Response<api::LoraUpdateResponse>, Status> {
 }
 
 impl GrpcService {
+    fn anthropic(&self) -> Anthropic<'_> {
+        Anthropic {
+            core: &self.core,
+            chat_formatter: self.chat_formatter.as_ref(),
+            server_args: &self.server_args,
+        }
+    }
+
     fn ollama(&self) -> Ollama<'_> {
         Ollama {
             core: &self.core,
@@ -1119,6 +1128,50 @@ impl SglangService for GrpcService {
         request: Request<api::OllamaShowRequest>,
     ) -> Result<Response<api::OllamaShowResponse>, Status> {
         Ok(Response::new(self.ollama().show(request.into_inner())))
+    }
+
+    /// `/v1/messages` without `stream`: failures are statuses with the
+    /// Anthropic message.
+    async fn anthropic_messages(
+        &self,
+        request: Request<api::AnthropicMessagesRequest>,
+    ) -> Result<Response<api::AnthropicMessagesResponse>, Status> {
+        let mut request = request.into_inner();
+        request.apply_absent_defaults();
+        self.anthropic()
+            .messages(request)
+            .await
+            .map(Response::new)
+            .map_err(|failure| failure.grpc_status())
+    }
+
+    type AnthropicStreamMessagesStream = ResponseStream<api::AnthropicStreamEvent>;
+
+    /// `/v1/messages` with `stream`: the event sequence; a failure after
+    /// the first event is an `error` event, as on SSE.
+    async fn anthropic_stream_messages(
+        &self,
+        request: Request<api::AnthropicMessagesRequest>,
+    ) -> Result<Response<Self::AnthropicStreamMessagesStream>, Status> {
+        let mut request = request.into_inner();
+        request.apply_absent_defaults();
+        let events = self
+            .anthropic()
+            .messages_stream(request)
+            .await
+            .map_err(|failure| failure.grpc_status())?;
+        Ok(Response::new(Box::pin(events.map(Ok))))
+    }
+
+    async fn anthropic_count_tokens(
+        &self,
+        request: Request<api::AnthropicCountTokensRequest>,
+    ) -> Result<Response<api::AnthropicCountTokensResponse>, Status> {
+        self.anthropic()
+            .count_tokens(request.into_inner())
+            .await
+            .map(Response::new)
+            .map_err(|failure| failure.grpc_status())
     }
 
     // The OpenAI interface: the schema is in place for the adapter
@@ -2088,6 +2141,63 @@ mod tests {
             .into_inner();
         assert_eq!(card.details.unwrap().family, "Qwen");
         assert_eq!(card.parameters, "num_ctx 4096");
+    }
+
+    /// `AnthropicMessages` renders through the chat core and shapes the
+    /// reply; `AnthropicCountTokens` counts the rendered prompt's ids.
+    #[tokio::test]
+    async fn anthropic_messages_and_count_tokens_over_grpc() {
+        let mut harness = Harness::new(2, true, Duration::from_secs(1));
+        harness.service.chat_formatter =
+            Some(crate::api_server::http::openai::test_utils::chatml_formatter());
+        let request: api::AnthropicMessagesRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "max_tokens": 8, "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .unwrap();
+        let rpc = harness.service.anthropic_messages(Request::new(request));
+        let runtime = async {
+            let intake = harness.next_generation().await;
+            assert!(intake.admission.try_accept());
+            assert_eq!(intake.request.sampling_params.max_new_tokens, Some(8));
+            intake
+                .sink
+                .try_send(ResponseItem::Done(chunk(&intake.rid, "ok", 7, true)))
+                .unwrap();
+        };
+        let (response, ()) = tokio::join!(rpc, runtime);
+        let message = response.unwrap().into_inner();
+        assert_eq!(message.r#type, "message");
+        assert_eq!(message.stop_reason.as_deref(), Some("end_turn"));
+        let content = message.content.unwrap().items;
+        assert_eq!(content.len(), 1);
+        assert!(matches!(
+            &content[0].block,
+            Some(api::anthropic_content_block::Block::Text(text)) if text.text == "ok"
+        ));
+        assert_eq!(message.usage.unwrap().input_tokens, Some(3));
+
+        let request: api::AnthropicCountTokensRequest = serde_json::from_value(serde_json::json!({
+            "model": "m", "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .unwrap();
+        let rpc = harness
+            .service
+            .anthropic_count_tokens(Request::new(request));
+        let runtime = async {
+            let TmEvent::Intake { request, admission } =
+                harness.intake_rx.recv_async().await.unwrap()
+            else {
+                panic!("expected intake");
+            };
+            assert!(admission.try_accept());
+            assert!(matches!(request.kind, RequestKind::Tokenize { .. }));
+            request
+                .sink
+                .try_send(ResponseItem::TokenIds(vec![1, 2, 3, 4]))
+                .unwrap();
+        };
+        let (response, ()) = tokio::join!(rpc, runtime);
+        assert_eq!(response.unwrap().into_inner().input_tokens, 4);
     }
 
     #[tokio::test]
