@@ -8,7 +8,7 @@ from flash_attn_interface import flash_attn_varlen_func
 from flash_attn_interface import flash_attn_with_kvcache as mate_flash_attn_with_kvcache
 from flash_attn_interface import get_scheduler_metadata
 
-from sglang.srt.distributed import get_pp_group, get_pp_indices
+from sglang.srt.distributed import get_pp_indices
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.musa.layers.utils.cp_utils import (
     musa_cp_attn_forward_extend as cp_attn_forward_extend,
@@ -22,8 +22,8 @@ from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.layers.utils.cp_utils import (
     cp_allgather_and_save_kv_cache,
 )
-from sglang.srt.mem_cache.memory_pool import KVWriteLoc
-from sglang.srt.runtime_context import get_schedule
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc, window_write_locs
+from sglang.srt.runtime_context import get_parallel, get_schedule
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -61,7 +61,7 @@ def _compute_scheduler_metadata(
 
     # Determine if scheduler metadata should be updated
     should_update = True
-    pp_group = get_pp_group()
+    pp_group = get_parallel().pp_group
     pp_rank = pp_group.rank_in_group
     start_layer_id, _ = get_pp_indices(
         backend.num_hidden_layers, pp_group.rank_in_group, pp_group.world_size
@@ -270,7 +270,12 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
                 if not self.use_mla:
                     self.token_to_kv_pool.set_kv_buffer(
                         layer,
-                        KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
+                        KVWriteLoc(
+                            cache_loc,
+                            window_locs=window_write_locs(
+                                self.runner_ids, self.forward_metadata.swa_out_cache_loc
+                            ),
+                        ),
                         k,
                         v,
                         layer.k_scale,
@@ -290,8 +295,10 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
                     k,
                     v,
                     self.attn_cp_size,
-                    swa_loc=(
-                        self.forward_metadata.swa_out_cache_loc
+                    window_locs=(
+                        window_write_locs(
+                            self.runner_ids, self.forward_metadata.swa_out_cache_loc
+                        )
                         if self.use_sliding_window_kv_pool
                         else None
                     ),
@@ -671,7 +678,12 @@ class MusaFlashAttentionBackend(FlashAttentionBackend):
                 if not self.use_mla:
                     self.token_to_kv_pool.set_kv_buffer(
                         layer,
-                        KVWriteLoc(cache_loc, self.forward_metadata.swa_out_cache_loc),
+                        KVWriteLoc(
+                            cache_loc,
+                            window_locs=window_write_locs(
+                                self.runner_ids, self.forward_metadata.swa_out_cache_loc
+                            ),
+                        ),
                         k,
                         v,
                         layer.k_scale,

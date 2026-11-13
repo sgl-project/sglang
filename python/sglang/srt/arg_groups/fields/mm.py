@@ -1,14 +1,8 @@
-"""Config fields of the ``mm`` namespace.
-
-One class per namespace. The class *is* the namespace: a field declared here
-lands in the ``mm`` bag, which is what ``get_mm()`` returns, so a reader
-spells it exactly as before. ``ServerArgs`` composes these classes, so the
-record stays one flat object -- the split moves where declarations live, not
-how config is shaped at runtime.
-"""
+"""Config fields of the ``mm`` namespace."""
 
 from __future__ import annotations
 
+import argparse
 import json
 from typing import (
     Any,
@@ -64,9 +58,14 @@ class Mm(msgspec.Struct):
         bool, "Enable prefix multimodal cache. Currently only supports mm-only."
     ] = False
     mm_enable_dp_encoder: A[
-        bool,
-        "Enabling data parallelism for mm encoder. The dp size will be set to the tp size automatically.",
-    ] = False
+        Optional[bool],
+        Arg(
+            help="Enabling data parallelism for mm encoder. The dp size will be set to the tp size automatically.",
+            action=argparse.BooleanOptionalAction,
+            resolvable=True,
+            fallback=False,
+        ),
+    ] = None
     mm_process_config: A[
         Optional[Dict[str, Any]],
         Arg(
@@ -97,6 +96,20 @@ class Mm(msgspec.Struct):
         "Maximum size in MiB for one client-supplied remote media download. "
         "The limit is enforced while streaming; set to 0 to disable it.",
     ] = 64
+    media_url_timeout: A[
+        Optional[float],
+        "Seconds to download one client-supplied media URL, redirects and body "
+        "included, for every media type. When unset, REQUEST_TIMEOUT applies, "
+        "else each loader's default.",
+    ] = None
+    allow_local_media_files: A[
+        bool,
+        Arg(
+            help="Allow client media to name local files (paths or file:// URLs). "
+            "Enabled by default; use --no-allow-local-media-files to reject them.",
+            action=argparse.BooleanOptionalAction,
+        ),
+    ] = True
     mm_preprocess_cache_size_mb: A[
         Optional[int],
         Arg(
@@ -157,8 +170,3 @@ class Mm(msgspec.Struct):
             resolvable=True,
         ),
     ] = None
-    keep_mm_feature_on_device: A[
-        bool,
-        "Deprecated. Use --mm-feature-transport=cuda_ipc for bounded GPU-resident "
-        "multimodal feature transport.",
-    ] = False

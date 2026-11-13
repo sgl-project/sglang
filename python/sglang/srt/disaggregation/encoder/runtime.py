@@ -35,6 +35,7 @@ from sglang.srt.disaggregation.encoder.server import (
     await_task_completion_on_cancel,
     launch_encoder,
 )
+from sglang.srt.entrypoints.server_utils import set_prometheus_multiproc_dir
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
     ProfileReq,
@@ -44,7 +45,7 @@ from sglang.srt.managers.io_struct import (
     sock_send,
     wrap_as_pickle,
 )
-from sglang.srt.managers.schedule_batch import Modality
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.observability.metrics_collector import EncoderMetricsCollector
 from sglang.srt.observability.req_time_stats import EncoderReqTimeStats
 from sglang.srt.observability.trace import (
@@ -59,8 +60,8 @@ from sglang.srt.runtime_context import (
     publish,
 )
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.utils import configure_logger, random_uuid, set_prometheus_multiproc_dir
-from sglang.srt.utils.common import maybe_reindex_device_id
+from sglang.srt.utils import configure_logger, random_uuid
+from sglang.srt.utils.device import maybe_reindex_device_id
 from sglang.srt.utils.network import NetworkAddress, get_free_port, get_zmq_socket
 
 logger = logging.getLogger(__name__)
@@ -1744,10 +1745,10 @@ def launch_local_runtime(server_args: ServerArgs) -> EncoderRuntime:
     This function owns backend construction only.  HTTP/gRPC middleware,
     service registration, and network serving remain Transport concerns.
     """
-    if get_parallel().dp_size > 1:
+    if get_parallel().num_dp_ranks > 1:
         raise ValueError(
-            "launch_local_runtime requires --dp-size 1; got "
-            f"dp_size={get_parallel().dp_size}."
+            "launch_local_runtime requires a single DP rank; got "
+            f"num_dp_ranks={get_parallel().num_dp_ranks}."
         )
 
     # Set up prometheus metrics.
@@ -1775,7 +1776,7 @@ def launch_local_runtime(server_args: ServerArgs) -> EncoderRuntime:
     if get_observability().enable_trace:
         process_tracing_init(
             get_observability().otlp_traces_endpoint,
-            "sglang",
+            get_observability().otlp_service_name,
             trace_modules=get_observability().trace_modules,
         )
         trace_set_thread_info("Encoder")
@@ -1827,8 +1828,8 @@ def launch_dp_runtime(server_args: ServerArgs) -> DPDispatcher:
             "Encoder DP mode requires --dp-size > 1 and --tp-size 1; got "
             f"dp_size={get_parallel().dp_size}, tp_size={get_parallel().tp_size}."
         )
-    dp_size = get_parallel().dp_size
-    logger.info(f"Launching encoder in DP mode: dp_size={dp_size}")
+    num_dp_ranks = get_parallel().num_dp_ranks
+    logger.info(f"Launching encoder in DP mode: num_dp_ranks={num_dp_ranks}")
 
     # DP mode: workers (subprocesses) write metrics to the shared multiproc dir;
     # the main process exposes the aggregated /metrics endpoint.
@@ -1837,7 +1838,7 @@ def launch_dp_runtime(server_args: ServerArgs) -> DPDispatcher:
 
     ctx = mp.get_context("spawn")
     ipc_prefix = random_uuid()
-    async_zmq_ctx = zmq.asyncio.Context(dp_size + 1)
+    async_zmq_ctx = zmq.asyncio.Context(num_dp_ranks + 1)
 
     result_path = f"ipc:///tmp/{ipc_prefix}_dp_result"
     result_socket = get_zmq_socket(async_zmq_ctx, zmq.PULL, result_path, True)
@@ -1845,13 +1846,13 @@ def launch_dp_runtime(server_args: ServerArgs) -> DPDispatcher:
         get_zmq_socket(
             async_zmq_ctx, zmq.PUSH, f"ipc:///tmp/{ipc_prefix}_dp_dispatch_{r}", True
         )
-        for r in range(dp_size)
+        for r in range(num_dp_ranks)
     ]
     release_sockets: List[zmq.asyncio.Socket] = [
         get_zmq_socket(
             async_zmq_ctx, zmq.PUSH, f"ipc:///tmp/{ipc_prefix}_dp_release_{r}", True
         )
-        for r in range(dp_size)
+        for r in range(num_dp_ranks)
     ]
 
     worker_processes: List[mp.Process] = []
@@ -1867,7 +1868,7 @@ def launch_dp_runtime(server_args: ServerArgs) -> DPDispatcher:
     # exception (atexit holds the list ref and reads it at exit time).
     atexit.register(_kill_workers)
 
-    for dp_rank in range(dp_size):
+    for dp_rank in range(num_dp_ranks):
         gpu_id = get_device().base_gpu_id + dp_rank
         # Pin the device parent-side around spawn (same convention as the
         # scheduler launcher and DP controller) so the child inherits
@@ -1894,7 +1895,7 @@ def launch_dp_runtime(server_args: ServerArgs) -> DPDispatcher:
     if get_observability().extra_metric_labels:
         labels.update(get_observability().extra_metric_labels)
     return DPDispatcher(
-        dp_size,
+        num_dp_ranks,
         dispatch_sockets,
         release_sockets,
         result_socket,

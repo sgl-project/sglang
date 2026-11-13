@@ -127,12 +127,12 @@ export const GLM46Deployment = () => {
 
     // MI300X/MI325X BF16 requires extra flags
     if ((hardware === 'mi300x' || hardware === 'mi325x') && quantization === 'bf16') {
-      cmd += ` \\\n  --max-context-length 8192 \\\n  --mem-fraction-static 0.9`;
+      cmd += ` \\\n  --context-length 8192 \\\n  --mem-fraction-static 0.9`;
     }
 
     // Strategy-specific parameters
     if (strategyArray.includes('dp')) {
-      cmd += ` \\\n  --dp 8 \\\n  --enable-dp-attention`;
+      cmd += ` \\\n  --attn-dp-size 8`;
       if (hardware === 'b300') {
         cmd += ` \\\n  --cuda-graph-max-bs-decode 256`;
       }

@@ -24,7 +24,6 @@ This file provides:
 from __future__ import annotations
 
 import ctypes
-import errno
 import logging
 import os
 import pickle
@@ -36,7 +35,7 @@ from typing import Any, Dict, List
 import torch
 import torch.distributed as dist
 
-from sglang.srt.distributed.parallel_state import get_world_group
+from sglang.srt.runtime_context import get_parallel
 
 logger = logging.getLogger(__name__)
 
@@ -174,7 +173,7 @@ class FlexKVComm:
             self.pp_size > 1 or self.attn_tp_size > 1 or self.attn_cp_size > 1
         )
 
-        self._world_cpu_group = get_world_group().cpu_group
+        self._world_cpu_group = get_parallel().world_group.cpu_group
 
         self.pp_group = (
             self.pp_cpu_group
@@ -476,25 +475,6 @@ def eventfd(initval: int = 0, flags: int = 0) -> int:
         err = ctypes.get_errno()
         raise OSError(err, os.strerror(err))
     return fd
-
-
-def eventfd_write(fd: int, val: int) -> None:
-    v = ctypes.c_uint64(val)
-    n = _libc.write(fd, ctypes.byref(v), ctypes.sizeof(v))
-    if n != ctypes.sizeof(v):
-        err = ctypes.get_errno()
-        raise OSError(err, f"eventfd write failed: {os.strerror(err)}")
-
-
-def eventfd_read(fd: int) -> int:
-    v = ctypes.c_uint64()
-    n = _libc.read(fd, ctypes.byref(v), ctypes.sizeof(v))
-    if n != ctypes.sizeof(v):
-        err = ctypes.get_errno()
-        if err == errno.EAGAIN:
-            return 0
-        raise OSError(err, f"eventfd read failed: {os.strerror(err)}")
-    return v.value
 
 
 def send_fds(sock: socket.socket, fds: list, extra_data: bytes = b"x") -> None:

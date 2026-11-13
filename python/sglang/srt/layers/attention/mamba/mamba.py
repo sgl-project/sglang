@@ -26,21 +26,17 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils.common import set_weight_attrs
 from sglang.srt.mem_cache.memory_pool import MambaPool
 from sglang.srt.model_loader.weight_utils import (
     composed_weight_loader,
     sharded_weight_loader,
 )
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import (
-    is_cpu,
-    is_cuda,
-    is_npu,
-    is_xpu,
-    set_weight_attrs,
-)
+from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu, is_xpu
 
-if is_cuda():
+# ROCm uses the same imports: causal_conv1d.py falls back to the Triton kernels there.
+if is_cuda() or is_hip():
     from sglang.kernels.ops.mamba.causal_conv1d_triton import (
         causal_conv1d_fn as causal_conv1d_fn_triton,
     )
@@ -211,6 +207,7 @@ class MambaMixer2(torch.nn.Module):
         activation: str = "silu",
         use_rms_norm: bool = True,
         quant_config: Optional[QuantizationConfig] = None,
+        reduce_results: Optional[bool] = None,
         prefix: str = "",
     ):
         super().__init__()
@@ -230,9 +227,11 @@ class MambaMixer2(torch.nn.Module):
         # - NOTE: currently for the world size DOES NOT divide groups
         #   case, we only support the case when n_groups == 1
         if is_dp_attention_enabled():
+            parallel_group = "attn_tp"
             self.tp_size = get_parallel().attn_tp_size
             self.tp_rank = get_parallel().attn_tp_rank
         else:
+            parallel_group = "tp"
             self.tp_size = get_parallel().tp_size
             self.tp_rank = get_parallel().tp_rank
 
@@ -283,8 +282,7 @@ class MambaMixer2(torch.nn.Module):
                 bias=use_conv_bias,
                 quant_config=None,
                 prefix=f"{prefix}.conv1d",
-                tp_rank=self.tp_rank,
-                tp_size=self.tp_size,
+                parallel_group=parallel_group,
             )
 
             self.in_proj = MergedColumnParallelLinear(
@@ -299,8 +297,7 @@ class MambaMixer2(torch.nn.Module):
                 bias=use_bias,
                 quant_config=quant_config,
                 prefix=f"{prefix}.in_proj",
-                tp_rank=self.tp_rank,
-                tp_size=self.tp_size,
+                parallel_group=parallel_group,
             )
         else:
             # This is the n_groups == 1 case,
@@ -312,8 +309,7 @@ class MambaMixer2(torch.nn.Module):
                 bias=use_conv_bias,
                 quant_config=None,
                 prefix=f"{prefix}.conv1d",
-                tp_rank=self.tp_rank,
-                tp_size=self.tp_size,
+                parallel_group=parallel_group,
             )
 
             self.in_proj = ColumnParallelLinear(
@@ -322,8 +318,7 @@ class MambaMixer2(torch.nn.Module):
                 bias=use_bias,
                 quant_config=quant_config,
                 prefix=f"{prefix}.in_proj",
-                tp_rank=self.tp_rank,
-                tp_size=self.tp_size,
+                parallel_group=parallel_group,
             )
 
             # - because in_proj is a concatenation of 3 weights, we
@@ -414,22 +409,32 @@ class MambaMixer2(torch.nn.Module):
         self.dt_bias = nn.Parameter(torch.ones(num_heads // self.tp_size))
         self.use_rms_norm = use_rms_norm
 
-        set_weight_attrs(self.D, {"weight_loader": sharded_weight_loader(0)})
+        set_weight_attrs(
+            self.D,
+            {"weight_loader": sharded_weight_loader(0, parallel_group=parallel_group)},
+        )
         a_weight_loader = composed_weight_loader(
-            sharded_weight_loader(0), lambda x: -torch.exp(x.float())
+            sharded_weight_loader(0, parallel_group=parallel_group),
+            lambda x: -torch.exp(x.float()),
         )
         set_weight_attrs(self.A, {"weight_loader": a_weight_loader})
-        set_weight_attrs(self.dt_bias, {"weight_loader": sharded_weight_loader(0)})
+        set_weight_attrs(
+            self.dt_bias,
+            {"weight_loader": sharded_weight_loader(0, parallel_group=parallel_group)},
+        )
 
+        # By default the stage boundary reduces the output under DP attention.
+        if reduce_results is None:
+            reduce_results = not is_dp_attention_enabled()
         self.out_proj = RowParallelLinear(
             intermediate_size,
             hidden_size,
             bias=use_bias,
             input_is_parallel=True,
             quant_config=quant_config,
-            tp_rank=self.tp_rank,
-            tp_size=self.tp_size,
-            reduce_results=not is_dp_attention_enabled(),
+            parallel_group=parallel_group,
+            reduce_results=reduce_results,
+            use_dp_attention_reduce=reduce_results and is_dp_attention_enabled(),
             prefix=f"{prefix}.out_proj",
         )
 
@@ -545,6 +550,9 @@ class MambaMixer2(torch.nn.Module):
             dtype=hidden_states.dtype,
             device=hidden_states.device,
         )
+        # Rows past the batch's tokens are DP padding; keep them finite.
+        if num_actual_tokens < preallocated_ssm_out.shape[0]:
+            preallocated_ssm_out[num_actual_tokens:].zero_()
         preallocated_ssm_out_active = preallocated_ssm_out[:num_actual_tokens]
         preallocated_ssm_out_p, preallocated_ssm_out_d = torch.split(
             preallocated_ssm_out_active,

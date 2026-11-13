@@ -18,7 +18,10 @@ from sglang.test.test_utils import (
 )
 
 register_amd_ci(
-    est_time=1200, suite="nightly-amd-8-gpu-deepseek-v3-kv-fp8", nightly=True
+    est_time=1200,
+    suite="nightly-amd-8-gpu-deepseek-v3-kv-fp8",
+    nightly=True,
+    disabled="Older model generation; AMD nightly keeps the latest two per family",
 )
 
 FULL_DEEPSEEK_V3_MODEL_PATH = "deepseek-ai/DeepSeek-V3-0324"
@@ -70,7 +73,7 @@ class TestDeepseekV3MTPKvFp8(CustomTestCase):
             num_questions=200,
             max_new_tokens=512,
             parallel=128,
-            host="http://127.0.0.1",
+            host="127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
         metrics = run_eval_few_shot_gsm8k(args)

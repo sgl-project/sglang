@@ -133,6 +133,7 @@
 .set sPhysC,   71
 .set sPBrow,   72       // hkv*256 (token stride inside a page)
 .set sKvhOff,  73       // kvh*256
+.set sPlan,    74       // s74:75 segment plan ptr (0 = legacy fixed-SEGS split)
 
 // ---------------- macros ----------------
 
@@ -401,7 +402,22 @@ vattn_asm:
     s_load_dwordx8  s[24:31], s[0:1], 0x40
     s_load_dwordx4  s[32:35], s[0:1], 0x60
     s_load_dwordx4  s[56:59], s[0:1], 0x70
+    s_load_dwordx2  s[sPlan:sPlan+1], s[0:1], 0x80
     s_waitcnt lgkmcnt(0)
+    s_cmp_eq_u64 s[sPlan:sPlan+1], 0
+    s_cbranch_scc1 L_PLAN_DONE
+    // segment plan (1-D grid): plan[0] = tiles per segment, plan[1+wg_x] = seq<<16 | seg, or -1 past the
+    // end of the work list. Idle WGs sit at the tail of the grid and exit before touching memory.
+    s_load_dword s[sTps], s[sPlan:sPlan+1], 0x0
+    s_lshl_b32 s[sT2], s[sSeg], 2
+    s_add_i32 s[sT2], s[sT2], 4
+    s_load_dword s[sT3], s[sPlan:sPlan+1], s[sT2]
+    s_waitcnt lgkmcnt(0)
+    s_cmp_lt_i32 s[sT3], 0
+    s_cbranch_scc1 L_EXIT
+    s_lshr_b32 s[sSeq], s[sT3], 16
+    s_and_b32 s[sSeg], s[sT3], 0xffff
+L_PLAN_DONE:
     s_load_dword s[sT2], s[sKd:sKd+1], 0x0
     s_load_dword s[sT], s[sVd:sVd+1], 0x0
     s_waitcnt lgkmcnt(0)
@@ -428,11 +444,14 @@ vattn_asm:
     // num_tiles, tps, pg0/pg1
     s_add_i32 s[sNt], s[sSlen], 15
     s_lshr_b32 s[sNt], s[sNt], 4
+    s_cmp_lg_u64 s[sPlan:sPlan+1], 0
+    s_cbranch_scc1 L_TPS_DONE                   // planned: sTps already holds T
     s_lshl_b32 s[sT2], s[sSEGS], 4
     s_add_i32 s[sT2], s[sT2], -1
     s_add_i32 s[sT2], s[sSlen], s[sT2]
     s_mul_hi_u32 s[sTps], s[sT2], s[sMagic]
     s_lshr_b32 s[sTps], s[sTps], s[sShift]
+L_TPS_DONE:
     s_mul_i32 s[sPg0], s[sSeg], s[sTps]
     s_add_i32 s[sPg1], s[sPg0], s[sTps]
     s_min_i32 s[sPg1], s[sPg1], s[sNt]
@@ -725,7 +744,7 @@ L_EXIT:
 .amdhsa_kernel vattn_asm
     .amdhsa_group_segment_fixed_size LDS_TOTAL
     .amdhsa_private_segment_fixed_size 0
-    .amdhsa_kernarg_size 128
+    .amdhsa_kernarg_size 136
     .amdhsa_user_sgpr_count 2
     .amdhsa_user_sgpr_kernarg_segment_ptr 1
     .amdhsa_system_sgpr_workgroup_id_x 1
@@ -751,7 +770,7 @@ amdhsa.target: amdgcn-amd-amdhsa--gfx950
 amdhsa.kernels:
   - .name: vattn_asm
     .symbol: vattn_asm.kd
-    .kernarg_segment_size: 128
+    .kernarg_segment_size: 136
     .kernarg_segment_align: 8
     .group_segment_fixed_size: 148480
     .private_segment_fixed_size: 0
@@ -781,5 +800,6 @@ amdhsa.kernels:
       - {.offset: 104, .size: 4, .value_kind: by_value}
       - {.address_space: global, .offset: 112, .size: 8, .value_kind: global_buffer}
       - {.address_space: global, .offset: 120, .size: 8, .value_kind: global_buffer}
+      - {.address_space: global, .offset: 128, .size: 8, .value_kind: global_buffer}
 ...
 .end_amdgpu_metadata

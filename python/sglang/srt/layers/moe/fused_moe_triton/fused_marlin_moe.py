@@ -5,7 +5,9 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.activation.minimax_m3_swiglu import swiglu_oai_split
 from sglang.srt.layers import zero_copy_context
+from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils import is_cuda
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -14,10 +16,14 @@ _is_cuda = is_cuda()
 if _is_cuda:
     from sgl_kernel import moe_sum_reduce
 
-    from sglang.kernels.ops.activation.activation import silu_and_mul
+    from sglang.kernels.ops.activation.activation import (
+        silu_and_mul,
+        silu_and_mul_with_activation_rounding,
+    )
     from sglang.kernels.ops.moe.moe_wna16_marlin import moe_wna16_marlin_gemm
 
 
+# Not the JIT situ_and_mul: tanh as 2 * sigmoid(2x) - 1 is not bit-exact with it.
 @triton.jit
 def _tl_tanh(x):
     return 2.0 * tl.sigmoid(2.0 * x) - 1.0
@@ -109,6 +115,17 @@ def swiglu_limit_func(
     swiglu_limit: float = 0.0,
 ) -> None:
     d = input.shape[1] // 2
+    if (
+        _is_cuda
+        and get_platform().is_sm90
+        and input.is_cuda
+        and input.dtype in (torch.bfloat16, torch.float16)
+        and d % 16 == 0
+        and input.is_contiguous()
+        and output.is_contiguous()
+    ):
+        silu_and_mul_with_activation_rounding(input, output, clamp_limit=swiglu_limit)
+        return
     gate = input[:, :d]
     up = input[:, d:]
 
@@ -117,18 +134,6 @@ def swiglu_limit_func(
         up = torch.clamp(up, min=-swiglu_limit, max=swiglu_limit)
 
     output.copy_(F.silu(gate) * up)
-
-
-def swiglu_gpt_oss_sigmoid_alpha_contiguous(
-    output: torch.Tensor,
-    input: torch.Tensor,  # first half is gate, second half is up
-    gemm1_alpha: float,
-    gemm1_limit: float,
-) -> None:
-    d = input.shape[1] // 2
-    gate = input[:, :d].clamp(max=gemm1_limit)
-    up = input[:, d:].clamp(min=-gemm1_limit, max=gemm1_limit)
-    output.copy_(gate * torch.sigmoid(gate * gemm1_alpha) * (up + 1))
 
 
 @register_custom_op(out_shape="hidden_states")
@@ -162,6 +167,7 @@ def fused_marlin_moe(
     gemm1_alpha: Optional[float] = None,
     activation: str = "silu",
     is_gated: bool = True,
+    no_combine: bool = False,
 ) -> torch.Tensor:
     """
     This function computes a Mixture of Experts (MoE) layer using two sets of
@@ -186,6 +192,8 @@ def fused_marlin_moe(
     - w1_zeros (Optional[torch.Tensor]): Optional zero points to be used for w1.
     - w2_zeros (Optional[torch.Tensor]): Optional zero points to be used for w2.
     - num_bits (int): The number of bits in expert weights quantization.
+    - no_combine (bool): Return the router-weighted per-(token, expert) outputs,
+        ``[num_tokens, topk, hidden]``, instead of their top-k sum.
 
     Returns:
     - torch.Tensor: The output tensor after applying the MoE layer.
@@ -256,11 +264,14 @@ def fused_marlin_moe(
         from sglang.kernels.ops.moe.moe_align_single_token import moe_align_single_token
 
         sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_single_token(
-            topk_ids, block_size_m
+            topk_ids, block_size_m, return_inactive_prefix_count=True
         )
     else:
         sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(
-            topk_ids, block_size_m, global_num_experts
+            topk_ids,
+            block_size_m,
+            global_num_experts,
+            return_inactive_prefix_count=expert_map is None,
         )
 
     if workspace is None:
@@ -286,15 +297,14 @@ def fused_marlin_moe(
         device=hidden_states.device,
         dtype=hidden_states.dtype,
     )
-    # Marlin skips masked expert rows, so their shared cache must start at zero.
-    intermediate_cache13 = torch.zeros(
-        (M * topk_ids.shape[1] * max(gemm1_n, K),),
+    intermediate_cache13 = torch.empty(
+        (M * topk * max(gemm1_n, K),),
         device=hidden_states.device,
         dtype=hidden_states.dtype,
     )
     intermediate_cache1 = intermediate_cache13[: M * topk_ids.shape[1] * gemm1_n]
     intermediate_cache1 = intermediate_cache1.view(-1, gemm1_n)
-    intermediate_cache3 = intermediate_cache13[: M * topk_ids.shape[1] * K]
+    intermediate_cache3 = intermediate_cache13[: M * topk * K]
     intermediate_cache3 = intermediate_cache3.view(-1, K)
 
     use_atomic_add = (
@@ -321,6 +331,8 @@ def fused_marlin_moe(
         top_k=topk,
         mul_topk_weights=False,
         is_ep=expert_map is not None,
+        expert_ids_are_sorted=expert_map is None,
+        has_inactive_prefix_count=expert_map is None,
         b_q_type=scalar_type1,
         size_m=M,
         size_n=gemm1_n,
@@ -334,11 +346,12 @@ def fused_marlin_moe(
     if activation == "silu" and is_gated and gemm1_alpha is not None:
         if clamp_limit is None:
             raise ValueError("GPT-OSS Marlin activation requires clamp_limit.")
-        swiglu_gpt_oss_sigmoid_alpha_contiguous(
-            intermediate_cache2,
+        swiglu_oai_split(
             intermediate_cache1.view(-1, gemm1_n),
             gemm1_alpha,
+            1.0,
             clamp_limit,
+            out=intermediate_cache2,
         )
     elif activation == "silu" and is_gated and clamp_limit is not None:
         swiglu_limit_func(
@@ -362,9 +375,7 @@ def fused_marlin_moe(
     else:
         raise ValueError(f"Unsupported activation: {activation=}, with {is_gated=}")
 
-    if expert_map is not None:
-        intermediate_cache3.zero_()
-
+    # Gate-up is dead; the down GEMM defines inactive rows in the shared output.
     intermediate_cache3 = moe_wna16_marlin_gemm(
         intermediate_cache2,
         intermediate_cache3,
@@ -383,7 +394,10 @@ def fused_marlin_moe(
         moe_block_size=block_size_m,
         top_k=1,
         mul_topk_weights=True,
+        zero_inactive_output=True,
         is_ep=expert_map is not None,
+        expert_ids_are_sorted=expert_map is None,
+        has_inactive_prefix_count=expert_map is None,
         b_q_type=scalar_type2,
         size_m=M * topk,
         size_n=K,
@@ -393,6 +407,9 @@ def fused_marlin_moe(
         use_fp32_reduce=True,
         is_zp_float=False,
     ).view(-1, topk, K)
+
+    if no_combine:
+        return intermediate_cache3
 
     output = zero_copy_context.get_moe_output(hidden_states)
     if output is None:

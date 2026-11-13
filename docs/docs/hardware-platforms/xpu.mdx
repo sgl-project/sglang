@@ -7,39 +7,8 @@ The document addresses how to set up the [SGLang](https://github.com/sgl-project
 Specifically, SGLang is optimized for [Intel® Arc™ Pro B-Series Graphics](https://www.intel.com/content/www/us/en/ark/products/series/242616/intel-arc-pro-b-series-graphics.html) and [
 Intel® Arc™ B-Series Graphics](https://www.intel.com/content/www/us/en/ark/products/series/240391/intel-arc-b-series-graphics.html).
 
-## Optimized Model List
-
-A list of LLMs have been optimized on Intel GPU, and more are on the way:
-
-<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
-  <colgroup>
-    <col style={{width: "50%"}} />
-    <col style={{width: "50%"}} />
-  </colgroup>
-  <thead>
-    <tr style={{borderBottom: "2px solid #d55816"}}>
-      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Model Name</th>
-      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>BF16</th>
-    </tr>
-  </thead>
-  <tbody>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Llama-3.2-3B</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>[meta-llama/Llama-3.2-3B-Instruct](https://huggingface.co/meta-llama/Llama-3.2-3B-Instruct)</td>
-    </tr>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Llama-3.1-8B</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>[meta-llama/Llama-3.1-8B-Instruct](https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct)</td>
-    </tr>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Qwen2.5-1.5B</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>[Qwen/Qwen2.5-1.5B](https://huggingface.co/Qwen/Qwen2.5-1.5B)</td>
-    </tr>
-  </tbody>
-</table>
-
-**Note:** The model identifiers listed in the table above
-have been verified on [Intel® Arc™ B580 Graphics](https://www.intel.com/content/www/us/en/products/sku/241598/intel-arc-b580-graphics/specifications.html).
+A number of popular LLMs are optimized and run efficiently on XPU, including the most notable open-source models like Llama series, Qwen series, and Diffusion model series like FLUX and Z-Image.
+Please check the [SGLang Cookbook pages](https://docs.sglang.io/cookbook/intro) in which the support status and example commands can be found.
 
 Quantized MoE models are covered separately in
 [MXFP4 MoE Quantization](#mxfp4-moe-quantization) below.
@@ -62,13 +31,12 @@ curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.rustup
 # Make cargo available in the current shell
 source "$HOME/.cargo/env"
 
-# Create and activate a conda environment
-conda create -n sgl-xpu python=3.12 -y
-conda activate sgl-xpu
+# Install uv, then create and activate a virtual environment
+pip install uv
+uv venv --python 3.12 sgl-xpu
+source sgl-xpu/bin/activate
 
-# Set PyTorch XPU as primary pip install channel to avoid installing the larger CUDA-enabled version and prevent potential runtime issues.
-pip3 install torch==2.13.0+xpu torchvision==0.28.0+xpu torchaudio==2.11.0+xpu --index-url https://download.pytorch.org/whl/xpu
-pip3 install xgrammar==0.1.33 --no-deps # xgrammar will introduce CUDA-enabled triton which might conflict with XPU
+uv pip install xgrammar==0.1.33 --no-deps # xgrammar will introduce CUDA-enabled triton which might conflict with XPU
 
 # Clone the SGLang code
 git clone https://github.com/sgl-project/sglang.git
@@ -79,11 +47,32 @@ git checkout <YOUR-DESIRED-VERSION>
 cd python
 cp pyproject_xpu.toml pyproject.toml
 # Install SGLang dependent libs, and build SGLang main package
-pip install --upgrade pip setuptools
-pip install -v . --extra-index-url https://download.pytorch.org/whl/xpu
+uv pip install -v ".[dev,diffusion]"
+```
+
+pip ignores the `[tool.uv.*]` sections of `pyproject.toml`. To install with pip instead of uv, pass the package indexes explicitly:
+
+```bash Command
+pip install -v ".[dev,diffusion]" \
+    --extra-index-url https://download.pytorch.org/whl/xpu \
+    --extra-index-url https://docs.sglang.io/whl/xpu/
 ```
 
 ### Install Using Docker
+
+It is recommended to use Docker for setting up the SGLang environment.
+
+#### Pull from Docker Hub
+
+Pull the prebuilt docker image of SGLang package releases from `lmsysorg/sglang` repository.
+The [XPU image tags](https://hub.docker.com/r/lmsysorg/sglang/tags?name=xpu) end with `xpu` suffix.
+The image pulling command is like:
+
+```bash Command
+docker pull lmsysorg/sglang:v0.5.23-xpu
+```
+
+#### Build from Dockerfile
 
 [The SGLang XPU Dockerfile](https://github.com/sgl-project/sglang/blob/main/docker/xpu.Dockerfile) is provided to facilitate the installation.
 Replace `<secret>` below with your [HuggingFace access token](https://huggingface.co/docs/hub/en/security-tokens).
@@ -121,7 +110,6 @@ Example command to launch SGLang serving:
 sglang serve                         \
     --model-path <MODEL_ID_OR_PATH>  \
     --trust-remote-code              \
-    --disable-overlap-schedule       \
     --device xpu                     \
     --host 0.0.0.0                   \
     --tp 2                           \   # using multi GPUs
@@ -169,7 +157,7 @@ You can benchmark the performance via the `bench_serving` script.
 Run the command in another terminal.
 
 ```bash
-python -m sglang.bench_serving   \
+python -m sglang.benchmark.serving   \
     --dataset-name random        \
     --random-input-len 1024      \
     --random-output-len 1024     \
@@ -181,7 +169,7 @@ python -m sglang.bench_serving   \
 The detail explanations of the parameters can be looked up by the command:
 
 ```bash
-python -m sglang.bench_serving -h
+python -m sglang.benchmark.serving -h
 ```
 
 Additionally, the requests can be formed with
@@ -195,7 +183,7 @@ SGLang enables XPU graph capture to reduce per-step kernel-launch overhead.
 | Phase | Backend | Mechanism | Default |
 |---|---|---|---|
 | Decode | `full` | One `torch.xpu.XPUGraph` per batch size, captured on startup | **Off** (opt-in) |
-| Prefill | `tc_piecewise` | `torch.compile` + XPU graph, one graph segment per token-length bucket | **Off** (opt-in) |
+| Prefill | `full` | One `torch.xpu.XPUGraph` per token-length bucket, capturing the whole prefill forward | **Off** (opt-in) |
 | Prefill | `breakable` | Segmented `torch.xpu.XPUGraph` capture/replay (no `torch.compile`); eager break points at attention / MoE boundaries | **Off** (opt-in) |
 
 ### Enable Decode Graph
@@ -210,25 +198,27 @@ python -m sglang.launch_server --model-path <MODEL> --device xpu \
 ### Enable Prefill Graph
 
 Prefill graph capture is **opt-in** on XPU and must be enabled explicitly.
-Two backends are available: `tc_piecewise` and `breakable`.
+The available backends are `full` and `breakable`.
 
-#### tc_piecewise
+#### full
 
-Uses `torch.compile` plus an XPU graph, one graph segment per token-length
-bucket:
+Captures the full prefill forward as one `torch.xpu.XPUGraph` per
+token-length bucket. For `full` prefill, the graph also fixes the
+number of request slots baked into each capture. If you do not set that
+explicitly, SGLang derives it from `chunked_prefill_size // 512` and
+clamps it by the phase-level `max_bs`.
 
 ```bash
 python -m sglang.launch_server --model-path <MODEL> --device xpu \
-    --cuda-graph-backend-prefill tc_piecewise
+    --cuda-graph-backend-prefill full
 ```
 
-By default the prefill subgraphs are compiled with `eager` mode. Switch to
-`inductor` for higher-quality generated code at the cost of longer startup:
+To override the request-slot cap for `full` prefill, pass it through
+`--cuda-graph-config`, for example:
 
 ```bash
 python -m sglang.launch_server --model-path <MODEL> --device xpu \
-    --cuda-graph-backend-prefill tc_piecewise \
-    --cuda-graph-tc-compiler inductor
+    --cuda-graph-config '{"prefill":{"backend":"full","bs":[64,128,256],"full_prefill_max_req":8}}'
 ```
 
 #### breakable
@@ -245,7 +235,7 @@ You can also configure both phases together with a single `--cuda-graph-config` 
 
 ```bash
 python -m sglang.launch_server --model-path <MODEL> --device xpu \
-    --cuda-graph-config '{"decode":{"backend":"full"},"prefill":{"backend":"tc_piecewise","tc_compiler":"eager"}}'
+    --cuda-graph-config '{"decode":{"backend":"full"},"prefill":{"backend":"breakable"}}'
 ```
 
 ### Enable torch.compile for Decode
@@ -259,11 +249,6 @@ but increases startup time.
 python -m sglang.launch_server --model-path <MODEL> --device xpu \
     --enable-torch-compile
 ```
-
-> **Note:** `--enable-torch-compile` is mutually exclusive with the prefill
-> `tc_piecewise` graph (the compatibility rules auto-disable it). Use them
-> separately or lock the prefill backend explicitly via `--cuda-graph-config`
-> if you need both.
 
 ### Disable XPU Graph
 
@@ -292,7 +277,7 @@ To specify explicit token-length buckets:
 ```bash
 python -m sglang.launch_server \
     --model-path <MODEL> --device xpu \
-    --cuda-graph-backend-prefill tc_piecewise \
+    --cuda-graph-backend-prefill breakable \
     --cuda-graph-bs-prefill 64 128 256 512
 ```
 
@@ -308,12 +293,11 @@ python -m sglang.launch_server \
 
 | Argument | XPU allowed values | Default | Description |
 |---|---|---|---|
-| `--cuda-graph-backend-decode` | `full`, `disabled` | `disabled` | Backend for the decode phase. Only `full` is supported on XPU. Set to `full` to enable. |
-| `--cuda-graph-backend-prefill` | `tc_piecewise`, `breakable`, `disabled` | `disabled`* | Backend for the prefill phase. Set to `tc_piecewise` or `breakable` explicitly to enable. |
-| `--cuda-graph-tc-compiler` | `eager`, `inductor` | `eager` | Compiler for `tc_piecewise` prefill subgraphs. `inductor` produces more optimized code but has longer startup. |
+| `--cuda-graph-backend-decode` | `full`, `disabled` | `disabled` | Backend for the decode phase. Set to `full` to enable. |
+| `--cuda-graph-backend-prefill` | `full`, `breakable`, `disabled` | `disabled`* | Backend for the prefill phase. Set to `full` or `breakable` explicitly to enable. |
 | `--cuda-graph-bs-prefill` | list of ints | auto | Explicit token-length buckets to capture for prefill. |
 | `--cuda-graph-bs-decode` | list of ints | auto | Explicit batch sizes to capture for decode. |
-| `--cuda-graph-config` | JSON string | — | One-shot JSON config for both phases, e.g. `'{"decode":{"backend":"full"},"prefill":{"backend":"tc_piecewise","tc_compiler":"eager"}}'`. Overrides all per-phase flags. |
+| `--cuda-graph-config` | JSON string | — | One-shot JSON config for both phases, e.g. `'{"decode":{"backend":"full"},"prefill":{"backend":"full"}}'` or `'{"decode":{"backend":"full"},"prefill":{"backend":"breakable"}}'`. Overrides all per-phase flags. |
 | `--disable-decode-cuda-graph` | — | `False` | Shorthand for `--cuda-graph-backend-decode=disabled`. |
 | `--disable-prefill-cuda-graph` | — | `False` | Shorthand for `--cuda-graph-backend-prefill=disabled`. |
 | `--enable-torch-compile` | — | `False` | Apply `torch.compile` on top of the decode XPU graph for further kernel optimization. |
@@ -327,7 +311,29 @@ via `--cuda-graph-backend-prefill` or `--cuda-graph-config`.
 | Feature | Status |
 |---|---|
 | Two-batch overlap (`--enable-two-batch-overlap`) | Not yet supported |
-| Speculative decoding | Not yet implemented |
+| Speculative decoding | Supported |
+| Decode breakable graph (`--cuda-graph-backend-decode breakable`) | Not yet supported |
+
+## Decode Context Parallel (DCP) on Intel XPU [Experimental]
+
+DCP shards the KV cache across the ranks of a TP group by token position. It grows
+the servable context only when `tp_size` exceeds the model's KV heads, which TP would
+otherwise replicate, and decode gets slower, so use it only when the context you need
+does not fit.
+
+```bash
+python -m sglang.launch_server --model-path Qwen/Qwen3.5-4B --device xpu \
+    --attention-backend intel_xpu --tp 2 --dcp-size 2 \
+    --disable-radix-cache --mem-fraction-static 0.60
+```
+
+It needs the `intel_xpu` attention backend and ranks that share their DCP group's
+KV heads: Qwen3.5 models, or models with at most `tp_size / dcp_size` KV heads.
+Unsupported features are refused at startup. If startup fails with
+`UR_RESULT_ERROR_OUT_OF_RESOURCES`, lower `--mem-fraction-static`.
+
+With P/D disaggregation, DCP on XPU skips the DCP pack fast path: the pack
+kernel runs only on CUDA, so KV is transferred per token instead.
 
 ## Memory Saver (release/resume memory occupation) on Intel XPU [Experimental]
 
@@ -354,7 +360,7 @@ below is the `v0.0.10b2` release, pinned so the build is reproducible.
 
 ```bash
 source /opt/intel/oneapi/setvars.sh
-TMS_PLATFORM=xpu pip install --no-build-isolation \
+TMS_PLATFORM=xpu uv pip install --no-build-isolation \
     git+https://github.com/fzyzcjy/torch_memory_saver.git@a5c99f11b18ebb8e9fda71a68812e476ae49e417
 ```
 
@@ -385,21 +391,61 @@ the `cuda_graph` tag is a no-op there.
 
 ## Prefill-Decode (P/D) Disaggregation on Intel XPU [Experimental]
 
-SGLang supports prefill-decode disaggregation on Intel XPU using the [NIXL](https://github.com/ai-dynamo/nixl) KV-transfer backend.
+SGLang supports prefill-decode disaggregation on Intel XPU with the [Mooncake](https://github.com/kvcache-ai/Mooncake) and [NIXL](https://github.com/ai-dynamo/nixl) KV-transfer backends. Both are covered by the XPU nightly P/D test.
 
-**Tested models:**
+**Tested configurations:**
 
-| Model | Notes |
-|:---:|:---:|
-| [Qwen/Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B) | Used in integration tests; verified on Intel XPU with homogeneous P/D (XPU prefill + XPU decode) |
-| [Qwen/Qwen2.5-7B-Instruct](https://huggingface.co/Qwen/Qwen2.5-7B-Instruct) | Verified on Intel XPU with homogeneous P/D (XPU prefill + XPU decode) |
+| Model | Backend | Notes |
+|:---:|:---:|:---:|
+| [Qwen/Qwen2.5-1.5B-Instruct](https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct) | Mooncake (TENT, Level Zero IPC) | Used in the XPU nightly P/D test; homogeneous P/D (XPU prefill + XPU decode) |
+| [Qwen/Qwen2.5-1.5B-Instruct](https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct) | NIXL (UCX with Level Zero) | Used in the XPU nightly P/D test; homogeneous P/D (XPU prefill + XPU decode) |
+| [Qwen/Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B) | NIXL | Verified on Intel XPU with homogeneous P/D (XPU prefill + XPU decode) |
+| [Qwen/Qwen2.5-7B-Instruct](https://huggingface.co/Qwen/Qwen2.5-7B-Instruct) | NIXL | Verified on Intel XPU with homogeneous P/D (XPU prefill + XPU decode) |
 
-**Prerequisites:** `pip install nixl sglang-router`
+### Mooncake backend
+
+Mooncake supports Intel XPU through its TENT engine. The PyPI `mooncake-transfer-engine` wheel does not include it, so either use the XPU Docker image, which builds Mooncake from a pinned upstream commit (see `docker/xpu.Dockerfile`), or build Mooncake from source with icpx and `-DUSE_XPU=ON -DUSE_TENT=ON`. The image builds Mooncake without its store (`-DWITH_STORE=OFF`), so the Mooncake store HiCache L3 backend (`--hicache-storage-backend mooncake`) is not available on XPU.
+
+**Prerequisites:** Mooncake with XPU support (above) and `uv pip install sglang-router`.
+
+Set `MC_USE_TENT=1` on both the prefill and decode servers, and leave `MOONCAKE_PROTOCOL` at its default. On one node, the TENT engine then copies KV card to card through Level Zero IPC, so no RDMA NIC is needed.
+
+Both servers must see both cards: give them the same `ZE_AFFINITY_MASK` and pick each server's card with `--base-gpu-id`. If a server cannot see the peer's card, TENT logs `... is on a device not visible here ... using another route` and does not copy card to card.
+
+Inside a container, run with `--cap-add SYS_PTRACE`, or `--privileged` as in the Docker example above. TENT imports the peer's buffer through `pidfd_getfd()`, which Docker blocks by default; without it TENT logs `cannot map peer buffer ... Operation not permitted ... using another route`, and requests still succeed but KV no longer goes card to card.
 
 **Start the prefill server (GPU 0):**
 
 ```bash
-ZE_AFFINITY_MASK=0 UCX_POSIX_USE_PROC_LINK=n python -m sglang.launch_server \
+ZE_AFFINITY_MASK=0,1 MC_USE_TENT=1 python -m sglang.launch_server \
+    --model-path Qwen/Qwen2.5-1.5B-Instruct --trust-remote-code --device xpu \
+    --disaggregation-mode prefill --disaggregation-transfer-backend mooncake \
+    --disaggregation-bootstrap-port 12335 --host 0.0.0.0 --port 30000
+```
+
+**Start the decode server (GPU 1):**
+
+```bash
+ZE_AFFINITY_MASK=0,1 MC_USE_TENT=1 python -m sglang.launch_server \
+    --model-path Qwen/Qwen2.5-1.5B-Instruct --trust-remote-code --device xpu --base-gpu-id 1 \
+    --disaggregation-mode decode --disaggregation-transfer-backend mooncake \
+    --disaggregation-bootstrap-port 12335 --host 0.0.0.0 --port 30001
+```
+
+Start the router and send a request as shown for NIXL below, using `Qwen/Qwen2.5-1.5B-Instruct` as the model.
+
+`SGLANG_MOONCAKE_CUSTOM_MEM_POOL` (`NVLINK`, `BAREX`, `INTRA_NODE_NVLINK`) selects Mooncake's CUDA allocators and is CUDA-only; do not set it on XPU.
+
+### NIXL backend
+
+**Prerequisites:** NIXL on a UCX built with the Level Zero transport (`--with-ze`), and `uv pip install sglang-router`. The PyPI `nixl` wheel bundles a UCX without it, so either use the XPU Docker image, which builds UCX, Abseil, and NIXL from pinned upstream commits (see `docker/xpu.Dockerfile`), or build them from source the same way.
+
+Inside a container, run with `--cap-add SYS_PTRACE`, or `--privileged` as in the Docker example above: UCX's ze_ipc transport maps the peer's device memory through `pidfd_getfd()`, which Docker blocks by default, and the first transfer fails with `Operation not permitted`.
+
+**Start the prefill server (GPU 0):**
+
+```bash
+ZE_AFFINITY_MASK=0 python -m sglang.launch_server \
     --model-path Qwen/Qwen3-0.6B --trust-remote-code --device xpu \
     --disaggregation-mode prefill --disaggregation-transfer-backend nixl \
     --disaggregation-bootstrap-port 12335 --host 0.0.0.0 --port 30000
@@ -408,7 +454,7 @@ ZE_AFFINITY_MASK=0 UCX_POSIX_USE_PROC_LINK=n python -m sglang.launch_server \
 **Start the decode server (GPU 1):**
 
 ```bash
-ZE_AFFINITY_MASK=1 UCX_POSIX_USE_PROC_LINK=n python -m sglang.launch_server \
+ZE_AFFINITY_MASK=1 python -m sglang.launch_server \
     --model-path Qwen/Qwen3-0.6B --trust-remote-code --device xpu \
     --disaggregation-mode decode --disaggregation-transfer-backend nixl \
     --disaggregation-bootstrap-port 12335 --host 0.0.0.0 --port 30001
@@ -432,4 +478,4 @@ curl http://127.0.0.1:8000/v1/completions \
     -d '{"model": "Qwen/Qwen3-0.6B", "prompt": "The capital of France is", "max_tokens": 32}'
 ```
 
-> **Note:** `UCX_POSIX_USE_PROC_LINK=n` is required on Intel XPU to avoid UCX shared-memory transport issues.
+> **Note:** If UCX's shared-memory transport fails to attach a peer's segment (it opens `/proc/<pid>/fd/<fd>`, which needs ptrace rights), set `UCX_POSIX_USE_PROC_LINK=n` to have it open the segment by its `/dev/shm` path instead.

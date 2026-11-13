@@ -6,16 +6,6 @@ import torch
 import triton
 import triton.testing
 
-from sglang.kernels.jit.benchmark.kv_canary.utils import (
-    RING_CAPACITY,
-    SWA_WINDOW,
-    BenchCase,
-    build_fast_matrix_cases,
-    build_full_matrix_cases,
-    cases_to_x_vals,
-    make_real_kv_sources,
-    naive_slot_copy_fn,
-)
 from sglang.kernels.jit.benchmark.utils import (
     DEFAULT_DEVICE,
     get_benchmark_range,
@@ -28,13 +18,24 @@ from sglang.kernels.ops.kv_canary.verify import (
     VerifyOrWriteContext,
 )
 from sglang.kernels.ops.kv_canary.write import WritePlan, launch_canary_write_kernel
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.kernels.kv_canary.bench_cases import (
+    RING_CAPACITY,
+    SWA_WINDOW,
+    BenchCase,
+    build_fast_matrix_cases,
+    build_full_matrix_cases,
+    cases_to_x_vals,
+    make_real_kv_sources,
+    naive_slot_copy_fn,
+)
 
-register_cuda_ci(est_time=20, stage="weekly", runner_config="1-gpu-large")
+register_cuda_ci(
+    est_time=20, stage="base-b-kernel-benchmark", runner_config="1-gpu-small"
+)
 # AMD mirrors the CUDA nightly registration (nightly-only, no per-PR suite).
 # Note: amd_ci_exec.sh sets SGLANG_IS_IN_CI, so this runs the CI-reduced range
 # (build_fast_matrix_cases via get_benchmark_range), same as CUDA nightly.
-register_amd_ci(est_time=900, suite="nightly-amd-kernel-1-gpu", nightly=True)
 
 
 _X_NAMES = [

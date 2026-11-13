@@ -5,24 +5,64 @@ from dataclasses import dataclass
 from typing import (
     TYPE_CHECKING,
     Any,
-    Callable,
     List,
     Optional,
     Tuple,
 )
 
+from sglang.srt.layers.cp.base import is_cp_sharded_padded
+from sglang.srt.layers.cp.utils import from_cp_sharded
 from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
-from sglang.srt.mem_cache.allocator.unified_hybrid_swa import (
-    UnifiedMambaSWATokenToKVPoolAllocator,
-)
+from sglang.srt.utils.common import ceil_align
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.schedule_batch import ReqKvInfo
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
-    from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+    from sglang.srt.mem_cache.kv.storage import KVStorage, SubPoolUsage
+    from sglang.srt.mem_cache.static_kv_storage import StaticKVStorage
 
 
 class SchedulerStats: ...  # type: ignore[no-redef]
+
+
+# A KV record's footprint outside the tree, in whole pages. Each row is summed
+# once, under its owner: uncached for a request's own, session-held for a session's.
+
+
+def kv_private_tokens(kv: ReqKvInfo, page_size: int) -> int:
+    return ceil_align(kv.kv_allocated_len, page_size) - kv.cache_protected_len
+
+
+def kv_private_window_tokens(kv: ReqKvInfo, page_size: int, sub_pool: str) -> int:
+    # Window eviction frees only [window_dead_lo, evicted); [protected, window_dead_lo)
+    # stays held until the request finishes, even after the cursor jumps past it.
+    allocated = ceil_align(kv.kv_allocated_len, page_size)
+    window_freed = max(
+        0, kv.get_evicted_seqlen(sub_pool) - kv.window_dead_lo(page_size)
+    )
+    return allocated - kv.cache_protected_len - window_freed
+
+
+def kv_mamba_slots(kv: ReqKvInfo) -> int:
+    total = kv.mamba_pool_idx.numel() if kv.holds_mamba else 0
+    if kv.mamba_ping_pong_track_buffer is not None:
+        total += kv.mamba_ping_pong_empty.count(False)
+    return total
+
+
+@dataclasses.dataclass
+class WindowPoolStats:
+    """One window sub-pool's occupancy in tokens, under the name its numbers
+    are published by (`SubPoolUsage.label`)."""
+
+    name: str
+    sub_pool: str
+    capacity: int
+    available_size: int
+    evictable_size: int
+    num_used: int
+    token_usage: float
 
 
 @dataclasses.dataclass
@@ -33,17 +73,19 @@ class PoolStats:
     full_available_size: int
     full_evictable_size: int
 
-    is_hybrid_swa: bool = False
     is_hybrid_ssm: bool = False
     is_hisparse: bool = False
 
-    # For hybrid-swa pools
-    swa_num_used: Optional[int] = None
-    swa_token_usage: Optional[float] = None
-    swa_available_size: Optional[int] = None
-    swa_evictable_size: Optional[int] = None
+    # Denominator of full_token_usage (always set)
+    full_capacity: Optional[int] = None
+    # Every window sub-pool, the tree's first window first; empty without one.
+    windows: Tuple[WindowPoolStats, ...] = ()
+    # The sub-pool of the target's own window (`window_sub_pool_of`), which
+    # the single-window `swa_*` numbers report.
+    target_window: Optional[str] = None
 
     # For mamba pools
+    mamba_capacity: Optional[int] = None
     mamba_num_used: Optional[int] = None
     mamba_usage: Optional[float] = None
     mamba_available_size: Optional[int] = None
@@ -55,21 +97,23 @@ class PoolStats:
     hisparse_host_tokens: Optional[int] = None
     hisparse_host_token_usage: Optional[float] = None
 
+    def window(self, name: str) -> Optional[WindowPoolStats]:
+        return next((w for w in self.windows if w.name == name), None)
+
+    def target_window_stats(self) -> Optional[WindowPoolStats]:
+        """The target's own window, None without one."""
+        return next((w for w in self.windows if w.sub_pool == self.target_window), None)
+
     def get_kv_token_stats(self) -> Tuple[int, float]:
         # NOTE: mamba pool is not included in the "token usage" calculation.
-        if self.is_hybrid_swa:
-            num_used = max(self.full_num_used, self.swa_num_used)
-            token_usage = max(self.full_token_usage, self.swa_token_usage)
-        else:
-            num_used = self.full_num_used
-            token_usage = self.full_token_usage
-
+        num_used = max([self.full_num_used, *(w.num_used for w in self.windows)])
+        token_usage = max(
+            [self.full_token_usage, *(w.token_usage for w in self.windows)]
+        )
         return num_used, token_usage
 
     def get_max_pool_usage(self) -> float:
-        usage = self.full_token_usage
-        if self.is_hybrid_swa:
-            usage = max(usage, self.swa_token_usage)
+        usage = max([self.full_token_usage, *(w.token_usage for w in self.windows)])
         if self.is_hybrid_ssm:
             usage = max(usage, self.mamba_usage)
         assert usage is not None and usage >= 0, f"{usage=} is not valid"
@@ -77,13 +121,13 @@ class PoolStats:
 
     def get_prefill_usage_msg_parts(self) -> List[str]:
         parts = []
-        if self.is_hybrid_swa:
+        if self.windows:
+            parts.append(f"full token usage: {self.full_token_usage:.2f}")
             parts += [
-                f"full token usage: {self.full_token_usage:.2f}",
-                f"swa token usage: {self.swa_token_usage:.2f}",
+                f"{w.name} token usage: {w.token_usage:.2f}" for w in self.windows
             ]
         if self.is_hybrid_ssm:
-            if not self.is_hybrid_swa:
+            if not self.windows:
                 parts.append(f"full token usage: {self.full_token_usage:.2f}")
             parts.append(f"mamba usage: {self.mamba_usage:.2f}")
         if not parts:
@@ -92,15 +136,18 @@ class PoolStats:
 
     def get_decode_usage_msg_parts(self) -> List[str]:
         parts = []
-        if self.is_hybrid_swa:
+        if self.windows:
             parts += [
                 f"#full token: {self.full_num_used}",
                 f"full token usage: {self.full_token_usage:.2f}",
-                f"#swa token: {self.swa_num_used}",
-                f"swa token usage: {self.swa_token_usage:.2f}",
             ]
+            for w in self.windows:
+                parts += [
+                    f"#{w.name} token: {w.num_used}",
+                    f"{w.name} token usage: {w.token_usage:.2f}",
+                ]
         if self.is_hybrid_ssm:
-            if not self.is_hybrid_swa:
+            if not self.windows:
                 parts += [
                     f"#full token: {self.full_num_used}",
                     f"full token usage: {self.full_token_usage:.2f}",
@@ -128,11 +175,16 @@ class PoolStats:
         stats.num_used_tokens = num_used
         stats.token_usage = round(self.get_max_pool_usage(), 2)
         stats.full_token_usage = self.full_token_usage
-        if self.is_hybrid_swa:
-            stats.swa_token_usage = self.swa_token_usage
-            stats.swa_available_tokens = self.swa_available_size
-            stats.swa_evictable_tokens = self.swa_evictable_size
-            stats.swa_used_tokens = self.swa_num_used
+        stats.window_token_usage = {w.name: w.token_usage for w in self.windows}
+        stats.window_available_tokens = {w.name: w.available_size for w in self.windows}
+        stats.window_evictable_tokens = {w.name: w.evictable_size for w in self.windows}
+        stats.window_used_tokens = {w.name: w.num_used for w in self.windows}
+        target = self.target_window_stats()
+        if target is not None:
+            stats.swa_token_usage = target.token_usage
+            stats.swa_available_tokens = target.available_size
+            stats.swa_evictable_tokens = target.evictable_size
+            stats.swa_used_tokens = target.num_used
         if self.is_hybrid_ssm:
             stats.mamba_usage = self.mamba_usage
             stats.mamba_available_tokens = self.mamba_available_size
@@ -146,18 +198,14 @@ class PoolStats:
 @dataclass(kw_only=True, slots=True, frozen=True)
 class SchedulerPoolStatsObserver:
     tree_cache: BasePrefixCache
+    # The sub-pools' usage, unified or static.
+    storage: KVStorage | StaticKVStorage
+    # Only for what pools built without unified memory still decide alone: a
+    # per-request window ring and int8 state checkpoints.
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
-    req_to_token_pool: ReqToTokenPool
     session_controller: Any
     hisparse_coordinator: Any
-    is_hybrid_swa: bool
-    is_hybrid_ssm: bool
     enable_hisparse: bool
-    full_tokens_per_layer: Any
-    swa_tokens_per_layer: Any
-    max_total_num_tokens: int
-    get_last_batch: Callable
-    get_running_batch: Callable
 
     def streaming_session_count(self) -> int:
         return sum(
@@ -166,51 +214,54 @@ class SchedulerPoolStatsObserver:
             if session.streaming
         )
 
-    def active_pool_idxs(self) -> set:
-        """Pool idxs currently owned by reqs in last_batch / running_batch.
-
-        Used to decide which session slots' KV is owned by batch reqs
-        (and thus counted via uncached_size, not session_held).
-        """
-        idxs = set()
-        for batch in [self.get_last_batch(), self.get_running_batch()]:
-            if batch is None or batch.is_empty():
-                continue
-            for req in batch.reqs:
-                if req.kv.holds_kv:
-                    idxs.add(req.kv.req_pool_idx)
-        return idxs
+    def _session_kv_rows(self) -> List[ReqKvInfo]:
+        records = self.tree_cache.session_records().values()
+        return [kv for kv in records if kv.holds_kv]
 
     def session_held_tokens(self) -> int:
-        return self.tree_cache.session_held_tokens(self.active_pool_idxs())
+        page_size = self.tree_cache.page_size
+        total = sum(kv_private_tokens(kv, page_size) for kv in self._session_kv_rows())
+        return total + self.tree_cache.retained_window_tokens()
 
-    def session_held_full_tokens(self) -> int:
-        return self.tree_cache.session_held_full_tokens(self.active_pool_idxs())
-
-    def session_held_swa_tokens(self) -> int:
-        return self.tree_cache.session_held_swa_tokens(self.active_pool_idxs())
+    def session_held_window_tokens(self, sub_pool: str) -> int:
+        page_size = self.tree_cache.page_size
+        total = sum(
+            kv_private_window_tokens(kv, page_size, sub_pool)
+            for kv in self._session_kv_rows()
+        )
+        # Document windows a one-window model retains across requests.
+        if len(self.tree_cache.window_slots()) <= 1:
+            total += self.tree_cache.retained_window_tokens()
+        return total
 
     def session_held_req_count(self) -> int:
-        return self.tree_cache.session_held_req_count()
+        held = len(self._session_kv_rows())
+        held += self.tree_cache.retained_window_req_count()
+        return held
 
     def session_held_mamba_slots(self) -> int:
-        return self.tree_cache.session_held_mamba_slots(self.active_pool_idxs())
+        return sum(kv_mamba_slots(kv) for kv in self._session_kv_rows())
 
     def get_pool_stats(self) -> PoolStats:
-        if self.is_hybrid_swa:
-            pool_stats = self._get_swa_token_info()
-        elif self.is_hybrid_ssm:
-            pool_stats = self._get_mamba_token_info()
+        usage = self.storage.usage()
+        (full,) = (u for u in usage if u.metrics == "full")
+        mamba = next((u for u in usage if u.metrics == "mamba"), None)
+        windows = tuple(u for u in usage if u.metrics == "window")
+        if windows:
+            pool_stats = self._get_window_token_info(full, windows)
+        elif mamba is not None:
+            pool_stats = self._get_mamba_token_info(full, mamba)
         else:
-            pool_stats = self._get_token_info()
+            pool_stats = self._get_token_info(full)
 
         if self.enable_hisparse:
             pool_stats = self._get_hisparse_token_info(pool_stats)
 
-        # swa + ssm can coexist: overlay mamba fields onto swa stats
-        if self.is_hybrid_ssm:
-            mamba_stats = self._get_mamba_token_info()
+        # windows + ssm can coexist: overlay mamba fields onto the window stats
+        if mamba is not None:
+            mamba_stats = self._get_mamba_token_info(full, mamba)
             pool_stats.is_hybrid_ssm = True
+            pool_stats.mamba_capacity = mamba_stats.mamba_capacity
             pool_stats.mamba_num_used = mamba_stats.mamba_num_used
             pool_stats.mamba_usage = mamba_stats.mamba_usage
             pool_stats.mamba_available_size = mamba_stats.mamba_available_size
@@ -218,16 +269,19 @@ class SchedulerPoolStatsObserver:
 
         return pool_stats
 
-    def _get_token_info(self) -> PoolStats:
-        available_size = self.token_to_kv_pool_allocator.available_size()
+    def _get_token_info(self, full: SubPoolUsage) -> PoolStats:
+        available_size = full.available
+        if is_cp_sharded_padded():
+            available_size = from_cp_sharded(available_size)
         evictable_size = self.tree_cache.evictable_size()
-        num_used = self.max_total_num_tokens - (available_size + evictable_size)
-        token_usage = num_used / self.max_total_num_tokens
+        num_used = full.capacity - (available_size + evictable_size)
+        token_usage = num_used / full.capacity
         return PoolStats(
             full_num_used=num_used,
             full_token_usage=token_usage,
             full_available_size=available_size,
             full_evictable_size=evictable_size,
+            full_capacity=full.capacity,
         )
 
     def _get_hisparse_token_info(self, pool_stats: PoolStats) -> PoolStats:
@@ -243,38 +297,37 @@ class SchedulerPoolStatsObserver:
             )
         return pool_stats
 
-    def _get_mamba_token_info(self):
+    def _get_mamba_token_info(
+        self, full: SubPoolUsage, mamba: SubPoolUsage
+    ) -> PoolStats:
         is_mamba_radix_cache = (
-            self.tree_cache.supports_mamba() and self.tree_cache.is_tree_cache()
+            self.tree_cache.supports_mamba()
+            and self.tree_cache.supports_prefix_sharing()
         )
-        full_available_size = self.token_to_kv_pool_allocator.available_size()
+        full_available_size = full.available
         full_evictable_size = (
             self.tree_cache.full_evictable_size() if is_mamba_radix_cache else 0
         )
-        mamba_available_size = self.req_to_token_pool.mamba_allocator.available_size()
+        mamba_available_size = mamba.available
         # `mamba_usage`/`mamba_num_used` track the ACTIVE bf16 pool occupancy (running
         # requests) -- this feeds throttle decisions (get_max_pool_usage) which asserts
         # usage >= 0. With int8 checkpoints the radix-cached states live in a SEPARATE
         # int8 pool, so they own ZERO active slots: report evictable=0 against the active
         # pool (otherwise active.size - (available + radix_cached) goes negative). The
         # int8 cache pool's own occupancy is validated separately in the invariant check.
-        has_int8_ckpt = (
-            getattr(self.req_to_token_pool, "mamba_ckpt_pool", None) is not None
-        )
+        has_int8_ckpt = self.token_to_kv_pool_allocator.state.ckpt_pool is not None
         mamba_evictable_size = (
             self.tree_cache.mamba_evictable_size()
             if (is_mamba_radix_cache and not has_int8_ckpt)
             else 0
         )
-        full_capacity = self.req_to_token_pool.schedulable_token_capacity(
-            self.token_to_kv_pool_allocator.size
-        )
+        full_capacity = full.capacity
         full_num_used = full_capacity - (full_available_size + full_evictable_size)
-        mamba_num_used = self.req_to_token_pool.mamba_pool.size - (
-            mamba_available_size + mamba_evictable_size
-        )
+        mamba_num_used = mamba.capacity - (mamba_available_size + mamba_evictable_size)
         full_token_usage = full_num_used / full_capacity
-        mamba_usage = mamba_num_used / self.req_to_token_pool.mamba_pool.size
+        # Unified memory reports the state slots held plus those free now:
+        # zero while no slot is held and other sub-pools hold the bytes.
+        mamba_usage = mamba_num_used / mamba.capacity if mamba.capacity else 0.0
 
         return PoolStats(
             is_hybrid_ssm=True,
@@ -282,59 +335,93 @@ class SchedulerPoolStatsObserver:
             full_token_usage=full_token_usage,
             full_available_size=full_available_size,
             full_evictable_size=full_evictable_size,
+            full_capacity=full_capacity,
+            mamba_capacity=mamba.capacity,
             mamba_num_used=mamba_num_used,
             mamba_usage=mamba_usage,
             mamba_available_size=mamba_available_size,
             mamba_evictable_size=mamba_evictable_size,
         )
 
-    def _get_swa_token_info(self) -> PoolStats:
-        # `*_num_used` is `static_cap - (available + evictable)`, so the
-        # available term must match the static cap's denomination: the conserve
-        # view, never the byte-coordinated one (see
-        # `conserve_full_available_size`). Measured ~25-90x inflated otherwise.
-        allocator = self.token_to_kv_pool_allocator
-        if isinstance(allocator, UnifiedMambaSWATokenToKVPoolAllocator):
-            full_available_size = allocator.conserve_full_available_size()
-            swa_available_size = allocator.conserve_swa_available_size()
-        else:
-            full_available_size = allocator.full_available_size()
-            swa_available_size = allocator.swa_available_size()
+    def _window_evictable_size(self, sub_pool: str) -> int:
+        """Evictable tokens the prefix tree holds in window sub-pool
+        ``sub_pool``: its slot's, or, for a tree keeping one pool and no window
+        slots, everything it can evict."""
+        names = [name for name, _ in self.tree_cache.window_sub_pools()]
+        if not names:
+            return self.tree_cache.evictable_size()
+        return (
+            self.tree_cache.window_evictable_size(sub_pool) if sub_pool in names else 0
+        )
+
+    def _in_tree_order(
+        self, windows: Tuple[SubPoolUsage, ...]
+    ) -> Tuple[SubPoolUsage, ...]:
+        """The window sub-pools in the prefix tree's window order. A sub-pool
+        no slot keeps comes last."""
+        order = {
+            name: i for i, (name, _) in enumerate(self.tree_cache.window_sub_pools())
+        }
+        return tuple(sorted(windows, key=lambda w: order.get(w.name, len(order))))
+
+    def _get_window_token_info(
+        self, full: SubPoolUsage, windows: Tuple[SubPoolUsage, ...]
+    ) -> PoolStats:
+        from sglang.srt.mem_cache.base_prefix_cache import window_sub_pool_of
+
+        full_capacity, full_available_size = full.capacity, full.available
+        if is_cp_sharded_padded():
+            full_capacity = from_cp_sharded(full_capacity)
+            full_available_size = from_cp_sharded(full_available_size)
         full_evictable_size = self.tree_cache.full_evictable_size()
-        swa_evictable_size = self.tree_cache.swa_evictable_size()
-        # Per-request SWA ring: released with the req slot, yet cached radix
-        # prefixes still report swa_evictable; counting it drives usage negative.
-        if is_swa_req_ring(self.token_to_kv_pool_allocator):
-            swa_evictable_size = 0
-        full_num_used = self.full_tokens_per_layer - (
-            full_available_size + full_evictable_size
-        )
-        swa_num_used = self.swa_tokens_per_layer - (
-            swa_available_size + swa_evictable_size
-        )
+        full_num_used = full_capacity - (full_available_size + full_evictable_size)
         # FIXME(hisparse): host-backup transiently over-releases the device pool
-        # counter, producing negative full_num_used / swa_num_used. We clamp to 0
-        # to keep token_usage / leak checks sane, but the underlying accounting
-        # bug should be fixed so the clamp can go away.
+        # counter, producing negative used counts. We clamp to 0 to keep
+        # token_usage / leak checks sane, but the underlying accounting bug
+        # should be fixed so the clamp can go away.
         if self.enable_hisparse:
             full_num_used = max(0, full_num_used)
-            swa_num_used = max(0, swa_num_used)
-        if not self.full_tokens_per_layer:
+        if not full_capacity:
             full_num_used = 0
             full_available_size = 0
             full_token_usage = 0.0
         else:
-            full_token_usage = full_num_used / self.full_tokens_per_layer
-        swa_token_usage = swa_num_used / self.swa_tokens_per_layer
+            full_token_usage = full_num_used / full_capacity
+        # Per-request window ring: released with the req slot, yet cached radix
+        # prefixes still report window evictable; counting it drives usage negative.
+        req_ring = is_swa_req_ring(self.token_to_kv_pool_allocator)
+        window_stats = []
+        for window in self._in_tree_order(windows):
+            capacity, available = window.capacity, window.available
+            if is_cp_sharded_padded():
+                capacity = from_cp_sharded(capacity)
+                available = from_cp_sharded(available)
+            evictable = 0 if req_ring else self._window_evictable_size(window.name)
+            num_used = capacity - (available + evictable)
+            if self.enable_hisparse:
+                num_used = max(0, num_used)
+            if not capacity:
+                num_used, available, token_usage = 0, 0, 0.0
+            else:
+                token_usage = num_used / capacity
+            window_stats.append(
+                WindowPoolStats(
+                    name=window.label,
+                    sub_pool=window.name,
+                    capacity=capacity,
+                    available_size=available,
+                    evictable_size=evictable,
+                    num_used=num_used,
+                    token_usage=token_usage,
+                )
+            )
 
         return PoolStats(
-            is_hybrid_swa=True,
+            full_capacity=full_capacity,
             full_num_used=full_num_used,
             full_token_usage=full_token_usage,
             full_available_size=full_available_size,
             full_evictable_size=full_evictable_size,
-            swa_num_used=swa_num_used,
-            swa_token_usage=swa_token_usage,
-            swa_available_size=swa_available_size,
-            swa_evictable_size=swa_evictable_size,
+            windows=tuple(window_stats),
+            target_window=window_sub_pool_of(self.token_to_kv_pool_allocator),
         )

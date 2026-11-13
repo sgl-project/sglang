@@ -87,8 +87,9 @@ class Hf3fsMockClient(Hf3fsClient):
             size = tensor.numel() * tensor.itemsize
 
             try:
-                os.lseek(self.file, offset, os.SEEK_SET)
-                bytes_read = os.read(self.file, size)
+                # pread/pwrite do not touch the shared fd offset, so concurrent
+                # reads and writes from different threads cannot interleave.
+                bytes_read = os.pread(self.file, size, offset)
 
                 if len(bytes_read) == size:
                     # Convert bytes to tensor and copy to target
@@ -122,8 +123,7 @@ class Hf3fsMockClient(Hf3fsClient):
                 tensor_bytes = tensor.contiguous().view(torch.uint8).flatten()
                 data = tensor_bytes.numpy().tobytes()
 
-                os.lseek(self.file, offset, os.SEEK_SET)
-                bytes_written = os.write(self.file, data)
+                bytes_written = os.pwrite(self.file, data, offset)
 
                 if bytes_written == size:
                     results.append(size)

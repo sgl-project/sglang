@@ -17,7 +17,12 @@ from sglang.test.test_utils import (
     write_github_step_summary,
 )
 
-register_amd_ci(est_time=3600, suite="nightly-8-gpu-qwen3-235b", nightly=True)
+register_amd_ci(
+    est_time=3600,
+    suite="nightly-8-gpu-qwen3-235b",
+    nightly=True,
+    disabled="Older model generation; AMD nightly keeps the latest two per family",
+)
 
 QWEN3_MODEL_PATH = "Qwen/Qwen3-235B-A22B-Instruct-2507-FP8"
 SERVER_LAUNCH_TIMEOUT = 3600
@@ -60,7 +65,7 @@ class TestQwen3Instruct2507FP8(CustomTestCase):
             num_questions=1319,
             parallel=1319,
             max_new_tokens=512,
-            host="http://127.0.0.1",
+            host="127.0.0.1",
             port=int(self.base_url.split(":")[-1]),
         )
         metrics = run_eval_few_shot_gsm8k(args)

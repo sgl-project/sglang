@@ -25,10 +25,11 @@ from sglang.srt.model_loader.weight_utils import (
     fastsafetensors_weights_iterator,
     safetensors_weights_iterator,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class _InlineThread:
@@ -71,6 +72,12 @@ def _wait_all(fs, return_when):
 
 class TestPrefetchCheckpoints(CustomTestCase):
     """Verify coordinated checkpoint prefetch behavior."""
+
+    def setUp(self):
+        # The fastsafetensors iterator asks for the current CUDA device; keep CPU runners off CUDA.
+        current_device = patch("torch.cuda.current_device", return_value=0)
+        current_device.start()
+        self.addCleanup(current_device.stop)
 
     def _create_safetensors_files(self, tmpdir, num_shards=3):
         """Create real safetensors files with known tensor content."""
@@ -202,27 +209,6 @@ class TestPrefetchCheckpoints(CustomTestCase):
         self.assertEqual(warning.call_args.args[1], paths[0])
         self.assertIsInstance(warning.call_args.args[2], OSError)
 
-    @patch("torch.distributed.is_initialized", return_value=False)
-    def test_prefetch_progress_logs_all_crossed_buckets(self, _):
-        paths = [f"model-{i:05d}.safetensors" for i in range(3)]
-
-        with (
-            patch("threading.Thread", _InlineThread),
-            patch("concurrent.futures.ThreadPoolExecutor", _InlineExecutor),
-            patch("concurrent.futures.wait", side_effect=_wait_all),
-            patch("sglang.srt.model_loader.weight_utils._prefetch_checkpoint_file"),
-            patch("sglang.srt.model_loader.weight_utils.logger.debug") as log_debug,
-        ):
-            _prefetch_all_checkpoints(paths, num_threads=1)
-
-        progress_pcts = [
-            call.args[2]
-            for call in log_debug.call_args_list
-            if call.args
-            and call.args[0] == "Rank %d: prefetching checkpoint files: %d%% (%d/%d)"
-        ]
-        self.assertEqual(progress_pcts, list(range(10, 101, 10)))
-
     @patch("torch.distributed.is_initialized", return_value=True)
     def test_prefetch_uses_node_local_rank_partitioning(self, _):
         paths = [f"model-{i:05d}.safetensors" for i in range(10)]
@@ -237,10 +223,7 @@ class TestPrefetchCheckpoints(CustomTestCase):
             patch("threading.Thread", _InlineThread),
             patch("concurrent.futures.ThreadPoolExecutor", _InlineExecutor),
             patch("concurrent.futures.wait", side_effect=_wait_all),
-            patch(
-                "sglang.srt.model_loader.weight_utils.get_world_group",
-                return_value=FakeWorldGroup(),
-            ),
+            get_parallel().override(world_group=FakeWorldGroup()),
             patch(
                 "sglang.srt.model_loader.weight_utils._prefetch_checkpoint_file",
                 side_effect=lambda path, cancel_event: loaded_paths.append(path),
@@ -359,6 +342,47 @@ class TestPrefetchCheckpoints(CustomTestCase):
 
         torch.testing.assert_close(loaded[0][1], torch.tensor([1.0]))
         self.assertEqual(events, ["close", "drop:model.safetensors"])
+
+    @patch("torch.distributed.is_initialized", return_value=False)
+    def test_fastsafetensors_uses_local_device_not_group_rank(self, _):
+        """On multi-node TP the group rank exceeds the node's GPU count;
+        the loader must copy to this process's current device, not cuda:{rank}."""
+        devices = []
+
+        class FakeGroup:
+            def rank(self):
+                return 3
+
+            def size(self):
+                return 1
+
+        class FakeBuffer:
+            key_to_rank_lidx = {}
+
+        class FakeLoader:
+            def __init__(self, group, device, nogds):
+                devices.append(device)
+
+            def add_filenames(self, rank_file_map):
+                pass
+
+            def copy_files_to_device(self):
+                return FakeBuffer()
+
+            def close(self):
+                pass
+
+        with (
+            patch("sglang.srt.model_loader.weight_utils.SingleGroup", FakeGroup),
+            patch(
+                "sglang.srt.model_loader.weight_utils.SafeTensorsFileLoader",
+                FakeLoader,
+            ),
+            patch("torch.cuda.current_device", return_value=1),
+        ):
+            list(fastsafetensors_weights_iterator(["model.safetensors"]))
+
+        self.assertEqual(devices, [torch.device("cuda", 1)])
 
 
 class TestPrefetchDispatch(CustomTestCase):

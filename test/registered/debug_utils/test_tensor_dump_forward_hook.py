@@ -11,14 +11,15 @@ from sglang.srt.debug_utils.tensor_dump_forward_hook import (
 from sglang.srt.distributed.parallel_state import get_default_distributed_backend
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import LinearBase
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.models.qwen2 import Qwen2MLP
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
-from sglang.srt.utils import add_prefix, get_device
+from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.layer_ut_utils import init_single_process_dist
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=9, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=13, stage="base-b", runner_config="1-gpu-small")
 # Backend-specific: the hook resolves get_device() and the matching distributed
 # backend, so only an AMD run exercises the HIP device and dump path.
 register_amd_ci(est_time=15, suite="stage-b-test-1-gpu-small-amd")
