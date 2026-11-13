@@ -99,12 +99,6 @@ struct RopeParams {
   inline int64_t rows() const {
     return batches * seqlen;
   }
-  inline int64_t q_offset(int64_t batch, int64_t seq, int64_t head) const {
-    return batch * q_strideB + seq * q_strideS + head * q_strideH;
-  }
-  inline int64_t q_out_offset(int64_t batch, int64_t seq, int64_t head) const {
-    return batch * q_out_strideB + seq * q_out_strideS + head * q_out_strideH;
-  }
   inline std::array<int64_t, 4> row_offsets(int64_t row, int64_t b, int64_t s) const {
     std::array<int64_t, 4> offsets{
         b * q_strideB + s * q_strideS,
@@ -375,10 +369,11 @@ void apply_rotary_embedding_single_kernel_impl(
           cos + seq * cos_stride_s,
           sin + seq * sin_stride_s,
       };
+      const auto offsets = p.row_offsets(row, batch, seq);
 
       for (int64_t head = 0; head < p.num_heads; ++head) {
-        const scalar_t* input_row = input + p.q_offset(batch, seq, head);
-        scalar_t* output_row = output + p.q_out_offset(batch, seq, head);
+        const scalar_t* input_row = input + offsets[0] + head * p.q_strideH;
+        scalar_t* output_row = output + offsets[2] + head * p.q_out_strideH;
         RotaryEmbedInternal<scalar_t, RotaryMode::Interleaved>::apply(
             output_row, input_row, cache, static_cast<int>(p.rotary_dim));
       }
