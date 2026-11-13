@@ -588,8 +588,15 @@ jobs:
 
       - name: Run test
         timeout-minutes: ${{ (inputs.runner_arch || 'mi300') == 'mi300' && 90 || 75 }}
+        env:
+          CI_ROCM_VERSION: ${{ matrix.rocm_version }}
+          CI_AMD_RUNNER_ARCH: ${{ inputs.runner_arch || 'mi300' }}
         run: |
-          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-1-gpu-small-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 8 --timeout-per-file 2400 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+          partition_model_args=()
+          if [[ "$CI_ROCM_VERSION" == "rocm10" && "$CI_AMD_RUNNER_ARCH" == "mi300" ]]; then
+            partition_model_args=(--partition-model-file /sglang-checkout/scripts/ci/amd/partition-model-mi300-rocm10.json)
+          fi
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-1-gpu-small-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 8 --timeout-per-file 2400 "${partition_model_args[@]}" ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
   stage-b-test-1-gpu-small-amd-nondeterministic:
     name: ${{ format('stage-b-test-1-gpu-small-amd-nondeterministic ({0}, linux-{1}-1gpu-sglang)', matrix.rocm_version, inputs.runner_arch || 'mi300') }}
