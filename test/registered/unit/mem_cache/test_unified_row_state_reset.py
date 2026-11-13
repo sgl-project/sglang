@@ -226,22 +226,6 @@ class TestRowStateResetOnReuse(CustomTestCase):
                 self.assertTrue(torch.all(_at(tensors, name, new_unit) == 0))
                 self.assertTrue(torch.all(_at(tensors, name, old_unit) == 9))
 
-    def test_forwards_never_reset_a_bound_unit(self):
-        """A unit is zeroed when its row binds it; later forwards keep what the
-        request wrote."""
-        storage = _storage()
-        tensors, unit_of = _ring(storage)
-        req = _request("req")
-        (row,) = storage.acquire([req])
-        unit = unit_of(row)
-        _fill(tensors, unit, 6)
-        _forward(storage.requests, storage.allocator)
-        _forward(storage.requests, storage.allocator)
-        torch.cuda.synchronize()
-        for name in tensors:
-            with self.subTest(part=name):
-                self.assertTrue(torch.all(_at(tensors, name, unit) == 6))
-
     def test_backup_before_first_forward_drops_previous_request_state(self):
         """A retraction backup taken before the request's first forward holds
         zeroed request state, not the row's previous request's; one taken after

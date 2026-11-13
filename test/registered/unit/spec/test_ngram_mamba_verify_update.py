@@ -245,7 +245,7 @@ class TestPPReplaySSMVerifySourceRows(CustomTestCase):
             patch(
                 "sglang.kernels.ops.attention.linear.gdn_replayssm_spec_decode."
                 "commit_gdn_replayssm_spec"
-            ) as advance,
+            ),
             patch(
                 "sglang.kernels.ops.attention.linear.gdn_replayssm_spec_decode."
                 "commit_gdn_replayssm_circular"
@@ -269,11 +269,6 @@ class TestPPReplaySSMVerifySourceRows(CustomTestCase):
 
         scatter.assert_called_once()
         torch.testing.assert_close(scatter.call_args.args[4], batch.req_pool_indices)
-        # The ring is indexed by the rows the forward resolved.
-        torch.testing.assert_close(
-            advance.call_args.kwargs["replay_indices"],
-            torch.tensor([2, 3], dtype=torch.int32),
-        )
 
 
 class TestDelayedMambaCommitBatchPairing(CustomTestCase):

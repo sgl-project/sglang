@@ -295,9 +295,10 @@ def size_plan(
 ) -> SizedKVStorage:
     """Solve all declared storage against one unsubtracted byte budget.
 
-    State and request units are boot targets. The arena may give state more slots at runtime,
-    and FULL may grow into the whole arena: ``max_total_tokens`` sizes the FULL
-    target, it does not cap allocation. Captured fixed extents never grow.
+    State and request units are boot targets. The arena may give state more
+    slots at runtime, and FULL may grow into the whole arena:
+    ``max_total_tokens`` sizes the FULL target, it does not cap allocation.
+    Captured fixed extents never grow.
     """
     if inp.alignment <= 0 or not 0 <= inp.state_share < 1:
         raise ValueError("invalid sizing alignment or state share")

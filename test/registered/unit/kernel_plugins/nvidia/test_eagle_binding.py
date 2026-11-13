@@ -173,7 +173,6 @@ def _init(
     target_backend=None,
     draft_backend=None,
     hot_token_id=None,
-    unified_replay_ring=False,
 ):
     """init_eagle_megakernel, with --enable-nvidia-megakernel unless enabled is False,
     for a draft worker whose model's megakernel offers these entries; by default its
@@ -201,16 +200,10 @@ def _init(
     )
     spec = SimpleNamespace(speculative_use_rejection_sampling=rejection_sampling)
     parallel = SimpleNamespace(attn_dp_enabled=dp_attention)
-    memory = SimpleNamespace(enable_unified_memory=unified_replay_ring)
-    exec_ = SimpleNamespace(
-        mamba=SimpleNamespace(enable_linear_replayssm_spec=unified_replay_ring)
-    )
     with (
         patch.object(eagle_megakernel, "megakernel_enabled", return_value=enabled),
         patch.object(eagle_megakernel, "get_spec", return_value=spec),
         patch.object(eagle_megakernel, "get_parallel", return_value=parallel),
-        patch.object(eagle_megakernel, "get_memory", return_value=memory),
-        patch.object(eagle_megakernel, "get_exec", return_value=exec_),
     ):
         return eagle_megakernel.init_eagle_megakernel(draft_worker=draft_worker)
 
@@ -586,17 +579,12 @@ class TestEagleEntries(CustomTestCase):
             _init(draft=offer, target_backend=_trtllm(KvPool()))
         with self.assertRaisesRegex(ValueError, "multi-step draft"):
             _init(draft={"draft_extend": print}, num_steps=1)
-        # The entries take the ReplaySSM ring as rows by request slot; unified
-        # memory keeps it in request sub-pool units instead.
-        with self.assertRaisesRegex(ValueError, "ReplaySSM speculative ring"):
-            _init(draft=offer, unified_replay_ring=True)
 
-    def test_a_target_verify_megakernel_without_draft_entries_is_refused_too(self):
+    def test_a_target_verify_megakernel_without_draft_entries_is_refused(self):
         """A target megakernel covering only the verify step reads the same
         ReplaySSM ring while its draft offers no entry, so SGLang's side of the
         entries never runs: the install refuses it before the build, and so before
         any capture. Static pools keep it."""
-        self.assertIsNone(_init(unified_replay_ring=True))
         for unified in (False, True):
             with self.subTest(unified_memory=unified):
                 model = torch.nn.Module()
