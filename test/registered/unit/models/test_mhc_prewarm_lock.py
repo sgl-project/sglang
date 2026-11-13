@@ -11,6 +11,7 @@ import multiprocessing
 import runpy
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from contextlib import contextmanager, nullcontext
@@ -52,12 +53,12 @@ class TestMhcPrewarmLock(unittest.TestCase):
         # These CPU-only workers inherit only the test's lightweight imports.
         self.ctx = multiprocessing.get_context("fork")
 
-    def worker(self, wait, release=None):
+    def worker(self, wait, release=None, tag="bucket"):
         reader, writer = self.ctx.Pipe(duplex=False)
 
         def run():
             writer.send("started")
-            with claim("bucket", wait=wait, timeout=5) as own:
+            with claim(tag, wait=wait, timeout=5) as own:
                 writer.send(own)
                 if release is not None:
                     release.wait(10)
@@ -100,8 +101,7 @@ class TestMhcPrewarmLock(unittest.TestCase):
                 with claim("bucket", wait=True, timeout=0) as own:
                     self.assertTrue(own)
 
-    def test_lock_failures_preserve_full_replay(self):
-        replay = Mock()
+    def mock_prewarm(self, replay):
         residual = Mock(shape=(128, 4, 4096), device="cuda:0")
         residual.new_zeros.side_effect = lambda tokens, *args: tokens
         torch = Mock(inference_mode=nullcontext, version=Mock(hip=None))
@@ -118,6 +118,41 @@ class TestMhcPrewarmLock(unittest.TestCase):
                 get_mhc_pre_token_count_representatives=lambda *args: (64, 128),
             )
         )
+        return residual
+
+    def test_peer_owned_bucket_replays_after_release(self):
+        events = []
+        replay = Mock(side_effect=lambda tokens, *args, **kwargs: events.append(tokens))
+        residual = self.mock_prewarm(replay)
+        release = self.ctx.Event()
+        owner, result = self.worker(
+            False, release, tag="mhc_pre_sm100_h4x4096_sNone_None_m128"
+        )
+        self.assertTrue(result.poll(10))
+        self.assertTrue(result.recv())
+
+        prewarm = threading.Thread(
+            target=scope["prewarm_mhc_pre"], args=(residual, *([None] * 12))
+        )
+        prewarm.start()
+        deadline = time.monotonic() + 10
+        while events != [64] and time.monotonic() < deadline:
+            time.sleep(0.01)
+        time.sleep(0.3)
+        self.assertEqual(events, [64])
+        events.append("release")
+        release.set()
+        prewarm.join(10)
+        self.assertFalse(prewarm.is_alive())
+        self.assertEqual(events, [64, "release", 128])
+        for call in replay.call_args_list:
+            self.assertIs(call.kwargs["symmetric_output"], False)
+        owner.join(10)
+        self.assertEqual(owner.exitcode, 0)
+
+    def test_lock_failures_preserve_full_replay(self):
+        replay = Mock()
+        residual = self.mock_prewarm(replay)
 
         error = OSError(errno.EROFS, "read-only filesystem")
         file = Mock()

@@ -930,7 +930,7 @@ def prewarm_mhc_pre(
         max_num_tokens, hc_mult * hidden_size
     )
 
-    logger.info("DeepSeek V4 MHC prenorm prewarm: %d n_splits buckets", len(buckets))
+    logger.info("MHC prenorm prewarm: %d n_splits buckets", len(buckets))
 
     def replay(num_tokens: int) -> None:
         mhc_pre(
@@ -947,6 +947,9 @@ def prewarm_mhc_pre(
             n_splits_pre,
             norm_weight=norm_weight,
             norm_eps=norm_eps,
+            # Ranks replay buckets in different orders, so their allocations
+            # must not touch the symmetric pool.
+            symmetric_output=False,
         )
 
     props = torch.cuda.get_device_properties(residual.device)
@@ -972,7 +975,7 @@ def prewarm_mhc_pre(
                 pass
             replay(num_tokens)
     logger.info(
-        "DeepSeek V4 MHC prenorm prewarm: claimed %d buckets, %d held by peers",
+        "MHC prenorm prewarm: claimed %d buckets, %d held by peers",
         len(buckets) - len(taken_by_peers),
         len(taken_by_peers),
     )
@@ -1170,9 +1173,12 @@ def mhc_pre(
     norm_weight: torch.Tensor | None = None,
     norm_eps: float | None = None,
     eps_outside_sqrt: bool = False,
+    symmetric_output: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """``eps_outside_sqrt`` normalizes by ``1 / (sqrt(mean_sq) + eps)`` instead of
-    ``rsqrt(mean_sq + eps)``; set it to the formula the checkpoint was trained with."""
+    ``rsqrt(mean_sq + eps)``; set it to the formula the checkpoint was trained with.
+    ``symmetric_output=False`` keeps ``layer_input`` out of the symmetric memory
+    pool, whose growth is a collective call every TP rank must make in step."""
     assert residual.dtype == torch.bfloat16
     assert fn.dtype == torch.float32
     assert hc_scale.dtype == torch.float32
@@ -1207,7 +1213,8 @@ def mhc_pre(
     # output back into this buffer, so a symmetric input yields a symmetric
     # all-reduce input.
     with use_symmetric_memory(
-        get_parallel().tp_group, disabled=not is_allocation_symmetric()
+        get_parallel().tp_group,
+        disabled=not symmetric_output or not is_allocation_symmetric(),
     ):
         layer_input = torch.empty(
             num_tokens, hidden_size, dtype=torch.bfloat16, device=residual.device
