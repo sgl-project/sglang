@@ -421,11 +421,15 @@ On supported deployments, delete the job to request cancellation. Retrying
 generation creates another job, so retain and poll the returned ID.
 
 `DELETE /v1/videos/&#123;video_id&#125;` removes the API record and requests
-cancellation: a cancelled queued job does not start, and a running job stops after its
-current denoising step, on each rank of its replica. The stages that follow
-denoising, such as decoding, do not run. A job deleted after its last denoising
-step still decodes and saves or uploads its output, but the API does not return
-it. Cancelled jobs are excluded before dynamic batching. Once a batch starts,
+cancellation: a cancelled queued job does not start. Running jobs check at stage
+boundaries and between sampling steps, independently of progress reporting.
+All ranks of a replica stop together. If cancellation arrives during encoding or
+decoding, that stage may finish, but subsequent stages are skipped once the
+request is observed. Rank-only stages check at executor boundaries, not inside
+their sampling loops. There is also a check before output finalization is started
+or handed to a background thread. Already submitted GPU kernels and ongoing
+saves or uploads are not interrupted; the API does not return deleted jobs.
+Cancelled jobs are excluded before dynamic batching. Once a batch starts,
 it runs to the end unless every member is cancelled.
 
 If a replica's cancellation channel is not connected or its queue is full,

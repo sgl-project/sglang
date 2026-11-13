@@ -21,9 +21,9 @@ from sgl_kernel import fp8_scaled_mm as sgl_scaled_mm
 from sglang.kernels.ops.quantization.per_tensor_quant_fp8 import (
     per_tensor_quant_fp8,
 )
-from sglang.utils import is_in_ci
+from sglang.srt.environ import envs
 
-IS_CI = is_in_ci()
+IS_CI = envs.SGLANG_IS_IN_CI.get()
 
 # (N, K) shapes targeting each dispatch bucket boundary.
 # Spans M16_smallN / M16_largeN / M32_largeN / M64_smallN / M64_largeN /
