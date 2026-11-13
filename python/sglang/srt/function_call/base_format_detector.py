@@ -153,16 +153,16 @@ class BaseFormatDetector(ABC):
                 and current_text.startswith(self.tool_call_separator)
             )
         ):
-            # Only clear buffer if we're sure no tool call is starting
-            if not self._ends_with_partial_token(self._buffer, self.bot_token):
-                normal_text = self._buffer
-                self._buffer = ""
-                if self.eot_token in normal_text:
-                    normal_text = normal_text.replace(self.eot_token, "")
-                return StreamingParseResult(normal_text=normal_text)
-            else:
-                # Might be partial bot_token, keep buffering
-                return StreamingParseResult()
+            # Hold back only a trailing partial bot_token. Text before it is
+            # ordinary content: keeping it buffered loses it, because the
+            # branch below drops everything preceding the bot_token once the
+            # tool call is confirmed.
+            partial_len = self._ends_with_partial_token(self._buffer, self.bot_token)
+            normal_text = self._buffer[: len(self._buffer) - partial_len]
+            self._buffer = self._buffer[len(self._buffer) - partial_len :]
+            if self.eot_token in normal_text:
+                normal_text = normal_text.replace(self.eot_token, "")
+            return StreamingParseResult(normal_text=normal_text)
 
         # Build tool indices if not already built
         if not hasattr(self, "_tool_indices"):
