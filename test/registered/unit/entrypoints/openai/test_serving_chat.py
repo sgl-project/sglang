@@ -1940,6 +1940,7 @@ class ServingChatTestCase(CustomTestCase):
 
     def test_convert_to_internal_request_input_ids_bypasses_template(self):
         self.tm.tokenizer = None
+        self.template_manager.chat_template_name = "llama-2"
         req = ChatCompletionRequest(
             model="x",
             messages=[{"role": "user", "content": "Hi?"}],
@@ -1960,10 +1961,74 @@ class ServingChatTestCase(CustomTestCase):
         self.assertEqual(processed, req)
         self.assertEqual(adapted.input_ids, [101, 102, 103])
         self.assertTrue(adapted.return_prompt_token_ids)
-        self.assertEqual(adapted.sampling_params["stop"], ["STOP"])
+        # The template is not rendered, but its stop strings still apply.
+        self.assertEqual(
+            adapted.sampling_params["stop"],
+            ["[INST]", "[/INST]", "<<SYS>>", "<</SYS>>", "STOP"],
+        )
         self.assertEqual(adapted.cache_salt, "tenant-a")
         self.assertEqual(adapted.extra_key, "classification")
         conv_mock.assert_not_called()
+
+    def test_convert_to_internal_request_input_ids_jinja_template(self):
+        self.tm.tokenizer = None
+        self.template_manager.chat_template_name = None
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            input_ids=[101, 102, 103],
+            stop=["STOP"],
+        )
+
+        adapted, _ = self.chat._convert_to_internal_request(req, self.fastapi_request)
+
+        # No conversation template: only the request stops apply.
+        self.assertEqual(adapted.sampling_params["stop"], ["STOP"])
+
+    def test_convert_to_internal_request_input_ids_ignore_eos(self):
+        self.tm.tokenizer = None
+        self.template_manager.chat_template_name = "llama-2"
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            input_ids=[101, 102, 103],
+            stop=["STOP"],
+            ignore_eos=True,
+        )
+
+        adapted, _ = self.chat._convert_to_internal_request(req, self.fastapi_request)
+
+        self.assertEqual(adapted.sampling_params["stop"], ["STOP"])
+
+    def test_convert_to_internal_request_input_ids_template_stops_only(self):
+        self.tm.tokenizer = None
+        self.template_manager.chat_template_name = "llama-2"
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            input_ids=[101, 102, 103],
+        )
+
+        adapted, _ = self.chat._convert_to_internal_request(req, self.fastapi_request)
+
+        self.assertEqual(
+            adapted.sampling_params["stop"],
+            ["[INST]", "[/INST]", "<<SYS>>", "<</SYS>>"],
+        )
+
+    def test_convert_to_internal_request_input_ids_string_template_stop(self):
+        self.tm.tokenizer = None
+        self.template_manager.chat_template_name = "phi-4-mm"
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            input_ids=[101, 102, 103],
+            stop=["STOP"],
+        )
+
+        adapted, _ = self.chat._convert_to_internal_request(req, self.fastapi_request)
+
+        self.assertEqual(adapted.sampling_params["stop"], ["<|end|>", "STOP"])
 
     def test_kimi_k3_usage_excludes_assistant_generation_stub(self):
         _use_chat_encoding(self.chat, "kimi_k3")
