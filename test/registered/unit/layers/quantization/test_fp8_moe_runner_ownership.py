@@ -49,6 +49,72 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 _ACTIVATION_PARAMS = ("gemm1_alpha", "gemm1_beta", "gemm1_clamp_limit")
 
 
+class TestMxfp8CapabilityGate(CustomTestCase):
+    """MXFP8 keeps its SM100 gate unless the MoE runner is marlin or lora_marlin,
+    which serve the experts W8A16 on SM90 (dense MXFP8 layers are then admitted
+    one by one when they load); no other backend lowers it, and the gate of
+    plain FP8 does not move."""
+
+    def test_only_the_marlin_runners_lower_the_mxfp8_gate(self):
+        config = Fp8Config(is_checkpoint_fp8_serialized=True, use_mxfp8=True)
+        with patch("sglang.srt.layers.quantization.fp8._is_cuda", True):
+            for backend, expected in (
+                (MoeRunnerBackend.AUTO, 100),
+                (MoeRunnerBackend.TRITON, 100),
+                (MoeRunnerBackend.FLASHINFER_TRTLLM, 100),
+                (MoeRunnerBackend.LORA_CUTEDSL, 100),
+                (MoeRunnerBackend.MARLIN, 90),
+                (MoeRunnerBackend.LORA_MARLIN, 90),
+            ):
+                with (
+                    self.subTest(backend.value),
+                    get_flags().moe.override(runner_backend=backend),
+                ):
+                    self.assertEqual(config.get_min_capability(), expected)
+            with get_flags().moe.override(runner_backend=MoeRunnerBackend.MARLIN):
+                block_fp8 = Fp8Config(
+                    is_checkpoint_fp8_serialized=True, weight_block_size=[128, 128]
+                )
+                self.assertEqual(block_fp8.get_min_capability(), 80)
+
+
+class TestMxfp8DenseAdmission(CustomTestCase):
+    """A dense MXFP8 layer on a device with no MXFP8 GEMM backend (before
+    Blackwell without DeepGEMM, or with it disabled) is refused when its
+    weights are created, naming the layer, its shape, the device and the
+    requested backend, instead of failing in its first forward. Dense layers
+    kept BF16 through ignored_layers never build this method, so the
+    experts-only Marlin configuration is untouched."""
+
+    def test_unsupported_backend_is_refused_at_weight_creation(self):
+        from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+        from sglang.srt.layers.quantization.fp8_utils import Mxfp8DenseGemmBackend
+
+        with patch.object(
+            fp8_module,
+            "resolve_mxfp8_dense_gemm_backend",
+            return_value=Mxfp8DenseGemmBackend.UNSUPPORTED,
+        ):
+            method = Fp8LinearMethod(
+                Fp8Config(is_checkpoint_fp8_serialized=True, use_mxfp8=True)
+            )
+        layer = torch.nn.Module()
+        with self.assertRaisesRegex(
+            RuntimeError,
+            r"MXFP8 dense weight \(512, 256\) of Module has no GEMM backend"
+            r".*marlin / lora_marlin",
+        ):
+            method.create_weights(
+                layer,
+                input_size_per_partition=256,
+                output_partition_sizes=[512],
+                input_size=256,
+                output_size=512,
+                params_dtype=torch.bfloat16,
+            )
+        self.assertEqual(len(list(layer.parameters())), 0)
+
+
 class TestFp8MoERunnerOwnership(CustomTestCase):
     def setUp(self):
         moe = get_flags().moe

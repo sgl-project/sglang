@@ -181,6 +181,60 @@ class TestNvfp4MoeScaleLoading(CustomTestCase):
                             up_alpha, torch.tensor([0.5 * (reload + 1)])
                         )
 
+    def test_swizzled_block_scales_exist_only_for_runners_that_read_them(self):
+        """create_weights builds the swizzled copies of the block scales for
+        the runners that read them; the lora_* runners read the checkpoint
+        form (lora_cutedsl packs its own atoms, lora_marlin repacks tiles), so
+        they get none and the checkpoint-form parameters stay."""
+        readers = (MoeRunnerBackend.FLASHINFER_CUTLASS,)
+        non_readers = (MoeRunnerBackend.LORA_CUTEDSL, MoeRunnerBackend.LORA_MARLIN)
+        for backend in readers + non_readers:
+            with (
+                self.subTest(backend=backend),
+                get_flags().moe.override(
+                    runner_backend=backend, a2a_backend=MoeA2ABackend.NONE
+                ),
+                mock.patch.object(
+                    modelopt_quant,
+                    "get_platform",
+                    return_value=SimpleNamespace(is_blackwell=True),
+                ),
+                mock.patch.object(modelopt_quant, "is_cuda", return_value=False),
+            ):
+                method = ModelOptNvFp4FusedMoEMethod(
+                    modelopt_quant.ModelOptFp4Config(
+                        is_checkpoint_nvfp4_serialized=True,
+                        group_size=16,
+                        use_per_token_activation=False,
+                    )
+                )
+                layer = torch.nn.Module()
+                layer.moe_runner_config = MoeRunnerConfig(is_gated=True)
+                layer.num_experts = layer.num_local_experts = 2
+                method.create_weights(
+                    layer=layer,
+                    num_experts=2,
+                    hidden_size=128,
+                    intermediate_size_per_partition=128,
+                    params_dtype=torch.bfloat16,
+                )
+                swizzled = (layer.w13_blockscale_swizzled, layer.w2_blockscale_swizzled)
+                if backend in readers:
+                    self.assertEqual(tuple(swizzled[0].shape), (2, 256, 8))
+                    self.assertEqual(tuple(swizzled[1].shape), (2, 128, 8))
+                else:
+                    self.assertEqual(swizzled, (None, None))
+                    self.assertNotIn(
+                        "w13_blockscale_swizzled", dict(layer.named_parameters())
+                    )
+                    self.assertNotIn(
+                        "w2_blockscale_swizzled", dict(layer.named_parameters())
+                    )
+                # The checkpoint form is registered either way.
+                self.assertEqual(tuple(layer.w13_weight_scale.shape), (2, 256, 8))
+                self.assertEqual(tuple(layer.w2_weight_scale.shape), (2, 128, 8))
+                self.assertEqual(layer.w13_weight_scale.dtype, torch.float8_e4m3fn)
+
     def test_non_gated_trtllm_loads_one_projection(self):
         with get_flags().moe.override(
             runner_backend=MoeRunnerBackend.FLASHINFER_TRTLLM,

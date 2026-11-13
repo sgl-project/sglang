@@ -276,6 +276,59 @@ class TestFp8BlockwiseLinearBackends(_LinearBackendCheck):
         self._run("cutlass")
 
 
+@unittest.skipIf(get_device_sm() != 90, "the Hopper MXFP8 dense admission check")
+class TestMxfp8DenseAdmissionOnHopper(_LinearBackendCheck):
+    """Hopper has no MXFP8 dense GEMM besides DeepGEMM's. Whether the installed
+    DeepGEMM takes per-row 32-wide K scale groups is probed once, so an MXFP8
+    dense layer either loads or fails while loading, naming its shape and the
+    experts-only Marlin path, never at its first forward."""
+
+    @staticmethod
+    def _build_layer(n: int, k: int):
+        quant_config = Fp8Config(
+            is_checkpoint_fp8_serialized=True,
+            activation_scheme="dynamic",
+            use_mxfp8=True,
+        )
+        layer = _make_linear(quant_config, n, k)
+        w = torch.randn((n, k), device="cuda", dtype=torch.bfloat16) / 10
+        w_fp8, scale_e8m0, w_dequant = _quantize_mxfp8(w)
+        load_linear_weights(layer, weight=w_fp8, weight_scale_inv=scale_e8m0)
+        return layer, w_dequant
+
+    def test_deep_gemm_admission_is_decided_while_loading(self):
+        n, k = 512, 512
+        layer, _ = self._build_layer(n, k)
+        backend = layer.quant_method.mxfp8_dense_backend
+        if backend is None or not backend.is_deep_gemm():
+            self.skipTest(f"SM90 MXFP8 dense layers resolve to {backend}, not DeepGEMM")
+        with (
+            mock.patch.object(fp8, "hopper_deepgemm_serves_mxfp8", return_value=False),
+            self.assertRaisesRegex(
+                RuntimeError,
+                r"MXFP8 dense weight \(512, 512\) of \w+ cannot run on this device"
+                r".*--moe-runner-backend marlin / lora_marlin",
+            ),
+        ):
+            layer.quant_method.process_weights_after_loading(layer)
+        half, _ = self._build_layer(n, k)
+        half.params_dtype = torch.float16
+        with self.assertRaisesRegex(RuntimeError, "BF16 only"):
+            half.quant_method.process_weights_after_loading(half)
+        # The real probe's verdict decides the real load.
+        layer, w_dequant = self._build_layer(n, k)
+        if fp8_utils.hopper_deepgemm_serves_mxfp8():
+            layer.quant_method.process_weights_after_loading(layer)
+            x = torch.randn((8, k), device="cuda", dtype=torch.bfloat16) / 10
+            out, _ = layer(x)
+            assert_output_close(
+                self, out, x.float() @ w_dequant.T, rtol=5e-2, atol=1e-1
+            )
+        else:
+            with self.assertRaisesRegex(RuntimeError, "cannot run on this device"):
+                layer.quant_method.process_weights_after_loading(layer)
+
+
 @unittest.skipIf(get_device_sm() < 90, "FP8 GEMM backends require SM90+")
 class TestMxfp8LinearBackends(_LinearBackendCheck):
     @staticmethod

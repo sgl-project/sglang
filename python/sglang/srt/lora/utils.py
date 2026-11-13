@@ -1,12 +1,16 @@
 import logging
 from dataclasses import dataclass
 from enum import Enum
-from typing import Iterable, List, Optional, Set, Tuple, Union
+from typing import Iterable, List, Optional, Set, Tuple
 
 import torch
 from torch import nn
 
 from sglang.srt.hf_transformers import AutoConfig
+from sglang.srt.lora.lora_config import (
+    PRESERVED_LORA_TARGET_NAMES,
+    get_normalized_target_modules,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 logger = logging.getLogger(__name__)
@@ -296,66 +300,6 @@ def get_default_hidden_dim(
         raise NotImplementedError("get_hidden_dim not implemented for " + module_name)
 
 
-def get_normalized_target_modules(
-    target_modules: Union[str, Iterable[str]],
-) -> set[str]:
-    """
-    Mapping a list of target module name to names of the normalized LoRA weights.
-    Handles both base module names (e.g., "gate_proj") and prefixed module names (e.g., "feed_forward.gate_proj").
-
-    The attention gate must be named "self_attn.gate_proj"; bare "gate_proj"
-    maps only to the MLP/MoE gate_up_proj.
-
-    Also handles PEFT shorthand strings like "all-linear" or "all" by returning
-    {"all"} as a sentinel value.  Callers that need a concrete module set
-    should use :func:`auto_detect_lora_target_modules` to resolve the shorthand
-    against the loaded base model.
-    """
-    # Handle PEFT shorthand strings — return {"all"} as sentinel.
-    # Callers can resolve to concrete names via auto_detect_lora_target_modules().
-    if isinstance(target_modules, str):
-        if target_modules not in ["all", "all-linear"]:
-            raise ValueError(
-                "Only 'all' or 'all-linear' can be used as the string for target module"
-            )
-        return {"all"}
-
-    params_mapping = {
-        "q_proj": "qkv_proj",
-        "k_proj": "qkv_proj",
-        "v_proj": "qkv_proj",
-        "gate_proj": "gate_up_proj",
-        "up_proj": "gate_up_proj",
-        "out_proj": "out_proj",
-        "embed_tokens": "embed_tokens",
-        "vocab_emb": "embed_tokens",
-        "embeddings": "embed_tokens",
-        "word_embeddings": "embed_tokens",
-        "lm_head": "lm_head",
-        "output": "lm_head",
-        "unembed_tokens": "lm_head",
-        "q_a_proj": "fused_qkv_a_proj_with_mqa",
-        "kv_a_proj_with_mqa": "fused_qkv_a_proj_with_mqa",
-        # DSA indexer projections are qualified with their parent module name
-        # because the bare leaf names collide with unrelated modules in other
-        # models (e.g. DeepSeek-V4 attention `wq_b`, Pixtral vision `wk`).
-        "wq_b": "indexer.wq_b",
-        "wk": "indexer.wk",
-        "weights_proj": "indexer.weights_proj",
-    }
-
-    result = set()
-    for name in target_modules:
-        qualified_name = ".".join(name.split(".")[-2:])
-        if qualified_name in PRESERVED_LORA_TARGET_NAMES:
-            result.add(qualified_name)
-            continue
-        base_name = name.split(".")[-1]
-        normalized_name = params_mapping.get(base_name, base_name)
-        result.add(normalized_name)
-    return result
-
-
 def get_stacked_multiply(
     module_name: str, base_model: Optional[torch.nn.Module] = None
 ) -> int:
@@ -411,8 +355,6 @@ ROW_PARALLELISM_LINEAR_LORA_NAMES = [
 DSA_INDEXER_LORA_NAMES = frozenset(
     {"indexer.wq_b", "indexer.wk", "indexer.weights_proj"}
 )
-# Preserve the parent because the leaf alone names an MLP projection.
-PRESERVED_LORA_TARGET_NAMES = frozenset({"self_attn.gate_proj"})
 REPLICATED_LINEAR_LORA_NAMES = [
     "fused_qkv_a_proj_with_mqa",
     "fc1_latent_proj",

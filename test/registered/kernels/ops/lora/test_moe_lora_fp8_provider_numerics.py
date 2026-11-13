@@ -160,6 +160,7 @@ def test_fp8_gateup_and_down_match_reference(vendor, rows, hidden_size):
         )
 
         state.act_quant = sglang_per_token_group_quant_fp8(act, _BLOCK)
+        state.act_quant_ready = True
         # The supplied FP8 operands must bypass the unused BF16 activation.
         act.fill_(float("nan"))
         down.fill_(float("nan"))

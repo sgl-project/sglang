@@ -12,6 +12,7 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
 )
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
+from sglang.srt.layers.moe.utils import get_moe_runner_backend
 from sglang.srt.layers.parameter import ChannelQuantScaleParameter, ModelWeightParameter
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
@@ -206,6 +207,8 @@ class W8A8FP8MoEMethod(FusedMoEMethodBase):
 
     def __init__(self, quant_config: W8A8Fp8Config):
         self.quant_config = quant_config
+        # --moe-runner-backend marlin / lora_marlin: W8A16 from Marlin tiles.
+        self.use_marlin = get_moe_runner_backend().reads_marlin_tiles()
 
     def create_weights(
         self,
@@ -278,11 +281,31 @@ class W8A8FP8MoEMethod(FusedMoEMethodBase):
         layer.w2_weight_scale = Parameter(
             layer.w2_weight_scale.data, requires_grad=False
         )
+        if self.use_marlin:
+            from sglang.srt.layers.quantization.marlin_utils_fp8 import (
+                repack_moe_fp8_layer_for_marlin,
+            )
+
+            repack_moe_fp8_layer_for_marlin(layer, "channel")
+
+    def get_marlin_quant_info(self, layer: torch.nn.Module):
+        from sglang.srt.layers.moe.moe_runner.marlin import (
+            build_marlin_fp8_moe_quant_info,
+        )
+
+        return build_marlin_fp8_moe_quant_info(layer)
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
+        if self.use_marlin:
+            from sglang.srt.layers.moe.moe_runner.marlin import (
+                marlin_base_moe_runner,
+            )
+
+            self.runner = marlin_base_moe_runner(moe_runner_config)
+            return
         self.runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
 
     def get_triton_quant_info(self, layer: torch.nn.Module) -> TritonMoeQuantInfo:
@@ -303,5 +326,9 @@ class W8A8FP8MoEMethod(FusedMoEMethodBase):
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
 
-        quant_info = self.get_triton_quant_info(layer)
+        quant_info = (
+            self.get_marlin_quant_info(layer)
+            if self.use_marlin
+            else self.get_triton_quant_info(layer)
+        )
         return self.runner.run(dispatch_output, quant_info)

@@ -5,6 +5,8 @@ Activations use group-128 quantization; GEMM outputs remain BF16 for LoRA.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
 
 from sglang.kernels.ops.lora.moe.dispatch_contiguous import (
@@ -16,7 +18,7 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
 )
 from sglang.srt.lora.moe.base_gemm_provider.base import (
     MoeBaseProviderContract,
-    expected_rows_per_expert,
+    RowBuffers,
     prepare_buffer,
 )
 from sglang.srt.lora.moe.base_gemm_provider.contiguous_row_domain import (
@@ -27,25 +29,38 @@ from sglang.srt.lora.moe.base_gemm_provider.cutedsl_common import CuteDslTileMix
 from sglang.srt.lora.moe.base_gemm_provider.masked_row_domain import (
     MaskedRowDomainProvider,
     MaskedRowState,
-    masked_m_max,
 )
 from sglang.srt.lora.moe.quant_info import MoeLoraFp8QuantInfo
+
+if TYPE_CHECKING:
+    from sglang.srt.lora.workspace import LoraWorkspace
 
 QUANT_GROUP = 128
 
 
-class _CuteDslFp8Mixin(CuteDslTileMixin):
+class CuteDslFp8Mixin(CuteDslTileMixin):
+    """FP8 rows with FP32 scales, one per 128 columns of a row; the per-channel
+    subclass keeps one per row."""
+
     _DTYPE_TAG = "fp8"
     WIDE_EXPECTED_M_THRESHOLD = 32
+    _PER_TOKEN = False
+    # Workspace names of the input rows' and the activation's scales.
+    _SCALE_BUFFERS = ("sf_rows", "act_scale")
+    # Whether the row state owns down-input buffers an activation can fill.
+    _OWNS_DOWN_INPUT = True
 
     @staticmethod
     def _prepare_input_rows(workspace, shape, device):
+        """The FP8 input rows of gate/up, packed at the front of the
+        ``base:down`` slab. Producer: the dispatch fill in prepare(). Last
+        consumer: the gate/up GEMM. The down GEMM overwrites the storage with
+        its BF16 output, on the same stream and after gate/up in every plan."""
         if workspace is None:
             return torch.empty(shape, dtype=torch.float8_e4m3fn, device=device)
         output = workspace.tensor(
             "base:down", shape, dtype=torch.bfloat16, device=device
         )
-        # Gate/up consumes the packed FP8 prefix before down overwrites the BF16 slab.
         return output.view(torch.float8_e4m3fn).flatten()[: output.numel()].view(shape)
 
     def _bind_weights(self, quant_info: MoeLoraFp8QuantInfo) -> None:
@@ -54,6 +69,105 @@ class _CuteDslFp8Mixin(CuteDslTileMixin):
 
     def _stage_scale(self, stage: str) -> torch.Tensor:
         return self._sf_w13 if stage == "gemm1" else self._sf_w2
+
+    def _row_scale_shape(self, lead: tuple, width: int) -> tuple:
+        return lead if self._PER_TOKEN else (*lead, width // QUANT_GROUP)
+
+    def _prepare_dummy(self, stage: str, config):
+        weight = self._stage_weight(stage)
+        device = weight.device
+        _, n, k = weight.shape
+        rows, scales, groups = self._dummy_layout(device)
+        return self._prepare_gemm(
+            torch.zeros((*rows, k), dtype=torch.float8_e4m3fn, device=device),
+            weight,
+            torch.zeros(
+                self._row_scale_shape(scales, k), dtype=torch.float32, device=device
+            ),
+            self._stage_scale(stage),
+            torch.empty((*rows, n), dtype=torch.bfloat16, device=device),
+            groups,
+            config=config,
+        )
+
+    def _input_buffers(
+        self,
+        workspace: LoraWorkspace | None,
+        prefix: str,
+        lead: tuple[int, ...],
+        hidden_states: torch.Tensor,
+    ) -> tuple[torch.Tensor, RowBuffers]:
+        """The row domains' hook for FP8 rows. ``rows`` is FP8; with a
+        workspace it is the front of the ``base:down`` slab (see
+        _prepare_input_rows). ``buffers``:
+
+          sf_rows             the rows' FP32 scales, one per 128 columns or one
+                              per row (``_PER_TOKEN``); the dispatch fill writes
+                              them with the rows
+          act_fp8, act_scale  the down GEMM's input and its scales, only when
+                              the row state owns them (``_OWNS_DOWN_INPUT``);
+                              the unfused activation writes them. When the
+                              activation left ``act_quant_ready`` false, down()
+                              writes them itself for one scale per row, and
+                              quantizes into tensors of its own for
+                              128-column groups
+        """
+        k, inter = hidden_states.size(1), self.quant_info.intermediate_size
+        device = hidden_states.device
+        sf_name, act_scale_name = self._SCALE_BUFFERS
+
+        def _buf(name, shape, dtype):
+            return prepare_buffer(
+                workspace, f"{prefix}:{name}", shape, dtype=dtype, device=device
+            )
+
+        rows = self._prepare_input_rows(workspace, (*lead, k), device)
+        buffers = dict(
+            sf_rows=_buf(sf_name, self._row_scale_shape(lead, k), torch.float32)
+        )
+        if self._OWNS_DOWN_INPUT:
+            buffers.update(
+                act_fp8=_buf("act_fp8", (*lead, inter), torch.float8_e4m3fn),
+                act_scale=_buf(
+                    act_scale_name, self._row_scale_shape(lead, inter), torch.float32
+                ),
+            )
+        return rows, buffers
+
+    def _fill_masked(
+        self, hidden_states, topk_ids, top_k, masked_m, pair_to_row, rows, buffers
+    ) -> None:
+        dispatch_fill_masked_fp8(
+            hidden_states,
+            topk_ids,
+            top_k,
+            masked_m_out=masked_m,
+            pair_to_row_out=pair_to_row,
+            rows_fp8_out=rows,
+            scale_out=buffers["sf_rows"],
+            per_token=self._PER_TOKEN,
+        )
+
+    def _fill_contiguous(
+        self, hidden_states, topk_ids, pair_to_row, seg_offsets, rows, buffers
+    ) -> None:
+        dispatch_fill_rows_contiguous_fp8(
+            hidden_states,
+            topk_ids,
+            pair_to_row,
+            rows_fp8_out=rows,
+            scale_out=buffers["sf_rows"],
+            per_token=self._PER_TOKEN,
+            seg_offsets=seg_offsets if self._fill_finalizes_map else None,
+        )
+
+    def _act_quant_target(self, row_state, fused, config):
+        # Only the unfused activation writes FP8; one scale per row when the
+        # group is the row width.
+        if fused or not self._OWNS_DOWN_INPUT:
+            return None
+        group = self.quant_info.intermediate_size if self._PER_TOKEN else QUANT_GROUP
+        return row_state.act_fp8, row_state.act_scale, group
 
     def _launch(
         self,
@@ -69,11 +183,13 @@ class _CuteDslFp8Mixin(CuteDslTileMixin):
         # Runtime wrapping must match the compiled argument's MLIR type.
         dyn = self._as_dynamic_cute_tensor
         a_rows = self._rows_arg(a_fp8)
+        scale_tail = () if self._PER_TOKEN else (-1,)
+        scale_dim = 1 + len(scale_tail)
         call.compiled_fn(
             dyn(a_rows, leading_dim=2),
             call.b_arg,
-            dyn(sf_tokens.view(*a_rows.shape[:2], -1), leading_dim=2),
-            dyn(call.sf_weights, leading_dim=2),
+            dyn(sf_tokens.view(*a_rows.shape[:2], *scale_tail), leading_dim=scale_dim),
+            dyn(call.sf_weights, leading_dim=scale_dim),
             dyn(self._rows_arg(c), leading_dim=2),
             dyn(self._group_arg(row_state), leading_dim=0),
             dyn(schedule, leading_dim=0),
@@ -106,6 +222,10 @@ class _CuteDslFp8Mixin(CuteDslTileMixin):
 
 
 class CuteDslFp8MaskedRowState(MaskedRowState, kw_only=True):
+    """MaskedRowState plus the buffers of CuteDslFp8Mixin._input_buffers() and
+    the schedule fields (CuteDslTileMixin._schedules()). The activation
+    wrappers assign ``act_quant_ready`` after every activation."""
+
     token_width: int
     sf_rows: torch.Tensor  # [E_local, m_max, hidden // 128] fp32 group scales
     gemm1_schedule: torch.Tensor
@@ -118,7 +238,7 @@ class CuteDslFp8MaskedRowState(MaskedRowState, kw_only=True):
     act_quant_ready: bool = False
 
 
-class CuteDslFp8MaskedProvider(_CuteDslFp8Mixin, MaskedRowDomainProvider):
+class CuteDslFp8MaskedProvider(CuteDslFp8Mixin, MaskedRowDomainProvider):
     contract = MoeBaseProviderContract(
         key="cutedsl_fp8_masked",
         quant_info_cls=MoeLoraFp8QuantInfo,
@@ -130,6 +250,7 @@ class CuteDslFp8MaskedProvider(_CuteDslFp8Mixin, MaskedRowDomainProvider):
     )
 
     _ROW_MODE = "masked"
+    _row_state_cls = CuteDslFp8MaskedRowState
 
     def __init__(self, quant_info: MoeLoraFp8QuantInfo):
         super().__init__(quant_info)
@@ -139,144 +260,10 @@ class CuteDslFp8MaskedProvider(_CuteDslFp8Mixin, MaskedRowDomainProvider):
             dual_stage_schedule_capacities_masked,
         )
 
-        self._prepare_masked_gemm = prepare_masked_fp8
+        self._prepare_gemm = prepare_masked_fp8
         self._build_schedules = build_dual_stage_schedules_masked
         self._schedule_capacities = dual_stage_schedule_capacities_masked
         self._init_tiles(quant_info)
-
-    def _prepare_dummy(self, stage: str, config):
-        weight, weight_sf = self._stage_weight(stage), self._stage_scale(stage)
-        device = weight.device
-        experts, n, k = weight.shape
-        dummy_a = torch.zeros(
-            (experts, 256, k), dtype=torch.float8_e4m3fn, device=device
-        )
-        dummy_sf = torch.zeros(
-            (experts, 256, k // QUANT_GROUP), dtype=torch.float32, device=device
-        )
-        dummy_c = torch.empty((experts, 256, n), dtype=torch.bfloat16, device=device)
-        dummy_masked = torch.zeros(experts, dtype=torch.int32, device=device)
-        return self._prepare_masked_gemm(
-            dummy_a,
-            weight,
-            dummy_sf,
-            weight_sf,
-            dummy_c,
-            dummy_masked,
-            config=config,
-        )
-
-    @staticmethod
-    def _rows_arg(tensor: torch.Tensor) -> torch.Tensor:
-        return tensor
-
-    @staticmethod
-    def _input_rows(row_state: CuteDslFp8MaskedRowState) -> torch.Tensor:
-        return row_state.hidden_permuted
-
-    @staticmethod
-    def _group_arg(row_state: CuteDslFp8MaskedRowState) -> torch.Tensor:
-        return row_state.masked_m
-
-    def prepare(
-        self,
-        hidden_states: torch.Tensor,
-        topk_ids: torch.Tensor,
-        top_k: int,
-        workspace=None,
-    ) -> CuteDslFp8MaskedRowState:
-        experts = self.quant_info.num_local_experts
-        k = hidden_states.size(1)
-        inter = self.quant_info.intermediate_size
-        expected_m = expected_rows_per_expert(topk_ids.numel(), experts)
-        token_width = self._token_width_for(hidden_states.size(0), expected_m)
-        # FP8 scale loads are unpredicated across the whole selected token tile.
-        m_max = masked_m_max(hidden_states.size(0), token_width)
-        device = hidden_states.device
-
-        def _buf(name, shape, dtype):
-            return prepare_buffer(workspace, name, shape, dtype=dtype, device=device)
-
-        masked_m = _buf("masked:masked_m", (experts,), torch.int32)
-        pair_to_row = _buf("masked:pair_to_row", (topk_ids.numel(),), torch.int32)
-        rows_fp8 = self._prepare_input_rows(workspace, (experts, m_max, k), device)
-        sf_rows = _buf(
-            "masked:sf_rows", (experts, m_max, k // QUANT_GROUP), torch.float32
-        )
-        act_fp8 = _buf("masked:act_fp8", (experts, m_max, inter), torch.float8_e4m3fn)
-        act_scale = _buf(
-            "masked:act_scale", (experts, m_max, inter // QUANT_GROUP), torch.float32
-        )
-        geometry = dict(
-            token_width=token_width,
-            n_gemm1=self.gate_up_slices * inter,
-            n_gemm2=self.quant_info.hidden_size,
-            output_width=self.OUTPUT_WIDTH,
-            cluster_shape_mn=self.CLUSTER_SHAPE_MN,
-            use_2cta_instrs=self.USE_2CTA_INSTRS,
-        )
-        capacities = self._schedule_capacities(
-            num_experts=experts, m_max=m_max, **geometry
-        )
-        dispatch_fill_masked_fp8(
-            hidden_states,
-            topk_ids,
-            top_k,
-            masked_m_out=masked_m,
-            pair_to_row_out=pair_to_row,
-            rows_fp8_out=rows_fp8,
-            scale_out=sf_rows,
-        )
-        schedule_outputs = {}
-        if workspace is not None:
-            schedule_outputs = self._schedule_buffers(
-                workspace, f"cutedsl_masked:tw{token_width}", capacities, device
-            )
-        schedule1, tiles1, schedule2, tiles2 = self._build_schedules(
-            masked_m, m_max=m_max, **geometry, **schedule_outputs
-        )
-        return CuteDslFp8MaskedRowState(
-            hidden_permuted=rows_fp8,
-            masked_m=masked_m,
-            expected_m=expected_m,
-            pair_to_row=pair_to_row,
-            m_max=m_max,
-            input_buffer_reuse=workspace is not None,
-            token_width=token_width,
-            sf_rows=sf_rows,
-            gemm1_schedule=schedule1,
-            gemm1_tiles=tiles1,
-            gemm2_schedule=schedule2,
-            gemm2_tiles=tiles2,
-            act_fp8=act_fp8,
-            act_scale=act_scale,
-        )
-
-    def act_with_delta(
-        self,
-        row_state: CuteDslFp8MaskedRowState,
-        gateup_out: torch.Tensor,
-        gate_up_delta: torch.Tensor | None,
-        topk_ids: torch.Tensor,
-        act_out: torch.Tensor,
-        activation_lora_input: torch.Tensor,
-        *,
-        activation: str = "silu",
-    ) -> None:
-        self._act_kernel(
-            gateup_out,
-            gate_up_delta,
-            act_out,
-            activation_lora_input,
-            row_state.pair_to_row,
-            topk_ids,
-            num_local_experts=self.num_local_experts,
-            gate_first=self.contract.gate_first,
-            interleaved=self.contract.interleaved,
-            activation=activation,
-            act_quant=(row_state.act_fp8, row_state.act_scale, QUANT_GROUP),
-        )
-        row_state.act_quant_ready = True
 
     @staticmethod
     def _down_operands(
@@ -291,6 +278,10 @@ class CuteDslFp8MaskedProvider(_CuteDslFp8Mixin, MaskedRowDomainProvider):
 
 
 class CuteDslFp8ContiguousRowState(ContiguousRowState, kw_only=True):
+    """ContiguousRowState plus the input-row scales of
+    CuteDslFp8Mixin._input_buffers() and the schedule fields
+    (CuteDslTileMixin._schedules()); it owns no down-input buffers."""
+
     token_width: int
     sf_rows: torch.Tensor  # [m_pad_ceiling, hidden // 128] fp32 group scales
     gemm1_schedule: torch.Tensor
@@ -299,7 +290,7 @@ class CuteDslFp8ContiguousRowState(ContiguousRowState, kw_only=True):
     gemm2_tiles: torch.Tensor
 
 
-class CuteDslFp8ContiguousProvider(_CuteDslFp8Mixin, ContiguousRowDomainProvider):
+class CuteDslFp8ContiguousProvider(CuteDslFp8Mixin, ContiguousRowDomainProvider):
     contract = MoeBaseProviderContract(
         key="cutedsl_fp8_contiguous",
         quant_info_cls=MoeLoraFp8QuantInfo,
@@ -313,6 +304,9 @@ class CuteDslFp8ContiguousProvider(_CuteDslFp8Mixin, ContiguousRowDomainProvider
     M_ALIGNMENT = 128
 
     _ROW_MODE = "contiguous"
+    _row_state_cls = CuteDslFp8ContiguousRowState
+    # The stock group quantizer returns the down input in tensors of its own.
+    _OWNS_DOWN_INPUT = False
 
     def __init__(self, quant_info: MoeLoraFp8QuantInfo):
         super().__init__(quant_info, m_alignment=self.M_ALIGNMENT)
@@ -323,121 +317,14 @@ class CuteDslFp8ContiguousProvider(_CuteDslFp8Mixin, ContiguousRowDomainProvider
             validate_tile_geometry_contiguous,
         )
 
-        self._prepare_contiguous_gemm = prepare_contiguous_fp8
+        self._prepare_gemm = prepare_contiguous_fp8
         self._validate_tile_geometry = validate_tile_geometry_contiguous
-        self._build_schedules_contiguous = build_dual_stage_schedules_contiguous
+        self._build_schedules = build_dual_stage_schedules_contiguous
         self._schedule_capacities = dual_stage_schedule_capacities_contiguous
         self._init_tiles(quant_info)
 
     def _admit_tile_width(self, token_width: int) -> None:
         self._validate_tile_geometry(token_width, self._m_alignment)
-
-    def _prepare_dummy(self, stage: str, config):
-        weight, weight_sf = self._stage_weight(stage), self._stage_scale(stage)
-        device = weight.device
-        num_experts, n, k = weight.shape
-        dummy_a = torch.zeros((256, k), dtype=torch.float8_e4m3fn, device=device)
-        dummy_sf = torch.zeros(
-            (1, 256, k // QUANT_GROUP), dtype=torch.float32, device=device
-        )
-        dummy_c = torch.empty((256, n), dtype=torch.bfloat16, device=device)
-        dummy_seg = torch.zeros(num_experts + 1, dtype=torch.int32, device=device)
-        return self._prepare_contiguous_gemm(
-            dummy_a,
-            weight,
-            dummy_sf,
-            weight_sf,
-            dummy_c,
-            dummy_seg,
-            config=config,
-        )
-
-    @staticmethod
-    def _rows_arg(tensor: torch.Tensor) -> torch.Tensor:
-        # Flat rows occupy one expert slot in the swap_ab wrapper.
-        return tensor.unsqueeze(0)
-
-    @staticmethod
-    def _input_rows(row_state: CuteDslFp8ContiguousRowState) -> torch.Tensor:
-        return row_state.hidden_compact
-
-    @staticmethod
-    def _group_arg(row_state: CuteDslFp8ContiguousRowState) -> torch.Tensor:
-        return row_state.seg_offsets
-
-    def prepare(
-        self,
-        hidden_states: torch.Tensor,
-        topk_ids: torch.Tensor,
-        top_k: int,
-        workspace=None,
-    ) -> CuteDslFp8ContiguousRowState:
-        base = super().prepare(
-            hidden_states, topk_ids, top_k, workspace, fill_rows=False
-        )
-        num_experts = self.quant_info.num_local_experts
-        hidden = hidden_states.size(1)
-        device = hidden_states.device
-        prefix = f"contiguous:a{self._m_alignment}"
-        rows_fp8 = self._prepare_input_rows(
-            workspace,
-            (base.m_pad_ceiling, hidden),
-            device,
-        )
-        sf_rows = prepare_buffer(
-            workspace,
-            f"{prefix}:sf_rows",
-            (base.m_pad_ceiling, hidden // QUANT_GROUP),
-            dtype=torch.float32,
-            device=device,
-        )
-        dispatch_fill_rows_contiguous_fp8(
-            hidden_states,
-            topk_ids,
-            base.pair_to_row,
-            rows_fp8_out=rows_fp8,
-            scale_out=sf_rows,
-        )
-        # Distinct top-k experts bound each expert to one row per token.
-        max_expert_rows = max(int(hidden_states.size(0)), 1)
-        expected_m = expected_rows_per_expert(topk_ids.numel(), num_experts)
-        token_width = self._token_width_for(max_expert_rows, expected_m)
-        geometry = dict(
-            m_pad_ceiling=base.m_pad_ceiling,
-            max_expert_rows=max_expert_rows,
-            m_alignment=self._m_alignment,
-            token_width=token_width,
-            n_gemm1=self.gate_up_slices * self.quant_info.intermediate_size,
-            n_gemm2=self.quant_info.hidden_size,
-            output_width=self.OUTPUT_WIDTH,
-            cluster_shape_mn=self.CLUSTER_SHAPE_MN,
-            use_2cta_instrs=self.USE_2CTA_INSTRS,
-        )
-        schedule_outputs = {}
-        if workspace is not None:
-            schedule_outputs = self._schedule_buffers(
-                workspace,
-                f"cutedsl_contiguous:a{self._m_alignment}:tw{token_width}",
-                self._schedule_capacities(num_experts=num_experts, **geometry),
-                device,
-            )
-        schedule1, tiles1, schedule2, tiles2 = self._build_schedules_contiguous(
-            base.seg_counts, **geometry, **schedule_outputs
-        )
-        return CuteDslFp8ContiguousRowState(
-            hidden_compact=rows_fp8,
-            seg_counts=base.seg_counts,
-            seg_offsets=base.seg_offsets,
-            pair_to_row=base.pair_to_row,
-            m_pad_ceiling=base.m_pad_ceiling,
-            input_buffer_reuse=base.input_buffer_reuse,
-            token_width=token_width,
-            sf_rows=sf_rows,
-            gemm1_schedule=schedule1,
-            gemm1_tiles=tiles1,
-            gemm2_schedule=schedule2,
-            gemm2_tiles=tiles2,
-        )
 
     @staticmethod
     def _down_operands(

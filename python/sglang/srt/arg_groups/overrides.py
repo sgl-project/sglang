@@ -1734,6 +1734,12 @@ def _moe_runner_backend_quant_constraints(view: Any) -> dict:
 
         is_gfx95_mxfp8 = get_platform().is_hip and is_gfx95_supported()
         allowed = list(MXFP8_MOE_RUNNER_BACKEND_CHOICES)
+        # The LoRA MoE runner reads the canonical MXFP8 layout on SM100.
+        if moe_runner_backend.startswith("lora_"):
+            allowed.append(moe_runner_backend)
+        # Marlin repacks the E4M3 experts into W8A16 tiles (CUDA kernels).
+        if not get_platform().is_hip:
+            allowed.append("marlin")
         # Every other entry is CUDA-only. Honor an explicit triton request on ROCm
         # instead of sending it back to flashinfer_trtllm, whose MoE apply path
         # imports flashinfer.

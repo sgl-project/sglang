@@ -1476,7 +1476,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         :class:`~sglang.srt.layers.quantization.mxfp4_marlin_moe.Mxfp4MarlinMoEMethod`;
         only the input padding is local (``hidden_size`` is pre-rounded to the
         Marlin-padded width at create_weights)."""
-        from sglang.srt.layers.quantization.mxfp4_marlin_moe import (
+        from sglang.srt.layers.moe.moe_runner.marlin import (
             build_marlin_moe_quant_info,
         )
 

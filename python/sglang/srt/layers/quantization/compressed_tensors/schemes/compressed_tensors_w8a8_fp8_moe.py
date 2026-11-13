@@ -76,6 +76,8 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                 "For FP8 Fused MoE layer, we require either per tensor or "
                 "channelwise, dynamic per token quantization."
             )
+        # --moe-runner-backend marlin / lora_marlin: W8A16 from Marlin tiles.
+        self.use_marlin = get_moe_runner_backend().reads_marlin_tiles()
 
     @classmethod
     def get_min_capability(cls) -> int:
@@ -242,6 +244,13 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
             layer.w2_input_scale = None
 
     def process_weights_after_loading(self, layer: torch.nn.Module | FusedMoE) -> None:
+        if self.use_marlin:
+            # W8A16 reads the floating activations: the checkpoint's activation
+            # scales are not applied, and per-tensor gate/up scales stay separate
+            # instead of being requantized to one, so repack before any fold.
+            self._process_weights_for_marlin(layer)
+            return
+
         # Fp8 moe kernels require a single activation scale.
         # We take the max of all the scales in case they differ.
         if self.static_input_scales:
@@ -349,11 +358,42 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                 requires_grad=False,
             )
 
+    def _process_weights_for_marlin(self, layer: torch.nn.Module) -> None:
+        """Repack the e4m3 experts into Marlin W8A16 tiles; block scales keep
+        their K groups, channel scales become one group, and per-tensor scales
+        become one group holding each shard's own scale."""
+        from sglang.srt.layers.quantization.marlin_utils_fp8 import (
+            repack_moe_fp8_layer_for_marlin,
+        )
+
+        if self.weight_quant.strategy == QuantizationStrategy.TENSOR:
+            repack_moe_fp8_layer_for_marlin(layer, "tensor")
+        elif self.block_quant:
+            repack_moe_fp8_layer_for_marlin(
+                layer, "block", block_n=self.weight_block_size[0]
+            )
+        else:
+            repack_moe_fp8_layer_for_marlin(layer, "channel")
+
+    def get_marlin_quant_info(self, layer: torch.nn.Module):
+        from sglang.srt.layers.moe.moe_runner.marlin import (
+            build_marlin_fp8_moe_quant_info,
+        )
+
+        return build_marlin_fp8_moe_quant_info(layer)
+
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
         moe_runner_backend = get_moe_runner_backend()
+        if self.use_marlin:
+            from sglang.srt.layers.moe.moe_runner.marlin import (
+                marlin_base_moe_runner,
+            )
+
+            self.runner = marlin_base_moe_runner(moe_runner_config)
+            return
         if moe_runner_backend.is_auto():
             if (
                 _use_aiter
@@ -386,6 +426,8 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
 
         moe_runner_config = self.moe_runner_config
 
+        if self.use_marlin:
+            return self.runner.run(dispatch_output, self.get_marlin_quant_info(layer))
         if self.runner.runner_backend.is_aiter():
             from sglang.srt.layers.moe.moe_runner.aiter import (
                 AiterMoeQuantInfo,
