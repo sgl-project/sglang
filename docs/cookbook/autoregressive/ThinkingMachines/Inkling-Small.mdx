@@ -1,7 +1,6 @@
 ---
 title: Inkling-Small
 description: "Deploy Inkling-Small with SGLang — launch commands, tuning, and multimodal / reasoning / tool-calling usage for Thinking Machines' Inkling-Small Mixture-of-Experts model."
-tag: NEW
 ---
 
 ## Deployment

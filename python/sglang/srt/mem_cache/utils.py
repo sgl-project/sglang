@@ -24,7 +24,6 @@ from sglang.srt.mem_cache.evict_policy import (
     EvictionStrategy,
     FIFOStrategy,
     FILOStrategy,
-    GDSStrategy,
     LFUStrategy,
     LRUStrategy,
     MRUStrategy,
@@ -42,7 +41,6 @@ _EVICTION_POLICY_FACTORIES: dict[str, Callable[..., EvictionStrategy]] = {
     "priority": PriorityStrategy,
     "slru": SLRUStrategy,
     "tlru": TLRUStrategy,
-    "gds": GDSStrategy,
     # Each component's own order under joint eviction (uses_joint_lru).
     "joint_lru": LRUStrategy,
 }

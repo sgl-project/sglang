@@ -268,6 +268,13 @@ def mamba_extra_buffer_lazy_of(cfg: Any) -> bool:
     )
 
 
+def mamba_path_state_cap_of(cfg: Any) -> int:
+    """The per-path Mamba state cap the tree enforces."""
+    if cfg.mamba_max_states_per_path is not None:
+        return cfg.mamba_max_states_per_path
+    return 1 if cfg.hybrid_cache_checkpoints_level < 3 else -1
+
+
 def collect_model_override_declarations(
     architecture: str, server_args: Any, hf_config: Any
 ) -> List[Tuple[str, Dict[str, Any]]]:
@@ -468,13 +475,6 @@ def _mamba_radix_cache_resolution(view: Any) -> dict:
         return {}
 
     declared: Dict[str, Any] = {"uses_mamba_radix_cache": True}
-    if (
-        view.radix_eviction_policy == "lru"
-        and not view._radix_eviction_policy_explicitly_set
-        and not view.enable_session_radix_cache
-    ):
-        # gds rejects the session radix cache on recurrent-state models.
-        declared["radix_eviction_policy"] = "gds"
     if view.mamba_radix_cache_strategy == "auto":
         wants_overlap = not view.disable_overlap_schedule
         wants_paging = view.page_size is not None and view.page_size > 1

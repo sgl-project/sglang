@@ -211,7 +211,10 @@ class TestPPReplaySSMVerifySourceRows(CustomTestCase):
 
         target_worker = MagicMock()
         target_worker.model_runner.attn_backend.forward_state_slots.return_value = (
-            ForwardStateSlots(torch.tensor([5, 7], dtype=torch.int32))
+            ForwardStateSlots(
+                torch.tensor([5, 7], dtype=torch.int32),
+                ring=torch.tensor([2, 3], dtype=torch.int32),
+            )
         )
         mamba_pool = MagicMock()
         router = target_worker.model_runner.token_to_kv_pool.layer_router

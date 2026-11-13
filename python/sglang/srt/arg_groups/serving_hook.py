@@ -299,7 +299,7 @@ def handle_deprecated_args(server_args: Any):
         enable_flashinfer_allreduce_fusion=False,
     )
     # Deprecated attention-backend aliases.
-    aliases = {"compressed": "dsv4", "tokenspeed_mla": "cutedsl_mla"}
+    aliases = {"tokenspeed_mla": "cutedsl_mla"}
     renamed = {}
     for attr in (
         "attention_backend",
@@ -452,9 +452,6 @@ def handle_environment_variables(server_args: Any):
     envs.SGLANG_ENABLE_TORCH_COMPILE.set("1" if cfg.enable_torch_compile else "0")
     if cfg.mamba_ssm_dtype is not None:
         envs.SGLANG_MAMBA_SSM_DTYPE.set(cfg.mamba_ssm_dtype)
-    envs.SGLANG_DISABLE_OUTLINES_DISK_CACHE.set(
-        "1" if cfg.disable_outlines_disk_cache else "0"
-    )
     envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.set(
         "1" if cfg.enable_deterministic_inference else "0"
     )
@@ -688,18 +685,6 @@ def handle_missing_default_values(server_args: Any):
     # Handle ModelScope model downloads
     if envs.SGLANG_USE_MODELSCOPE.get():
         handle_modelscope_paths(server_args)
-
-    # Model-specific defaults replace the eviction policy only when it was left unset.
-    if cfg._radix_eviction_policy_explicitly_set is None:
-        declare_resolution(
-            server_args,
-            "_handle_missing_default_values",
-            _radix_eviction_policy_explicitly_set=cfg.radix_eviction_policy is not None,
-        )
-    if cfg.radix_eviction_policy is None:
-        declare_resolution(
-            server_args, "_handle_missing_default_values", radix_eviction_policy="lru"
-        )
 
     # In speculative scenario:
     # - If `speculative_draft_model_quantization` is specified, the draft model uses this quantization method.

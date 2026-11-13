@@ -2484,6 +2484,4 @@ class LTX2VideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         return hidden_states, audio_hidden_states
 
 
-# Backward-compatible alias (older internal name).
-LTXModel = LTX2VideoTransformer3DModel
 EntryClass = LTX2VideoTransformer3DModel
