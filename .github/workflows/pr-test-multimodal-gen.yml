@@ -6,6 +6,10 @@ on:
       multimodal_gen:
         required: true
         type: string
+      diffusion_sm103:
+        required: false
+        type: string
+        default: 'true'
       sgl_kernel:
         required: true
         type: string
@@ -188,7 +192,8 @@ jobs:
   multimodal-gen-unit-test-b300:
     if: |
       ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
-      inputs.multimodal_gen == 'true'
+      inputs.multimodal_gen == 'true' &&
+      inputs.diffusion_sm103 == 'true'
     uses: ./.github/workflows/_diffusion-pr-test-stage.yml
     with:
       runner_config: diffusion-unit-1-gpu-b300
