@@ -105,6 +105,7 @@ def _build_peak(pool_size: int, lock_prefixes: bool):
     component.tree_core = cache
     component.component_type = ComponentType.MAMBA
     component.host_only_checkpoint = False
+    component.checkpoints_level = 3
 
     owned = [cache.allocator.alloc(1) for _ in range(N)]
     assert all(s is not None for s in owned)
@@ -646,6 +647,7 @@ class TestExtraMambaCacheSizing(CustomTestCase):
                 )
             ),
             extra_mamba_cache_bytes_per_req=extra_bytes,
+            allocate_intermediate_ssm=True,
             fused_entry_bytes=lambda name: None,
             spec_algorithm=SimpleNamespace(is_none=lambda: draft_tokens is None),
             attn_dp_size=dp_size,
