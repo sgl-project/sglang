@@ -52,6 +52,7 @@ def _cache(backend, interval=16, page_size=1, bigram=False):
     cache.hicache_storage_pass_prefix_keys = True
     cache.sidecar_pool_specs = []
     cache.ongoing_backup = {}
+    cache._backup_requested_tokens = {}
     cache.ongoing_write_through = {}
     cache.insert_session_id = None
     cache.cache_controller = SimpleNamespace(write_storage=Mock(side_effect=count()))
@@ -67,7 +68,7 @@ def _cache(backend, interval=16, page_size=1, bigram=False):
     )
     with get_context().override_server_args(
         _mamba_cache_chunk_size=4,
-        mamba_max_states_per_path=-1,
+        hybrid_cache_checkpoints_level=3,
         hicache_mamba_l3_snapshot_interval=interval,
     ):
         cache.components = {
@@ -123,6 +124,7 @@ def _write_and_ack(cache, node):
     for stored_node, receipt in cache.ongoing_backup.values():
         cache.tree_core.dec_host_lock_ref(stored_node, receipt)
     cache.ongoing_backup.clear()
+    cache._backup_requested_tokens.clear()
     return call
 
 
