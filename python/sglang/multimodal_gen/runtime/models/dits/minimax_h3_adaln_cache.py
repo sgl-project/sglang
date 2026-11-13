@@ -495,6 +495,14 @@ class MiniMaxH3AdalnCache(nn.Module):
         ):
             raise ValueError("MiniMax H3 AdaLN cache has invalid final_params")
 
+        # A prebuilt sidecar's capacity is what it holds: the warmup planner
+        # asks max_plans/max_plan_width whether the file can also reserve the
+        # other image task's grid, and a file that does not cover it must not
+        # be mistaken for one that does (a miss here has no rebuild to fall
+        # back on).
+        self.max_plans = plan_timesteps.shape[0]
+        self.max_plan_width = plan_timesteps.shape[1]
+
         for slot in range(plan_timesteps.shape[0]):
             length = int(plan_lengths[slot])
             self._slots[_plan_key(plan_timesteps[slot, :length])] = slot
