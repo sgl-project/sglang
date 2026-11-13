@@ -43,19 +43,7 @@ class LIMDecodeAdapter:
         self.rows = manager.size
         self.batch_capacity = manager.batch_capacity
         self.max_query_width = manager.max_query_width
-        self.index_head_dim = manager.budget.index_head_dim
-        self.index_n_heads = manager.budget.index_n_heads
         self.operator = load_fused_lim_operator()
-        try:
-            supported = torch.ops.npu.lim_full_visible_max_query_width.default()
-        except (AttributeError, RuntimeError) as error:
-            raise RuntimeError(
-                "Install the matching dynamic-query LIM kernel wheel."
-            ) from error
-        if supported < self.max_query_width:
-            raise ValueError(
-                "Configured MTP query width exceeds the loaded LIM kernel."
-            )
         self._fused_prepare_lim_metadata = fused_prepare_lim_metadata
         self._fused_copy_sfa_metadata = fused_lim_copy_sfa_metadata
         device = manager.device
@@ -88,16 +76,6 @@ class LIMDecodeAdapter:
         batch = forward_batch.batch_size
         width = sparse_query_width(forward_batch)
         rows = batch * width
-        if (
-            not 1 <= width <= self.max_query_width
-            or query.ndim != 3
-            or query.shape[1:] != (self.index_n_heads, self.index_head_dim)
-            or query.shape[0] < rows
-            or batch > self.batch_capacity
-        ):
-            raise ValueError(
-                "LIM query geometry exceeds the configured native buffers."
-            )
         if block_table.shape[0] != batch:
             raise ValueError("LIM source table must match the padded request batch.")
         columns = min(block_table.shape[1], self.block_table.shape[1])

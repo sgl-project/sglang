@@ -164,7 +164,6 @@ def test_real_manager_mtp_owner_share_lifecycle(graph, heads, query_width, capac
                 pool,
                 SimpleNamespace(get_kvcache=lambda: index_pool),
                 K,
-                copy_sfa_padded_query_heads=heads,
                 paged_kv_cache=index_pool,
             )
             for i in range(2):

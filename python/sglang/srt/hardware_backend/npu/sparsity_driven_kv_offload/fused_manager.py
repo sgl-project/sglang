@@ -26,7 +26,7 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.prefill_kv_plan 
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool, ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.runtime_context import get_disagg, get_parallel
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 if TYPE_CHECKING:
@@ -49,8 +49,6 @@ class FusedSparseKVCacheManager:
         req_to_token_pool: ReqToTokenPool,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
         sparse_context_len: int,
-        copy_sfa_padded_query_heads: Optional[int] = None,
-        graph_batch_capacity: int = 0,
         paged_kv_cache: Optional[MLATokenToKVPool] = None,
         budget_plan=None,
     ) -> None:
@@ -60,7 +58,6 @@ class FusedSparseKVCacheManager:
         )
 
         self.actual_request_rows = int(req_to_token_pool.req_to_token.shape[0])
-        self.last_decode_path = "unselected"
         self.logical_max_context_len = int(req_to_token_pool.req_to_token.shape[1])
         self.req_to_token_pool = req_to_token_pool
         self.sparse_context_len = int(sparse_context_len)
@@ -69,11 +66,6 @@ class FusedSparseKVCacheManager:
         # separate draft KV pool. The allocator's pool is not the draft pool.
         if paged_kv_cache is None:
             paged_kv_cache = token_to_kv_pool_allocator.get_kvcache()
-        if not isinstance(paged_kv_cache, MLATokenToKVPool):
-            raise TypeError(
-                "FusedSparseKVCacheManager requires an MLATokenToKVPool, "
-                f"got {type(paged_kv_cache).__name__}"
-            )
         self.paged_kv_cache = paged_kv_cache
         self.start_layer = paged_kv_cache.start_layer
         # MLA params
@@ -92,19 +84,6 @@ class FusedSparseKVCacheManager:
         if self.budget is None:
             raise ValueError("Native KV pool has no sparse KV budget plan.")
         self.budget.bind_native_pool(paged_kv_cache)
-        if (
-            self.actual_request_rows > self.budget.request_rows
-            or self.logical_max_context_len > self.budget.context_len
-            or graph_batch_capacity > self.budget.batch_capacity
-            or (
-                copy_sfa_padded_query_heads is not None
-                and copy_sfa_padded_query_heads != self.budget.copy_sfa_query_heads
-            )
-            or self.sparse_context_len != self.budget.top_k
-        ):
-            raise ValueError(
-                "Native manager geometry exceeds or differs from its budget plan."
-            )
         self.size = self.budget.request_rows
         self.batch_capacity = self.budget.batch_capacity
         self.max_context_len = self.budget.context_len
@@ -127,12 +106,7 @@ class FusedSparseKVCacheManager:
         )
         self.cache_capacity = self.device_cache_size
         self._copy_sfa_operator = load_copy_sfa_operator()
-        split_host = use_pd_split_kv() and get_disagg().disaggregation_mode == "decode"
-        if split_host and not any(
-            argument.name == "dram_rope_dev_ptr"
-            for argument in self._copy_sfa_operator._schema.arguments
-        ):
-            raise RuntimeError("PD split KV requires a split-host CopySFA wheel.")
+        split_host = use_pd_split_kv()
 
         # Allocate exactly the persistent shapes reserved by the plan.
         try:

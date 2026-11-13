@@ -65,22 +65,23 @@ class TestSparsityDrivenKVOffloadConfig(CustomTestCase):
         ):
             for backend in ("ascend", "mooncake"):
                 disagg.disaggregation_transfer_backend = backend
-                for mode in ("prefill", "decode"):
+                for mode in ("null", "prefill", "decode"):
                     disagg.disaggregation_mode = mode
                     for dp_size, attn_dp_size in ((1, 1), (2, 1), (2, 2)):
                         parallel.dp_size, parallel.attn_dp_size = dp_size, attn_dp_size
                         with self.subTest(
                             backend=backend, mode=mode, dp=dp_size, attn_dp=attn_dp_size
                         ):
-                            self.assertTrue(use_pd_split_kv())
+                            self.assertEqual(use_pd_split_kv(), mode == "decode")
 
             disagg.disaggregation_decode_host_receive_threshold = 0
-            self.assertTrue(
-                use_pd_split_kv()
-            )  # Mooncake registers host buffers directly.
-            disagg.disaggregation_transfer_backend = "ascend"
-            with self.assertRaisesRegex(ValueError, "host receive threshold"):
-                use_pd_split_kv()
+            for backend in ("ascend", "mooncake"):
+                disagg.disaggregation_transfer_backend = backend
+                with (
+                    self.subTest(backend=backend),
+                    self.assertRaisesRegex(ValueError, "host receive threshold"),
+                ):
+                    use_pd_split_kv()
             disagg.disaggregation_decode_host_receive_threshold = 1
             with patch.object(parallel, "nnodes", 2):
                 self.assertTrue(use_pd_split_kv())
@@ -89,11 +90,8 @@ class TestSparsityDrivenKVOffloadConfig(CustomTestCase):
             ):
                 for mode in ("prefill", "decode"):
                     disagg.disaggregation_mode = mode
-                    with (
-                        self.subTest(mode=mode),
-                        self.assertRaisesRegex(ValueError, "page-size 128"),
-                    ):
-                        use_pd_split_kv()
+                    with self.subTest(mode=mode):
+                        self.assertEqual(use_pd_split_kv(), mode == "decode")
             for obj, attribute, value, message in (
                 (disagg, "disaggregation_transfer_backend", "fake", "transfer backend"),
                 (parallel, "pp_size", 2, "PP=1"),
@@ -109,6 +107,49 @@ class TestSparsityDrivenKVOffloadConfig(CustomTestCase):
                     with self.assertRaisesRegex(ValueError, message):
                         use_pd_split_kv()
                 self.assertEqual(getattr(obj, attribute), previous)
+
+    def test_fused_prefill_keeps_native_pool_without_changing_legacy(self):
+        from sglang.srt.environ import envs
+
+        prefix = "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config."
+        model = _make_glm51_model_config()
+        model.hf_config.index_topk = 2048
+        disagg = SimpleNamespace(disaggregation_mode="prefill")
+        with (
+            envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.override(True),
+            envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.override(True),
+            patch(prefix + "is_npu", return_value=True),
+            patch(prefix + "attention_backends", return_value=("ascend", "ascend")),
+            patch(prefix + "get_disagg", return_value=disagg),
+            patch(
+                prefix + "get_schedule",
+                return_value=SimpleNamespace(max_running_requests=8, page_size=64),
+            ),
+            patch(
+                prefix + "get_parallel",
+                return_value=SimpleNamespace(pp_size=1, dcp_enabled=False),
+            ),
+            patch(
+                prefix + "get_spec",
+                return_value=SimpleNamespace(speculative_algorithm="NONE"),
+            ),
+        ):
+            for mode in ("prefill", "decode", "null"):
+                disagg.disaggregation_mode = mode
+                with self.subTest(mode=mode):
+                    self.assertEqual(
+                        is_sparsity_driven_kv_offload_enabled(
+                            model_config=model, use_mla_backend=True
+                        ),
+                        mode != "prefill",
+                    )
+            disagg.disaggregation_mode = "prefill"
+            with envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.override(False):
+                self.assertTrue(
+                    is_sparsity_driven_kv_offload_enabled(
+                        model_config=model, use_mla_backend=True
+                    )
+                )
 
     def test_copy_sfa_heads_follow_model_and_attention_tp(self):
         from sglang.srt.environ import envs

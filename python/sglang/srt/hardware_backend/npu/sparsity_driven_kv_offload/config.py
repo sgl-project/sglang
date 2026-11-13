@@ -40,13 +40,8 @@ def use_fused_sparse_kv_offload() -> bool:
     return envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.get()
 
 
-def _validate_fused_page_size() -> None:
-    if get_schedule().page_size != 128:
-        raise ValueError("Native LIM integration requires --page-size 128.")
-
-
 def use_pd_split_kv() -> bool:
-    """Select split host storage only for explicitly enabled NPU PD roles."""
+    """Select split host storage only for explicitly enabled PD decode."""
     if not (
         envs.SGLANG_NPU_ENABLE_PD_SPLIT_KV.get()
         and use_fused_sparse_kv_offload()
@@ -54,9 +49,8 @@ def use_pd_split_kv() -> bool:
     ):
         return False
     disagg = get_disagg()
-    if disagg.disaggregation_mode not in ("prefill", "decode"):
+    if disagg.disaggregation_mode != "decode":
         return False
-    _validate_fused_page_size()
     prefill_backend, decode_backend = attention_backends()
     if (prefill_backend, decode_backend) != ("ascend", "ascend"):
         raise ValueError("PD split KV requires the Ascend attention backend.")
@@ -70,7 +64,7 @@ def use_pd_split_kv() -> bool:
             "PD split KV requires the Ascend or Mooncake transfer backend."
         )
     if (
-        disagg.disaggregation_transfer_backend == "ascend"
+        disagg.disaggregation_transfer_backend in ("ascend", "mooncake")
         and disagg.disaggregation_decode_host_receive_threshold < 1
     ):
         raise ValueError("PD split KV requires host receive threshold 1.")
@@ -111,12 +105,11 @@ def is_sparsity_driven_kv_offload_enabled(
         )
     if not use_fused_sparse_kv_offload():
         return True
-    if use_pd_split_kv() and get_disagg().disaggregation_mode == "prefill":
-        # Publish the same native split page layout that decode registers.
+    if get_disagg().disaggregation_mode == "prefill":
+        # Prefill publishes native KV pages; fused offload belongs to decode.
         return False
     if int(get_dsa_index_topk(model_config.hf_config)) != 2048:
         raise ValueError("Native LIM integration requires model index_topk=2048.")
-    _validate_fused_page_size()
     if get_parallel().pp_size != 1 or get_parallel().dcp_enabled:
         raise ValueError(
             "Native LIM integration currently requires PP=1 and DCP disabled."

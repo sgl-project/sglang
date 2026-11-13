@@ -247,12 +247,6 @@ class TestLIMState(CustomTestCase):
             post.fused_lim_copy_sfa_metadata = Mock()
             with (
                 patch(prefix + "fused_lim.load_fused_lim_operator", return_value=None),
-                patch.object(
-                    torch.ops.npu,
-                    "lim_full_visible_max_query_width",
-                    SimpleNamespace(default=lambda: 14),
-                    create=True,
-                ),
                 patch.dict(
                     "sys.modules",
                     {
@@ -363,12 +357,6 @@ class TestLIMState(CustomTestCase):
                 torch, "npu", SimpleNamespace(current_device=lambda: 0), create=True
             ),
             patch(prefix + "fused_lim.load_fused_lim_operator", return_value=None),
-            patch.object(
-                torch.ops.npu,
-                "lim_full_visible_max_query_width",
-                SimpleNamespace(default=lambda: 14),
-                create=True,
-            ),
             patch.dict(
                 sys.modules,
                 {
@@ -378,7 +366,7 @@ class TestLIMState(CustomTestCase):
             ),
         ):
             manager = fused_manager.FusedSparseKVCacheManager(
-                req_pool, None, 2048, graph_batch_capacity=8, paged_kv_cache=pool
+                req_pool, None, 2048, paged_kv_cache=pool
             )
         self.assertIs(manager.budget, plan)
         self.assertIs(pool.sparse_kv_budget_plan, plan)

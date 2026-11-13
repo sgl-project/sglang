@@ -93,7 +93,6 @@ def test_prefill_attention_and_short_residency():
                 pool,
                 SimpleNamespace(get_kvcache=lambda: index_pool),
                 2048,
-                copy_sfa_padded_query_heads=heads,
                 paged_kv_cache=index_pool,
             )
             lengths, positions = [129, 65, 0], [127, 128, 63, 64]
@@ -232,7 +231,6 @@ def test_short_sparse_graph_lifecycle(
                 pool,
                 SimpleNamespace(get_kvcache=lambda: index_pool),
                 2048,
-                copy_sfa_padded_query_heads=heads,
                 paged_kv_cache=index_pool,
             )
             allocations = [
@@ -382,7 +380,6 @@ def test_short_sparse_graph_lifecycle(
                                 (actual[t].float() - expected).abs().max().item(),
                             )
                     assert torch.count_nonzero(actual[2 * width :]) == 0
-                assert inputs.sparse_kv_decode_path == "lim_copy_sfa"
                 assert manager.planner_num_cache_tokens[:batch].cpu().tolist() == [
                     capacity if lengths[0] >= capacity else 0,
                     capacity,

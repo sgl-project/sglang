@@ -425,13 +425,11 @@ class AscendAttnBackend(AttentionBackend):
                     FusedSparseKVCacheManager,
                 )
 
-                plan = self.token_to_kv_pool.sparse_kv_budget_plan
                 self.sparse_kv_manager = FusedSparseKVCacheManager(
                     model_runner.req_to_token_pool,
                     model_runner.token_to_kv_pool_allocator,
                     sparse_context_len,
                     paged_kv_cache=self.token_to_kv_pool,
-                    copy_sfa_padded_query_heads=plan.copy_sfa_query_heads,
                 )
                 self.token_to_kv_pool.sparse_kv_manager = self.sparse_kv_manager
             else:

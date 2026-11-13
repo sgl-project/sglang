@@ -109,14 +109,6 @@ def _current_metadata(batch, current_valid):
         return None, 0
     counts = [int(x) for x in ext]
     prefixes = [int(x) for x in prefix]
-    lens = [int(x) for x in lengths]
-    requests = [int(x) for x in req]
-    active = [r for r, length in zip(requests, lens) if r >= 0 and length > 0]
-    if len(set(active)) != len(active) or any(
-        e < 0 or p < 0 or e + p != length
-        for e, p, length in zip(counts, prefixes, lens)
-    ):
-        return None, 0
     rows = int(current_valid.numel())
     if not rows:
         return None, 0

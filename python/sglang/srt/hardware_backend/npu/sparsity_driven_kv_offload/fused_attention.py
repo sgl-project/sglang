@@ -61,8 +61,6 @@ def forward_fused_sparse_kv_offload(
             plan,
             current_inputs,
         )
-        manager.last_decode_path = "lim_copy_sfa"
-        forward_batch.sparse_kv_decode_path = manager.last_decode_path
         return torch.nn.functional.pad(result, (0, 0, 0, q.shape[0] - rows))
 
     actual_q = backend.forward_metadata.actual_seq_lengths_q
