@@ -71,6 +71,7 @@ def allocate_pp_proxy_tensors(
     hidden_size: int,
     dtype: torch.dtype,
     hc_hidden_size: Optional[int] = None,
+    hc_pre_from_prev_sublayer: bool = False,
     pp_proxy_topk_size: Optional[int] = None,
     pp_proxy_residual_num_blocks: Optional[int] = None,
     pp_proxy_dspark_hidden_size: int = 0,
@@ -81,6 +82,10 @@ def allocate_pp_proxy_tensors(
     pp_proxy_tensors = {
         "hidden_states": torch.zeros((max_hidden_tokens, pp_hidden_size), dtype=dtype),
     }
+    if is_mhc and hc_pre_from_prev_sublayer:
+        pp_proxy_tensors["hc_pre"] = torch.zeros(
+            (max_hidden_tokens, hidden_size), dtype=torch.float32
+        )
     if pp_proxy_residual_num_blocks is not None:
         # Only Kimi K3 supplies num_blocks: its attention-residual bank is
         # token-major [T, blocks, H] and takes the residual's place.
@@ -149,6 +154,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
         enable_mamba_track: bool,
         ne_token_table: Optional[torch.Tensor] = None,
         hc_hidden_size: Optional[int] = None,
+        hc_pre_from_prev_sublayer: bool = False,
         pp_proxy_topk_size: Optional[int] = None,
         pp_proxy_residual_num_blocks: Optional[int] = None,
         pp_proxy_dspark_hidden_size: int = 0,
@@ -193,6 +199,7 @@ class DecodeInputBuffers(ForwardInputBuffers):
                     hidden_size=hidden_size,
                     dtype=dtype,
                     hc_hidden_size=hc_hidden_size,
+                    hc_pre_from_prev_sublayer=hc_pre_from_prev_sublayer,
                     pp_proxy_topk_size=pp_proxy_topk_size,
                     pp_proxy_residual_num_blocks=pp_proxy_residual_num_blocks,
                     pp_proxy_dspark_hidden_size=pp_proxy_dspark_hidden_size,
@@ -298,6 +305,7 @@ class PrefillInputBuffers(ForwardInputBuffers):
         pp_size: int = 1,
         is_first_pp_rank: bool = False,
         hc_hidden_size: Optional[int] = None,
+        hc_pre_from_prev_sublayer: bool = False,
         pp_proxy_topk_size: Optional[int] = None,
         pp_proxy_residual_num_blocks: Optional[int] = None,
         pp_proxy_dspark_hidden_size: int = 0,
@@ -341,6 +349,7 @@ class PrefillInputBuffers(ForwardInputBuffers):
                     hidden_size=hidden_size,
                     dtype=dtype,
                     hc_hidden_size=hc_hidden_size,
+                    hc_pre_from_prev_sublayer=hc_pre_from_prev_sublayer,
                     pp_proxy_topk_size=pp_proxy_topk_size,
                     pp_proxy_residual_num_blocks=pp_proxy_residual_num_blocks,
                     pp_proxy_dspark_hidden_size=pp_proxy_dspark_hidden_size,

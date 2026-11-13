@@ -365,6 +365,7 @@ class DraftBlockProposer:
         greedy_draft: bool,
         sharded_accept: bool = False,
         dp_moe_sync: bool = False,
+        force_draft_embedding: bool = False,
         acceptance_estimator: Optional[OnlineAcceptanceEstimator] = None,
     ) -> None:
         self.draft_model = draft_model
@@ -398,6 +399,7 @@ class DraftBlockProposer:
         )
         # SGLANG_DSPARK_DEFER_CONTEXT_KV's draft KV store, set by its attach_draft.
         self.deferred_draft_kv = None
+        self._force_draft_embedding = force_draft_embedding
         # Persistent (bs, gamma) mask-token buffer: only column 0 (the bonus
         # token) changes per step, so avoid a fresh torch.full every decode.
         self._draft_block_ids_buf: Optional[torch.Tensor] = None
@@ -464,7 +466,7 @@ class DraftBlockProposer:
     ) -> DraftProposal:
         embed_module = unwrap_lora_layer(
             self.draft_model.embed_tokens
-            if not self.sample_from_anchor
+            if not self.sample_from_anchor or self._force_draft_embedding
             else target_model.get_input_embeddings()
         )
         draft_sampler = self._draft_sampler

@@ -3520,6 +3520,7 @@ class TestPipelineParallelCompat(CustomTestCase):
         cfg = dict(
             disable_overlap_schedule=True,
             speculative_algorithm=None,
+            speculative_dspark_pp_replicated_draft=False,
             enable_multi_layer_eagle=False,
             disaggregation_mode="prefill",
             min_free_slots_delay=None,
@@ -3540,16 +3541,45 @@ class TestPipelineParallelCompat(CustomTestCase):
     def test_no_speculative_decoding_is_fine(self):
         check_pipeline_parallel_compat(self._cfg())
 
-    def test_dspark_pd_prefill_does_not_require_eagle_architecture(self):
-        check_pipeline_parallel_compat(self._cfg(speculative_algorithm="DSPARK"))
+    def test_dspark_pd_prefill_preserves_non_replicated_path(self):
+        check_pipeline_parallel_compat(
+            self._cfg(
+                speculative_algorithm="DSPARK",
+                speculative_dspark_pp_replicated_draft=False,
+                disaggregation_mode="prefill",
+            )
+        )
 
-    def test_dspark_is_rejected_outside_pd_prefill(self):
-        for mode in ("decode", "null"):
+    def test_dspark_replicated_draft_supports_both_pd_roles(self):
+        for mode in ("prefill", "decode"):
             with self.subTest(mode=mode):
-                with self.assertRaisesRegex(AssertionError, "DSPARK.*prefill"):
+                check_pipeline_parallel_compat(
+                    self._cfg(
+                        speculative_algorithm="DSPARK",
+                        speculative_dspark_pp_replicated_draft=True,
+                        disaggregation_mode=mode,
+                    )
+                )
+
+    def test_dspark_decode_requires_replicated_draft(self):
+        with self.assertRaisesRegex(AssertionError, "decode.*replicated-draft"):
+            check_pipeline_parallel_compat(
+                self._cfg(
+                    speculative_algorithm="DSPARK",
+                    speculative_dspark_pp_replicated_draft=False,
+                    disaggregation_mode="decode",
+                )
+            )
+
+    def test_dspark_rejects_non_pd_mode(self):
+        for replicated in (False, True):
+            with self.subTest(replicated=replicated):
+                with self.assertRaisesRegex(AssertionError, "DSPARK.*PD"):
                     check_pipeline_parallel_compat(
                         self._cfg(
-                            speculative_algorithm="DSPARK", disaggregation_mode=mode
+                            speculative_algorithm="DSPARK",
+                            speculative_dspark_pp_replicated_draft=replicated,
+                            disaggregation_mode="null",
                         )
                     )
 
@@ -3559,7 +3589,10 @@ class TestPipelineParallelCompat(CustomTestCase):
         ):
             with self.assertRaisesRegex(AssertionError, "SGLANG_ENABLE_PP_SPEC"):
                 check_pipeline_parallel_compat(
-                    self._cfg(speculative_algorithm="DSPARK")
+                    self._cfg(
+                        speculative_algorithm="DSPARK",
+                        speculative_dspark_pp_replicated_draft=True,
+                    )
                 )
 
     def test_eagle_is_allowed_on_prefill(self):

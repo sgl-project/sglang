@@ -210,6 +210,11 @@ class DynamicChunkSizer:
                     hidden_size=model_config.hidden_size,
                     dtype=model_config.dtype,
                     hc_hidden_size=getattr(model_config, "hc_hidden_size", None),
+                    hc_pre_from_prev_sublayer=getattr(
+                        model_config.hf_config,
+                        "hc_pre_from_prev_sublayer",
+                        False,
+                    ),
                     pp_proxy_topk_size=model_runner.get_pp_proxy_topk_size(),
                     pp_proxy_residual_num_blocks=(
                         model_runner.get_pp_proxy_residual_num_blocks()
