@@ -40,6 +40,8 @@ class TestInklingRenderer(unittest.TestCase):
                 actual = render_inkling_messages(
                     case["messages"],
                     tools=case["tools"],
+                    tool_choice=case["tool_choice"],
+                    parallel_tool_calls=case["parallel_tool_calls"],
                     reasoning_effort=case["reasoning_effort"],
                 )
                 self.assertEqual(actual, case["input_ids"])
