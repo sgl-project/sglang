@@ -447,6 +447,47 @@ class TestKDAChunkExponentDomain(CustomTestCase):
                 self.assertLess(output_error, 1e-2, f"output error={output_error:.3%}")
                 self.assertLess(state_error, 1e-2, f"state error={state_error:.3%}")
 
+    @torch.inference_mode()
+    def test_short_prefill_matches_recurrence_under_steep_gate_decay(self):
+        """A short prefill without a gate lower bound must match the recurrence
+        when a channel decays by more than 2^126 within a 16-token sub-chunk."""
+        device = get_device()
+        dtype = torch.bfloat16
+        num_tokens, num_heads, head_dim = 64, 2, 64
+        shape = (1, num_tokens, num_heads, head_dim)
+        torch.manual_seed(42)
+        normalize = torch.nn.functional.normalize
+        q = normalize(torch.randn(shape, device=device), dim=-1).to(dtype)
+        k = normalize(torch.randn(shape, device=device), dim=-1).to(dtype)
+        v = (torch.randn(shape, device=device) * 0.1).to(dtype)
+        # Even channels lose 8 nats per token: 15 steps span 173 in log2.
+        decay = torch.where(torch.arange(head_dim, device=device) % 2 == 0, 8.0, 0.05)
+        gate = (-decay * (1 + 0.1 * torch.rand(shape, device=device))).to(dtype)
+        beta = torch.rand(1, num_tokens, num_heads, device=device).sigmoid().to(dtype)
+        initial_state = torch.zeros(1, num_heads, head_dim, head_dim, device=device)
+
+        expected_output, _ = self._naive_recurrent(
+            q=q,
+            k=k,
+            v=v,
+            g=gate,
+            beta=beta,
+            initial_state=initial_state,
+            lengths=[num_tokens],
+        )
+        actual_output = chunk_kda(
+            q=q.clone(),
+            k=k.clone(),
+            v=v.clone(),
+            g=gate.clone(),
+            beta=beta.clone(),
+            initial_state=initial_state.clone(),
+            initial_state_indices=torch.zeros(1, dtype=torch.int32, device=device),
+        )
+
+        output_error = self._relative_rmse(actual_output, expected_output)
+        self.assertLess(output_error, 1e-2, f"output error={output_error:.3%}")
+
 
 @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestKDAPackedDecode(unittest.TestCase):
