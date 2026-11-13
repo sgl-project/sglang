@@ -539,6 +539,73 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
         self.assertTrue(all(isinstance(row, DatasetRow) for row in rows_text))
         self.assertTrue(all(isinstance(row.prompt, list) for row in rows_ids))
 
+    def test_random_dataset_rejects_invalid_explicit_path(self):
+        """Invalid explicit corpora must not silently benchmark downloaded data."""
+        fallback_path = self._write_sharegpt_json()
+        malformed_path = self.tmpdir_path / "malformed.json"
+        malformed_path.write_text("{", encoding="utf-8")
+        for dataset_path, error in (
+            (self.tmpdir_path / "missing.json", FileNotFoundError),
+            (malformed_path, json.JSONDecodeError),
+            (self.tmpdir_path, IsADirectoryError),
+        ):
+            with (
+                self.subTest(path=dataset_path),
+                patch(
+                    "sglang.benchmark.datasets.random.download_and_cache_hf_file",
+                    return_value=fallback_path,
+                ) as download,
+            ):
+                args = make_args(dataset_name="random", dataset_path=str(dataset_path))
+                with self.assertRaises(error):
+                    get_dataset(args, self.tokenizer)
+                download.assert_not_called()
+
+    def test_random_dataset_uses_default_or_explicit_corpus(self):
+        dataset_path = self._write_sharegpt_json()
+        self.tokenizer.add_tokens(["hello", "world", "how", "are", "third", "prompt"])
+        for path, download_count in (("", 1), (dataset_path, 0)):
+            with (
+                self.subTest(path=path),
+                patch(
+                    "sglang.benchmark.datasets.random.download_and_cache_hf_file",
+                    return_value=dataset_path,
+                ) as download,
+            ):
+                args = make_args(
+                    dataset_name="random",
+                    dataset_path=path,
+                    num_prompts=3,
+                    random_input_len=2,
+                    random_range_ratio=1.0,
+                )
+                rows = get_dataset(args, self.tokenizer)
+                self.assertCountEqual(
+                    [row.prompt for row in rows],
+                    ["hello world", "how are", "third prompt"],
+                )
+                self.assertEqual(download.call_count, download_count)
+
+    def test_random_ids_does_not_read_dataset_path(self):
+        args = make_args(
+            dataset_name="random-ids",
+            dataset_path=str(self.tmpdir_path / "missing.json"),
+            tokenize_prompt=True,
+            random_range_ratio=1.0,
+        )
+        with patch(
+            "sglang.benchmark.datasets.random.download_and_cache_hf_file"
+        ) as download:
+            rows = get_dataset(args, self.tokenizer)
+            self.assertEqual(len(rows), args.num_prompts)
+            self.assertTrue(
+                all(len(row.prompt) == args.random_input_len for row in rows)
+            )
+            self.assertTrue(
+                all(isinstance(token, int) for row in rows for token in row.prompt)
+            )
+            download.assert_not_called()
+
     def test_custom_sampler(self):
         dataset_path = self._write_custom_jsonl()
         rows = sample_custom_requests(
