@@ -585,21 +585,9 @@ pub fn lower_chat(
                     == Some(&Value::Bool(true)),
             },
         });
-    let history_tool_calls = request
-        .messages
-        .iter()
-        .filter(|m| {
-            m["role"]
-                .as_str()
-                .is_some_and(|r| r.eq_ignore_ascii_case("assistant"))
-        })
-        .filter_map(|m| m["tool_calls"].as_array())
-        .map(|calls| calls.len() as i64)
-        .sum();
     let responder = ChatResponder {
         model: request.model,
         unreported_prompt_tokens: model.unreported_prompt_tokens(),
-        history_tool_calls,
         n: request.n as usize,
         logprobs: request.logprobs,
         parsing: match deepseek {
@@ -1065,8 +1053,6 @@ pub struct ChatResponder {
     model: String,
     /// Prompt tokens `_reported_prompt_tokens` leaves out of usage.
     unreported_prompt_tokens: u64,
-    /// `_get_history_tool_calls_cnt`, which numbers K3 tool-call ids.
-    history_tool_calls: i64,
     n: usize,
     logprobs: bool,
     parsing: OutputParsing,
@@ -1435,23 +1421,11 @@ impl ChatResponder {
         }
     }
 
-    /// A `ToolCall` as Pydantic dumps it, with `_process_tool_call_id`'s id.
+    /// A `ToolCall` as Pydantic dumps it, with `_process_tool_call_id`'s id: a
+    /// uuid for every parser served here, Kimi-K3's included.
     fn tool_call(&self, index: i64, call: &ToolCallItem) -> Value {
-        let id = match self
-            .parsing
-            .text_parsers()
-            .1
-            .map(|(parser, _)| parser.as_str())
-        {
-            Some("kimi_k3") => format!(
-                "{}:{}",
-                call.name,
-                self.history_tool_calls + call.tool_index
-            ),
-            _ => tool_call_id(),
-        };
         json!({
-            "id": id,
+            "id": tool_call_id(),
             "index": index,
             "type": "function",
             "function": {"name": call.name, "arguments": call.parameters},

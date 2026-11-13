@@ -648,7 +648,7 @@
                 "reasoning_content": "I need the weather.",
                 "tool_calls": [
                   {
-                    "id": "get_weather:0",
+                    "id": "call_99b2dbdc5319414db631a637",
                     "index": 0,
                     "type": "function",
                     "function": {"name": "get_weather", "arguments": "{\"city\": \"Paris\"}"}
@@ -742,7 +742,7 @@
           {"id": "r", "object": "chat.completion.chunk", "created": 1791964277, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": null, "role": "assistant", "content": ""}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
           {"id": "r", "object": "chat.completion.chunk", "created": 1791964277, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": "I need the"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
           {"id": "r", "object": "chat.completion.chunk", "created": 1791964277, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": " weather."}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791964277, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"role": null, "content": null, "reasoning_content": null, "tool_calls": [{"id": "get_weather:0", "index": 0, "type": "function", "function": {"name": "get_weather", "arguments": "{"}}]}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
+          {"id": "r", "object": "chat.completion.chunk", "created": 1791964277, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"role": null, "content": null, "reasoning_content": null, "tool_calls": [{"id": "call_cffddad4ab434e41969e9e75", "index": 0, "type": "function", "function": {"name": "get_weather", "arguments": "{"}}]}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
           {"id": "r", "object": "chat.completion.chunk", "created": 1791964277, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"role": null, "content": null, "reasoning_content": null, "tool_calls": [{"id": null, "index": 0, "type": "function", "function": {"name": null, "arguments": "\"city\": \""}}]}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
           {"id": "r", "object": "chat.completion.chunk", "created": 1794555221, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"role": null, "content": null, "reasoning_content": null, "tool_calls": [{"id": null, "index": 0, "type": "function", "function": {"name": null, "arguments": "Paris"}}]}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
           {"id": "r", "object": "chat.completion.chunk", "created": 1794555221, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"role": null, "content": null, "reasoning_content": null, "tool_calls": [{"id": null, "index": 0, "type": "function", "function": {"name": null, "arguments": "\""}}]}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
@@ -828,12 +828,12 @@
         "events": [
           {"id": "r", "object": "chat.completion.chunk", "created": 1791964277, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": null, "role": "assistant", "content": ""}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
           {"id": "r", "object": "chat.completion.chunk", "created": 1791964277, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": "Two calls."}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "r", "object": "chat.completion.chunk", "created": 1791964277, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"role": null, "content": null, "reasoning_content": null, "tool_calls": [{"id": "get_weather:0", "index": 0, "type": "function", "function": {"name": "get_weather", "arguments": "{"}}]}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
+          {"id": "r", "object": "chat.completion.chunk", "created": 1791964277, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"role": null, "content": null, "reasoning_content": null, "tool_calls": [{"id": "call_94bf382085384fc5af598d88", "index": 0, "type": "function", "function": {"name": "get_weather", "arguments": "{"}}]}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
           {"id": "r", "object": "chat.completion.chunk", "created": 1791964277, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"role": null, "content": null, "reasoning_content": null, "tool_calls": [{"id": null, "index": 0, "type": "function", "function": {"name": null, "arguments": "\"city\": \""}}]}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
           {"id": "r", "object": "chat.completion.chunk", "created": 1791964277, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"role": null, "content": null, "reasoning_content": null, "tool_calls": [{"id": null, "index": 0, "type": "function", "function": {"name": null, "arguments": "Paris"}}]}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
           {"id": "r", "object": "chat.completion.chunk", "created": 1794555221, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"role": null, "content": null, "reasoning_content": null, "tool_calls": [{"id": null, "index": 0, "type": "function", "function": {"name": null, "arguments": "\""}}]}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
           {"id": "r", "object": "chat.completion.chunk", "created": 1794555221, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"role": null, "content": null, "reasoning_content": null, "tool_calls": [{"id": null, "index": 0, "type": "function", "function": {"name": null, "arguments": "}"}}]}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
-          {"id": "r", "object": "chat.completion.chunk", "created": 1794555221, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"role": null, "content": null, "reasoning_content": null, "tool_calls": [{"id": "get_time:1", "index": 1, "type": "function", "function": {"name": "get_time", "arguments": "{"}}]}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
+          {"id": "r", "object": "chat.completion.chunk", "created": 1794555221, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"role": null, "content": null, "reasoning_content": null, "tool_calls": [{"id": "call_052b7e133a5347988ec7792b", "index": 1, "type": "function", "function": {"name": "get_time", "arguments": "{"}}]}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
           {"id": "r", "object": "chat.completion.chunk", "created": 1794555221, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"role": null, "content": null, "reasoning_content": null, "tool_calls": [{"id": null, "index": 1, "type": "function", "function": {"name": null, "arguments": "}"}}]}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
           {"id": "r", "object": "chat.completion.chunk", "created": 1794555221, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": null}, "logprobs": null, "finish_reason": "tool_calls", "matched_stop": "<|close|>tools<|sep|>"}]},
           "[DONE]"
@@ -909,7 +909,7 @@
           {"id": "r", "object": "chat.completion.chunk", "created": 1794555267, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": null, "role": "assistant", "content": ""}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
           {"id": "r", "object": "chat.completion.chunk", "created": 1794555267, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": "I need the"}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
           {"id": "r", "object": "chat.completion.chunk", "created": 1794555267, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"reasoning_content": " weather."}, "logprobs": null, "finish_reason": null, "matched_stop": null}]},
-          {"id": "r", "object": "chat.completion.chunk", "created": 1794555267, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"role": null, "content": null, "reasoning_content": null, "tool_calls": [{"id": "get_weather:0", "index": 0, "type": "function", "function": {"name": "get_weather", "arguments": "{"}}]}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
+          {"id": "r", "object": "chat.completion.chunk", "created": 1794555267, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"role": null, "content": null, "reasoning_content": null, "tool_calls": [{"id": "call_3e41ba2dc41e4aaaacd2c963", "index": 0, "type": "function", "function": {"name": "get_weather", "arguments": "{"}}]}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
           {"id": "r", "object": "chat.completion.chunk", "created": 1794555267, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"role": null, "content": null, "reasoning_content": null, "tool_calls": [{"id": null, "index": 0, "type": "function", "function": {"name": null, "arguments": "\"city\": \""}}]}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
           {"id": "r", "object": "chat.completion.chunk", "created": 1794555267, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"role": null, "content": null, "reasoning_content": null, "tool_calls": [{"id": null, "index": 0, "type": "function", "function": {"name": null, "arguments": "Paris"}}]}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
           {"id": "r", "object": "chat.completion.chunk", "created": 1794555267, "model": "moonshotai/Kimi-K3", "choices": [{"index": 0, "delta": {"role": null, "content": null, "reasoning_content": null, "tool_calls": [{"id": null, "index": 0, "type": "function", "function": {"name": null, "arguments": "\""}}]}, "logprobs": null, "finish_reason": null, "matched_stop": null}], "usage": null},
@@ -1001,7 +1001,7 @@
                 "reasoning_content": "I need the weather.",
                 "tool_calls": [
                   {
-                    "id": "get_weather:0",
+                    "id": "call_bbc219855c5b4fb1907466ed",
                     "index": 0,
                     "type": "function",
                     "function": {"name": "get_weather", "arguments": "{\"city\": \"Paris\"}"}
@@ -1129,7 +1129,7 @@
                 "reasoning_content": "I need the weather.",
                 "tool_calls": [
                   {
-                    "id": "get_weather:1",
+                    "id": "call_bed6a3a5830748abbbbc26c6",
                     "index": 0,
                     "type": "function",
                     "function": {"name": "get_weather", "arguments": "{\"city\": \"Paris\"}"}
@@ -1235,7 +1235,7 @@
                 "reasoning_content": "I need the weather.",
                 "tool_calls": [
                   {
-                    "id": "get_weather:0",
+                    "id": "call_6d83d18af1f34a5ab599a294",
                     "index": 0,
                     "type": "function",
                     "function": {"name": "get_weather", "arguments": "{\"city\": \"Paris\"}"}
@@ -1439,7 +1439,7 @@
                 "reasoning_content": "I need the weather.",
                 "tool_calls": [
                   {
-                    "id": "get_weather:0",
+                    "id": "call_651a30ef160144fe8322ae33",
                     "index": 0,
                     "type": "function",
                     "function": {"name": "get_weather", "arguments": "{\"city\": \"Paris\"}"}
@@ -1638,7 +1638,7 @@
                 "reasoning_content": "I need the weather.",
                 "tool_calls": [
                   {
-                    "id": "get_weather:0",
+                    "id": "call_f658ddd78b794e5db654df56",
                     "index": 0,
                     "type": "function",
                     "function": {"name": "get_weather", "arguments": "{\"city\": \"Paris\"}"}
