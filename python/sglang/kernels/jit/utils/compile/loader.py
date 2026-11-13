@@ -38,6 +38,13 @@ else:
 logger = logging.getLogger(__name__)
 
 _LOCK_FILE = ".lock"
+# SGLANG_JIT_DEBUG_TRACE -> the macros sgl_kernel/debug/trace.cuh switches on.
+_TRACE_FLAGS = {
+    "iket": ["-DSGL_TRACE_IKET"],
+    "iket-extended": ["-DSGL_TRACE_IKET", "-DSGL_TRACE_IKET_EXTENDED"],
+    "naive": ["-DSGL_TRACE_NAIVE"],
+    "naive-debug": ["-DSGL_TRACE_NAIVE", "-DSGL_TRACE_NAIVE_DEBUG"],
+}
 
 
 # JIT compilation is pure Python/filesystem plumbing (path `.resolve()` calls
@@ -108,6 +115,13 @@ def load_jit(
         extra_cuda_cflags += (
             ["-gline-tables-only"] if is_hip_runtime() else ["-lineinfo"]
         )
+    trace = envs.SGLANG_JIT_DEBUG_TRACE.get()
+    if trace:
+        if trace not in _TRACE_FLAGS:
+            raise ValueError(
+                f"SGLANG_JIT_DEBUG_TRACE={trace!r}; expected one of {list(_TRACE_FLAGS)}"
+            )
+        extra_cuda_cflags += _TRACE_FLAGS[trace]
 
     includes = list(DEFAULT_INCLUDE) + (extra_include_paths or [])
     if is_sail_runtime():
@@ -286,4 +300,10 @@ def _build_lock(scope: pathlib.Path):
 def _load(library: pathlib.Path) -> Module:
     from tvm_ffi import load_module
 
-    return load_module(str(library))
+    module = load_module(str(library))
+    if (envs.SGLANG_JIT_DEBUG_TRACE.get() or "").startswith("naive"):
+        # The naive trace buffer is handed to every traced module at capture time.
+        from sglang.kernels.jit.debug import trace
+
+        trace.register_naive_module(library.stem, module)
+    return module
