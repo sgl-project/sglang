@@ -204,6 +204,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
                 "chunk_indices": kwargs["chunk_indices"],
                 "chunk_offsets": kwargs["chunk_offsets"],
             }
+        transpose_npu_state = False
         if is_cpu():
             if not inplace_update:
                 raise NotImplementedError(
@@ -216,12 +217,22 @@ class TritonGDNKernel(LinearAttnKernelBase):
                     "GDN multi-item scoring is not supported by the NPU chunk kernel"
                 )
             recurrent_state = ssm_states[cache_indices]
+            # chunk_gated_delta_rule_npu expects initial_state and returns
+            # (final_state, h) in [N, HV, K, V] layout, whereas MambaPool and
+            # NPU decode kernels store ssm_states in [num_slots, HV, V, K].
+            transpose_npu_state = not (
+                ssm_states.stride(-2) == 1 and ssm_states.stride(-1) > 1
+            )
+            if transpose_npu_state:
+                recurrent_state = recurrent_state.transpose(-1, -2).contiguous()
+            else:
+                recurrent_state = recurrent_state.contiguous()
             recurrent_state_indices_args = {}
             # The external NPU kernel does not expose the optional write-back
             # control. Its existing behavior is equivalent to True.
             inplace_update_args = {}
 
-        return chunk_gated_delta_rule(
+        res = chunk_gated_delta_rule(
             q=q,
             k=k,
             v=v,
@@ -236,6 +247,14 @@ class TritonGDNKernel(LinearAttnKernelBase):
             **graph_table_args,
             **output_args,
         )
+        if transpose_npu_state:
+            attn_out, final_state, h = res
+            if final_state is not None:
+                final_state = final_state.transpose(-1, -2).contiguous()
+            if h is not None:
+                h = h.transpose(-1, -2)
+            return attn_out, final_state, h
+        return res
 
     def target_verify(
         self,
