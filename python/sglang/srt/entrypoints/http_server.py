@@ -2083,6 +2083,20 @@ async def retrieve_model(model: str):
     served_model_names = [_global_state.tokenizer_manager.served_model_name]
 
     if model not in served_model_names:
+        # `available_models` publishes every loaded adapter as its own card, and the
+        # OpenAI routes accept an adapter name as `model`, so retrieving one answers
+        # with the card the list returns instead of a 404.
+        if get_lora().enable_lora:
+            lora_registry = _global_state.tokenizer_manager.lora_registry
+            for lora_ref in lora_registry.get_all_adapters().values():
+                if lora_ref.lora_name == model:
+                    return ModelCard(
+                        id=lora_ref.lora_name,
+                        root=lora_ref.lora_path,
+                        parent=served_model_names[0],
+                        max_model_len=None,
+                    )
+
         return ORJSONResponse(
             status_code=404,
             content={
