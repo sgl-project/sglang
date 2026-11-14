@@ -484,6 +484,8 @@ class Envs:
     SGLANG_MEM_PROFILE_MAX_ENTRIES = EnvInt(100000)
     SGLANG_OTLP_EXPORTER_SCHEDULE_DELAY_MILLIS = EnvInt(500)
     SGLANG_OTLP_EXPORTER_MAX_EXPORT_BATCH_SIZE = EnvInt(64)
+    # First occurrence of each checked prefill rejection on sampled traces.
+    SGLANG_TRACE_PREFILL_ADMISSION = EnvBool(False)
     SGLANG_TRACE_ASYNC = EnvBool(False)
     SGLANG_TRACE_ASYNC_FLUSH_THRESHOLD = EnvInt(100)
     SGLANG_ENABLE_METRICS_DEVICE_TIMER = EnvBool(False)

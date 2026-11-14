@@ -5,6 +5,11 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+try:
+    from opentelemetry import trace
+except ImportError:
+    trace = None
+
 import sglang.srt.managers.schedule_policy as schedule_policy
 from sglang.srt.disaggregation.prefill import (
     PrefillBootstrapQueue,
@@ -59,6 +64,22 @@ from sglang.test.unified_allocator_fixtures import (
 )
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+
+
+def _parent(sampled=True):
+    return trace.set_span_in_context(
+        trace.NonRecordingSpan(
+            trace.SpanContext(
+                trace_id=1,
+                span_id=2,
+                is_remote=True,
+                trace_flags=trace.TraceFlags(
+                    trace.TraceFlags.SAMPLED if sampled else 0
+                ),
+            )
+        )
+    )
+
 
 # Window rows retire at once here; the scheduler's window retirement is
 # priced in test_request_demand.py.
@@ -207,6 +228,81 @@ class TestPrefillAdder(CustomTestCase):
         defaults.update(kwargs)
         defaults["token_to_kv_pool_allocator"].page_size = defaults["page_size"]
         return PrefillAdder(**defaults)
+
+    @unittest.skipIf(trace is None, "OpenTelemetry API not installed")
+    def test_max_requests_trace_does_not_change_admission(self):
+        for enabled, sampled in ((False, True), (True, False), (True, True)):
+            with self.subTest(enabled=enabled, sampled=sampled):
+                adder = self.create_adder(
+                    self.create_running_batch(), prefill_max_requests=1
+                )
+                chosen = object()
+                adder.can_run_list.append(chosen)
+                ctx = SimpleNamespace(
+                    tracing_enable=sampled,
+                    trace_level=3,
+                    root_span_context=_parent(),
+                    trace_slice=MagicMock(),
+                )
+                req = SimpleNamespace(time_stats=SimpleNamespace(trace_ctx=ctx))
+                with schedule_policy.envs.SGLANG_TRACE_PREFILL_ADMISSION.override(
+                    enabled
+                ):
+                    for _ in range(2):
+                        self.assertEqual(
+                            adder.add_one_req(req, False, None), AddReqResult.OTHER
+                        )
+                self.assertEqual(adder.can_run_list, [chosen])
+                self.assertEqual(ctx.trace_slice.call_count, int(enabled and sampled))
+                if enabled and sampled:
+                    self.assertEqual(
+                        ctx.trace_slice.call_args.args[0].attrs,
+                        {
+                            "reason": "prefill_max_requests",
+                            "selected_requests": 1,
+                            "max_requests": 1,
+                        },
+                    )
+
+    @unittest.skipIf(trace is None, "OpenTelemetry API not installed")
+    def test_input_budget_trace_preserves_rejected_request(self):
+        adder = self.create_adder(self.create_running_batch(), rem_input_tokens=10)
+        adder.can_run_list.append(object())
+        req = self.create_mock_req("waiting", 0, 4)
+        req.full_untruncated_fill_ids = [1] * 12
+        ctx = SimpleNamespace(
+            tracing_enable=True,
+            trace_level=3,
+            root_span_context=_parent(),
+            trace_slice=MagicMock(),
+        )
+        req.time_stats.trace_ctx = ctx
+        with (
+            schedule_policy.envs.SGLANG_TRACE_PREFILL_ADMISSION.override(True),
+            patch.object(adder, "_check_prefill_budget", return_value=(True, None)),
+        ):
+            for _ in range(2):
+                verdict = adder._select_prefill_admission(
+                    req,
+                    total_tokens=17,
+                    host_hit_length=0,
+                    window_host_hit_lengths={},
+                    truncation_align_size=None,
+                )
+                self.assertEqual(verdict, AddReqResult.OTHER)
+        self.assertEqual(adder.rem_input_tokens, 10)
+        self.assertIsNone(req.extend_end)
+        self.assertEqual(len(adder.can_run_list), 1)
+        ctx.trace_slice.assert_called_once()
+        self.assertEqual(
+            ctx.trace_slice.call_args.args[0].attrs,
+            {
+                "reason": "prefill_input_budget",
+                "input_tokens": 12,
+                "remaining_input_tokens": 10,
+                "selected_requests": 1,
+            },
+        )
 
     def create_shared_adder(self, *, num_mixed_decode_tokens=0, total_bytes=2048):
         self.mock_tree_cache.supports_mamba.return_value = False
