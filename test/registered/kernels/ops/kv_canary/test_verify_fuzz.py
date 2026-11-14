@@ -12,6 +12,7 @@ from sglang.kernels.ops.kv_canary.verify import (
     RealKvSource,
     VerifyPlan,
 )
+from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kernels.kv_canary._canary_helpers import (
     FakeViolationLog,
@@ -35,7 +36,7 @@ register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-s
 register_amd_ci(est_time=30, stage="jit-kernel-unit", runner_config="amd")
 
 
-_DEVICE = torch.device("cuda")
+_DEVICE = torch.device(get_device())
 
 _FUZZ_ITER_PER_SEED = 30
 

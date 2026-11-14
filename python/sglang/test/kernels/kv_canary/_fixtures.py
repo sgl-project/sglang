@@ -10,10 +10,8 @@ from sglang.kernels.ops.kv_canary.verify import (
     VerifyPlan,
 )
 from sglang.kernels.ops.kv_canary.write import WritePlan
+from sglang.srt.utils import get_device
 from sglang.test.kernels.kv_canary._constants import DEFAULT_NUM_SLOTS
-
-_DEVICE = torch.device("cuda")
-
 
 LutKind = Literal["identity", "shift", "permutation", "with_oob"]
 
@@ -216,25 +214,28 @@ def allocate_plan_pair(
     verify_capacity: int,
     write_req_capacity: int,
 ) -> tuple[VerifyPlan, WritePlan, VerifyPlan, WritePlan]:
+    device = torch.device(get_device())
     return (
-        VerifyPlan.allocate(verify_capacity=verify_capacity, device=_DEVICE),
-        WritePlan.allocate(write_req_capacity=write_req_capacity, device=_DEVICE),
-        VerifyPlan.allocate(verify_capacity=verify_capacity, device=_DEVICE),
-        WritePlan.allocate(write_req_capacity=write_req_capacity, device=_DEVICE),
+        VerifyPlan.allocate(verify_capacity=verify_capacity, device=device),
+        WritePlan.allocate(write_req_capacity=write_req_capacity, device=device),
+        VerifyPlan.allocate(verify_capacity=verify_capacity, device=device),
+        WritePlan.allocate(write_req_capacity=write_req_capacity, device=device),
     )
 
 
 def empty_extras() -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    device = torch.device(get_device())
     return (
-        torch.zeros(1, dtype=torch.int64, device=_DEVICE),
-        torch.zeros(1, dtype=torch.int64, device=_DEVICE),
-        torch.zeros(1, dtype=torch.int64, device=_DEVICE),
-        torch.zeros(1, dtype=torch.int32, device=_DEVICE),
+        torch.zeros(1, dtype=torch.int64, device=device),
+        torch.zeros(1, dtype=torch.int64, device=device),
+        torch.zeros(1, dtype=torch.int64, device=device),
+        torch.zeros(1, dtype=torch.int32, device=device),
     )
 
 
 def dummy_pseudo_tensors(num_tokens: int) -> tuple[torch.Tensor, torch.Tensor]:
+    device = torch.device(get_device())
     return (
-        torch.zeros(num_tokens, dtype=torch.int64, device=_DEVICE),
-        torch.zeros(num_tokens, dtype=torch.int64, device=_DEVICE),
+        torch.zeros(num_tokens, dtype=torch.int64, device=device),
+        torch.zeros(num_tokens, dtype=torch.int64, device=device),
     )
