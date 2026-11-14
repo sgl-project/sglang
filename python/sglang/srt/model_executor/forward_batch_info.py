@@ -63,12 +63,7 @@ from sglang.srt.runtime_context import (
     mamba_cache_chunk_size,
 )
 from sglang.srt.speculative.spec_info import SpecInputType
-from sglang.srt.utils import (
-    is_cpu,
-    is_hip,
-    is_npu,
-    support_triton,
-)
+from sglang.srt.utils import is_cpu, is_hip, is_npu, support_triton
 from sglang.srt.utils.common import ceil_align
 from sglang.srt.utils.device import (
     async_h2d_stack,
@@ -493,6 +488,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     dimensions: Optional[list[int]] = None
     # Whether to return pooled hidden states (pre-head transformer output)
     return_pooled_hidden_states: bool = False
+    mtp_prefix_scheduler_ready: bool = False
+    mtp_prefix_preconditioned: bool = False
+    mtp_t1_hidden: Optional[torch.Tensor] = None
+    mtp_t1_ids: Optional[torch.Tensor] = None
 
     # For DP attention
     is_extend_in_batch: bool = False

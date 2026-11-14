@@ -100,6 +100,20 @@ if _is_gfx95:
         conv_prepare,
     )
 
+
+def _make_dflash_hidden_norm(config, hidden_size, eps, default_cls=RMSNorm):
+    # Legacy Qwen checkpoints center only this context-projection gamma at
+    # zero. Do not switch Q/K, transformer, or final norms to GemmaRMSNorm.
+    cfg = getattr(config, "dflash_config", None)
+    centered = bool(getattr(config, "hidden_norm_zero_centered_gamma", False))
+    centered = centered or (
+        isinstance(cfg, dict)
+        and bool(cfg.get("hidden_norm_zero_centered_gamma", False))
+    )
+    cls = GemmaRMSNorm if centered else default_cls
+    return cls(hidden_size, eps=eps)
+
+
 # MI355X, TP4 Muse Spark draft (SGLANG_ROCM_MUSE_DFLASH_DENSE): the QKV [2560, 8192], MLP down [8192, 7168] and
 # gate/up [14336, 8192] weights on the row-major split-K GEMM at the widths it is tuned for (the ROW_MAJOR table);
 # the gate/up from 33 to 128 rows on hipBLASLt, since aiter's tuned table picks a slower split-K kernel there with
@@ -709,9 +723,11 @@ class DFlashMLAAttention(DeepseekV2AttentionMLA):
                     window_locs=layer_window_locs(
                         pool,
                         self.attn_mqa.layer_id,
-                        None
-                        if swa_cache_loc is None
-                        else swa_cache_loc.view_as(cache_loc_2d),
+                        (
+                            None
+                            if swa_cache_loc is None
+                            else swa_cache_loc.view_as(cache_loc_2d)
+                        ),
                     ),
                     physical=True,
                 ),
@@ -1143,7 +1159,9 @@ class DFlashDraftModel(nn.Module):
             self.fc = nn.Linear(
                 self.num_context_features * hidden_size, hidden_size, bias=False
             )
-        self.hidden_norm = norm_cls(hidden_size, eps=rms_norm_eps)
+        self.hidden_norm = _make_dflash_hidden_norm(
+            config, hidden_size, rms_norm_eps, norm_cls
+        )
 
         # The model loader calls load_weights() before set_block_size(). Build
         # Domino projector modules here so their parameters are present while
@@ -1743,6 +1761,19 @@ class DFlash2DraftModel(DFlashDraftModel):
             hidden, self.lm_head, self.candidate_selector.top_k
         )
         return ids, self._transform_unary_logits(vals)
+
+    def load_weights(self, weights):
+        from sglang.srt.speculative.dflash2_contract import (
+            checked_weights,
+            validate_dflash2,
+        )
+
+        # Strict export checks apply to this recipe, not unrelated upstream
+        # vendor aliases whose loaders accept additional HF name mappings.
+        if "conv_base_kernel_identity_folded" in self.config.dflash_config:
+            validate_dflash2(self.config)
+            weights = checked_weights(self, weights)
+        super().load_weights(weights)
 
 
 class MiniMaxDFlash2DraftModel(DFlash2DraftModel):

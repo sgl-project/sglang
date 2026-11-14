@@ -14,9 +14,7 @@ from sglang.kernels.ops.speculative.dflash import (
     _prepare_dflash_draft_block_unchecked,
     compute_dflash_correct_drafts_and_bonus,
 )
-from sglang.kernels.ops.speculative.dspark.dspark_accept import (
-    accept_sampling,
-)
+from sglang.kernels.ops.speculative.dspark.dspark_accept import accept_sampling
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import get_dp_tp_group
@@ -101,9 +99,7 @@ from sglang.srt.speculative.lilicorr_utils import (
     target_input_embeddings,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.speculative.spec_sampling_mask import (
-    SpeculativeSamplingMaskCapture,
-)
+from sglang.srt.speculative.spec_sampling_mask import SpeculativeSamplingMaskCapture
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
 from sglang.srt.speculative.spec_utils import (
     SIMULATE_ACC_LEN,
@@ -418,10 +414,16 @@ class DFlashWorkerV2(BaseSpecWorker):
     ):
         super().__init__()
 
+        if os.getenv("SGLANG_DMTP_LEGACY_FA3_COMPAT", "0") == "1":
+            from sglang.srt.speculative.dmtp_runtime import install_legacy_fa3_compat
+
+            install_legacy_fa3_compat()
+
         self.server_args = server_args
         self.gpu_id = gpu_id
         self.nccl_port = nccl_port
         self._target_worker = target_worker
+        self._dmtp_controller = None
         self.model_runner = target_worker.model_runner
         self._need_mamba_verify_commit = False
         self.page_size = get_schedule().page_size
@@ -766,6 +768,11 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_tp_context(self.draft_parallel_layout),
         ):
             self._draft_worker.init_attention_backends()
+            from sglang.srt.speculative.dflash2_anchor_window import (
+                install_anchor_window,
+            )
+
+            install_anchor_window(self)
         if self.draft_kv_ring is not None:
             self.draft_model_runner.attn_backend.set_draft_kv_ring(self.draft_kv_ring)
         self._need_mamba_verify_commit = mambaish_config(
@@ -828,6 +835,11 @@ class DFlashWorkerV2(BaseSpecWorker):
             self._draft_worker.init_cuda_graphs(
                 capture_decode_cuda_graph=capture_decode_cuda_graph
             )
+            from sglang.srt.speculative.dflash2_anchor_window import (
+                validate_anchor_capture,
+            )
+
+            validate_anchor_capture(self)
             if target_dp_enabled and not _is_npu and self.selector is not None:
                 self._warm_eager_selector()
 
@@ -1430,9 +1442,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         None. Its compact rows must name those ids, like its writes do."""
         if not self.draft_model_runner.token_to_kv_pool.follows_target_swa_ids:
             return None
-        assert self.use_compact_draft_cache, (
-            "a draft pool on the target's SWA ids needs the compact window"
-        )
+        assert (
+            self.use_compact_draft_cache
+        ), "a draft pool on the target's SWA ids needs the compact window"
         return self.model_runner.token_to_kv_pool_allocator.full_to_swa_index_mapping
 
     def _maybe_merge_trained_mask_embedding(self) -> None:
@@ -2126,9 +2138,11 @@ class DFlashWorkerV2(BaseSpecWorker):
                             window_locs=layer_window_locs(
                                 self.draft_model_runner.token_to_kv_pool,
                                 attn.attn.layer_id,
-                                swa_cache_loc.view_as(cache_loc_2d)
-                                if swa_cache_loc is not None
-                                else None,
+                                (
+                                    swa_cache_loc.view_as(cache_loc_2d)
+                                    if swa_cache_loc is not None
+                                    else None
+                                ),
                             ),
                             physical=True,
                         ),
@@ -2245,9 +2259,11 @@ class DFlashWorkerV2(BaseSpecWorker):
                         window_locs=layer_window_locs(
                             token_to_kv_pool,
                             attn.layer_id,
-                            ctx_swa_cache_loc.view_as(ctx_cache_loc_2d)
-                            if ctx_swa_cache_loc is not None
-                            else None,
+                            (
+                                ctx_swa_cache_loc.view_as(ctx_cache_loc_2d)
+                                if ctx_swa_cache_loc is not None
+                                else None
+                            ),
                         ),
                         physical=True,
                     ),
@@ -2360,9 +2376,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         ]
         self._accept_bonus_buffer_cap = new_cap
 
-    def _next_accept_bonus_buffers(
-        self, bs: int
-    ) -> tuple[
+    def _next_accept_bonus_buffers(self, bs: int) -> tuple[
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
@@ -2633,6 +2647,11 @@ class DFlashWorkerV2(BaseSpecWorker):
                 extend_lens=ctx_lens,
             )
 
+            if self._dmtp_controller is not None:
+                self._dmtp_controller.prefill(
+                    batch, next_token_ids, logits_output.hidden_states
+                )
+
             # Avoid copying large hidden-state buffers to CPU in overlap scheduling.
             logits_output.hidden_states = None
 
@@ -2790,17 +2809,30 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
             verify_out_cache_loc_2d.copy_(verify_out_cache_loc.view(bs, block_size))
 
-        if self._full_embed_gpu is not None:
-            # A borrowed embedding may use target-wide collectives, while
-            # other DP replicas are idle or looking up different token IDs.
-            noise_embedding = torch.nn.functional.embedding(
-                block_ids, self._full_embed_gpu
-            )
+        dmtp = self._dmtp_controller
+        draft_slots = block_size if dmtp is None else dmtp.draft_slots
+        if dmtp is not None:
+            dmtp.t1(batch, block_ids)
+        draft_ids = block_ids
+        prepared = dmtp.prepared_embeds if dmtp is not None else None
+        if prepared is not None:
+            input_embeds = prepared.reshape(bs * draft_slots, -1)
         else:
-            noise_embedding = embed_module(block_ids)
-        if self._noise_embed_scale != 1.0:
-            noise_embedding = noise_embedding * self._noise_embed_scale
-        input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
+            if self._full_embed_gpu is not None:
+                # Borrowed embeddings can use target-wide collectives.
+                noise_embedding = torch.nn.functional.embedding(
+                    draft_ids, self._full_embed_gpu
+                )
+            else:
+                noise_embedding = embed_module(draft_ids)
+            if self._noise_embed_scale != 1.0:
+                noise_embedding = noise_embedding * self._noise_embed_scale
+            input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
+            if dmtp is not None:
+                input_embeds = self.draft_model.mtp_prefix_conditioner(
+                    input_embeds.view(bs, draft_slots, -1), dmtp.hidden
+                )
+                input_embeds = input_embeds.reshape(bs * draft_slots, -1)
 
         positions = positions_2d.reshape(-1)
         verify_out_cache_loc = verify_out_cache_loc_2d.reshape(-1)
@@ -2857,10 +2889,12 @@ class DFlashWorkerV2(BaseSpecWorker):
                     seq_lens_cpu[i] = req.kv.kv_allocated_len
                 draft_seq_lens_sum = int(seq_lens_cpu.sum())
 
+        if dmtp is not None:
+            self._draft_block_spec_info.custom_mask = dmtp.mask(draft_seq_lens)
         forward_batch = ForwardBatch(
             forward_mode=ForwardMode.TARGET_VERIFY,
             batch_size=bs,
-            input_ids=block_ids.flatten(),
+            input_ids=draft_ids.flatten(),
             req_pool_indices=batch.req_pool_indices,
             seq_lens=draft_seq_lens,
             out_cache_loc=verify_out_cache_loc,
@@ -2872,11 +2906,11 @@ class DFlashWorkerV2(BaseSpecWorker):
             spec_info=self._draft_block_spec_info,
             capture_hidden_mode=CaptureHiddenMode.NULL,
             num_token_non_padded=(
-                torch.full((), bs * block_size, dtype=torch.int32, device=device)
+                torch.full((), bs * draft_slots, dtype=torch.int32, device=device)
                 if enable_num_token_non_padded()
                 else None
             ),
-            global_num_token_non_padded_cpu=bs * block_size,
+            global_num_token_non_padded_cpu=bs * draft_slots,
             can_run_decode_cuda_graph=batch.can_run_decode_cuda_graph,
         )
         # The draft block writes the whole window. A compact draft reads its
@@ -2900,6 +2934,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
             forward_batch.out_cache_loc = ring_block_locs
             forward_batch.out_cache_loc_virtual = None
+        if dmtp is not None:
+            forward_batch.mtp_prefix_scheduler_ready = True
+            forward_batch.mtp_prefix_preconditioned = True
 
         if self.selector is not None or self.lilicorr is not None:
             self._selector_sample = None
@@ -2916,7 +2953,36 @@ class DFlashWorkerV2(BaseSpecWorker):
             draft_out = self.draft_model_runner.forward(forward_batch)
         draft_logits_output = draft_out.logits_output
 
-        if (
+        if dmtp is not None:
+            draft_hidden = draft_logits_output.hidden_states
+            if draft_hidden is None:
+                raise RuntimeError("DMTP draft returned no hidden states")
+            dmtp.graph_used["draft"] = bool(draft_out.can_run_graph)
+            checked = getattr(dmtp, "_df_graph_checked_batches", None)
+            if checked is None:
+                checked = dmtp._df_graph_checked_batches = set()
+            if bs not in checked:
+                graph = self.draft_model_runner.decode_cuda_graph_runner
+                logger.info(
+                    "DMTP_DF_GRAPH_FIRST_PASS B=%d width=%d captured=%s replay=%s",
+                    bs,
+                    forward_batch.spec_info.num_tokens_per_req,
+                    getattr(graph, "captured_req_width", None),
+                    bool(draft_out.can_run_graph),
+                )
+                if (
+                    graph is not None
+                    and batch.can_run_decode_cuda_graph
+                    and not draft_out.can_run_graph
+                ):
+                    raise RuntimeError(
+                        "DMTP DF unexpectedly fell back from its captured graph"
+                    )
+                checked.add(bs)
+            draft_next = dmtp.proposal(
+                draft_hidden.view(bs, draft_slots, -1), block_ids, positions_2d
+            )
+        elif (
             self._is_domino
             and self._draft_sampler is not None
             and draft_out.can_run_graph
@@ -3216,6 +3282,17 @@ class DFlashWorkerV2(BaseSpecWorker):
                 "DFLASH verify requires target hidden states, but got None."
             )
         hidden = hidden.view(bs, int(self.block_size), -1)
+
+        if dmtp is not None:
+            dmtp.graph_used["target"] = bool(can_run_cuda_graph)
+            dmtp.commit(
+                candidates,
+                accept_len,
+                bonus,
+                hidden,
+                new_seq_lens,
+                verify_out_cache_loc_2d,
+            )
 
         # Consume in this step: every decode graph size shares one aux output,
         # which the next target forward overwrites (resolve_aux_hidden_states_width).
