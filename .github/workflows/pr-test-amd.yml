@@ -1344,6 +1344,9 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
+      # Cache-only: no sgl-router-build here. amd_ci_exec.sh maps the path into the container.
+      - uses: ./.github/actions/download-sgl-router
+
       - name: Ensure VRAM is clear
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
