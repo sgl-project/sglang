@@ -155,3 +155,41 @@ def test_host_resident_embedding_matches_resident_embedding():
         restore_host_resident_tables(detach_host_resident_tables(model), "cpu")
 
     torch.testing.assert_close(_encode(model, input_ids), reference, rtol=0, atol=0)
+
+
+@pytest.mark.usefixtures("single_process_model_parallel")
+def test_folded_encoder_keeps_a_whole_host_resident_vocab_table(monkeypatch):
+    from types import SimpleNamespace
+
+    from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
+        VocabParallelEmbedding,
+    )
+    from sglang.multimodal_gen.runtime.loader.weight_utils import (
+        default_weight_loader,
+    )
+    from sglang.multimodal_gen.runtime.models.encoders import gemma_4_unified
+
+    text_config = SimpleNamespace(vocab_size=512, hidden_size=64)
+    unfolded = gemma_4_unified._vocab_embedding(text_config)
+    assert isinstance(unfolded, VocabParallelEmbedding)
+    monkeypatch.setattr(gemma_4_unified, "get_tp_world_size", lambda: 2)
+    folded = gemma_4_unified._vocab_embedding(text_config)
+    assert type(folded) is torch.nn.Embedding
+
+    # load_weights loads a plain parameter with the default loader
+    weight = torch.randn(512, 64)
+    default_weight_loader(folded.weight, weight)
+    unfolded.weight.weight_loader(unfolded.weight, weight)
+    input_ids = torch.randint(0, 512, (2, 9))
+    with torch.no_grad():
+        torch.testing.assert_close(
+            folded(input_ids), unfolded(input_ids), rtol=0, atol=0
+        )
+
+    # unlike a sharded table, the whole one can stay on the host
+    holder = torch.nn.Module()
+    holder.embed_tokens = folded
+    holder.host_resident_table_names = ["embed_tokens"]
+    threshold = f"{layerwise_offload.__name__}.HOST_RESIDENT_TABLE_MIN_BYTES"
+    with patch(threshold, 1024):
+        assert _host_resident_tables(holder) == [folded]
