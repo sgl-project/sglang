@@ -4659,6 +4659,7 @@ class Scheduler(
 
         mamba_allocator = self.token_to_kv_pool_allocator.state_slots
         if mamba_allocator is not None:
+            # The adder read its free state slots before this pre-take.
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
         buffer_pipeline = self.tree_cache.buffer_pipeline
         # A parked chunk found no budget in this pass: admit no one ahead of it,
@@ -4758,7 +4759,8 @@ class Scheduler(
                 truncation_align_size=self.truncation_align_size,
             )
 
-            if self.enable_lora:
+            # A held request is not admitted, so its adapter takes no slot.
+            if self.enable_lora and res != AddReqResult.HELD:
                 running_loras.add(req.lora_id)
 
             if res != AddReqResult.CONTINUE:
@@ -4778,7 +4780,10 @@ class Scheduler(
                     # keep the request queued forever.
                     unschedulable.append(req)
                     continue
+                if res == AddReqResult.HELD:
+                    continue
                 break
+        adder.count_cache_reserve_overtakes()
 
         for req in unschedulable:
             if self.disaggregation_mode == DisaggregationMode.PREFILL:

@@ -378,6 +378,27 @@ def check_server_args(server_args: Any):
     validate_buckets_rule("--prompt-tokens-buckets", cfg.prompt_tokens_buckets)
     validate_buckets_rule("--generation-tokens-buckets", cfg.generation_tokens_buckets)
 
+    if cfg.prefill_cache_reserve is not None:
+        assert 0 < cfg.prefill_cache_reserve < 1, (
+            "--prefill-cache-reserve must be between 0 and 1"
+        )
+        assert not cfg.disable_radix_cache, (
+            "--prefill-cache-reserve keeps room for cached prefixes and needs the radix cache"
+        )
+        # A shared-memory budget prices demands and has no free-token count to compare.
+        assert not cfg.enable_unified_memory, (
+            "--prefill-cache-reserve does not support --enable-unified-memory"
+        )
+        # PD prefill and dLLM run no decode batch, so the reserve would never hold.
+        assert cfg.disaggregation_mode == "null" and cfg.dllm_algorithm is None, (
+            "--prefill-cache-reserve does not support PD disaggregation or dLLM"
+        )
+        # Any order but arrival lets admitted requests pass a held one every
+        # pass, so it would never get its turn.
+        assert cfg.schedule_policy == "fcfs" and not cfg.enable_priority_scheduling, (
+            "--prefill-cache-reserve needs --schedule-policy fcfs without priority scheduling"
+        )
+
     # Check scheduling policy
     if cfg.enable_priority_scheduling:
         assert cfg.schedule_policy in [

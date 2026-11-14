@@ -598,6 +598,8 @@ class Req(ReqDllmMixin):
         self.eos_token_ids = eos_token_ids
         self.vocab_size = vocab_size
         self.priority = priority
+        # Requests admitted ahead of this one while `--prefill-cache-reserve` held it.
+        self.cache_reserve_overtaken = 0
 
         # For multimodal inputs
         self.multimodal_inputs: Optional[MultimodalInputs] = None

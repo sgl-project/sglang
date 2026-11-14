@@ -6,6 +6,7 @@ import math
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.base import get_cp_strategy, is_cp_sharded_padded
 from sglang.srt.layers.cp.utils import (
+    from_cp_sharded,
     get_cp_sharded_padded_allocation_tokens,
 )
 from sglang.srt.managers.prefill_delayer import PrefillDelayerSinglePassExecutor
@@ -46,7 +47,17 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from enum import Enum, auto
 from functools import lru_cache
-from typing import TYPE_CHECKING, Dict, Iterable, List, Mapping, Optional, Set, Union
+from typing import (
+    TYPE_CHECKING,
+    Dict,
+    Iterable,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Set,
+    Union,
+)
 
 import torch
 
@@ -67,6 +78,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.capacity import capacity_decision, create_prefill_budget
 from sglang.srt.mem_cache.common import match_kv_cache, touch_waiting_prefix
+from sglang.srt.mem_cache.prefill_budget import SWAPrefillBudget
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.model_executor import encoder_swa_replay
@@ -636,6 +648,13 @@ class AddReqResult(Enum):
     # No memory comes back for a request no chunk of which fits now
     # (`PrefillBudget.unschedulable`): it is aborted, not queued.
     UNSCHEDULABLE = auto()
+    # Waits for `--prefill-cache-reserve`; the requests behind it still try.
+    HELD = auto()
+
+
+# Arbitrary: in a replay of coding-agent traffic 16 kept the hit rate where 4
+# let the cache thrash again; a held request is admitted once passed this often.
+CACHE_RESERVE_MAX_OVERTAKES = 16
 
 
 @dataclass(frozen=True, slots=True)
@@ -695,6 +714,11 @@ def windows_retire_behind_checkpoints(tree_cache: Optional[BasePrefixCache]) -> 
 
 
 class PrefillAdder:
+    # Off unless `_init_cache_reserve` sets them; adders built without
+    # __init__ (test doubles, `object.__new__`) keep the reserve off.
+    cache_reserve_tokens: Optional[int] = None
+    cache_reserve_held: Sequence[tuple[Req, int]] = ()
+
     def __init__(
         self,
         page_size: int,
@@ -794,6 +818,7 @@ class PrefillAdder:
             priority_scheduling_preemption_threshold
         )
         self.max_running_requests = max_running_requests
+        self._init_cache_reserve()
         # Align sharded chunk boundaries to physical pages; 0 disables alignment.
         kv_shard_size = page_interleave_shard_size(self.token_to_kv_pool_allocator)
         self.kv_shard_granule = (
@@ -926,6 +951,87 @@ class PrefillAdder:
         if self.memory_budget.unschedulable:
             return AddReqResult.UNSCHEDULABLE
         return AddReqResult.NO_TOKEN
+
+    def _init_cache_reserve(self) -> None:
+        """Fix the room `--prefill-cache-reserve` keeps for cached prefixes."""
+        ratio = get_schedule().prefill_cache_reserve
+        self.cache_reserve_tokens = None
+        # Requests held this pass, with how many had been admitted before each.
+        self.cache_reserve_held = []
+        if ratio is None:
+            return
+        self.kv_capacity = self._kv_capacity()
+        self.cache_reserve_tokens = int(ratio * self.kv_capacity)
+        self.cache_reserve_state_slots = 0
+        if self.is_hybrid_ssm_cache:
+            table = self.tree_cache.req_to_token_pool
+            self.cache_reserve_state_slots = int(ratio * table.mamba_allocator.size)
+            # Read before the scheduler's alloc_group_begin takes slots for the
+            # waiting queue; admits of this pass are subtracted at each check.
+            self.free_state_slots_at_start = (
+                table.mamba_allocator.available_size()
+                + self.tree_cache.mamba_evictable_size()
+            )
+            # Checkpoints pinned after this point (admits, the temporary pin
+            # of the request asked about) stop being evictable.
+            self.protected_state_slots_at_start = self.tree_cache.mamba_protected_size()
+            # What acquire takes for a request with no state (StateStorage).
+            self.fresh_state_slots = 1 + (
+                table.mamba_initial_tracking_slots
+                if table.enable_mamba_extra_buffer
+                else 0
+            )
+
+    def count_cache_reserve_overtakes(self) -> None:
+        """Charge each request held this pass with the requests admitted after it."""
+        for req, admitted_before in self.cache_reserve_held:
+            req.cache_reserve_overtaken += len(self.can_run_list) - admitted_before
+
+    def _kv_capacity(self) -> int:
+        """The pool size in the units of `memory_budget.remaining_total`."""
+        allocator = self.token_to_kv_pool_allocator
+        if isinstance(self.memory_budget, SWAPrefillBudget):
+            size = (
+                allocator.size_swa
+                if self.memory_budget.all_swa
+                else allocator.size_full
+            )
+        else:
+            size = allocator.size
+        return from_cp_sharded(size) if is_cp_sharded_padded() else size
+
+    def _holds_for_cache_reserve(self, req: Req, *, total_tokens: int) -> bool:
+        """Whether a mostly-uncached ``req`` would take the room kept for cached
+        prefixes; it waits for running requests to finish instead."""
+        if self.cache_reserve_tokens is None or self.running_batch is None:
+            return False
+        # Nothing running would free memory, so waiting could never end.
+        if self.running_batch.is_empty():
+            return False
+        # Too large to ever fit beside the reserve: holding it would drain the server.
+        if total_tokens + self.cache_reserve_tokens > self.kv_capacity:
+            return False
+        cached = req.prefix_len + req.host_hit_length
+        if 2 * cached >= len(req.full_untruncated_fill_ids):
+            return False
+        if req.cache_reserve_overtaken >= CACHE_RESERVE_MAX_OVERTAKES:
+            return False
+        if (
+            self.memory_budget.remaining_total - total_tokens
+            < self.cache_reserve_tokens
+        ):
+            return True
+        if not self.is_hybrid_ssm_cache:
+            return False
+        pinned_states = (
+            self.tree_cache.mamba_protected_size() - self.protected_state_slots_at_start
+        )
+        free_states = (
+            self.free_state_slots_at_start
+            - pinned_states
+            - self.fresh_state_slots * (len(self.can_run_list) + 1)
+        )
+        return free_states < self.cache_reserve_state_slots
 
     def _state_slots_for_req(self, req: Req, *, include_host_hit: bool = False) -> int:
         """Number of state slots a request still needs.
@@ -1745,6 +1851,11 @@ class PrefillAdder:
                 if admission is AddReqResult.NO_TOKEN:
                     self._defer_staged_for_capacity_if_idle(req, pool="prefill_budget")
                 return admission
+
+            # Not NO_TOKEN: the batch is not full, later requests still try.
+            if self._holds_for_cache_reserve(req, total_tokens=total_tokens):
+                self.cache_reserve_held.append((req, len(self.can_run_list)))
+                return AddReqResult.HELD
 
             # A rejected candidate must not report prefillable or queue H2D.
             if (self.prefill_delayer_single_pass is not None) and (

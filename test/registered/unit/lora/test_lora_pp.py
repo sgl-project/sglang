@@ -132,7 +132,10 @@ class TestAllPPLoras(CustomTestCase):
 
         # Stop after LoRA admission setup, before allocating or running a prefill.
         adder = SimpleNamespace(
-            can_run_list=[], preempt_list=[], budget_state=lambda: AddReqResult.OTHER
+            can_run_list=[],
+            preempt_list=[],
+            budget_state=lambda: AddReqResult.OTHER,
+            count_cache_reserve_overtakes=lambda: None,
         )
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.__dict__.update(

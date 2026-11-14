@@ -1,5 +1,6 @@
 """A request that already holds a req_to_token row is not counted twice at admission (#38118, #35537),
-and a parked chunked request lets no one be admitted ahead of it."""
+a parked chunked request lets no one be admitted ahead of it, and a request held
+for the cache reserve takes no LoRA slot."""
 
 import unittest
 from types import SimpleNamespace
@@ -11,6 +12,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.disaggregation.mode import DisaggregationMode
+from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.managers.scheduler import Scheduler
@@ -183,6 +185,55 @@ class TestHeldRowAdmission(CustomTestCase):
         self.assertIsNone(new_batch)
         self.assertIs(s.chunked_req, parked)
         self.assertEqual(list(s.waiting_queue), [waiting])
+
+    def test_request_held_for_the_cache_reserve_takes_no_lora_slot(self):
+        """A request held for `--prefill-cache-reserve` is not admitted, so its
+        adapter must not fill a LoRA slot: with 2 slots and adapter A running, a
+        request on C behind a held one on B is still admitted."""
+
+        def lora_req(lora_id, holds_row):
+            req = _Req(holds_row=holds_row)
+            req.kv.holds_mamba = False
+            req.session = None
+            req.lora_id = lora_id
+            req.finished = lambda: False
+            return req
+
+        running = [lora_req("A", holds_row=True)]
+        final_chunk = lora_req("A", holds_row=True)
+        cold, warm = lora_req("B", holds_row=False), lora_req("C", holds_row=False)
+
+        class _HoldsCold(_Adder):
+            def add_one_req(self, req, has_chunked_req, truncation_align_size):
+                if req is cold:
+                    return AddReqResult.HELD
+                return super().add_one_req(req, has_chunked_req, truncation_align_size)
+
+        running_batch = ScheduleBatch(reqs=running)
+        s = self._scheduler(
+            DisaggregationMode.NULL, running, final_chunk, [cold, warm], _HoldsCold
+        )
+        s.enable_lora = True
+        s.enable_lora_overlap_loading = False
+        s.lora_drainer = None
+        lora_manager = LoRAManager.__new__(LoRAManager)
+        lora_manager.max_loras_per_batch = 2
+        lora_manager.num_pinned_loras = 0
+        s.tp_worker.model_runner.lora_manager = lora_manager
+
+        def capture(can_run_list, *args, **kwargs):
+            raise _BatchBuilt(list(can_run_list))
+
+        with (
+            get_context().override_server_args(pp_max_micro_batch_size=NUM_ROWS),
+            patch.object(ScheduleBatch, "init_new", side_effect=capture),
+            patch("sglang.srt.managers.scheduler.set_time_batch"),
+        ):
+            with self.assertRaises(_BatchBuilt) as built:
+                s._get_new_batch_prefill_raw(
+                    prefill_delayer_single_pass=None, running_batch=running_batch
+                )
+        self.assertEqual(built.exception.args[0], [final_chunk, warm])
 
 
 if __name__ == "__main__":
