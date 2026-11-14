@@ -21,6 +21,10 @@ from sglang.kernels.ops.speculative.lilicorr import lilicorr_topk_lse
 from sglang.srt.arg_groups.choices import DFLASH_MLA_ONLY_DRAFT_BACKENDS
 from sglang.srt.configs.draft_parallel import DraftParallelSpec, DraftTPExecution
 from sglang.srt.configs.laguna import normalize_gating
+from sglang.srt.distributed.device_communicators.triton_symm_mem_ag import (
+    MultimemAllGatherer,
+    recommended_max_tokens,
+)
 from sglang.srt.environ import envs
 from sglang.srt.hf_transformers import get_rope_config
 from sglang.srt.layers.activation import SiluAndMul
@@ -1130,6 +1134,7 @@ class DFlashDraftModel(nn.Module):
         num_context_features = len(target_layer_ids)
 
         self.num_context_features = int(num_context_features)
+        self._fc_gatherer: Optional[MultimemAllGatherer] = None
         if self.quantizable:
             fc_prefix = f"{prefix}.fc" if prefix else "fc"
             self.fc = ReplicatedLinear(
@@ -1138,6 +1143,25 @@ class DFlashDraftModel(nn.Module):
                 bias=False,
                 quant_config=quant_config,
                 prefix=fc_prefix,
+            )
+        elif (
+            envs.SGLANG_OPT_DFLASH_SPLIT_FC.get()
+            and get_parallel().tp_group.world_size > 1
+            and type(self).project_target_hidden
+            is DFlashDraftModel.project_target_hidden
+        ):
+            # Each rank projects its hidden columns; the gather rebuilds the row. The draft's
+            # TP ranks share token rows (SINGLE_GROUP), as the gather needs.
+            self.fc = ColumnParallelLinear(
+                self.num_context_features * hidden_size,
+                hidden_size,
+                bias=False,
+                gather_output=False,
+                prefix=f"{prefix}.fc" if prefix else "fc",
+            )
+            # Rows are the injected target tokens, up to a prefill chunk.
+            self._fc_gatherer = MultimemAllGatherer(
+                max_tokens=recommended_max_tokens(include_prefill=True, floor=512)
             )
         else:
             self.fc = nn.Linear(
@@ -1204,7 +1228,11 @@ class DFlashDraftModel(nn.Module):
 
     def project_target_hidden(self, target_hidden: torch.Tensor) -> torch.Tensor:
         """Project concatenated target-layer hidden states into draft hidden_size."""
-        expected = int(self.fc.input_size if self.quantizable else self.fc.in_features)
+        expected = int(
+            self.fc.in_features
+            if isinstance(self.fc, nn.Linear)
+            else self.fc.input_size
+        )
         if target_hidden.ndim != 2 or int(target_hidden.shape[-1]) != expected:
             raise ValueError(
                 "DFLASH target_hidden feature dim mismatch. "
@@ -1215,7 +1243,9 @@ class DFlashDraftModel(nn.Module):
                 "the draft checkpoint/config expects."
             )
         projected = self.fc(target_hidden)
-        if self.quantizable:
+        if self._fc_gatherer is not None:
+            projected = self._fc_gatherer(projected[0])
+        elif self.quantizable:
             projected = projected[0]
         return self.hidden_norm(projected)
 
@@ -1356,6 +1386,14 @@ class DFlashDraftModel(nn.Module):
                             getattr(param, "pack_factor", None) is None
                             and tuple(loaded_weight.shape) == tuple(param.shape)
                         )
+                    elif self._fc_gatherer is not None:
+                        # This rank holds a row block; the weight_loader shards the full tensor.
+                        expected_shape = (
+                            int(self.config.hidden_size),
+                            int(self.num_context_features * self.config.hidden_size),
+                        )
+                        loaded_shape = tuple(loaded_weight.shape)
+                        shape_matches = loaded_shape == expected_shape
                     else:
                         expected_shape = tuple(param.shape)
                         loaded_shape = tuple(loaded_weight.shape)

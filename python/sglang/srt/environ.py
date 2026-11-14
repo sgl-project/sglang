@@ -1799,6 +1799,9 @@ class Envs:
     SGLANG_OPT_FUSED_KDA_VERIFY = EnvBool(False)
     # A/B: keep the DFLASH draft greedy head eager (not folded in-graph).
     SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
+    # Split the unquantized DFLASH draft fc over the draft TP ranks (ColumnParallelLinear) and
+    # multicast all-gather the slices (MultimemAllGatherer, NCCL fallback).
+    SGLANG_OPT_DFLASH_SPLIT_FC = EnvBool(False)
     # The DFLASH draft KV ring (speculative/dflash_draft_ring.py); resolved at
     # startup to off where it does not fit.
     SGLANG_ENABLE_DFLASH_DRAFT_KV_RING = EnvBool(True)
