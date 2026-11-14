@@ -1,35 +1,23 @@
 import json
 import logging
 import re
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set, Tuple
 
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
-from sglang.srt.function_call.core_types import (
-    StreamingParseResult,
-    _GetInfoFunc,
-)
-from sglang.srt.function_call.utils import (
-    get_schema_properties,
-    safe_literal_eval,
-)
+from sglang.srt.function_call.core_types import StreamingParseResult, _GetInfoFunc
+from sglang.srt.function_call.utils import get_schema_properties, safe_literal_eval
 
 logger = logging.getLogger(__name__)
 
-try:
-    from lxml import etree as ET  # type: ignore
+_FUNC_OPEN_RE = re.compile(r"<function\s+name=['\"]([^'\"]+)['\"][^>]*>")
+_PARAM_OPEN_RE = re.compile(r"<param\s+name=['\"]([^'\"]+)['\"][^>]*>")
 
-    _HAS_LXML = True
-except Exception:  # pragma: no cover - environment may not have lxml
-    import xml.etree.ElementTree as ET  # type: ignore
-
-    _HAS_LXML = False
-
-_FUNC_NAME_V1_REGEX = re.compile(r"<function\s+name=[\'\"]([^\'\"]+)[\'\"][^>]*>")
-_PARAM_WITH_NAME_REGEX = re.compile(
-    r"<param\s+name=[\'\"]([^\'\"]+)[\'\"]>([\s\S]*?)</param>", re.DOTALL
-)
-_PARAM_MISSING_NAME_REGEX = re.compile(r"<param(?![^>]*\bname=)[^>]*>", re.DOTALL)
+CDATA_START = "<![CDATA["
+CDATA_END = "]]>"
+PARAM_CLOSE = "</param>"
+FUNCTION_CLOSE = "</function>"
+PARAM_OPEN = "<param"
 
 
 def get_argument_type(
@@ -55,9 +43,157 @@ def parse_arguments(json_value):
         return json_value, False
 
 
+def _convert_param_value(key: str, val_text: str, props: dict) -> object:
+    arg_type = props[key].get("type") if key in props else None
+    if arg_type is None or arg_type == "string":
+        return val_text
+    parsed_val, _ = parse_arguments(val_text)
+    return parsed_val
+
+
+def _extract_param_value(text: str, start: int) -> Tuple[str, int]:
+    """Extract a param value and return (value, end_pos after value markup)."""
+    if text.startswith(CDATA_START, start):
+        cdata_content_start = start + len(CDATA_START)
+        cdata_end = text.find(CDATA_END, cdata_content_start)
+        if cdata_end != -1:
+            value = text[cdata_content_start:cdata_end]
+            end_pos = cdata_end + len(CDATA_END)
+            if text.startswith(PARAM_CLOSE, end_pos):
+                end_pos += len(PARAM_CLOSE)
+            return value, end_pos
+
+        # Broken CDATA: fall back to nearest-boundary extraction from content start.
+        start = cdata_content_start
+
+    slice_text = text[start:]
+    candidates = []
+    for marker, consume in (
+        (PARAM_CLOSE, len(PARAM_CLOSE)),
+        (PARAM_OPEN, 0),
+        (FUNCTION_CLOSE, 0),
+    ):
+        idx = slice_text.find(marker)
+        if idx != -1:
+            candidates.append((idx, consume))
+
+    if not candidates:
+        func_close = text.find(FUNCTION_CLOSE, start)
+        if func_close == -1:
+            return text[start:], len(text)
+        return text[start:func_close].strip(), func_close
+
+    end_idx, consume = min(candidates, key=lambda x: x[0])
+    value = slice_text[:end_idx].strip()
+    end_pos = start + end_idx + consume
+    return value, end_pos
+
+
+def _find_function_close(text: str, start: int = 0) -> int:
+    """Find </function> that is not inside a well-formed CDATA section."""
+    pos = start
+    while True:
+        idx = text.find(FUNCTION_CLOSE, pos)
+        if idx == -1:
+            return -1
+
+        cdata_start = text.rfind(CDATA_START, start, idx)
+        if cdata_start == -1:
+            return idx
+
+        cdata_end = text.find(CDATA_END, cdata_start)
+        if cdata_end == -1:
+            return idx
+
+        if cdata_end < idx:
+            return idx
+
+        pos = idx + len(FUNCTION_CLOSE)
+
+
+def _parse_function_block(
+    text: str, start: int, name_to_props: Dict[str, dict]
+) -> Tuple[Optional[dict], int, bool]:
+    """
+    Parse one <function>...</function> block starting at `start`.
+
+    Returns:
+        (call_dict or None, end_pos, is_complete)
+    """
+    m = _FUNC_OPEN_RE.match(text, start)
+    if not m:
+        return None, start + 1, False
+
+    func_name = (m.group(1) or "").strip()
+    pos = m.end()
+    arguments: Dict[str, object] = {}
+    seen_keys: Set[str] = set()
+    props = name_to_props.get(func_name, {})
+
+    close_idx = _find_function_close(text, pos)
+    if close_idx == -1:
+        return None, len(text), False
+
+    body_end = close_idx
+    pos_in_body = pos
+
+    while pos_in_body < body_end:
+        remaining = text[pos_in_body:body_end]
+        ws_len = len(remaining) - len(remaining.lstrip())
+        if ws_len:
+            pos_in_body += ws_len
+            continue
+
+        pm = _PARAM_OPEN_RE.match(text, pos_in_body)
+        if pm:
+            key = pm.group(1).strip()
+            val_start = pm.end()
+            val_text, val_end = _extract_param_value(text, val_start)
+            pos_in_body = val_end
+
+            if key in seen_keys:
+                logger.warning(
+                    "Ignoring duplicate param '%s' in tool call '%s'",
+                    key,
+                    func_name,
+                )
+                continue
+
+            if props and key not in props:
+                logger.warning(
+                    "Ignoring unknown param '%s' in tool call '%s'",
+                    key,
+                    func_name,
+                )
+                continue
+
+            seen_keys.add(key)
+            arguments[key] = _convert_param_value(key, val_text, props)
+            continue
+
+        if text.startswith(PARAM_OPEN, pos_in_body):
+            logger.warning(
+                "Ignoring param without name in tool call '%s'",
+                func_name,
+            )
+            close = text.find(PARAM_CLOSE, pos_in_body, body_end)
+            if close == -1:
+                break
+            pos_in_body = close + len(PARAM_CLOSE)
+            continue
+
+        break
+
+    end_pos = close_idx + len(FUNCTION_CLOSE)
+    call = {"name": func_name, "parameters": arguments}
+    return call, end_pos, True
+
+
 class MiniCPM5Detector(BaseFormatDetector):
     """
-    Detector for MiniCPM-4 models (V3 schema) adapted to the new chat template.
+    MiniCPM <function>/<param> tool calls scanned in order: a </function>
+    inside CDATA does not close the call, unknown params are dropped, and
+    calls missing a required param are dropped.
 
     Expected format example (multiple calls allowed):
       <function name="get_weather"><param name="city">北京</param><param name="date">2024-06-27</param></function>
@@ -68,10 +204,8 @@ class MiniCPM5Detector(BaseFormatDetector):
         super().__init__()
         self.bot_token = "<function"
         self.eot_token = "</function>"
-        self.func_call_regex = r"<function.*?</function>"
 
     def has_tool_call(self, text: str) -> bool:
-        """Check if the text contains a MiniCPM-4 V3 XML-styled tool call."""
         return self.bot_token in text
 
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
@@ -79,236 +213,106 @@ class MiniCPM5Detector(BaseFormatDetector):
         if idx == -1:
             return StreamingParseResult(normal_text=text, calls=[])
 
-        normal_parts = []
+        normal_parts: List[str] = []
         calls = []
         name_to_tool = {t.function.name: t for t in tools if t.function.name}
-        tool_names = set(name_to_tool.keys())
-        name_to_allowed_props = {}
-        name_to_required = {}
-        for name, t in name_to_tool.items():
-            params = t.function.parameters or {}
-            name_to_allowed_props[name] = set(get_schema_properties(params).keys())
-            req = params.get("required", []) if isinstance(params, dict) else []
-            try:
-                name_to_required[name] = set(req)
-            except Exception:
-                name_to_required[name] = set()
-
+        name_to_props: Dict[str, dict] = {}
+        name_to_required: Dict[str, Set[str]] = {}
         try:
+            for name, t in name_to_tool.items():
+                params = t.function.parameters
+                if not isinstance(params, dict):
+                    params = {}
+                name_to_props[name] = get_schema_properties(params)
+                name_to_required[name] = set(params.get("required") or ())
+
             last_end = 0
-            for m in re.finditer(self.func_call_regex, text, re.DOTALL):
-                if m.start() > last_end:
-                    normal_parts.append(text[last_end : m.start()])
+            pos = 0
+            while pos < len(text):
+                start = text.find(self.bot_token, pos)
+                if start == -1:
+                    break
 
-                block = m.group(0)
-                func_name = None
-                arguments = {}
-                parsed_ok = False
-                param_invalid = False
+                if start > last_end:
+                    normal_parts.append(text[last_end:start])
 
-                # Primary path: XML parsing (lxml preferred, stdlib fallback)
-                try:
-                    if _HAS_LXML:
-                        try:
-                            parser = ET.XMLParser(**{"strip_cdata": False})  # type: ignore[call-arg]
-                        except TypeError:
-                            parser = ET.XMLParser()
-                        root = ET.fromstring(block, parser=parser)
-                    else:
-                        root = ET.fromstring(block)
+                call_obj, end_pos, is_complete = _parse_function_block(
+                    text, start, name_to_props
+                )
 
-                    if root.tag == "function":
-                        func_node = root
-                    else:
-                        func_node = (
-                            root.find("function") if hasattr(root, "find") else None
-                        )
+                if not is_complete:
+                    normal_parts.append(text[start:])
+                    last_end = len(text)
+                    break
 
-                    if func_node is not None:
-                        func_name = (func_node.attrib.get("name") or "").strip()
-
-                    args_node = (
-                        func_node.find("arguments") if func_node is not None else None
+                func_name = call_obj["name"]
+                if func_name not in name_to_tool:
+                    normal_parts.append(text[start:end_pos])
+                elif name_to_required[func_name].issubset(call_obj["parameters"]):
+                    calls.extend(self.parse_base_json(call_obj, tools))
+                else:
+                    logger.warning(
+                        "Dropped tool call '%s' due to missing required params",
+                        func_name,
                     )
-                    param_nodes = []
-                    if func_node is not None:
-                        param_nodes = list(func_node.findall("param"))
-                        if args_node is not None and not param_nodes:
-                            param_nodes = list(args_node.findall("param"))
 
-                    if func_node is not None:
-                        seen_keys = set()
-                        allowed_props = set()
-                        if func_name in tool_names:
-                            allowed_props = name_to_allowed_props.get(func_name, set())
-                        has_invalid_param = False
-                        for param in param_nodes:
-                            key = param.attrib.get("name")
-                            if not key:
-                                has_invalid_param = True
-                                break
-                            if allowed_props and key not in allowed_props:
-                                has_invalid_param = True
-                                break
-                            if key in seen_keys:
-                                has_invalid_param = True
-                                break
-                            seen_keys.add(key)
-                            val_text = param.text or ""
-                            val_text = val_text.strip()
-                            arg_type = get_argument_type(
-                                func_name or "", key, name_to_tool
-                            )
-                            if arg_type != "string":
-                                parsed_val, _ = parse_arguments(val_text)
-                                arguments[key] = parsed_val
-                            else:
-                                arguments[key] = val_text
-                        if has_invalid_param:
-                            arguments.clear()
-                            param_invalid = True
-                    parsed_ok = bool(func_name)
-                except Exception:
-                    parsed_ok = False
-
-                if not parsed_ok:
-                    # Fallback path: regex extraction
-                    try:
-                        m_fn = _FUNC_NAME_V1_REGEX.search(block)
-                        if m_fn:
-                            func_name = (m_fn.group(1) or "").strip()
-                        has_invalid_param = (
-                            _PARAM_MISSING_NAME_REGEX.search(block) is not None
-                        )
-                        seen_keys = set()
-                        allowed_props = set()
-                        if func_name in tool_names:
-                            allowed_props = name_to_allowed_props.get(func_name, set())
-                        for pm in _PARAM_WITH_NAME_REGEX.finditer(block):
-                            key = pm.group(1).strip()
-                            if allowed_props and key not in allowed_props:
-                                has_invalid_param = True
-                                break
-                            if key in seen_keys:
-                                has_invalid_param = True
-                                break
-                            seen_keys.add(key)
-                            val_text = pm.group(2) or ""
-                            if val_text.startswith("<![CDATA[") and val_text.endswith(
-                                "]]>"
-                            ):
-                                val_text = val_text[len("<![CDATA[") : -len("]]>")]
-                            val_text = val_text.strip()
-                            arg_type = get_argument_type(
-                                func_name or "", key, name_to_tool
-                            )
-                            if arg_type != "string":
-                                parsed_val, _ = parse_arguments(val_text)
-                                arguments[key] = parsed_val
-                            else:
-                                arguments[key] = val_text
-                        if has_invalid_param:
-                            arguments.clear()
-                            param_invalid = True
-                        parsed_ok = bool(func_name)
-                    except Exception:
-                        parsed_ok = False
-
-                if not func_name or func_name not in tool_names or param_invalid:
-                    parsed_ok = False
-                else:
-                    req_props = name_to_required.get(func_name, set())
-                    if req_props and not req_props.issubset(arguments.keys()):
-                        parsed_ok = False
-
-                if parsed_ok:
-                    tool_call_obj = {"name": func_name, "parameters": arguments}
-                    calls.extend(self.parse_base_json(tool_call_obj, tools))
-                else:
-                    normal_parts.append(block)
-
-                last_end = m.end()
+                last_end = end_pos
+                pos = end_pos
 
             if last_end < len(text):
                 normal_parts.append(text[last_end:])
 
             return StreamingParseResult(normal_text="".join(normal_parts), calls=calls)
         except Exception as e:
-            logger.error(f"Error in detect_and_parse: {e}")
+            logger.error("Error in detect_and_parse: %s", e)
             return StreamingParseResult(normal_text=text)
-
-    def _append_tool_call(self, call, all_calls: List) -> None:
-        if self.current_tool_id == -1:
-            self.current_tool_id = 0
-            self.prev_tool_call_arr = []
-            self.streamed_args_for_tool = [""]
-
-        while len(self.prev_tool_call_arr) <= self.current_tool_id:
-            self.prev_tool_call_arr.append({})
-        while len(self.streamed_args_for_tool) <= self.current_tool_id:
-            self.streamed_args_for_tool.append("")
-
-        self.prev_tool_call_arr[self.current_tool_id] = {
-            "name": call.name,
-            "arguments": json.loads(call.parameters),
-        }
-        self.streamed_args_for_tool[self.current_tool_id] = call.parameters
-        call.tool_index = self.current_tool_id
-        self.current_tool_id += 1
-        all_calls.append(call)
 
     def parse_streaming_increment(
         self, new_text: str, tools: List[Tool]
     ) -> StreamingParseResult:
         self._buffer += new_text
-        normal_parts = []
-        all_calls = []
+        current_text = self._buffer
 
-        while True:
-            current_text = self._buffer
-            start = current_text.find(self.bot_token)
-            if start == -1:
-                partial_len = self._ends_with_partial_token(
-                    current_text, self.bot_token
-                )
-                if partial_len > 0:
-                    self._buffer = current_text[-partial_len:]
-                    emit = current_text[:-partial_len]
-                else:
-                    self._buffer = ""
-                    emit = "" if self.current_tool_id > 0 else current_text
-                if emit:
-                    normal_parts.append(emit)
-                break
+        start = current_text.find(self.bot_token)
+        if start == -1:
+            partial_len = self._ends_with_partial_token(self._buffer, self.bot_token)
+            if partial_len:
+                return StreamingParseResult()
+            normal_text = self._buffer
+            self._buffer = ""
+            if self.current_tool_id > 0:
+                normal_text = ""
+            return StreamingParseResult(normal_text=normal_text)
 
-            if start > 0:
-                normal_parts.append(current_text[:start])
-                current_text = current_text[start:]
-
-            end = current_text.find(self.eot_token)
-            if end == -1:
-                self._buffer = current_text
-                break
-
-            block = current_text[: end + len(self.eot_token)]
+        end = _find_function_close(current_text, start)
+        if end != -1:
+            if self.current_tool_id == -1:
+                self.current_tool_id = 0
+                self.prev_tool_call_arr = []
+                self.streamed_args_for_tool = [""]
+            while len(self.prev_tool_call_arr) <= self.current_tool_id:
+                self.prev_tool_call_arr.append({})
+            while len(self.streamed_args_for_tool) <= self.current_tool_id:
+                self.streamed_args_for_tool.append("")
+            result = self.detect_and_parse(
+                current_text[: end + len(self.eot_token)], tools=tools
+            )
+            if result.calls:
+                self.prev_tool_call_arr[self.current_tool_id] = {
+                    "name": result.calls[0].name,
+                    "arguments": json.loads(result.calls[0].parameters),
+                }
+                self.streamed_args_for_tool[self.current_tool_id] = result.calls[
+                    0
+                ].parameters
+                result.calls[0].tool_index = self.current_tool_id
+                self.current_tool_id += 1
             self._buffer = current_text[end + len(self.eot_token) :]
+            return result
 
-            result = self.detect_and_parse(block, tools=tools)
-            for call in result.calls:
-                self._append_tool_call(call, all_calls)
-
-            if self.bot_token not in self._buffer:
-                partial_len = self._ends_with_partial_token(
-                    self._buffer, self.bot_token
-                )
-                if partial_len == 0:
-                    emit = "" if self.current_tool_id > 0 else self._buffer
-                    if emit:
-                        normal_parts.append(emit)
-                    self._buffer = ""
-                break
-
-        return StreamingParseResult(normal_text="".join(normal_parts), calls=all_calls)
+        normal_text = current_text[:start]
+        self._buffer = current_text[start:]
+        return StreamingParseResult(normal_text=normal_text)
 
     def supports_structural_tag(self) -> bool:
         return False
