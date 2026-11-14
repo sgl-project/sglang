@@ -38,6 +38,12 @@ from sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline import LoRAPipel
 from sglang.multimodal_gen.runtime.pipelines_core.stages.image_encoding import (
     ImageEncodingStage,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.audio_encoding import (
+    MiniMaxH3AudioEncodingStage,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.visual_encoding import (
+    MiniMaxH3VisualEncodingStage,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.realtime.text_encoding import (
     RealtimeTextEncodingStage,
 )
@@ -1009,6 +1015,28 @@ def test_realtime_text_encoder_use_starts_at_call_site():
 
     assert len(uses) == 1
     assert uses[0].component_name == "text_encoder"
+    assert uses[0].start_at_stage_entry is False
+
+
+@pytest.mark.parametrize(
+    ("stage_cls", "stage_name", "component_name"),
+    [
+        (MiniMaxH3VisualEncodingStage, "MiniMaxH3VisualEncodingStage", "video_vae"),
+        (MiniMaxH3AudioEncodingStage, "MiniMaxH3AudioEncodingStage", "audio_vae"),
+    ],
+)
+def test_minimax_h3_reference_codec_use_starts_at_call_site(
+    stage_cls, stage_name, component_name
+):
+    # A text-to-video+audio request returns before the encode block, so pulling
+    # the codec in at stage entry costs a full H2D/D2H cycle for nothing -- and
+    # video_vae gets loaded a second time by the decoding stage anyway.
+    stage = stage_cls.__new__(stage_cls)
+    stage._registered_stage_name = None
+
+    uses = stage.component_uses(SimpleNamespace(), stage_name)
+
+    assert [use.component_name for use in uses] == [component_name]
     assert uses[0].start_at_stage_entry is False
 
 
