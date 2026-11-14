@@ -1146,21 +1146,10 @@ Run from an installed SGLang checkout in the target Linux environment:
 ```bash
 # CPU adapter tests with a mocked SDK.
 pytest python/sglang/multimodal_gen/test/unit/test_ascend_fa.py
-
-# Ascend 950: execute all three precisions, chunking, and packed/GQA cases.
-SGLANG_TEST_ASCEND_QUANT_FA=1 \
-  pytest python/sglang/multimodal_gen/test/unit/test_ascend_fa.py::TestAscendFAQuantizedNPU
-
-# H3 end-to-end collection with one unquantized BF16 checkpoint.
-SGLANG_TEST_H3_BF16_MODEL_PATH=/models/MiniMax-H3 \
-SGLANG_TEST_H3_OUTPUT_DIR=/tmp/h3-quant-comparison \
-  pytest -s python/sglang/multimodal_gen/test/server/ascend/test_ascend_quant_fa_h3.py
 ```
 
-The native tests check adapter/SDK agreement. The H3 suite collects outputs and
-performance with the same online MXFP8 linear weights in every case; only
-attention changes. Neither test establishes model-quality parity. Inspect the
-generated outputs for your workload.
+These tests check adapter behavior without executing NPU kernels. They do not
+establish model-quality parity; inspect generated outputs for your workload.
 
 ### Using Sliding Tile Attention (STA)
 
