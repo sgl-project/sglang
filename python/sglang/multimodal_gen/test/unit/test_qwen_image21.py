@@ -507,7 +507,9 @@ def test_condition_slots_expand_to_actual_latent_grid():
 
 
 class _RecordingAttention(torch.nn.Module):
-    def forward(self, x, ropes, prefixes, layouts, caches, prefix_pad):
+    def forward(
+        self, x, ropes, prefixes, layouts, caches, prefix_pad, project_out=True
+    ):
         self.seen = caches
         return torch.zeros_like(x), [None] * len(caches)
 

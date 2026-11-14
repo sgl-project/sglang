@@ -195,6 +195,121 @@ def _worker() -> int:
     return 1 if verdict.item() else 0
 
 
+def _tp_worker() -> int:
+    """One rank: a row-parallel layer's all-reduce folded into the Z-Image norm
+    kernel against the all-reduce followed by the unfused kernels."""
+    import torch.distributed as dist
+
+    from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+        maybe_init_distributed_environment_and_model_parallel,
+    )
+
+    rank = int(os.environ["RANK"])
+    torch.cuda.set_device(rank)
+    torch.set_grad_enabled(False)  # as when serving; the staged GEMM needs it
+    maybe_init_distributed_environment_and_model_parallel(tp_size=_WORLD, sp_size=1)
+
+    from sglang.kernels.ops.diffusion import residual_gate_add
+    from sglang.multimodal_gen.runtime.distributed.device_communicators.tp_peer_partial import (
+        TP_PEER_PARTIALS,
+    )
+    from sglang.multimodal_gen.runtime.layers.linear import RowParallelLinear
+    from sglang.multimodal_gen.runtime.models.dits.qwen_image21 import (
+        projected_residual_gate_add,
+    )
+    from sglang.multimodal_gen.runtime.models.dits.zimage import (
+        ZImageRMSNorm,
+        zimage_peer_partial_rmsnorm_tanh_mul_add,
+        zimage_rmsnorm_scale,
+        zimage_rmsnorm_tanh_mul_add,
+    )
+
+    if not torch.cuda.can_device_access_peer(rank, 1 - rank):
+        print("SKIP no peer-to-peer access between the two devices", flush=True)
+        return 0
+
+    def raw(t):
+        return t.contiguous().view(torch.int16)
+
+    failures = []
+    # (hidden dim, batch, tokens): Z-Image's 1024x1024 rows, a batch, a short
+    # sequence; the sizes shrink and grow so the staging is reused and regrown
+    for dim, batch, tokens in ((3840, 1, 4128), (3840, 2, 96), (1024, 1, 4096)):
+        shared = torch.Generator(device="cuda").manual_seed(7)
+        mine = torch.Generator(device="cuda").manual_seed(100 + rank)
+
+        def randn(*shape, generator):
+            return torch.randn(
+                *shape, dtype=torch.bfloat16, device="cuda", generator=generator
+            )
+
+        norm, scale_norm = ZImageRMSNorm(dim), ZImageRMSNorm(dim)
+        for m in (norm, scale_norm):
+            m.weight.data = 1 + 0.1 * randn(dim, generator=shared)
+        for bias in (False, True):
+            layer = RowParallelLinear(2 * dim, dim, bias=bias, input_is_parallel=True)
+            layer.weight.data = randn(dim, dim, generator=mine) / dim**0.5
+            if bias:
+                layer.bias.data = randn(dim, generator=shared)
+            for _ in range(3):
+                hidden = randn(batch, tokens, dim, generator=mine)
+                residual = randn(batch, tokens, dim, generator=shared)
+                gate = randn(batch, 1, dim, generator=shared)
+                scale = 1 + 0.1 * randn(batch, 1, dim, generator=shared)
+
+                reduced, _ = layer(hidden)
+                x_ref = zimage_rmsnorm_tanh_mul_add(reduced, gate, residual, norm)
+                z_ref = zimage_rmsnorm_scale(x_ref, scale, scale_norm)
+
+                x = zimage_peer_partial_rmsnorm_tanh_mul_add(
+                    layer, hidden, gate, residual, norm
+                )
+                pair = zimage_peer_partial_rmsnorm_tanh_mul_add(
+                    layer, hidden, gate, residual, norm, scale, scale_norm
+                )
+                where = f"dim={dim} batch={batch} tokens={tokens} bias={bias}"
+                if x is None or pair is None:
+                    failures.append(f"declined {where}")
+                    continue
+                if not torch.equal(raw(x), raw(x_ref)):
+                    failures.append(f"residual {where}")
+                if not torch.equal(raw(pair[0]), raw(x_ref)):
+                    failures.append(f"residual with scale {where}")
+                if not torch.equal(raw(pair[1]), raw(z_ref)):
+                    failures.append(f"scale {where}")
+
+                # Qwen-Image-2.1's epilogue over the same partials
+                tanh_gate = gate.tanh()
+                gated_ref = residual_gate_add(residual, reduced, tanh_gate)
+                calls = TP_PEER_PARTIALS.calls
+                gated = projected_residual_gate_add(layer, hidden, residual, tanh_gate)
+                if TP_PEER_PARTIALS.calls == calls:
+                    failures.append(f"gate declined {where}")
+                if not torch.equal(raw(gated), raw(gated_ref)):
+                    failures.append(f"gate {where}")
+
+    # both arms taking the all-reduce would pass while testing nothing
+    if not TP_PEER_PARTIALS.inited or not TP_PEER_PARTIALS.calls:
+        failures.append(
+            f"peer partials never engaged (inited={TP_PEER_PARTIALS.inited} "
+            f"failed={TP_PEER_PARTIALS.failed})"
+        )
+
+    verdict = torch.tensor([len(failures)], device="cuda")
+    dist.all_reduce(verdict)
+    if failures:
+        print(f"rank{rank} MISMATCH: {failures}", flush=True)
+    if rank == 0:
+        print(
+            f"TP_PEER_PARTIALS_PARITY {'FAIL' if verdict.item() else 'PASS'} "
+            f"(calls={TP_PEER_PARTIALS.calls})",
+            flush=True,
+        )
+    dist.barrier()
+    dist.destroy_process_group()
+    return 1 if verdict.item() else 0
+
+
 class TestIpcA2ATwoGpu(CustomTestCase):
     def test_ipc_matches_nccl_bitwise(self):
         # CUDA only: the transport opens torch IPC handles through libcudart and
@@ -225,8 +340,35 @@ class TestIpcA2ATwoGpu(CustomTestCase):
         self.assertEqual(proc.returncode, 0, "IPC all-to-all diverged from NCCL")
         self.assertIn("IPC_A2A_PARITY PASS", proc.stdout)
 
+    def test_tp_peer_partials_match_all_reduce_bitwise(self):
+        if not current_platform.is_cuda():
+            self.skipTest("TP peer partials are unavailable on this platform")
+        if torch.cuda.device_count() < _WORLD:
+            self.skipTest(f"needs {_WORLD} GPUs")
+        proc = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "torch.distributed.run",
+                f"--nproc-per-node={_WORLD}",
+                "--master-port=29518",
+                __file__,
+                "--tp-worker",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=1200,
+        )
+        print(proc.stdout[-4000:])
+        if proc.returncode != 0:
+            print(proc.stderr[-4000:], file=sys.stderr)
+        self.assertEqual(proc.returncode, 0, "peer partials diverged from all-reduce")
+        self.assertIn("TP_PEER_PARTIALS_PARITY PASS", proc.stdout)
+
 
 if __name__ == "__main__":
     if "--worker" in sys.argv:
         raise SystemExit(_worker())
+    if "--tp-worker" in sys.argv:
+        raise SystemExit(_tp_worker())
     unittest.main()

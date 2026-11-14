@@ -10,6 +10,9 @@ from sglang.multimodal_gen.runtime.distributed import (
     get_sp_world_size,
     get_tp_world_size,
 )
+from sglang.multimodal_gen.runtime.distributed.device_communicators.tp_peer_partial import (
+    staged_partials,
+)
 from sglang.multimodal_gen.runtime.layers.activation import SiluAndMul
 from sglang.multimodal_gen.runtime.layers.attention import (
     USPAttention,
@@ -119,6 +122,51 @@ def zimage_rmsnorm_scale(
     return norm(x) * scale
 
 
+def zimage_peer_partial_rmsnorm_tanh_mul_add(
+    layer: nn.Module,
+    hidden: torch.Tensor,
+    gate: torch.Tensor,
+    residual: torch.Tensor,
+    norm: ZImageRMSNorm,
+    scale: torch.Tensor | None = None,
+    scale_norm: ZImageRMSNorm | None = None,
+):
+    """``residual + tanh(gate) * norm(layer(hidden))`` with the row-parallel
+    ``layer``'s all-reduce folded into the norm kernel, which reads both ranks'
+    partial sums; with ``scale``, also ``scale_norm`` of the result times it.
+
+    None, before anything is exchanged, when the call cannot take this path.
+    """
+    if type(layer) is not RowParallelLinear or residual.dtype != torch.bfloat16:
+        return None
+    partials = staged_partials(layer, hidden, residual)
+    if partials is None:
+        return None
+    from sglang.kernels.ops.diffusion import rmsnorm_tanh_residual_sum2
+
+    mine, theirs = partials
+    weight = lambda m: m.weight.data.to(  # noqa: E731
+        device=residual.device, dtype=residual.dtype
+    ).contiguous()
+    out = rmsnorm_tanh_residual_sum2(
+        mine,
+        theirs,
+        gate,
+        residual,
+        weight(norm),
+        norm.variance_epsilon,
+        None if scale is None else weight(scale_norm),
+        scale,
+    )
+    if out is not None:
+        return out
+    # the kernel declined these operands: reduce the staged partials instead
+    x = zimage_rmsnorm_tanh_mul_add(
+        (mine + theirs).view_as(residual), gate, residual, norm
+    )
+    return x if scale is None else (x, zimage_rmsnorm_scale(x, scale, scale_norm))
+
+
 def zimage_native_qk_rmsnorm(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -226,10 +274,12 @@ class FeedForward(nn.Module):
         )
         self.act = SiluAndMul()
 
-    def forward(self, x):
+    def hidden(self, x):
         x13, _ = self.w13(x)
-        x = self.act(x13)
-        out, _ = self.w2(x)
+        return self.act(x13)
+
+    def forward(self, x):
+        out, _ = self.w2(self.hidden(x))
         return out
 
 
@@ -352,6 +402,7 @@ class ZImageAttention(nn.Module):
         skip_sequence_parallel_override: bool = False,
         *,
         rope_freqs_complex: Optional[torch.Tensor] = None,
+        project_out: bool = True,
     ):
         # The fused native qk-norm kernel reads the strided fused-qkv slices
         # directly and writes contiguous outputs, so q/k materialization is
@@ -441,6 +492,8 @@ class ZImageAttention(nn.Module):
             skip_sequence_parallel_override=skip_sequence_parallel_override,
         )
         hidden_states = hidden_states.flatten(2)
+        if not project_out:
+            return hidden_states
 
         hidden_states, _ = self.to_out[0](hidden_states)
 
@@ -563,7 +616,8 @@ class ZImageTransformerBlock(nn.Module):
             scale_msa = 1.0 + scale_msa
 
             # Attention block
-            attn_out = self.attention(
+            peer_partials = self.enable_zimage_native_norm_fusion
+            attn_hidden = self.attention(
                 self._norm_scale(
                     x,
                     scale_msa,
@@ -578,27 +632,55 @@ class ZImageTransformerBlock(nn.Module):
                 num_replicated_suffix=num_replicated_suffix,
                 skip_sequence_parallel_override=skip_sequence_parallel_override,
                 rope_freqs_complex=rope_freqs_complex,
+                project_out=not peer_partials,
             )
-            x = self._norm_tanh_mul_add(
-                attn_out,
+            to_out = self.attention.to_out[0]
+            fused = peer_partials and zimage_peer_partial_rmsnorm_tanh_mul_add(
+                to_out,
+                attn_hidden,
                 gate_msa,
                 x,
                 self.attention_norm2,
-            )
-            ffn_in = self._norm_scale(
-                x,
                 1.0 + scale_mlp,
                 self.ffn_norm1,
             )
+            if fused:
+                x, ffn_in = fused
+            else:
+                attn_out = to_out(attn_hidden)[0] if peer_partials else attn_hidden
+                x = self._norm_tanh_mul_add(
+                    attn_out,
+                    gate_msa,
+                    x,
+                    self.attention_norm2,
+                )
+                ffn_in = self._norm_scale(
+                    x,
+                    1.0 + scale_mlp,
+                    self.ffn_norm1,
+                )
 
             # FFN block
-            ffn_out = self.feed_forward(ffn_in)
-            x = self._norm_tanh_mul_add(
-                ffn_out,
-                gate_mlp,
-                x,
-                self.ffn_norm2,
-            )
+            fused = None
+            if peer_partials:
+                ffn_hidden = self.feed_forward.hidden(ffn_in)
+                fused = zimage_peer_partial_rmsnorm_tanh_mul_add(
+                    self.feed_forward.w2, ffn_hidden, gate_mlp, x, self.ffn_norm2
+                )
+                ffn_out = (
+                    None if fused is not None else self.feed_forward.w2(ffn_hidden)[0]
+                )
+            else:
+                ffn_out = self.feed_forward(ffn_in)
+            if fused is not None:
+                x = fused
+            else:
+                x = self._norm_tanh_mul_add(
+                    ffn_out,
+                    gate_mlp,
+                    x,
+                    self.ffn_norm2,
+                )
         else:
             # Attention block
             attn_input = self.attention_norm1(x)
