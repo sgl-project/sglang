@@ -115,17 +115,17 @@ EXPECTED_BFS_MASKS = [
         [1, 1, 1, 1, 1, 0, 0, 0],
         [1, 1, 1, 1, 1, 1, 0, 0],
         [1, 1, 1, 1, 1, 1, 1, 0],
-        [1, 0, 0, 0, 0, 0, 0, 1],
+        [0, 0, 0, 0, 0, 0, 0, 1],
     ],
     [
         [1, 0, 0, 0, 0, 0, 0, 0],
-        [1, 1, 0, 0, 0, 0, 0, 0],
-        [1, 0, 1, 0, 0, 0, 0, 0],
-        [1, 0, 0, 1, 0, 0, 0, 0],
-        [1, 0, 0, 0, 1, 0, 0, 0],
-        [1, 0, 0, 0, 0, 1, 0, 0],
-        [1, 0, 0, 0, 0, 0, 1, 0],
-        [1, 0, 0, 0, 0, 0, 0, 1],
+        [0, 1, 0, 0, 0, 0, 0, 0],
+        [0, 0, 1, 0, 0, 0, 0, 0],
+        [0, 0, 0, 1, 0, 0, 0, 0],
+        [0, 0, 0, 0, 1, 0, 0, 0],
+        [0, 0, 0, 0, 0, 1, 0, 0],
+        [0, 0, 0, 0, 0, 0, 1, 0],
+        [0, 0, 0, 0, 0, 0, 0, 1],
     ],
 ]
 
@@ -148,17 +148,17 @@ EXPECTED_PROB_MASKS = [
         [1, 1, 1, 1, 1, 0, 0, 0],
         [1, 1, 1, 1, 1, 1, 0, 0],
         [1, 1, 1, 1, 1, 1, 1, 0],
-        [1, 0, 0, 0, 0, 0, 0, 1],
+        [0, 0, 0, 0, 0, 0, 0, 1],
     ],
     [
         [1, 0, 0, 0, 0, 0, 0, 0],
-        [1, 1, 0, 0, 0, 0, 0, 0],
-        [1, 0, 1, 0, 0, 0, 0, 0],
-        [1, 0, 0, 1, 0, 0, 0, 0],
-        [1, 0, 0, 0, 1, 0, 0, 0],
-        [1, 0, 0, 0, 0, 1, 0, 0],
-        [1, 0, 0, 0, 0, 0, 1, 0],
-        [1, 0, 0, 0, 0, 0, 0, 1],
+        [0, 1, 0, 0, 0, 0, 0, 0],
+        [0, 0, 1, 0, 0, 0, 0, 0],
+        [0, 0, 0, 1, 0, 0, 0, 0],
+        [0, 0, 0, 0, 1, 0, 0, 0],
+        [0, 0, 0, 0, 0, 1, 0, 0],
+        [0, 0, 0, 0, 0, 0, 1, 0],
+        [0, 0, 0, 0, 0, 0, 0, 1],
     ],
 ]
 
@@ -266,6 +266,16 @@ class TestNgramCorpusSqueeze(CustomTestCase):
 
 class TestNgramCorpusLeafPaths(CustomTestCase):
     """Verify the leaf_paths_from_mask utility."""
+
+    def test_disconnected_padding_is_not_a_leaf_path(self):
+        corpus = _make_corpus("BFS", draft_token_num=12)
+        corpus.batch_put([[10, 20, 30, 40]])
+        corpus.synchronize()
+        ids, masks = _batch_get(corpus, [[10, 20, 30]])
+        self.assertEqual(
+            corpus.leaf_paths_from_mask(ids.tolist(), masks.reshape(12, 12).tolist()),
+            [[30, 40]],
+        )
 
     def test_simple_tree(self):
         corpus = _make_corpus("BFS")
@@ -618,6 +628,23 @@ class TestNgramCorpusIncremental(CustomTestCase):
 
 class TestNgramCorpusExternalSam(CustomTestCase):
     """Verify external SAM loading and fixed-budget composition."""
+
+    def test_real_zero_leaf_survives_corpus_merge(self):
+        for match_type in ("BFS", "PROB"):
+            for online_token, external_token in ((0, 40), (40, 0)):
+                with self.subTest(match_type=match_type, online_token=online_token):
+                    corpus = _make_corpus(
+                        match_type,
+                        draft_token_num=12,
+                        external_sam_budget=3,
+                        external_corpus_documents=[[10, 20, 30, external_token]],
+                    )
+                    corpus.batch_put([[10, 20, 30, online_token]])
+                    corpus.synchronize()
+                    ids, masks = _batch_get(corpus, [[10, 20, 30]])
+                    mask = masks.reshape(12, 12)
+                    connected = np.flatnonzero(mask[1:, 0]) + 1
+                    self.assertEqual(sorted(ids[connected].tolist()), [0, 40])
 
     def test_external_corpus_iterator_streams_documents(self):
         corpus = _make_corpus(
