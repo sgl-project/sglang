@@ -7,10 +7,12 @@ import torch
 
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.environ import envs
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.utils import compute_spec_context_reserve
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.kv.alloc.demand import WindowRetirement
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.unified_allocator_fixtures import build_test_unified_pools
 
@@ -32,7 +34,7 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
     """Property tests for Scheduler.init_req_max_new_tokens.
 
     Rules enforced when clipping a request's max_new_tokens:
-      1. context: input_len + max_new_tokens < max_req_len
+      1. context: input_len + max_new_tokens + spec_context_reserve < max_req_len
       2. admission budget (PrefillAdder):
          ceil_page(input_len) + max_new_tokens + page_size * shard_widening
          < max_total_num_tokens * shard_widening
@@ -71,10 +73,12 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
         max_total_num_tokens: int = 1024,
         page_size: int = 1,
         kv_shard_widening: int = 1,
+        spec_context_reserve: int = 0,
     ) -> Scheduler:
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.disaggregation_mode = DisaggregationMode.NULL
         scheduler.max_req_len = max_req_len
+        scheduler.spec_context_reserve = spec_context_reserve
         scheduler.max_total_num_tokens = max_total_num_tokens
         scheduler.page_size = page_size
         scheduler.kv_shard_widening = kv_shard_widening
@@ -120,7 +124,10 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
         limit_active = limit is not None and limit > 0
 
         def satisfies_rules(candidate: int) -> bool:
-            context_ok = input_len + candidate < scheduler.max_req_len
+            context_ok = (
+                input_len + candidate + scheduler.spec_context_reserve
+                < scheduler.max_req_len
+            )
             budget_ok = (
                 paged_input_len + candidate + page_size * shard_widening
                 < scheduler.max_total_num_tokens * shard_widening
@@ -220,6 +227,143 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
             req = self._new_req(max_new_tokens=64, min_new_tokens=32)
             self.assertEqual(self._init_and_check(scheduler, req), 16)
             self.assertEqual(req.sampling_params.min_new_tokens, 16)
+
+    def _spec_reserve(
+        self,
+        *,
+        algorithm,
+        num_steps,
+        num_draft_tokens,
+        enable_overlap=False,
+        skip_finishing_decode=False,
+        pp_size=1,
+        **server_args,
+    ):
+        server_args = {
+            "speculative_algorithm": algorithm,
+            "speculative_num_steps": num_steps,
+            "speculative_eagle_topk": 1,
+            "speculative_num_draft_tokens": num_draft_tokens,
+            **server_args,
+        }
+        with (
+            get_context().override_server_args(**server_args),
+            get_parallel().override(pp_size=pp_size),
+        ):
+            return compute_spec_context_reserve(
+                enable_overlap=enable_overlap,
+                skip_finishing_decode=skip_finishing_decode,
+            )
+
+    def _assert_reads_end_at_context(self, *, reserve, reads_past_start):
+        """Reads that reach reads_past_start past the last unfinished step's
+        seq_lens (B - 2) stay within context_len, and hit it where the cap binds."""
+        context_len, input_len = 4096, 25
+        max_req_len = context_len - 1  # TpModelWorker.get_worker_info
+        for requested in (None, 1 << 20, context_len - 4 - input_len):
+            with self.subTest(reserve=reserve, requested=requested):
+                scheduler = self._new_scheduler(
+                    max_req_len=max_req_len,
+                    max_total_num_tokens=1 << 20,
+                    spec_context_reserve=reserve,
+                )
+                req = self._new_req(max_new_tokens=requested, input_len=input_len)
+                max_new_tokens = self._init_and_check(scheduler, req)
+                read = input_len + max_new_tokens - 2 + reads_past_start
+                self.assertLessEqual(read, context_len)
+                if requested is None or max_new_tokens < requested:
+                    self.assertEqual(read, context_len)
+
+    # (algorithm, num_steps, num_draft_tokens) of single-chain verifies.
+    _CHAINS = (
+        ("EAGLE", 3, 4),
+        ("EAGLE", 5, 6),
+        ("EAGLE", 6, 7),
+        ("EAGLE3", 7, 8),
+        ("DFLASH", None, 16),
+        ("DSPARK", None, 8),
+    )
+
+    def test_no_spec_keeps_full_context(self):
+        with get_context().override_server_args(speculative_algorithm=None):
+            self.assertEqual(compute_spec_context_reserve(enable_overlap=True), 0)
+
+    def test_spec_verify_stays_within_context(self):
+        """The last unfinished step verifies and accepts D tokens past the cap."""
+        for algorithm, num_steps, num_draft_tokens in self._CHAINS:
+            self._assert_reads_end_at_context(
+                reserve=self._spec_reserve(
+                    algorithm=algorithm,
+                    num_steps=num_steps,
+                    num_draft_tokens=num_draft_tokens,
+                ),
+                reads_past_start=num_draft_tokens,
+            )
+
+    def test_spec_overlap_tail_step_stays_within_context(self):
+        """Under overlap the finished request gets one more verify past the accept,
+        one slot lower with skip_finishing_decode."""
+        for algorithm, num_steps, num_draft_tokens in self._CHAINS:
+            for skip, tick_offset in ((False, 0), (True, 1)):
+                self._assert_reads_end_at_context(
+                    reserve=self._spec_reserve(
+                        algorithm=algorithm,
+                        num_steps=num_steps,
+                        num_draft_tokens=num_draft_tokens,
+                        enable_overlap=True,
+                        skip_finishing_decode=skip,
+                    ),
+                    reads_past_start=2 * num_draft_tokens - tick_offset,
+                )
+
+    def test_skip_finishing_decode_drops_the_last_step(self):
+        """A request whose in-flight step started at B - 2 skips the next batch;
+        one from B - 3 does not (the CPU lags one step behind)."""
+        input_len, max_new_tokens = 25, 100
+        cap = input_len + max_new_tokens
+        for start, skipped in ((cap - 2, True), (cap - 3, False)):
+            # Outputs through the previous step; seq_lens leaves out the bonus token.
+            req = SimpleNamespace(
+                output_ids=[0] * (start - input_len + 1),
+                sampling_params=SimpleNamespace(max_new_tokens=max_new_tokens),
+            )
+            with self.subTest(start=start):
+                self.assertEqual(Req.next_output_finishes_by_length(req), skipped)
+
+    def test_spec_pp_tail_draft_stays_within_context(self):
+        """Under PP the last stage tail-drafts num_steps - 1 slots past the accept."""
+        for num_steps in (3, 5, 6, 7):
+            num_draft_tokens = num_steps + 1
+            self._assert_reads_end_at_context(
+                reserve=self._spec_reserve(
+                    algorithm="EAGLE",
+                    num_steps=num_steps,
+                    num_draft_tokens=num_draft_tokens,
+                    pp_size=2,
+                ),
+                reads_past_start=num_draft_tokens + num_steps - 1,
+            )
+
+    def test_spec_reserve_off_chain_keeps_whole_windows(self):
+        """Algorithms outside the exact form keep a whole window per pass."""
+        for algorithm, num_steps, num_draft_tokens, window, server_args in (
+            ("EAGLE", 3, 8, 12, {"speculative_eagle_topk": 4}),
+            ("EAGLE", 3, 4, 4, {"enable_multi_layer_eagle": True}),
+            ("FROZEN_KV_MTP", 3, 4, 4, {}),
+            ("NGRAM", 3, 12, 12, {}),
+        ):
+            for enable_overlap, passes in ((False, 1), (True, 2)):
+                with self.subTest(
+                    algorithm=algorithm, enable_overlap=enable_overlap, **server_args
+                ):
+                    reserve = self._spec_reserve(
+                        algorithm=algorithm,
+                        num_steps=num_steps,
+                        num_draft_tokens=num_draft_tokens,
+                        enable_overlap=enable_overlap,
+                        **server_args,
+                    )
+                    self.assertEqual(reserve, window * passes)
 
     def test_unified_budget_rounds_prompt_and_decode_together(self):
         bundle = build_test_unified_pools(
