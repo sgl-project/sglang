@@ -356,23 +356,6 @@ Max ITL (ms):                            2229.30
 ==================================================
 ```
 
-#### Measure shared-prefix cache hits across attention DP ranks
-
-With `--dataset-name generated-shared-prefix`, the shared portion of a prompt determines how many tokens *can* be reused. Each attention data-parallel (DP) rank has its own prefix cache. With round-robin routing, a single warmup request fills only one rank's cache.
-
-For a warm-cache benchmark with the native `--backend sglang`:
-
-1. With the server idle, send `POST /flush_cache` before warmup. Keep prefix caching enabled.
-2. For each attention DP rank, send an untimed `POST /generate` with `routed_dp_rank` set to that rank (for example, 0 and 1 for two ranks). Use the exact shared token IDs from the timed workload in `input_ids`, followed by one token distinct from the first token of every timed suffix. Set `sampling_params.max_new_tokens` to 1. Wait for all responses and check `meta_info.dp_rank` before starting the benchmark.
-3. Run the timed workload with `--tokenize-prompt --warmup-requests 0 --cache-report --output-details --output-file result.jsonl`. Omit `--flush-cache` from this command because the benchmark flushes *after* its built-in warmup.
-4. Check the successful request count, actual input and output lengths, and the ratio of cached tokens to input tokens. For example, a 128,000-token input with a 90% shared prefix has 115,200 shared tokens and a 12,800-token suffix. Check each request's counters to see whether it reused the full prefix.
-
-To inspect the latest run in the output file, print the input, cached, and output token counts for each request:
-
-```shell
-tail -n 1 result.jsonl | jq -r '[.input_lens, .cached_tokens, .output_lens] | transpose[] | @tsv'
-```
-
 #### SGLang Serving Benchmark Result — Complete Reference
 
 The output format is **hardcoded in `bench_serving.py`**. All formatting decisions — including column widths, alignment, and decimal precision — are statically defined in the source and cannot be changed via command-line arguments.
