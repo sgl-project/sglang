@@ -7,8 +7,9 @@ cannot be confused with a config difference.
 This runs as the step after the eval inside nightly-8-gpu-mi35x-kimi-k31-pro,
 as the Kimi-K3 perf test did in the job this one replaced: the 1.5 TB
 checkpoint is already in the container cache, the job takes one 8-GPU MI35x
-slot instead of two, and a failed eval fails the job before throughput is
-measured.
+slot instead of two. Performance diagnostics still run after a failed eval,
+provided container and dependency setup succeeded; they do not imply that
+accuracy passed.
 
 Registry: nightly-perf-8-gpu-mi35x-kimi-k31-pro suite
 """

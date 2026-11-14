@@ -1,0 +1,19 @@
+name: Report AMD performance outcome
+description: Record the performance step outcome before continue-on-error.
+inputs:
+  outcome:
+    description: The performance step's outcome before continue-on-error.
+    required: false
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      if: always()
+      env:
+        TEST_OUTCOME: ${{ inputs.outcome }}
+      run: |
+        outcome="${TEST_OUTCOME:-unknown}"
+        printf '### Performance test\n\nOutcome before `continue-on-error`: **%s**\n' "$outcome" >> "$GITHUB_STEP_SUMMARY"
+        if [[ "$outcome" != "success" ]]; then
+          echo "::warning::AMD performance test outcome: $outcome. This is not a passing performance result."
+        fi

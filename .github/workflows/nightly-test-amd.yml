@@ -670,6 +670,7 @@ jobs:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Install dependencies
+        id: install-dependencies
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
 
       - name: Accuracy Test ROCm (8-GPU GPT-OSS)
@@ -687,7 +688,7 @@ jobs:
       # two models, and an MI30x job spends ~49 min pulling the image and
       # installing dependencies before it runs anything.
       - name: Performance Test ROCm (8-GPU GPT-OSS)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.install-dependencies.outcome == 'success' }}
         timeout-minutes: 120
         run: |
           > github_summary.md  # Clear summary file
@@ -723,6 +724,7 @@ jobs:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Install dependencies
+        id: install-dependencies
         run: |
           bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
           # Install tabulate for run_suite.py (missing in MI35x container)
@@ -742,7 +744,7 @@ jobs:
       # Shares this job with the accuracy step above rather than taking its own,
       # so the container setup and the GPT-OSS weight cache are paid for once.
       - name: Performance Test MI35x ROCm (8-GPU GPT-OSS)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.install-dependencies.outcome == 'success' }}
         timeout-minutes: 120
         run: |
           > github_summary.md  # Clear summary file
@@ -782,6 +784,7 @@ jobs:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Install dependencies
+        id: install-dependencies
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
 
       - name: Accuracy Test ROCm (8-GPU Grok1-INT4)
@@ -796,9 +799,10 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
       - name: Performance Test ROCm (8-GPU Grok1-INT4)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.install-dependencies.outcome == 'success' }}
         timeout-minutes: 60
         continue-on-error: true
+        id: performance
         run: |
           > github_summary.md  # Clear summary file
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
@@ -807,6 +811,12 @@ jobs:
             python3 run_suite.py --hw amd --suite nightly-perf-8-gpu-grok1-int4 --nightly --timeout-per-file 3600 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
+
+      - name: Report performance outcome
+        if: always()
+        uses: ./.github/actions/report-amd-perf-outcome
+        with:
+          outcome: ${{ steps.performance.outcome }}
 
   nightly-8-gpu-mi35x-grok1-int4:
     name: ${{ format('nightly-8-gpu-mi35x-grok1-int4 ({0}, linux-mi35x-gpu-8)', matrix.rocm_version) }}
@@ -833,6 +843,7 @@ jobs:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Install dependencies
+        id: install-dependencies
         run: |
           bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
           # Install tabulate for run_suite.py (missing in MI35x container)
@@ -850,9 +861,10 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
       - name: Performance Test MI35x ROCm (8-GPU Grok1-INT4)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.install-dependencies.outcome == 'success' }}
         timeout-minutes: 60
         continue-on-error: true
+        id: performance
         run: |
           > github_summary.md  # Clear summary file
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
@@ -861,6 +873,12 @@ jobs:
             python3 run_suite.py --hw amd --suite nightly-perf-8-gpu-mi35x-grok1-int4 --nightly --timeout-per-file 3600 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
+
+      - name: Report performance outcome
+        if: always()
+        uses: ./.github/actions/report-amd-perf-outcome
+        with:
+          outcome: ${{ steps.performance.outcome }}
 
   # ==============================================================================
   # 8-GPU Grok2 (MI30x + MI35x)
@@ -891,6 +909,7 @@ jobs:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Install dependencies
+        id: install-dependencies
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
 
       - name: Accuracy Test ROCm (8-GPU Grok2)
@@ -905,9 +924,10 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
       - name: Performance Test ROCm (8-GPU Grok2)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.install-dependencies.outcome == 'success' }}
         timeout-minutes: 60
         continue-on-error: true
+        id: performance
         run: |
           > github_summary.md  # Clear summary file
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
@@ -916,6 +936,12 @@ jobs:
             python3 run_suite.py --hw amd --suite nightly-perf-8-gpu-grok2 --nightly --timeout-per-file 3600 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
+
+      - name: Report performance outcome
+        if: always()
+        uses: ./.github/actions/report-amd-perf-outcome
+        with:
+          outcome: ${{ steps.performance.outcome }}
 
   nightly-8-gpu-mi35x-grok2:
     name: ${{ format('nightly-8-gpu-mi35x-grok2 ({0}, linux-mi35x-gpu-8)', matrix.rocm_version) }}
@@ -942,6 +968,7 @@ jobs:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Install dependencies
+        id: install-dependencies
         run: |
           bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
           # Install tabulate for run_suite.py (missing in MI35x container)
@@ -959,9 +986,10 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
       - name: Performance Test MI35x ROCm (8-GPU Grok2)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.install-dependencies.outcome == 'success' }}
         timeout-minutes: 60
         continue-on-error: true
+        id: performance
         run: |
           > github_summary.md  # Clear summary file
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
@@ -970,6 +998,12 @@ jobs:
             python3 run_suite.py --hw amd --suite nightly-perf-8-gpu-mi35x-grok2 --nightly --timeout-per-file 3600 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
+
+      - name: Report performance outcome
+        if: always()
+        uses: ./.github/actions/report-amd-perf-outcome
+        with:
+          outcome: ${{ steps.performance.outcome }}
 
   # ==============================================================================
   # 8-GPU DeepSeek-R1 (MI35x only)
@@ -1001,6 +1035,7 @@ jobs:
           ENABLE_CACHE_HOST: "1"
 
       - name: Install dependencies
+        id: install-dependencies
         run: |
           bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
           # Install tabulate for run_suite.py (missing in MI35x container)
@@ -1018,9 +1053,10 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
       - name: Performance Test MI35x ROCm (8-GPU DeepSeek-R1-MXFP4)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.install-dependencies.outcome == 'success' }}
         timeout-minutes: 300
         continue-on-error: true
+        id: performance
         run: |
           > github_summary.md  # Clear summary file
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
@@ -1029,6 +1065,12 @@ jobs:
             python3 registered/amd/perf/mi35x/test_deepseek_r1_mxfp4_perf_mi35x.py || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
+
+      - name: Report performance outcome
+        if: always()
+        uses: ./.github/actions/report-amd-perf-outcome
+        with:
+          outcome: ${{ steps.performance.outcome }}
 
   nightly-8-gpu-mi35x-deepseek-r1-mxfp4-tp4:
     name: ${{ format('nightly-8-gpu-mi35x-deepseek-r1-mxfp4-tp4 ({0}, linux-mi35x-gpu-8)', matrix.rocm_version) }}
@@ -1056,6 +1098,7 @@ jobs:
           ENABLE_CACHE_HOST: "1"
 
       - name: Install dependencies
+        id: install-dependencies
         run: |
           bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
           bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
@@ -1072,7 +1115,7 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
       - name: Accuracy Test MI35x ROCm (DeepSeek-R1-MXFP4 TP4 MTP)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.install-dependencies.outcome == 'success' }}
         timeout-minutes: 180
         run: |
           > github_summary.md
@@ -1109,6 +1152,7 @@ jobs:
           ENABLE_CACHE_HOST: "1"
 
       - name: Install dependencies
+        id: install-dependencies
         run: |
           bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
           # Install tabulate for run_suite.py (missing in MI35x container)
@@ -1126,9 +1170,10 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
       - name: Performance Test MI35x ROCm (8-GPU DeepSeek-R1-MXFP4 KV FP8)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.install-dependencies.outcome == 'success' }}
         timeout-minutes: 300
         continue-on-error: true
+        id: performance
         run: |
           > github_summary.md  # Clear summary file
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
@@ -1137,6 +1182,12 @@ jobs:
             python3 registered/amd/perf/mi35x/test_deepseek_r1_mxfp4_kv_fp8_perf_mi35x.py || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
+
+      - name: Report performance outcome
+        if: always()
+        uses: ./.github/actions/report-amd-perf-outcome
+        with:
+          outcome: ${{ steps.performance.outcome }}
 
   nightly-8-gpu-mi35x-deepseek-r1-mxfp4-ar-fusion:
     name: ${{ format('nightly-8-gpu-mi35x-deepseek-r1-mxfp4-ar-fusion ({0}, linux-mi35x-gpu-8)', matrix.rocm_version) }}
@@ -1164,6 +1215,7 @@ jobs:
           ENABLE_CACHE_HOST: "1"
 
       - name: Install dependencies
+        id: install-dependencies
         run: |
           bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
           # Install tabulate for run_suite.py (missing in MI35x container)
@@ -1181,9 +1233,10 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
       - name: Performance Test MI35x ROCm (8-GPU DeepSeek-R1-MXFP4 AllReduce Fusion)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.install-dependencies.outcome == 'success' }}
         timeout-minutes: 300
         continue-on-error: true
+        id: performance
         run: |
           > github_summary.md  # Clear summary file
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
@@ -1192,6 +1245,12 @@ jobs:
             python3 registered/amd/perf/mi35x/test_deepseek_r1_mxfp4_ar_fusion_perf_mi35x.py || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
+
+      - name: Report performance outcome
+        if: always()
+        uses: ./.github/actions/report-amd-perf-outcome
+        with:
+          outcome: ${{ steps.performance.outcome }}
 
   nightly-8-gpu-mi35x-deepseek-r1-hicache:
     name: ${{ format('nightly-8-gpu-mi35x-deepseek-r1-hicache ({0}, linux-mi35x-gpu-8)', matrix.rocm_version) }}
@@ -1309,6 +1368,7 @@ jobs:
           ENABLE_CACHE_HOST: "1"
 
       - name: Install dependencies
+        id: install-dependencies
         run: |
           # --skip-test-time-deps: GSM8K + bench_one_batch_server don't need lmms-eval / human-eval.
           bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
@@ -1327,7 +1387,7 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
 
       - name: Accuracy + Performance Test MI35x ROCm (8-GPU DeepSeek-V4-Flash FP8 + FP4, triton)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.install-dependencies.outcome == 'success' }}
         timeout-minutes: 300
         run: |
           > github_summary.md  # Clear summary file
@@ -1365,6 +1425,7 @@ jobs:
           ENABLE_CACHE_HOST: "1"
 
       - name: Install dependencies
+        id: install-dependencies
         run: |
           # --skip-test-time-deps: GSM8K + bench_one_batch_server don't need lmms-eval / human-eval.
           bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
@@ -1383,7 +1444,7 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
 
       - name: Accuracy + Performance Test MI35x ROCm (8-GPU DeepSeek-V4-Pro FP8 + FP4, triton)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.install-dependencies.outcome == 'success' }}
         timeout-minutes: 480
         run: |
           > github_summary.md  # Clear summary file
@@ -1421,6 +1482,7 @@ jobs:
           ENABLE_CACHE_HOST: "1"
 
       - name: Install dependencies
+        id: install-dependencies
         run: |
           # --skip-test-time-deps: GSM8K + send_one don't need lmms-eval / human-eval.
           bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
@@ -1439,7 +1501,7 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
 
       - name: Accuracy + MTP Accept Length Test MI35x ROCm (8-GPU DeepSeek-V4-Pro FP8 MTP, triton)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.install-dependencies.outcome == 'success' }}
         timeout-minutes: 240
         run: |
           > github_summary.md  # Clear summary file
@@ -1660,6 +1722,7 @@ jobs:
           ENABLE_CACHE_HOST: "1"
 
       - name: Install dependencies
+        id: install-dependencies
         run: |
           bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
           # Install tabulate for run_suite.py (missing in MI35x container)
@@ -1679,15 +1742,16 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
       # Shares the job with the eval above so the checkpoint is already cached
-      # and only one 8-GPU MI35x slot is consumed. Step ordering is also the
-      # accuracy gate: a failed eval fails the job before this runs, so
-      # throughput is never measured on a build that got the tokens wrong.
+      # and only one 8-GPU MI35x slot is consumed. Keep performance diagnostics
+      # after a failed eval, but only when setup succeeded. These measurements
+      # do not establish that accuracy passed.
       # continue-on-error matches every other combined accuracy + perf job here,
       # so a perf hiccup cannot turn the accuracy result red.
       - name: Performance Test MI35x ROCm (8-GPU Kimi-K3.1-Pro)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.install-dependencies.outcome == 'success' }}
         timeout-minutes: 300
         continue-on-error: true
+        id: performance
         run: |
           > github_summary.md  # Clear summary file
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
@@ -1696,6 +1760,12 @@ jobs:
             python3 registered/amd/perf/mi35x/test_kimi_k31_pro_perf_mi35x.py || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
+
+      - name: Report performance outcome
+        if: always()
+        uses: ./.github/actions/report-amd-perf-outcome
+        with:
+          outcome: ${{ steps.performance.outcome }}
 
   # ==============================================================================
   # 8-GPU Muse Spark Open MXFP4 (MI35x only - native MXFP4 needs gfx95x)
@@ -1773,6 +1843,7 @@ jobs:
           ENABLE_CACHE_HOST: "1"
 
       - name: Install dependencies
+        id: install-dependencies
         run: |
           bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-aiter-build --skip-test-time-deps
           bash scripts/ci/amd/amd_ci_exec.sh pip install mistral-common "lm-eval[api]"
@@ -1789,9 +1860,10 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
       - name: Performance Test ROCm (8-GPU Qwen 3.5 FP8)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.install-dependencies.outcome == 'success' }}
         timeout-minutes: 120
         continue-on-error: true
+        id: performance
         run: |
           > github_summary.md  # Clear summary file
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
@@ -1801,6 +1873,12 @@ jobs:
             python3 run_suite.py --hw amd --suite nightly-perf-8-gpu-qwen35-fp8 --nightly --timeout-per-file 5400 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
+
+      - name: Report performance outcome
+        if: always()
+        uses: ./.github/actions/report-amd-perf-outcome
+        with:
+          outcome: ${{ steps.performance.outcome }}
 
   nightly-8-gpu-mi35x-qwen35:
     name: ${{ format('nightly-8-gpu-mi35x-qwen35 ({0}, linux-mi35x-gpu-8)', matrix.rocm_version) }}
@@ -1827,6 +1905,7 @@ jobs:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Install dependencies
+        id: install-dependencies
         run: |
           bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-aiter-build --skip-test-time-deps
           bash scripts/ci/amd/amd_ci_exec.sh pip install tabulate
@@ -1844,9 +1923,10 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
       - name: Performance Test MI35x ROCm (8-GPU Qwen 3.5 FP8)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.install-dependencies.outcome == 'success' }}
         timeout-minutes: 120
         continue-on-error: true
+        id: performance
         run: |
           > github_summary.md  # Clear summary file
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
@@ -1856,6 +1936,12 @@ jobs:
             python3 run_suite.py --hw amd --suite nightly-perf-8-gpu-mi35x-qwen35-fp8 --nightly --timeout-per-file 5400 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
+
+      - name: Report performance outcome
+        if: always()
+        uses: ./.github/actions/report-amd-perf-outcome
+        with:
+          outcome: ${{ steps.performance.outcome }}
 
   nightly-8-gpu-mi35x-qwen35-triton-dcp:
     name: ${{ format('nightly-8-gpu-mi35x-qwen35-triton-dcp ({0}, linux-mi35x-gpu-8)', matrix.rocm_version) }}
@@ -2117,6 +2203,7 @@ jobs:
           ENABLE_CACHE_HOST: "1"
 
       - name: Install dependencies
+        id: install-dependencies
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
 
       - name: Accuracy Test MI35x ROCm (4-GPU MiniMax-M3 MXFP8)
@@ -2131,12 +2218,12 @@ jobs:
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 
-      # Run perf only after correctness passes. Keeping both steps in this job
-      # reuses the cached checkpoint and one scarce MI35x slot.
+      # Reuse the cached checkpoint and scarce MI35x slot for performance diagnostics.
       - name: Performance Test MI35x ROCm (4-GPU MiniMax-M3 MXFP8)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.install-dependencies.outcome == 'success' }}
         timeout-minutes: 120
         continue-on-error: true  # Perf test failure doesn't fail the job if accuracy passed
+        id: performance
         run: |
           > github_summary.md
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
@@ -2146,6 +2233,12 @@ jobs:
             python3 run_suite.py --hw amd --suite nightly-perf-4-gpu-mi35x-minimax-m3 --nightly --timeout-per-file 5400 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
+
+      - name: Report performance outcome
+        if: always()
+        uses: ./.github/actions/report-amd-perf-outcome
+        with:
+          outcome: ${{ steps.performance.outcome }}
 
   # ==============================================================================
   # 4-GPU MiniMax-M3.1-Flash MXFP4 + DSpark (MI35x)
@@ -2220,6 +2313,7 @@ jobs:
           ENABLE_CACHE_HOST: "1"
 
       - name: Install dependencies
+        id: install-dependencies
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh --skip-test-time-deps
 
       - name: Accuracy Test ROCm (8-GPU MiniMax-M2.7)
@@ -2235,9 +2329,10 @@ jobs:
           exit ${TEST_EXIT_CODE:-0}
 
       - name: Performance Test ROCm (8-GPU MiniMax-M2.7)
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && steps.install-dependencies.outcome == 'success' }}
         timeout-minutes: 120
         continue-on-error: true  # Perf test failure doesn't fail the job if accuracy passed
+        id: performance
         run: |
           > github_summary.md  # Clear summary file
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout/test \
@@ -2247,6 +2342,12 @@ jobs:
             python3 run_suite.py --hw amd --suite nightly-perf-8-gpu-minimax-m27 --nightly --timeout-per-file 5400 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }} || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
+
+      - name: Report performance outcome
+        if: always()
+        uses: ./.github/actions/report-amd-perf-outcome
+        with:
+          outcome: ${{ steps.performance.outcome }}
 
   # ==============================================================================
   # Diffusion (MI30x)
@@ -2285,8 +2386,15 @@ jobs:
           bash scripts/ci/amd/amd_ci_exec.sh -w /sglang-checkout \
             -e GITHUB_STEP_SUMMARY="/sglang-checkout/github_summary.md" \
             -e SGLANG_DIFFUSION_ARTIFACT_DIR="/sglang-checkout/diffusion-artifacts" \
-            pytest test/registered/amd/test_zimage_turbo.py -v -s ${{ inputs.continue_on_error && '|| true' || '' }} || TEST_EXIT_CODE=$?
+            pytest test/registered/amd/test_zimage_turbo.py -v -s || TEST_EXIT_CODE=$?
           echo "$(<github_summary.md )" >> $GITHUB_STEP_SUMMARY || true
+          if [[ ${TEST_EXIT_CODE:-0} -ne 0 ]]; then
+            echo "::warning::Z-Image-Turbo test failed with exit code $TEST_EXIT_CODE"
+            echo "Z-Image-Turbo test failed with exit code $TEST_EXIT_CODE." >> "$GITHUB_STEP_SUMMARY"
+          fi
+          if [[ "${{ inputs.continue_on_error }}" == "true" ]]; then
+            exit 0
+          fi
           exit ${TEST_EXIT_CODE:-0}
 
       - name: Upload generated images
@@ -2367,14 +2475,56 @@ jobs:
       - nightly-1-gpu-zimage-turbo
     runs-on: ubuntu-latest
     steps:
-      - name: Check if any job failed
-        run: |
-          if [[ "${{ contains(needs.*.result, 'failure') }}" == "true" ]]; then
-            echo "One or more ROCm nightly test jobs failed"
-            exit 1
-          fi
-          if [[ "${{ contains(needs.*.result, 'cancelled') }}" == "true" ]]; then
-            echo "One or more ROCm nightly test jobs were cancelled"
-            exit 1
-          fi
-          echo "All ROCm nightly test jobs passed"
+      - name: Summarize nightly job results
+        uses: actions/github-script@v7
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+          JOB_FILTER: ${{ inputs.job_filter }}
+          JOB_SELECT: ${{ inputs.job_select }}
+        with:
+          script: |
+            const groups = Object.entries(JSON.parse(process.env.NEEDS_JSON));
+            // Match the case-insensitive workflow conditions without trimming filters.
+            const filter = (process.env.JOB_FILTER || process.env.JOB_SELECT || 'all').toLowerCase();
+            const requested = new Set(filter === 'all' ? groups.map(([name]) => name.toLowerCase()) : filter.split(','));
+            const selected = groups.filter(([name]) => requested.has(name.toLowerCase()));
+            const unknown = [...requested].filter(name => !groups.some(([id]) => id.toLowerCase() === name));
+            const errors = [];
+            if (unknown.length) errors.push(`Unknown job selection: ${unknown.join(', ')}`);
+            if (!selected.length) errors.push('No nightly job groups were selected.');
+
+            const unsuccessful = groups.filter(([name, job]) =>
+              job.result !== 'success' && (job.result !== 'skipped' || requested.has(name.toLowerCase()))
+            );
+            if (unsuccessful.length) {
+              errors.push(`Nightly job groups did not succeed: ${unsuccessful.map(([name, job]) => `${name}: ${job.result}`).join(', ')}`);
+            }
+
+            const states = ['success', 'failure', 'cancelled', 'skipped'];
+            const summary = [
+              '## AMD nightly job results',
+              '',
+              `Selected **${selected.length} of ${groups.length}** logical job groups.`,
+              '',
+              '| Result | All groups | Selected groups |',
+              '| --- | ---: | ---: |',
+              ...[...states, 'other'].map(state => {
+                const matches = job => state === 'other' ? !states.includes(job.result) : job.result === state;
+                return `| ${state} | ${groups.filter(([, job]) => matches(job)).length} | ${selected.filter(([, job]) => matches(job)).length} |`;
+              }),
+              '',
+              'These are job-group conclusions, not matrix-execution or test-case counts. Tolerated step failures are not visible in these conclusions.',
+            ];
+            if (selected.length < groups.length) {
+              const message = 'Partial nightly: this run does not certify full nightly coverage.';
+              summary.push('', message);
+              core.warning(message);
+            }
+            if (errors.length) {
+              summary.push('', 'Result: **failed or incomplete**.');
+              core.setFailed(errors.join('\n'));
+            } else {
+              summary.push('', 'Result: **all selected job groups reported success**.');
+              core.info(`All ${selected.length} selected AMD nightly job groups reported success.`);
+            }
+            await core.summary.addRaw(summary.join('\n')).write();
