@@ -4161,6 +4161,28 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         }
     }
 
+    /// Queue a storage-tier store event for a node whose backup reached
+    /// storage whole. `backed_tokens` is the span the backup covered; a node
+    /// split since then no longer spans it, and queues nothing (`false`).
+    pub fn record_storage_backup_event(
+        &mut self,
+        node_id: NodeId,
+        backed_tokens: usize,
+    ) -> Result<bool, NodeAccessError> {
+        let node_id = self.arena.resolve(node_id)?;
+        let pages = self
+            .arena
+            .node(node_id)
+            .key
+            .atom_len()
+            .div_ceil(self.page_size);
+        if pages * self.page_size != backed_tokens {
+            return Ok(false);
+        }
+        self.record_store_event_(node_id, StorageMedium::External, None);
+        Ok(true)
+    }
+
     /// Take all queued events, leaving the queue empty.
     pub fn take_events(&mut self) -> Vec<KvCacheEvent<K::Atom>> {
         std::mem::take(&mut self.kv_event_queue)
@@ -6590,6 +6612,8 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
 pub enum StorageMedium {
     Gpu,
     Cpu,
+    /// L3 storage backend (HiCache storage, e.g. Mooncake).
+    External,
 }
 
 impl StorageMedium {
@@ -6598,6 +6622,7 @@ impl StorageMedium {
         match self {
             StorageMedium::Gpu => "GPU",
             StorageMedium::Cpu => "CPU_PINNED",
+            StorageMedium::External => "EXTERNAL",
         }
     }
 }

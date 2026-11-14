@@ -1142,6 +1142,9 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                 torch.cat(full_values)
             ).to(torch.int64)
 
+    def record_storage_backup_event(self, node_id: NodeId, backed_tokens: int) -> bool:
+        return self._binding.record_storage_backup_event(node_id, backed_tokens)
+
     def build_storage_backup_spec(
         self, node_id: NodeId, pass_prefix_keys: bool
     ) -> Optional[StorageBackupSpec]:

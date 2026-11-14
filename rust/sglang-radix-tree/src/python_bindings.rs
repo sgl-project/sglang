@@ -2128,6 +2128,21 @@ macro_rules! tree_core_methods {
                 py.detach(|| self.core().record_all_cleared_event());
             }
 
+            /// Queue a storage-tier store event for a node whose backup reached
+            /// storage whole; false when the node no longer spans the backup.
+            fn record_storage_backup_event(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+                backed_tokens: usize,
+            ) -> PyResult<bool> {
+                py.detach(|| {
+                    self.core()
+                        .record_storage_backup_event(node_id, backed_tokens)
+                })
+                .map_err(node_access_error)
+            }
+
             /// Drain the queued placement events as tagged tuples.
             fn take_events(&self, py: Python<'_>) -> PyResult<Py<PyList>>
             where
@@ -3490,6 +3505,20 @@ macro_rules! tree_core_binding {
                 catch_native_panic(|| {
                     self.inner.record_all_cleared_event(py);
                     Ok(())
+                })
+            }
+
+            /// Queue a storage-tier store event for a node whose backup reached
+            /// storage whole; false when the node no longer spans the backup.
+            fn record_storage_backup_event(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+                backed_tokens: usize,
+            ) -> PyResult<bool> {
+                catch_native_panic(|| {
+                    self.inner
+                        .record_storage_backup_event(py, node_id, backed_tokens)
                 })
             }
 

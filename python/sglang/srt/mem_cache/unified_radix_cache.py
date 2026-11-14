@@ -4008,6 +4008,12 @@ class UnifiedRadixCache(BasePrefixCache):
             entry = self.ongoing_backup.pop(operation.id, None)
             if entry is not None:
                 node_id, lock_params = entry
+                # Announce only a whole write; a short one's written prefix stays
+                # unannounced until a later write-through covers the node.
+                if requested_tokens and agreed_tokens == requested_tokens:
+                    self.tree_core.record_storage_backup_event(
+                        node_id, backed_tokens=requested_tokens
+                    )
                 self.dec_host_lock_ref(node_id, lock_params)
         if short:
             logger.warning(

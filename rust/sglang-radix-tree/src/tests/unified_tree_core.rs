@@ -3395,6 +3395,51 @@ fn insert_coalesces_parent_linked_block_stores() {
     assert!(tc.namespaced_event_hashes.is_empty());
 }
 
+/// A whole storage backup re-announces the node's blocks on the storage tier
+/// with the same hashes and chain; a span the node no longer matches queues nothing.
+#[test]
+fn storage_backup_event_reuses_the_device_store_hashes() {
+    let mut tc = events_core(2);
+    tc.insert(&insert_params(&vec![1, 2, 7, 8], &[10, 11, 12, 13]));
+    let device = tc.take_events();
+    let leaf = tc
+        .match_prefix(&match_params(&vec![1, 2, 7, 8]))
+        .best_match_node_id;
+
+    assert_eq!(tc.record_storage_backup_event(leaf, 2), Ok(false));
+    assert_eq!(tc.take_events(), Vec::new());
+
+    assert_eq!(tc.record_storage_backup_event(leaf, 4), Ok(true));
+    let storage = tc.take_events();
+    let expected: Vec<_> = device
+        .into_iter()
+        .map(|event| match event {
+            KvCacheEvent::BlockStored {
+                block_hashes,
+                parent_block_hash,
+                token_ids,
+                block_size,
+                cache_salt,
+                session_id,
+                extra_key,
+                ..
+            } => KvCacheEvent::BlockStored {
+                block_hashes,
+                parent_block_hash,
+                token_ids,
+                block_size,
+                medium: StorageMedium::External,
+                cache_salt,
+                session_id,
+                extra_key,
+            },
+            other => other,
+        })
+        .collect();
+    assert_eq!(storage, expected);
+    assert_eq!(StorageMedium::External.as_str(), "EXTERNAL");
+}
+
 #[test]
 fn insert_attributes_stored_blocks_to_session_without_changing_hashes() {
     let mut tc = events_core(2);
