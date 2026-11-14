@@ -32,7 +32,7 @@
 //! ranks. Clients reach the other ranks through a router that dials each
 //! listener (DP rank 0 publishes them), or by dialing them themselves.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use axum::Router;
@@ -41,6 +41,7 @@ use axum::extract::{Request, State};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::Response;
+use futures::TryStreamExt;
 use serde::Deserialize;
 
 use super::request_headers::int_header;
@@ -318,14 +319,20 @@ impl DpRelay {
     /// response back as received.
     async fn relay(&self, rank: u32, base: &str, request: Request) -> Response {
         let (parts, body) = request.into_parts();
-        let body = match axum::body::to_bytes(body, usize::MAX).await {
-            Ok(body) => body,
-            Err(error) => return unreadable_body(error),
-        };
+        // A client body that fails to read also fails the send;
+        // that is the client's 400, not a 502 that blames the peer.
+        let read_error = Arc::new(OnceLock::new());
+        let body = reqwest::Body::wrap_stream(body.into_data_stream().inspect_err({
+            let read_error = read_error.clone();
+            move |error| {
+                let _ = read_error.set(error.to_string());
+            }
+        }));
         let mut headers = parts.headers;
         strip_hop_by_hop(&mut headers);
-        // The body is already whole: the relay sets its own length.
-        for name in [header::HOST, header::CONTENT_LENGTH, header::EXPECT] {
+        // The body goes on as it arrives, so `Content-Length` stays;
+        // without one, it goes chunked.
+        for name in [header::HOST, header::EXPECT] {
             headers.remove(name);
         }
         headers.insert(RELAYED_RANK_HEADER, HeaderValue::from(rank));
@@ -348,6 +355,9 @@ impl DpRelay {
         {
             Ok(upstream) => upstream,
             Err(error) => {
+                if let Some(cause) = read_error.get() {
+                    return unreadable_body(cause);
+                }
                 let status = if error.is_connect() {
                     StatusCode::SERVICE_UNAVAILABLE
                 } else {
@@ -414,10 +424,10 @@ fn strip_hop_by_hop(headers: &mut HeaderMap) {
     }
 }
 
-fn unreadable_body(error: axum::Error) -> Response {
+fn unreadable_body(error: impl std::fmt::Display) -> Response {
     json_error(
         StatusCode::BAD_REQUEST,
-        &format!("Failed to buffer the request body: {error}"),
+        &format!("Failed to read the request body: {error}"),
     )
 }
 
@@ -963,5 +973,128 @@ mod tests {
             .await
             .expect("the serving listener sees the hang-up")
             .unwrap();
+    }
+
+    /// Feeds a request body chunk by chunk; dropping it ends the body.
+    type Feed = tokio::sync::mpsc::Sender<Result<Bytes, std::io::Error>>;
+
+    fn fed_body() -> (Feed, Body) {
+        let (feed, chunks) = tokio::sync::mpsc::channel(4);
+        let chunks = futures::stream::unfold(chunks, |mut chunks| async move {
+            chunks.recv().await.map(|chunk| (chunk, chunks))
+        });
+        (feed, Body::from_stream(chunks))
+    }
+
+    /// A DP rank 1 listener that signals when it reads the first chunk of a
+    /// body, then answers how many bytes it read and the length it was told.
+    async fn reading_peer() -> (String, tokio::sync::oneshot::Receiver<()>) {
+        let (first_tx, first_rx) = tokio::sync::oneshot::channel();
+        let first_tx = Arc::new(Mutex::new(Some(first_tx)));
+        let read = post(move |request: Request| {
+            let first_tx = first_tx.clone();
+            async move {
+                let length = request.headers().get(header::CONTENT_LENGTH).cloned();
+                let mut body = request.into_body().into_data_stream();
+                let mut read = 0;
+                while let Some(chunk) = body.next().await {
+                    let Ok(chunk) = chunk else {
+                        return (StatusCode::BAD_REQUEST, String::from("cut"));
+                    };
+                    read += chunk.len();
+                    if let Some(first) = first_tx.lock().unwrap().take() {
+                        let _ = first.send(());
+                    }
+                }
+                (
+                    StatusCode::OK,
+                    format!("{read} bytes, content-length {length:?}"),
+                )
+            }
+        });
+        let url = serve(Router::new().route("/v1/completions", read))
+            .await
+            .unwrap();
+        (url, first_rx)
+    }
+
+    /// Rank 0's relay of a completion whose header names rank 1, with the
+    /// test feeding its body.
+    fn relayed_completion(
+        app: Router,
+        length: Option<&str>,
+    ) -> (
+        Feed,
+        tokio::task::JoinHandle<Result<Response, std::convert::Infallible>>,
+    ) {
+        let (feed, body) = fed_body();
+        let mut request = Request::post("/v1/completions").body(body).unwrap();
+        request
+            .headers_mut()
+            .insert(DATA_PARALLEL_RANK_HEADER, HeaderValue::from_static("1"));
+        if let Some(length) = length {
+            request
+                .headers_mut()
+                .insert(header::CONTENT_LENGTH, length.parse().unwrap());
+        }
+        (feed, tokio::spawn(app.oneshot(request)))
+    }
+
+    async fn reply(response: Response) -> (StatusCode, String) {
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, String::from_utf8(body.to_vec()).unwrap())
+    }
+
+    /// A request whose header names another rank reaches that rank's
+    /// listener as it arrives: the listener reads its first chunk before the
+    /// client sends the rest, and is told the length the client declared.
+    #[tokio::test]
+    async fn a_header_named_request_reaches_its_listener_before_its_body_ends() {
+        let (peer_url, first_read) = reading_peer().await;
+        let (feed, response) = relayed_completion(listener(&peer_url, false, core()), Some("8"));
+        feed.send(Ok(Bytes::from_static(b"1234"))).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), first_read)
+            .await
+            .expect("rank 1 reads the first chunk before the client sends the rest")
+            .unwrap();
+        feed.send(Ok(Bytes::from_static(b"5678"))).await.unwrap();
+        drop(feed);
+        let (status, reply) = reply(response.await.unwrap().unwrap()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(reply, r#"8 bytes, content-length Some("8")"#);
+    }
+
+    /// A body of undeclared length reaches the other rank's listener whole.
+    #[tokio::test]
+    async fn a_body_of_undeclared_length_is_relayed_whole() {
+        let (peer_url, _first_read) = reading_peer().await;
+        let (feed, response) = relayed_completion(listener(&peer_url, false, core()), None);
+        feed.send(Ok(Bytes::from_static(b"1234"))).await.unwrap();
+        feed.send(Ok(Bytes::from_static(b"5678"))).await.unwrap();
+        drop(feed);
+        let (status, reply) = reply(response.await.unwrap().unwrap()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(reply, "8 bytes, content-length None");
+    }
+
+    /// A body that fails while it is relayed is the client's fault: 400, not
+    /// a 502 that blames the other rank's listener.
+    #[tokio::test]
+    async fn a_body_cut_while_relayed_is_the_clients_fault() {
+        let (peer_url, _first_read) = reading_peer().await;
+        let (feed, response) = relayed_completion(listener(&peer_url, false, core()), Some("8"));
+        feed.send(Ok(Bytes::from_static(b"1234"))).await.unwrap();
+        feed.send(Err(std::io::Error::other("client gone")))
+            .await
+            .unwrap();
+        let (status, reply) = reply(response.await.unwrap().unwrap()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{reply}");
+        assert!(
+            reply.contains("Failed to read the request body: client gone"),
+            "{reply}"
+        );
     }
 }
