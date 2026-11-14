@@ -1173,6 +1173,29 @@ class TestResolveAutoParsers(CustomTestCase):
         )
         self.assertIsNone(_declared(args, "tool_call_parser"))
 
+    def test_response_template_reasoning_content_alias_is_detected(self):
+        args = self._make_server_args(
+            reasoning_parser="auto",
+            tool_call_parser="auto",
+        )
+        tokenizer = _DummyTokenizer([], chat_template="unrecognized")
+        tokenizer.response_template = {
+            "start_anchor": "<assistant>",
+            "fields": {
+                "reasoning_content": {"open": "<think>", "close": "</think>"},
+                "content": {"content": "text"},
+            },
+        }
+
+        with _patch_hf_transformers(Mock(return_value=tokenizer)):
+            resolve_auto_parsers(args)
+
+        self.assertEqual(
+            _declared(args, "reasoning_parser"),
+            "response_template",
+        )
+        self.assertIsNone(_declared(args, "tool_call_parser"))
+
     def test_unsupported_response_template_is_ignored(self):
         args = self._make_server_args(
             reasoning_parser="auto",
