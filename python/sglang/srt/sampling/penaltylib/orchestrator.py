@@ -20,7 +20,10 @@ class BatchedPenalizerOrchestrator:
         self.vocab_size = vocab_size
         self._batch_ref = weakref.ref(batch)
         self.device = batch.device
+        self._device_module = torch.get_device_module(self.device)
         self.penalizers = {Penalizer: Penalizer(self) for Penalizer in penalizers}
+        # Recorded after a forward-stream token feed; None when there is none to wait for.
+        self._forward_write_done = None
 
         is_required = False
         for penalizer in self.penalizers.values():
@@ -42,15 +45,33 @@ class BatchedPenalizerOrchestrator:
     def reqs(self):
         return self.batch.reqs
 
-    def cumulate_output_tokens(self, output_ids: torch.Tensor):
+    def cumulate_output_tokens(self, output_ids: torch.Tensor, row_start: int = 0):
         """
         Feed the output tokens to the penalizers.
 
         Args:
-            output_ids (torch.Tensor): The output tokens.
+            output_ids (torch.Tensor): The output tokens, one per request row.
+            row_start (int): The batch row of output_ids[0]; the rows before it
+                and after the last one are left unchanged.
         """
         for penalizer in self.penalizers.values():
-            penalizer.cumulate_output_tokens(output_ids=output_ids)
+            penalizer.cumulate_output_tokens(output_ids=output_ids, row_start=row_start)
+
+    def cumulate_output_tokens_on_forward_stream(
+        self, output_ids: torch.Tensor, row_start: int = 0
+    ):
+        # The overlap resolve feeds tokens on the forward stream, while filter and
+        # merge run on the schedule stream; they wait for this write before copying.
+        self.cumulate_output_tokens(output_ids=output_ids, row_start=row_start)
+        if self.is_required:
+            self._forward_write_done = self._device_module.Event()
+            self._forward_write_done.record()
+
+    def _wait_for_forward_write(self):
+        if self._forward_write_done is None:
+            return
+        self._device_module.current_stream().wait_event(self._forward_write_done)
+        self._forward_write_done = None
 
     def apply(self, logits: torch.Tensor, repeat: Optional[int] = None):
         """
@@ -110,6 +131,7 @@ class BatchedPenalizerOrchestrator:
         Args:
             keep_indices (torch.Tensor): Tensor of indices to keep in the batch.
         """
+        self._wait_for_forward_write()
         if not self.is_required:
             return
 
@@ -156,6 +178,8 @@ class BatchedPenalizerOrchestrator:
         Args:
             their (BatchedPenalizerOrchestrator): The orchestrator to merge into this one.
         """
+        self._wait_for_forward_write()
+        their._wait_for_forward_write()
         if not self.is_required and not their.is_required:
             return
 
@@ -209,11 +233,12 @@ class _BatchedPenalizer(abc.ABC):
         self._teardown()
         self._is_prepared = False
 
-    def cumulate_output_tokens(self, output_ids: torch.Tensor):
+    def cumulate_output_tokens(self, output_ids: torch.Tensor, row_start: int = 0):
         if not self._is_prepared:
             return
 
-        self._cumulate_output_tokens(output_ids=output_ids)
+        rows = slice(row_start, row_start + output_ids.shape[0])
+        self._cumulate_output_tokens(output_ids=output_ids, rows=rows)
 
     def apply(self, logits: torch.Tensor) -> torch.Tensor:
         if not self._is_prepared:
@@ -251,10 +276,11 @@ class _BatchedPenalizer(abc.ABC):
         pass
 
     @abc.abstractmethod
-    def _cumulate_output_tokens(self, output_ids: torch.Tensor):
+    def _cumulate_output_tokens(self, output_ids: torch.Tensor, rows: slice):
         """
         Cumulate the output tokens.
         Orchestrator will call this function to feed the output tokens to the penalizer.
+        output_ids[i] belongs to batch row rows.start + i; other rows are untouched.
         """
         pass
 
