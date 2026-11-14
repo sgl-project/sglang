@@ -2086,7 +2086,7 @@ class PrefillAdder:
         #   2) filter out of batch                (in get_next_batch_to_run / update_running_batch)
         # Preemption runs between these two phases (inside get_new_batch_prefill),
         # so running_batch may still contain requests whose KV cache is already freed.
-        # We must skip them here to avoid a double-free on release_req.
+        # We must skip them here to avoid a double-free on retract.
         valid_running_reqs = (
             r
             for r in self.running_batch.reqs
@@ -2137,10 +2137,10 @@ class PrefillAdder:
                     self._get_running_request_total_token_offset(running_req)
                 )
                 release_counter += 1
-                self.running_batch.release_req(
-                    i,
-                    len(self.running_batch.reqs) - release_counter,
-                    self.request_retirer,
+                self.request_retirer.retract(
+                    running_req,
+                    remaining_req_count=len(self.running_batch.reqs) - release_counter,
+                    offload_kv=True,
                 )
             else:
                 keep_indices.append(i)

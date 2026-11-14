@@ -249,6 +249,7 @@ from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
     retract_all,
+    retract_decode,
 )
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
@@ -5111,8 +5112,8 @@ class Scheduler(
                 if mamba_allocator is not None
                 else None
             )
-            retracted_reqs, new_token_ratio, reqs_to_abort = batch.retract_decode(
-                self.request_retirer
+            retracted_reqs, new_token_ratio, reqs_to_abort = retract_decode(
+                batch=batch, request_retirer=self.request_retirer
             )
             new_available_tokens = self.token_to_kv_pool_allocator.available_size()
             new_token_gained = new_available_tokens - old_available_tokens

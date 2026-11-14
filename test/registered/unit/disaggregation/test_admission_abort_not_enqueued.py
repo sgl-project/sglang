@@ -168,9 +168,10 @@ class TestAdmissionAbortNotEnqueued(CustomTestCase):
     def test_reentering_prefill_request_is_not_retired(self):
         """A preempted prefill requeue must reach its queue, which owns release.
 
-        Preemption runs `release_req`, so KV is gone by then; what survives is
-        the metadata buffer (`finalize_bootstrap` allocated it before the
-        request ever entered the running batch) and the host retraction backup.
+        Preemption runs `RequestRetirer.retract`, so KV is gone by then; what
+        survives is the metadata buffer (`finalize_bootstrap` allocated it
+        before the request ever entered the running batch) and the host
+        retraction backup.
         """
         for marker in ("metadata_buffer_index", "retraction_backup"):
             with self.subTest(marker=marker):
@@ -178,7 +179,7 @@ class TestAdmissionAbortNotEnqueued(CustomTestCase):
                 req.to_finish = FINISH_ABORT(
                     "Aborted by AbortReq.", HTTPStatus.SERVICE_UNAVAILABLE
                 )
-                # release_req already freed the KV row.
+                # The retract already freed the KV row.
                 self.assertFalse(req.kv.holds_kv)
                 if marker == "metadata_buffer_index":
                     req.metadata_buffer_index = 7
@@ -197,11 +198,11 @@ class TestAdmissionAbortNotEnqueued(CustomTestCase):
         """The decode door cannot sniff this one, so it must trust its flags.
 
         By the time `retract_decode` requeues, the request carries none of the
-        markers `is_unadmitted_reject` reads: `release_req` nulled
+        markers `is_unadmitted_reject` reads: `RequestRetirer.retract` nulled
         `kv.req_pool_idx`, `reset_for_retract` nulled `kv.mamba_pool_idx`, the
         decode metadata buffer lives on `DecodeRequest` rather than `Req`, and
         `add()` itself clears `retraction_mb_id`. Retiring it here would strand
-        the host pages `release_req` allocated, which only `restore_kv_cache`
+        the host pages the retract allocated, which only `restore_kv_cache`
         or `discard_kv_cache_backup` free.
 
         `backup=None` is the short-sequence case: `backup_kv_cache()` returns
@@ -265,10 +266,10 @@ class TestAdmissionAbortNotEnqueued(CustomTestCase):
     def test_preempted_reentry_is_not_retired(self):
         """Preemption requeues through a bare `_add_request_to_queue`.
 
-        The door sees no flag at all, and `release_req` -> `reset_for_retract`
-        is the only thing that marks the request. The resource markers miss
-        this shape on their own: the KV row is already freed and
-        `retraction_backup` is never taken for `seqlen <= 1`.
+        The door sees no flag at all, and `RequestRetirer.retract` ->
+        `reset_for_retract` is the only thing that marks the request. The
+        resource markers miss this shape on their own: the KV row is already
+        freed and `retraction_backup` is never taken for `seqlen <= 1`.
         """
         for door in ("prefill", "decode"):
             with self.subTest(door=door):

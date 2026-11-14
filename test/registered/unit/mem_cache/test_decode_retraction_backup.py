@@ -275,7 +275,8 @@ class TestDecodeRetractionBackup(CustomTestCase):
         # The declined backup must not leak host slots.
         self.assertEqual(env.cache.host_pool_group.available_size(), host_free_before)
 
-        # This is the signal release_req propagates so retract_decode aborts.
+        # This is the signal RequestRetirer.retract propagates so retract_decode
+        # aborts.
         self.assertFalse(
             backup_kv_cache(
                 req,
