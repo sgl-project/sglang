@@ -74,9 +74,14 @@ jobs:
 
       - name: Resolve runner_config
         id: rc
-        run: python3 scripts/ci/runner_configs.py '${{ inputs.runner_config }}' >> "$GITHUB_OUTPUT"
+        run: |
+          python3 -c 'import yaml' 2>/dev/null ||
+            python3 -m pip install --disable-pip-version-check pyyaml
+          python3 scripts/ci/runner_configs.py '${{ inputs.runner_config }}' >> "$GITHUB_OUTPUT"
 
       - uses: ./.github/actions/check-pr-test-health
+        with:
+          independent-test-job-prefix: 'call-multimodal-gen-tests /'
 
       - uses: ./.github/actions/check-maintenance
 

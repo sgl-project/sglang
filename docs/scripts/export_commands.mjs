@@ -103,6 +103,12 @@ const byModel = {};
 for (const name of EXPORTED_CONFIGS) {
   for (const { model, ...entry } of await exportConfig(name)) (byModel[model] ||= []).push(entry);
 }
+// The CLI Guide picks by hardware, GPU count and mode, so a second match would never run.
+for (const [model, entries] of Object.entries(byModel)) {
+  const keys = entries.map(({ hw, gpus, mode }) => `${gpus}x ${hw} ${mode ?? "(no mode)"}`);
+  const duplicate = keys.find((key, i) => keys.indexOf(key) !== i);
+  if (duplicate) throw new Error(`${model}: two commands for ${duplicate}`);
+}
 const files = Object.fromEntries(
   Object.entries(byModel).map(([model, entries]) => [
     fileName(model),

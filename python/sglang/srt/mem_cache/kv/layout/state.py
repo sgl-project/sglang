@@ -201,8 +201,7 @@ class StateView:
     custom_mem_pool = None
     debug_memory_pool = False
     conv_shard_groups = None
-    # GDN/KDA ReplaySSM is not supported in the arena: its rings are not per
-    # slot entry. Readers test these for None.
+    # ReplaySSM rings and cursors; None without them. Readers test for None.
     enable_linear_replayssm = False
     linear_replayssm_cache_len = 16
     replayssm_write_pos = None
@@ -288,6 +287,9 @@ class StateView:
             self.replayssm_spec_write_pos = payloads.get("replayssm_spec_write_pos")
             self.replayssm_cache_base = payloads.get("replayssm_cache_base")
             self.replayssm_is_flush = payloads.get("replayssm_is_flush")
+            # Parts a request owns (the GDN and KDA speculative rings) are indexed
+            # by the request row's unit, the rest by state slot.
+            self.replayssm_request_ring = "replayssm_d" in request_parts
         if intermediate_conv_window is None:
             self.mamba_cache = self.State(
                 conv=list(conv_views), temporal=temporal_view, **ring_fields

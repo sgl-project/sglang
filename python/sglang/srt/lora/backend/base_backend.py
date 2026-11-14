@@ -152,29 +152,6 @@ class BaseLoRABackend(LoRABackendLmHeadMixing):
         """
         pass
 
-    def run_extra_token_embedding(
-        self,
-        input_ids: torch.Tensor,
-        output: torch.Tensor,
-        extra_embeddings: torch.Tensor,
-        vocab_size: int,
-        *args,
-        **kwargs,
-    ) -> torch.Tensor:
-        """
-        Apply extra token embeddings to output in-place.
-
-        Args:
-            input_ids: (s,) token IDs
-            output: (s, embed_dim) output tensor to be modified
-            extra_embeddings: (num_loras, num_extra_tokens, embed_dim) extra embeddings
-            vocab_size: base vocabulary size
-
-        Returns:
-            output: modified output tensor
-        """
-        raise NotImplementedError
-
     def run_lora_a_sgemm(
         self, x: torch.Tensor, weights: torch.Tensor, *args, **kwargs
     ) -> torch.Tensor:

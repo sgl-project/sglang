@@ -732,7 +732,6 @@ def test_mxfp4_tp8_load_before_padding(tp_rank):
         moe_tp_rank=tp_rank,
         use_padded_loading=False,
         use_presharded_weights=False,
-        use_triton_kernels=False,
         moe_runner_config=SimpleNamespace(is_gated=True),
         quant_method=method,
         quant_config=None,

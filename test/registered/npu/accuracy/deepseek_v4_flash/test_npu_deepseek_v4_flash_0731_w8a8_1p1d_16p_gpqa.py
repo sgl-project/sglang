@@ -12,7 +12,6 @@ from sglang.test.ascend.e2e.test_npu_performance_utils import (
     run_bench_serving,
 )
 from sglang.test.ci.ci_register import register_npu_ci
-from sglang.test.ascend.e2e.test_npu_multi_node_utils import NIC_NAME
 from sglang.test.ascend.test_ascend_utils import build_hicache_storage_extra_config
 
 logger = logging.getLogger(__name__)
@@ -44,8 +43,8 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_COMMON_ENVS = {
     # gloo CPU process group must bind the real NIC instead of loopback: with
     # GLOO_SOCKET_IFNAME=lo every rank advertises 127.0.0.1 to its peers and
     # cross-node connectFullMesh fails with "Connection refused".
-    "HCCL_SOCKET_IFNAME": NIC_NAME,
-    "GLOO_SOCKET_IFNAME": NIC_NAME,
+    "HCCL_SOCKET_IFNAME": "lo",
+    "GLOO_SOCKET_IFNAME": "lo",
     # Two pods may share a host (hostNetwork); let HCCL pick free host ports.
     "HCCL_HOST_SOCKET_PORT_RANGE": "auto",
     "HCCL_OP_EXPANSION_MODE": "AIV",

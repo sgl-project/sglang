@@ -8,19 +8,15 @@ from sglang.test.ascend.e2e.test_npu_accuracy_utils import (
     TestNpuAccuracyTestCaseBase,
 )
 from sglang.test.ascend.e2e.test_npu_performance_utils import (
-    DEEPSEEK_V4_FLASH_0731_W8A8_MODEL_PATH, run_bench_serving, assert_metrics,
-)
-from sglang.test.ascend.e2e.test_npu_multi_node_utils import (
-    build_hicache_storage_extra_config,
+    DEEPSEEK_V4_FLASH_0731_W8A8_MODEL_PATH,
+    assert_metrics,
+    run_bench_serving,
 )
 from sglang.test.ci.ci_register import register_npu_ci
+from sglang.test.ascend.test_ascend_utils import build_hicache_storage_extra_config
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST
 from sglang.utils import wait_for_server
-HICACHE_STORAGE_EXTRA_CONFIG = build_hicache_storage_extra_config(
-    world_size=16,
-    protocol="device_sdma",
-    dram_size="4GB",
-)
+
 register_npu_ci(est_time=3600, suite="base-c-test-acc-16-npu-a3")
 
 register_npu_ci(
@@ -33,6 +29,16 @@ register_npu_ci(
 # (local runs, full test) still gets the full run.
 _is_pr_pipeline = os.environ.get("GITHUB_EVENT_NAME") == "pull_request" and (
     "nightly-test-npu.yml" not in os.environ.get("GITHUB_WORKFLOW_REF", "")
+)
+
+# npu_memcache L3 backend config; building it starts the MetaService on this
+# node and points the endpoints at the same node IP. world_size is
+# tp_size*pp_size and dram_size is the per-rank host DRAM contribution
+# (16 ranks x 4GB = 64GB).
+HICACHE_STORAGE_EXTRA_CONFIG = build_hicache_storage_extra_config(
+    world_size=16,
+    protocol="device_sdma",
+    dram_size="4GB",
 )
 
 DEEPSEEK_V4_FLASH_W8A8_DSPARK_8P_ENVS = {
@@ -55,7 +61,6 @@ DEEPSEEK_V4_FLASH_W8A8_DSPARK_8P_ENVS = {
     "SGLANG_OPT_USE_TILELANG_MHC_PRE": "False",
     "SGLANG_OPT_DEEPGEMM_HC_PRENORM": "False",
     "SGLANG_OPT_USE_TILELANG_MHC_POST": "False",
-    "SGLANG_DSPARK_FAST_KERNEL": "0",
     # DSPARK
     "SGLANG_RAGGED_VERIFY_MODE": "static",
     # mtp
@@ -124,7 +129,9 @@ DEEPSEEK_V4_FLASH_W8A8_DSPARK_8P_OTHER_ARGS = [
     6,
     8,
     10,
-    # "--disable-radix-cache",
+    # npu_memcache L3 cache (HiCache). It requires radix cache, so
+    # --disable-radix-cache must not be used together with it.
+    "--enable-cache-report",
     "--enable-hierarchical-cache",
     "--hicache-io-backend",
     "kernel_ascend",
@@ -132,9 +139,6 @@ DEEPSEEK_V4_FLASH_W8A8_DSPARK_8P_OTHER_ARGS = [
     1.5,
     "--hicache-write-policy",
     "write_through",
-    "--enable-cache-report",
-    "--max-total-tokens",
-    140000,
     "--hicache-storage-backend",
     "npu_memcache",
     "--hicache-storage-backend-extra-config",
@@ -169,6 +173,8 @@ class TestNPUDeepSeekV4FlashW8A88PGPQA(TestNpuAccuracyTestCaseBase):
     stream = True
     timeout = 6000
     seed = 1
+    # percent: L2 host and L3 storage hit rates must exceed the thresholds.
+    min_hit_rate_pcts = {"host": 0, "storage": 0}
 
     @classmethod
     def setUpClass(cls):
@@ -195,17 +201,15 @@ class TestNPUDeepSeekV4FlashW8A88PGPQA(TestNpuAccuracyTestCaseBase):
         cls.process = subprocess.Popen(command, env=env)
         wait_for_server(cls.base_url, timeout=cls.server_timeout, process=cls.process)
 
-    # def test_npu_deepseek_v4_flash_w8a8_8p_gpqa(self):
-    #     """Run NPU accuracy test for DeepSeek-V4-Flash W8A8 8p DSPARK GPQA."""
-    #     self.run_accuracy()
+    def test_npu_deepseek_v4_flash_w8a8_8p_gpqa(self):
+        """Run NPU accuracy test for DeepSeek-V4-Flash W8A8 8p DSPARK GPQA."""
+        self.run_accuracy()
 
-    def test_npu_deepseek_v4_flash_0731_w8a8_1p1d_16p_l2_l3_hit_rate(self):
-        """Run the 32k GSP bench; assert_metrics checks the L2/L3 hit rates"""
+    def test_npu_deepseek_v4_flash_w8a8_8p_l2_l3_hit_rate(self):
+        """Run the 32k GSP bench; assert_metrics checks the L2/L3 hit rates."""
         # 3 groups x 32 prompts share a 28800-token system prompt (32k * 0.9)
         # plus a 3200-token question, which exceeds L1 so evictions land in L2
         # and L3.
-        # This base class launches the server on cls.base_url, so derive the
-        # bench host/port from it (there is no host/port class attribute).
         parsed_url = urlparse(self.base_url)
         metrics = run_bench_serving(
             host=parsed_url.hostname,
@@ -222,5 +226,7 @@ class TestNPUDeepSeekV4FlashW8A88PGPQA(TestNpuAccuracyTestCaseBase):
             cache_report=True,
         )
         assert_metrics(self, metrics)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -22,7 +22,6 @@ import requests
 
 from sglang.benchmark.serving import run_benchmark
 from sglang.srt.utils import kill_process_tree
-from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -769,6 +768,12 @@ def run_mmlu_test(
     chunked_prefill_size=32,
 ):
     def workload_func(base_url, model):
+        # Imported lazily: in image mode the CI harness overlays only
+        # sglang/test/ascend onto the image, and images built before
+        # sglang.test.sgl_eval_utils existed must still be able to import the
+        # rest of this module (mmlu is the only user of the eval helper).
+        from sglang.test.sgl_eval_utils import run_sgl_eval
+
         # Run the eval
         args = SimpleNamespace(
             base_url=base_url,

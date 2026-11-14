@@ -23,7 +23,6 @@ from sglang.srt.mem_cache.kv.build import UnifiedBuildContext, build_kv_storage
 from sglang.srt.mem_cache.kv.decl import (
     DerivedPartDecl,
     MHAGeometry,
-    RequestPartDecl,
     StateGeometry,
     StateReplay,
     TensorPartDecl,
@@ -41,6 +40,7 @@ from sglang.test.token_demand import demand_windows, token_demand
 from sglang.test.tree_slots import window_evictable
 from sglang.test.unified_allocator_fixtures import (
     hold_band,
+    largest_take,
     release_band,
     setup_allocator_context,
 )
@@ -58,6 +58,12 @@ DRAFT_WINDOW = ComponentType.of("DRAFT_SWA")
 TARGET_WINDOW = ComponentType.of("WINDOW_16")
 
 
+# GDN speculative ReplaySSM: its ring and cursors are request memory.
+_GDN_SPEC_REPLAY = StateReplay(
+    decode=False, speculative=True, is_kda=False, cache_len=16, key_heads=1
+)
+
+
 class _RequestKV:
     def __init__(self):
         self.req_pool_idx = None
@@ -68,10 +74,22 @@ class _RequestKV:
         return self.req_pool_idx is not None
 
 
+class _StateRequestKV(_RequestKV):
+    def __init__(self):
+        super().__init__()
+        self.mamba_pool_idx = None
+        self.mamba_needs_clear = False
+        self.mamba_cow_src_index = None
+        self.mamba_ping_pong_track_buffer = None
+
+    @property
+    def holds_mamba(self):
+        return self.mamba_pool_idx is not None
+
+
 def _build(
     *,
     extra=(),
-    requests=(),
     derived=(),
     state=False,
     gamma=None,
@@ -127,7 +145,6 @@ def _build(
         decls,
         page_size=4,
         speculative_num_draft_tokens=gamma,
-        request_parts=requests,
         derived_parts=derived,
         fused_draft=fused_draft,
     )
@@ -651,7 +668,7 @@ class TestDeclaredParts(CustomTestCase):
                 cfg._unified_config_from_budget(1 << 20).max_total_num_tokens, 0
             )
 
-    def test_kda_spec_replay_pd_is_rejected_before_state_allocation(self):
+    def test_kda_spec_replay_keeps_pd_state_entries_alike(self):
         from unittest.mock import patch
 
         from sglang.srt.configs.mamba_utils import (
@@ -676,37 +693,47 @@ class TestDeclaredParts(CustomTestCase):
         )
         cfg.is_hybrid_swa = False
         cfg.use_mla_backend = True
-        cfg.model_config = SimpleNamespace(kv_lora_rank=8, qk_rope_head_dim=8)
+        cfg.model_config = SimpleNamespace(
+            kv_lora_rank=8,
+            qk_rope_head_dim=8,
+            hf_config=SimpleNamespace(architectures=["KimiLinearForCausalLM"]),
+        )
         cfg.kv_cache_dtype = torch.bfloat16
         cfg.layer_info = SimpleNamespace(start_layer=0, end_layer=2)
         cfg.hybrid_gdn_config = None
         cfg.hybrid_kda_config = cfg.mambaish_config
-        with (
-            patch(
-                "sglang.srt.mem_cache.kv_cache_configurator.mamba_cache_chunk_size",
-                return_value=4,
-            ),
-            get_context().override_server_args(
-                enable_linear_replayssm_spec=True,
-                disaggregation_mode="decode",
-                speculative_algorithm="DFLASH",
-            ),
-        ):
-            with self.assertRaisesRegex(ValueError, "different state entry layouts"):
-                cfg._kv_layer_decls()
 
-        with (
-            patch(
-                "sglang.srt.mem_cache.kv_cache_configurator.mamba_cache_chunk_size",
-                return_value=4,
-            ),
-            get_context().override_server_args(
-                enable_linear_replayssm_spec=True,
-                disaggregation_mode="null",
-                speculative_algorithm="DFLASH",
-            ),
-        ):
-            self.assertEqual(len(cfg._kv_layer_decls()), 2)
+        def plan_for(*, mode, replay_spec):
+            with (
+                patch(
+                    "sglang.srt.mem_cache.kv_cache_configurator.mamba_cache_chunk_size",
+                    return_value=4,
+                ),
+                get_context().override_server_args(
+                    enable_linear_replayssm_spec=replay_spec,
+                    disaggregation_mode=mode,
+                    speculative_algorithm="DFLASH" if replay_spec else None,
+                ),
+            ):
+                return plan_kv_storage(cfg._kv_layer_decls(), page_size=4)
+
+        # A PD prefill server runs no verify, so it declares no ring; its decode
+        # peer does. The ring is request memory, so the state entries they
+        # transfer are laid out alike.
+        prefill = plan_for(mode="prefill", replay_spec=False)
+        decode = plan_for(mode="decode", replay_spec=True)
+        (request,) = decode.requests()
+        self.assertIn("mamba.replayssm_rawv", {p.name for p in request.geometry.parts})
+        self.assertFalse(prefill.requests())
+        sent = prefill.sub_pool("mamba").spec
+        received = decode.sub_pool("mamba").spec
+        self.assertEqual(received.entry_bytes(), sent.entry_bytes())
+        self.assertEqual(received.entry_layout().offsets, sent.entry_layout().offsets)
+        self.assertEqual(
+            [(e.sub_pool, e.part, e.state_type) for e in decode.wire_entries()],
+            [(e.sub_pool, e.part, e.state_type) for e in prefill.wire_entries()],
+        )
+        self.assertNotIn(request.name, {e.sub_pool for e in decode.wire_entries()})
 
     def test_window_shares_do_not_limit_shared_arena_borrowing(self):
         """A long FULL history may borrow bytes released by its short window,
@@ -861,7 +888,11 @@ class TestDeclaredParts(CustomTestCase):
         )
         cfg.is_hybrid_swa = False
         cfg.use_mla_backend = True
-        cfg.model_config = SimpleNamespace(kv_lora_rank=8, qk_rope_head_dim=4)
+        cfg.model_config = SimpleNamespace(
+            kv_lora_rank=8,
+            qk_rope_head_dim=4,
+            hf_config=SimpleNamespace(architectures=["KimiLinearForCausalLM"]),
+        )
         cfg.kv_cache_dtype = torch.bfloat16
         cfg.layer_info = SimpleNamespace(start_layer=0, end_layer=2)
         cfg.hybrid_gdn_config = cfg.hybrid_kda_config = None
@@ -983,50 +1014,120 @@ class TestDeclaredParts(CustomTestCase):
         with self.assertRaises(RuntimeError):
             size_plan(plan, msgspec.structs.replace(inp, budget_bytes=16 * 1024 * 1024))
 
-    def test_each_request_part_resets_only_on_fresh_acquisition(self):
-        declarations = tuple(
-            RequestPartDecl(part=p)
-            for p in (
-                TensorPartDecl(name="cursor", shape=(), dtype=torch.int32),
-                TensorPartDecl(
-                    name="ring", shape=(4, 8), dtype=torch.float32, layer_ids=(1, 3)
-                ),
-                TensorPartDecl(
-                    name="context", shape=(3,), dtype=torch.int64, reset_value=7
-                ),
-            )
-        )
-        storage, _, sized = _build(requests=declarations)
-        memory = storage._request_memory
-        self.assertEqual(
-            memory.nbytes,
-            sum(t.bytes for t in sized.fixed if t.name != "request_table"),
-        )
-        req = SimpleNamespace(rid="r0", kv=_RequestKV())
+    def test_request_units_bind_with_rows_and_start_zeroed(self):
+        """A request sub-pool's unit is bound with its request row, zeroed when
+        a row binds it, kept while the row is held, and given back with it."""
+        storage, plan, _ = _build(state=True, gamma=3, replay=_GDN_SPEC_REPLAY)
+        (request,) = plan.requests()
+        allocator = storage.allocator
+        band = allocator.request_allocators[request.name]
+        ids = allocator.request_id_spaces()[request.name]
+        cursor = storage.view("mamba").replayssm_spec_write_pos
+        req = SimpleNamespace(rid="r0", kv=_StateRequestKV())
         row = storage.acquire([req])[0]
-        addresses = {n: t.data_ptr() for n, t in memory.tensors.items()}
-        for part in memory.parts:
-            tensor = memory.tensors[part.name].select(part.row_axis, row)
-            self.assertTrue(torch.all(tensor == part.reset_value))
-            tensor.fill_(19)
+        unit = int(ids.ids(torch.tensor([row]))[0])
+        self.assertGreater(unit, 0)
+        self.assertEqual(band.allocated_count(), 1)
+        self.assertEqual(int(cursor[unit]), 0)
+        cursor[unit] = 19
+        # A later chunk keeps its row, and with it its unit.
         self.assertEqual(storage.acquire([req]), [row])
-        for part in memory.parts:
-            self.assertTrue(
-                torch.all(memory.tensors[part.name].select(part.row_axis, row) == 19)
-            )
+        self.assertEqual(int(ids.ids(torch.tensor([row]))[0]), unit)
+        self.assertEqual(int(cursor[unit]), 19)
         storage.release_row(req)
-        other = SimpleNamespace(kv=_RequestKV())
-        self.assertEqual(storage.acquire([other]), [row])
-        for part in memory.parts:
-            self.assertTrue(
-                torch.all(
-                    memory.tensors[part.name].select(part.row_axis, row)
-                    == part.reset_value
-                )
-            )
-        self.assertEqual(
-            addresses, {n: t.data_ptr() for n, t in memory.tensors.items()}
+        self.assertEqual(band.allocated_count(), 0)
+        other = SimpleNamespace(rid="r1", kv=_StateRequestKV())
+        row = storage.acquire([other])[0]
+        unit = int(ids.ids(torch.tensor([row]))[0])
+        self.assertEqual(int(cursor[unit]), 0)
+
+    def test_request_usage_counts_rows_past_a_larger_state_entry(self):
+        """Usage lists every sub-pool, the request sub-pool included, though
+        views and the prefix tree's components leave it out; its usage is the
+        request rows bound and free. The arena's padding sink spans the largest
+        unit, so with a state entry larger than a request entry the request
+        band's first physical unit lies past 1. That padding is physical: the
+        free request rows are still the request table's rows past its padding
+        row 0."""
+        big = TensorPartDecl(
+            name="wide", shape=(512,), dtype=torch.float32, layer_ids=(1, 2)
         )
+        storage, plan, _ = _build(
+            extra=(big,), state=True, gamma=3, replay=_GDN_SPEC_REPLAY
+        )
+        (request,) = plan.requests()
+        (snapshot, *_) = storage.allocator._stage_snapshots()
+        self.assertGreater(snapshot.band(request.name).min_page, 1)
+        self.assertEqual(
+            [u.name for u in storage.usage()],
+            [s.name for s in plan.owner_first()],
+        )
+
+        def request_usage():
+            (usage,) = [u for u in storage.usage() if u.metrics == "request"]
+            self.assertEqual((usage.name, usage.label), (request.name, "request"))
+            return usage.capacity, usage.available
+
+        rows = storage.requests.available_size()
+        self.assertGreater(rows, 0)
+        self.assertEqual(request_usage(), (rows, rows))
+        req = SimpleNamespace(rid="r0", kv=_StateRequestKV())
+        storage.acquire([req])
+        self.assertEqual(request_usage(), (rows, rows - 1))
+        storage.release_row(req)
+        self.assertEqual(request_usage(), (rows, rows))
+
+    def test_request_rows_are_priced_with_the_other_units(self):
+        """A demand's request rows take a unit of every request sub-pool, priced
+        in the same layout as its tokens and state slots; nothing evictable
+        frees one."""
+        storage, plan, _ = _build(state=True, gamma=3, replay=_GDN_SPEC_REPLAY)
+        allocator = storage.allocator
+        (request,) = plan.requests()
+        demand = KVDemand(full_tokens=4, state_slots=1, request_rows=2)
+        demands = allocator.page_demands(demand)
+        self.assertEqual(demands[request.name], 2)
+        self.assertEqual(demands["mamba"], 1)
+        units, reclaim = allocator._admission_units(
+            demand, {request.name: 5}, empty_pool=False
+        )
+        self.assertEqual(units[request.name], 2)
+        self.assertEqual(reclaim[request.name], 0)
+
+    def test_reclaim_guard_prices_request_rows(self):
+        """The prefix tree evicts only for a demand that fits once everything
+        evictable is gone: that check prices the request rows the demand binds,
+        as the fit checks that stop the eviction do. Without them, a demand
+        whose state alone fits but whose request units do not evicts every
+        cached entry and still fails."""
+        from unittest.mock import MagicMock, patch
+
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        storage, plan, _ = _build(state=True, gamma=3, replay=_GDN_SPEC_REPLAY)
+        allocator = storage.allocator
+        (request,) = plan.requests()
+        cache = object.__new__(UnifiedRadixCache)
+        cache.token_to_kv_pool_allocator = allocator
+        cache.full_evictable_size = lambda: 0
+        cache.window_evictable_size = lambda name: 0
+        cache.mamba_evictable_size = lambda: 0
+        cache.supports_mamba = lambda: True
+        cache.evict_until = MagicMock()
+        demand = cache._units_demand({"mamba": 1, request.name: 1})
+        self.assertEqual((demand.state_slots, demand.request_rows), (1, 1))
+        priced = []
+        with (
+            patch.object(allocator, "fits_after_frees", return_value=False),
+            patch.object(
+                allocator,
+                "admits",
+                side_effect=lambda d, **kw: priced.append(d) or False,
+            ),
+        ):
+            cache._reclaim({"mamba": 1, request.name: 1})
+        self.assertEqual(priced[0].request_rows, 1)
+        cache.evict_until.assert_not_called()
 
     def test_total_budget_charges_fixed_storage_once(self):
         storage, plan, _ = _build(state=True, gamma=3)
@@ -1409,6 +1510,9 @@ class TestDeclaredParts(CustomTestCase):
         from unittest.mock import patch
 
         from sglang.srt.configs.qwen3_next import Qwen3NextConfig
+        from sglang.srt.layers.attention.mamba.mamba2_metadata import (
+            ForwardStateSlots,
+        )
         from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
         from sglang.srt.model_executor.forward_mode import ForwardMode
         from sglang.srt.speculative.spec_utils import commit_mamba_states_after_verify
@@ -1422,7 +1526,7 @@ class TestDeclaredParts(CustomTestCase):
                         decode=False,
                         speculative=True,
                         is_kda=mode == "kda_fold",
-                        cache_len=8,
+                        cache_len=16,
                         key_heads=1,
                     ),
                 )
@@ -1437,9 +1541,10 @@ class TestDeclaredParts(CustomTestCase):
                 physical_active = a.mamba_allocator.ids.translate(active)
                 physical_track = a.mamba_allocator.ids.translate(track)
                 self.assertFalse(torch.equal(active, physical_active))
-                req.req_index_to_mamba_index_mapping[1] = active.int()[0]
+                (row,) = storage.take_rows(1)
+                req.req_index_to_mamba_index_mapping[row] = active.int()[0]
                 batch = SimpleNamespace(
-                    req_pool_indices=torch.tensor([1]),
+                    req_pool_indices=torch.tensor([row]),
                     forward_mode=ForwardMode.TARGET_VERIFY,
                     mamba_track_indices=track,
                     seq_lens=torch.tensor([15]),
@@ -1460,16 +1565,40 @@ class TestDeclaredParts(CustomTestCase):
                         device="cpu",
                     ),
                 )
-                outputs, conv_destinations = [], []
+                # The verify forward's metadata preparation resolved its slots.
+                state_ids = runner.runner_ids.state_ids(req.state_sub_pool)
+                forward_slots = ForwardStateSlots(
+                    state_ids.ids(req.get_mamba_indices(batch.req_pool_indices)),
+                    state_ids.ids(track),
+                    runner.runner_ids.request_ids().ids(batch.req_pool_indices),
+                )
+                runner.attn_backend = SimpleNamespace(
+                    forward_state_slots=lambda n, track_ids: forward_slots
+                )
+                # The row's ring unit is neither its row nor its state slot; after
+                # the forward resolved it, the row is rebound to another unit,
+                # which a commit reading the live table would pick up.
+                ring_ids = runner.runner_ids.request_ids()
+                resolved = forward_slots.ring
+                self.assertNotIn(int(resolved[0]), (row, int(physical_active[0])))
+                storage.release_rows([row])
+                spare = row + 1
+                self.assertTrue(a.alloc_request_rows(torch.tensor([spare])))
+                self.assertEqual(storage.take_rows(1), [row])
+                live = ring_ids.ids(torch.tensor([row]))
+                self.assertFalse(torch.equal(live, resolved))
+                ring_keyword = {
+                    "gdn_circular": "replay_indices",
+                    "kda_fold": "ring_indices",
+                }
+                outputs, conv_destinations, ring_rows = [], [], []
 
                 def commit(**kw):
                     outputs.append(
                         (kw["state_batch_indices"], kw["mamba_track_indices"])
                     )
-                    if "replay_indices" in kw:
-                        torch.testing.assert_close(
-                            kw["replay_indices"], batch.req_pool_indices
-                        )
+                    if mode in ring_keyword:
+                        ring_rows.append(kw[ring_keyword[mode]])
 
                 def scatter(*args):
                     conv_destinations.append(args[2])
@@ -1501,6 +1630,11 @@ class TestDeclaredParts(CustomTestCase):
                         prepared_step_indices=(torch.tensor([1]), torch.tensor([0])),
                     )
                 self.assertEqual(len(outputs), 1)
+                if mode in ring_keyword:
+                    # The ring rows the forward resolved, not the table's.
+                    torch.testing.assert_close(
+                        ring_rows[0], resolved, check_dtype=False
+                    )
                 torch.testing.assert_close(
                     outputs[0][0], physical_active, check_dtype=False
                 )
@@ -1521,7 +1655,62 @@ class TestDeclaredParts(CustomTestCase):
                     check_dtype=False,
                 )
 
-    def test_replay_algorithm_guard_covers_unified_and_static_construction(self):
+    def test_direct_kda_commit_uses_the_resolved_ring_rows(self):
+        """DSPARK and DFLASH commit KDA through the hybrid backend directly: it
+        writes the ring rows the forward resolved, not what the request table
+        names when the commit runs."""
+        from unittest.mock import patch
+
+        from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+            HybridLinearAttnBackend,
+        )
+        from sglang.srt.layers.attention.mamba.mamba2_metadata import (
+            ForwardStateSlots,
+        )
+
+        storage, plan, _ = _build(
+            state=True,
+            gamma=4,
+            replay=StateReplay(
+                decode=False, speculative=True, is_kda=True, cache_len=8, key_heads=1
+            ),
+        )
+        a = storage.allocator
+        a.state.bind_routes(a.get_kvcache().layer_router)
+        (request,) = plan.requests()
+        ring_ids = a.request_id_spaces()[request.name]
+        (row,) = storage.take_rows(1)
+        resolved = ring_ids.ids(torch.tensor([row]))
+        slots = a.alloc_state_slots(1)
+        working = a.mamba_allocator.ids.translate(slots)
+        forward_slots = ForwardStateSlots(working, None, resolved)
+        # The row is rebound to another unit before the commit runs.
+        storage.release_rows([row])
+        self.assertTrue(a.alloc_request_rows(torch.tensor([row + 1])))
+        self.assertEqual(storage.take_rows(1), [row])
+        self.assertFalse(torch.equal(ring_ids.ids(torch.tensor([row])), resolved))
+
+        hybrid = object.__new__(HybridLinearAttnBackend)
+        hybrid.linear_attn_backend = SimpleNamespace(state_pool=a.state.pool)
+        with patch(
+            "sglang.kernels.ops.attention.linear.kda_replayssm_spec_decode."
+            "commit_kda_replayssm_after_verify"
+        ) as commit:
+            hybrid.update_mamba_state_after_mtp_verify(
+                torch.tensor([1]),
+                None,
+                None,
+                None,
+                req_pool_indices=torch.tensor([row]),
+                state_slots=forward_slots,
+            )
+        kwargs = commit.call_args.kwargs
+        torch.testing.assert_close(kwargs["ring_indices"], resolved, check_dtype=False)
+        torch.testing.assert_close(
+            kwargs["state_batch_indices"], working, check_dtype=False
+        )
+
+    def test_gdn_replay_spec_declares_parts_for_every_algorithm(self):
         from sglang.srt.configs.qwen3_next import Qwen3NextConfig
         from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
         from sglang.srt.runtime_context import get_exec, get_spec
@@ -1533,10 +1722,14 @@ class TestDeclaredParts(CustomTestCase):
         cfg.mambaish_config = cfg.hybrid_gdn_config = hf
         cfg.is_hybrid_swa = False
         cfg.use_mla_backend = True
-        cfg.model_config = SimpleNamespace(kv_lora_rank=8, qk_rope_head_dim=4)
+        cfg.model_config = SimpleNamespace(
+            kv_lora_rank=8,
+            qk_rope_head_dim=4,
+            hf_config=SimpleNamespace(architectures=["KimiLinearForCausalLM"]),
+        )
         cfg.kv_cache_dtype = torch.bfloat16
         cfg.layer_info = SimpleNamespace(start_layer=0, end_layer=2)
-        for algorithm in ("DFLASH", "DSPARK"):
+        for algorithm in ("DFLASH", "DSPARK", "EAGLE"):
             with (
                 self.subTest(algorithm=algorithm),
                 get_exec().mamba.override(enable_linear_replayssm_spec=True),
@@ -1544,20 +1737,7 @@ class TestDeclaredParts(CustomTestCase):
                     speculative_algorithm=algorithm, speculative_num_draft_tokens=4
                 ),
             ):
-                with self.assertRaisesRegex(ValueError, "requires a KDA"):
-                    cfg._kv_layer_decls()
-                with self.assertRaisesRegex(ValueError, "requires a KDA"):
-                    cfg._build_hybrid_req_pool(max_num_reqs=3, extra_max_context_len=4)
-                cfg.hybrid_kda_config = object()
-                cfg._validate_replay_spec_algorithm()
-                cfg.hybrid_kda_config = None
-        with (
-            get_exec().mamba.override(enable_linear_replayssm_spec=True),
-            get_spec().override(
-                speculative_algorithm="EAGLE", speculative_num_draft_tokens=4
-            ),
-        ):
-            self.assertEqual(len(cfg._kv_layer_decls()), 2)
+                self.assertEqual(len(cfg._kv_layer_decls()), 2)
 
     def test_full_cap_is_enforced_on_live_allocations(self):
         storage, _, _ = _build()
@@ -1594,77 +1774,67 @@ class TestDeclaredParts(CustomTestCase):
         self.assertTrue(torch.all(ngram.intermediate_context == 17))
         self.assertEqual(len(plan.scratch), 4)
 
-    def test_gdn_replay_request_parts_reset_on_row_reuse(self):
+    def test_gdn_spec_ring_is_request_memory(self):
+        """The GDN speculative ring and its cursors form the request sub-pool: a
+        float of the chain the prefix tree, host stores and PD peers never see,
+        and no state slot (so no checkpoint) carries them."""
+        storage, plan, _ = _build(state=True, gamma=3, replay=_GDN_SPEC_REPLAY)
+        view = storage.view("mamba")
+        self.assertIsNone(view.mamba_cache.intermediate_ssm)
+        (request,) = plan.requests()
+        self.assertEqual(request.spec.grow_direction, "float")
+        self.assertEqual(
+            {p.name for p in request.geometry.parts},
+            {
+                f"mamba.{name}"
+                for name in (
+                    "replayssm_d",
+                    "replayssm_k",
+                    "replayssm_g",
+                    "replayssm_rawv",
+                    "replayssm_rawk",
+                    "replayssm_spec_write_pos",
+                    "replayssm_cache_base",
+                    "replayssm_is_flush",
+                )
+            },
+        )
+        self.assertNotIn(request.name, storage.sub_pool_names())
+        self.assertNotIn(request, plan.drive_order())
+        self.assertNotIn(request.name, {e.sub_pool for e in plan.wire_entries()})
+        self.assertTrue(view.replayssm_request_ring)
+        self.assertEqual(view._checkpoint_extra_buffers, ())
+        self.assertNotIn(
+            "replayssm_d", {p.name for p in plan.sub_pool("mamba").spec.extra_parts}
+        )
+        # The cursors sit one per unit in the request entries.
+        entry = request.spec.entry_bytes()
+        self.assertEqual(view.replayssm_spec_write_pos.stride(0) * 4, entry)
+        self.assertEqual(view.replayssm_is_flush.stride(0), entry)
+
+    def test_decode_replay_records_and_cursor_move_together(self):
+        """The decode ring and its cursor lag the slot's state, so they are the
+        slot's: copied, cleared and backed up with its entry."""
         storage, plan, _ = _build(
             state=True,
-            gamma=3,
             replay=StateReplay(
-                decode=False,
-                speculative=True,
-                is_kda=False,
-                cache_len=8,
-                key_heads=1,
+                decode=True, speculative=False, is_kda=False, cache_len=8, key_heads=1
             ),
         )
         view = storage.view("mamba")
-        self.assertIsNone(view.mamba_cache.intermediate_ssm)
-        self.assertEqual(len(plan.request_parts), 8)
-        row = storage.take_rows(1)[0]
-        for part in storage._request_memory.parts:
-            with self.subTest(part=part.name):
-                storage._request_memory.tensors[part.name].select(
-                    part.row_axis, row
-                ).fill_(23)
-        storage.release_rows([row])
-        self.assertEqual(storage.take_rows(1), [row])
-        for part in storage._request_memory.parts:
-            with self.subTest(part=part.name):
-                self.assertTrue(
-                    torch.all(
-                        storage._request_memory.tensors[part.name].select(
-                            part.row_axis, row
-                        )
-                        == part.reset_value
-                    )
-                )
-        self.assertIs(
-            view.replayssm_spec_write_pos,
-            storage._request_memory.tensors["mamba.replayssm_spec_write_pos"],
-        )
-        self.assertEqual(view._checkpoint_extra_buffers, ())
-
-    def test_replay_state_records_and_cursor_move_together(self):
-        for speculative in (False, True):
-            with self.subTest(speculative=speculative):
-                storage, plan, _ = _build(
-                    state=True,
-                    gamma=3 if speculative else None,
-                    replay=StateReplay(
-                        decode=True,
-                        speculative=speculative,
-                        is_kda=speculative,
-                        cache_len=8,
-                        key_heads=1,
-                    ),
-                )
-                view = storage.view("mamba")
-                self.assertFalse(plan.request_parts)
-                self.assertEqual(len(view.extra_parts), 7 if speculative else 4)
-                for part in view.extra_parts:
-                    view.extra_views[part.name].select(part.row_axis, 3).fill_(5)
-                view.copy_from(torch.tensor([3]), torch.tensor([7]))
-                saved = view.get_cpu_copy(torch.tensor([7]))
-                view.clear_slots(torch.tensor([7]))
-                view.load_cpu_copy(saved, torch.tensor([7]))
-                for part in view.extra_parts:
-                    self.assertTrue(
-                        torch.all(
-                            view.extra_views[part.name].select(part.row_axis, 7) == 5
-                        )
-                    )
-                self.assertIs(
-                    view.replayssm_write_pos, view.extra_views["replayssm_write_pos"]
-                )
+        self.assertFalse(plan.requests())
+        self.assertEqual(len(view.extra_parts), 4)
+        for part in view.extra_parts:
+            view.extra_views[part.name].select(part.row_axis, 3).fill_(5)
+        view.copy_from(torch.tensor([3]), torch.tensor([7]))
+        saved = view.get_cpu_copy(torch.tensor([7]))
+        view.clear_slots(torch.tensor([7]))
+        view.load_cpu_copy(saved, torch.tensor([7]))
+        for part in view.extra_parts:
+            self.assertTrue(
+                torch.all(view.extra_views[part.name].select(part.row_axis, 7) == 5)
+            )
+        self.assertIs(view.replayssm_write_pos, view.extra_views["replayssm_write_pos"])
 
     def test_window_resume_keeps_the_handoff_boundary(self):
         storage, _, _ = _build()
@@ -1739,7 +1909,7 @@ class TestDeclaredParts(CustomTestCase):
             ),
         )
         allocator = storage.allocator
-        available = allocator.available_size()
+        available = largest_take(allocator)
         ids = allocator.alloc(available)
         self.assertIsNotNone(ids)
         self.assertIsNone(allocator.alloc(4))
@@ -1751,7 +1921,7 @@ class TestDeclaredParts(CustomTestCase):
         allocator.load_cpu_copy(saved, ids)
         self.assertTrue(torch.all(view.k_buffer[0][physical] == 7))
         allocator.free(ids)
-        self.assertEqual(allocator.available_size(), available)
+        self.assertEqual(largest_take(allocator), available)
         self.assertEqual(allocator.verify_byte_accounting(), [])
         self.assertEqual(
             storage.plan.tree_slots()[0].component,
@@ -2056,14 +2226,16 @@ class TestDeclaredParts(CustomTestCase):
         )
         self.assertTrue(a.admits(KVDemand(400, demand_windows(a, 400, 16))))
         self.assertFalse(a.admits(KVDemand(400, demand_windows(a, 400, 400))))
-        full_budget = a.full_available_size()
+        full_budget = largest_take(a, a.full_attn_allocator.sub_pool_name)
         swa_budget = a.conserve_swa_available_size()
+        # Over a shared memory the budgets count from zero: holding nothing
+        # back, the request fits.
         self.assertTrue(
             a.prealloc_fits(
                 token_demand(a, 400, 16),
                 evictable=evictable_by_sub_pool(cache, a),
-                full_budget_tokens=full_budget,
-                window_budget_tokens={a.target_window_pool(): swa_budget},
+                full_budget_tokens=0,
+                window_budget_tokens={a.target_window_pool(): 0},
             )
         )
         # Pending requests and decode headroom are deducted from these budgets.
@@ -2083,10 +2255,8 @@ class TestDeclaredParts(CustomTestCase):
                     a.prealloc_fits(
                         token_demand(a, 400, 16),
                         evictable=evictable_by_sub_pool(cache, a),
-                        full_budget_tokens=full_budget - full_reserved,
-                        window_budget_tokens={
-                            a.target_window_pool(): swa_budget - swa_reserved
-                        },
+                        full_budget_tokens=-full_reserved,
+                        window_budget_tokens={a.target_window_pool(): -swa_reserved},
                     ),
                     fits,
                 )
@@ -2616,10 +2786,13 @@ class TestDeclaredParts(CustomTestCase):
         queue = object.__new__(DecodePreallocQueue)
         queue.tree_cache = cache
         queue.token_to_kv_pool_allocator = a
-        full_budget = a.full_available_size() + cache.full_evictable_size()
-        swa_budget = a.swa_available_size() + cache.window_evictable_size(
-            a.swa_attn_allocator.sub_pool_name
+        full_budget = (
+            largest_take(a, a.full_attn_allocator.sub_pool_name)
+            + cache.full_evictable_size()
         )
+        swa_budget = largest_take(
+            a, a.swa_attn_allocator.sub_pool_name
+        ) + cache.window_evictable_size(a.swa_attn_allocator.sub_pool_name)
         from sglang.srt.mem_cache.base_prefix_cache import evictable_by_sub_pool
 
         evictable = evictable_by_sub_pool(cache, a)
@@ -2630,11 +2803,11 @@ class TestDeclaredParts(CustomTestCase):
             # requests: charged beside this one in one admission question,
             # where reclaimed bytes of either side may serve it.
             held_full = (
-                a.full_available_size()
+                largest_take(a, a.full_attn_allocator.sub_pool_name)
                 + evictable[a.full_attn_allocator.sub_pool_name]
                 - full
             )
-            held_swa = a.window_available_size(target) + evictable[target] - swa
+            held_swa = largest_take(a, target) + evictable[target] - swa
             demand = token_demand(a, need, need)
             return a.admits(
                 KVDemand(
@@ -2656,8 +2829,9 @@ class TestDeclaredParts(CustomTestCase):
             self.assertEqual(
                 queue._prealloc_reservation_fits(
                     token_demand(a, need, need),
-                    full_allocatable_tokens=full,
-                    window_allocatable_tokens={target: swa},
+                    # Counted from zero: what each budget holds back.
+                    full_allocatable_tokens=full - full_budget,
+                    window_allocatable_tokens={target: swa - swa_budget},
                 ),
                 jointly(full, swa),
             )
@@ -3565,11 +3739,10 @@ class TestDeclaredParts(CustomTestCase):
                             a.conserve_swa_available_size(),
                             (window_capacity - 32) * factor,
                         )
-                        self.assertGreater(a.swa_available_size(), 0)
-                        full, window = a.swa_capacity_and_available(
-                            full_capacity=sized.full_tokens,
-                            swa_capacity=sized.window_tokens,
+                        self.assertGreater(
+                            largest_take(a, a.swa_attn_allocator.sub_pool_name), 0
                         )
+                        window = a.usage()[a.swa_attn_allocator.sub_pool_name]
                         self.assertEqual(window[0] - window[1], 32 * factor)
                         a.free(ids)
                         self.assertEqual(
@@ -3656,7 +3829,7 @@ class TestDeclaredParts(CustomTestCase):
                 )
                 self.assertEqual(storage.requests.size, sized.max_running_requests)
 
-    def test_retraction_carries_whole_entries_derived_pages_and_request_parts(self):
+    def test_retraction_carries_whole_entries_and_derived_pages(self):
         from unittest.mock import patch
 
         from torch.utils._python_dispatch import TorchDispatchMode
@@ -3716,19 +3889,10 @@ class TestDeclaredParts(CustomTestCase):
                             ),
                         ),
                     ),
-                    requests=(
-                        RequestPartDecl(
-                            part=TensorPartDecl(
-                                name="pending", shape=(3,), dtype=torch.int32
-                            )
-                        ),
-                    ),
                 )
                 allocator = storage.allocator
                 source = allocator.alloc(16)
                 state_ids = allocator.alloc_state_slots(1) if with_state else None
-                (request_row,) = storage.take_rows(1)
-                storage.request_memory.tensors["pending"][request_row].fill_(97)
                 original = {}
                 for n, band in enumerate(allocator.members):
                     ids = (
@@ -3754,12 +3918,11 @@ class TestDeclaredParts(CustomTestCase):
                     BoundedGather(),
                 ):
                     saved = allocator.get_cpu_copy(
-                        source, mamba_indices=state_ids, req_pool_index=request_row
+                        source, mamba_indices=state_ids, req_pool_index=None
                     )
                 # A distinct allocation changes both virtual and physical rows.
                 destination = allocator.alloc(16)
                 new_state = allocator.alloc_state_slots(1) if with_state else None
-                (new_row,) = storage.take_rows(1)
                 if not with_state:
                     allocator.free_swa_segment(destination[:4], start_pos=0)
                 with (
@@ -3774,7 +3937,7 @@ class TestDeclaredParts(CustomTestCase):
                         saved,
                         destination,
                         mamba_indices=new_state,
-                        req_pool_index=new_row,
+                        req_pool_index=None,
                     )
                 for band in allocator.members:
                     ids = (
@@ -3794,11 +3957,28 @@ class TestDeclaredParts(CustomTestCase):
                     destination[::4] // 4
                 ]
                 self.assertTrue(torch.all(blob[:, pages] == 83))
-                self.assertTrue(
-                    torch.all(storage.request_memory.tensors["pending"][new_row] == 97)
-                )
 
-    def test_sparse_page_regions_and_request_ring_reuse(self):
+    def test_retraction_carries_request_units(self):
+        """A retracted request's request-sub-pool unit is backed up by its row
+        and restored into the unit its new row binds."""
+        storage, plan, _ = _build(state=True, gamma=3, replay=_GDN_SPEC_REPLAY)
+        (request,) = plan.requests()
+        allocator = storage.allocator
+        ids = allocator.request_id_spaces()[request.name]
+        entries = allocator.arena.entries(request.name)
+        source = allocator.alloc(4)
+        (row,) = storage.take_rows(1)
+        entries[int(ids.ids(torch.tensor([row]))[0])] = 97
+        saved = allocator.get_cpu_copy(source, req_pool_index=row)
+        storage.release_rows([row])
+        destination = allocator.alloc(4)
+        (other,) = [r for r in storage.take_rows(2) if r != row]
+        unit = int(ids.ids(torch.tensor([other]))[0])
+        self.assertTrue(torch.all(entries[unit] == 0))
+        allocator.load_cpu_copy(saved, destination, req_pool_index=other)
+        self.assertTrue(torch.all(entries[unit] == 97))
+
+    def test_sparse_page_regions(self):
         # Packed DSA pages put all 128-byte keys before the 4-byte scales;
         # QSA pages contain two compressed K rows. Neither is token-interleaved.
         dsa = TensorPartDecl(
@@ -3811,36 +3991,16 @@ class TestDeclaredParts(CustomTestCase):
             layer_ids=(0, 4),
             slice_axis=1,
         )
-        tails = tuple(
-            RequestPartDecl(
-                part=TensorPartDecl(
-                    name=name, shape=(7, 128), dtype=torch.bfloat16, layer_ids=(0, 4)
-                ),
-                wire="dsa_tail",
-            )
-            for name in ("tail_k", "tail_score")
-        )
-        pending = RequestPartDecl(
-            part=TensorPartDecl(
-                name="pending", shape=(2, 2, 8), dtype=torch.bfloat16, layer_ids=(0, 4)
-            ),
-            wire="qsa_pending",
-        )
-        rope = RequestPartDecl(
-            part=TensorPartDecl(name="rope", shape=(2, 3), dtype=torch.int64),
-            wire="qsa_pending",
-        )
         storage, plan, sized = _build(
             derived=(
                 DerivedPartDecl(sub_pool="full", part=dsa, wire="dsa"),
                 DerivedPartDecl(sub_pool="full", part=qsa, wire="qsa_compressed"),
             ),
-            requests=(*tails, pending, rope),
         )
         wires = plan.wire_entries()
         self.assertEqual(
             [e.state_type for e in wires],
-            ["swa", "dsa", "dsa_tail", "qsa_pending", "qsa_compressed"],
+            ["swa", "dsa", "qsa_compressed"],
         )
         self.assertEqual(storage.regions("full", part="dsa").item_lens, (528, 528))
         region = storage.regions("full", part="qsa_compressed")
@@ -3848,44 +4008,12 @@ class TestDeclaredParts(CustomTestCase):
         self.assertEqual(region.layer_ids, (0, 4))
         self.assertEqual(region.dim_per_tensor, (2, 2))
         self.assertEqual(region.slice_outer_counts, (2, 2))
-        self.assertEqual(
-            storage.regions("full", part="dsa_tail").item_lens, (1792,) * 4
-        )
-        self.assertEqual(
-            storage.regions("full", part="qsa_pending").item_lens, (64, 64, 48)
-        )
         arena = storage.allocator.arena
         for tensor in arena.page_parts["full"].tensors.values():
             tensor[:, 3].fill_(7)
         arena.move_units("full", torch.tensor([9]), torch.tensor([3]))
         for tensor in arena.page_parts["full"].tensors.values():
             self.assertTrue(torch.all(tensor[:, 9] == 7))
-        for declared in plan.request_parts:
-            storage._request_memory.tensors[declared.part.name].fill_(9)
-        row = storage.take_rows(1)[0]
-        for declared in plan.request_parts:
-            part = declared.part
-            tensor = storage._request_memory.tensors[part.name]
-            self.assertTrue(
-                torch.all(tensor.select(part.row_axis, row) == part.reset_value)
-            )
-        storage.release_rows([row])
-        for declared in plan.request_parts:
-            part = declared.part
-            storage._request_memory.tensors[part.name].select(part.row_axis, row).fill_(
-                11
-            )
-        self.assertEqual(storage.take_rows(1), [row])
-        for declared in plan.request_parts:
-            part = declared.part
-            self.assertTrue(
-                torch.all(
-                    storage._request_memory.tensors[part.name].select(
-                        part.row_axis, row
-                    )
-                    == part.reset_value
-                )
-            )
 
     def test_derived_page_blobs_move_with_physical_pages(self):
         part = TensorPartDecl(
