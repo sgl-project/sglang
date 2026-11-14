@@ -1,7 +1,7 @@
 import json
 import logging
 import re
-from typing import Any, Dict, List
+from typing import Any, Dict, Iterator, List
 
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
@@ -74,8 +74,9 @@ class Step3Detector(BaseFormatDetector):
             r'<steptml:invoke name="([^"]+)">(.+?)</steptml:invoke>', re.DOTALL
         )
         self.param_regex = re.compile(
-            r'<steptml:parameter name="([^"]+)">([^<]*)</steptml:parameter>', re.DOTALL
+            r'<steptml:parameter name="([^"]+)">(.*?)</steptml:parameter>', re.DOTALL
         )
+        self.param_end_tag = "</steptml:parameter>"
 
         # Streaming state variables
         self._in_tool_block: bool = False
@@ -89,6 +90,14 @@ class Step3Detector(BaseFormatDetector):
         """Check if the text contains a Step3 format tool call."""
         return self.bot_token in text
 
+    def _find_complete_params(self, text: str) -> Iterator[re.Match]:
+        # Every match ends at a closing tag, so the scan stops at the last one;
+        # an unclosed opening tag would otherwise scan to the end of the text.
+        end = text.rfind(self.param_end_tag)
+        if end == -1:
+            return iter(())
+        return self.param_regex.finditer(text, endpos=end + len(self.param_end_tag))
+
     def _parse_steptml_invoke(
         self, text: str, tools: List[Tool] = None
     ) -> tuple[str, dict]:
@@ -101,7 +110,7 @@ class Step3Detector(BaseFormatDetector):
         params_text = invoke_match.group(2)
 
         params = {}
-        for param_match in self.param_regex.finditer(params_text):
+        for param_match in self._find_complete_params(params_text):
             param_name = param_match.group(1)
             param_value = param_match.group(2).strip()
 
@@ -318,7 +327,7 @@ class Step3Detector(BaseFormatDetector):
         if self._function_name_sent:
             # Extract all complete parameters
             new_params = {}
-            for param_match in self.param_regex.finditer(invoke_part):
+            for param_match in self._find_complete_params(invoke_part):
                 param_name = param_match.group(1)
                 param_value = param_match.group(2).strip()
 
