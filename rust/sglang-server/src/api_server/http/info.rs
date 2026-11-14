@@ -631,6 +631,7 @@ mod tests {
             "tp_size": 4,
             "max_total_num_tokens": 1,
             "launch_command": "launch --tp-size 4",
+            "instance_id": "stale-launch-instance-id",
         });
         // Gathered in no particular order; published by rank.
         let listeners = ["http://10.0.0.1:30000", "http://[fd00::2]:30000"];
@@ -760,12 +761,13 @@ mod tests {
             .map(String::as_str)
             .collect();
         assert_eq!(
-            keys[..5],
+            keys[..6],
             [
                 "model_path",
                 "tp_size",
                 "max_total_num_tokens",
                 "launch_command",
+                "instance_id",
                 "served_model_name"
             ]
         );
@@ -787,6 +789,14 @@ mod tests {
         assert_eq!(body["max_context_length"], 4096);
         assert_eq!(body["max_total_num_tokens"], 8192);
         assert_eq!(body["version"], "1.2.3");
+        let instance_id = body["instance_id"]
+            .as_str()
+            .expect("HTTP /server_info must carry typed instance_id");
+        assert_ne!(instance_id, "stale-launch-instance-id");
+        assert_eq!(
+            uuid::Uuid::parse_str(instance_id).unwrap().get_version(),
+            Some(uuid::Version::Random)
+        );
         assert_eq!(body["frontend"], "rust");
         assert_eq!(
             body["internal_states"][0]["rust_mm_transport"]["inline_features"],

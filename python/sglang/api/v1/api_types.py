@@ -786,6 +786,7 @@ class GetServerInfoResponse(msgspec.Struct, kw_only=True, frozen=True):
     allow_auto_truncate: bool = False
     skip_tokenizer_init: bool = False
     num_reserved_tokens: int = 0
+    instance_id: str = ""
 
     @classmethod
     def from_json_value(cls, value: Any) -> "GetServerInfoResponse":
@@ -2479,6 +2480,8 @@ def decode_GetServerInfoResponse(value: Any) -> GetServerInfoResponse:
             kw["skip_tokenizer_init"] = _expect_bool(x, expected="a boolean")
         elif key == "num_reserved_tokens":
             kw["num_reserved_tokens"] = _expect_uint(x, expected="u64")
+        elif key == "instance_id":
+            kw["instance_id"] = _expect_str(x, expected="a string")
     return GetServerInfoResponse(**kw)
 
 
@@ -2502,6 +2505,7 @@ def encode_GetServerInfoResponse(v: GetServerInfoResponse) -> Dict[str, Any]:
     d["allow_auto_truncate"] = v.allow_auto_truncate
     d["skip_tokenizer_init"] = v.skip_tokenizer_init
     d["num_reserved_tokens"] = v.num_reserved_tokens
+    d["instance_id"] = v.instance_id
     return d
 
 

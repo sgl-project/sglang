@@ -79,6 +79,7 @@ impl CoreHandle {
             max_total_num_tokens: metadata.max_total_num_tokens,
             num_reserved_tokens: metadata.num_reserved_tokens,
             version: metadata.version.clone(),
+            instance_id: self.inner.instance_id.clone(),
             frontend: "rust",
             startup_time,
             internal_states,
@@ -128,6 +129,7 @@ mod tests {
     use super::*;
     use crate::api_server::handlers::test_utils::*;
     use crate::api_server::handlers::{CoreConfig, CoreMetadata};
+    use crate::tokenizer_manager::wiring::TmEvent;
 
     #[test]
     fn list_models_returns_static_cards_without_runtime_work() {
@@ -241,5 +243,94 @@ mod tests {
             answer_local_control(&intake_rx, envelope(serde_json::json!(1.5))),
         );
         info
+    }
+
+    fn empty_internal_state_reply() -> bytes::Bytes {
+        bytes::Bytes::from(
+            rmp_serde::to_vec_named(&serde_json::json!({ "internal_state": {} })).unwrap(),
+        )
+    }
+
+    fn assert_uuid_v4(id: &str) {
+        let uuid = uuid::Uuid::parse_str(id).expect("instance_id must parse as a UUID");
+        assert_eq!(uuid.get_version(), Some(uuid::Version::Random));
+    }
+
+    fn handle_with_metadata(metadata: CoreMetadata) -> (CoreHandle, flume::Receiver<TmEvent>) {
+        let (intake_tx, intake_rx) = flume::unbounded();
+        let (abort_tx, _abort_rx) = flume::unbounded();
+        let handle = CoreHandle::new(
+            intake_tx,
+            abort_tx,
+            CoreConfig {
+                response_capacity: 8,
+                response_activity: Default::default(),
+                startup_ready: true,
+                is_disaggregation: false,
+                mm_limits: Vec::new(),
+                multimodal: false,
+                metrics: None,
+                metadata,
+                peer_endpoints: Vec::new(),
+                request_log: None,
+                generate_validator: None,
+                abort_hook: None,
+            },
+        );
+        (handle, intake_rx)
+    }
+
+    /// Owning-runtime identity is minted once, shared by clones, and stable
+    /// across repeated `/server_info` reads. Fresh runtimes mint distinct ids
+    /// even with identical host/port/model/version metadata.
+    #[tokio::test]
+    async fn server_info_instance_id_is_owning_runtime_boot_identity() {
+        let metadata = CoreMetadata {
+            host: "127.0.0.1".into(),
+            port: 30000,
+            model_path: "/model".into(),
+            served_model_name: "served".into(),
+            version: "1.2.3".into(),
+            launch_server_info: std::sync::Arc::new(
+                serde_json::json!({ "instance_id": "stale-launch-instance-id" })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            ),
+            ..Default::default()
+        };
+        let (handle, intake_rx) = handle_with_metadata(metadata.clone());
+        let clone = handle.clone();
+
+        let ((first, second, from_clone), ()) = tokio::join!(
+            async {
+                let a = handle.server_info().await.unwrap();
+                let b = handle.server_info().await.unwrap();
+                let c = clone.server_info().await.unwrap();
+                (a, b, c)
+            },
+            async {
+                for _ in 0..3 {
+                    answer_local_control(&intake_rx, empty_internal_state_reply()).await;
+                }
+            },
+        );
+        assert_uuid_v4(&first.instance_id);
+        assert_eq!(first.instance_id, second.instance_id);
+        assert_eq!(first.instance_id, from_clone.instance_id);
+        assert_ne!(first.instance_id, "stale-launch-instance-id");
+        assert_eq!(
+            first.to_json().unwrap()["instance_id"],
+            first.instance_id.as_str()
+        );
+
+        let (other, other_rx) = handle_with_metadata(metadata);
+        let (other_info, ()) = tokio::join!(
+            other.server_info(),
+            answer_local_control(&other_rx, empty_internal_state_reply()),
+        );
+        let other_info = other_info.unwrap();
+        assert_uuid_v4(&other_info.instance_id);
+        assert_ne!(first.instance_id, other_info.instance_id);
     }
 }

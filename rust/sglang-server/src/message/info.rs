@@ -57,6 +57,9 @@ pub(crate) struct ServerInfo {
     pub(crate) max_total_num_tokens: u64,
     pub(crate) num_reserved_tokens: u64,
     pub(crate) version: String,
+    /// Opaque owning-runtime boot identity. Overrides any stale
+    /// `launch_fields.instance_id` when serialized for HTTP.
+    pub(crate) instance_id: String,
     pub(crate) frontend: &'static str,
     /// The server's startup phase durations in seconds, Python's
     /// `TokenizerManager.startup_time` shape.
