@@ -48,13 +48,13 @@ def _jit_module(
         and in_dtype in (torch.bfloat16, torch.float16)
         and out_dtype == torch.float8_e4m3fn
         and group_size == 128
-        and not masked_layout
         and not sorted_layout
     ):
         raise ValueError(
-            "dense mode requires flat BF16/FP16 SiLU+mul, FP8 output and group_size=128"
+            "dense mode requires flat or masked BF16/FP16 SiLU+mul, FP8 output and "
+            "group_size=128"
         )
-    # Only the flat dense variant adds a flag; legacy launcher arguments stay intact.
+    # Only the dense variants add a flag; legacy launcher arguments stay intact.
     trait_args = make_cpp_args(
         in_dtype,
         out_dtype,
@@ -275,7 +275,8 @@ def per_token_group_quant(
     With ``fuse_silu_and_mul=True``, ``silu_and_mul_mode="dense"`` matches the
     dense CUDA activation: FP32 SiLU and multiply, then one source-dtype round
     before quantizing. The default retains the existing early SiLU rounding.
-    Dense mode supports flat BF16/FP16 inputs, FP8 output and groups of 128.
+    Dense mode supports flat or masked BF16/FP16 inputs, FP8 output and groups
+    of 128.
 
     ``expected_m`` (masked only) is an optional expected-tokens-per-expert hint.
 

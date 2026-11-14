@@ -102,6 +102,7 @@ from sglang.srt.mem_cache.page_interleave import (
     get_kv_shard_group_info,
     get_shared_kv_shard_pool,
     make_page_shard_spec,
+    page_shard_row_bytes,
 )
 from sglang.srt.mem_cache.page_interleave_pool import (
     PageInterleaveKVPoolMixin,
@@ -208,6 +209,7 @@ class TestPageShardScratchSizing(CustomTestCase):
                 get_num_kv_heads=lambda tp: num_kv_heads // tp,
             ),
         )
+        kvc.page_shard_scratch_row_bytes = lambda: page_shard_row_bytes(kvc)
         with (
             unittest.mock.patch.object(
                 page_interleave, "get_parallel", return_value=parallel

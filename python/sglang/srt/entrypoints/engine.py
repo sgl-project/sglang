@@ -1263,6 +1263,7 @@ class Engine(EngineScoreMixin, EngineBase):
         # the validation stage writes through late resolution, which refuses a
         # record that is already published.
         try:
+            _check_rust_server_warmups()
             # Allocate ports for inter-process communications
             if port_args is None:
                 port_args = PortArgs.init_new(server_args)
@@ -2150,6 +2151,21 @@ def _calculate_rank_ranges(node_rank: int) -> Tuple[range, range, int, int]:
     )
 
     return pp_rank_range, tp_rank_range, pp_size_per_node, tp_size_per_node
+
+
+def _check_rust_server_warmups() -> None:
+    """In Rust mode, refuse a ``--warmups`` it cannot run before any scheduler
+    loads weights. The listener-hosting schedulers run the warmups, but this
+    process has the registry Python mode reads: an entry point may register a
+    warmup only in this launcher process, which a spawned scheduler would not
+    know and would skip as unknown."""
+    if envs.SGLANG_RUST_SERVER.get():
+        from sglang.srt.rust_server.warmups import (
+            check_rust_server_warmups,
+            rust_server_warmup_names,
+        )
+
+        check_rust_server_warmups(rust_server_warmup_names(get_serving().warmups))
 
 
 def _rank_hosts_rust_listener(pp_rank: int, tp_rank: int) -> bool:
