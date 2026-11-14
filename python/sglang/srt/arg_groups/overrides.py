@@ -582,7 +582,7 @@ def _check_dsa_backend_constraints(
             "The prims_ts DSA backend needs CUDA and --kv-cache-dtype fp8_e4m3."
         )
 
-    rocm_only = {"triton"} & chosen
+    rocm_only = {"triton", "aiter_sparse_mla"} & chosen
     if not hip and rocm_only:
         raise ValueError(
             f"The {'/'.join(sorted(rocm_only))} DSA backend is only supported on "
