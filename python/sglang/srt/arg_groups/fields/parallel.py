@@ -244,8 +244,10 @@ class Parallel(msgspec.Struct):
         Optional[int],
         "Shared-expert TP size for Kimi-K3 with an expert-parallel all-to-all "
         "backend. Must divide attention TP size, or attention TP x CP size "
-        "with interleave prefill CP; never crosses attention DP replicas. Overrides "
-        "--enable-shared-experts-attn-tp when set; 1 replicates the weights.",
+        "with interleave prefill CP. Under attention DP with attention TP 1 it may "
+        "instead divide TP: each group then spans that many consecutive attention-DP "
+        "ranks, whose rows are padded to the DP maximum around the collectives. "
+        "Overrides --enable-shared-experts-attn-tp when set; 1 replicates the weights.",
     ] = None
     enable_dense_mlp_attn_tp: A[
         bool,

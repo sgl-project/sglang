@@ -2526,6 +2526,10 @@ class Envs:
     # CUDA events built once (host cost only; the copies are unchanged). 0 restores the
     # per-issue slicing and event creation.
     SGLANG_K3_KDA_WS_LEAN_ISSUE = EnvBool(True)
+    # --shared-experts-tp-size == TP under attention DP: run the shared experts' row
+    # all-gather / reduce-scatter on K3's GB300 push collectives over the TP group; 0 keeps
+    # NCCL.
+    SGLANG_K3_SHARED_TP_SP_COMM = EnvBool(True)
     # Use the ROCm radix-4 router for covered K3 top-k workloads.
     SGLANG_K3_RADIX4_TOPK = EnvBool(False)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_CACHE_CAPACITY = EnvInt(2)
