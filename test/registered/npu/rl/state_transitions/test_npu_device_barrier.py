@@ -119,6 +119,8 @@ class TestNpuDeviceBarrier(CustomTestCase):
                 "torch.distributed.barrier",
                 lambda *args, **kwargs: events.append(("barrier", None)),
             ),
+            # release_memory_occupation gates on the TP ranks being idle.
+            patch("torch.distributed.all_reduce", lambda *args, **kwargs: None),
         ):
             manager.release_memory_occupation(SimpleNamespace(tags=["weights"]))
 

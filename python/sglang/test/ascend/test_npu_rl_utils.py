@@ -66,9 +66,17 @@ def _is_ascend_950() -> bool:
         return False
 
 
+# The memory saver cannot free HBM with expandable segments, which CI enables
+# for the whole job.
+RL_SERVER_ENV = {"PYTORCH_NPU_ALLOC_CONF": "expandable_segments:False"}
+
+
 def npu_rl_env() -> Dict[str, str]:
     """Return the extra server env required by the RL lifecycle tests."""
-    return dict(A5_SPEC_ENV) if _is_ascend_950() else {}
+    env = dict(RL_SERVER_ENV)
+    if _is_ascend_950():
+        env.update(A5_SPEC_ENV)
+    return env
 
 
 def npu_free_bytes(device: int = 0) -> int:
