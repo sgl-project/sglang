@@ -29,6 +29,7 @@ from sglang.srt.model_executor.forward_context import (
 from sglang.srt.models.deepseek_common.utils import (
     _is_cuda,
     _is_hip,
+    _is_mlu,
     _is_musa,
     _is_npu,
     _use_aiter_gfx95,
@@ -631,7 +632,7 @@ class DeepseekMHAForwardMixin:
         dst_dtype: torch.dtype,
         forward_batch: ForwardBatch,
     ):
-        if _is_cuda or _use_aiter_gfx95:
+        if _is_cuda or _use_aiter_gfx95 or _is_mlu:
             kv_a, k_pe = (
                 get_kv_layers()
                 .read(self.attn_mha.layer_id)

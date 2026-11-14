@@ -656,3 +656,16 @@ def create_intel_xpu_backend(runner):
     from sglang.srt.layers.attention.xpu_backend import XPUAttentionBackend
 
     return XPUAttentionBackend(runner)
+
+
+@register_attention_backend("mlu")
+def create_mlu_backend(runner):
+    if runner.use_mla_backend:
+        from sglang.srt.hardware_backend.mlu.attention.mla_backend import (
+            MLUMLABackend,
+        )
+
+        return MLUMLABackend(runner)
+    from sglang.srt.hardware_backend.mlu.attention.mha_backend import MLUMHABackend
+
+    return MLUMHABackend(runner)

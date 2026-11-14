@@ -2,6 +2,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
 from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.model_executor.forward_context import get_attn_backend
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     is_in_breakable_cuda_graph,
 )
@@ -256,6 +257,32 @@ def handle_attention_intel_xpu(attn, forward_batch):
     return _handle_attention_backend(attn, forward_batch, "intel_xpu")
 
 
+def _get_mlu_chunked_prefix_cache_threshold(attn):
+    if envs.SGLANG_CHUNKED_PREFIX_CACHE_THRESHOLD.is_set():
+        return attn.chunked_prefix_cache_threshold
+    # Use dense MHA for cached-prefix prefill on MLU by default.
+    return 0
+
+
+def handle_attention_mlu(attn, forward_batch):
+    if forward_batch.forward_mode != ForwardMode.EXTEND:
+        return AttnForwardMethod.MLA
+
+    prefix_len = _get_sum_extend_prefix_lens(forward_batch)
+    if prefix_len == 0:
+        return AttnForwardMethod.MHA
+
+    if (
+        attn.disable_chunked_prefix_cache
+        or prefix_len < _get_mlu_chunked_prefix_cache_threshold(attn)
+    ):
+        return AttnForwardMethod.MLA
+
+    if forward_batch.seq_lens_sum <= forward_batch.get_max_chunk_capacity():
+        return AttnForwardMethod.MHA_ONE_SHOT
+    return AttnForwardMethod.MHA_CHUNKED_KV
+
+
 AttentionBackendRegistry.register("ascend", handle_attention_ascend)
 AttentionBackendRegistry.register("flashinfer", handle_attention_flashinfer)
 AttentionBackendRegistry.register("fa3", handle_attention_fa3)
@@ -269,3 +296,4 @@ AttentionBackendRegistry.register(
 )  # Deprecated alias; use "dsa"
 AttentionBackendRegistry.register("triton", handle_attention_triton)
 AttentionBackendRegistry.register("intel_xpu", handle_attention_intel_xpu)
+AttentionBackendRegistry.register("mlu", handle_attention_mlu)

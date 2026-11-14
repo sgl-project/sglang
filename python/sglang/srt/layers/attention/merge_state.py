@@ -3,12 +3,16 @@ from typing import Optional, Tuple
 import torch
 
 from sglang.kernels.ops.attention.merge_state import merge_state_triton
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import is_cuda, is_mlu
 
 _is_cuda = is_cuda()
+_is_mlu = is_mlu()
 
 if _is_cuda:
     from sgl_kernel import merge_state_v2
+
+if _is_mlu:
+    from sglang.kernels.ops.attention.merge_state import merge_state_mlu
 
 
 # Automatically fallback to the Triton kernel in some cases
@@ -33,6 +37,10 @@ def merge_state(
     output: Optional[torch.Tensor] = None,
     output_lse: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    if _is_mlu:
+        return merge_state_mlu(
+            prefix_output, prefix_lse, suffix_output, suffix_lse, output, output_lse
+        )
     if (
         _is_cuda
         and _supported_dtypes(prefix_output)

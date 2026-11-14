@@ -6,12 +6,13 @@ from typing import Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.platforms.device_mixin import (
     DeviceCapability,
     DeviceMixin,
     PlatformEnum,
 )
-from sglang.srt.platforms.interface import PlatformCapabilities, SRTPlatform
+from sglang.srt.platforms.interface import KVPoolKind, PlatformCapabilities, SRTPlatform
 
 
 class MluDeviceMixin(DeviceMixin):
@@ -77,3 +78,69 @@ class MluSRTPlatform(MluDeviceMixin, SRTPlatform):
 
     def get_dispatch_key_name(self) -> str:
         return "mlu"
+
+    def apply_server_args_defaults(self, server_args) -> None:
+        if server_args.quantization is not None:
+            raise NotImplementedError(
+                "MLU inference currently requires unquantized weights."
+            )
+        if server_args.speculative_algorithm is not None:
+            raise NotImplementedError("MLU speculative decoding is not supported yet.")
+        if server_args.sampling_backend not in (None, "pytorch"):
+            raise ValueError("MLU inference requires the pytorch sampling backend.")
+        default_attention_backend = server_args.attention_backend or "mlu"
+        for field in (
+            "attention_backend",
+            "prefill_attention_backend",
+            "decode_attention_backend",
+        ):
+            backend = getattr(server_args, field)
+            if backend not in (None, "mlu", "triton"):
+                raise ValueError(f"MLU inference requires {field}='mlu' or 'triton'.")
+            if backend is None:
+                setattr(server_args, field, default_attention_backend)
+        if (
+            server_args.prefill_attention_backend
+            != server_args.decode_attention_backend
+        ):
+            raise ValueError(
+                "MLU prefill and decode share a KV cache memory pool. "
+                "Use the same attention backend to ensure compatible layouts."
+            )
+        use_hnd = server_args.prefill_attention_backend == "mlu"
+        if not envs.SGLANG_USE_HND_KVCACHE.is_set():
+            envs.SGLANG_USE_HND_KVCACHE.set(use_hnd)
+        elif envs.SGLANG_USE_HND_KVCACHE.get() != use_hnd:
+            from sglang.srt.arg_groups.model_override_base import use_mla_backend
+
+            # MLA uses token-linear storage independently of the MHA layout.
+            if not use_mla_backend(server_args):
+                raise ValueError(
+                    f"MLU MHA attention backend {server_args.prefill_attention_backend!r} "
+                    f"requires SGLANG_USE_HND_KVCACHE={int(use_hnd)}."
+                )
+        if server_args.sampling_backend is None:
+            server_args.sampling_backend = "pytorch"
+        if server_args.page_size is None:
+            server_args.page_size = 16
+        server_args.disable_custom_all_reduce = True
+
+    def get_default_attention_backend(self) -> str:
+        return "mlu"
+
+    def get_kv_pool_cls(self, *, kind: KVPoolKind) -> Optional[type]:
+        if kind == "mha":
+            if not envs.SGLANG_USE_HND_KVCACHE.get():
+                return None
+            from sglang.srt.hardware_backend.mlu.memory_pool import (
+                MLUMHATokenToKVPool,
+            )
+
+            return MLUMHATokenToKVPool
+        if kind == "mla":
+            from sglang.srt.hardware_backend.mlu.memory_pool import (
+                MLUMLATokenToKVPool,
+            )
+
+            return MLUMLATokenToKVPool
+        return None

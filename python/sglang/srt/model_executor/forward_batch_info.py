@@ -66,6 +66,7 @@ from sglang.srt.speculative.spec_info import SpecInputType
 from sglang.srt.utils import (
     is_cpu,
     is_hip,
+    is_mlu,
     is_npu,
     support_triton,
 )
@@ -598,6 +599,11 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     extend_logprob_start_lens_cpu: Optional[List[int]] = None
     extend_input_logprob_token_ids_gpu: Optional[torch.Tensor] = None
 
+    # For MLU mixed batches: number of leading prefill requests, derived from
+    # scheduler identity rather than query lengths. None on other platforms
+    # and for non-mixed batches.
+    mixed_prefill_reqs: Optional[int] = None
+
     # For DP attention (MLP sync sizes)
     original_global_num_tokens_cpu: Optional[List[int]] = None
     _original_batch_size: Optional[int] = None
@@ -986,6 +992,12 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             seq_lens=batch.seq_lens,
             out_cache_loc=batch.out_cache_loc,
             seq_lens_sum=batch.seq_lens_sum,
+            # MLU mixed request boundary derived from scheduler identity
+            mixed_prefill_reqs=(
+                len(batch.reqs) - len(batch.decoding_reqs or ())
+                if is_mlu() and batch.forward_mode.is_mixed()
+                else None
+            ),
             # Inputs aliased by reference from ScheduleBatch
             seq_lens_cpu=seq_lens_cpu,
             max_seq_len_host=getattr(batch, "max_seq_len_host", None),
