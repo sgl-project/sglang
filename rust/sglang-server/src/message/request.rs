@@ -72,6 +72,23 @@ impl From<&ServerArgs> for GenerationPolicy {
     }
 }
 
+/// Whether Python reads `value` (one value, or one per prompt) as set: `set`
+/// holds for the value, or for the entry of one of a batch's `n` prompts
+/// (Python reads no entry past them). A list sent with a single prompt is set
+/// unless empty, as Python tests the list itself.
+fn is_set<T: OneOrManyItem>(
+    value: Option<OneOrMany<T>>,
+    batch: Option<usize>,
+    set: impl Fn(&T) -> bool,
+) -> bool {
+    match (value, batch) {
+        (None, _) => false,
+        (Some(OneOrMany::One(item)), _) => set(&item),
+        (Some(OneOrMany::Many(items)), Some(n)) => items.iter().take(n).any(set),
+        (Some(OneOrMany::Many(items)), None) => !items.is_empty(),
+    }
+}
+
 pub fn into_requests(
     req: api_v1::GenerateRequest,
     policy: &GenerationPolicy,
@@ -108,13 +125,10 @@ pub fn into_requests(
         extra_key,
         cache_salt,
         session_params,
+        custom_logit_processor,
+        return_sampling_mask,
         ..
     } = req;
-    if session_params.is_some() {
-        return Err(Error::Validation(
-            "session_params is not supported by the Rust server".into(),
-        ));
-    }
     let rid = rid.and_then(wire::string_or_list);
     let text = text.and_then(wire::string_or_list);
     let input_ids = input_ids.and_then(wire::token_ids_or_list);
@@ -209,6 +223,35 @@ pub fn into_requests(
         return Err(Error::Validation(
             "batch must contain at least one item".into(),
         ));
+    }
+    // Python acts on these, so dropping one would silently change the answer:
+    // a value Python reads as set is a 400 (as Python's is for `session_params`
+    // without that session), and one it reads as unset passes: `null`, `false`,
+    // an empty processor name, or a batch's list of those.
+    let batch = is_batch.then_some(n);
+    let unsupported = [
+        ("session_params", session_params.is_some()),
+        (
+            "custom_logit_processor",
+            is_set(
+                custom_logit_processor.and_then(wire::optional_string_or_list),
+                batch,
+                |name| name.as_deref().is_some_and(|name| !name.is_empty()),
+            ),
+        ),
+        (
+            "return_sampling_mask",
+            is_set(
+                return_sampling_mask.and_then(wire::bool_or_list),
+                batch,
+                |&on| on,
+            ),
+        ),
+    ];
+    if let Some((field, _)) = unsupported.iter().find(|(_, set)| *set) {
+        return Err(Error::Validation(format!(
+            "{field} is not supported by the Rust server"
+        )));
     }
 
     // A list is per-item; a single object broadcasts to every item.
@@ -441,7 +484,8 @@ pub fn into_requests(
                 // `Some` here means "these ids were requested", so an empty list
                 // collapses to None.
                 token_ids_logprob: token_ids_logprob.filter(|ids| !ids.is_empty()),
-                return_sampling_mask: false, // TODO: port Python's `return_sampling_mask`
+                // A client that asks for the mask is refused above.
+                return_sampling_mask: false,
                 return_hidden_states: return_hidden_states.unwrap_or(false),
                 return_text_in_logprobs,
                 bootstrap_host,
@@ -1232,16 +1276,22 @@ mod tests {
     /// declared and dropped by hand just to let `bench_serving` through.
     /// FastAPI's pydantic dataclass drops extras, so ignoring them is the parity
     /// behavior; a typo being silently ignored is the same trade Python makes.
-    /// The exception is `session_params`: dropping it would silently change the
-    /// answer, so a non-null value is a 400 (as Python's is without that
-    /// session), and `null` passes.
+    /// `session_id` only names a radix-native session, which this server does
+    /// not run, so Python without `--enable-session-radix-cache` ignores it too.
+    /// The exceptions are the fields Python acts on, where dropping one would
+    /// silently change the answer: `session_params`, `custom_logit_processor`
+    /// and `return_sampling_mask` are a 400 when Python reads them as set, and
+    /// pass when it reads them as unset (`null`, `false`, `""`, or a batch's
+    /// list of those; a list sent with one prompt is set).
     #[test]
     fn unported_generate_req_input_fields_are_ignored() {
         for field in [
             r#""session_id": "s""#,
             r#""session_params": null"#,
-            r#""return_sampling_mask": true"#,
-            r#""custom_logit_processor": "cls""#,
+            r#""return_sampling_mask": false"#,
+            r#""return_sampling_mask": null"#,
+            r#""custom_logit_processor": null"#,
+            r#""custom_logit_processor": """#,
             r#""lora_path": null"#,
             r#""image_data": "base64""#,
             r#""return_routed_experts": true"#,
@@ -1255,10 +1305,46 @@ mod tests {
             assert_eq!(ps.len(), 1, "{field}");
             assert_eq!(ps[0].text.as_deref(), Some("hi"), "{field}");
         }
-        let field = r#""session_params": {"id": "s"}"#;
-        let body = format!(r#"{{"text": "hi", {field}}}"#);
-        let err = requests(&body).unwrap_err().to_string();
-        assert!(err.contains("not supported"), "{field}: {err}");
+        // Python reads no entry past the batch's prompts.
+        let batch = r#""text": ["a", "b"], "return_sampling_mask": [false, false, true], "custom_logit_processor": [null, null, "cls"]"#;
+        assert_eq!(requests(&format!("{{{batch}}}")).unwrap().0.len(), 2);
+        for (field, body) in [
+            (
+                "session_params",
+                r#""text": "hi", "session_params": {"id": "s"}"#,
+            ),
+            (
+                "custom_logit_processor",
+                r#""text": "hi", "custom_logit_processor": "cls""#,
+            ),
+            (
+                "custom_logit_processor",
+                r#""text": ["a", "b"], "custom_logit_processor": [null, "cls"]"#,
+            ),
+            (
+                "return_sampling_mask",
+                r#""text": "hi", "return_sampling_mask": true"#,
+            ),
+            (
+                "return_sampling_mask",
+                r#""text": ["a", "b"], "return_sampling_mask": [false, true]"#,
+            ),
+            (
+                "custom_logit_processor",
+                r#""text": "hi", "custom_logit_processor": [null]"#,
+            ),
+            (
+                "return_sampling_mask",
+                r#""text": "hi", "return_sampling_mask": [false]"#,
+            ),
+        ] {
+            let err = requests(&format!("{{{body}}}")).unwrap_err().to_string();
+            assert_eq!(
+                err,
+                format!("{field} is not supported by the Rust server"),
+                "{body}"
+            );
+        }
     }
 
     /// Client-supplied rid semantics mirror Python's `_normalize_batch`: a

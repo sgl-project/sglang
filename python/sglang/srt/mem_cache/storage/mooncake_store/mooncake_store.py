@@ -617,6 +617,10 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     self.config.client_server_address,
                 )
             else:
+                from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
+                    MooncakeTransferEngine,
+                )
+
                 try:
                     from sglang.srt.distributed.parallel_state import (
                         get_mooncake_transfer_engine,
@@ -633,9 +637,12 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 # configuration matches the one used by MooncakeStore.
                 # PD may already have created an NVLink engine even when
                 # storage opted out of sharing in order to use RDMA.
+                # A TENT engine has no classic engine object for the store to drive.
                 if (
                     envs.SGLANG_HICACHE_MOONCAKE_REUSE_TE.get()
-                    and self._shared_mooncake_transfer_engine is not None
+                    and isinstance(
+                        self._shared_mooncake_transfer_engine, MooncakeTransferEngine
+                    )
                     and device_name
                     == self._shared_mooncake_transfer_engine.get_ib_device()
                     and self.config.metadata_server == "P2PHANDSHAKE"
