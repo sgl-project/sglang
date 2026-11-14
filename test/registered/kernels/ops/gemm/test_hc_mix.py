@@ -80,5 +80,50 @@ def test_fused_hc_mix_gate_rejects_prefill_rows():
     assert not fused_hc_mix_supported(x, w_down, w_up)
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10,
+    reason="hc_mix_splitk's split-K epilogue GEMMs are tcgen05 (sm_100 family) only",
+)
+@pytest.mark.parametrize("num_tokens", [1, 4, 16, 32])
+def test_hc_mix_splitk_matches_reference_and_repeats_bitwise(num_tokens):
+    """The split-K epilogue's cluster hand-off: reference values, the same bits per run."""
+    from sglang.kernels.ops.gemm.hc_mix_splitk import hc_mix, permute_pad_up_weight
+
+    x, w_down, w_up = _make_inputs(num_tokens, torch.bfloat16)
+    w_up_p = permute_pad_up_weight(w_up, HC_COUNT)
+    out = hc_mix(x, w_down, w_up_p, HC_COUNT, HIDDEN_SIZE)
+    ref = _reference_mix(x, w_down, w_up, HC_COUNT, HIDDEN_SIZE)
+    torch.testing.assert_close(
+        out.to(torch.float64), ref, **_TOLERANCES[torch.bfloat16]
+    )
+    for _ in range(3):
+        assert torch.equal(hc_mix(x, w_down, w_up_p, HC_COUNT, HIDDEN_SIZE), out)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10,
+    reason="the split-K epilogue GEMM is tcgen05 (sm_100 family) only",
+)
+def test_splitk_dense_silu_serves_a_raised_max_m():
+    """Above the default M bound only with a caller's ``max_m``; the grid tiles M."""
+    from sglang.kernels.ops.gemm.dense_bf16_gemm_sm100_splitk_epilogue import (
+        default_tactic,
+        run_splitk_dense_silu,
+    )
+
+    m, n, k, scale = 64, LOWRANK, HC_COUNT * HIDDEN_SIZE, 1.0 / HC_COUNT
+    x, w_down, _ = _make_inputs(m, torch.bfloat16)
+    out = torch.empty((m, n), dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(ValueError, match="M <= 32"):
+        run_splitk_dense_silu(x, w_down.T, out, True, default_tactic(32, n, k), scale)
+    run_splitk_dense_silu(
+        x, w_down.T, out, True, default_tactic(32, n, k), scale, max_m=m
+    )
+    ref = F.silu(scale * (x.to(torch.float64) @ w_down.T.to(torch.float64)))
+    torch.testing.assert_close(
+        out.to(torch.float64), ref, **_TOLERANCES[torch.bfloat16]
+    )
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
