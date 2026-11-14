@@ -971,8 +971,13 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ENABLE_KV_SHARD_ZERO_SM_GATHER</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>With <code>--enable-kv-cache-sharding</code>, allocate the prefix gather scratch of single-node shard groups with PyTorch symmetric memory and run the all-gather on copy engines (zero SMs) through its CUDA multicast mapping, in chunks that a foreground NVLink transfer pause can stop. GPUs without multicast, <code>--enable-memory-saver</code>, and <code>SGLANG_MOONCAKE_CUSTOM_MEM_POOL</code> keep the NCCL all-gather. Set to <code>false</code> to keep the NCCL all-gather.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>With <code>--enable-kv-cache-sharding</code>, allocate the prefix gather scratch of single-node shard groups with PyTorch symmetric memory and run the all-gather on copy engines (zero SMs) through its CUDA multicast mapping, in chunks. Enable <code>SGLANG_ENABLE_KV_SHARD_GATHER_PAUSE</code> to pause these chunks during forward collectives. GPUs without multicast, <code>--enable-memory-saver</code>, and <code>SGLANG_MOONCAKE_CUSTOM_MEM_POOL</code> keep the NCCL all-gather. Set to <code>false</code> to keep the NCCL all-gather.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ENABLE_KV_SHARD_GATHER_PAUSE</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>On NVIDIA CUDA, let standard NCCL/torch all-gathers and all-reduces in an active page-interleaved prefill pause its multicast prefix gather, enabled by <code>--enable-kv-cache-sharding</code> and <code>SGLANG_ENABLE_KV_SHARD_ZERO_SM_GATHER</code>. An already-issued chunk can finish; subsequent chunks resume after the collective. Eager execution only: CUDA graph capture and tracing do not pause. The engine defaults <code>CUDA_DEVICE_MAX_CONNECTIONS</code> to <code>32</code> in this mode, preserving an explicit value. Shared hardware queues or lazy communication setup can still stall a pause; keep <code>SGLANG_GATED_TRANSFER_WATCHDOG_MS</code> enabled so the watchdog can release it. NCCL fallback prefix gathers and custom/fused collective backends are unaffected.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
   </tbody>
 </table>

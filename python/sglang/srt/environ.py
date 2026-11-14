@@ -653,6 +653,11 @@ class Envs:
     # CUDA multicast mapping (MulticastAllGather). Without multicast the
     # gather stays an NCCL allgather.
     SGLANG_ENABLE_KV_SHARD_ZERO_SM_GATHER = EnvBool(True)
+    # Let standard NCCL/torch forward all-gathers/all-reduces pause the active
+    # page-interleaved pool's multicast prefix gather chunks during prefill.
+    # Opt-in because parked streams can share hardware queues with forward
+    # work; the gated-transfer watchdog releases a stalled pause.
+    SGLANG_ENABLE_KV_SHARD_GATHER_PAUSE = EnvBool(False)
 
     # Attention (aiter, ROCm): route NEXTN spec draft_extend (EAGLE-v2 KV
     # catch-up) through aiter unified_attention (GQA-packed + split-KV) instead

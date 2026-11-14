@@ -34,6 +34,8 @@ validate actually addresses the bytes the collective delivers:
 4. The multicast gather copies on copy engines (no NCCL kernel), and every
    rank falls back to NCCL together for a cross-node group or a rank without
    a multicast mapping.
+5. Forward all-gathers and all-reduces pause an active sharded pool's gather,
+   without pausing for an unrelated pool or outside a sharded extend.
 
 ``TestSymmetricBufferLifetime`` covers the NCCL symmetric-window allocator
 (``allocate_symmetric_buffer``), which the pool no longer uses.
@@ -48,8 +50,11 @@ import ctypes
 import gc
 import math
 import os
+import threading
+import time
 import unittest
 import unittest.mock
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import torch
@@ -59,6 +64,7 @@ from sglang.srt.distributed import (
     init_distributed_environment,
     initialize_model_parallel,
 )
+from sglang.srt.distributed.device_communicators.gated_transfer import Link
 from sglang.srt.distributed.device_communicators.multicast_all_gather import (
     _multicast_address,
     has_multicast_support,
@@ -764,6 +770,9 @@ def _run_multicast_mla(rank, world, port):
     pool, req_to_token, prefix_len, seq_len = _run_mla(
         rank, world, port, multicast=True
     )
+    assert pool._multicast_gather.chain.link == (
+        Link.NVLINK if envs.SGLANG_ENABLE_KV_SHARD_GATHER_PAUSE.get() else None
+    )
     activity = _gather_gpu_activity(pool, req_to_token, prefix_len, seq_len)
     nccl_kernels = sorted({name for name in activity if "nccl" in name.lower()})
     assert not nccl_kernels, f"gather ran NCCL kernels: {nccl_kernels}"
@@ -774,6 +783,168 @@ def _run_multicast_mla(rank, world, port):
     copies = activity.count("Memcpy PtoP (Device -> Device)")
     assert chunks > 1 and copies == _GATHER_LAYER_NUM * chunks, (copies, chunks)
     torch.distributed.barrier()
+
+
+def _run_forward_collectives_under_prefix_gather(rank, world, port):
+    from cuda.bindings import driver as cu
+
+    from sglang.srt.model_executor.forward_context import (
+        ForwardContext,
+        forward_context,
+    )
+    from sglang.srt.utils.cuda_vmm_utils import check_drv
+
+    pool, req_to_token, prefix_len, seq_len = _run_mla(
+        rank, world, port, multicast=True
+    )
+    chain = pool._multicast_gather.chain
+    gate = chain._gate
+    group = get_parallel().attn_tp_group
+    context = ForwardContext(SimpleNamespace(token_to_kv_pool=pool))
+    unrelated_context = ForwardContext(SimpleNamespace(token_to_kv_pool=object()))
+    foreground = torch.cuda.Stream()
+    done = torch.cuda.Event()
+    done.record(foreground)
+    blocker = torch.zeros(1, dtype=torch.int32).pin_memory()
+    x = torch.full((8, 16), rank + 1.0, device="cuda")
+    gathered = torch.empty((world * 8, 16), device="cuda")
+    gathered_list = [torch.empty_like(x) for _ in range(world)]
+    expected_reduce = torch.full_like(x, world * (world + 1) / 2)
+    expected_gather = torch.cat(
+        [torch.full_like(x, peer + 1.0) for peer in range(world)]
+    )
+    sizes = list(range(1, world + 1))
+    varying = [
+        torch.full((rank + 1, 16), rank + 1.0 + offset, device="cuda")
+        for offset in (0, 10)
+    ]
+    expected_varying = [
+        torch.cat(
+            [
+                torch.full((rows, 16), peer + 1.0 + offset, device="cuda")
+                for peer, rows in enumerate(sizes)
+            ]
+        )
+        for offset in (0, 10)
+    ]
+    all_locs = req_to_token[0, :prefix_len].long()
+    expected_prefix = _mla_value(all_locs, _GATHER_KV_LORA_RANK + _GATHER_QK_ROPE)
+    req_indices = torch.tensor([0])
+
+    def hold(stream):
+        check_drv(
+            cu.cuStreamWaitValue32(stream.cuda_stream, blocker.data_ptr(), 1, 1),
+            "prefix gather test blocker",
+        )
+
+    def gather_into_tensor():
+        group.all_gather_into_tensor(gathered, x)
+        return gathered
+
+    def gather_into_list():
+        group.all_gather(x, output_tensor_list=gathered_list)
+        return gathered_list
+
+    def check_collective(name, collective, expected, ctx=context, end_extend=False):
+        # Warm communicator setup and allocations before parking any stream.
+        with torch.cuda.stream(foreground):
+            x.fill_(rank + 1)
+            warmup = collective()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(warmup, expected, rtol=0, atol=0)
+        del warmup
+        pool.begin_shard_extend(req_to_token, req_indices, [prefix_len], [seq_len])
+        slot = pool._slots[0]
+        chain.wait(slot.ticket)
+        rows = pool.translate_loc_to_scratch(all_locs)
+        x.fill_(rank + 1)
+        blocker[0] = 0
+        torch.cuda.synchronize()
+        torch.distributed.barrier(group=group.cpu_group)
+
+        # Reissue the prepared first-layer gather behind a host blocker. The
+        # plan's allocations and host synchronizations have already finished.
+        slot.resident_key = None
+        pauses, forced = gate._seq, gate.forced_opens
+        timed_out = threading.Event()
+
+        def release_on_timeout():
+            timed_out.set()
+            blocker[0] = 1
+
+        # Also recover a regression that blocks the host during submission,
+        # before it reaches the event-polling deadline below.
+        release_timer = threading.Timer(10, release_on_timeout)
+        release_timer.daemon = True
+        release_timer.start()
+        try:
+            chain.run([hold])
+            pool._prefetch_layer(0)
+            if end_extend:
+                pool.end_shard_extend()
+            with (
+                forward_context(ctx) if ctx is not None else nullcontext(),
+                torch.cuda.stream(foreground),
+            ):
+                result = collective()
+                done.record()
+            deadline = time.monotonic() + 30
+            while not done.query():
+                assert time.monotonic() < deadline, f"{name}: foreground hung"
+                time.sleep(0.005)
+            assert not timed_out.is_set(), f"{name}: host timeout released blocker"
+            should_pause = ctx is context and not end_extend
+            assert gate._seq == pauses + int(should_pause), name
+            assert gate._pause_thread is None and gate.word() == 0, name
+            assert not chain.query(slot.ticket), f"{name}: blocker did not hold"
+        finally:
+            blocker[0] = 1
+            release_timer.cancel()
+            release_timer.join()
+        assert not timed_out.is_set(), f"{name}: host timeout released blocker"
+        chain.wait(slot.ticket)
+        torch.cuda.synchronize()
+        torch.testing.assert_close(result, expected, rtol=0, atol=0)
+        torch.testing.assert_close(
+            pool._scratch_kv(slot)[rows, 0, :], expected_prefix, rtol=0, atol=0
+        )
+        assert gate.forced_opens == forced, f"{name}: watchdog rescue"
+
+    cases = [
+        ("all_reduce", lambda: group.all_reduce(x), expected_reduce),
+        ("all_gather_into_tensor", gather_into_tensor, expected_gather),
+        ("all_gather", lambda: group.all_gather(x, dim=0), expected_gather),
+        ("all_gather_list", gather_into_list, list(expected_gather.chunk(world))),
+    ]
+    torch.cuda.synchronize()
+    # Restrict this test to the standard torch/PyNccl forward paths supported
+    # by the pool pause; custom all-reduce backends keep their existing path.
+    with unittest.mock.patch.object(group, "ca_comm", None):
+        for enabled in (False, True):
+            with group.pynccl_comm.change_state(enable=enabled):
+                for name, collective, expected in cases:
+                    check_collective(f"{name}, pynccl={enabled}", collective, expected)
+                if enabled:
+                    check_collective(
+                        "grouped unequal all_gatherv",
+                        lambda: group.all_gatherv(varying, sizes=sizes),
+                        expected_varying,
+                    )
+                for ctx, end_extend, label in (
+                    (None, False, "no forward context"),
+                    (unrelated_context, False, "unrelated pool"),
+                    (context, True, "extend ended"),
+                ):
+                    for name, collective, expected in cases[:2]:
+                        check_collective(
+                            f"{name}, {label}, pynccl={enabled}",
+                            collective,
+                            expected,
+                            ctx,
+                            end_extend,
+                        )
+    pool.end_shard_extend()
+    torch.distributed.barrier(group=group.cpu_group)
 
 
 def _run_cross_node_mla(rank, world, port):
@@ -883,7 +1054,20 @@ class TestPageInterleaveMulticastGather(CustomTestCase):
             )
 
     def test_gather_issues_no_nccl_kernels(self):
-        self._spawn(_run_multicast_mla, 29817)
+        for pause in (False, True):
+            with (
+                self.subTest(pause=pause),
+                envs.SGLANG_ENABLE_KV_SHARD_GATHER_PAUSE.override(pause),
+            ):
+                self._spawn(_run_multicast_mla, 29817)
+
+    def test_forward_collectives_pause_only_the_active_shard_pool(self):
+        with (
+            envs.SGLANG_ENABLE_KV_SHARD_GATHER_PAUSE.override(True),
+            envs.SGLANG_GATED_TRANSFER_WATCHDOG_MS.override(0),
+            unittest.mock.patch.dict(os.environ, {"CUDA_DEVICE_MAX_CONNECTIONS": "32"}),
+        ):
+            self._spawn(_run_forward_collectives_under_prefix_gather, 29822)
 
     def test_cross_node_group_keeps_nccl_gather(self):
         self._spawn(_run_cross_node_mla, 29818)

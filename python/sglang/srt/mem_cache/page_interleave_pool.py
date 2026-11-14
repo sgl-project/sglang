@@ -36,9 +36,10 @@ scratch slot laid out ``[prefix region | chunk region | trash page]``:
   PyTorch symmetric-memory buffer, and ``MulticastAllGather`` copies each
   rank's block to its place on every rank through the buffer's multicast
   mapping: copy-engine chunks (zero SMs) on the pool's own ``TransferChain``,
-  each behind the NVLink transfer gate, so a foreground
-  ``paused_background_transfers(Link.NVLINK)`` bracket stops the gather at
-  the next chunk boundary. Every rank carves the same offsets, because a
+  optionally behind the NVLink transfer gate. With
+  ``SGLANG_ENABLE_KV_SHARD_GATHER_PAUSE``, standard NCCL/torch all-gathers and
+  all-reduces in this pool's active prefill stop the gather at the next chunk
+  boundary for their duration. Every rank carves the same offsets, because a
   multicast copy lands at the same offset in every rank's buffer.
   Otherwise the prefix is NCCL-allgathered on the side stream, with a
   dedicated ``PyNcclCommunicator``.
@@ -77,6 +78,7 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.distributed.device_communicators.gated_transfer import (
     Link,
     TransferChain,
+    paused_background_transfers,
 )
 from sglang.srt.distributed.device_communicators.multicast_all_gather import (
     MulticastAllGather,
@@ -342,7 +344,9 @@ class PageInterleaveKVPoolMixin:
             for slot_offsets in offsets
         ]
         with torch.cuda.device(device):
-            chain = TransferChain(Link.NVLINK)
+            chain = TransferChain(
+                Link.NVLINK if envs.SGLANG_ENABLE_KV_SHARD_GATHER_PAUSE.get() else None
+            )
         try:
             # Named by the cpu_group, like the other symmetric-memory users.
             self._multicast_gather = MulticastAllGather(
@@ -517,6 +521,21 @@ class PageInterleaveKVPoolMixin:
     def end_shard_extend(self) -> None:
         """Mark no sharded extend in flight (non-extend forward modes)."""
         self._shard_extend_active = False
+
+    def pause_gather_for_forward(self):
+        """Yield NVLink to a foreground collective during a sharded prefill.
+
+        The caller must resolve this pool from the active ForwardContext and
+        allocate the collective's output before entering this bracket.
+        """
+        if (
+            self._shard_extend_active
+            and self._block_pages > 0
+            and self._multicast_gather is not None
+            and self._multicast_gather.chain.link == Link.NVLINK
+        ):
+            return paused_background_transfers(Link.NVLINK)
+        return nullcontext()
 
     # ---- translation ----------------------------------------------------------
 
