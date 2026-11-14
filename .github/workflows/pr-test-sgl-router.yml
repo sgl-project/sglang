@@ -68,6 +68,10 @@ jobs:
               - 'rust/sglang-runtime-v1-types/**'
               - 'proto/**'
               - '.github/workflows/pr-test-sgl-router.yml'
+              - '.github/workflows/_pr-test-sgl-router-build.yml'
+              - '.github/actions/download-sgl-router/**'
+              - 'scripts/ci/utils/build_sgl_router.sh'
+              - 'scripts/ci/utils/prepare_sgl_router.sh'
               - 'docker/sgl-router.Dockerfile'
               - 'scripts/ci/cuda/ci_install_dependency.sh'
       - name: Decide
@@ -108,6 +112,15 @@ jobs:
     uses: ./.github/workflows/pr-gate.yml
     with:
       require-run-ci: true
+
+  # The release binary the e2e and k8s jobs run, built once (or restored).
+  sgl-router-build:
+    name: build binary
+    needs: [sgl-router-changes, sgl-router-gate]
+    if: needs.sgl-router-changes.outputs.should_run == 'true'
+    uses: ./.github/workflows/_pr-test-sgl-router-build.yml
+    with:
+      runs_on: ubuntu-22.04
 
   sgl-router-lint:
     name: tier-1 — lint
@@ -232,6 +245,16 @@ jobs:
           cache-on-failure: true
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      # The tokenizer parity matrix reads each fixture model's tokenizer.json
+      # from the HuggingFace cache.
+      - name: Fetch the parity matrix tokenizers
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          for model in $(jq -r .model_id sgl-router/tests/fixtures/tokenizer_parity/*/*.json | sort -u); do
+            pipx run --spec huggingface_hub hf download "$model" tokenizer.json
+          done
+
       - name: cargo build (record wall time)
         working-directory: sgl-router
         run: |
@@ -244,13 +267,9 @@ jobs:
 
       - name: cargo test
         working-directory: sgl-router
-        # Skip the tokenizer parity_matrix test here: ubuntu-latest has
-        # no HuggingFace cache, so the matrix would hard-fail (see the
-        # test docstring). The e2e job runs it after pytest populates
-        # the Qwen3-0.6B tokenizer.json. Filter is matched against the
-        # full test path `tokenizer::parity::parity_matrix`; substring
-        # `parity_matrix` is unique to that test.
-        run: cargo test --locked --release --workspace -- --skip parity_matrix
+        # The chat render matrix also needs each model's chat template files,
+        # which the step above does not fetch.
+        run: cargo test --locked --release --workspace -- --skip chat_render_parity_matrix
 
       # Regenerate the cross-impl block-hash parity fixture and fail if it
       # differs from the committed file.  The Python script replicates
@@ -306,12 +325,15 @@ jobs:
   # the GPU/cluster runners from spinning up.
   sgl-router-k8s-integration:
     name: tier-3 — k8s integration
-    needs: [sgl-router-changes, sgl-router-gate, sgl-router-build-and-test]
+    needs: [sgl-router-changes, sgl-router-gate, sgl-router-build-and-test, sgl-router-build]
     if: needs.sgl-router-changes.outputs.should_run == 'true'
     runs-on: ubuntu-22.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+      - uses: ./.github/actions/download-sgl-router
+        with:
+          artifact_name: ${{ needs.sgl-router-build.outputs.artifact_name }}
       - name: Setup Docker buildx
         uses: docker/setup-buildx-action@v3
       - name: Install kind
@@ -322,14 +344,9 @@ jobs:
         run: |
           curl -Lo /tmp/kubectl https://dl.k8s.io/release/v1.31.0/bin/linux/amd64/kubectl
           chmod +x /tmp/kubectl && sudo mv /tmp/kubectl /usr/local/bin/kubectl
-      - name: Build router image
-        run: docker build -t sgl-router:e2e -f sgl-router/tests/e2e/k8s_integration/Dockerfile.router .
-      - name: Build fake_worker image
-        run: |
-          docker build -t sgl-router-fake-worker:e2e \
-            -f sgl-router/tests/e2e/k8s_integration/Dockerfile.fake_worker \
-            sgl-router/tests/e2e/k8s_integration/
       - name: Bootstrap kind + deploy
+        env:
+          ROUTER_FROM: prebuilt
         run: bash sgl-router/tests/e2e/k8s_integration/setup.sh
       - name: Set up Python
         run: |
@@ -353,24 +370,15 @@ jobs:
 
   sgl-router-e2e:
     name: tier-3 — e2e
-    needs: [sgl-router-changes, sgl-router-gate, sgl-router-build-and-test]
+    needs: [sgl-router-changes, sgl-router-gate, sgl-router-build-and-test, sgl-router-build]
     if: needs.sgl-router-changes.outputs.should_run == 'true'
     runs-on: 2-gpu-h100
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
-      - name: Install Rust toolchain
-        run: bash scripts/ci/utils/install_rust_protoc.sh
-      - name: Rust cache
-        uses: Swatinem/rust-cache@v2
+      - uses: ./.github/actions/download-sgl-router
         with:
-          workspaces: sgl-router
-          shared-key: "sgl-router-cache"
-      - name: cargo build (release)
-        working-directory: sgl-router
-        run: |
-          source "$HOME/.cargo/env"
-          cargo build --locked --release --workspace
+          artifact_name: ${{ needs.sgl-router-build.outputs.artifact_name }}
 
       # Install SGLang from the local checkout in editable mode (no PyPI
       # version pin) so the router e2e runs against whatever SGLang version
@@ -400,22 +408,16 @@ jobs:
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
+          export SGL_ROUTER_BINARY="${SGLANG_TEST_PD_ROUTER_BINARY}"
           python3 -m pytest tests/e2e/ -v -s --tb=short \
             --ignore=tests/e2e/k8s_integration
-
-      - name: Tokenizer parity matrix (uses HF cache populated by e2e)
-        working-directory: sgl-router
-        env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
-        run: |
-          source "$HOME/.cargo/env"
-          cargo test --locked --release --test component tokenizer::parity
 
   sgl-router-finish:
     name: finish
     needs:
       - sgl-router-changes
       - sgl-router-gate
+      - sgl-router-build
       - sgl-router-lint
       - sgl-router-build-and-test
       - sgl-router-docker-build-test
@@ -435,6 +437,7 @@ jobs:
           CHANGES_RESULT: ${{ needs.sgl-router-changes.result }}
           SHOULD_RUN: ${{ needs.sgl-router-changes.outputs.should_run }}
           GATE_RESULT: ${{ needs.sgl-router-gate.result }}
+          BINARY_RESULT: ${{ needs.sgl-router-build.result }}
           LINT_RESULT: ${{ needs.sgl-router-lint.result }}
           BUILD_RESULT: ${{ needs.sgl-router-build-and-test.result }}
           DOCKER_RESULT: ${{ needs.sgl-router-docker-build-test.result }}
@@ -445,12 +448,12 @@ jobs:
             echo "::error::sgl-router path detection did not succeed ($CHANGES_RESULT)."
             exit 1
           fi
-          tiers="$GATE_RESULT $LINT_RESULT $BUILD_RESULT $DOCKER_RESULT $K8S_RESULT $E2E_RESULT"
-          if [[ "$SHOULD_RUN" == "true" && "$tiers" == "success success success success success success" ]]; then
+          tiers="$GATE_RESULT $BINARY_RESULT $LINT_RESULT $BUILD_RESULT $DOCKER_RESULT $K8S_RESULT $E2E_RESULT"
+          if [[ "$SHOULD_RUN" == "true" && "$tiers" == "success success success success success success success" ]]; then
             echo "All sgl-router checks passed."
-          elif [[ "$SHOULD_RUN" == "false" && "$tiers" == "skipped skipped skipped skipped skipped skipped" ]]; then
+          elif [[ "$SHOULD_RUN" == "false" && "$tiers" == "skipped skipped skipped skipped skipped skipped skipped" ]]; then
             echo "No sgl-router-related changes; tiers skipped."
           else
-            echo "::error::Unexpected sgl-router results: should_run=$SHOULD_RUN, gate=$GATE_RESULT, lint=$LINT_RESULT, build=$BUILD_RESULT, docker=$DOCKER_RESULT, k8s=$K8S_RESULT, e2e=$E2E_RESULT."
+            echo "::error::Unexpected sgl-router results: should_run=$SHOULD_RUN, gate=$GATE_RESULT, binary=$BINARY_RESULT, lint=$LINT_RESULT, build=$BUILD_RESULT, docker=$DOCKER_RESULT, k8s=$K8S_RESULT, e2e=$E2E_RESULT."
             exit 1
           fi

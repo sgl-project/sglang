@@ -1,9 +1,14 @@
 # syntax=docker/dockerfile:1.6
-# Build sgl-router binary for k8s integration E2E.
+# sgl-router image for k8s integration E2E.
 # Context root: repo root (one level above sgl-router/).
+#
+# ROUTER_FROM picks where the binary comes from: `source` builds it here;
+# `prebuilt` copies sgl-router-bin/sgl-router, a binary built for glibc <= 2.35
+# (CI's download-sgl-router action puts one there).
+ARG ROUTER_FROM=source
 
 # Matches rust-toolchain.toml's pinned channel, avoiding an in-build rustup channel-sync.
-FROM rust:1.92-bookworm AS builder
+FROM rust:1.92-bookworm AS source
 
 # Pin to the exact toolchain pre-installed in the base image so rustup
 # doesn't try to sync the channel manifest when it sees rust-toolchain.toml's
@@ -32,12 +37,17 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     && cargo build --locked --release --bin sgl-router \
     && cp target/release/sgl-router /usr/local/bin/sgl-router
 
+FROM scratch AS prebuilt
+COPY sgl-router-bin/sgl-router /usr/local/bin/sgl-router
+
+FROM ${ROUTER_FROM} AS router
+
 FROM debian:bookworm-slim
 
 RUN apt-get update && apt-get install -y ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /usr/local/bin/sgl-router /usr/local/bin/sgl-router
+COPY --from=router /usr/local/bin/sgl-router /usr/local/bin/sgl-router
 
 # Tiny tokenizer fixture used by the E2E config
 COPY sgl-router/tests/fixtures/tiny_tokenizer.json /etc/tokenizer/tiny.json
