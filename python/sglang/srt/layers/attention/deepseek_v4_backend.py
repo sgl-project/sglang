@@ -123,6 +123,7 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.mem_cache.deepseek_v4_compress_state import KVAndScore
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.model_executor.encoder_swa_replay import folded_replay_lens
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     get_server_return_hidden_states_mode,
@@ -1876,14 +1877,25 @@ class DeepseekV4AttnBackend(
                 for req in batch.reqs
             )
         ) and not self.model_runner.spec_algorithm.is_dspark()
+        extend_lens = list(batch.extend_lens)
+        logprob_start_lens = (
+            list(batch.extend_logprob_start_lens) if batch.return_logprob else None
+        )
+        # The worker folds each hit's replay rows into its extend after this vote
+        # (fold_encoder_swa_replay), and can_run_prefill_cuda_graph judges the
+        # folded batch: judge the same rows here, or a rank whose folded tail
+        # outgrows the block runs eagerly while its peers replay.
+        if self.folds_encoder_swa_replay and batch.encoder_swa_reset is not None:
+            replay = folded_replay_lens(batch)
+            extend_lens = [n + r for n, r in zip(extend_lens, replay)]
+            if logprob_start_lens is not None:
+                logprob_start_lens = [s + r for s, r in zip(logprob_start_lens, replay)]
         whole_extend = _late_layer_whole_extend(
-            extend_lens=batch.extend_lens,
-            logprob_start_lens=(
-                batch.extend_logprob_start_lens if batch.return_logprob else None
-            ),
+            extend_lens=extend_lens,
+            logprob_start_lens=logprob_start_lens,
             full_hidden_states=full_hidden_states,
         )
-        return self._prefill_graph_fits_late_tail(batch.extend_lens, whole_extend)
+        return self._prefill_graph_fits_late_tail(extend_lens, whole_extend)
 
     def _prefill_graph_fits_late_tail(
         self, extend_lens: List[int], whole_extend: Optional[List[bool]]
