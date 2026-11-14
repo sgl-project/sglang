@@ -239,6 +239,8 @@ class SchedulePolicy:
             and get_disagg().disaggregation_mode != "decode"
         ):
             for r in waiting_queue:
+                if self.tree_cache.has_uncommitted_restore(r):
+                    continue
                 match_kv_cache(r, self.tree_cache)
 
         if self.policy == CacheAgnosticPolicy.FCFS:
@@ -375,6 +377,8 @@ class SchedulePolicy:
         self.waiting_queue_radix_tree.reset()
 
         for r in waiting_queue:
+            if self.tree_cache.has_uncommitted_restore(r):
+                continue
             prefix_ids = r.origin_input_ids + r.output_ids
             extra_key = r.extra_key
             cache_salt = r.cache_salt
@@ -756,6 +760,7 @@ class PrefillAdder:
 
         if self.rem_chunk_tokens is not None:
             self.rem_chunk_tokens -= num_mixed_decode_tokens
+        self.initial_chunk_tokens = self.rem_chunk_tokens
         self.memory_budget = create_prefill_budget(
             token_to_kv_pool_allocator,
             tree_cache,
@@ -1969,6 +1974,18 @@ class PrefillAdder:
                 return AddReqResult.OTHER
             max_new_tokens = 0
         elif chunk_tokens_limit is not None and chunk_fit_tokens > chunk_tokens_limit:
+            # Prefer completing a short restored tail in a fresh batch before
+            # allocating its destination slots. An empty batch always progresses.
+            if (
+                self.can_run_list
+                and host_hit_length > 0
+                and getattr(self.tree_cache, "prefer_complete_restored_requests", False)
+                and not self.is_hybrid_swa
+                and not self.is_hybrid_ssm_cache
+                and self.initial_chunk_tokens is not None
+                and 0 < chunk_fit_tokens <= self.initial_chunk_tokens
+            ):
+                return AddReqResult.OTHER
             if has_chunked_req:
                 # Only one unfinished chunked request can be tracked; a
                 # continuation cut short by memory leaves chunk budget to spare.

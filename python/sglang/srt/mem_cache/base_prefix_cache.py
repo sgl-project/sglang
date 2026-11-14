@@ -799,6 +799,10 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         """Expected storage-hit span in logical tokens for a waiting request."""
         return None
 
+    def has_uncommitted_restore(self, req: Any) -> bool:
+        """Whether a request retains private restore slots pending checkpoint."""
+        return False
+
     def pop_prefetch_loaded_span(
         self, handle: CacheRequestHandle
     ) -> tuple[int, Optional[int]]:

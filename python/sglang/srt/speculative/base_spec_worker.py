@@ -268,9 +268,14 @@ class BaseSpecWorker(ABC):
         target_model_runner.mtp_draft_device_pools = ()
         target_model_runner.mtp_draft_mamba_pools = ()
         spec_algorithm = target_model_runner.spec_algorithm
+        use_flexkv = (
+            getattr(get_memory(), "enable_flexkv", False)
+            or getattr(get_memory(), "radix_cache_backend", None) == "flexkv"
+        )
         if not (
             get_memory().enable_hierarchical_cache
             or get_memory().enable_unified_cache_external_linker
+            or use_flexkv
             or get_disagg().disaggregation_decode_retraction_backup == "host_pool"
         ):
             return HiCacheDraftPlan()
@@ -280,6 +285,10 @@ class BaseSpecWorker(ABC):
             return HiCacheDraftPlan()
         draft_pools = tuple(runner.token_to_kv_pool for runner in draft_runners)
         if any(runner.runner_ids.is_fused_draft for runner in draft_runners):
+            if use_flexkv:
+                raise NotImplementedError(
+                    "FlexKV fused draft page envelopes are not supported yet"
+                )
             from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
                 validate_fused_hicache_draft,
             )
@@ -330,7 +339,8 @@ class BaseSpecWorker(ABC):
             mode=HiCacheDraftMode.SIDECAR,
             # Preserve the legacy non-packed HiCache behavior: multi-layer
             # EAGLE registers only the first draft runner as the sidecar.
-            device_pools=draft_pools[:1],
+            # FlexKV's grouped task instead carries every draft member.
+            device_pools=draft_pools if use_flexkv else draft_pools[:1],
         )
 
     def init_hicache_draft_plan(self) -> None:
