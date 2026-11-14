@@ -15,6 +15,10 @@ from diffusers.models.autoencoders.vae import (
 )
 from diffusers.models.modeling_outputs import AutoencoderKLOutput
 
+from sglang.multimodal_gen.runtime.distributed import get_decode_parallel_world_size
+from sglang.multimodal_gen.runtime.layers.parallel_conv import (
+    disable_spatial_parallel_decode,
+)
 from sglang.multimodal_gen.runtime.models.vaes.parallel.diffusers_spatial import (
     spatial_parallel_diffusers_decode,
 )
@@ -65,13 +69,20 @@ class AutoencoderKLMixin:
             return self.tiled_decode(z, return_dict=return_dict)
         if self.post_quant_conv is not None:
             z = self.post_quant_conv(z)
-        if self._spatial_parallel_decode_enabled:
-            dec = spatial_parallel_diffusers_decode(
-                self.decoder, z, self._spatial_parallel_upsample_count
-            )
-        else:
-            dec = self.decoder(z)
+        dec = self._decode_latents(z)
         return DecoderOutput(sample=dec) if return_dict else (dec,)
+
+    def _decode_latents(self, z: torch.Tensor) -> torch.Tensor:
+        if not self._spatial_parallel_decode_enabled:
+            return self.decoder(z)
+        if z.shape[-2] < get_decode_parallel_world_size():
+            # A height shard cannot be empty. Decode this small input locally;
+            # the scope restores parallel decode for later tiles and requests.
+            with disable_spatial_parallel_decode():
+                return self.decoder(z)
+        return spatial_parallel_diffusers_decode(
+            self.decoder, z, self._spatial_parallel_upsample_count
+        )
 
     def blend_v(self, a: torch.Tensor, b: torch.Tensor, blend_extent: int):
         blend_extent = min(a.shape[2], b.shape[2], blend_extent)
@@ -147,8 +158,7 @@ class AutoencoderKLMixin:
                 ]
                 if self.config.use_post_quant_conv:
                     tile = self.post_quant_conv(tile)
-                decoded = self.decoder(tile)
-                row.append(decoded)
+                row.append(self._decode_latents(tile))
             rows.append(row)
         dec = self._blend_tiles(rows, blend_extent, row_limit)
         return DecoderOutput(sample=dec) if return_dict else (dec,)

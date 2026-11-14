@@ -4,6 +4,11 @@ export const DiffusionModelCatalog = ({ category }) => {
   const MODEL_CATALOG = {
   image: [
     {
+      name: "Ovis-Image",
+      modelIds: ["ATH-MaaS/Ovis-Image-7B", "AIDC-AI/Ovis-Image-7B"],
+      cookbook: "/cookbook/diffusion/Ovis/Ovis-Image",
+    },
+    {
       name: "MiniMax-H3-Image",
       modelIds: ["MiniMaxAI/MiniMax-H3-Image"],
       cookbook: "/cookbook/diffusion/MiniMax/MiniMax-H3-Image",
