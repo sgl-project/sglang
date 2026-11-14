@@ -24,7 +24,12 @@ from sglang.srt.environ import envs
 logger = logging.getLogger(__name__)
 
 # Global constants for custom memory pool types
-SUPPORTED_MOONCAKE_CUSTOM_MEM_POOL_TYPES = ["NVLINK", "BAREX", "INTRA_NODE_NVLINK"]
+SUPPORTED_MOONCAKE_CUSTOM_MEM_POOL_TYPES = [
+    "NVLINK",
+    "BAREX",
+    "INTRA_NODE_NVLINK",
+    "FABRIC",
+]
 
 
 def _cuda_expandable_segments_enabled() -> Optional[str]:
@@ -44,7 +49,11 @@ def _validate_efa_allocator_compatibility(
     if envs.MOONCAKE_PROTOCOL.get().lower() != "efa":
         return
 
-    if enable_custom_mem_pool and custom_mem_pool_type in ("NVLINK", "BAREX"):
+    if enable_custom_mem_pool and custom_mem_pool_type in (
+        "NVLINK",
+        "BAREX",
+        "FABRIC",
+    ):
         raise ValueError(
             f"SGLANG_MOONCAKE_CUSTOM_MEM_POOL={custom_mem_pool_type} is "
             "incompatible with MOONCAKE_PROTOCOL=efa. Mooncake custom memory "
@@ -81,6 +90,12 @@ def init_mooncake_custom_mem_pool(
     custom_mem_pool = None
 
     if enable_custom_mem_pool:
+        if custom_mem_pool_type == "FABRIC":
+            from sglang.srt.mem_cache.fabric_mem_pool import (
+                init_cuda_vmm_fabric_mem_pool,
+            )
+
+            return init_cuda_vmm_fabric_mem_pool(device)
         try:
             # TODO(shangming): abstract custom allocator class for more backends
             if custom_mem_pool_type == "NVLINK":
@@ -108,6 +123,26 @@ def init_mooncake_custom_mem_pool(
                 f"Initialized custom memory pool: {custom_mem_pool_type} on device {device}"
             )
         except ImportError as e:
+            if custom_mem_pool_type == "NVLINK":
+                from sglang.srt.mem_cache.fabric_mem_pool import (
+                    _resolve_cuda_device,
+                    init_cuda_vmm_fabric_mem_pool,
+                )
+                from sglang.srt.utils.cuda_vmm_utils import is_gpu_fabric_ready
+
+                if (
+                    hasattr(torch, "cuda")
+                    and torch.cuda.is_available()
+                    and torch.device(device).type == "cuda"
+                    and is_gpu_fabric_ready(_resolve_cuda_device(device))
+                ):
+                    logger.info(
+                        "mooncake.allocator is not installed (%s); falling back "
+                        "to native CUDA VMM FABRIC mem pool on %s.",
+                        e,
+                        device,
+                    )
+                    return init_cuda_vmm_fabric_mem_pool(device)
             logger.warning(
                 f"Failed to import mooncake allocator for {custom_mem_pool_type}: {e}. "
                 f"Falling back to default memory pool."
