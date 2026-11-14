@@ -1,0 +1,254 @@
+---
+title: "GLM-5.2 W4A8 single-node long-context tuning"
+description: "Single-node GLM-5.2 W4A8 deployment and 128K long-context tuning on Atlas A3"
+---
+
+<Note>
+This page supplements the [GLM-5.2 model tutorial](/docs/hardware-platforms/ascend-npus/model-deployment/tutorials/glm_5_2) and the [GLM-5.2 best practices](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/glm_5_2) with a single-node, eight-card Atlas A3 configuration for 128K input, 1K output, and 90% shared prefixes.
+
+The results below were collected with `swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann9.1.0-a3`. This is a mutable `main` image tag. For reproducible runs, record the SGLang commit, image digest, CANN version, and `torch_npu` version. The measurements are single-run results, not statistically aggregated benchmarks.
+</Note>
+
+## Test Setup
+
+| Item | Value |
+| --- | --- |
+| Model | GLM-5.2 W4A8, ModelSlim quantization |
+| Hardware | One Atlas A3 node, 8 cards and 16 dies |
+| Parallelism | `--tp-size 16`, `--attn-dp-size 8` |
+| Deployment | Single-node mixed prefill/decode, without PD disaggregation |
+| Dataset | `completion-accept3-128k-prefix90-4096` |
+| Workload | 131072 input tokens, 1024 output tokens, 90% shared prefix |
+| Client concurrency | 8 |
+| Formal requests | 32 |
+
+## Recommended Configuration for a 50 ms TPOT Target
+
+This configuration uses Attention DP, NEXTN MTP, DeepEP auto mode, and NPU decode graphs. In the recorded run, it achieved a mean TPOT of 22.30 ms and an output throughput of 200.45 tokens/s.
+
+### Start the Server
+
+Replace `MODEL_PATH` with the local model weight directory before running the script.
+
+```bash Command
+# High-performance CPU mode
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=0
+sysctl -w kernel.numa_balancing=0
+sysctl -w kernel.sched_migration_cost_ns=50000
+
+# Bind CPUs
+export SGLANG_SET_CPU_AFFINITY=1
+
+unset https_proxy
+unset http_proxy
+unset HTTPS_PROXY
+unset HTTP_PROXY
+unset ASCEND_LAUNCH_BLOCKING
+
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+
+export STREAMS_PER_DEVICE=32
+export SGLANG_ENABLE_SPEC_V2=1
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export DEEPEP_HCCL_BUFFSIZE=1000
+export HCCL_OP_EXPANSION_MODE=AIV
+export HCCL_SOCKET_IFNAME=lo
+export GLOO_SOCKET_IFNAME=lo
+
+MODEL_PATH=/home/weights/GLM-5.2-w4a8
+
+export DEEPEP_NORMAL_LONG_SEQ_ROUND=72
+export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=1024
+export DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ=1
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=16
+export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
+export DEEPEP_HYBRID_DEPLOYMENT=1
+
+python3 -m sglang.launch_server \
+    --model-path "$MODEL_PATH" \
+    --attention-backend ascend \
+    --device npu \
+    --tp-size 16 \
+    --attn-dp-size 8 \
+    --nnodes 1 \
+    --disable-shared-experts-fusion \
+    --chunked-prefill-size 8192 \
+    --max-prefill-tokens 280000 \
+    --trust-remote-code \
+    --mem-fraction-static 0.85 \
+    --served-model-name GLM-5.2-w4a8 \
+    --max-running-requests 8 \
+    --cuda-graph-max-bs-decode 2 \
+    --quantization modelslim \
+    --moe-a2a-backend deepep \
+    --deepep-mode auto \
+    --speculative-algorithm NEXTN \
+    --speculative-num-steps 3 \
+    --speculative-eagle-topk 1 \
+    --speculative-num-draft-tokens 4 \
+    --load-balance-method round_robin \
+    --host 127.0.0.1 \
+    --port 5599
+```
+
+<Note>
+With Attention DP8 and `--cuda-graph-max-bs-decode 1`, the recorded run captured the target-verify graph at batch size 1 but produced `capture_bs=[]` for the draft graph. Increasing `--cuda-graph-max-bs-decode` to 2 allowed the server to start. Do not use the failed batch-size-1 configuration as a deployment baseline.
+</Note>
+
+### Verify Basic Inference
+
+```bash Command
+curl http://127.0.0.1:5599/generate \
+    -H "Content-Type: application/json" \
+    -d '{
+        "text": "What is the capital of France?",
+        "sampling_params": {
+            "max_new_tokens": 64,
+            "temperature": 0
+        }
+    }'
+```
+
+This request checks only basic serving functionality. It is not a substitute for standardized GSM8K accuracy evaluation. No standardized accuracy result was collected in the recorded experiment, so this page does not claim accuracy acceptance.
+
+### Warm the Prefix Cache and Benchmark
+
+The benchmark has two stages. The first stage distributes shared-prefix warmup requests across the Attention DP ranks and generates only four tokens per request. The second stage retains the prefix cache and sends 32 formal requests at client concurrency 8.
+
+Set `DP_SIZE` to the same value as the server's `--attn-dp-size`. Replace `MODEL_PATH` and `DATASET_DIR` with local paths.
+
+```bash Command
+#!/usr/bin/env bash
+set -e
+
+DP_SIZE=8
+CONCURRENCY=8
+BENCH_HOST=127.0.0.1
+BENCH_PORT=5599
+
+MODEL_PATH=/home/weights/GLM-5.2-w4a8
+DATASET_DIR=/home/datasets/completion-accept3-128k-prefix90-4096
+
+# Preserve the prefix cache between warmup and the formal benchmark.
+export SGLANG_IS_IN_CI=false
+
+# Stage 1: warm the shared prefix on each Attention DP rank.
+python -m sglang.benchmark.serving \
+  --backend sglang \
+  --host "$BENCH_HOST" --port "$BENCH_PORT" \
+  --model "$MODEL_PATH" \
+  --served-model-name GLM-5.2-w4a8 \
+  --tokenizer "$MODEL_PATH" \
+  --dataset-name custom \
+  --dataset-path "$DATASET_DIR/requests-64.jsonl" \
+  --sharegpt-output-len 4 \
+  --num-prompts "$((DP_SIZE * 2))" \
+  --max-concurrency "$DP_SIZE" \
+  --temperature 1.1 --top-p 0.95 \
+  --seed 42 --warmup-requests 0 \
+  --output-file /dev/null
+
+# Stage 2: run the formal benchmark without flushing the prefix cache.
+python -m sglang.benchmark.serving \
+  --backend sglang \
+  --host "$BENCH_HOST" --port "$BENCH_PORT" \
+  --model "$MODEL_PATH" \
+  --served-model-name GLM-5.2-w4a8 \
+  --tokenizer "$MODEL_PATH" \
+  --dataset-name custom \
+  --dataset-path "$DATASET_DIR/requests.jsonl" \
+  --sharegpt-output-len 1024 \
+  --num-prompts "$((CONCURRENCY * 4))" \
+  --max-concurrency "$CONCURRENCY" \
+  --temperature 1.1 --top-p 0.95 \
+  --seed 42 --warmup-requests 0
+```
+
+### Recorded Results
+
+| Metric | Result |
+| --- | ---: |
+| Successful requests | 32 |
+| Benchmark duration | 163.47 s |
+| Total input tokens | 4,194,304 |
+| Total generated tokens | 32,768 |
+| Request throughput | 0.20 req/s |
+| Input token throughput | 25,657.18 tokens/s |
+| Output token throughput | 200.45 tokens/s |
+| Total token throughput | 25,857.63 tokens/s |
+| Accept length | 3.02 |
+| Mean end-to-end latency | 40,830.29 ms |
+| Mean TTFT | 18,020.05 ms |
+| Mean TPOT | 22.30 ms |
+| Median TPOT | 21.93 ms |
+| P90 TPOT | 23.20 ms |
+| P99 TPOT | 24.93 ms |
+| Maximum ITL | 737.05 ms |
+
+The mean TPOT meets the 50 ms target. The accept length of 3.02 indicates that NEXTN MTP provided acceleration in this run. These results come from one run and should be confirmed with at least three repeated runs, cache-hit reporting, and a standardized accuracy evaluation before being used as an acceptance baseline.
+
+## Tuning Toward a 20 ms TPOT Target
+
+The following experiments did not reach a mean or median TPOT below 20 ms at client concurrency 8. They are retained to document performance trade-offs and should not replace the recommended configuration above.
+
+| Configuration | Client concurrency | Accept length | Mean TPOT | Output throughput | Observation |
+| --- | ---: | ---: | ---: | ---: | --- |
+| TP16, no Attention DP | 1 | 3.02 | 19.35 ms | 36.92 tokens/s | Meets 20 ms only at single concurrency; not comparable with the concurrency-8 runs |
+| Attention DP8, decode graph max BS2, dispatch16 | 8 | 3.02 | 22.30 ms | 200.45 tokens/s | Best recorded configuration; meets the 50 ms target |
+| MLAPO, FIA NZ, Multi-Stream, Overlap Reflow, DP LM Head | 8 | 1.00 | 59.79 ms | 96.46 tokens/s | MTP acceleration lost; do not use this combination as a baseline |
+| Multi-Stream, dispatch4 | 8 | 3.13 | 30.89 ms | 158.44 tokens/s | Higher peak throughput but a 13.13 s maximum ITL |
+| Multi-Stream, dispatch4, chunk4096, Prefill Delayer | 8 | 3.02 | 29.15 ms | 130.50 tokens/s | Long-tail latency remains; the 20 ms target is not met |
+
+The single-concurrency result is not evidence that the 20 ms target was reached at concurrency 8 because its request count, concurrency, and throughput differ from the other experiments.
+
+### Final 20 ms Experiment Configuration
+
+The final experiment starts from the recommended configuration and makes the following changes:
+
+```bash Command
+export SGLANG_NPU_USE_MULTI_STREAM=1
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=4
+```
+
+Use these server arguments instead of their counterparts in the recommended configuration:
+
+```bash Command
+    --chunked-prefill-size 4096 \
+    --enable-prefill-delayer \
+    --prefill-delayer-max-delay-passes 100 \
+```
+
+The benchmark commands remain unchanged. The recorded results were:
+
+| Metric | Recommended configuration | Final 20 ms experiment |
+| --- | ---: | ---: |
+| Mean TPOT | 22.30 ms | 29.15 ms |
+| Median TPOT | 21.93 ms | 20.95 ms |
+| P90 TPOT | 23.20 ms | 40.63 ms |
+| P99 TPOT | 24.93 ms | 81.09 ms |
+| Maximum ITL | 737.05 ms | 19,307.91 ms |
+| Mean TTFT | 18,020.05 ms | 25,265.98 ms |
+| Output throughput | 200.45 tokens/s | 130.50 tokens/s |
+| Accept length | 3.02 | 3.02 |
+
+Prefill Delayer did not remove the long-tail stalls. It increased mean TTFT and reduced output throughput while still missing the 20 ms TPOT target. Evaluate P90/P99 TPOT, maximum ITL, TTFT, and output throughput together rather than optimizing only mean TPOT.
+
+## Compatibility and Observability Notes
+
+- **Combined decode optimizations:** In the recorded W4A8, Attention DP8, DeepEP auto, and NEXTN mixed-node setup, enabling MLAPO, FIA NZ, Multi-Stream, Overlap Reflow, and DP LM Head together reduced accept length from 3.02 to 1.00. Because multiple variables changed simultaneously, the result does not identify a single incompatible switch.
+- **Long-tail latency:** Multi-Stream with dispatch4 increased peak output throughput to 449 tokens/s but produced a 13.13 s maximum ITL. Adding chunk4096 and Prefill Delayer increased maximum ITL to 19.31 s.
+- **Prefix-cache observability:** The warmup relies on request count, concurrency, and `round_robin` placement. The recorded benchmark did not enable `--cache-report`, so it could not verify cache hits independently on every Attention DP rank. Enable cache reporting and save warmup logs when diagnosing long-tail latency.
+- **Stale server processes:** Before changing configurations, stop the old SGLang server and verify that both the serving port and internal ports are released. A stopped old process can still cause a port conflict, and a benchmark may otherwise connect to the previous configuration.
+
+## Reproduction Checklist
+
+1. Record the SGLang commit, immutable image digest, CANN version, and `torch_npu` version.
+2. Stop the previous server and confirm that its serving and internal ports are released.
+3. Repeat prefix-cache warmup after every server restart; do not include warmup results in formal benchmark results.
+4. Keep the dataset, request count, output length, concurrency, temperature, and top-p fixed when comparing configurations.
+5. Use `--cache-report` and save per-rank cache-hit information where available.
+6. Report median/P90/P99 TPOT, maximum ITL, accept length, TTFT, and output throughput in addition to mean TPOT.
+7. Run at least three benchmark repetitions and report variability.
+8. Run standardized GSM8K accuracy evaluation separately; MTP accept length is not an accuracy metric.
