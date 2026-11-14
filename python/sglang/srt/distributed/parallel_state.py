@@ -70,6 +70,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_cuda_alike,
     is_gfx95_supported,
+    is_gfx942_supported,
     is_hip,
     is_mlu,
     is_musa,
@@ -903,7 +904,7 @@ class GroupCoordinator:
     ) -> Optional[Tuple[torch.Tensor, ...]]:
         """Attempt fused all-reduce + RMSNorm + per-group FP8 quant.
 
-        ROCm/aiter/gfx95-only entry point. Returns ``None`` on any other
+        ROCm/aiter entry point for gfx942 and gfx95. Returns ``None`` on any other
         platform or when the aiter custom-all-reduce communicator cannot
         service the request, letting the caller fall back to the existing
         ``fused_allreduce_rmsnorm`` + separate per-group quant path.
@@ -918,7 +919,7 @@ class GroupCoordinator:
         the column-major layout the gfx95 bpreshuffle GEMM consumes, so the
         caller can skip the post-kernel scale transpose.
         """
-        if not (is_hip() and is_gfx95_supported()):
+        if not (is_hip() and (is_gfx95_supported() or is_gfx942_supported())):
             return None
 
         ca_comm = self.ca_comm

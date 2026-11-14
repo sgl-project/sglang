@@ -289,7 +289,7 @@ def _forward_with_allreduce_fusion_quant_per_group(
 ):
     """Fused AR + RMSNorm + per-group FP8 quant with graceful staged fallback.
 
-    The single-kernel quantized backend dispatch is ROCm + aiter + gfx95-only.
+    The single-kernel quantized backend dispatch is ROCm + aiter on gfx942 and gfx95.
     Other HIP/aiter runs can still use the 2-kernel fallback below to preserve
     the existing tuple handoff behavior.
 
