@@ -1083,6 +1083,56 @@ def _minimax_h3_attention_core_impl(
 
     _minimax_h3_bind_attention_backend(attention, q.dtype)
 
+    if (
+        ulysses_active
+        and not ring_active
+        and gate_compress is None
+        and attention._attention_backend_enum
+        is AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN
+        and attention._attention_impl.schedule.quantize_before_a2a
+    ):
+        from sglang.multimodal_gen.runtime.layers.attention.backends.subblock_sparse.prepared_sage_attention import (
+            prepared_subblock_sage_attention_forward,
+        )
+
+        out = prepared_subblock_sage_attention_forward(
+            q,
+            k,
+            v,
+            impl=attention._attention_impl,
+            cu_seqlens_host=cu_seqlens_host,
+            max_seqlen=max_seqlen,
+            ulysses_active=ulysses_active,
+            ring_active=ring_active,
+            query_block_mask=subblock_sparse_query_block_mask,
+        )
+        if out is not None:
+            return out
+
+    if (
+        ulysses_active
+        and not ring_active
+        and gate_compress is None
+        and attention._attention_backend_enum is AttentionBackendEnum.SAGE_ATTN
+        and getattr(attention._attention_impl, "quantize_before_a2a", False)
+    ):
+        from sglang.multimodal_gen.runtime.layers.attention.backends.prepared_sage_attn import (
+            prepared_dense_sage_attention_forward,
+        )
+
+        out = prepared_dense_sage_attention_forward(
+            q,
+            k,
+            v,
+            impl=attention._attention_impl,
+            cu_seqlens_host=cu_seqlens_host,
+            max_seqlen=max_seqlen,
+            ulysses_active=ulysses_active,
+            ring_active=ring_active,
+        )
+        if out is not None:
+            return out
+
     if ulysses_active and not ring_active and gate_compress is None:
         pipeline_kwargs = dict(
             cu_seqlens=cu_seqlens,
@@ -1338,6 +1388,14 @@ class MiniMaxH3Attention(nn.Module):
                 selected_attention_backend=AttentionBackendEnum.FA,
             )
         impl_cls = backend.get_impl_cls()
+        extra_impl_args = {}
+        if backend.get_enum() is AttentionBackendEnum.SAGE_ATTN:
+            from sglang.multimodal_gen.runtime.server_args import get_global_server_args
+
+            config = get_global_server_args().attention_backend_config or {}
+            extra_impl_args["quantize_before_a2a"] = config.get(
+                "quantize_before_a2a", False
+            )
         self._attention_impl = impl_cls(
             num_heads=self.num_heads,
             head_size=self.head_dim,
@@ -1346,6 +1404,7 @@ class MiniMaxH3Attention(nn.Module):
             num_kv_heads=self.num_heads,
             prefix=self.prefix,
             packed_trailing_padding=True,
+            **extra_impl_args,
         )
         # Ring only supports _RING_ATTENTION_BACKENDS; keep the resolved enum
         # alongside the impl instance instead of a second get_attn_backend()

@@ -65,6 +65,21 @@ class SageAttentionImpl(AttentionImpl):
         self.causal = causal
         self.softmax_scale = softmax_scale
         self.dropout = extra_impl_args.get("dropout_p", 0.0)
+        self.quantize_before_a2a = extra_impl_args.get("quantize_before_a2a", False)
+        if type(self.quantize_before_a2a) is not bool:
+            raise ValueError("sage_attn quantize_before_a2a must be a boolean")
+        if (
+            self.quantize_before_a2a
+            and envs.SGLANG_USE_SAGE_ATTENTION_IMPL.get().lower()
+            in {
+                "trtllm_gen",
+                "trtllm-gen",
+            }
+        ):
+            raise ValueError(
+                "sage_attn quantize_before_a2a uses SageAttention2; "
+                "it cannot be combined with the TRT-LLM Gen Sage implementation"
+            )
         self.packed_trailing_padding = extra_impl_args.get(
             "packed_trailing_padding", False
         )

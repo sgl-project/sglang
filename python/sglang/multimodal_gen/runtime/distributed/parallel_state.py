@@ -944,6 +944,13 @@ def destroy_model_parallel() -> None:
 
     IPC_A2A.reset()
     IPC_A2A_MULTI.reset()
+    import sys
+
+    prepared_sage = sys.modules.get(
+        "sglang.multimodal_gen.runtime.distributed.sage_ulysses"
+    )
+    if prepared_sage is not None:
+        prepared_sage.shutdown_prepared_sage_ulysses()
 
     destroyed_groups = []
     for group in (

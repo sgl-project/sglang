@@ -21,7 +21,7 @@ individual keys of the defaults below::
 Requirements inherited from the kernels: compute capability 9.0 (Hopper) or
 10.0/12.0 (Blackwell), bf16, head_dim 128. Hopper uses SGLang's CuTe-DSL SM90
 block-sparse FlashAttention kernel by default; ``compute_mode="sage_fp8"``
-selects native SageAttention2 on SM90 and FlashInfer's CuTe-DSL Sage kernel
+selects native SageAttention2 on SM90 and FlashInfer's CAKE Sage kernel
 on SM120, both using INT8 QK and FP8 PV. SM100 uses the BF16 kernel because
 its Sage path does not support SubBlock's variable counts and partial blocks.
 Inside the DiT, unsupported calls run dense instead; unsupported GPU
@@ -253,8 +253,8 @@ def _load_sm120_sage_ops():
         )
     except (ImportError, OSError) as exc:
         raise ImportError(
-            "SM120 SubBlock sage_fp8 requires FlashInfer with the CuTe-DSL "
-            "SM120 Sage backend and quantize_sage_qkv_sm120."
+            "SM120 SubBlock sage_fp8 requires FlashInfer with the "
+            "SM120 CAKE Sage backend and quantize_sage_qkv_sm120."
         ) from exc
     return quantize_sage_qkv_sm120, bsa_attn_sm120_blk64_sage_fwd
 
@@ -268,9 +268,11 @@ def _sm120_sage_fp8_sparse_attention(
     softmax_scale: float,
     block_counts: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Quantize BSHD activations online and execute a Q64 x K64 Sage plan."""
+    """Quantize BSHD views online and execute a Q64 x K64 CAKE Sage plan."""
     quantize, attention = _load_sm120_sage_ops()
-    q_hnd, k_hnd, v_hnd = (x.transpose(1, 2).contiguous() for x in (q, k, v))
+    # The quantizer reads BHSD strides; only the head dimension must be
+    # contiguous. Preserve packed QKV views instead of copying BF16 inputs.
+    q_hnd, k_hnd, v_hnd = (x.transpose(1, 2) for x in (q, k, v))
     quantized = quantize(q_hnd, k_hnd, v_hnd)
     out = attention(
         *quantized,
@@ -281,9 +283,14 @@ def _sm120_sage_fp8_sparse_attention(
             block_counts.contiguous() if block_counts is not None else None
         ),
         softmax_scale=softmax_scale,
-        backend="cute_dsl",
+        out=torch.empty(q_hnd.shape, dtype=torch.bfloat16, device=q.device),
+        uniform_block_count=block_counts is None,
+        contiguous_block_indices=False,
+        backend="cake",
     )
-    return out.transpose(1, 2).contiguous()
+    # Packed callers copy each segment into their output buffer, so returning
+    # the BSHD view avoids another full attention-output copy here.
+    return out.transpose(1, 2)
 
 
 def _sm120_sparse_attention(
@@ -413,6 +420,7 @@ class SubBlockSparseSchedule(msgspec.Struct, frozen=True):
     n_q: int
     min_seq_len: int
     compute_mode: str
+    quantize_before_a2a: bool = False
 
     @classmethod
     def from_server_args(cls) -> SubBlockSparseSchedule:
@@ -420,6 +428,13 @@ class SubBlockSparseSchedule(msgspec.Struct, frozen=True):
 
         config = get_global_server_args().attention_backend_config or {}
         compute_mode = str(config.get("compute_mode", DEFAULT_COMPUTE_MODE))
+        quantize_before_a2a = config.get("quantize_before_a2a", False)
+        if type(quantize_before_a2a) is not bool:
+            raise ValueError("subblock quantize_before_a2a must be a boolean")
+        if quantize_before_a2a and compute_mode != "sage_fp8":
+            raise ValueError(
+                "subblock quantize_before_a2a requires compute_mode='sage_fp8'"
+            )
         # Use 16-token pooling cells for both K128 (SM90) and K64 (SM120).
         default_n_k = (
             _sage_key_block_size() // 16 if compute_mode == "sage_fp8" else DEFAULT_N_K
@@ -436,6 +451,7 @@ class SubBlockSparseSchedule(msgspec.Struct, frozen=True):
             n_q=int(config.get("n_q", DEFAULT_N_Q)),
             min_seq_len=int(config.get("min_seq_len", DEFAULT_MIN_SEQ_LEN)),
             compute_mode=compute_mode,
+            quantize_before_a2a=quantize_before_a2a,
         )
         if not 0.0 <= schedule.sparsity < 1.0:
             raise ValueError(
@@ -518,7 +534,27 @@ class SubBlockSparseAttentionImpl(AttentionImpl):
             )
 
     def _build_dense_impl(self, *, causal: bool) -> AttentionImpl:
-        """Flash attention, used wherever the schedule excludes sparsity."""
+        """Use dense Sage for SM120 Sage DiT steps excluded from sparsity."""
+        if (
+            self.schedule.compute_mode == "sage_fp8"
+            and self.layer_idx is not None
+            and torch.cuda.is_available()
+            and torch.cuda.get_device_capability() == (12, 0)
+        ):
+            from sglang.multimodal_gen.runtime.layers.attention.backends.sage_attn import (
+                SageAttentionImpl,
+            )
+
+            return SageAttentionImpl(
+                num_heads=self.num_heads,
+                head_size=self.head_size,
+                causal=causal,
+                softmax_scale=self.softmax_scale,
+                num_kv_heads=self.num_kv_heads,
+                prefix=f"{self.prefix}.dense",
+                packed_trailing_padding=True,
+                quantize_before_a2a=self.schedule.quantize_before_a2a,
+            )
         from sglang.multimodal_gen.runtime.layers.attention.selector import (
             get_attn_backend,
         )
