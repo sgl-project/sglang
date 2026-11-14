@@ -702,9 +702,9 @@ class TestGGUFIncompatibleOptions(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "svdquant"):
             self._resolve(nunchaku_config=object())
 
-    def test_rejects_lora(self):
+    def test_rejects_merged_lora(self):
         with self.assertRaisesRegex(ValueError, "LoRA"):
-            self._resolve(lora_path="some/adapter")
+            self._resolve(lora_path="some/adapter", lora_merge_mode="merge")
 
     def test_rejects_h3_adaln_online(self):
         with self.assertRaisesRegex(ValueError, "adaln-online"):
