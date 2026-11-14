@@ -34,7 +34,7 @@ from triton.language.extra import libdevice
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
-from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
+from sglang.srt.hf_transformers import get_rope_config
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
@@ -57,7 +57,6 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
     get_deepep_mode,
     get_moe_a2a_backend,
-    get_moe_runner_backend,
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
@@ -65,13 +64,14 @@ from sglang.srt.layers.moe.token_dispatcher import DeepEPDispatcher
 from sglang.srt.layers.moe.topk import (
     StandardTopKOutput,
     TopK,
-    TritonKernelTopKOutput,
     capture_routed_experts_if_allowed,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.layers.utils.layer_list import make_pp_layers
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -83,17 +83,10 @@ from sglang.srt.models.utils import (
     apply_qk_norm,
     create_fused_set_kv_buffer_arg,
     enable_fused_set_kv_buffer,
+    is_non_idle_and_non_empty,
 )
 from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
-from sglang.srt.utils import (
-    LazyValue,
-    add_prefix,
-    is_cuda,
-    is_non_idle_and_non_empty,
-    is_npu,
-    make_pp_layers,
-)
-from sglang.srt.utils.hf_transformers_utils import get_rope_config
+from sglang.srt.utils import LazyValue, is_cuda, is_npu
 
 LoraConfig = None
 logger = logging.getLogger(__name__)
@@ -127,59 +120,16 @@ def _require_block_routing_simulated_experts_compatibility() -> None:
         )
 
 
-def _get_effective_moe_runner_backend(experts):
-    """Return the runner selected by the quant method, including auto selection."""
-    quant_method = getattr(experts, "quant_method", None)
-
-    # UnquantizedFusedMoEMethod keeps a Triton fallback in ``runner`` but
-    # forward_cuda executes this AITER runner first whenever auto selection
-    # created it. Resolve the runner that actually executes, not the fallback.
-    aiter_runner = getattr(quant_method, "_aiter_runner", None)
-    backend = getattr(aiter_runner, "runner_backend", None)
-    if backend is not None:
-        return backend
-
-    backend = getattr(quant_method, "_moe_runner_backend", None)
-    if backend is not None:
-        return backend
-
-    runner = getattr(quant_method, "runner", None)
-    backend = getattr(runner, "runner_backend", None)
-    if backend is not None:
-        return backend
-
-    runner = getattr(experts, "runner", None)
-    backend = getattr(runner, "runner_backend", None)
-    if backend is not None:
-        return backend
-
-    return get_moe_runner_backend()
-
-
-def _require_block_routing_runner_compatibility(experts) -> None:
-    backend = _get_effective_moe_runner_backend(experts)
+def _require_block_routing_runner_compatibility(experts, top_k: int) -> None:
+    backend = experts.runner_backend
+    if backend is None:
+        # Direct standard/local-ID kernels consume the block router's materialized output.
+        return
     if backend.is_flashinfer_trtllm():
         raise ValueError(
             "LLaDA2 block routing does not support --moe-runner-backend "
             "flashinfer_trtllm; use a compatible runner instead"
         )
-
-
-def _make_block_routing_triton_output(
-    ragged_metadata,
-    combine_indx: torch.Tensor,
-    gate_scal: torch.Tensor,
-    n_expts_act: int,
-) -> TritonKernelTopKOutput:
-    """Pack block-routing metadata using the current five-field ABI."""
-    gather_indx = torch.div(combine_indx, n_expts_act, rounding_mode="trunc")
-    return TritonKernelTopKOutput(
-        a_ragged_metadata=ragged_metadata,
-        gather_indx=gather_indx,
-        scatter_indx=combine_indx,
-        gate_scal=gate_scal,
-        n_expts_act=n_expts_act,
-    )
 
 
 @triton.jit
@@ -636,9 +586,13 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
         )
 
         if self.use_block_routing:
-            if get_moe_a2a_backend().is_deepep():
+            if (
+                get_moe_a2a_backend().is_deepep()
+                or get_moe_a2a_backend().is_ascend_ops()
+            ):
                 raise ValueError(
-                    "LLaDA2 block routing does not support --moe-a2a-backend deepep"
+                    "LLaDA2 block routing does not support --moe-a2a-backend "
+                    f"{get_moe_a2a_backend().value}"
                 )
             if self.correction_bias is None:
                 raise ValueError(
@@ -666,14 +620,6 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
                     f"got top_k={self.top_k}, "
                     f"expert_capacity={self.expert_capacity}, "
                     f"num_experts={self.num_experts}"
-                )
-            if get_moe_runner_backend().is_triton_kernels() and self.top_k & (
-                self.top_k - 1
-            ):
-                raise ValueError(
-                    "LLaDA2 block routing with --moe-runner-backend "
-                    "triton_kernel requires num_experts_per_tok to be a "
-                    f"power of two, got {self.top_k}"
                 )
 
         if self.score_function is not None:
@@ -709,8 +655,15 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
             routed_scaling_factor=self.routed_scaling_factor,
             prefix=add_prefix("experts", prefix),
         )
+        self.topk.topk_config.apply_routed_scaling_factor_on_output = (
+            _is_npu or self.experts.should_fuse_routed_scaling_factor_in_topk
+        )
+        self.topk.bind_runner_backend(
+            self.experts.runner_backend,
+            routing_method_type=self.experts.routing_method_type,
+        )
         if self.use_block_routing:
-            _require_block_routing_runner_compatibility(self.experts)
+            _require_block_routing_runner_compatibility(self.experts, self.top_k)
         # shared expert
         if config.num_shared_experts is not None:
             if hasattr(config, "moe_shared_expert_intermediate_size"):
@@ -726,7 +679,10 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
                 reduce_results=False,
                 prefix=add_prefix("shared_experts", prefix),
                 parallel_group="replicated"
-                if get_moe_a2a_backend().is_deepep()
+                if (
+                    get_moe_a2a_backend().is_deepep()
+                    or get_moe_a2a_backend().is_ascend_ops()
+                )
                 else "tp",
             )
         # dispatcher
@@ -749,7 +705,10 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: Optional[ForwardBatch] = None,
     ) -> torch.Tensor:
-        if not get_moe_a2a_backend().is_deepep():
+        if (
+            not get_moe_a2a_backend().is_deepep()
+            and not get_moe_a2a_backend().is_ascend_ops()
+        ):
             return self.forward_normal(hidden_states)
         else:
             return self.forward_deepep(hidden_states, forward_batch)
@@ -791,62 +750,17 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
         )
         get_global_expert_distribution_recorder().on_select_experts(topk_ids=topk_ids)
 
-        runner_backend = _get_effective_moe_runner_backend(self.experts)
-        if not runner_backend.is_triton_kernels():
-            if (
-                runner_backend.is_aiter()
-                or getattr(
-                    self.experts,
-                    "should_fuse_routed_scaling_factor_in_topk",
-                    False,
-                )
-            ) and self.routed_scaling_factor is not None:
-                topk_weights = topk_weights * self.routed_scaling_factor
-            return StandardTopKOutput(
-                topk_weights=topk_weights,
-                topk_ids=topk_ids,
-                router_logits=router_logits,
-            )
-
-        # triton_kernels needs expert-sorted routing metadata. Reuse the
-        # block router's selected expert ids via y_indx, but do not use the
-        # values produced by triton_kernels_topk: block routing uses sigmoid
-        # scores normalized over its own selected experts, not softmax scores.
-        from triton_kernels.tensor import make_ragged_tensor_metadata
-        from triton_kernels.topk import topk as triton_kernels_topk
-
-        if topk_ids.numel() == 0:
-            # Avoid launching the Triton top-k kernel with a zero-row grid.
-            dispatch_indx = torch.empty((0,), dtype=torch.int32, device=topk_ids.device)
-            combine_indx = torch.empty_like(dispatch_indx)
-            expert_counts = torch.zeros(
-                (self.num_experts,), dtype=torch.int32, device=topk_ids.device
-            )
-        else:
-            sparse_logits = triton_kernels_topk(
-                router_logits,
-                self.top_k,
-                apply_softmax=False,
-                y_indx=topk_ids,
-            )
-            dispatch_indx = sparse_logits.mask_metadata.row_sorted_indx
-            combine_indx = sparse_logits.mask_metadata.col_sorted_indx
-            expert_counts = sparse_logits.mask_metadata.col_sum
-
-        ragged_metadata = make_ragged_tensor_metadata(
-            expert_counts,
-            dispatch_indx.shape[0],
-        )
-
-        # combine_indx maps expert-major entries back to flattened token-major
-        # top-k entries. Preserve block routing's FP32 weights while packing the
-        # five-field triton_kernels output expected by the current MoE runner.
-        gate_scal = topk_weights.flatten()[combine_indx]
-        return _make_block_routing_triton_output(
-            ragged_metadata,
-            combine_indx,
-            gate_scal,
-            self.top_k,
+        runner_backend = self.experts.runner_backend
+        if (
+            runner_backend is not None
+            and runner_backend.is_aiter()
+            or self.experts.should_fuse_routed_scaling_factor_in_topk
+        ) and self.routed_scaling_factor is not None:
+            topk_weights = topk_weights * self.routed_scaling_factor
+        return StandardTopKOutput(
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            router_logits=router_logits,
         )
 
     def _forward_router_experts(self, hidden_states: torch.Tensor):
@@ -946,10 +860,6 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
-                num_token_non_padded=forward_batch.moe_num_token_non_padded(),
-                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                    layer_id=self.layer_id,
-                ),
             )
         else:
             topk_output = self.topk.empty_topk_output(hidden_states.device)

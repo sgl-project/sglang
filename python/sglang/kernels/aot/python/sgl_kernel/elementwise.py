@@ -324,59 +324,6 @@ if torch.version.hip is not None:
         return out
 
 
-def dsv4_fused_q_norm_rope(
-    q_input: torch.Tensor,
-    freqs_cis: torch.Tensor,
-    positions: torch.Tensor,
-    eps: float = 1e-6,
-    q_output: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    """DeepSeek-V4 fused Q RMSNorm (no weight) + RoPE.
-
-    Parameters
-    ----------
-    q_input  : (B, num_q_heads, head_dim) bfloat16
-    freqs_cis: (max_pos, rope_dim) float32, re/im interleaved
-    positions: (B,) int32
-    eps      : RMSNorm epsilon
-    q_output : optional pre-allocated output tensor
-    """
-    if q_output is None:
-        q_output = torch.empty_like(q_input)
-    torch.ops.sgl_kernel.dsv4_fused_q_norm_rope.default(
-        q_input, q_output, freqs_cis, positions, eps
-    )
-    return q_output
-
-
-def dsv4_fused_k_norm_rope_flashmla(
-    kv: torch.Tensor,
-    kv_weight: torch.Tensor,
-    freqs_cis: torch.Tensor,
-    positions: torch.Tensor,
-    out_loc: torch.Tensor,
-    kvcache: torch.Tensor,
-    eps: float = 1e-6,
-    page_size: int = 1,
-) -> None:
-    """DeepSeek-V4 fused K RMSNorm + RoPE + FlashMLA FP8 store.
-
-    Parameters
-    ----------
-    kv       : (B, 512) bfloat16
-    kv_weight: (512,) bfloat16
-    freqs_cis: (max_pos, 64) float32
-    positions: (B,) int32
-    out_loc  : (B,) int32  cache slot ids
-    kvcache  : (npages, page_bytes) uint8
-    eps      : RMSNorm epsilon
-    page_size: page size (power of 2)
-    """
-    torch.ops.sgl_kernel.dsv4_fused_k_norm_rope_flashmla.default(
-        kv, kv_weight, freqs_cis, positions, out_loc, kvcache, eps, page_size
-    )
-
-
 def dsv4_fused_q_indexer_rope_hadamard_quant(
     q_input: torch.Tensor,
     q_fp8: torch.Tensor,

@@ -16,9 +16,13 @@ from sglang.kernels.jit.benchmark.utils import (
     DEFAULT_DTYPE,
 )
 from sglang.kernels.jit.utils import is_arch_support_pdl
+from sglang.kernels.ops.kvcache.mla_buffer import (
+    set_mla_kv_buffer_kernel as sglang_triton_kernel,
+)
+from sglang.kernels.ops.kvcache.mla_buffer import (
+    set_mla_kv_buffer_triton as sglang_wrapper,
+)
 from sglang.kernels.ops.kvcache.set_mla_kv_buffer import set_mla_kv_buffer as jit_set
-from sglang.srt.mem_cache.utils import set_mla_kv_buffer_kernel as sglang_triton_kernel
-from sglang.srt.mem_cache.utils import set_mla_kv_buffer_triton as sglang_wrapper
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(

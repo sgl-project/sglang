@@ -49,11 +49,7 @@ def get_expected_cases(repo_root: Path) -> dict[str, set[str]]:
     run_suite_path = repo_root / RUN_SUITE_REL_PATH
     case_config_path = resolve_case_config_path(repo_root, run_suite_path)
 
-    suites = collect_diffusion_suites(
-        case_config_path,
-        run_suite_path,
-        baseline_path,
-    )
+    suites = collect_diffusion_suites(case_config_path, baseline_path)
 
     expected = {}
     for suite_name, suite_info in suites.items():

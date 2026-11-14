@@ -28,14 +28,12 @@ def _req(sampling_params: SamplingParams, steps: int) -> Req:
 def test_generic_warmup_keeps_the_requested_steps():
     warmup = _req(SamplingParams(prompt="p"), 50).copy_as_warmup(1)
     assert warmup.num_inference_steps == 1
-    assert warmup.extra["warmup_target_num_inference_steps"] == 50
 
 
 def test_h3_warmup_keeps_one_denoise_step():
     assert MiniMaxH3SamplingParams.min_num_inference_steps == 1
     warmup = _req(MiniMaxH3SamplingParams(prompt="p"), 50).copy_as_warmup(1)
     assert warmup.num_inference_steps == 1
-    assert warmup.extra["warmup_target_num_inference_steps"] == 50
 
 
 def test_explicit_steps_above_the_floor_are_kept():

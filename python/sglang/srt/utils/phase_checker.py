@@ -68,7 +68,7 @@ class SimplePhaseChecker:
         """Reset phase to initial_phase, then enable the device-side assert."""
         self._reset_to_idle()
         self._enable_assert_device.fill_(1)
-        _host_debug(f"[SimplePhaseChecker.enable_assert] assert ENABLED")
+        _host_debug("[SimplePhaseChecker.enable_assert] assert ENABLED")
 
     def update(
         self,

@@ -36,11 +36,12 @@ def prepare_kimi_k3_encoder_inputs(
     item and are executed by ``KimiK3ForConditionalGeneration`` only for images
     assigned to the local vision rank.
     """
-    from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+    from sglang.srt.managers.req_types import MultimodalDataItem
     from sglang.srt.multimodal.encoder_preprocessing import (
         EncoderPreprocessOutput,
         hash_raw_encoder_item,
     )
+    from sglang.srt.multimodal.modality import Modality
     from sglang.srt.multimodal.processors.kimi_k25 import (
         _grid_thw_from_resize_config,
         navit_resize_config,

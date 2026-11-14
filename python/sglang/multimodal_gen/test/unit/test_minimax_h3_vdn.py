@@ -16,6 +16,8 @@ import torch
 from sglang.multimodal_gen.configs.models.dits.minimax_h3 import (
     MiniMaxH3DiTArchConfig,
     MiniMaxH3DiTConfig,
+)
+from sglang.multimodal_gen.configs.models.dits.minimax_h3_vdn import (
     VDNHybridAttentionArchConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
@@ -97,6 +99,7 @@ def test_vdn_h3_sampling_defaults_and_rejections() -> None:
 def _server_args(**overrides) -> SimpleNamespace:
     args = dict(
         model_variant=None,
+        performance_mode="speed",
         attention_backend=None,
         component_attention_backends={},
         attention_backend_config=None,

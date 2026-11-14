@@ -2,7 +2,7 @@
 
 # SPDX-License-Identifier: Apache-2.0
 
-import importlib
+import functools
 import logging
 import os
 
@@ -10,6 +10,7 @@ import aiter
 import torch
 import triton
 import triton.language as tl
+from aiter.jit.core import ENABLE_CK as _AITER_ENABLE_CK
 
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionBackend,
@@ -20,7 +21,7 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.platforms.aiter import (
     USE_AITER_GFX95,
-    USE_AITER_GFX942,
+    USE_AITER_GFX1250,
 )
 
 logger = logging.getLogger(__name__)
@@ -227,6 +228,12 @@ def _fmha_fp8_prefill_attention(
     )
 
 
+@functools.lru_cache(maxsize=64)
+def _cu_seqlens(bounds: tuple[int, ...], device: torch.device) -> torch.Tensor:
+    # one upload per bounds and device; callers must not mutate the result
+    return torch.tensor(bounds, dtype=torch.int32, device=device)
+
+
 class AITerBackend(AttentionBackend):
     """
     Backend for AITemplate attention implementation.
@@ -248,6 +255,10 @@ class AITerBackend(AttentionBackend):
     @staticmethod
     def get_builder_cls() -> type["AttentionMetadataBuilder"]:
         raise NotImplementedError("AITer backend does not have a metadata builder.")
+
+    @classmethod
+    def supports_ring_rotation(cls) -> bool:
+        return True
 
 
 class AITerImpl(AttentionImpl):
@@ -280,13 +291,69 @@ class AITerImpl(AttentionImpl):
         self.softmax_scale = softmax_scale
 
     @torch.compiler.disable
+    def _forward_fp8(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+    ) -> torch.Tensor | None:
+        """
+        FP8 FMHA prefill path. Kept out of the compiled graph (the aiter FP8
+        quant + FMHA kernels are not torch.compile-safe); only invoked when
+        SGLANG_DIFFUSION_AITER_FP8_ATTN=1.
+
+        Returns the attention output, or None if the FP8 FMHA kernel does not
+        support the current shapes, in which case the caller falls back to the
+        (compilable) BF16 path.
+        """
+        if query.dtype != _fp8_dtype:
+            q_fp8, q_scale = _per_tensor_quant_fp8(query)
+            k_fp8, k_scale = _per_tensor_quant_fp8(key)
+            v_fp8, v_scale = _per_tensor_quant_fp8(value)
+        else:
+            q_fp8, k_fp8, v_fp8 = query, key, value
+            one = torch.tensor(1.0, dtype=torch.float32, device=query.device)
+            q_scale = k_scale = v_scale = one
+
+        d_q = q_fp8.shape[-1]
+        d_k = k_fp8.shape[-1]
+        d_v = v_fp8.shape[-1]
+        h_q = q_fp8.shape[2]
+        h_kv = k_fp8.shape[2]
+
+        if _can_use_fmha_fp8_prefill(d_q, d_k, d_v, h_q, h_kv):
+            return _fmha_fp8_prefill_attention(
+                q_fp8,
+                k_fp8,
+                v_fp8,
+                softmax_scale=self.softmax_scale,
+                is_causal=self.causal,
+                q_scale=q_scale,
+                k_scale=k_scale,
+                v_scale=v_scale,
+            )
+
+        logger.warning_once(
+            "FP8 FMHA prefill unsupported for this shape (need gfx950-class AITER, "
+            "full MHA, q/k/v head_dim=%d; got q=%d, k=%d, v=%d, num_heads=%d, "
+            "num_kv_heads=%d). Falling back to BF16.",
+            _FMHA_FP8_HEAD_DIM,
+            d_q,
+            d_k,
+            d_v,
+            h_q,
+            h_kv,
+        )
+        return None
+
     def forward(
         self,
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
         attn_metadata: AttentionMetadata | None = None,
-    ) -> torch.Tensor:
+        return_softmax_lse: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """
         Performs attention using one of:
           - _fmha_fp8_prefill_attention (FP8, SGLANG_DIFFUSION_AITER_FP8_ATTN=1 when eligible)
@@ -299,49 +366,28 @@ class AITerImpl(AttentionImpl):
             attn_metadata: Metadata for the attention operation (unused).
 
         Returns:
-            Output tensor of shape [batch_size, seq_len, num_heads, head_dim]
+            Output tensor of shape [batch_size, seq_len, num_heads, head_dim],
+            plus the [batch_size, num_heads, seq_len] softmax LSE when
+            return_softmax_lse (always the BF16 kernel, for ring merging).
         """
+        if return_softmax_lse:
+            return self._forward_bf16(query, key, value, return_lse=True)
         if _use_fp8_attn:
-            if query.dtype != _fp8_dtype:
-                q_fp8, q_scale = _per_tensor_quant_fp8(query)
-                k_fp8, k_scale = _per_tensor_quant_fp8(key)
-                v_fp8, v_scale = _per_tensor_quant_fp8(value)
-            else:
-                q_fp8, k_fp8, v_fp8 = query, key, value
-                one = torch.tensor(1.0, dtype=torch.float32, device=query.device)
-                q_scale = k_scale = v_scale = one
+            output = self._forward_fp8(query, key, value)
+            if output is not None:
+                return output
 
-            d_q = q_fp8.shape[-1]
-            d_k = k_fp8.shape[-1]
-            d_v = v_fp8.shape[-1]
-            h_q = q_fp8.shape[2]
-            h_kv = k_fp8.shape[2]
+        if USE_AITER_GFX1250 or not _AITER_ENABLE_CK:
+            return self._forward_bf16_eager(query, key, value)
+        return self._forward_bf16(query, key, value)
 
-            if _can_use_fmha_fp8_prefill(d_q, d_k, d_v, h_q, h_kv):
-                return _fmha_fp8_prefill_attention(
-                    q_fp8,
-                    k_fp8,
-                    v_fp8,
-                    softmax_scale=self.softmax_scale,
-                    is_causal=self.causal,
-                    q_scale=q_scale,
-                    k_scale=k_scale,
-                    v_scale=v_scale,
-                )
-
-            logger.warning_once(
-                "FP8 FMHA prefill unsupported for this shape (need gfx950-class AITER, "
-                "full MHA, q/k/v head_dim=%d; got q=%d, k=%d, v=%d, num_heads=%d, "
-                "num_kv_heads=%d). Falling back to BF16.",
-                _FMHA_FP8_HEAD_DIM,
-                d_q,
-                d_k,
-                d_v,
-                h_q,
-                h_kv,
-            )
-
-        # BF16 path
+    def _forward_bf16(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        return_lse: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         output = aiter.flash_attn_func(
             query,
             key,
@@ -349,10 +395,19 @@ class AITerImpl(AttentionImpl):
             dropout_p=self.dropout_p,
             causal=self.causal,
             return_attn_probs=False,
-            return_lse=False,
+            return_lse=return_lse,
             how_v3_bf16_cvt=AITER_BF16_CVT_MODE,
         )
-        return output
+        return tuple(output[:2]) if return_lse else output
+
+    @torch.compiler.disable
+    def _forward_bf16_eager(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+    ) -> torch.Tensor:
+        return self._forward_bf16(query, key, value)
 
     @torch.compiler.disable
     def forward_varlen(
@@ -366,14 +421,7 @@ class AITerImpl(AttentionImpl):
         cu_seqlens_host: tuple[int, ...] | None = None,
     ) -> torch.Tensor:
         del cu_seqlens_host
-        if USE_AITER_GFX942:
-            # The grouped-varlen ASM kernel hangs on H3's ~64K packed
-            # sequences on gfx942; AITER's Triton path handles this shape.
-            attention_func = importlib.import_module(
-                "aiter.ops.triton.attention.mha"
-            ).flash_attn_varlen_func
-        else:
-            attention_func = aiter.flash_attn_varlen_func
+        attention_func = aiter.flash_attn_varlen_func
 
         cu_seqlens = cu_seqlens.to(device=query.device, dtype=torch.int32).contiguous()
         output = attention_func(
@@ -386,5 +434,30 @@ class AITerImpl(AttentionImpl):
             max_seqlen_k=max_seqlen,
             softmax_scale=self.softmax_scale,
             causal=self.causal,
+            how_v3_bf16_cvt=AITER_BF16_CVT_MODE,
         )
         return output[0] if isinstance(output, tuple) else output
+
+    @torch.compiler.disable
+    def forward_ring_kv_chunk(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Attend packed [T, H, D] queries to one rotated KV chunk; returns
+        the output and the [H, Tq] softmax LSE."""
+        output, lse = aiter.flash_attn_varlen_func(
+            q=query.contiguous(),
+            k=key.contiguous(),
+            v=value.contiguous(),
+            cu_seqlens_q=_cu_seqlens((0, query.shape[0]), query.device),
+            cu_seqlens_k=_cu_seqlens((0, key.shape[0]), key.device),
+            max_seqlen_q=query.shape[0],
+            max_seqlen_k=key.shape[0],
+            softmax_scale=self.softmax_scale,
+            causal=False,
+            how_v3_bf16_cvt=AITER_BF16_CVT_MODE,
+            return_lse=True,
+        )[:2]
+        return output, lse

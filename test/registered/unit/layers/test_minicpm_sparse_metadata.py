@@ -8,19 +8,22 @@ import torch
 
 from sglang.srt.runtime_context import override_platform
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.mem_cache_utils import routed
 from sglang.test.test_utils import CustomTestCase
 
-with patch.dict(
-    sys.modules,
-    {
-        module: MagicMock()
-        for module in (
-            "sgl_kernel",
-            "sgl_kernel.quantization",
-            "sgl_kernel.scalar_type",
-        )
-    },
-):
+# Stub only these keys: patch.dict would also unload every module first
+# imported under it, and re-importing cutlass's native extension aborts.
+_SGL_KERNEL_STUBS = {
+    module: MagicMock()
+    for module in (
+        "sgl_kernel",
+        "sgl_kernel.quantization",
+        "sgl_kernel.scalar_type",
+    )
+}
+_saved_modules = {name: sys.modules.get(name) for name in _SGL_KERNEL_STUBS}
+sys.modules.update(_SGL_KERNEL_STUBS)
+try:
     from sglang.srt.layers.attention import attention_registry
     from sglang.srt.layers.attention.minicpm import backend as backend_module
     from sglang.srt.layers.attention.minicpm import sparse_utils
@@ -36,8 +39,14 @@ with patch.dict(
         CompressionLevelMetadata,
     )
     from sglang.srt.runtime_context import get_context, get_schedule
+finally:
+    for name, module in _saved_modules.items():
+        if module is None:
+            sys.modules.pop(name, None)
+        else:
+            sys.modules[name] = module
 
-register_cpu_ci(est_time=22, suite="base-a-test-cpu")
+register_cpu_ci(est_time=26, suite="base-a-test-cpu")
 
 
 def _compression_layout():
@@ -66,7 +75,7 @@ def _construct_sparse_backend(
         device="cpu",
         decode_cuda_graph_metadata={},
         req_to_token_pool=req_pool,
-        token_to_kv_pool=SimpleNamespace(),
+        token_to_kv_pool=routed(SimpleNamespace()),
         page_size=1,
     )
     model_runner = SimpleNamespace(
@@ -364,7 +373,7 @@ class TestMiniCPMSparseMetadata(CustomTestCase):
             device="cpu",
             decode_cuda_graph_metadata={},
             req_to_token_pool=req_pool,
-            token_to_kv_pool=SimpleNamespace(),
+            token_to_kv_pool=routed(SimpleNamespace()),
             page_size=1,
         )
         hf_config = SimpleNamespace(
@@ -629,10 +638,11 @@ class TestMiniCPMSparseMetadata(CustomTestCase):
         key_cache = torch.ones(4, 1, 1, 1)
         value_cache = torch.ones(4, 1, 1, 1)
         backend.flash_attn_backend = SimpleNamespace(
+            fa_impl_ver=3,
             prepare_paged_mha_query=Mock(return_value=(q, None, None, None, None)),
             get_paged_mha_kv_cache=Mock(return_value=(key_cache, value_cache)),
         )
-        backend.token_to_kv_pool = SimpleNamespace(set_kv_buffer=Mock())
+        backend.token_to_kv_pool = routed(SimpleNamespace(set_kv_buffer=Mock()))
         backend.attention_adapter = SimpleNamespace(
             forward=Mock(return_value=torch.ones(2, 1, 1))
         )
@@ -656,6 +666,7 @@ class TestMiniCPMSparseMetadata(CustomTestCase):
             return_value=torch.tensor([[[0]]], dtype=torch.int32)
         )
         layer = SimpleNamespace(
+            layer_id=0,
             is_cross_attention=False,
             sliding_window_size=-1,
             tp_q_head_num=1,
@@ -697,11 +708,12 @@ class TestMiniCPMSparseMetadata(CustomTestCase):
         key_cache = torch.ones(4, 1, 1, 1)
         value_cache = torch.ones(4, 1, 1, 1)
         backend.flash_attn_backend = SimpleNamespace(
+            fa_impl_ver=3,
             prepare_paged_mha_query=Mock(return_value=(q, None, None, None, None)),
             get_paged_mha_kv_cache=Mock(return_value=(key_cache, value_cache)),
             forward_decode=Mock(),
         )
-        backend.token_to_kv_pool = SimpleNamespace(set_kv_buffer=Mock())
+        backend.token_to_kv_pool = routed(SimpleNamespace(set_kv_buffer=Mock()))
         backend.attention_adapter = SimpleNamespace(
             forward=Mock(return_value=torch.ones(1, 1, 1))
         )
@@ -729,6 +741,7 @@ class TestMiniCPMSparseMetadata(CustomTestCase):
         backend._compress_decode_keys = Mock()
         backend.get_topk_for_sparse = Mock(return_value=None)
         layer = SimpleNamespace(
+            layer_id=0,
             is_cross_attention=False,
             sliding_window_size=-1,
             tp_q_head_num=1,
@@ -767,10 +780,11 @@ class TestMiniCPMSparseMetadata(CustomTestCase):
         key_cache = torch.ones(8, 1, 1, 1)
         value_cache = torch.ones(8, 1, 1, 1)
         backend.flash_attn_backend = SimpleNamespace(
+            fa_impl_ver=3,
             prepare_paged_mha_query=Mock(return_value=(q, None, None, None, None)),
             get_paged_mha_kv_cache=Mock(return_value=(key_cache, value_cache)),
         )
-        backend.token_to_kv_pool = SimpleNamespace(set_kv_buffer=Mock())
+        backend.token_to_kv_pool = routed(SimpleNamespace(set_kv_buffer=Mock()))
         backend.attention_adapter = SimpleNamespace(
             forward=Mock(return_value=torch.ones(2, 1, 1))
         )
@@ -797,6 +811,7 @@ class TestMiniCPMSparseMetadata(CustomTestCase):
             return_value=torch.tensor([[[0, 1], [0, 1]]], dtype=torch.int32)
         )
         layer = SimpleNamespace(
+            layer_id=0,
             is_cross_attention=False,
             sliding_window_size=-1,
             tp_q_head_num=1,
@@ -957,7 +972,9 @@ class TestMiniCPMSparseMetadata(CustomTestCase):
         pool = SimpleNamespace(get_key_buffer=lambda _layer_id: torch.empty(1, 1, 1))
 
         with (
-            patch.object(sparse_utils, "get_token_to_kv_pool", return_value=pool),
+            patch.object(
+                sparse_utils, "get_kv_layers", return_value=routed(pool).layer_router
+            ),
             patch.object(sparse_utils, "compress_k_core_new") as compress,
         ):
             sparse_utils.get_compress_k_v2(

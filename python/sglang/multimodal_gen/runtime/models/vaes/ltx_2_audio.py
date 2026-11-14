@@ -411,7 +411,6 @@ class LTX2AudioEncoder(nn.Module):
         self.causality_axis = causality_axis
 
         base_block_channels = base_channels
-        base_resolution = resolution
 
         if self.causality_axis is not None:
             self.conv_in = LTX2AudioCausalConv2d(
@@ -591,7 +590,6 @@ class LTX2AudioDecoder(nn.Module):
         self.causality_axis = causality_axis
 
         base_block_channels = base_channels * self.channel_multipliers[-1]
-        base_resolution = resolution // (2 ** (self.num_resolutions - 1))
 
         if self.causality_axis is not None:
             self.conv_in = LTX2AudioCausalConv2d(

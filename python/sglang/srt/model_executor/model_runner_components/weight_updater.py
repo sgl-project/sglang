@@ -84,6 +84,16 @@ def _unsupported_derived_weight_cache_error(
     return None
 
 
+def _direct_weight_update_error(model: torch.nn.Module) -> Optional[str]:
+    """Direct updates skip the model's ``load_weights`` and ``post_load_weights``,
+    so buffers those hooks rebuild in place would keep serving the old weights."""
+    for module in model.modules():
+        reason = getattr(module, "_direct_weight_update_error", None)
+        if reason is not None:
+            return reason
+    return None
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class WeightUpdater:
     tp_rank: int
@@ -171,6 +181,18 @@ class WeightUpdater:
                 f"Restart with --weight-cache-mode off to use this operation."
             )
 
+    def load_rejection(self: WeightUpdater, op: str) -> Optional[str]:
+        """Why ``op`` may not write this runner's weights, or None.
+
+        Startup-determined and rank-uniform: the CUDA IPC weight cache, and
+        derived-weight caches that in-place writes would leave stale.
+        """
+        try:
+            self._assert_weight_cache_inactive(op)
+        except RuntimeError as e:
+            return str(e)
+        return _unsupported_derived_weight_cache_error(self.get_model())
+
     def update_weights_from_disk(
         self: WeightUpdater,
         model_path: str,
@@ -214,6 +236,8 @@ class WeightUpdater:
             return iter
 
         def model_load_weights(model, iter):
+            # Expert loaders may copy in parallel; restore before any thread writes.
+            DefaultModelLoader.restore_weights_before_loading(model, target_device)
             loader.load_weights_and_postprocess(model, iter, target_device)
             return model
 
@@ -298,15 +322,7 @@ class WeightUpdater:
     def _receive_bucketed_weights_from_distributed(
         self: WeightUpdater, *, names, dtypes, shapes, group_name
     ):
-        named_tensors = []
-        for name, dtype, shape in zip(names, dtypes, shapes):
-            target_dtype = (
-                dtype if isinstance(dtype, torch.dtype) else getattr(torch, dtype)
-            )
-            named_tensors.append(
-                (name, torch.empty(shape, dtype=target_dtype, device=self.device))
-            )
-        bucket = FlattenedTensorBucket(named_tensors=named_tensors)
+        bucket = FlattenedTensorBucket.empty(names, dtypes, shapes, self.device)
         flattened_tensor = bucket.get_flattened_tensor()
         torch.distributed.broadcast(
             flattened_tensor,
@@ -352,6 +368,8 @@ class WeightUpdater:
         load_format: Optional[str] = None,
     ):
         error = _unsupported_derived_weight_cache_error(self.get_model())
+        if error is None and load_format == "direct":
+            error = _direct_weight_update_error(self.get_model())
         if error is not None:
             return False, error
 

@@ -211,6 +211,7 @@ class Router:
         queue_size: Queue size for pending requests when max concurrent limit reached (0 = no queue, return 429 immediately). Default: 100
         queue_timeout_secs: Maximum time (in seconds) a request can wait in queue before timing out. Default: 60
         rate_limit_tokens_per_second: Token bucket refill rate (tokens per second). If not set, defaults to max_concurrent_requests. Default: None
+        decode_dispatch_limit: Max requests per prefill worker in flight to decode (PD mode only). Default: None
         cors_allowed_origins: List of allowed origins for CORS. Empty list allows all origins. Default: []
         health_failure_threshold: Number of consecutive health check failures before marking worker unhealthy. Default: 3
         health_success_threshold: Number of consecutive health check successes before marking worker healthy. Default: 2

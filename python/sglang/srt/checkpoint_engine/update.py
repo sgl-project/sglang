@@ -60,7 +60,10 @@ def check_sglang_ready(
         while True:
             try:
                 response = client.get(f"{endpoint}/ping", timeout=10)
-                response.raise_for_status()
+                # /ping is 503 until warmup, which may wait on the weights this script sends;
+                # a 503 still means the server is listening, which is all this check needs.
+                if response.status_code != 503:
+                    response.raise_for_status()
                 break
             except (httpx.ConnectError, httpx.HTTPStatusError) as e:
                 if retry_num % 10 == 0:

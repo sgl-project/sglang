@@ -23,10 +23,12 @@ from sglang.srt.layers.quantization.gguf import GGUFConfig
 from sglang.srt.layers.quantization.gptq import (
     CPUGPTQConfig,
     GPTQAscendConfig,
+    GPTQConfig,
     GPTQMarlinConfig,
     GPTQXPUConfig,
 )
 from sglang.srt.layers.quantization.humming import HummingConfig
+from sglang.srt.layers.quantization.minimax_m3_nvfp4 import MiniMaxM3Nvfp4Config
 from sglang.srt.layers.quantization.mlx import MlxQuantizationConfig
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
@@ -51,6 +53,7 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_gfx95_supported,
+    is_hip,
     is_mps,
     is_npu,
     is_xpu,
@@ -62,6 +65,7 @@ _is_gfx95_supported = is_gfx95_supported()
 BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
     "fp8": Fp8Config,
     "mxfp8": Fp8Config,
+    "minimax_m3_nvfp4": MiniMaxM3Nvfp4Config,
     "blockwise_int8": BlockInt8Config,
     "modelopt": ModelOptFp8Config,  # Auto-detect, defaults to FP8
     "modelopt_fp8": ModelOptFp8Config,
@@ -122,6 +126,14 @@ if is_cpu():
     BASE_QUANTIZATION_METHODS.update(
         {
             "gptq": CPUGPTQConfig,
+        }
+    )
+
+
+if is_hip():
+    BASE_QUANTIZATION_METHODS.update(
+        {
+            "gptq": GPTQConfig,
         }
     )
 

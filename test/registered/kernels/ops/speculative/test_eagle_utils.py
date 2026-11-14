@@ -12,7 +12,7 @@ if torch.version.cuda is not None or torch.version.hip is not None:
 else:
     from sgl_kernel import verify_tree_greedy
 
-register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 
 def test_verify_tree_greedy():

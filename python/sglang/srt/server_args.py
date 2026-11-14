@@ -34,14 +34,20 @@ from sglang.srt.arg_groups.arg_utils import (
     record_fields,
 )
 from sglang.srt.arg_groups.argparse_actions import (
+    DeprecatedAction,
+    DeprecatedAliasStoreAction,
+    DeprecatedChoiceToFlagAction,
     DeprecatedStoreTrueAction,
 )
-from sglang.srt.arg_groups.model_override_base import ep_joiner_of, ep_scale_joiner_of
-from sglang.srt.arg_groups.overrides import (
+from sglang.srt.arg_groups.model_override_base import (
+    ep_joiner_of,
+    ep_scale_joiner_of,
     model_config_of,
+    resolving_view,
+)
+from sglang.srt.arg_groups.overrides import (
     remote_instance_transfer_engine_of,
     resolution_result,
-    resolving_view,
 )
 from sglang.srt.arg_groups.validation_hook import (
     validate_mps_model_config,
@@ -93,10 +99,6 @@ def _real_kv_hash_modes():
 
     return list(RealKvHashMode)
 
-
-# Compatibility re-exports for callers importing through server_args.
-from sglang.srt.arg_groups.arg_utils import NS, A, Arg  # noqa: F401
-from sglang.srt.arg_groups.argparse_actions import LoRAPathAction  # noqa: F401
 
 # Public choice lists and plugin registration helpers.
 from sglang.srt.arg_groups.choices import (  # noqa: F401
@@ -180,18 +182,7 @@ from sglang.srt.arg_groups.fields.serving import (
 from sglang.srt.arg_groups.fields.spec import (
     Spec,
 )
-from sglang.srt.lora.lora_registry import LoRARef  # noqa: F401
-from sglang.srt.model_executor.cuda_graph_config import (  # noqa: F401
-    CudaGraphConfig,
-    parse_cuda_graph_config_arg,
-)
-from sglang.srt.utils.common import (  # noqa: F401
-    LORA_TARGET_ALL_MODULES,
-    SUPPORTED_LORA_TARGET_MODULES,
-    human_readable_int,
-    json_list_type,
-    nullable_str,
-)
+from sglang.srt.configs.unlimited_ocr_v2 import UocrDocumentConfig
 
 # Re-exported like the imports above, but resolved on first use: importing them
 # eagerly is what the choices helpers avoid, and most processes never read them.
@@ -239,6 +230,17 @@ class ServerArgs:
 
     def __post_init__(self):
         """Leave construction unresolved; launchers and publishers call ``resolve_once``."""
+        for name in (
+            "disable_outlines_disk_cache",
+            "show_time_cost",
+            "triton_attention_reduce_in_fp32",
+        ):
+            if getattr(self, name) is not None:
+                logger.warning(
+                    "'%s' is deprecated and has no effect. It will be removed "
+                    "in a future release.",
+                    name,
+                )
 
     def resolve_once(self) -> None:
         """Resolve once, preserving declarations across pickling to child processes.
@@ -289,6 +291,9 @@ class ServerArgs:
                 validate_mps_model_config(
                     model_config_of(self),
                     lora_enabled=lora_enabled,
+                    attention_backend=cfg.attention_backend,
+                    prefill_attention_backend=cfg.prefill_attention_backend,
+                    decode_attention_backend=cfg.decode_attention_backend,
                 )
         except BaseException:
             self._resolution_failed = True
@@ -300,8 +305,22 @@ class ServerArgs:
 
     @property
     def launch_command(self) -> str | None:
-        """Original CLI arguments or Engine constructor call; ``None`` for direct construction."""
+        """Original CLI arguments or Engine call, with secrets redacted."""
         return getattr(self, "_launch_command", None)
+
+    def __repr__(self) -> str:
+        hidden = {
+            "watermark_key",
+            "watermark_key_b",
+            "watermark_config",
+            *SERVER_ARGS_SECRET_FIELD_NAMES,
+        }
+        values = ", ".join(
+            f"{field.name}={getattr(self, field.name)!r}"
+            for field in record_fields(type(self))
+            if field.name not in hidden
+        )
+        return f"ServerArgs({values})"
 
     def resolved_dict(self) -> dict[str, Any]:
         """Serialize resolved field values, expanding nested records and excluding bookkeeping.
@@ -361,7 +380,7 @@ class ServerArgs:
             choices=["auto"] + reasoning_parser_choices,
             default=_declared_default("reasoning_parser"),
             help=f"Specify the parser for reasoning models. "
-            f"Use 'auto' to detect from chat template. "
+            f"Use 'auto' to detect from chat template or checkpoint metadata. "
             f"Options include: {reasoning_parser_choices}.",
         )
         tool_call_parser_choices = _tool_call_parser_choices()
@@ -371,7 +390,7 @@ class ServerArgs:
             choices=["auto"] + tool_call_parser_choices,
             default=_declared_default("tool_call_parser"),
             help=f"Specify the parser for handling tool-call interactions. "
-            f"Use 'auto' to detect from chat template. "
+            f"Use 'auto' to detect from chat template or checkpoint metadata. "
             f"Options include: {tool_call_parser_choices}.",
         )
         parser.add_argument(
@@ -413,6 +432,39 @@ class ServerArgs:
             "--dp-size <dp-size> --enable-dp-attention.",
         )
         parser.add_argument(
+            "--monokernel-backend",
+            action=DeprecatedChoiceToFlagAction,
+            dest="monokernel_backend",
+            flags={
+                "amd": ("enable_amd_monokernel", "--enable-amd-monokernel"),
+                "msa": ("enable_nvidia_megakernel", "--enable-nvidia-megakernel"),
+            },
+            help="Deprecated. Use --enable-amd-monokernel instead of "
+            "--monokernel-backend amd, and --enable-nvidia-megakernel instead of "
+            "--monokernel-backend msa.",
+        )
+        # `mamba_max_states_per_path` is `no_cli=True`; any cap still applies.
+        parser.add_argument(
+            "--mamba-max-states-per-path",
+            action=DeprecatedAliasStoreAction,
+            new_flag="--hybrid-cache-checkpoints-level 2",
+            dest="mamba_max_states_per_path",
+            type=int,
+            default=None,
+            help="Deprecated. Use --hybrid-cache-checkpoints-level 2 instead.",
+        )
+        for flag in (
+            "--disable-outlines-disk-cache",
+            "--show-time-cost",
+            "--triton-attention-reduce-in-fp32",
+        ):
+            parser.add_argument(
+                flag,
+                action=DeprecatedAction,
+                default=argparse.SUPPRESS,
+                help="Deprecated. Has no effect.",
+            )
+        parser.add_argument(
             "--enable-flashinfer-allreduce-fusion",
             action="store_true",
             help="(Deprecated: use --flashinfer-allreduce-fusion-backend=auto) "
@@ -428,9 +480,9 @@ class ServerArgs:
         return cls(**{attr: getattr(args, attr) for attr in attrs})
 
     def get_tokenizer_worker_class(self):
-        from sglang.srt.managers.multi_tokenizer_mixin import TokenizerWorker
+        from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
-        return TokenizerWorker
+        return TokenizerManager
 
     def url(self, port: int | None = None):
         scheme = "https" if self.ssl_certfile else "http"
@@ -517,6 +569,7 @@ _INPUT_NAMESPACES = [
     Schedule,
     ExecFeatures,
     Mm,
+    UocrDocumentConfig,
     Serving,
 ]
 
@@ -550,7 +603,11 @@ def resolve_encoder_transfer_backend(
 ) -> str:
     if backend != "auto":
         return backend
-    if model_arch == "KimiK3ForConditionalGeneration" and tp_size > 1:
+    if (
+        model_arch
+        in ("KimiK3ForConditionalGeneration", "KimiK31ForConditionalGeneration")
+        and tp_size > 1
+    ):
         return "zmq_to_tokenizer"
     return "zmq_to_scheduler"
 
@@ -574,8 +631,8 @@ def m3_fp8_attn_gemm_enabled(args) -> bool:
     e4m3 kernel), the trtllm_mha backend (the only dense backend with fp8-q
     GEMMs), and SM100 (MSA fp8 variants and trtllm-gen fp8 dense kernels are
     sm100-only). SGLANG_DISABLE_M3_FP8_ATTN_GEMM=1 is the kill switch:
-    it forces the pre-fp8 numerics (bf16 indexer + widening sparse path,
-    bf16 q) without having to move off trtllm_mha.
+    it forces bf16 q with the widening sparse/indexer path without having to
+    move off trtllm_mha.
     """
     from sglang.srt.environ import envs
 
@@ -642,6 +699,86 @@ def _declared_default(name: str):
     )
 
 
+# Credentials -- the access keys and the TLS key's password: no display, log or
+# dump of the configuration carries them.
+SERVER_ARGS_SECRET_FIELD_NAMES = frozenset(
+    {"api_key", "admin_api_key", "ssl_keyfile_password"}
+)
+_REDACTED = "<redacted>"
+
+
+def redact_server_args_secrets(values: dict[str, Any]) -> dict[str, Any]:
+    """A copy of a server-args mapping with the credentials and the watermark
+    secrets replaced. An unset credential stays None, so readers can still
+    tell whether one is configured."""
+    # lazy: watermark imports torch, outside server_args' top-level boundary.
+    from sglang.srt.sampling.watermarking.core import redact_watermark_secrets
+
+    return redact_watermark_secrets(
+        {
+            name: (
+                _REDACTED
+                if name in SERVER_ARGS_SECRET_FIELD_NAMES and value is not None
+                else value
+            )
+            for name, value in values.items()
+        }
+    )
+
+
+@functools.lru_cache(maxsize=1)
+def _default_cli_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="sglang serve")
+    ServerArgs.add_cli_args(parser)
+    return parser
+
+
+def redact_secret_cli_args(
+    argv: list[str], parser: argparse.ArgumentParser | None = None
+) -> list[str]:
+    """``argv`` with the value of every credential flag replaced.
+
+    Options are matched as argparse matches them -- the exact spelling,
+    ``--flag=value`` and, since argparse accepts any unambiguous prefix, an
+    abbreviation -- so each occurrence is redacted whatever its value contains.
+    A prefix that also matches other options is redacted too: argparse rejects
+    it, so it cannot have reached a running server.
+    """
+    parser = parser or _default_cli_parser()
+    options = {
+        option: action.dest in SERVER_ARGS_SECRET_FIELD_NAMES
+        for action in parser._actions
+        for option in action.option_strings
+        if option.startswith("--")
+    }
+    secret_options = [option for option, secret in options.items() if secret]
+
+    def is_secret(name: str) -> bool:
+        if name in options:
+            return options[name]
+        return parser.allow_abbrev and any(
+            option.startswith(name) for option in secret_options
+        )
+
+    result: list[str] = []
+    redact_next = False
+    for index, argument in enumerate(argv):
+        if redact_next:
+            result.append(_REDACTED)
+            redact_next = False
+            continue
+        if argument == "--":
+            result.extend(argv[index:])
+            break
+        name, separator, _ = argument.partition("=")
+        if argument.startswith("--") and is_secret(name):
+            result.append(f"{name}={_REDACTED}" if separator else name)
+            redact_next = not separator
+            continue
+        result.append(argument)
+    return result
+
+
 def prepare_server_args(argv: list[str]) -> ServerArgs:
     """
     Prepare the server arguments from the command line arguments.
@@ -688,7 +825,12 @@ def prepare_server_args(argv: list[str]) -> ServerArgs:
     # Not a field: the record's fields are the configuration, and this is how
     # the configuration was asked for. It rides along on the record so a
     # subprocess copy can answer the same question the launcher can.
-    server_args._launch_command = " ".join(argv)
+    # lazy: watermark imports torch, outside server_args' top-level boundary.
+    from sglang.srt.sampling.watermarking.core import redact_watermark_command_line
+
+    server_args._launch_command = redact_watermark_command_line(
+        redact_secret_cli_args(argv, parser), raw_args.watermark_config
+    )
     return server_args
 
 
@@ -719,7 +861,7 @@ class PortArgs:
     # The ipc filename for Scheduler to send metrics
     metrics_ipc_name: str
 
-    # The ipc filename for MultiTokenizerRouter to receive inputs from TokenizerWorker processes (zmq)
+    # The ipc filename for MultiTokenizerRouter to receive inputs from tokenizer worker processes (zmq)
     tokenizer_worker_ipc_name: str | None
 
     # The ipc endpoints between verifier scheduler and drafter scheduler

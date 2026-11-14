@@ -15,14 +15,14 @@ from sglang.srt.utils import is_gfx95_supported, is_sm90_supported
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 try:
-    from sglang.kernels.ops.attention.fla import (
-        fused_sigmoid_gating_recurrent as recurrent_module,
-    )
-    from sglang.kernels.ops.attention.fla.fused_gdn_gating import fused_gdn_gating
     from sglang.kernels.ops.attention.fla.fused_recurrent import (
         fused_recurrent_gated_delta_rule_update,
     )
-    from sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent import (
+    from sglang.kernels.ops.attention.linear import (
+        fused_sigmoid_gating_recurrent as recurrent_module,
+    )
+    from sglang.kernels.ops.attention.linear.fused_gdn_gating import fused_gdn_gating
+    from sglang.kernels.ops.attention.linear.fused_sigmoid_gating_recurrent import (
         _select_recurrent_launch_config,
         fused_sigmoid_gating_delta_rule_update,
     )
@@ -33,6 +33,8 @@ except ImportError:
 
 register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_amd_ci(est_time=10, suite="nightly-amd-kernel-1-gpu", nightly=True)
+# backend-specific: the gfx95 TP4 launch config only applies on MI35x.
+register_amd_ci(est_time=10, suite="nightly-amd-1-gpu-mi35x", nightly=True)
 
 
 def _make_tensors(N, T, H, HV, K, V, device="cuda", seed=2025):

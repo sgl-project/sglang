@@ -22,7 +22,7 @@ from sglang.srt.layers.quantization.base_config import (
 from sglang.srt.layers.quantization.int8_utils import apply_w8a8_block_int8_linear
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.quantization.utils import is_layer_skipped
-from sglang.srt.utils import set_weight_attrs
+from sglang.srt.layers.utils.common import set_weight_attrs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.linear import LinearBase
