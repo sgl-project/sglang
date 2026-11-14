@@ -145,11 +145,12 @@ class TestQwen35GDNPackedInProj(CustomTestCase):
             gdn.in_proj_qkvz.weight.data_ptr(), gdn._fused_in_proj_weight.data_ptr()
         )
 
-    def test_rocm_prepare_hook_is_limited_to_qwen35(self):
+    def test_rocm_prepare_hook_model_types(self):
+        # qwen4_exp runs the hook for FP8 packing; finalize keeps its BF16 path off.
         for model_type, supported in (
             ("qwen3_5_text", True),
             ("qwen3_5_moe_text", True),
-            ("qwen4_exp_text", False),
+            ("qwen4_exp_text", True),
             ("other_text_model", False),
         ):
             with self.subTest(model_type=model_type):
@@ -165,6 +166,15 @@ class TestQwen35GDNPackedInProj(CustomTestCase):
                 )
                 self.assertEqual(model.modules.call_count, int(supported))
                 self.assertEqual(gdn.finalize_fused_in_proj.call_count, int(supported))
+
+    def test_qwen4_exp_forwards_prepare_hook(self):
+        from sglang.srt.models.qwen4_exp import Qwen4ExpForConditionalGeneration
+
+        model = types.SimpleNamespace(model=Mock())
+        Qwen4ExpForConditionalGeneration.prepare_before_cuda_graph_capture(
+            model, "runner"
+        )
+        model.model.prepare_before_cuda_graph_capture.assert_called_once_with("runner")
 
     def test_packed_views_alias_and_preserve_values(self):
         gdn = self.gdn
