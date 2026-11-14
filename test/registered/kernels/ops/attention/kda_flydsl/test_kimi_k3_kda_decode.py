@@ -783,6 +783,330 @@ def test_vendored_and_aiter_kda_decode_agree(select_fused_backend, batch: int) -
     assert torch.equal(vendored_inputs.conv_state, aiter_inputs.conv_state)
 
 
+def _aiter_has_kda_verify() -> bool:
+    try:
+        from aiter.ops.flydsl.linear_attention_kernels import (  # noqa: F401
+            flydsl_kda_verify_with_f_b,
+        )
+    except ImportError:
+        return False
+    return True
+
+
+def _verify_backend(state, slots: torch.Tensor, steps: int):
+    from sglang.srt.layers.attention.linear.kda_backend import (
+        KDAAttnBackend,
+        KDAKernelDispatcher,
+    )
+    from sglang.srt.layers.attention.linear.utils import LinearAttnKernelBackend
+
+    backend = KDAAttnBackend.__new__(KDAAttnBackend)
+    backend.state_layer_cache = state.at_layer_idx
+    backend.state_pool = SimpleNamespace(replayssm_request_ring=False)
+    backend.req_to_token_pool = SimpleNamespace(size=state.temporal.shape[1])
+    backend.forward_metadata = SimpleNamespace(
+        query_start_loc=torch.arange(
+            slots.numel() + 1, device=_DEVICE, dtype=torch.int32
+        )
+        * steps,
+        mamba_cache_indices=slots,
+        retrieve_next_token=None,
+        retrieve_next_sibling=None,
+        retrieve_parent_token=None,
+    )
+    backend.verify_intermediate_state_indices = torch.arange(
+        state.temporal.shape[1], device=_DEVICE, dtype=torch.int32
+    )
+    backend.accept_lens_pool = None
+    backend.kernel_dispatcher = KDAKernelDispatcher(
+        LinearAttnKernelBackend.TRITON,
+        LinearAttnKernelBackend.TRITON,
+        LinearAttnKernelBackend.TRITON,
+    )
+    backend._fused_chain_verify_fn = None
+    return backend
+
+
+@pytest.mark.skipif(not _aiter_has_kda_verify(), reason="AITER without KDA verify")
+@pytest.mark.parametrize("ring", [False, True])
+def test_aiter_fused_verify_matches_unfused_backend(ring: bool) -> None:
+    """The fused verify must reproduce the backend's unfused chain plus o_norm.
+
+    Goes through forward_extend with MoE token padding past the verify rows, so
+    it covers the padding trim of the deferred f_a [tokens, K] and the o_norm
+    gate, the slot/scratch index slices and the transposed conv-cache views.
+    """
+    from sglang.kernels.ops.attention.fla.fused_norm_gate import rms_norm_gated
+    from sglang.kernels.ops.attention.kda_fused_verify_aiter_hip import materialize_f_b
+    from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
+    from sglang.srt.mem_cache.memory_pool import MambaPool
+    from sglang.srt.model_executor.forward_mode import ForwardMode
+
+    torch.manual_seed(20261104)
+    batch, steps, num_slots, ring_len = 3, 5, 7, 8
+    tokens = batch * steps
+    padded_tokens = tokens + 2
+
+    def randn(*shape, dtype=torch.bfloat16, scale=1.0):
+        return (scale * torch.randn(*shape, device=_DEVICE)).to(dtype)
+
+    layer = RadixLinearAttention(
+        layer_id=0,
+        num_q_heads=_HEADS,
+        num_k_heads=_HEADS,
+        num_v_heads=_HEADS,
+        head_q_dim=_DIM,
+        head_k_dim=_DIM,
+        head_v_dim=_DIM,
+        conv_weights=randn(_CHANNELS, _CONV_WIDTH, dtype=torch.float32, scale=0.5),
+        A_log=randn(_HEADS, dtype=torch.float32, scale=0.5),
+        dt_bias=randn(_HEADS * _DIM, dtype=torch.float32, scale=0.5),
+        lower_bound=_LOWER_BOUND,
+    )
+    norm_weight = randn(_DIM)
+    layer._k3_hip_fused_verify_args = (
+        randn(_HEADS, _DIM, _DIM, scale=0.05),
+        norm_weight,
+        _NORM_EPS,
+        layer.A_log,
+        steps,
+    )
+    # The model slices these out of one in-projection: [q,k,v,g | f_a | b | pad].
+    wide = randn(padded_tokens, _CHANNELS + _HEADS * _DIM + _DIM + _HEADS + 4)
+    mixed_qkv, gate, f_a, beta, _ = wide.split(
+        [_CHANNELS, _HEADS * _DIM, _DIM, _HEADS, 4], dim=-1
+    )
+    beta = beta.unsqueeze(0)
+
+    template = MambaPool.SpeculativeState(
+        conv=[randn(1, num_slots, _CONV_WIDTH - 1, _CHANNELS)],
+        temporal=randn(1, num_slots, _HEADS, _DIM, _DIM, scale=0.05),
+        intermediate_ssm=None
+        if ring
+        else randn(1, num_slots, steps, _HEADS, _DIM, _DIM),
+        intermediate_conv_window=[
+            randn(1, num_slots, steps, _CONV_WIDTH - 1, _CHANNELS)
+        ],
+        replayssm_rawv=randn(1, num_slots, _HEADS, ring_len, _DIM) if ring else None,
+        replayssm_rawk=randn(1, num_slots, _HEADS, ring_len, _DIM) if ring else None,
+        replayssm_g=(
+            randn(1, num_slots, _HEADS, ring_len, _DIM, dtype=torch.float32)
+            if ring
+            else None
+        ),
+        replayssm_beta=(
+            randn(1, num_slots, _HEADS, ring_len, dtype=torch.float32) if ring else None
+        ),
+    )
+    # Mamba slots differ from the positional scratch rows.
+    slots = torch.tensor([5, 0, 3], device=_DEVICE, dtype=torch.int32)
+    forward_batch = SimpleNamespace(
+        forward_mode=ForwardMode.TARGET_VERIFY,
+        ragged_verify_layout=None,
+        req_pool_indices=torch.arange(batch, device=_DEVICE, dtype=torch.int32),
+        spec_info=SimpleNamespace(draft_token_num=steps),
+    )
+
+    def clone_state():
+        return MambaPool.SpeculativeState(
+            **{
+                name: (
+                    None
+                    if value is None
+                    else [v.clone() for v in value]
+                    if isinstance(value, list)
+                    else value.clone()
+                )
+                for name, value in vars(template).items()
+            }
+        )
+
+    fused_state = clone_state()
+    layer._k3_deferred_f_b = True
+    layer._k3_onorm_gate = gate
+    layer._k3_onorm_consumed = False
+    fused = _verify_backend(fused_state, slots, steps).forward_extend(
+        layer, forward_batch, mixed_qkv, f_a, beta
+    )
+    assert layer._k3_onorm_consumed
+    assert fused.shape[1] == padded_tokens
+    assert torch.count_nonzero(fused[:, tokens:]) == 0
+    fused = fused[:, :tokens]
+
+    ref_state = clone_state()
+    layer._k3_deferred_f_b = False
+    layer._k3_onorm_gate = None
+    unfused = _verify_backend(ref_state, slots, steps).forward_extend(
+        layer, forward_batch, mixed_qkv, materialize_f_b(layer=layer, f_a=f_a), beta
+    )[:, :tokens]
+    unfused = rms_norm_gated(
+        unfused,
+        gate[:tokens].reshape(1, tokens, _HEADS, _DIM),
+        norm_weight,
+        None,
+        "sigmoid",
+        eps=_NORM_EPS,
+    )
+    torch.cuda.synchronize()
+
+    # One BF16 ulp: the kernels reduce K in different orders.
+    torch.testing.assert_close(fused, unfused, rtol=2**-7, atol=2e-3)
+    windows = slice(0, batch)
+    torch.testing.assert_close(
+        fused_state.intermediate_conv_window[0][:, windows],
+        ref_state.intermediate_conv_window[0][:, windows],
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(fused_state.temporal, template.temporal, rtol=0, atol=0)
+    if ring:
+        for name in (
+            "replayssm_rawv",
+            "replayssm_rawk",
+            "replayssm_g",
+            "replayssm_beta",
+        ):
+            torch.testing.assert_close(
+                getattr(fused_state, name),
+                getattr(ref_state, name),
+                rtol=1e-2,
+                atol=1e-2,
+            )
+    else:
+        torch.testing.assert_close(
+            fused_state.intermediate_ssm[:, windows],
+            ref_state.intermediate_ssm[:, windows],
+            rtol=1e-2,
+            atol=1e-4,
+        )
+
+
+def _verify_warmup(adapter, *, replay_ring: bool) -> None:
+    def randn(*shape, dtype=torch.bfloat16):
+        return torch.randn(*shape, device=_DEVICE).to(dtype)
+
+    adapter.warmup(
+        f_b_weight=randn(_HEADS, _DIM, _DIM),
+        conv_weight=randn(_CHANNELS, _CONV_WIDTH, dtype=torch.float32),
+        A_log=randn(_HEADS, dtype=torch.float32),
+        dt_bias=randn(_HEADS * _DIM, dtype=torch.float32),
+        lower_bound=_LOWER_BOUND,
+        norm_weight=randn(_DIM),
+        norm_eps=_NORM_EPS,
+        state_dtype=torch.bfloat16,
+        num_draft_tokens=5,
+        replay_ring=replay_ring,
+    )
+
+
+@pytest.mark.skipif(not _aiter_has_kda_verify(), reason="AITER without KDA verify")
+@pytest.mark.parametrize("ring", [False, True])
+def test_verify_warmup_builds_every_wave_count(monkeypatch, ring: bool) -> None:
+    """A wave count left cold compiles during CUDA graph capture; warmup must build
+    each one AITER can dispatch, from batch-1 calls rather than max-batch buffers."""
+    from aiter.ops.flydsl.linear_attention_kernels import flydsl_kda_verify_with_f_b
+
+    from sglang.kernels.ops.attention import kda_fused_verify_aiter_hip as adapter
+
+    built = []
+    real_run = adapter.run
+
+    def recording_run(**kwargs):
+        built.append((kwargs["cache_indices"].numel(), kwargs["num_warps"]))
+        return real_run(**kwargs)
+
+    monkeypatch.setattr(adapter, "run", recording_run)
+    monkeypatch.setattr(adapter, "_WARMED", set())
+    _verify_warmup(adapter, replay_ring=ring)
+
+    # The pinned AITER stack's op has no tag but takes 8 and 4 waves by keyword.
+    wave_counts = getattr(flydsl_kda_verify_with_f_b, "num_warps", (8, 4))
+    assert sorted(wave_counts) == [4, 8]
+    assert built == [(1, n) for n in wave_counts]
+
+
+@pytest.mark.parametrize("takes_num_warps", [True, False])
+def test_verify_warmup_without_wave_tag_builds_both_policy_wave_counts(
+    monkeypatch, takes_num_warps: bool
+) -> None:
+    """An AITER verify op without the num_warps tag picks 8 waves up to batch 16
+    and 4 above; warmup builds both by keyword, else with one batch on each side."""
+    from sglang.kernels.ops.attention import kda_fused_verify_aiter_hip as adapter
+
+    built = []
+
+    def recording_run(**kwargs):
+        built.append((kwargs["cache_indices"].numel(), kwargs["num_warps"]))
+        if kwargs["num_warps"] is not None and not takes_num_warps:
+            raise TypeError("unexpected keyword argument 'num_warps'")
+
+    monkeypatch.setattr(adapter, "_op", lambda: SimpleNamespace())
+    monkeypatch.setattr(adapter, "run", recording_run)
+    monkeypatch.setattr(adapter, "_WARMED", set())
+    _verify_warmup(adapter, replay_ring=False)
+
+    if takes_num_warps:
+        assert built == [(1, 8), (1, 4)]
+    else:
+        assert built == [(1, 8), (1, None), (17, None)]
+
+
+@pytest.mark.skipif(not _aiter_has_kda_verify(), reason="AITER without KDA verify")
+@pytest.mark.parametrize("ring", [False, True])
+def test_verify_covered_falls_back_instead_of_aiter_raising(ring: bool) -> None:
+    """A draft-token count other than the warmed one would JIT-build inside graph
+    capture, and a cache dtype or ring shape AITER rejects would raise; both fall back."""
+    from sglang.kernels.ops.attention.kda_fused_verify_aiter_hip import covered
+
+    batch, steps, slots = 3, 5, 7
+    tokens = batch * steps
+
+    def empty(*shape, dtype=torch.bfloat16):
+        return torch.empty(*shape, dtype=dtype, device="meta")
+
+    def make_ring(ring_len, g_dtype=torch.float32):
+        return (
+            empty(slots, _HEADS, ring_len, _DIM),
+            empty(slots, _HEADS, ring_len, _DIM),
+            empty(slots, _HEADS, ring_len, _DIM, dtype=g_dtype),
+            empty(slots, _HEADS, ring_len, dtype=torch.float32),
+        )
+
+    kwargs = dict(
+        f_a=empty(tokens, _DIM),
+        mixed_qkv=empty(tokens, _CHANNELS),
+        raw_beta=empty(1, tokens, _HEADS),
+        output_gate=empty(tokens, _HEADS, _DIM),
+        conv_state=empty(slots, _CONV_WIDTH - 1, _CHANNELS).transpose(-1, -2),
+        state=empty(slots, _HEADS, _DIM, _DIM),
+        cache_indices=empty(batch, dtype=torch.int32),
+        intermediate_indices=empty(batch, dtype=torch.int32),
+        intermediate_conv_window=empty(
+            slots, steps, _CONV_WIDTH - 1, _CHANNELS
+        ).transpose(-1, -2),
+        intermediate_states=None if ring else empty(slots, steps, _HEADS, _DIM, _DIM),
+        replay_ring=make_ring(2 * steps) if ring else None,
+        num_draft_tokens=steps,
+        armed_draft_tokens=steps,
+    )
+    assert covered(**kwargs)
+    rejected = [
+        {"armed_draft_tokens": steps + 1},
+        {
+            "conv_state": empty(
+                slots, _CONV_WIDTH - 1, _CHANNELS, dtype=torch.float16
+            ).transpose(-1, -2)
+        },
+    ]
+    if ring:
+        rejected += [
+            {"replay_ring": make_ring(steps - 1)},
+            {"replay_ring": make_ring(2 * steps, g_dtype=torch.bfloat16)},
+        ]
+    for change in rejected:
+        assert not covered(**{**kwargs, **change}), change
+
+
 if __name__ == "__main__":
     import sys
 
