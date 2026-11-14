@@ -320,9 +320,9 @@ class TestUMBPStore(unittest.TestCase):
         mem_pool.fill_page(0, ord("C"), ord("D"))
         store.batch_set_v1(["clear_key"], make_indices([0]))
 
-        self.assertTrue(store.exists("clear_key_0_k"))
+        self.assertTrue(store.exists("test-model_clear_key_0_k"))
         store.clear()
-        self.assertFalse(store.exists("clear_key_0_k"))
+        self.assertFalse(store.exists("test-model_clear_key_0_k"))
 
     def test_legacy_interface(self):
         from sglang.srt.mem_cache.storage.umbp.umbp_store import UMBPStore
