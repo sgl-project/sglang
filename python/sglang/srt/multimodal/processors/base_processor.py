@@ -633,6 +633,18 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
             return self._processor, self._tokenizer
         return processor, _tokenizer_of(processor)
 
+    @staticmethod
+    def _pop_transcription_language(request_obj) -> Optional[str]:
+        """Pop the language a transcription adapter put in ``sampling_params``.
+
+        Processors whose ASR prompt names the spoken language read it here; the
+        key must not reach ``SamplingParams``, which rejects unknown fields.
+        """
+        sampling_params = getattr(request_obj, "sampling_params", None)
+        if isinstance(sampling_params, dict):
+            return sampling_params.pop("language", None)
+        return None
+
     def _preprocessing_competes_with_the_scheduler(self) -> bool:
         return preprocessing_competes_with_the_scheduler(
             self._processor,

@@ -30,6 +30,17 @@ from sglang.srt.multimodal.processors.base_processor import (
 )
 from sglang.srt.utils.video_decoder import VideoDecoderWrapper
 
+# Google's recommended ASR instruction (Gemma 4 model card, "Audio"). Used when a
+# request carries audio but no text: /v1/audio/transcriptions sends text="" and
+# leaves the prompt to the processor.
+ASR_PROMPT = (
+    "Transcribe the following speech segment in its original language. "
+    "Follow these specific instructions for formatting the answer:\n"
+    "* Only output the transcription, with no newlines.\n"
+    "* When transcribing numbers, write the digits, i.e. write 1.7 and not "
+    "one point seven, and write 3 instead of three."
+)
+
 
 class Gemma4SGLangProcessor(SGLangBaseProcessor):
     """Multimodal processor for Gemma4 supporting image, video, and audio inputs."""
@@ -66,6 +77,28 @@ class Gemma4SGLangProcessor(SGLangBaseProcessor):
         # MultimodalDataItem via collect_mm_items_from_processor_output.
         self.ATTR_NAME_TO_MODALITY["image_position_ids"] = Modality.IMAGE
         self.ATTR_NAME_TO_MODALITY["video_position_ids"] = Modality.VIDEO
+        self._asr_prompt: Optional[str] = None
+
+    def _build_transcription_prompt(self) -> str:
+        """Chat prompt for a text-less audio request (rendered once, then cached).
+
+        The model card places audio after the instruction for best quality; with
+        audio first, LibriSpeech test-other WER rose from ~14% to 23-37%.
+        """
+        if self._asr_prompt is None:
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": ASR_PROMPT},
+                        {"type": "audio"},
+                    ],
+                }
+            ]
+            self._asr_prompt = self._processor.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+        return self._asr_prompt
 
     def _get_audio_pad_multiple(self) -> int:
         """Derive the waveform padding alignment from processor config.
@@ -140,6 +173,11 @@ class Gemma4SGLangProcessor(SGLangBaseProcessor):
         **kwargs,
     ):
         """Process multimodal data including images, video, and audio."""
+        # /v1/audio/transcriptions sends text="", which arrives here already
+        # tokenized as an empty id list.
+        if audio_data and not input_text:
+            input_text = self._build_transcription_prompt()
+
         base_output = await self.load_mm_data(
             prompt=input_text,
             image_data=image_data,
