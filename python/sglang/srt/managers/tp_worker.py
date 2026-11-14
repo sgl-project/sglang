@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import functools
 import logging
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, List, Optional, Tuple
@@ -326,29 +327,6 @@ class TpModelWorker(BaseTpWorker):
 
         self._init_dllm_algorithm()
 
-        if get_serving().skip_tokenizer_init or self.is_draft_worker:
-            # A draft worker's tokenizer would only duplicate the target's:
-            # tokenizer_path always points at the target model.
-            self.tokenizer = self.processor = None
-        else:
-            if self.model_config.is_multimodal:
-                self.processor = get_processor(
-                    get_serving().tokenizer_path,
-                    tokenizer_mode=get_serving().tokenizer_mode,
-                    trust_remote_code=get_model().trust_remote_code,
-                    revision=get_model().revision,
-                    tokenizer_backend=get_serving().tokenizer_backend,
-                    model_name=get_model().model_path,
-                )
-                self.tokenizer = get_tokenizer_from_processor(self.processor)
-            else:
-                self.tokenizer = get_tokenizer(
-                    get_serving().tokenizer_path,
-                    tokenizer_mode=get_serving().tokenizer_mode,
-                    trust_remote_code=get_model().trust_remote_code,
-                    revision=get_model().revision,
-                    tokenizer_backend=get_serving().tokenizer_backend,
-                )
         self.device = self.model_runner.device
 
         # Init nccl groups
@@ -464,6 +442,42 @@ class TpModelWorker(BaseTpWorker):
         self.model_runner.finalize_startup_weight_load()
         for mr in self.model_runner_list[1:]:
             mr.finalize_startup_weight_load()
+
+    # The scheduler loads its own tokenizer; a worker's is read only by the
+    # speculative workers that need one (ngram, standalone), so it loads on
+    # first use instead of on every rank's critical path at startup.
+    @functools.cached_property
+    def processor(self):
+        if (
+            get_serving().skip_tokenizer_init
+            or self.is_draft_worker
+            or not self.model_config.is_multimodal
+        ):
+            return None
+        return get_processor(
+            get_serving().tokenizer_path,
+            tokenizer_mode=get_serving().tokenizer_mode,
+            trust_remote_code=get_model().trust_remote_code,
+            revision=get_model().revision,
+            tokenizer_backend=get_serving().tokenizer_backend,
+            model_name=get_model().model_path,
+        )
+
+    @functools.cached_property
+    def tokenizer(self):
+        if get_serving().skip_tokenizer_init or self.is_draft_worker:
+            # A draft worker's tokenizer would only duplicate the target's:
+            # tokenizer_path always points at the target model.
+            return None
+        if self.model_config.is_multimodal:
+            return get_tokenizer_from_processor(self.processor)
+        return get_tokenizer(
+            get_serving().tokenizer_path,
+            tokenizer_mode=get_serving().tokenizer_mode,
+            trust_remote_code=get_model().trust_remote_code,
+            revision=get_model().revision,
+            tokenizer_backend=get_serving().tokenizer_backend,
+        )
 
     def _init_model_config(self):
         from sglang.srt.configs.model_config import ModelConfig
