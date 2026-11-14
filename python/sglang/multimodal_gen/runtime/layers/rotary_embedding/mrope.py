@@ -204,9 +204,9 @@ class OneDRotaryEmbedding(torch.nn.Module):
         self.use_real = use_real
         self.repeat_interleave_real = repeat_interleave_real
 
-    def build_freqs(self, device):
+    def build_freqs(self, device, theta: float):
         freqs = 1.0 / (
-            self.theta
+            theta
             ** (
                 torch.arange(0, self.dim, 2, dtype=self.dtype, device=device)[
                     : (self.dim // 2)
@@ -223,7 +223,7 @@ class OneDRotaryEmbedding(torch.nn.Module):
         if self.theta_rescale_factor != 1.0:
             theta *= self.theta_rescale_factor ** (self.dim / (self.dim - 2))
 
-        freqs = self.build_freqs(device)
+        freqs = self.build_freqs(device, theta)
 
         freqs = torch.outer(pos * self.interpolation_factor, freqs)
         freqs_cos = freqs.cos()
@@ -462,15 +462,17 @@ class NDRotaryEmbedding(torch.nn.Module):
         num_tokens = 1
         for s in shard_sizes:
             num_tokens *= int(s)
-        head_dim_half = sum(self.rope_dim_list) // 2
-        cos = torch.empty((num_tokens, head_dim_half), device=device, dtype=self.dtype)
-        sin = torch.empty((num_tokens, head_dim_half), device=device, dtype=self.dtype)
+        first_generator = self.rope_generators[0]
+        if first_generator.use_real and first_generator.repeat_interleave_real:
+            head_dim = sum(self.rope_dim_list)
+        else:
+            head_dim = sum(self.rope_dim_list) // 2
+        cos = torch.empty((num_tokens, head_dim), device=device, dtype=self.dtype)
+        sin = torch.empty((num_tokens, head_dim), device=device, dtype=self.dtype)
 
         # Compute per-axis 1D embeddings once and expand via repeats to [N, d_i/2]
         col_offset = 0
         for i in range(self.ndim):
-            dim_i = self.rope_dim_list[i]
-            dim_i_half = dim_i // 2
             size_i = int(shard_sizes[i])
 
             # Starting position for this axis, with optional frame offset for time axis (i==0)
@@ -500,9 +502,10 @@ class NDRotaryEmbedding(torch.nn.Module):
                 cos_expanded = cos_expanded.repeat(tile_count, 1)
                 sin_expanded = sin_expanded.repeat(tile_count, 1)
 
-            cos[:, col_offset : col_offset + dim_i_half] = cos_expanded
-            sin[:, col_offset : col_offset + dim_i_half] = sin_expanded
-            col_offset += dim_i_half
+            slice_width = cos_1d.shape[1]
+            cos[:, col_offset : col_offset + slice_width] = cos_expanded
+            sin[:, col_offset : col_offset + slice_width] = sin_expanded
+            col_offset += slice_width
 
         return cos.float(), sin.float()
 
