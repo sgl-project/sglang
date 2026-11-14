@@ -714,6 +714,12 @@ class DSV4Metadata:
     fp4_q_positions: Optional[torch.Tensor] = field(default=None, repr=False)
     # only on the metadata built for the late layers under decoder SWA bounded replay
     late_layer_tail: Optional[LateLayerTail] = None
+    # ratio -> the selection parts ("page" / "raw") a row-sharded prefill indexer
+    # exchanged for every row; absent when every row holds both. Written by each index
+    # source of the ratio, read by that ratio's attention (_opus_prefill_applies).
+    indexer_gathered_parts: Dict[int, Tuple[str, ...]] = field(
+        default_factory=dict, repr=False
+    )
 
     @property
     def core_metadata(self) -> DSV4AttnMetadata:
@@ -905,6 +911,7 @@ class DeepseekV4HipRadixBackend(
     _low_ratio_pair_partners = DeepseekV4AttnBackend._low_ratio_pair_partners
     _low_ratio_write_group = DeepseekV4AttnBackend._low_ratio_write_group
     _low_ratio_compress_fused = DeepseekV4AttnBackend._low_ratio_compress_fused
+    _indexer_row_shard = DeepseekV4AttnBackend._indexer_row_shard
     # MIXED BCG replay regresses ROCm DSV4 DP-attention serving throughput.
     prefer_eager_mixed_prefill_under_dp_attention: bool = True
 
@@ -967,6 +974,11 @@ class DeepseekV4HipRadixBackend(
         )
         # published by the candidate-source layer, consumed by the later index-source layers
         self.candidate_masks = None
+        # ratio -> whether that ratio's prefill (extend without speculative decoding)
+        # attention query met OPUS sparse prefill's shape and dtype checks, recorded by
+        # _opus_prefill_applies. Per ratio, not per layer: every layer of the ratio reads
+        # what its index source exchanged, and q's shape / dtype are model constants.
+        self._opus_prefill_q_ok: Dict[int, bool] = {}
         self.enable_deepseek_v4_fp4_indexer: bool = (
             get_exec().kernel.enable_deepseek_v4_fp4_indexer
         )
@@ -3106,16 +3118,47 @@ class DeepseekV4HipRadixBackend(
     def _opus_prefill_applies(
         self, q: torch.Tensor, forward_batch: ForwardBatch, compress_ratio: int
     ) -> bool:
+        q_ok = q.ndim == 3 and q.shape[-1] == 512 and q.dtype == torch.bfloat16
+        if (
+            forward_batch.forward_mode.is_extend_without_speculative()
+            and not self.is_draft_worker
+        ):
+            # only the forwards a row-sharded indexer runs in: a decode / verify query
+            # passing the checks says nothing about the prefill query
+            self._opus_prefill_q_ok[compress_ratio] = q_ok
+        applies = q_ok and self._opus_prefill_rows_apply(
+            forward_batch, compress_ratio, q.shape[0]
+        )
+        gathered = self.forward_metadata.indexer_gathered_parts.get(compress_ratio)
+        if gathered is None or ("raw" if applies else "page") in gathered:
+            return applies
+        # A row-sharded indexer exchanged one part only (indexer_gather_parts). Only the
+        # page part: the general path reads it, OPUS is only faster. Only the raw part:
+        # sent once this ratio's query passed the checks above and the rows applied for
+        # the indexer's row count, which never exceeds q's, so OPUS still applies (its
+        # row limits are monotone in the row count).
+        if not applies and q_ok:
+            logger.warning(
+                "ratio %d: OPUS sparse prefill declined %d rows the sharded indexer "
+                "predicted it for; running it on the exchanged raw indices",
+                compress_ratio,
+                q.shape[0],
+            )
+        assert q_ok or "page" in gathered, (compress_ratio, gathered, q.shape, q.dtype)
+        return "page" not in gathered
+
+    def _opus_prefill_rows_apply(
+        self, forward_batch: ForwardBatch, compress_ratio: int, num_tokens: int
+    ) -> bool:
+        """_opus_prefill_applies without the query's shape / dtype checks: monotone in
+        num_tokens."""
         if not envs.SGLANG_OPT_HIP_OPUS_SPARSE_PREFILL.get():
             return False
         if (
             compress_ratio not in (0, 1, 2)
             or self.is_draft_worker
             or not forward_batch.forward_mode.is_extend_without_speculative()
-            or q.ndim != 3
-            or q.shape[0] < _OPUS_PREFILL_MIN_TOKENS
-            or q.shape[-1] != 512
-            or q.dtype != torch.bfloat16
+            or num_tokens < _OPUS_PREFILL_MIN_TOKENS
             or not is_gfx95_supported()
             or self.token_to_kv_pool.request_window is not None
             or self.forward_metadata.late_layer_tail is not None
@@ -3129,9 +3172,46 @@ class DeepseekV4HipRadixBackend(
         seq_lens = forward_batch.seq_lens_cpu
         history_rows = len(seq_lens) * max(int(seq_lens.max()) // compress_ratio, 1)
         return history_rows <= min(
-            _OPUS_PREFILL_MAX_ROWS_PER_TOKEN[compress_ratio] * q.shape[0],
+            _OPUS_PREFILL_MAX_ROWS_PER_TOKEN[compress_ratio] * num_tokens,
             _OPUS_PREFILL_MAX_WORKSPACE_ROWS,
         )
+
+    # ---- row-sharded prefill indexer exchange ----
+
+    def indexer_gather_parts(
+        self, compress_ratio: int, forward_batch: ForwardBatch, num_rows: int
+    ) -> Tuple[str, ...]:
+        """The selection parts a row-sharded prefill indexer of the ratio exchanges for
+        every row, recorded for that ratio's attention. One part only when that is
+        provably enough (_opus_prefill_applies follows what was exchanged): the page
+        slots unless OPUS sparse prefill applies, its raw positions when it does for
+        num_rows (attention's query has at least as many rows) and the ratio's query is
+        known to pass its shape / dtype checks; else both."""
+        from sglang.srt.layers.attention.dsv4.unified_kv_gate import (
+            is_unified_kv_triton,
+        )
+
+        core = self.forward_metadata.core_metadata
+        if core.sparse_raw_indices(compress_ratio) is None:
+            parts = ("page",)
+        elif self.token_to_kv_pool.uniform_fp8 or is_unified_kv_triton():
+            parts = ("page", "raw")  # their attention paths are not audited
+        elif not self._opus_prefill_rows_apply(forward_batch, compress_ratio, num_rows):
+            parts = ("page",)
+        else:
+            q_ok = self._opus_prefill_q_ok.get(compress_ratio)
+            parts = {True: ("raw",), False: ("page",), None: ("page", "raw")}[q_ok]
+        self.set_indexer_gathered_parts(compress_ratio, parts)
+        return parts
+
+    def set_indexer_gathered_parts(
+        self, compress_ratio: int, parts: Optional[Tuple[str, ...]]
+    ) -> None:
+        gathered = self.forward_metadata.indexer_gathered_parts
+        if parts is None:
+            gathered.pop(compress_ratio, None)
+        else:
+            gathered[compress_ratio] = parts
 
     def _build_opus_prefill_cache(
         self,
@@ -3502,7 +3582,15 @@ class DeepseekV4HipRadixBackend(
                 forward_batch.seq_lens_cpu is not None
                 and forward_batch.extend_seq_lens_cpu is not None
             ), "the HIP low-ratio prefill indexer needs the batch's CPU lengths"
-            low_ratio_index_topk_hip_extend(self, layer, x, q_lora, pos, forward_batch)
+            low_ratio_index_topk_hip_extend(
+                self,
+                layer,
+                x,
+                q_lora,
+                pos,
+                forward_batch,
+                row_shard=self._indexer_row_shard(layer, num_rows=x.shape[0]),
+            )
         else:
             raise NotImplementedError(
                 f"low-ratio indexer for {forward_batch.forward_mode} on HIP"
