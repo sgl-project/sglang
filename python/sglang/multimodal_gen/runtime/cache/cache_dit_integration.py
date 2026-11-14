@@ -433,6 +433,12 @@ _CUSTOM_BLOCK_ADAPTER_SPECS: dict[str, CustomBlockAdapterSpec] = {
         blocks_attr="single_blocks",
         forward_pattern=ForwardPattern.Pattern_3,
     ),
+    # Not `blocks`: cache-dit mocks the attribute the model iterates, and the
+    # audio injector has to run per block inside the cached unit.
+    "WanS2VTransformer3DModel": CustomBlockAdapterSpec(
+        blocks_attr="block_runners",
+        forward_pattern=ForwardPattern.Pattern_3,
+    ),
 }
 
 
