@@ -377,15 +377,14 @@ async fn stop_profile(State(state): State<Arc<AppState>>) -> Response {
 }
 
 /// Python's responses for both profile routes: 200 with `ok_body` and no
-/// content type. A scheduler refusal (e.g. already profiling) is the
-/// `RuntimeError` Python raises in the route, which reaches the client as the
-/// framework's bare 500 `Internal Server Error`; the reason is only logged.
+/// content type. A scheduler refusal (e.g. already profiling) returns 409 Conflict
+/// with the scheduler error message, matching Python's handled RuntimeError.
 fn profile_response(outcome: Result<ProfileOutcome, CoreError>, ok_body: &'static str) -> Response {
     match outcome {
         Ok(ProfileOutcome { success: true, .. }) => Response::new(Body::from(ok_body)),
         Ok(ProfileOutcome { message, .. }) => {
             tracing::error!(%message, "profile request failed");
-            (StatusCode::INTERNAL_SERVER_ERROR, "Internal Server Error").into_response()
+            (StatusCode::CONFLICT, format!("{message}\n")).into_response()
         }
         Err(CoreError::Unavailable) => native_error(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1463,9 +1462,9 @@ mod tests {
         assert_eq!(
             plain_text(response).await,
             (
-                StatusCode::INTERNAL_SERVER_ERROR,
+                StatusCode::CONFLICT,
                 Some("text/plain; charset=utf-8".to_owned()),
-                "Internal Server Error".to_owned()
+                "Profiling is already in progress. Call /stop_profile first.\n".to_owned()
             )
         );
 
@@ -1533,9 +1532,9 @@ mod tests {
         assert_eq!(
             plain_text(response).await,
             (
-                StatusCode::INTERNAL_SERVER_ERROR,
+                StatusCode::CONFLICT,
                 Some("text/plain; charset=utf-8".to_owned()),
-                "Internal Server Error".to_owned()
+                "Profiling is not in progress. Call /start_profile first.\n".to_owned()
             )
         );
     }
