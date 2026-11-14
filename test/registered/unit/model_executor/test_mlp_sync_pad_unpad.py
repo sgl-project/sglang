@@ -469,5 +469,83 @@ class TestDraftScopeMlpSync(CustomTestCase):
         torch.testing.assert_close(fb.mm_input_embeds[6:], torch.zeros(3, self.HIDDEN))
 
 
+class TestSpecMlpSyncPadsWholeRequests(CustomTestCase):
+    # Tokens per request; not a multiple of the attention TP size.
+    WIDTH = 9
+
+    def setUp(self):
+        override = get_context().override_server_args(
+            tp_size=2,
+            cuda_graph_config=CudaGraphConfig(prefill=PhaseConfig(bs=[])),
+        )
+        override.install()
+        self.addCleanup(override.restore)
+
+    def _sync(self, forward_mode, hybrid_ssm=False):
+        spec_info = MagicMock()
+        spec_info.num_tokens_per_req = self.WIDTH
+        spec_info.is_draft_input.return_value = False
+        extend = {}
+        if forward_mode.is_draft_extend_v2():
+            extend = dict(
+                extend_num_tokens=self.WIDTH,
+                extend_seq_lens=torch.tensor([self.WIDTH], dtype=torch.int32),
+                extend_prefix_lens=torch.tensor([31]),
+                extend_seq_lens_cpu=[self.WIDTH],
+                extend_prefix_lens_cpu=[31],
+                extend_logprob_start_lens_cpu=[0],
+            )
+        fb = ForwardBatch(
+            forward_mode=forward_mode,
+            batch_size=1,
+            input_ids=torch.arange(self.WIDTH),
+            req_pool_indices=torch.tensor([0]),
+            seq_lens=torch.tensor([40]),
+            seq_lens_sum=40,
+            out_cache_loc=torch.arange(self.WIDTH),
+            positions=torch.arange(self.WIDTH),
+            seq_lens_cpu=torch.tensor([40]),
+            spec_info=spec_info,
+            is_extend_in_batch=False,
+            global_num_tokens_cpu=[self.WIDTH],
+            global_num_tokens_for_logprob_cpu=[1],
+            global_num_tokens_gpu=torch.zeros(1, dtype=torch.int32),
+            **extend,
+        )
+        runner = _mock_model_runner()
+        runner.attn_backend.get_cpu_graph_seq_len_fill_value.return_value = 1
+        runner.is_draft_worker = False
+        runner.attn_tp_sequence_sharded.return_value = False
+        with (
+            get_parallel().override(tp_rank=0, attn_tp_rank=0, attn_dp_rank=0),
+            # CPU runners have no driver to pin the synced token counts with.
+            patch("sglang.srt.model_executor.forward_batch_info._is_cpu", True),
+            patch(
+                "sglang.srt.model_executor.forward_batch_info.mambaish_config",
+                lambda model_config: object() if hybrid_ssm else None,
+            ),
+        ):
+            fb.prepare_mlp_sync_batch(runner)
+        return fb
+
+    def test_padding_keeps_whole_requests(self):
+        """One 9-token request at attention TP 2 pads to two requests (18 tokens),
+        not to 10 tokens that no longer divide into requests."""
+        for mode, hybrid_ssm in (
+            (ForwardMode.DRAFT_EXTEND_V2, False),
+            (ForwardMode.DRAFT_EXTEND_V2, True),
+            (ForwardMode.TARGET_VERIFY, False),
+        ):
+            with self.subTest(mode=mode, hybrid_ssm=hybrid_ssm):
+                fb = self._sync(mode, hybrid_ssm=hybrid_ssm)
+                self.assertEqual(fb.batch_size, 2)
+                self.assertEqual(fb.input_ids.shape[0], 2 * self.WIDTH)
+                self.assertEqual(fb.seq_lens.shape[0], 2)
+                self.assertEqual(fb.req_pool_indices.shape[0], 2)
+                if mode.is_draft_extend_v2():
+                    self.assertEqual(fb.extend_seq_lens.tolist(), [self.WIDTH] * 2)
+                    self.assertEqual(fb.extend_num_tokens, 2 * self.WIDTH)
+
+
 if __name__ == "__main__":
     unittest.main()

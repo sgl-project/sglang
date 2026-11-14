@@ -76,6 +76,15 @@ def rotate_input_ids(
         return input_ids
 
     batch_size = extend_seq_lens.shape[0]
+    assert extend_start_loc.shape[0] == topk_index.shape[0] == batch_size, (
+        extend_start_loc.shape,
+        extend_seq_lens.shape,
+        topk_index.shape,
+    )
+    assert select_index is None or select_index.shape[0] == batch_size, (
+        select_index.shape,
+        batch_size,
+    )
 
     # rotate_input_ids kernel skipped: batch_size=0 (empty extend_seq_lens).
     # This is expected when a DP rank has no requests.

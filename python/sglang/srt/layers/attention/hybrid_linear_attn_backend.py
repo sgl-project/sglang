@@ -1345,6 +1345,10 @@ class HybridLinearAttnBackend(AttentionBackend):
         return self.full_attn_backend.data_type
 
     @property
+    def can_replan_padded_batch(self) -> bool:
+        return self.full_attn_backend.can_replan_padded_batch
+
+    @property
     def supports_ragged_verify_graph(self) -> bool:
         return (
             self.full_attn_backend.supports_ragged_verify_graph

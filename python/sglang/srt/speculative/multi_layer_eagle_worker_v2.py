@@ -962,6 +962,9 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             # Left unmarked on every platform: each de-tied runner has its own
             # attn backend, and only runner[0]'s was pre-planned, so each step's
             # forward must init its own metadata post-pad (mirrors NPU behavior).
+            # The padded forward leaves extend_start_loc / extend_seq_lens at the
+            # padded request count; rotate only the real requests.
+            real_batch_size = forward_batch.batch_size
             for step in range(self.speculative_num_steps):
                 forward_batch.req_to_token_pool = self.draft_runner_list[
                     step
@@ -1008,8 +1011,8 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                 if forward_batch.extend_seq_lens is not None:
                     rotate_input_ids(
                         forward_batch.input_ids,
-                        forward_batch.extend_start_loc,
-                        forward_batch.extend_seq_lens,
+                        forward_batch.extend_start_loc[:real_batch_size],
+                        forward_batch.extend_seq_lens[:real_batch_size],
                         ret_topk_index,
                         select_index,
                     )

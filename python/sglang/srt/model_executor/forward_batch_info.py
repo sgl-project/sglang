@@ -28,6 +28,7 @@ ScheduleBatch -> ForwardBatch
 from __future__ import annotations
 
 import hashlib
+import math
 import warnings
 from dataclasses import dataclass
 from functools import lru_cache
@@ -1743,10 +1744,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         sync_group_size = len(global_num_tokens)
         attn_tp_size = get_parallel().attn_tp_size
 
+        # A speculative batch is a whole number of requests of num_tokens_per_req
+        # tokens each; keep it one after padding.
+        align = attn_tp_size
+        if self.spec_info is not None and self.spec_info.num_tokens_per_req > 1:
+            align = math.lcm(attn_tp_size, self.spec_info.num_tokens_per_req)
         for i in range(sync_group_size):
             # make sure that the padded length is divisible by attn_tp_size because we may need reduce-scatter across attn_tp dim.
             # there is no reduce-scatter in LM logprob, so we do not need to adjust the padded length for logprob
-            global_num_tokens[i] = ceil_align(global_num_tokens[i], attn_tp_size)
+            global_num_tokens[i] = ceil_align(global_num_tokens[i], align)
 
         dp_padding_mode = DpPaddingMode.get_dp_padding_mode(
             self.is_extend_in_batch, global_num_tokens
@@ -1846,6 +1852,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     self.forward_mode = ForwardMode.TARGET_VERIFY
                 # Invert the spec_scale_global_num_tokens scaling.
                 bs = self.batch_size = num_tokens // self.spec_info.num_tokens_per_req
+                if self.forward_mode.is_draft_extend_v2():
+                    self.extend_num_tokens = num_tokens
             elif materializes_dummy_extend:
                 self._original_forward_mode = self.forward_mode
                 self.forward_mode = ForwardMode.EXTEND
@@ -1914,6 +1922,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                     bs = self.batch_size = (
                         num_tokens // self.spec_info.num_tokens_per_req
                     )
+                    if self.forward_mode.is_draft_extend_v2():
+                        self.extend_num_tokens = num_tokens
                 else:
                     bs = self.batch_size = num_tokens
         elif self.forward_mode.is_extend():
