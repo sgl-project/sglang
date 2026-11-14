@@ -3028,6 +3028,32 @@ def pp_stage_needs_embedding(pp_group, speculative_algorithm) -> bool:
     )
 
 
+def moe_expert_offloader_kwargs():
+    # Offload only the routed experts of MoE layers (shared by DeepSeek V2/V3/V4).
+    return dict(
+        submodule_accessor=lambda layer: (
+            layer.mlp.experts if isinstance(layer.mlp, DeepseekV2MoE) else layer.mlp
+        ),
+        whitelist_param_names_creator=lambda module: (
+            [
+                "w13_weight",
+                "w2_weight",
+                # only for nvfp4
+                *(
+                    [
+                        "w13_blockscale_swizzled",
+                        "w2_blockscale_swizzled",
+                    ]
+                    if hasattr(module, "w13_blockscale_swizzled")
+                    else []
+                ),
+            ]
+            if isinstance(module, FusedMoE)
+            else []
+        ),
+    )
+
+
 class DeepseekV2Model(nn.Module):
     fall_back_to_pt_during_load = False
 
@@ -3076,30 +3102,7 @@ class DeepseekV2Model(nn.Module):
                 skip_rope=config.qk_rope_head_dim == 0,
             ),
             prefix=add_prefix("layers", prefix),
-            offloader_kwargs=dict(
-                submodule_accessor=lambda layer: (
-                    layer.mlp.experts
-                    if isinstance(layer.mlp, DeepseekV2MoE)
-                    else layer.mlp
-                ),
-                whitelist_param_names_creator=lambda module: (
-                    [
-                        "w13_weight",
-                        "w2_weight",
-                        # only for nvfp4
-                        *(
-                            [
-                                "w13_blockscale_swizzled",
-                                "w2_blockscale_swizzled",
-                            ]
-                            if hasattr(module, "w13_blockscale_swizzled")
-                            else []
-                        ),
-                    ]
-                    if isinstance(module, FusedMoE)
-                    else []
-                ),
-            ),
+            offloader_kwargs=moe_expert_offloader_kwargs(),
             stage_facts=lambda idx: DeepseekV2DecoderLayer.stage_facts(config, idx),
         )
 

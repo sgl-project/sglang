@@ -3973,6 +3973,7 @@ class DeepseekV4Model(nn.Module):
                 moe_routed_quant_stream=self.moe_routed_quant_stream,
             ),
             prefix=add_prefix("layers", prefix),
+            offloader_kwargs=deepseek_v2.moe_expert_offloader_kwargs(),
             final_read=hc_boundary.FinalRead() if _is_cuda else None,
             stage_facts=functools.partial(hc_boundary.stages, config)
             if _is_cuda
