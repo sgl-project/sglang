@@ -35,6 +35,7 @@ if TYPE_CHECKING:
     SGLANG_EXTERNAL_MODEL_PACKAGE: str = ""
     SGLANG_DIFFUSION_DISABLE_SP_PAD_MASK: bool = False
     SGLANG_DIFFUSION_DISABLE_STAGE_NAN_CHECK: bool = False
+    SGLANG_DIFFUSION_DISABLE_PARALLEL_PNG: bool = False
     SGLANG_DIFFUSION_DISABLE_MAPPED_COURIER: bool = False
     SGLANG_DIFFUSION_HOST_SPILL_DIR: str = os.path.expanduser(
         "~/.cache/sglang/diffusion/host_spill"
@@ -257,6 +258,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # request. Shape/type checks still run; only the NaN scan is skipped.
     "SGLANG_DIFFUSION_DISABLE_STAGE_NAN_CHECK": _lazy_bool(
         "SGLANG_DIFFUSION_DISABLE_STAGE_NAN_CHECK"
+    ),
+    # Encode large compressed PNG outputs with Pillow on one thread instead of
+    # the strip-parallel encoder; pixels are identical either way.
+    "SGLANG_DIFFUSION_DISABLE_PARALLEL_PNG": _lazy_bool(
+        "SGLANG_DIFFUSION_DISABLE_PARALLEL_PNG"
     ),
     # Select a built-in platform or an installed platform entry point.
     # Empty means automatic plugin activation followed by built-in detection.

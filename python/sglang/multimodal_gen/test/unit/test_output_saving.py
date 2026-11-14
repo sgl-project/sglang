@@ -1,4 +1,7 @@
+import io
 import shutil
+import struct
+import zlib
 
 import numpy as np
 import pytest
@@ -11,6 +14,10 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
     MaterializedOutput,
     post_process_sample,
     save_materialized_output,
+)
+from sglang.multimodal_gen.runtime.utils.png_encoder import (
+    encode_png_parallel,
+    png_encoder_executor,
 )
 
 
@@ -42,7 +49,7 @@ def test_png_output_saving_preserves_pixels(tmp_path, output_compression):
     np.testing.assert_array_equal(np.array(Image.open(output_path)), frame)
 
 
-# compress_level 0 writes stored blocks itself; a compressed PNG goes through Pillow
+# compress_level 0 writes stored blocks itself; a small compressed PNG goes through Pillow
 @pytest.mark.parametrize(
     ("output_compression", "expected_pillow_saves"),
     [(None, []), (0, []), (75, []), (100, [("PNG", 9)])],
@@ -76,6 +83,75 @@ def test_png_output_saving_skips_pillow_row_filters_when_uncompressed(
 
     assert save_calls == expected_pillow_saves
     np.testing.assert_array_equal(np.array(Image.open(output_path)), frame)
+
+
+def _png_chunks(data: bytes) -> list[tuple[bytes, bytes]]:
+    assert data[:8] == b"\x89PNG\r\n\x1a\n"
+    chunks, offset = [], 8
+    while offset < len(data):
+        (length,) = struct.unpack(">I", data[offset : offset + 4])
+        tag = data[offset + 4 : offset + 8]
+        body = data[offset + 8 : offset + 8 + length]
+        (crc,) = struct.unpack(">I", data[offset + 8 + length : offset + 12 + length])
+        assert crc == zlib.crc32(tag + body), f"bad CRC in {tag!r}"
+        chunks.append((tag, body))
+        offset += 12 + length
+    return chunks
+
+
+@pytest.mark.parametrize("shape", [(37, 29), (37, 29, 3), (37, 29, 4), (1, 5, 3)])
+@pytest.mark.parametrize("num_strips", [1, 2, 7, 64])
+@pytest.mark.parametrize("compress_level", [0, 1, 9])
+def test_parallel_png_strips_form_one_valid_stream(shape, num_strips, compress_level):
+    """Strips deflated separately must join into one zlib stream with a correct
+    header, combined Adler-32 and per-chunk CRCs, and decode to the same pixels."""
+    frame = np.random.default_rng(0).integers(0, 256, size=shape, dtype=np.uint8)
+
+    data = encode_png_parallel(
+        frame,
+        compress_level=compress_level,
+        num_strips=num_strips,
+        executor=png_encoder_executor(),
+    )
+
+    chunks = _png_chunks(data)
+    idat = b"".join(body for tag, body in chunks if tag == b"IDAT")
+    # zlib.decompress verifies the stream header and the trailing Adler-32.
+    assert len(zlib.decompress(idat)) == shape[0] * (frame[0].size + 1)
+    with Image.open(io.BytesIO(data)) as image:
+        np.testing.assert_array_equal(np.asarray(image), frame)
+
+
+@pytest.mark.parametrize("disabled", [False, True])
+def test_large_compressed_png_frames_take_the_parallel_encoder_unless_disabled(
+    tmp_path, monkeypatch, disabled
+):
+    frame = np.random.default_rng(1).integers(0, 256, size=(64, 48, 3), dtype=np.uint8)
+    output_path = tmp_path / "large.png"
+    original_save = Image.Image.save
+    pillow_saves = []
+
+    def save_spy(self, fp, format=None, **params):
+        pillow_saves.append((format, params.get("compress_level")))
+        return original_save(self, fp, format=format, **params)
+
+    monkeypatch.setattr(output_utils, "PARALLEL_PNG_MIN_BYTES", frame.nbytes)
+    monkeypatch.setattr(Image.Image, "save", save_spy)
+    if disabled:
+        monkeypatch.setenv("SGLANG_DIFFUSION_DISABLE_PARALLEL_PNG", "1")
+    else:
+        monkeypatch.delenv("SGLANG_DIFFUSION_DISABLE_PARALLEL_PNG", raising=False)
+
+    save_materialized_output(
+        MaterializedOutput(sample=None, frames=[frame]),
+        DataType.IMAGE,
+        str(output_path),
+        output_compression=11,  # compress_level 1; the default writes stored blocks
+    )
+
+    assert pillow_saves == ([("PNG", 1)] if disabled else [])
+    with Image.open(output_path) as image:
+        np.testing.assert_array_equal(np.asarray(image), frame)
 
 
 @pytest.mark.parametrize("extension", ["jpg", "jpeg", "JPG"])
