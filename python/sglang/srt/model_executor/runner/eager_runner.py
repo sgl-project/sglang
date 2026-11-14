@@ -24,6 +24,7 @@ import torch
 from sglang.kernels.ops.attention.kv_indices import (
     create_chunked_prefix_cache_kv_indices,
 )
+from sglang.srt.batch_overlap import prefill_mbo
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.utils import (
@@ -297,6 +298,8 @@ class EagerRunner(BaseRunner):
                 # e.g. Moss-VL's prefill cross-attention custom mask.
                 model_runner.model.prepare_forward_batch(forward_batch)
             model_runner.attn_backend.init_forward_metadata(forward_batch)
+            if prefill_mbo.enabled(model_runner):
+                prefill_mbo.maybe_split(forward_batch)
             shared_read_ends = (
                 model_runner.attn_backend.resolve_prefill_shared_read_ends(
                     forward_batch

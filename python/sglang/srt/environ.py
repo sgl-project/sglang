@@ -2249,6 +2249,10 @@ class Envs:
     SGLANG_DSA_INDEXER_BF16_LOGITS = EnvBool(False)
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
+    # Split large single-request extends into two microbatches whose TP
+    # all-reduces overlap the other's compute (GLM-5-Next, dense Qwen3.5).
+    SGLANG_PREFILL_MBO = EnvBool(False)
+    SGLANG_PREFILL_MBO_MIN_TOKENS = EnvInt(4096)
     # DCP8 decode: the indexer's local top-k, candidate exchange, merge and
     # localization in one kernel (DcpFusedTopK, SM100, multicast).
     SGLANG_ENABLE_DSA_DCP_FUSED_TOPK = EnvBool(False)

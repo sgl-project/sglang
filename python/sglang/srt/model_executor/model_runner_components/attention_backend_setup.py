@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 
 import msgspec
 
+from sglang.srt.batch_overlap import prefill_mbo
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.attention_registry import (
     ATTENTION_BACKENDS,
@@ -119,6 +120,20 @@ def build_attention_backends(*, model_runner: ModelRunner) -> AttentionBackends:
         attn_backend = _build_resolved_backend(
             model_runner=model_runner, resolved=resolved, init_new_workspace=False
         )
+        if prefill_mbo.enabled(model_runner):
+            from sglang.srt.distributed.parallel_state import get_tp_group
+
+            prefill_mbo.setup(
+                [
+                    _build_resolved_backend(
+                        model_runner=model_runner,
+                        resolved=resolved,
+                        init_new_workspace=False,
+                    )
+                    for _ in range(2)
+                ],
+                get_tp_group().ranks,
+            )
 
     if (
         model_runner.device == "npu"
