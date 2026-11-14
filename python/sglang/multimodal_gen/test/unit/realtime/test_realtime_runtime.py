@@ -615,6 +615,38 @@ def test_listen_generate_request_propagates_disconnect_without_error_write():
     assert sent_messages == []
 
 
+@pytest.mark.parametrize(
+    ("error", "reason"),
+    [
+        (NotImplementedError(), "NotImplementedError"),
+        (RuntimeError("\n\nscheduler failed\ndetails"), "scheduler failed"),
+    ],
+)
+def test_generate_loop_reports_errors_without_a_leading_message_line(error, reason):
+    """a failure with an empty or blank first line must still reach the client"""
+    sent_messages = []
+
+    class _Adapter(realtime_adapter.BaseRealtimeModelAdapter):
+        def create_state(self):
+            return None
+
+        async def wait_for_next_chunk(self, session):
+            raise error
+
+    class _Ws:
+        async def send_bytes(self, message):
+            sent_messages.append(msgspec.msgpack.decode(message))
+
+    session = GenerateSession()
+    session.set_adapter(_Adapter())
+
+    asyncio.run(realtime_video_api._generate_loop(_Ws(), session))
+
+    assert sent_messages == [
+        {"type": "error", "content": f"error during generate loop: {reason}"}
+    ]
+
+
 def test_invalid_event_does_not_split_frame_header_and_payload():
     """an invalid event under send backpressure must not corrupt frame transport"""
 
