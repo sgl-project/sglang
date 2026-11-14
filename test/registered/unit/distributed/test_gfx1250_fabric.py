@@ -138,18 +138,18 @@ def test_dpx_pairs(accel_ids, expected):
     ("accel_ids", "expected"),
     [
         ([52, 52, 53, 53], [0, 1, 2, 3]),
-        # DPX partners apart in the group: the ring keeps each SoC together
+        # an accelerator's partitions apart in the group: the ring keeps them together
         ([52, 53, 52, 53], [0, 2, 1, 3]),
         ([52, 53, 54, 55, 52, 53, 54, 55], [0, 4, 1, 5, 2, 6, 3, 7]),
-        # one partition of a SoC in the group, or four
+        # one partition of an accelerator in the group, or four
         ([52, 53, 53], [0, 1, 2]),
         ([53, 52, 52, 52, 52, 53], [0, 5, 1, 2, 3, 4]),
-        ([52, 53, 54, 55], [0, 1, 2, 3]),  # SPX
+        ([52, 53, 54, 55], [0, 1, 2, 3]),  # one partition per accelerator
         ([52, None, 52], [0, 1, 2]),
     ],
 )
-def test_soc_ring_order(accel_ids, expected):
-    assert gfx1250_fabric.soc_ring_order(accel_ids) == expected
+def test_accelerator_ring_order(accel_ids, expected):
+    assert gfx1250_fabric.accelerator_ring_order(accel_ids) == expected
 
 
 @pytest.mark.parametrize(("peer_accel_id", "expected"), [(52, [[0, 1]]), (None, None)])

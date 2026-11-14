@@ -1,4 +1,4 @@
-// gfx1250 (MI450) 2shot_push for large tensors, included by custom_all_reduce.cuh on
+// gfx1250 2shot_push for large tensors, included by custom_all_reduce.cuh on
 // ROCm: the same algorithm as `all_reduce_2shot_push_kernel` with a deeper memory
 // pipeline. `AllReduceKernel` picks it by size.
 #pragma once

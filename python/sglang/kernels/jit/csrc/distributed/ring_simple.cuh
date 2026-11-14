@@ -1,4 +1,4 @@
-// ring_simple, CustomAllReduceV2's ring all-reduce for ROCm gfx1250 (MI450): each
+// ring_simple, CustomAllReduceV2's ring all-reduce for ROCm gfx1250: each
 // chunk goes to the next rank only, through a fixed-size FIFO behind 64-bit
 // counters, in 2 * (world_size - 1) hops per loop. It runs over a ring plane of
 // its own (`RingPlaneObj` below), not over the shared communicator.

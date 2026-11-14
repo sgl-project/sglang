@@ -351,14 +351,13 @@ def _rocm_configs(num_sm: int) -> dict[int, AllReduceConfig]:
     return {world_size: default for world_size in range(2, 9)}
 
 
-# ROCm (MI450 / gfx1250, 96 CUs). Every size up to 4 GB stays on carv2:
-# 1shot_push, then 2shot_push, then ring_simple. The 2shot_push and ring_simple
-# cutoffs are the last size each won on h13-13 (DPX, graph, bf16, median of 3,
-# back to back, TP2-8). 1shot_push wins back to back up to 256 KB-8 MB, but
-# stops at 64 KB: with a late rank and a GEMM before the all-reduce, as in
-# serving, 2shot_push wins from 128 KB, and at TP8 a 256 KB cutoff cost
-# DeepSeek-V4-Flash 18% of its C16 decode throughput. Pull stays off: it lost
-# at every measured size.
+# ROCm gfx1250. Every size up to 4 GB stays on carv2: 1shot_push, then
+# 2shot_push, then ring_simple. The 2shot_push and ring_simple cutoffs are the
+# last size each won (graph, bf16, median of 3, back to back, TP2-8).
+# 1shot_push wins back to back up to 256 KB-8 MB, but stops at 64 KB: with a
+# late rank and a GEMM before the all-reduce, as in serving, 2shot_push wins
+# from 128 KB, and at TP8 a 256 KB cutoff cost DeepSeek-V4-Flash 18% of its C16
+# decode throughput. Pull stays off: it lost at every measured size.
 @cache
 def _rocm_gfx1250_configs(
     num_sm: int, dev_kernarg: bool = False
@@ -392,22 +391,22 @@ def _rocm_gfx1250_configs(
         7: (64 * KB, 16 * MB),
         8: (64 * KB, 8 * MB),
     }
-    # That stall needs kernel arguments in host memory (the cookbook's
-    # HIP_FORCE_DEV_KERNARG=0). With HIP_FORCE_DEV_KERNARG=1 the kernels after
-    # a 2shot_push run at full speed, so TP2/4/8 take 2shot_push to the last
-    # size it wins back to back. 1shot_push also serves decode further, to the
-    # last size it wins in CUDA graphs with a late rank or a GEMM before it
-    # (768 KB at TP8, every decode size at TP2/4): DeepSeek-V4-Flash decode
-    # gains about 2-4% at TP4/TP8.
+    # That stall needs kernel arguments in host memory (HIP_FORCE_DEV_KERNARG
+    # unset or 0). With HIP_FORCE_DEV_KERNARG=1 the kernels after a 2shot_push
+    # run at full speed, so TP2/4/8 take 2shot_push to the last size it wins
+    # back to back. 1shot_push also serves decode further, to the last size it
+    # wins in CUDA graphs with a late rank or a GEMM before it (768 KB at TP8,
+    # every decode size at TP2/4): DeepSeek-V4-Flash decode gains about 2-4% at
+    # TP4/TP8.
     if dev_kernarg:
         cutoffs.update(
             {2: (2 * MB, 16 * MB), 4: (2 * MB, 32 * MB), 8: (768 * KB, 32 * MB)}
         )
     configs = {ws: config(*cutoff) for ws, cutoff in cutoffs.items()}
-    # 16 ranks span two DPX hosts in one UALink fabric clique. Tuned there with
-    # and without a late rank: across hosts 2shot_push pays two fabric hops, so
+    # 16 ranks span two hosts in one fabric clique. Tuned there with and
+    # without a late rank: across hosts 2shot_push pays two fabric hops, so
     # 1shot_push wins to 256 KB, and a block per CU keeps 2shot_push ahead of
-    # RCCL to 64 MB. When every SoC's two DPX partitions are in the group,
+    # RCCL to 64 MB. When both partitions of every accelerator are in the group,
     # hier_2shot_push reduces each pair first, so only half the tensor crosses
     # the fabric: above 256 KB it beats 2shot_push by 17-31% back to back and
     # 9-14% with a late rank, so it takes over to 64 MB. ring_simple takes
@@ -420,9 +419,7 @@ def _rocm_gfx1250_configs(
         hier_2shot_push=Range(256 * KB, 64 * MB),
         ring_simple=Range(64 * MB + 16, 4 * 1024 * MB),
     )
-    configs[16] = configs[8]._replace(
-        graph=tp16, eager=tp16, num_push_blocks=min(num_sm, 96)
-    )
+    configs[16] = configs[8]._replace(graph=tp16, eager=tp16, num_push_blocks=num_sm)
     return configs
 
 
