@@ -139,8 +139,8 @@ class InklingOutputParser:
     def _cut_at_stop_string(
         self, token_ids: Sequence[int], stop: str, *, keep_stop: bool
     ) -> tuple[list[int], bytes]:
-        """Returns the whole tokens kept plus the kept byte prefix of the token the
-        cut falls in; those bytes may continue a character from earlier tokens."""
+        # Returns the whole tokens kept plus the kept byte prefix of the token the
+        # cut falls in; those bytes may continue a character from earlier tokens.
         # The scheduler matched ``stop`` on the decoded ids, framing included,
         # and ended on the token completing it; cut the raw stream there.
         tokenizer = self._tml.tokenizer

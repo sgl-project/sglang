@@ -36,10 +36,6 @@ _THINKING_PART_TYPES = frozenset({"thinking", "reasoning"})
 _IMAGE_LOCATION_PREFIX = "sglang-inkling-image://"
 _AUDIO_LOCATION_PREFIX = "sglang-inkling-audio://"
 
-_NATIVE_TOKENIZERS = {
-    "inkling": "O200kBaseChatTokenizer",
-    "inkling2": "H200kBaseChatTokenizer",
-}
 # Inkling2 checkpoints keep these native audio IDs as unused reserved tokens.
 _UNUSED_SPECIALS = {
     "inkling": (),
@@ -53,7 +49,11 @@ def load_tml_renderers(spec: str = "inkling") -> SimpleNamespace:
         from tml_renderers import chat, tokenizers, v0
     except ImportError as exc:
         raise ImportError(TML_RENDERERS_INSTALL_HINT) from exc
-    tokenizer = getattr(tokenizers, _NATIVE_TOKENIZERS[spec])()
+    native_tokenizers = {
+        "inkling": tokenizers.O200kBaseChatTokenizer,
+        "inkling2": tokenizers.H200kBaseChatTokenizer,
+    }
+    tokenizer = native_tokenizers[spec]()
     return SimpleNamespace(
         chat=chat,
         v0=v0,
@@ -68,7 +68,7 @@ def load_tml_renderers(spec: str = "inkling") -> SimpleNamespace:
 _TOKENIZER_PROBE = "Hello, 世界! def f(x): return x**2\n\t  naïve 👩‍🚀 12345678901"
 
 
-def check_served_tokenizer(tokenizer: Any, spec: str) -> None:
+def check_served_tokenizer(tokenizer: Any, *, spec: str) -> None:
     # Prompts and outputs use tml-renderers' tokenizer, while the scheduler matches
     # stop strings and detokenizes with the served one; they must agree.
     tml = load_tml_renderers(spec)
@@ -130,7 +130,7 @@ def render_inkling_messages(
     return _spans_to_input_ids(spans, tml)
 
 
-def render_inkling_assistant_prefix(prefix: str, spec: str = "inkling") -> list[int]:
+def render_inkling_assistant_prefix(prefix: str, *, spec: str = "inkling") -> list[int]:
     """TMLv0 has no prefill; continuation opens a model text block without a terminator."""
     tokenizer = load_tml_renderers(spec).tokenizer
     return [

@@ -60,7 +60,7 @@ class InklingChatEncodingAdapter:
         self._default_reasoning_effort = get_default_reasoning_effort()
         load_tml_renderers(spec)
         if tokenizer is not None:
-            check_served_tokenizer(tokenizer, spec)
+            check_served_tokenizer(tokenizer, spec=spec)
         self._spec = spec
         reasoning_is_token = reasoning_parser == "inkling"
         tool_call_is_token = tool_call_parser in _TOKEN_TOOL_CALL_PARSERS
@@ -126,9 +126,9 @@ class InklingChatEncodingAdapter:
         finish_reason: dict[str, Any],
     ) -> tuple[str | None, str, list[ToolCall] | None, dict[str, Any]]:
         parsed = _finish(
-            self._new_output_parser(request),
-            output_ids,
-            finish_reason,
+            parser=self._new_output_parser(request),
+            token_ids=output_ids,
+            finish_reason=finish_reason,
             keep_matched_stop=request.no_stop_trim,
         )
         if not parsed.tool_calls:
@@ -168,9 +168,9 @@ class InklingChatEncodingAdapter:
             delta = parser.feed(new_output_ids)
         else:
             delta = _finish(
-                parser,
-                new_output_ids,
-                content["meta_info"]["finish_reason"],
+                parser=parser,
+                token_ids=new_output_ids,
+                finish_reason=content["meta_info"]["finish_reason"],
                 keep_matched_stop=request.no_stop_trim,
             )
 
@@ -207,7 +207,12 @@ class InklingChatEncodingAdapter:
             parse_tool_calls=parse_tool_calls,
             spec=self._spec,
         )
-        delta = _finish(parser, output_ids, finish_reason, keep_matched_stop=False)
+        delta = _finish(
+            parser=parser,
+            token_ids=output_ids,
+            finish_reason=finish_reason,
+            keep_matched_stop=False,
+        )
         return delta.reasoning, delta.content, _tool_call_items(delta)
 
     def new_responses_stream(
@@ -279,16 +284,19 @@ class InklingResponsesStream:
             delta = self._parser.feed(new_output_ids)
         else:
             delta = _finish(
-                self._parser, new_output_ids, finish_reason, keep_matched_stop=False
+                parser=self._parser,
+                token_ids=new_output_ids,
+                finish_reason=finish_reason,
+                keep_matched_stop=False,
             )
         return delta.reasoning, delta.content, _tool_call_items(delta)
 
 
 def _finish(
+    *,
     parser: InklingOutputParser,
     token_ids: list[int],
     finish_reason: dict[str, Any] | None,
-    *,
     keep_matched_stop: bool,
 ) -> InklingOutputDelta:
     finish_reason = finish_reason or {}
