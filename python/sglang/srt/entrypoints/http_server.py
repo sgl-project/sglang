@@ -1257,22 +1257,34 @@ async def get_hicache_l3_cache_layout():
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def start_profile_async(obj: Annotated[Optional[ProfileReq], Body()] = None):
     """Start profiling."""
-    await _global_state.tokenizer_manager.start_profile(obj or ProfileReq())
-    return Response(
-        content="Start profiling.\n",
-        status_code=200,
-    )
+    try:
+        await _global_state.tokenizer_manager.start_profile(obj or ProfileReq())
+        return Response(
+            content="Start profiling.\n",
+            status_code=200,
+        )
+    except RuntimeError as e:
+        return Response(
+            content=f"{e}\n",
+            status_code=HTTPStatus.CONFLICT,
+        )
 
 
 @app.api_route("/stop_profile", methods=["GET", "POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def stop_profile_async():
     """Stop profiling."""
-    await _global_state.tokenizer_manager.stop_profile()
-    return Response(
-        content="Stop profiling. This will take some time.\n",
-        status_code=200,
-    )
+    try:
+        await _global_state.tokenizer_manager.stop_profile()
+        return Response(
+            content="Stop profiling. This will take some time.\n",
+            status_code=200,
+        )
+    except RuntimeError as e:
+        return Response(
+            content=f"{e}\n",
+            status_code=HTTPStatus.CONFLICT,
+        )
 
 
 @app.api_route("/set_trace_level", methods=["GET", "POST"])

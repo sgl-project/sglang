@@ -110,17 +110,21 @@ class TestStartProfile(CustomTestCase):
 
     def test_start_profile_4_refusals(self):
         """A stop with nothing running, and a deferred (start_step) start while
-        a profile runs, are refused with the scheduler's error surfaced as a
-        bare 500; the running profile is unaffected and stops normally. Runs
+        a profile runs, are refused with 409 Conflict containing the scheduler's
+        error message; the running profile is unaffected and stops normally. Runs
         after test_start_profile_3, whose num_steps profile stopped itself."""
-        self._assert_refused(requests.post(f"{DEFAULT_URL_FOR_TEST}/stop_profile"))
+        self._assert_refused(
+            requests.post(f"{DEFAULT_URL_FOR_TEST}/stop_profile"),
+            "Profiling is not in progress",
+        )
 
         self._start_profile()
         self._assert_refused(
             requests.post(
                 f"{DEFAULT_URL_FOR_TEST}/start_profile",
                 json={"start_step": "1", "num_steps": 1},
-            )
+            ),
+            "Profiling is already in progress",
         )
         self._post_request()
         response = requests.get(f"{DEFAULT_URL_FOR_TEST}/stop_profile")
@@ -128,9 +132,10 @@ class TestStartProfile(CustomTestCase):
         self.assertEqual(response.text, "Stop profiling. This will take some time.\n")
         self._check_non_empty_profile_dir()
 
-    def _assert_refused(self, response):
-        self.assertEqual(response.status_code, 500)
-        self.assertEqual(response.text, "Internal Server Error")
+    def _assert_refused(self, response, expected_message=None):
+        self.assertEqual(response.status_code, 409)
+        if expected_message is not None:
+            self.assertIn(expected_message, response.text)
 
     def _start_profile(self, **kwargs):
         """Start profiling with optional parameters."""
