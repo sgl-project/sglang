@@ -3,9 +3,18 @@
 import json
 import unittest
 
-from jsonschema import Draft202012Validator, SchemaError
+from jsonschema import (
+    Draft7Validator,
+    Draft202012Validator,
+    SchemaError,
+    ValidationError,
+)
 
-from sglang.srt.function_call.utils import normalize_json_schema_types
+from sglang.srt.entrypoints.openai.protocol import Function, Tool
+from sglang.srt.function_call.utils import (
+    normalize_json_schema_types,
+    without_schema_identifiers,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -403,6 +412,152 @@ class TestNormalizeJsonSchemaTypes(CustomTestCase):
         self.assertIs(schema["additionalProperties"], True)
         self.assertIs(schema["unevaluatedProperties"], False)
         self._assert_accepts(schema)
+
+
+class TestWithoutSchemaIdentifiers(CustomTestCase):
+    def test_invalid_reserved_property_schema_is_rejected(self):
+        """A tool field named like an identifier must still undergo schema validation."""
+        for name in ("$id", "$anchor", "$dynamicAnchor"):
+            with self.subTest(name=name):
+                tool = Tool(
+                    type="function",
+                    function=Function(
+                        name="lookup",
+                        parameters={
+                            "$id": "#lookup",
+                            "type": "object",
+                            "properties": {name: {"type": "mystery"}},
+                            "required": [name],
+                        },
+                    ),
+                )
+                normalize_json_schema_types(tool.function.parameters)
+                checked_schema = without_schema_identifiers(tool.function.parameters)
+                with self.assertRaises(SchemaError):
+                    Draft202012Validator.check_schema(checked_schema)
+
+    def test_definition_names_and_references_are_preserved(self):
+        """Removing metadata must not delete a referenced definition with the same name."""
+        for name in ("$id", "$anchor", "$dynamicAnchor"):
+            with self.subTest(name=name):
+                schema = {
+                    "$id": "#lookup",
+                    "$defs": {name: {"$id": "#value", "type": "integer"}},
+                    "type": "object",
+                    "properties": {"answer": {"$ref": f"#/$defs/{name}"}},
+                    "required": ["answer"],
+                }
+                checked_schema = without_schema_identifiers(schema)
+                Draft202012Validator.check_schema(checked_schema)
+                validator = Draft202012Validator(checked_schema)
+                validator.validate({"answer": 7})
+                with self.assertRaises(ValidationError):
+                    validator.validate({"answer": "seven"})
+
+    def test_schema_map_names_do_not_hide_invalid_schemas(self):
+        """Map keys name patterns, dependencies, or definitions, not metadata."""
+        for keyword in ("patternProperties", "dependentSchemas", "definitions"):
+            for name in ("$id", "$anchor", "$dynamicAnchor"):
+                with self.subTest(keyword=keyword, name=name):
+                    schema = {keyword: {name: {"type": "mystery"}}}
+                    with self.assertRaises(SchemaError):
+                        Draft202012Validator.check_schema(
+                            without_schema_identifiers(schema)
+                        )
+
+    def test_instance_valued_keywords_are_unchanged(self):
+        """Literal objects under const/enum/default/examples retain identifier-like keys."""
+        value = {
+            "$id": "document-id",
+            "$anchor": "document-anchor",
+            "$dynamicAnchor": {"$id": "nested-data"},
+            "properties": {"$id": 7},
+        }
+        schema = {
+            "$id": "#lookup",
+            "const": value,
+            "enum": [value, {"$id": "another-document"}],
+            "default": value,
+            "examples": [value],
+        }
+        checked_schema = without_schema_identifiers(schema)
+        self.assertEqual(checked_schema["const"], value)
+        self.assertEqual(checked_schema["enum"], schema["enum"])
+        self.assertEqual(checked_schema["default"], value)
+        self.assertEqual(checked_schema["examples"], [value])
+        Draft202012Validator.check_schema(checked_schema)
+        Draft202012Validator(checked_schema).validate(value)
+
+    def test_nested_metadata_still_accepts_legacy_identifiers(self):
+        """Schema-valued object, array, and legacy dependency positions remain covered."""
+        schemas = [
+            {
+                "$id": "#root",
+                "type": "array",
+                "prefixItems": [
+                    {
+                        "$anchor": "invalid anchor",
+                        "anyOf": [
+                            {"$id": "#integer", "type": "integer"},
+                            {"$dynamicAnchor": "invalid anchor", "type": "null"},
+                        ],
+                    }
+                ],
+                "items": False,
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "nested": {
+                        "$id": "#nested",
+                        "additionalProperties": {"$id": "#value", "type": "string"},
+                    }
+                },
+            },
+        ]
+        for schema in schemas:
+            with self.subTest(schema=schema):
+                Draft202012Validator.check_schema(without_schema_identifiers(schema))
+        legacy_schema = {
+            "type": "array",
+            "items": [{"$id": "#first", "type": "integer"}],
+            "definitions": {"Row": {"dependencies": {"key": {"$id": "#dependency"}}}},
+        }
+        checked_legacy = without_schema_identifiers(legacy_schema)
+        Draft7Validator.check_schema(checked_legacy)
+        self.assertEqual(checked_legacy["items"], [{"type": "integer"}])
+        self.assertEqual(
+            checked_legacy["definitions"]["Row"]["dependencies"], {"key": {}}
+        )
+
+    def test_copy_preserves_original_tool_schema(self):
+        """Metaschema preparation cannot mutate the parameters later rendered in prompts."""
+        tool = Tool(
+            type="function",
+            function=Function(
+                name="lookup",
+                parameters={
+                    "$id": "#lookup",
+                    "properties": {"value": {"$id": "#value", "type": "integer"}},
+                },
+            ),
+        )
+        original = tool.model_dump_json()
+        checked_schema = without_schema_identifiers(tool.function.parameters)
+        checked_schema["properties"]["value"]["type"] = "boolean"
+        self.assertEqual(tool.model_dump_json(), original)
+
+    def test_boolean_schemas_are_preserved(self):
+        """Boolean schemas and schema-valued booleans must not become object schemas."""
+        for schema in (
+            True,
+            False,
+            {"properties": {"allowed": True, "blocked": False}},
+        ):
+            with self.subTest(schema=schema):
+                checked_schema = without_schema_identifiers(schema)
+                self.assertEqual(checked_schema, schema)
+                Draft202012Validator.check_schema(checked_schema)
 
 
 if __name__ == "__main__":
