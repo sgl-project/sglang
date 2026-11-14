@@ -56,6 +56,9 @@ class MiniMaxH3ImagePipelineConfig(MiniMaxH3PipelineConfig):
         ModelTaskType.T2I,
         ModelTaskType.I2I,
     )
+    # One checkpoint serves both image tasks, so its sidecar names the release
+    # itself; --model-variant stays rejected because metadata selects the task.
+    minimax_h3_adaln_cache_variants: ClassVar[tuple[str, ...]] = ("image",)
     # The image decoder runs with BF16 weights under BF16 autocast.
     vae_decode_precision: str = "bf16"
     vae_sp: bool = False
@@ -263,8 +266,6 @@ class MiniMaxH3ImagePipelineConfig(MiniMaxH3PipelineConfig):
         ):
             if getattr(server_args, name):
                 raise ValueError(f"MiniMax H3 image does not support {name}")
-        if server_args.minimax_h3_adaln_cache_path is not None:
-            raise ValueError("MiniMax H3 image does not support an AdaLN cache")
         online_quantizations = (None, "fp8", "mxfp8")
         if server_args.quantization not in online_quantizations or any(
             name not in ("transformer", "text_encoder")
@@ -319,6 +320,15 @@ class MiniMaxH3ImagePipelineConfig(MiniMaxH3PipelineConfig):
             )
 
     def _configure_online_adaln(self, server_args) -> None:
+        if server_args.minimax_h3_adaln_cache_path is not None:
+            # A prebuilt sidecar already covers the fixed PDD grid; falling
+            # back to the rebuild would need the adaln_proj weights again.
+            if server_args.minimax_h3_adaln_online:
+                raise ValueError(
+                    "--minimax-h3-adaln-online and --minimax-h3-adaln-cache-path "
+                    "are mutually exclusive"
+                )
+            return
         # Measured H200/B300, GB10 and RTX PRO 6000 Blackwell recipes avoid keeping
         # 24.2 GiB of constant AdaLN projections resident. Explicit choices and
         # custom weights win.
