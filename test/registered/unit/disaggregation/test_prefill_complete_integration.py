@@ -16,6 +16,7 @@ from sglang.srt.disaggregation.common.conn import CommonKVReceiver, PrefillServe
 from sglang.srt.disaggregation.common.utils import TransferKVChunk
 from sglang.srt.disaggregation.decode import DecodePreallocQueue, DecodeRequest
 from sglang.srt.disaggregation.fake.conn import FakeKVSender
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.mooncake.conn import (
     MooncakeKVManager,
     MooncakeKVReceiver,
@@ -110,6 +111,9 @@ class TestAllocationIntegration(CustomTestCase):
         mgr.customized_info_enabled = False
         mgr.exchange_aux_item_lens = False
         mgr.local_ip, mgr.rank_port = ip, port
+        mgr.disaggregation_mode = (
+            DisaggregationMode.PREFILL if ip == "prefill" else DisaggregationMode.DECODE
+        )
         mgr.kv_args = SimpleNamespace(aux_data_ptrs=[], aux_item_lens=[])
         mgr.request_status = {}
         mgr.failure_lock = threading.Lock()
@@ -936,6 +940,141 @@ class TestAllocationIntegration(CustomTestCase):
         queue.add(req, is_rebootstrap=True)
         self.assertEqual(req.bootstrap_room, 1)
         self.assertEqual(req.disagg_prefill_dp_rank, 3)
+
+    def conclude_like_worker(self, mgr, room=1):
+        # The transfer worker's Success write once every destination returned
+        # (MooncakeKVManager.transfer_worker, conclude_transfer call).
+        mgr.conclude_transfer(
+            bootstrap_room=room,
+            status=KVPoll.Success,
+            targets=[("decode", 2)],
+            failure_reason=None,
+            # The worker uncounts the chunk only after this call returns.
+            counts_self=True,
+        )
+
+    def test_abort_after_worker_success_does_not_fail_decode(self):
+        sender, receiver = self.sender(), self.receiver()
+        self.flush()
+        sender.mark_prefill_complete()
+        self.flush()
+        self.assertEqual(receiver.poll(), KVPoll.WaitingForInput)
+        # Decode's destinations arrived; the room is now transferring.
+        self.prefill.update_status(1, KVPoll.WaitingForInput)
+        self.conclude_like_worker(self.prefill)
+        # A client abort reaches the transfer queue before the scheduler polls.
+        sender.abort()
+        to_decode = [
+            self.decode.parse_kv_status_message(msg)
+            for endpoint, msg in self.wire
+            if endpoint == "tcp://decode:2"
+        ]
+        self.flush()
+        with self.subTest("no Failed message reaches decode"):
+            self.assertNotIn(
+                KVPoll.Failed,
+                [status for room, status, _, _ in to_decode if room == 1],
+                "prefill sent decode a Failed status for a room whose transfer succeeded",
+            )
+        with self.subTest("decode room is not Failed"):
+            self.assertNotEqual(self.decode.request_status.get(1), KVPoll.Failed)
+        with self.subTest("prefill table keeps Success"):
+            self.assertEqual(self.prefill.request_status.get(1), KVPoll.Success)
+
+    def test_terminal_success_is_not_overwritten_by_abort(self):
+        mgr = self.manager("prefill", 1)
+        mgr.defer_decode_allocation = False
+        mgr.deferred_bootstrap = None
+        with get_context().override_server_args(
+            disaggregation_decode_allocation_policy="early"
+        ):
+            sender = MooncakeKVSender(mgr, "prefill:8998", 1)
+            # Decode's destinations arrived; the room is now transferring.
+            mgr.update_status(1, KVPoll.WaitingForInput)
+            self.conclude_like_worker(mgr)
+            sender.abort()
+            with self.subTest("table keeps Success"):
+                self.assertEqual(mgr.request_status.get(1), KVPoll.Success)
+            with self.subTest("sender reports Success"):
+                self.assertEqual(sender.poll(), KVPoll.Success)
+
+    def test_failed_deferred_chunk_replaces_provisional_success(self):
+        mgr = self.manager("prefill", 1)
+        mgr.defer_decode_allocation = False
+        mgr.deferred_bootstrap = None
+        mgr._staging_outstanding = defaultdict(int)
+        decode = self.manager("decode", 2)
+        decode.defer_decode_allocation = False
+        with get_context().override_server_args(
+            disaggregation_decode_allocation_policy="early"
+        ):
+            sender = MooncakeKVSender(mgr, "prefill:8998", 1)
+            # Decode's destinations arrived; the room is now transferring.
+            mgr.update_status(1, KVPoll.WaitingForInput)
+            decode.request_status[1] = KVPoll.WaitingForInput
+            decode.prefill_response_tracker[1] = set()
+            decode.required_prefill_response_num_table[1] = 1
+            # The worker keeps the room's decode endpoints until teardown;
+            # conclude_failure without targets notifies them.
+            mgr.transfer_infos[1] = {
+                "session": SimpleNamespace(
+                    is_dummy=False, endpoint="decode", dst_port=2
+                )
+            }
+            # The worker counts each chunk at dequeue. Chunk A was deferred and
+            # re-enqueued behind the last chunk B, so both are outstanding.
+            mgr._staging_outstanding[1] += 1
+            mgr._staging_outstanding[1] += 1
+            self.conclude_like_worker(mgr)
+            mgr._staging_outstanding[1] -= 1
+            # Chunk A's retry fails (transfer_worker, ret != 0 branch).
+            mgr.conclude_failure(
+                bootstrap_room=1,
+                failure_reason="Failed to send kv chunk of 1 to decode:2",
+            )
+            to_decode = [
+                decode.parse_kv_status_message(msg)
+                for endpoint, msg in self.wire
+                if endpoint == "tcp://decode:2"
+            ]
+            for room, status, rank, reason in to_decode:
+                decode.apply_prefill_status(
+                    bootstrap_room=room,
+                    status=status,
+                    prefill_rank=rank,
+                    failure_reason=reason,
+                )
+            self.wire.clear()
+            with self.subTest("prefill table reads Failed"):
+                self.assertEqual(mgr.request_status.get(1), KVPoll.Failed)
+            mgr._staging_outstanding[1] -= 1
+            with self.subTest("sender reports Failed"):
+                self.assertEqual(sender.poll(), KVPoll.Failed)
+            with self.subTest("a Failed message reaches decode"):
+                self.assertIn(
+                    KVPoll.Failed,
+                    [status for room, status, _, _ in to_decode if room == 1],
+                )
+            with self.subTest("decode room is Failed"):
+                self.assertEqual(decode.request_status.get(1), KVPoll.Failed)
+
+    def test_abort_before_last_chunk_is_uncounted_keeps_success(self):
+        mgr = self.manager("prefill", 1)
+        mgr.defer_decode_allocation = False
+        mgr.deferred_bootstrap = None
+        mgr._staging_outstanding = defaultdict(int)
+        with get_context().override_server_args(
+            disaggregation_decode_allocation_policy="early"
+        ):
+            sender = MooncakeKVSender(mgr, "prefill:8998", 1)
+            mgr.update_status(1, KVPoll.WaitingForInput)
+            # transfer_worker counts the chunk at dequeue and uncounts it only
+            # after conclude_transfer returns.
+            mgr._staging_outstanding[1] += 1
+            self.conclude_like_worker(mgr)
+            sender.abort()
+            mgr._staging_outstanding[1] -= 1
+            self.assertEqual(mgr.request_status.get(1), KVPoll.Success)
 
 
 if __name__ == "__main__":

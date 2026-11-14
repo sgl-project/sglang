@@ -312,6 +312,12 @@ class CommonKVManager(BaseKVManager):
     defer_decode_allocation: bool = False
     deferred_bootstrap: Optional[DeferredBootstrap] = None
     _staging_ctx = None
+    # Serializes request_status read then write across the scheduler, control,
+    # transfer and heartbeat threads.
+    _status_lock = threading.Lock()
+    # Rooms whose Success was written while another staging chunk was still
+    # outstanding (see conclude_transfer). Created on first use.
+    _provisional_success: Optional[Set[int]] = None
 
     # Wire layout of the prefill->decode terminal status message. The legacy
     # layout (mooncake, and ascend which inherits it) is three untagged frames
@@ -728,35 +734,57 @@ class CommonKVManager(BaseKVManager):
                 "compatible metadata buffers."
             )
 
-    def update_status(self, bootstrap_room: int, status: KVPoll):
-        current = self.request_status.get(bootstrap_room)
-        if current is None:
-            # The room does not exist yet, or clear() already popped it. Only a
-            # request's opening status may create it: Bootstrapping normally, or
-            # WaitingForInput for a dummy CP rank (see CommonKVSender.__init__).
-            # Anything else would resurrect a concluded room and pollute a later
-            # request that reuses the same bootstrap_room.
-            if status in (KVPoll.Bootstrapping, KVPoll.WaitingForInput):
-                # A new room lifecycle drops deferred-ACK state left by the
-                # previous request that used this bootstrap_room.
-                self._deferred_ack_targets.pop(bootstrap_room, None)
-                self._deferred_ack_poisoned_rooms.discard(bootstrap_room)
-                self._staging_outstanding.pop(bootstrap_room, None)
-                self._forget_sends(bootstrap_room)
-                self.request_status[bootstrap_room] = status
-            return
-        if status == KVPoll.Failed:
-            self.request_status[bootstrap_room] = KVPoll.Failed
-            if self.deferred_bootstrap is not None:
-                self._notify_bootstrap(
-                    bootstrap_room, self.deferred_bootstrap.fail(bootstrap_room)
+    def update_status(self, bootstrap_room: int, status: KVPoll) -> Optional[KVPoll]:
+        """Apply ``status`` and return the room's status afterwards (None if
+        the room does not exist)."""
+        notification = None
+        with self._status_lock:
+            current = self.request_status.get(bootstrap_room)
+            if current is None:
+                # The room does not exist yet, or clear() already popped it. Only a
+                # request's opening status may create it: Bootstrapping normally, or
+                # WaitingForInput for a dummy CP rank (see CommonKVSender.__init__).
+                # Anything else would resurrect a concluded room and pollute a later
+                # request that reuses the same bootstrap_room.
+                if status in (KVPoll.Bootstrapping, KVPoll.WaitingForInput):
+                    # A new room lifecycle drops deferred-ACK state left by the
+                    # previous request that used this bootstrap_room.
+                    self._deferred_ack_targets.pop(bootstrap_room, None)
+                    self._deferred_ack_poisoned_rooms.discard(bootstrap_room)
+                    self._staging_outstanding.pop(bootstrap_room, None)
+                    if self._provisional_success:
+                        self._provisional_success.discard(bootstrap_room)
+                    self._forget_sends(bootstrap_room)
+                    self.request_status[bootstrap_room] = status
+                    return status
+                return None
+            if current == KVPoll.Failed or (
+                current == KVPoll.Success
+                and (
+                    status != KVPoll.Failed
+                    or (
+                        self.disaggregation_mode == DisaggregationMode.PREFILL
+                        and bootstrap_room not in (self._provisional_success or ())
+                    )
                 )
-            return
-        if current == KVPoll.Failed:
-            # Failed is terminal. It also sorts lowest, so the max() below would
-            # happily promote it back to Transferring or Success.
-            return
-        self.request_status[bootstrap_room] = max(current, status)
+            ):
+                # Failed is terminal, and sorts lowest, so max() would promote it
+                # back. On prefill, Success is terminal unless conclude_transfer
+                # marked it provisional: another staging chunk was outstanding,
+                # and its failure must still fail the room. On decode, a prefill
+                # Failed after Success reports such a chunk, so it still
+                # replaces Success.
+                return current
+            if status == KVPoll.Failed:
+                self.request_status[bootstrap_room] = KVPoll.Failed
+                if self.deferred_bootstrap is not None:
+                    notification = self.deferred_bootstrap.fail(bootstrap_room)
+                result = KVPoll.Failed
+            else:
+                result = self.request_status[bootstrap_room] = max(current, status)
+        # Outside the lock: a peer that is gone must not stall status writers.
+        self._notify_bootstrap(bootstrap_room, notification)
+        return result
 
     def send_record(self, bootstrap_room: int) -> SendRecord:
         """The room's send record, created by its first send (scheduler
@@ -971,11 +999,15 @@ class CommonKVManager(BaseKVManager):
         status: KVPoll,
         targets: Optional[List[Tuple[str, int]]] = None,
         failure_reason: Optional[str] = None,
+        counts_self: bool = False,
     ) -> Optional[KVPoll]:
         """Returns the status emitted, or None for a cleared room.
 
         Runs more than once for a room when a staging chunk is deferred past the
         last one. ``targets`` defaults to the room's non-dummy decode endpoints.
+        ``counts_self`` says the concluding chunk is still counted in
+        ``_staging_outstanding``: its writes have returned, so it must not make
+        its own Success provisional.
         """
         if bootstrap_room not in self.request_status:
             # The sender already cleared this room. Concluding now would
@@ -1002,6 +1034,18 @@ class CommonKVManager(BaseKVManager):
 
         if targets is None:
             targets = self._room_notify_targets(bootstrap_room)
+        if status == KVPoll.Success:
+            # Provisional while a chunk other than the caller's is outstanding.
+            # Marked before the status write, so an abort never meets a Success
+            # that is neither terminal nor marked.
+            others = self._staging_outstanding.get(bootstrap_room, 0) - int(counts_self)
+            with self._status_lock:
+                if self._provisional_success is None:
+                    self._provisional_success = set()
+                if others > 0:
+                    self._provisional_success.add(bootstrap_room)
+                else:
+                    self._provisional_success.discard(bootstrap_room)
         self.update_status(bootstrap_room, status)
         if status == KVPoll.Success and self.deferred_bootstrap is not None:
             # Success permits decode to reuse the room after true retraction.
@@ -2584,6 +2628,9 @@ class CommonKVSender(BaseKVSender):
             if status in (KVPoll.Success, KVPoll.Failed):
                 self.conclude_state = status
         self.kv_mgr.request_status.pop(self.bootstrap_room, None)
+        if self.kv_mgr._provisional_success:
+            with self.kv_mgr._status_lock:
+                self.kv_mgr._provisional_success.discard(self.bootstrap_room)
         self._retire_sends()
         self.kv_mgr.req_to_decode_prefix_len.pop(self.bootstrap_room, None)
         self.kv_mgr.transfer_infos.pop(self.bootstrap_room, None)
@@ -2631,7 +2678,14 @@ class CommonKVSender(BaseKVSender):
             self.bootstrap_room,
             "Aborted by AbortReq.",
         )
-        self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+        if (
+            self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
+            == KVPoll.Success
+        ):
+            # The transfer concluded first and no other chunk was outstanding
+            # (else update_status would have written Failed); Success stands
+            # and clear() drops the failure record written above.
+            return
         self.conclude_state = KVPoll.Failed
         # Some abort paths release the request without ever clearing the
         # sender: retire its sends here, or the record outlives the room.
