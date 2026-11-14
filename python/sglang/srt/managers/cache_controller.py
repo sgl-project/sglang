@@ -447,6 +447,7 @@ class HiCacheController:
         # write D2H behind in-flight forwards (see start_loading, start_writing).
         self.load_fence_stream = None
         self.write_fence_stream = None
+        self.forward_on_fence_stream = False
         self.ack_write_queue: List[HiCacheAck] = []
 
         self.l2_transfer_engine = L2TransferEngine(io_backend)
