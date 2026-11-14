@@ -7,6 +7,8 @@ from abc import ABC, abstractmethod
 from datetime import datetime
 from typing import List, Optional, Union
 
+import msgspec
+
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
 from sglang.srt.sampling.watermarking.core import (
@@ -65,7 +67,10 @@ class RequestMetricsExporter(ABC):
         }
 
         request_output_data = {
-            "request_parameters": json.dumps(request_params),
+            # Normalized request fields such as kv_hints are msgspec structs.
+            "request_parameters": json.dumps(
+                request_params, default=msgspec.to_builtins
+            ),
             **filtered_out_meta_info,
         }
         return request_output_data

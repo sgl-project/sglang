@@ -17,6 +17,8 @@ import types
 import unittest
 from unittest.mock import MagicMock, patch
 
+import msgspec
+
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 
 # ── Test helper classes (local only, never injected into sys.modules) ──
@@ -29,6 +31,7 @@ class _GenerateReqInput:
     image_data: Optional[Any] = None
     sampling_params: Optional[Dict] = None
     watermark: Optional[Any] = None
+    kv_hints: Optional[Any] = None
 
 
 @dataclass
@@ -37,6 +40,22 @@ class _EmbeddingReqInput:
     text: Optional[str] = None
     image_data: Optional[Any] = None
     input_ids: Optional[List[int]] = None
+
+
+class _KvHintAction(msgspec.Struct, frozen=True, kw_only=True):
+    action_id: str
+    action_type: str
+    action_version: str
+    payload: Dict[str, Any] = {}
+
+
+class _KvHintsEnvelope(msgspec.Struct, frozen=True, kw_only=True):
+    """Same shape as sglang.srt.managers.kv_hints.KvHintsEnvelope, which
+    GenerateReqInput stores in kv_hints after normalization."""
+
+    protocol_version: str
+    message_id: str
+    actions: List[_KvHintAction] = []
 
 
 class _ServerArgs:
@@ -194,6 +213,34 @@ class TestFormatOutputData(unittest.TestCase):
         self.assertEqual(
             params["sampling_params"], {"temperature": 0.5, "watermark": redacted}
         )
+
+    def test_serializes_kv_hints_envelope(self):
+        """kv_hints reach the exporter as a KvHintsEnvelope msgspec struct, which
+        json.dumps cannot encode on its own; the record must still be written."""
+        server_args = _make_server_args("/tmp/unused")
+        exporter = _ConcreteExporter(
+            server_args, obj_skip_names=None, out_skip_names=None
+        )
+
+        hints = {
+            "protocol_version": "1",
+            "message_id": "m1",
+            "actions": [
+                {
+                    "action_id": "a1",
+                    "action_type": "retain",
+                    "action_version": "1",
+                    "payload": {"ttl": 30},
+                }
+            ],
+        }
+        obj = _GenerateReqInput(
+            rid="req-1", kv_hints=msgspec.convert(hints, _KvHintsEnvelope)
+        )
+        result = exporter._format_output_data(obj, {})
+
+        params = json.loads(result["request_parameters"])
+        self.assertEqual(params["kv_hints"], hints)
 
 
 class TestFileRequestMetricsExporter(unittest.TestCase):
