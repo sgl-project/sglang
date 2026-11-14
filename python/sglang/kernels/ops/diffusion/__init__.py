@@ -442,6 +442,12 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset], ...] = (
         _CUDA,
     ),
     (
+        "diffusion.alias_free_snake_beta",
+        KernelBackend.KDA,
+        "sglang.kernels.kda_kernels.alias_free_snake_beta:alias_free_snake_beta",
+        _CUDA,
+    ),
+    (
         "diffusion.bias_silu",
         KernelBackend.TRITON,
         "activation.sana_conv_post_triton:fused_bias_silu",
@@ -811,6 +817,7 @@ _EXPORTS: dict[str, str] = {
     # Tensor layout transformations fused with downstream quantization
     "try_flux2_token_cat_fp8": "sglang.kernels.kda_kernels.flux2_token_cat_fp8_triton",
     # Activation-function fusions
+    "alias_free_snake_beta": "sglang.kernels.kda_kernels.alias_free_snake_beta",
     "fused_bias_glu": "activation.sana_conv_post_triton",
     "fused_bias_silu": "activation.sana_conv_post_triton",
     "fused_depthwise_conv3x3_bias_glu": "sglang.kernels.kda_kernels.sana_depthwise_glu_triton",

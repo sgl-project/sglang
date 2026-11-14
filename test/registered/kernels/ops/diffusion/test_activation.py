@@ -1,8 +1,9 @@
 """``diffusion.activation``: activation-function fusions.
 
-All of these are bit-exact by construction -- they are elementwise chains with
+The elementwise fusions are bit-exact by construction: their chains have
 no reduction, so reproducing aten's per-op fp32-opmath / round-to-bf16
-boundaries is enough and ``torch.equal`` is the assertion.
+boundaries is enough and ``torch.equal`` is the assertion. The alias-free
+resampling fusion also reduces filter taps, so it uses a numerical tolerance.
 
 The cublasLt linear+tanh-GELU epilogue is *not* here: it is not bit-exact and
 is therefore quality-gated, so it is tested through its mount protocol in
@@ -16,6 +17,7 @@ import torch
 import torch.nn.functional as F
 
 from sglang.kernels.ops.diffusion import (
+    alias_free_snake_beta,
     can_use_fused_situ_softcap_mul,
     fused_bias_glu,
     fused_bias_silu,
@@ -229,6 +231,38 @@ def test_situ_rejects_unsupported_operands():
     for x in (strided, hidden[:, :0]):
         with pytest.raises(ValueError, match="matching CUDA BF16"):
             fused_situ_softcap_mul_bitexact(x, x)
+
+
+@pytest.mark.skipif(bool(torch.version.hip), reason="CUDA-only kernel")
+@pytest.mark.parametrize(
+    "length,param_dtype",
+    [(1, torch.float32), (17, torch.bfloat16), (129, torch.float16)],
+)
+@torch.inference_mode()
+def test_alias_free_snake_beta_crop_and_replicate_edges(length, param_dtype):
+    """Preserve cropped-edge replication and FP32 autocast of stored parameters."""
+    from sglang.multimodal_gen.runtime.models.vocoder.ltx_2_vocoder import (
+        Activation1d,
+        SnakeBeta,
+    )
+
+    current_device = torch.cuda.current_device()
+    device = torch.device("cuda", (current_device + 1) % torch.cuda.device_count())
+    module = Activation1d(SnakeBeta(3)).to(device=device, dtype=param_dtype)
+    module.act.alpha.copy_(torch.tensor([-1.0, 0.0, 1.0], device=device))
+    module.act.beta.copy_(torch.tensor([0.5, -0.5, 0.0], device=device))
+    x = torch.randn((2, 3, length), device=device)
+    actual = alias_free_snake_beta(
+        x,
+        module.act.alpha,
+        module.act.beta,
+        module.upsample.filter,
+        module.downsample.lowpass.filter,
+    )
+    with torch.autocast("cuda", dtype=torch.float32):
+        reference = module(x)
+    torch.testing.assert_close(actual, reference, atol=2e-6, rtol=3e-6)
+    assert torch.cuda.current_device() == current_device
 
 
 if __name__ == "__main__":

@@ -11,6 +11,10 @@ from sglang.multimodal_gen.configs.models.vocoder.ltx_vocoder import LTXVocoderC
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
+from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import (
+    VaeFastPathGate,
+    register_vae_fast_path_gate,
+)
 from sglang.multimodal_gen.runtime.utils.precision import (
     temporary_module_fp32_dtype,
 )
@@ -173,8 +177,41 @@ class Activation1d(nn.Module):
         self.act = activation
         self.upsample = UpSample1d(up_ratio, up_kernel_size)
         self.downsample = DownSample1d(down_ratio, down_kernel_size)
+        self.fast_path_gate: VaeFastPathGate | None = None
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if (
+            self.fast_path_gate is not None
+            and self.fast_path_gate.enabled
+            and isinstance(self.act, SnakeBeta)
+            and self.act.alpha_logscale
+            and self.upsample.ratio == self.downsample.lowpass.stride == 2
+            and self.upsample.kernel_size == self.downsample.lowpass.kernel_size == 12
+            and x.is_cuda
+            and torch.version.hip is None
+            and x.dtype == torch.float32
+            and (
+                self.act.alpha.dtype == self.act.beta.dtype == torch.float32
+                or (
+                    torch.is_autocast_enabled("cuda")
+                    and torch.get_autocast_dtype("cuda") == torch.float32
+                )
+            )
+            and x.is_contiguous()
+            and x.numel() > 0
+            and not torch.is_grad_enabled()
+            and not torch.compiler.is_compiling()
+        ):
+            from sglang.kernels.ops.diffusion import alias_free_snake_beta
+
+            return alias_free_snake_beta(
+                x,
+                self.act.alpha,
+                self.act.beta,
+                self.upsample.filter,
+                self.downsample.lowpass.filter,
+                self.act.eps,
+            )
         x = self.upsample(x)
         x = self.act(x)
         return self.downsample(x)
@@ -610,6 +647,11 @@ class LTX2Vocoder(ABC, nn.Module, LayerwiseOffloadableModuleMixin):
                     window_type="hann",
                 )
             self.sample_rate = self.output_sampling_rate
+            gate = VaeFastPathGate()
+            for module in self.modules():
+                if isinstance(module, Activation1d):
+                    module.fast_path_gate = gate
+            register_vae_fast_path_gate(self, gate)
             return
 
         self.sample_rate = (
