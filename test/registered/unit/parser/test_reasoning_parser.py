@@ -57,6 +57,24 @@ class TestBaseReasoningFormatDetector(CustomTestCase):
         self.assertEqual(result.reasoning_text, "This is reasoning")
         self.assertEqual(result.normal_text, "This is normal")
 
+    def test_detect_and_parse_inline_code_think_end_stays_in_reasoning(self):
+        """Bug regression (#48791): backtick-quoted think_end_token inside
+        reasoning is a mention, not the closer; the bare tag later wins."""
+        text = "<think>mentions `</think>` mid-thought then continues</think>answer"
+        result = self.detector.detect_and_parse(text)
+        self.assertEqual(
+            result.reasoning_text, "mentions `</think>` mid-thought then continues"
+        )
+        self.assertEqual(result.normal_text, "answer")
+
+    def test_detect_and_parse_literal_think_end_in_answer_stays_in_content(self):
+        """#48791 review: after the structural closer, a literal tag in the
+        answer stays in content (content wins; not last-occurrence)."""
+        text = "<think>plan</think>Close it with </think>."
+        result = self.detector.detect_and_parse(text)
+        self.assertEqual(result.reasoning_text, "plan")
+        self.assertEqual(result.normal_text, "Close it with </think>.")
+
     def test_detect_and_parse_force_reasoning(self):
         """Test forced reasoning mode."""
         detector = BaseReasoningFormatDetector(
@@ -201,6 +219,35 @@ class TestDeepSeekR1Detector(CustomTestCase):
         # Should be treated as reasoning because force_reasoning=True
         self.assertEqual(result.reasoning_text, "I need to think about this.")
         self.assertEqual(result.normal_text, "The answer is 42.")
+
+    def test_detect_and_parse_inline_code_think_end_stays_in_reasoning(self):
+        """Bug regression (#48791): backtick-quoted `</think>` inside CoT is
+        skipped; the first bare closer ends reasoning."""
+        text = (
+            "The client must split at the `</think>` marker. "
+            "Wait, with reasoning enabled the parser handles it. "
+            "Let me verify the field structure.</think>"
+            "Here is the answer."
+        )
+        result = self.detector.detect_and_parse(text)
+        self.assertEqual(
+            result.reasoning_text,
+            (
+                "The client must split at the `</think>` marker. "
+                "Wait, with reasoning enabled the parser handles it. "
+                "Let me verify the field structure."
+            ),
+        )
+        self.assertEqual(result.normal_text, "Here is the answer.")
+        self.assertNotIn("</think>", result.normal_text)
+
+    def test_detect_and_parse_literal_think_end_in_answer_stays_in_content(self):
+        """#48791 review: `<think>plan</think>Close it with </think>.` keeps
+        the answer's literal tag in content (first structural closer wins)."""
+        text = "<think>plan</think>Close it with </think>."
+        result = self.detector.detect_and_parse(text)
+        self.assertEqual(result.reasoning_text, "plan")
+        self.assertEqual(result.normal_text, "Close it with </think>.")
 
     def test_finish_flushes_truncated_forced_reasoning(self):
         """Bug regression: DeepSeek-R1 forces reasoning without a <think> start
@@ -1056,6 +1103,32 @@ class TestStreamingChunkSizeInvariance(CustomTestCase):
             lambda: DeepSeekR1Detector(stream_reasoning=False),
             "<think>abc reasoning</think>normal text",
             ("abc reasoning", "normal text"),
+        )
+
+    def test_inline_code_think_end_in_reasoning_chunk_invariant(self):
+        """#48791: streaming and one-shot both skip backtick-quoted closers."""
+        text = (
+            "<think>The client must split at the `</think>` marker. "
+            "Wait, with reasoning enabled the parser handles it. "
+            "Let me verify the field structure.</think>"
+            "Here is the answer."
+        )
+        expected = (
+            (
+                "The client must split at the `</think>` marker. "
+                "Wait, with reasoning enabled the parser handles it. "
+                "Let me verify the field structure."
+            ),
+            "Here is the answer.",
+        )
+        self._assert_invariant(DeepSeekR1Detector, text, expected)
+
+    def test_literal_think_end_in_answer_chunk_invariant(self):
+        """#48791 review: after the structural closer, answer tags stay put."""
+        self._assert_invariant(
+            DeepSeekR1Detector,
+            "<think>plan</think>Close it with </think>.",
+            ("plan", "Close it with </think>."),
         )
 
     def test_literal_angle_bracket_in_reasoning_is_not_swallowed(self):
