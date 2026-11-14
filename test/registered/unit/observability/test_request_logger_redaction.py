@@ -2,6 +2,7 @@
 bounded by max_length instead of the prompt length. With watermarking off, only
 requests that carry a watermark field are redacted."""
 
+import copy
 import json
 import unittest
 from unittest import mock
@@ -73,6 +74,62 @@ class _LongestWalkSpy:
 
 
 class TestRequestLogRedaction(CustomTestCase):
+    def test_prompt_token_ids_follow_request_logging_level(self):
+        prompt_token_ids = list(range(4096))
+        out = {
+            "text": "generated text",
+            "output_ids": [42],
+            "prompt_token_ids": prompt_token_ids,
+            "meta_info": {"prompt_tokens": len(prompt_token_ids), "e2e_latency": 1},
+        }
+        original_out = copy.deepcopy(out)
+        for log_format in ("text", "json"):
+            for level in (0, 1, 2, 3):
+                with self.subTest(log_format=log_format, level=level):
+                    req_logger = request_logger.RequestLogger(
+                        log_requests=True,
+                        log_requests_level=level,
+                        log_requests_format=log_format,
+                        log_requests_target=None,
+                    )
+                    req_logger.log_exceeded_ms = 0
+                    target = mock.Mock()
+                    req_logger.targets = [target]
+                    req_logger.log_finished_request(_request(16), out)
+                    target.info.assert_called_once()
+                    logged = target.info.call_args.args[0]
+                    if log_format == "json":
+                        logged_out = json.loads(logged)["out"]
+                        self.assertEqual(logged_out["meta_info"], out["meta_info"])
+                        if level < 2:
+                            self.assertNotIn("prompt_token_ids", logged_out)
+                        elif level == 2:
+                            self.assertEqual(
+                                logged_out["prompt_token_ids"],
+                                prompt_token_ids[:1024]
+                                + ["..."]
+                                + prompt_token_ids[-1024:],
+                            )
+                        else:
+                            self.assertEqual(
+                                logged_out["prompt_token_ids"], prompt_token_ids
+                            )
+                    else:
+                        self.assertIn("'prompt_tokens': 4096", logged)
+                        if level < 2:
+                            self.assertNotIn("'prompt_token_ids':", logged)
+                            self.assertNotIn(str(prompt_token_ids), logged)
+                        else:
+                            expected_ids = (
+                                str(prompt_token_ids[:1024])
+                                + " ... "
+                                + str(prompt_token_ids[-1024:])
+                                if level == 2
+                                else str(prompt_token_ids)
+                            )
+                            self.assertIn(f"'prompt_token_ids': {expected_ids}", logged)
+                    self.assertEqual(out, original_out)
+
     def test_secrets_redacted_in_both_formatters(self):
         for num_ids in (16, 100_000):
             req = _request(num_ids)
