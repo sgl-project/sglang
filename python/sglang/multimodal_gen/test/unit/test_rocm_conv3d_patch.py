@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
+import contextlib
 import unittest
 
 import torch
@@ -59,6 +60,41 @@ class TestRocmConv3dPatchEpilogueKwargs(unittest.TestCase):
                     self.assertTrue(
                         out.is_contiguous(memory_format=torch.channels_last_3d)
                     )
+
+    @unittest.skipUnless(is_gfx1250_supported(), "NHWC conv path is gfx1250-only")
+    def test_bf16_fused_unfold_matches_aten_gather_bitwise(self):
+        """The one-pass cat/pad/unfold/cast must build the same conv input as aten."""
+        from unittest.mock import patch
+
+        torch.manual_seed(0)
+        state = WanCausalConv3d(96, 96, 3, padding=1).state_dict()
+
+        def make_conv(fused: bool):
+            conv = WanCausalConv3d(96, 96, 3, padding=1).cuda()
+            conv.load_state_dict(state)
+            conv.weight.data = conv.weight.data.contiguous(
+                memory_format=torch.channels_last_3d
+            )
+            # The reference keeps the aten cat/pad/unfold/copy_ chain.
+            unfold = None if fused else (lambda *args, **kwargs: None)
+            with (
+                contextlib.nullcontext()
+                if fused
+                else patch("sglang.kernels.ops.diffusion.causal_unfold_nhwc", unfold)
+            ):
+                RocmPlatform._replace_conv3d_with_conv2d(conv, use_bf16=True)
+            return conv
+
+        fused, reference = make_conv(True), make_conv(False)
+        cl3d = torch.channels_last_3d
+        x = torch.randn(1, 96, 4, 20, 36, device="cuda").contiguous(memory_format=cl3d)
+        cache_x = torch.randn(1, 96, 2, 20, 36, device="cuda").contiguous(
+            memory_format=cl3d
+        )
+        for cache in (None, cache_x[:, :, -1:].contiguous(memory_format=cl3d), cache_x):
+            with self.subTest(cache_t=0 if cache is None else cache.shape[2]):
+                with torch.no_grad():
+                    self.assertTrue(torch.equal(fused(x, cache), reference(x, cache)))
 
 
 class TestWanVaeMathAttention(unittest.TestCase):
