@@ -42,7 +42,7 @@ docker run --gpus all \
 **AMD GPUs (ROCm)** — AMD uses the daily-updated `lmsysorg/sglang-rocm` images. You can find the latest images on [Docker Hub](https://hub.docker.com/r/lmsysorg/sglang-rocm/tags). We recommend the ROCm 10 version.
 
 ```bash Command
-docker pull lmsysorg/sglang-rocm:v0.5.22-rocm10-mi35x-20261021
+docker pull lmsysorg/sglang-rocm:v0.5.23-rocm10-mi35x-20261111
 
 docker run \
     --device=/dev/kfd --device=/dev/dri \
@@ -52,7 +52,7 @@ docker run \
     -p 30000:30000 \
     -v ~/.cache/huggingface:/root/.cache/huggingface \
     --env "HF_TOKEN=<your-hf-token>" \
-    lmsysorg/sglang-rocm:v0.5.22-rocm10-mi35x-20261021 \
+    lmsysorg/sglang-rocm:v0.5.23-rocm10-mi35x-20261111 \
     sglang serve <use args below>
 ```
 
@@ -226,20 +226,22 @@ Agentic replay is a different workload: long-context prompts, multi-turn session
 
 TP2 covers concurrency 1 to 32 and TP4 covers 1 to 16; at 32 and 64 the same two GPUs also run DP attention with TP MoE.
 
-**TP2 or TP4, concurrency 1–16:**
+**TP2, concurrency 1–32, or TP4, concurrency 1–16:**
 
-- TP2 raises `--mem-fraction-static` at concurrency 16; TP4 stops at 16 and holds 0.70, with a quarter of the checkpoint per rank leaving room to spare.
+- TP2 raises `--mem-fraction-static` from concurrency 16 and continues through 32; TP4 stops at 16 and holds 0.70, with a quarter of the checkpoint per rank leaving room to spare.
 - A longer `--prefill-decode-interval` runs more decode rounds between prefill batches, trading TTFT for P90 inter-token latency.
 - Up to concurrency 8 it pairs with `--schedule-policy lpm`, which admits the requests with the longest cached prefix first.
+- TP4 concurrency 1 and TP2 concurrency 4, 16 and 32 cap `--max-running-requests` below the session count. Sessions past the cap queue instead of joining the decode batch, which keeps each token stream at small-batch speed and lifts P90 interactivity at the cost of TTFT.
 - These points set `--enable-amd-monokernel`. Do not set `SGLANG_HIP_DSV41_INDEX_K_PAGE8`: the monokernel refuses that layout.
 
 The braced values in the command follow concurrency:
 
 | Concurrency | 1 | 2 | 4 | 8 | 16 | 32 |
 |---|---|---|---|---|---|---|
-| `--max-running-requests` | 2 | 4 | 8 | 16 | 32 | 64 |
+| `--max-running-requests`, TP2 | 2 | 4 | 1 | 16 | 4 | 8 |
+| `--max-running-requests`, TP4 | 1 | 4 | 8 | 16 | 32 | — |
 | `--swa-prefix-tails` | 128 | 128 | 256 | 512 | 1024 | 2048 |
-| `--prefill-decode-interval` | 192 | 192 | 192 | 192 | 96 | 32 |
+| `--prefill-decode-interval` | 192 | 192 | 192 | 192 | 96 | 8 |
 | `--schedule-policy` | lpm | lpm | lpm | lpm | fcfs | fcfs |
 | `--mem-fraction-static`, TP2 | 0.70 | 0.70 | 0.70 | 0.70 | 0.80 | 0.80 |
 | `--mem-fraction-static`, TP4 | 0.70 | 0.70 | 0.70 | 0.70 | 0.70 | — |
@@ -281,7 +283,7 @@ sglang serve \
   --watchdog-timeout 3600
 ```
 
-**TP2, concurrency 32:** the command above with the concurrency-32 column, without `--enable-amd-monokernel`, and with `SGLANG_HIP_DSV41_INDEX_K_PAGE8=1`.
+**TP2, concurrency 32:** the command above with the concurrency-32 column, plus `--tokenizer-backend fastokens`. Eight running requests with five drafts each give 48 rows, which fit the monokernel launch.
 
 **DP2, concurrency 32–64:** two DP attention ranks, one per GPU, with the MoE still tensor parallel across both. The braced values follow concurrency:
 
