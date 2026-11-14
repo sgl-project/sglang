@@ -26,6 +26,7 @@ from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     CudaGraphBufferRegistry,
     GraphSlot,
     PaddingPolicy,
+    build_decode_registry,
 )
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -49,6 +50,7 @@ class _MiniForwardBatch:
     num_token_non_padded: Optional[torch.Tensor] = None
     global_num_token_non_padded: Optional[torch.Tensor] = None
     global_num_token_non_padded_cpu: Optional[int] = None
+    moe_dp_valid_counts: Optional[torch.Tensor] = None
     global_num_tokens_gpu: Optional[torch.Tensor] = None
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor] = None
     ngram_embedding_info: Optional[object] = None
@@ -74,6 +76,46 @@ def _make_registry(max_bs: int = 8, max_num_tokens: int = 16):
         max_bs=max_bs,
         max_num_tokens=max_num_tokens,
     )
+
+
+class TestMoeRealRowCounts(unittest.TestCase):
+    def test_real_rows_survive_padding_and_missing_counts_reset(self):
+        reg = build_decode_registry(
+            device=torch.device("cpu"),
+            max_bs=8,
+            max_num_token=48,
+            seq_len_fill_value=1,
+            cache_loc_dtype=torch.int64,
+            require_gathered_buffer=True,
+            require_mlp_tp_gather=True,
+            num_dp_ranks=8,
+            share_pool=False,
+        )
+        buf = reg.get_slot("moe_dp_valid_counts").buffer
+        pointer = buf.data_ptr()
+        collective = reg.get_slot("global_num_tokens_gpu").buffer
+        self.assertNotEqual(pointer, collective.data_ptr())
+        template = _MiniForwardBatch()
+        vectors = ([0, 6, 12, 18, 24, 30, 36, 48], [48, 0, 18, 6, 30, 12, 24, 36], None)
+        for values in vectors:
+            template.moe_dp_valid_counts = (
+                torch.tensor(values, dtype=torch.int64) if values is not None else None
+            )
+            reg.fill_from(
+                template, raw_bs=8, padded_bs=8, raw_num_tokens=48, padded_num_tokens=48
+            )
+            expected = torch.tensor(
+                values if values is not None else [48] * 8, dtype=torch.int32
+            )
+            torch.testing.assert_close(buf, expected, rtol=0, atol=0)
+            torch.testing.assert_close(
+                collective, torch.full((8,), 48, dtype=torch.int32)
+            )
+            self.assertEqual(buf.data_ptr(), pointer)
+            extracted = reg.extract_buffer(
+                forward_batch_template=template, padded_bs=8, padded_num_tokens=48
+            )
+            self.assertEqual(extracted.moe_dp_valid_counts.data_ptr(), pointer)
 
 
 class TestGraphSlot(unittest.TestCase):

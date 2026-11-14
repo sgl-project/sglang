@@ -282,12 +282,14 @@ class _DpGatheredBufferWrapper:
         dp_max_padding: bool,
         global_num_tokens: Optional[List[int]] = None,
         global_num_tokens_gpu: Optional[torch.Tensor] = None,
+        moe_dp_valid_counts: Optional[torch.Tensor] = None,
     ):
         cls._global_dp_buffer_len = global_dp_buffer_len
         cls._local_dp_buffer_len = local_dp_buffer_len
         cls._dp_max_padding = dp_max_padding
         cls._global_num_tokens = global_num_tokens
         cls._global_num_tokens_gpu = global_num_tokens_gpu
+        cls._moe_dp_valid_counts = moe_dp_valid_counts
 
     @classmethod
     def get_global_dp_buffer(cls, group: GroupCoordinator) -> torch.Tensor:
@@ -357,6 +359,7 @@ def set_dp_buffer_len(
     dp_max_padding: bool,
     global_num_tokens: Optional[List[int]] = None,
     global_num_tokens_gpu: Optional[torch.Tensor] = None,
+    moe_dp_valid_counts: Optional[torch.Tensor] = None,
 ):
     _DpGatheredBufferWrapper.set_dp_buffer_len(
         global_dp_buffer_len,
@@ -364,6 +367,7 @@ def set_dp_buffer_len(
         dp_max_padding,
         global_num_tokens,
         global_num_tokens_gpu,
+        moe_dp_valid_counts,
     )
 
 
@@ -408,6 +412,7 @@ def set_dp_buffer_len_from_batch(forward_batch: ForwardBatch) -> None:
         forward_batch.dp_padding_mode.is_max_len(),
         global_num_tokens,
         forward_batch.global_num_tokens_gpu,
+        getattr(forward_batch, "moe_dp_valid_counts", None),
     )
 
 
@@ -850,6 +855,53 @@ def mask_dp_pad_moe_topk_ids(topk_ids: torch.Tensor) -> None:
         TOPK=topk,
         BLOCK=triton.next_power_of_2(topk),
     )
+
+
+@triton.jit
+def _copy_mask_dp_pad_topk_ids_kernel(
+    input_ptr,
+    output_ptr,
+    counts_ptr,
+    max_len,
+    TOPK: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0).to(tl.int64)
+    offs = tl.arange(0, BLOCK)
+    ids = tl.load(input_ptr + row * TOPK + offs, mask=offs < TOPK, other=-1)
+    valid = row % max_len < tl.load(counts_ptr + row // max_len)
+    tl.store(output_ptr + row * TOPK + offs, tl.where(valid, ids, -1), mask=offs < TOPK)
+
+
+def copy_mask_dp_moe_padding(topk_ids: torch.Tensor) -> torch.Tensor:
+    """Copy router-owned global IDs and drop unused MAX_LEN prefixes for CUTLASS."""
+    counts = getattr(_DpGatheredBufferWrapper, "_moe_dp_valid_counts", None)
+    max_len = get_local_dp_buffer_len()
+    if (
+        not is_dp_max_padding()
+        or counts is None
+        or max_len <= 0
+        or counts.ndim != 1
+        or counts.shape[0] != 8
+        or counts.dtype not in (torch.int32, torch.int64)
+        or counts.device != topk_ids.device
+        or not counts.is_contiguous()
+        or topk_ids.ndim != 2
+        or topk_ids.shape != (8 * max_len, 6)
+        or not topk_ids.is_cuda
+        or not topk_ids.is_contiguous()
+    ):
+        return topk_ids
+    output = torch.empty_like(topk_ids, dtype=torch.int32)
+    _copy_mask_dp_pad_topk_ids_kernel[(topk_ids.shape[0],)](
+        topk_ids,
+        output,
+        counts,
+        max_len,
+        TOPK=6,
+        BLOCK=8,
+    )
+    return output
 
 
 def _dp_gather_via_all_gatherv_fp8(

@@ -790,6 +790,24 @@ def build_decode_registry(
                 )
         reg.register_slot(slot, bind=bind)
 
+    if require_mlp_tp_gather:
+        # Keep real MoE rows independent of padded collective counts. Bind
+        # dedicated storage so a draft registry cannot alias target metadata.
+        reg.register_slot(
+            GraphSlot(
+                "moe_dp_valid_counts",
+                lambda _bs, _tokens: (num_dp_ranks,),
+                torch.int32,
+                axis="none",
+                post_fill=lambda buf, fb, ctx: (
+                    buf.fill_(ctx.padded_num_tokens)
+                    if getattr(fb, "moe_dp_valid_counts", None) is None
+                    else None
+                ),
+            ),
+            bind=torch.zeros(num_dp_ranks, dtype=torch.int32, device=device),
+        )
+
     # Structured slots whose backing storage still lives on the source object
     # (adopt-only during migration): registered only when the source actually
     # carries them. The per-replay copy source is a nested FB dataclass field,

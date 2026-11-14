@@ -605,6 +605,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     _original_num_tokens: Optional[int] = None
     global_num_tokens_cpu: Optional[List[int]] = None
     global_num_tokens_gpu: Optional[torch.Tensor] = None
+    # Phase-scaled counts before MAX_LEN/graph padding; separate collective metadata.
+    moe_dp_valid_counts: Optional[torch.Tensor] = None
     # Has to be None when cuda graph is captured.
     global_num_tokens_for_logprob_cpu: Optional[List[int]] = None
     global_num_tokens_for_logprob_gpu: Optional[torch.Tensor] = None
@@ -887,6 +889,19 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 dtype=torch.int64,
                 pin_memory=pin_memory,
             ).to(device, non_blocking=True)
+        # Preserve true row counts before collective padding rewrites them.
+        if (
+            not is_draft_worker
+            and (self.forward_mode.is_target_verify() or self.forward_mode.is_idle())
+            and self.spec_algorithm is not None
+            and self.spec_algorithm.is_dspark()
+            and self.ragged_verify_layout is None
+            and self.spec_info is not None
+            and self.spec_info.num_tokens_per_req == 6
+            and get_parallel().tp_size == get_parallel().attn_dp_size == 8
+            and get_parallel().attn_cp_size == 1
+        ):
+            self.moe_dp_valid_counts = self.global_num_tokens_gpu.clone()
         self.can_run_decode_cuda_graph = batch.can_run_decode_cuda_graph
         self.can_run_dp_draft_cuda_graph = batch.can_run_dp_draft_cuda_graph
 
