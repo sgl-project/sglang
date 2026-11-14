@@ -23,21 +23,25 @@ attention never reads the KV pool — a rank's pool holds only its stripe of
 the prefix *and* of the current chunk. Attention reads a per-layer assembled
 scratch slot laid out ``[prefix region | chunk region | trash page]``:
 
-- The prefix is NCCL-allgathered from the shard group into the slot one layer
-  ahead, on a dedicated side stream with a dedicated ``PyNcclCommunicator``.
-  Under rotated owner-classed allocation the owners of a cached prefix's
-  pages are exactly cyclic, so per-rank owned counts differ by <= 1: each
-  rank sends its own prefix pages in local-page order, padded to
-  ``ceil(prefix_pages / N)`` pages with the (never referenced) trash page —
-  a *regular* in-place allgather, owner-major output, no reorder pass.
-- Symmetric gather scratch (``SGLANG_ENABLE_KV_SHARD_ZERO_SM_GATHER``,
-  NCCL >= 2.31.2, single-node shard groups): both slots are carved out of one
-  ``ncclMemAlloc`` buffer registered as a symmetric window. Every rank carves
-  the same offsets, because CE addresses a peer's buffer by the local offset
-  into the window.
-  The dedicated gather communicator requests ``NCCL_CTA_POLICY_ZERO``
-  for eligible copy-engine transfers. Leave the global ``NCCL_CTA_POLICY``
-  unset so forward-pass communicators retain their default policy.
+- The prefix is allgathered from the shard group into the slot one layer
+  ahead, off the compute stream. Under rotated owner-classed allocation the
+  owners of a cached prefix's pages are exactly cyclic, so per-rank owned
+  counts differ by <= 1: each rank packs its own prefix pages in local-page
+  order, padded to ``ceil(prefix_pages / N)`` pages with the (never
+  referenced) trash page, into its block of the slot on a dedicated side
+  stream — a *regular* in-place allgather, owner-major output, no reorder
+  pass.
+- Multicast gather (``SGLANG_ENABLE_KV_SHARD_ZERO_SM_GATHER``, single-node
+  shard groups on GPUs with CUDA multicast): both slots are carved out of one
+  PyTorch symmetric-memory buffer, and ``MulticastAllGather`` copies each
+  rank's block to its place on every rank through the buffer's multicast
+  mapping: copy-engine chunks (zero SMs) on the pool's own ``TransferChain``,
+  each behind the NVLink transfer gate, so a foreground
+  ``paused_background_transfers(Link.NVLINK)`` bracket stops the gather at
+  the next chunk boundary. Every rank carves the same offsets, because a
+  multicast copy lands at the same offset in every rank's buffer.
+  Otherwise the prefix is NCCL-allgathered on the side stream, with a
+  dedicated ``PyNcclCommunicator``.
 - The chunk region is staged locally on the compute stream where the write
   path already holds the full chunk (GQA CP allgathers K/V before the pool
   write; MLA latent is replicated across the shard group at write time).
@@ -70,14 +74,16 @@ from sglang.kernels.ops.attention.dsa.dequant_k_cache import (
 from sglang.kernels.ops.kvcache import dsa_index_k_cache
 from sglang.kernels.ops.kvcache.mla_buffer import get_mla_kv_buffer_triton
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
+from sglang.srt.distributed.device_communicators.gated_transfer import (
+    Link,
+    TransferChain,
+)
+from sglang.srt.distributed.device_communicators.multicast_all_gather import (
+    MulticastAllGather,
+    MulticastUnavailableError,
+    has_multicast_support,
+)
 from sglang.srt.distributed.device_communicators.pynccl import PyNcclCommunicator
-from sglang.srt.distributed.device_communicators.pynccl_allocator import (
-    allocate_symmetric_buffer,
-)
-from sglang.srt.distributed.device_communicators.pynccl_wrapper import (
-    NCCL_CTA_POLICY_ZERO,
-    NCCLLibrary,
-)
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
 from sglang.srt.environ import envs
 from sglang.srt.layers.radix_attention import RadixAttention
@@ -102,31 +108,30 @@ logger = logging.getLogger(__name__)
 _TensorSpec = Tuple[Tuple[int, ...], torch.dtype]
 
 _NUM_SCRATCH_SLOTS = 2
-# NCCL_WIN_REQUIRED_ALIGNMENT in nccl.h. NCCL checks it only at the window
-# base; starting every slot tensor on it is a conservative choice.
+# Every slot tensor starts on a 4 KiB boundary of the symmetric buffer.
 _SCRATCH_ALIGN_BYTES = 4096
-# NCCL 2.31.2 fixes internal CE synchronization buffer initialization and the
-# two-rank multicast-team setup race (upstream commit 430afbc). Zeroing our
-# scratch cannot initialize NCCL's internal buffers.
-_NCCL_SYMMETRIC_SCRATCH_MIN_VERSION = 23102
 
 
-def _symmetric_scratch_supported(
-    *, memory_saver_enabled: bool, custom_mem_pool, shard_group: GroupCoordinator
+def _multicast_gather_supported(
+    *,
+    memory_saver_enabled: bool,
+    custom_mem_pool,
+    shard_group: GroupCoordinator,
+    device: torch.device,
 ) -> bool:
     """Collective over ``shard_group``: every rank returns the same verdict."""
-    # ncclMemAlloc memory sits outside both the memory-saver region and a
-    # custom mem pool, so either one keeps the torch-allocated scratch.
+    # Symmetric memory sits outside both the memory-saver region and a custom
+    # mem pool, so either one keeps the torch-allocated scratch.
     if (
         not envs.SGLANG_ENABLE_KV_SHARD_ZERO_SM_GATHER.get()
         or memory_saver_enabled
         or custom_mem_pool is not None
         or not is_cuda()
-        or NCCLLibrary().ncclGetRawVersion() < _NCCL_SYMMETRIC_SCRATCH_MIN_VERSION
+        or not has_multicast_support(device)
     ):
         return False
-    # Across nodes NCCL would run the windowed allgather on its hierarchical
-    # path (inter-node RMA proxy puts); only the in-node CE path is verified.
+    # A multicast mapping spans one NVLink domain; only single-node shard
+    # groups are verified.
     return all(in_the_same_node_as(shard_group.cpu_group, source_rank=0))
 
 
@@ -158,7 +163,8 @@ def _view_bytes(
 
 
 class _ScratchSlot:
-    """One half of the double buffer: scratch tensors + ready event.
+    """One half of the double buffer: scratch tensors + ready event (the
+    NCCL gather) or the ticket of its last multicast gather.
 
     ``resident_key`` identifies what the slot currently holds — ``(layer_id,
     epoch)`` — so repeated reads of the same layer skip the re-gather and a
@@ -169,6 +175,7 @@ class _ScratchSlot:
     def __init__(self, tensors: Dict[str, torch.Tensor], device_module):
         self.tensors = tensors
         self.ready = device_module.Event()
+        self.ticket: Optional[int] = None
         self.resident_key: Optional[Tuple[int, int]] = None
 
 
@@ -204,37 +211,45 @@ class PageInterleaveKVPoolMixin:
         self.shard_size = spec.shard_size
         self.device_module = torch.get_device_module(self.device)
 
-        # Check the pool's storage device before probing its NCCL shard group.
-        self._use_symmetric_scratch = False
+        # Check the pool's storage device before probing its shard group.
+        multicast_device = None
         if torch.device(self.device).type == "cuda":
-            self._use_symmetric_scratch = _symmetric_scratch_supported(
+            device = torch.device(self.device)
+            if device.index is None:
+                device = torch.device("cuda", torch.cuda.current_device())
+            if _multicast_gather_supported(
                 memory_saver_enabled=self.memory_saver_adapter.enabled,
                 custom_mem_pool=self.custom_mem_pool,
                 shard_group=shard_group,
-            )
-        # Dedicated communicator + stream so the layer-ahead gathers never
-        # interleave with the group's main collectives.
-        self.kv_gather_comm: PyNcclCommunicator = PyNcclCommunicator(
-            group=shard_group.cpu_group,
-            device=shard_group.device,
-            cta_policy=NCCL_CTA_POLICY_ZERO if self._use_symmetric_scratch else None,
-        )
-        if not self.kv_gather_comm.available:
-            raise RuntimeError(
-                "Page-interleave KV cache requires an available PyNccl communicator."
-            )
+                device=device,
+            ):
+                multicast_device = device
+        # Packs this rank's block off the compute stream (and runs the NCCL
+        # gather without multicast).
         self.kv_gather_stream = self.device_module.Stream()
 
         # Scratch: [prefix | chunk | trash page], double-buffered.
         scratch_rows = spec.scratch_rows
         self._chunk_base = spec.max_prefix_tokens
         self._trash_base = spec.max_prefix_tokens + spec.chunk_tokens
-        slot_tensors, self._scratch_window_registered = self._alloc_scratch(
-            scratch_rows
-        )
+        # Set when the scratch is mapped for multicast on every rank.
+        self._multicast_gather: Optional[MulticastAllGather] = None
+        slot_tensors = self._alloc_scratch(scratch_rows, multicast_device)
         self._slots = [
             _ScratchSlot(tensors, self.device_module) for tensors in slot_tensors
         ]
+        # Otherwise a dedicated communicator, so the layer-ahead gathers never
+        # interleave with the group's main collectives.
+        self.kv_gather_comm: Optional[PyNcclCommunicator] = None
+        if self._multicast_gather is None:
+            self.kv_gather_comm = PyNcclCommunicator(
+                group=shard_group.cpu_group, device=shard_group.device
+            )
+            if not self.kv_gather_comm.available:
+                raise RuntimeError(
+                    "Page-interleave KV cache requires an available PyNccl "
+                    "communicator."
+                )
         with self._torch_alloc_context():
             # Per-batch absolute scratch-page index of every logical page.
             # Unplanned pages initially target the trash page. Logical page
@@ -269,7 +284,7 @@ class PageInterleaveKVPoolMixin:
             "Page-interleave KV sharding enabled: shard_rank=%d shard_size=%d "
             "page_size=%d prefix_tokens=%d chunk_tokens=%d scratch_rows=%d x2 "
             "(%.2f MiB per rank, charged against the KV budget), "
-            "NCCL symmetric scratch=%s. "
+            "prefix gather=%s. "
             "Batch admission is limited by this scratch capacity.",
             self.shard_rank,
             self.shard_size,
@@ -278,7 +293,7 @@ class PageInterleaveKVPoolMixin:
             spec.chunk_tokens,
             scratch_rows,
             scratch_bytes / (1024 * 1024),
-            self._scratch_window_registered,
+            "multicast" if self._multicast_gather is not None else "NCCL",
         )
 
     @contextmanager
@@ -291,33 +306,32 @@ class PageInterleaveKVPoolMixin:
             ):
                 yield
 
-    def _alloc_scratch(self, rows: int) -> Tuple[List[Dict[str, torch.Tensor]], bool]:
-        """Every slot's tensors, and whether they sit in a symmetric window."""
+    def _alloc_scratch(
+        self, rows: int, multicast_device: Optional[torch.device]
+    ) -> List[Dict[str, torch.Tensor]]:
+        """Every slot's tensors: in one symmetric buffer on
+        ``multicast_device`` (collective over the shard group), else torch
+        tensors."""
         specs = self._scratch_tensor_specs(rows)
-        if self._use_symmetric_scratch:
-            return self._alloc_symmetric_scratch(specs)
+        if multicast_device is not None:
+            return self._alloc_multicast_scratch(specs, multicast_device)
         with self._torch_alloc_context():
-            slots = [
+            return [
                 {
                     name: torch.zeros(shape, dtype=dtype, device=self.device)
                     for name, (shape, dtype) in specs.items()
                 }
                 for _ in range(_NUM_SCRATCH_SLOTS)
             ]
-        return slots, False
 
-    def _alloc_symmetric_scratch(
-        self, specs: Dict[str, _TensorSpec]
-    ) -> Tuple[List[Dict[str, torch.Tensor]], bool]:
+    def _alloc_multicast_scratch(
+        self, specs: Dict[str, _TensorSpec], device: torch.device
+    ) -> List[Dict[str, torch.Tensor]]:
+        from torch.distributed import _symmetric_memory as symm_mem
+
         offsets, nbytes = _symmetric_scratch_layout(specs, num_slots=_NUM_SCRATCH_SLOTS)
-        buf, registered = allocate_symmetric_buffer(self.kv_gather_comm, nbytes)
-        if not registered:
-            logger.warning(
-                "NCCL returned no symmetric window for the KV-shard gather "
-                "scratch (NCCL_CUMEM_ENABLE=0, NCCL_WIN_ENABLE=0, or ranks "
-                "without CUDA P2P?); the prefix allgather falls back to NCCL "
-                "SM kernels."
-            )
+        buf = symm_mem.empty(nbytes, dtype=torch.uint8, device=device)
+        buf.zero_()
         slots = [
             {
                 name: _view_bytes(
@@ -327,7 +341,21 @@ class PageInterleaveKVPoolMixin:
             }
             for slot_offsets in offsets
         ]
-        return slots, registered
+        with torch.cuda.device(device):
+            chain = TransferChain(Link.NVLINK)
+        try:
+            # Named by the cpu_group, like the other symmetric-memory users.
+            self._multicast_gather = MulticastAllGather(
+                self.shard_group.cpu_group, buf, chain
+            )
+        except MulticastUnavailableError as error:
+            # Raised on every rank alike; the chain stays idle.
+            logger.warning(
+                "The KV-shard gather scratch has no multicast mapping on every "
+                "rank (%s); the prefix allgather falls back to NCCL SM kernels.",
+                error,
+            )
+        return slots
 
     def set_kv_buffer_prefix_valid(self, *args, **kwargs):
         raise NotImplementedError(
@@ -510,7 +538,7 @@ class PageInterleaveKVPoolMixin:
 
     def _prefetch_layer(self, layer_id: int) -> None:
         """Kick the allgather assembling ``layer_id``'s prefix into its slot,
-        on the gather stream. Idempotent per ``(layer_id, epoch)``."""
+        behind the gather stream. Idempotent per ``(layer_id, epoch)``."""
         local_layer = layer_id - self.start_layer
         if local_layer >= self.layer_num:
             return
@@ -530,21 +558,26 @@ class PageInterleaveKVPoolMixin:
             for pool_buf, name in self._gather_pairs(local_layer):
                 send_rows = self._gather_send_rows(name)
                 block = send_rows.numel()
-                scratch = slot.tensors[name]
-                send = scratch[self.shard_rank * block : (self.shard_rank + 1) * block]
+                output = slot.tensors[name][: self.shard_size * block]
+                send = output[self.shard_rank * block : (self.shard_rank + 1) * block]
                 torch.index_select(pool_buf, 0, send_rows, out=send)
                 # In-place regular allgather: send is exactly the rank's
                 # block of the output, every rank contributes `block` rows.
-                with self.kv_gather_comm.change_state(enable=True):
-                    self.kv_gather_comm.all_gather(
-                        scratch[: self.shard_size * block], send
+                if self._multicast_gather is not None:
+                    # Copy-engine chunks on the gather's chain, after the pack.
+                    slot.ticket = self._multicast_gather.run(
+                        send, output=output, after=self.kv_gather_stream
                     )
-            slot.ready.record(self.kv_gather_stream)
+                else:
+                    with self.kv_gather_comm.change_state(enable=True):
+                        self.kv_gather_comm.all_gather(output, send)
+            if self._multicast_gather is None:
+                slot.ready.record(self.kv_gather_stream)
         slot.resident_key = key
 
     def _acquire_slot_for_read(self, layer_id: int) -> _ScratchSlot:
-        """Block the compute stream on the slot's ready event (a no-op when
-        the layer-ahead gather already landed) and kick the next layer's
+        """Block the compute stream on the slot's gather (a no-op when the
+        layer-ahead gather already landed) and kick the next layer's
         gather. A residency miss is a caller bug — the batch plan captured by
         ``begin_shard_extend`` must have prefetched this layer."""
         assert self._shard_extend_active, (
@@ -557,7 +590,13 @@ class PageInterleaveKVPoolMixin:
                 f"prefix scratch miss for layer {layer_id} "
                 f"(resident={slot.resident_key}, epoch={self._epoch})"
             )
-            self.device_module.current_stream().wait_event(slot.ready)
+            current = self.device_module.current_stream()
+            if self._multicast_gather is not None:
+                # The slot's last run lands after every earlier one, once
+                # every rank's copies have arrived (its exit barrier).
+                self._multicast_gather.chain.wait(slot.ticket, stream=current)
+            else:
+                current.wait_event(slot.ready)
             self._prefetch_layer(layer_id + 1)
         return slot
 

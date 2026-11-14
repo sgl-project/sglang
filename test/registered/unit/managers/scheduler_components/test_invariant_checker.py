@@ -142,20 +142,20 @@ class TestCheckTreeCacheGate(CustomTestCase):
             checker.tree_cache.sanity_check.assert_not_called()
 
 
-class TestEndedRequests(CustomTestCase):
-    def _checker(self, listed=(), offloading=()):
-        return SchedulerInvariantChecker(
-            disaggregation_mode=DisaggregationMode.NULL,
-            page_size=1,
-            tree_cache=None,
-            token_to_kv_pool_allocator=None,
-            req_to_token_pool=None,
-            pool_stats_observer=None,
-            scheduler_stage_metrics=None,
-            get_request_lists=lambda: {ListKind.WAITING: list(listed)},
-            get_offloading_reqs=lambda: offloading,
-        )
+def _checker_over(lists):
+    return SchedulerInvariantChecker(
+        disaggregation_mode=DisaggregationMode.NULL,
+        page_size=1,
+        tree_cache=None,
+        token_to_kv_pool_allocator=None,
+        req_to_token_pool=None,
+        pool_stats_observer=None,
+        scheduler_stage_metrics=None,
+        get_request_lists=lambda: lists,
+    )
 
+
+class TestEndedRequests(CustomTestCase):
     def _req(self, rid, *, sent, exited):
         return FakeReq(
             rid=rid,
@@ -166,11 +166,10 @@ class TestEndedRequests(CustomTestCase):
     def test_a_request_in_no_list_must_have_exited_through_the_retirer(self):
         ended = self._req("ended", sent=True, exited=True)
         queued = self._req("queued", sent=False, exited=False)
-        offloading = self._req("offloading", sent=True, exited=False)
         dropped = self._req("dropped", sent=True, exited=False)
-        checker = self._checker(listed=[queued], offloading=[offloading])
+        checker = _checker_over({ListKind.WAITING: [queued]})
         with envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.override(True):
-            for req in (ended, queued, offloading, dropped):
+            for req in (ended, queued, dropped):
                 checker.expect_output(req)
 
         with self.assertRaisesRegex(StateCheckError, r"never exited.*\['dropped'\]"):
@@ -178,6 +177,22 @@ class TestEndedRequests(CustomTestCase):
 
         dropped.exit_via = "release"
         checker._check_ended_requests()
+
+
+class TestListedRequestsUnfinished(CustomTestCase):
+    def test_only_the_deferred_list_holds_a_finished_request_at_idle(self):
+        def req(rid, finished):
+            return FakeReq(rid=rid, finished=lambda: finished)
+
+        checker = _checker_over(
+            {
+                ListKind.DEFERRED: [req("deferred", True)],
+                ListKind.DECODING: [req("running", False), req("stuck", True)],
+            }
+        )
+
+        with self.assertRaisesRegex(StateCheckError, r"at idle: \['stuck'\]"):
+            checker._check_listed_requests_unfinished()
 
 
 class TestEveryWindowIsConserved(CustomTestCase):

@@ -281,8 +281,11 @@ class TestDeferredKVReleaseMetrics(CustomTestCase):
             disaggregation_mode=DisaggregationMode.DECODE,
             disagg_decode_transfer_queue=queue,
             disagg_decode_prealloc_queue=SimpleNamespace(
-                queue=[], pre_allocated_token_counts=lambda windows: (0, {})
+                queue=[],
+                num_tokens_pending_prealloc=0,
+                pre_allocated_token_counts=lambda windows: (0, {}),
             ),
+            max_total_num_tokens=1,
             running_batch=SimpleNamespace(reqs=[]),
             request_lists=lambda: {kind: [] for kind in ListKind},
             enable_fpm=False,
@@ -364,6 +367,7 @@ class TestDeferredKVReleaseMetrics(CustomTestCase):
                 queue=[],
                 retracted_queue=[],
                 num_tokens_pre_allocated=0,
+                num_tokens_pending_prealloc=0,
                 pre_allocated_token_counts=lambda windows: (0, {}),
             ),
             running_batch=batch,

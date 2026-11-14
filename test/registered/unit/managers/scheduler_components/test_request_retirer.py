@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import sglang
+from sglang.srt.environ import envs
 from sglang.srt.managers.req_types import FINISH_ABORT, FINISH_LENGTH
 from sglang.srt.managers.scheduler_components import request_retirer
 from sglang.srt.managers.scheduler_components.request_list import (
@@ -15,7 +16,7 @@ from sglang.srt.managers.scheduler_components.request_list import (
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.scheduler_test_utils import FakeReq, release_only_retirer
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, enter_scope
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
@@ -137,6 +138,49 @@ class TestRelease(CustomTestCase):
         calls = []
         self._release(_req(FINISH_LENGTH(length=0), calls), calls)
         self.assertEqual(calls, [False])
+
+
+class TestTakeOutWithoutRelease(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        enter_scope(self, envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.override(True))
+        enter_scope(self, envs.SGLANG_IS_IN_CI.override(False))
+        self.retirer = release_only_retirer()
+
+    def test_abandon_takes_a_listed_request_out_as_its_exit(self):
+        req = FakeReq(rid="r", bootstrap_room=7)
+        queue = IndexedReqList(ListKind.PD_RELEASING)
+        move([req], queue)
+
+        self.retirer.abandon(req, RuntimeError("release failed"))
+
+        self.assertIsNone(req.owner_list)
+        self.assertEqual(req.exit_via, "abandon")
+
+    def test_abandon_after_the_release_took_it_out_does_nothing(self):
+        req = FakeReq(rid="r", bootstrap_room=7, exit_via="release")
+
+        self.retirer.abandon(req, RuntimeError("release failed"))
+
+        self.assertEqual(req.exit_via, "release")
+
+    def test_abandon_raises_in_ci(self):
+        req = FakeReq(rid="r", bootstrap_room=7)
+        with (
+            envs.SGLANG_IS_IN_CI.override(True),
+            self.assertRaisesRegex(RuntimeError, "release failed"),
+        ):
+            self.retirer.abandon(req, RuntimeError("release failed"))
+
+    def test_settle_output_takes_a_released_request_out_without_an_exit(self):
+        req = FakeReq(rid="r", bootstrap_room=7, exit_via="release")
+        deferred = IndexedReqList(ListKind.DEFERRED)
+        move([req], deferred)
+
+        self.retirer.settle_output(req)
+
+        self.assertIsNone(req.owner_list)
+        self.assertEqual(req.exit_via, "release")
 
 
 if __name__ == "__main__":

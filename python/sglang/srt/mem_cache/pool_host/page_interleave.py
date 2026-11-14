@@ -68,6 +68,9 @@ class PageInterleaveHostPool:
     def available_size(self) -> int:
         return self._slots.available_size()
 
+    def least_full_class(self) -> int:
+        return self._slots.least_full_class()
+
     @synchronized
     def alloc(
         self, need_size: int, start_owner: Optional[int] = None

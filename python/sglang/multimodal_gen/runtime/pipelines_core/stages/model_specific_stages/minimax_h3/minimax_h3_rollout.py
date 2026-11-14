@@ -160,7 +160,6 @@ class MiniMaxH3RolloutCtx:
     sigmas_video: list[float]
     collector: MiniMaxH3RolloutCollector
     noise_buffer: torch.Tensor | None = None
-    denoising_env_kwargs: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
