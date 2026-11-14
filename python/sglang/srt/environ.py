@@ -1386,6 +1386,10 @@ class Envs:
     # Launch the TRT-LLM MoE grouped GEMMs with PDL only at or below this
     # token count.
     SGLANG_TRTLLM_MOE_PDL_MAX_TOKENS = EnvInt(8192)
+    # Upper bound on rows per finalized SiTU MXFP4 launch. Larger batches are
+    # split into sequential launches; 0 keeps one-shot launches.
+    # Deferred-finalize calls always use one launch.
+    SGLANG_MXFP4_MOE_MAX_TOKENS_PER_LAUNCH = EnvInt(0)
     # Use FlashInfer's fused atomic CUTLASS/CuTe DSL MoE finalize.
     SGLANG_FLASHINFER_MOE_FUSED_FINALIZE = EnvBool(False)
     # Experimental Nemotron small-M NVFP4 path; validated only on SM120.
