@@ -766,4 +766,10 @@ _ADDITIONAL_STOP_TOKEN_TEXTS = (
 def attach_additional_stop_token_ids(tokenizer):
     added = tokenizer.get_added_vocab()
     stop_ids = {added[text] for text in _ADDITIONAL_STOP_TOKEN_TEXTS if text in added}
+    chat_template = getattr(tokenizer, "chat_template", None)
+    if isinstance(chat_template, str) and "<|assistant|>" in added:
+        from sglang.srt.parser.template_detection import is_glm53_template
+
+        if is_glm53_template(chat_template):
+            stop_ids.add(added["<|assistant|>"])
     tokenizer.additional_stop_token_ids = stop_ids or None
