@@ -82,6 +82,7 @@ class TestExportHooks(unittest.TestCase):
                     stop = manager.stop
                 with (
                     envs.SGLANG_PROFILE_KERNEL_SUMMARY.override(True),
+                    envs.SGLANG_PROFILE_STEP_KERNELS.override(True),
                     envs.SGLANG_PROFILE_V2.override(False),
                     patch(module + ".get_parallel", return_value=ranks),
                     patch(module + ".torch.distributed.barrier"),
@@ -91,6 +92,14 @@ class TestExportHooks(unittest.TestCase):
                 self.assertEqual(len(paths), 1)
                 result = json.loads(paths[0].read_text())
                 self.assertEqual(result["devices"][0]["kernel_busy_union_ns"], 3000)
+                step_files = list(Path(tmp).glob("*.steps.json"))
+                self.assertEqual(len(step_files), 1)
+                self.assertEqual(
+                    json.loads(step_files[0].read_bytes())["metadata"][
+                        "unmatched_kernels"
+                    ],
+                    1,
+                )
 
     def test_stage_stop_reaches_barrier_after_bad_gzip(self):
         ranks = SimpleNamespace(tp_rank=0, num_dp_ranks=1, pp_size=1, moe_ep_size=1)
@@ -109,6 +118,7 @@ class TestExportHooks(unittest.TestCase):
             manager.torch_profiler = CapturedProfiler(truncate=True)
             with (
                 envs.SGLANG_PROFILE_KERNEL_SUMMARY.override(True),
+                envs.SGLANG_PROFILE_STEP_KERNELS.override(True),
                 patch(
                     "sglang.srt.observability.profile_utils.get_parallel",
                     return_value=ranks,

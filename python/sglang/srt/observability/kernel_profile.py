@@ -169,17 +169,29 @@ def export_kernel_summary(trace_path):
 
     from sglang.srt.environ import envs
 
-    if not envs.SGLANG_PROFILE_KERNEL_SUMMARY.get():
+    if not (
+        envs.SGLANG_PROFILE_KERNEL_SUMMARY.get()
+        or envs.SGLANG_PROFILE_STEP_KERNELS.get()
+    ):
         return
     path = Path(trace_path)
     output = path.with_name(
         path.name.removesuffix(".gz").removesuffix(".json") + ".kernel-summary.json"
     )
     try:
-        summary = summarize_profile(read_profile(path, max_bytes=_INLINE_LIMIT))
+        payload = read_profile(path, max_bytes=_INLINE_LIMIT)
+        summary = summarize_profile(payload)
         temporary = output.with_name(output.name + ".tmp")
         temporary.write_text(json.dumps(summary, indent=2), encoding="utf-8")
         temporary.replace(output)
+        if envs.SGLANG_PROFILE_STEP_KERNELS.get():
+            from sglang.srt.observability.step_kernel_profile import export_step_kernels
+
+            export_step_kernels(
+                path,
+                payload,
+                max_bytes=envs.SGLANG_PROFILE_STEP_TRACE_MAX_BYTES.get(),
+            )
     except (OSError, EOFError, zlib.error, ValueError, ArithmeticError):
         logger.warning("Could not summarize profiler trace %s", path, exc_info=True)
     else:
