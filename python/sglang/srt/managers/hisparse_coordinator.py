@@ -87,6 +87,69 @@ class HiSparseAct(NamedTuple):
     req: Req
 
 
+from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
+    ListKind,
+)
+
+
+class _HiSparseStagingQueue(IndexedReqList):
+    """Deque-backed IndexedReqList with O(1) FIFO popleft when draining head items."""
+
+    def __init__(self, kind: ListKind, **kwargs) -> None:
+        from collections import deque
+
+        super().__init__(kind, **kwargs)
+        self._items = deque()
+
+    def prepend(self, items) -> None:
+        for item in reversed(list(items)):
+            self._items.appendleft(item)
+
+    def replace(self, items) -> None:
+        from collections import deque
+
+        super().replace(items)
+        self._items = deque(self._items)
+
+    def clear(self) -> None:
+        from collections import deque
+
+        super().clear()
+        self._items = deque()
+
+    def __getitem__(self, index):
+        if isinstance(index, slice):
+            return list(self._items)[index]
+        return self._items[index]
+
+    def leave(self, reqs) -> None:
+        leaving = list(reqs)
+        if not leaving:
+            return
+        idx = 0
+        while (
+            idx < len(leaving)
+            and self._items
+            and self._req_of(self._items[0]) is leaving[idx]
+        ):
+            item = self._items.popleft()
+            self._req_of(item).owner_list = None
+            idx += 1
+        if idx < len(leaving):
+            from collections import deque
+
+            remaining = set(leaving[idx:])
+            kept = deque()
+            for item in self._items:
+                req = self._req_of(item)
+                if req in remaining:
+                    req.owner_list = None
+                else:
+                    kept.append(item)
+            self._items = kept
+
+
 class HiSparseTokenStats(NamedTuple):
     device_tokens: int
     device_token_usage: float
@@ -697,6 +760,9 @@ class HiSparseCoordinator:
         self.decode_producer_stream = None
         self._backup_done_event = device_module.Event()
         self._has_pending_backup = False
+        self.ack_staging_queue = _HiSparseStagingQueue(
+            ListKind.HISPARSE_STAGING, req_of=lambda x: x.req
+        )
 
         self.tp_group = tp_group
         self.tp_world_size = torch.distributed.get_world_size(group=self.tp_group)
