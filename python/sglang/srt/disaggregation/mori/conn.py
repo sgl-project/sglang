@@ -1397,6 +1397,22 @@ class MoriKVManager(CommonKVManager):
             sizes=sizes,
         )
 
+    @staticmethod
+    def _tp_slice_is_full_row(tp_cfg: TPSliceConfig) -> bool:
+        """Whether the TP-mismatch head slice is the whole token row on both sides.
+
+        That holds when every rank stores whole, replicated KV heads, e.g. 2 KV heads
+        with prefill attention TP2 and decode TP4 or TP8: each rank keeps one head,
+        so source and destination pages share one layout and need no per-token
+        slicing.
+        """
+        return (
+            tp_cfg.src_item_len == tp_cfg.dst_item_len
+            and tp_cfg.src_head_slice_offset == 0
+            and tp_cfg.dst_head_slice_offset == 0
+            and tp_cfg.heads_bytes_per_token_to_send == tp_cfg.bytes_per_token_src
+        )
+
     def send_kvcache(
         self,
         peer_info: KVArgsRegisterInfo,
@@ -1441,8 +1457,14 @@ class MoriKVManager(CommonKVManager):
             peer_info.dst_kv_mem_descs, peer_info.dst_kv_layer_ids
         )
 
+        tp_cfg = None
         if peer_info.decode_tp_size != self.attn_tp_size:
             tp_cfg = self._build_tp_slice_config(peer_info)
+            if self._tp_slice_is_full_row(tp_cfg):
+                # Replicated KV heads: the decode rank wants this rank's whole token
+                # row, so the pages move as-is through the contiguous plan below.
+                tp_cfg = None
+        if tp_cfg is not None:
             slice_plan = self._build_tp_slice_transfer_plan(
                 prefill_kv_indices, dst_kv_indices, tp_cfg
             )
