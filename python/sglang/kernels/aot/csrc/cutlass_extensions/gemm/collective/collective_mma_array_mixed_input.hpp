@@ -16,10 +16,44 @@
 #pragma once
 
 #include "cutlass/detail/dependent_false.hpp"
+#include "cutlass/gemm/dispatch_policy.hpp"
+
+/////////////////////////////////////////////////////////////////////////////////////////////////
+
+namespace cutlass::gemm {
+
+/////////////////////////////////////////////////////////////////////////////////////////////////
+
+// Pre-MMA scale variant
+template <
+    int Stages_,
+    class ClusterShape_ = cute::Shape<cute::_1, cute::_1, cute::_1>,
+    class KernelSchedule = KernelPtrArrayTmaWarpSpecializedCooperative>
+struct MainloopSm90ArrayTmaGmmaWarpSpecializedMixedInputPreScale {
+  constexpr static int Stages = Stages_;
+  using ClusterShape = ClusterShape_;
+  using ArchTag = arch::Sm90;
+  using Schedule = KernelSchedule;
+  static_assert(
+      cute::is_same_v<Schedule, KernelPtrArrayTmaWarpSpecializedCooperative> ||
+          cute::is_same_v<Schedule, KernelPtrArrayTmaWarpSpecializedPingpong>,
+      "KernelSchedule must be one of the Ptr-Array or Grouped GEMM TMA warp specialized policies");
+};
+
+/////////////////////////////////////////////////////////////////////////////////////////////////
+
+}  // namespace cutlass::gemm
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
 namespace cutlass::gemm::collective {
+
+/////////////////////////////////////////////////////////////////////////////////////////////////
+
+enum class MixedInputScaleMode {
+  kPostMma = 0,
+  kPreMmaE8M0,
+};
 
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -50,4 +84,5 @@ struct CollectiveMmaArrayMixedInput {
 /////////////////////////////////////////////////////////////////////////////////////////////////
 
 #include "cutlass_extensions/gemm/collective/sm90_mma_array_tma_gmma_rs_warpspecialized_mixed_input_.hpp"
+#include "cutlass_extensions/gemm/collective/sm90_mma_array_tma_gmma_rs_warpspecialized_mixed_input_prescale.hpp"
 /////////////////////////////////////////////////////////////////////////////////////////////////

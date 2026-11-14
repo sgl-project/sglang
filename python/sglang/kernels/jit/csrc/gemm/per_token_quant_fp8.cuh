@@ -99,7 +99,7 @@ __global__ void per_token_quant_fp8_cta_kernel(
     output_s[token_id] = scale_smem;
   }
   __syncthreads();
-  const float scale_inv = 1.0f / scale_smem;
+  const float scale_inv = scale_smem == 0.0f ? 0.0f : 1.0f / scale_smem;
 
   for (uint32_t i = threadIdx.x; i < num_vecs; i += blockDim.x) {
     input_vec_t input_vec;
