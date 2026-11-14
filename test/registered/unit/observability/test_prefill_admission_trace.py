@@ -110,6 +110,52 @@ class TestAdmissionTrace(unittest.TestCase):
             parent.end()
             provider.shutdown()
 
+    def test_async_scheduler_copy_flushes_only_sampled_rejection(self):
+        import pickle
+        from unittest.mock import patch
+
+        from opentelemetry import propagate
+
+        from sglang.srt.observability import trace_async as impl
+
+        with (
+            patch.object(impl, "is_async_tracing_available", return_value=True),
+            patch.object(impl._trace_mod, "opentelemetry_initialized", True),
+            patch.object(impl._trace_mod, "get_global_trace_level", return_value=3),
+            patch.object(impl, "_get_zmq_socket") as socket,
+        ):
+            for sampled in (True, False):
+                with self.subTest(sampled=sampled):
+                    ctx = impl.TraceReqContextAsync("req")
+                    carrier = {}
+                    propagate.inject(carrier, context=_parent(sampled))
+                    ctx._root_span_carrier = carrier
+                    restored = pickle.loads(pickle.dumps(ctx))
+                    socket.return_value.send_pyobj.reset_mock()
+                    req = SimpleNamespace(
+                        time_stats=SimpleNamespace(trace_ctx=restored)
+                    )
+                    for remaining in (10, 5):
+                        record_admission_wait(
+                            req,
+                            "prefill_input_budget",
+                            remaining_input_tokens=remaining,
+                        )
+                    restored.flush()
+                    ops = [
+                        op
+                        for call in socket.return_value.send_pyobj.call_args_list
+                        for op in call.args[0]["operations"]
+                        if op["type"] == "slice"
+                    ]
+                    self.assertEqual(len(ops), int(sampled))
+                    if sampled:
+                        self.assertEqual(ops[0]["slice_name"], "prefill_admission_wait")
+                        self.assertEqual(
+                            ops[0]["events"][0]["attrs"]["remaining_input_tokens"], 10
+                        )
+                    ctx.tracing_enable = restored.tracing_enable = False
+
     def test_unsampled_request_has_no_state_or_spans(self):
         ctx = SimpleNamespace(tracing_enable=False, trace_slice=Mock())
         record_admission_wait(
