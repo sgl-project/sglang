@@ -76,6 +76,23 @@ def is_war_barrier_enabled() -> bool:
     )
 
 
+def _async_d2h_rows(rows: List[Any]) -> List[Any]:
+    """`_async_d2h` over per-request rows with one host buffer and one copy.
+
+    The rows come back as host views with their shapes, in order; entries that
+    are not tensors pass through.
+    """
+    tensors = [row for row in rows if torch.is_tensor(row)]
+    if len(tensors) < 2 or len({row.dtype for row in tensors}) > 1:
+        return [_async_d2h(row) if torch.is_tensor(row) else row for row in rows]
+    host = _async_d2h(torch.cat([row.reshape(-1) for row in tensors]))
+    host_rows = iter(
+        chunk.view(row.shape)
+        for chunk, row in zip(host.split([row.numel() for row in tensors]), tensors)
+    )
+    return [next(host_rows) if torch.is_tensor(row) else row for row in rows]
+
+
 @dataclasses.dataclass
 class GenerationBatchResult:
     logits_output: Optional[LogitsProcessorOutput] = None
@@ -211,20 +228,17 @@ class GenerationBatchResult:
                     self.logits_output.input_token_logprobs
                 )
             if self.logits_output.next_token_top_logprobs_val is not None:
-                self.logits_output.next_token_top_logprobs_val = [
-                    _async_d2h(v) if torch.is_tensor(v) else v
-                    for v in self.logits_output.next_token_top_logprobs_val
-                ]
+                self.logits_output.next_token_top_logprobs_val = _async_d2h_rows(
+                    self.logits_output.next_token_top_logprobs_val
+                )
             if self.logits_output.next_token_top_logprobs_idx is not None:
-                self.logits_output.next_token_top_logprobs_idx = [
-                    _async_d2h(x) if torch.is_tensor(x) else x
-                    for x in self.logits_output.next_token_top_logprobs_idx
-                ]
+                self.logits_output.next_token_top_logprobs_idx = _async_d2h_rows(
+                    self.logits_output.next_token_top_logprobs_idx
+                )
             if self.logits_output.next_token_token_ids_logprobs_val is not None:
-                self.logits_output.next_token_token_ids_logprobs_val = [
-                    _async_d2h(v) if torch.is_tensor(v) else v
-                    for v in self.logits_output.next_token_token_ids_logprobs_val
-                ]
+                self.logits_output.next_token_token_ids_logprobs_val = _async_d2h_rows(
+                    self.logits_output.next_token_token_ids_logprobs_val
+                )
         if return_hidden_states and self.logits_output.hidden_states is not None:
             self.logits_output.hidden_states = _async_d2h(
                 self.logits_output.hidden_states
