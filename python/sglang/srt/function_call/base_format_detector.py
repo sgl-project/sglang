@@ -355,8 +355,25 @@ class BaseFormatDetector(ABC):
 
         Detectors that hold text back while waiting for a marker that can no
         longer arrive (the stream is over) override this to release it.
+
+        The default implementation also drains buffered tool calls: each
+        increment emits at most one tool-call unit (a name, then an argument
+        diff, then the next call), so a final delta that completes more than
+        one call strands the remainder in the buffer with no following delta
+        to pick it up. Re-running the increment until it stops emitting calls
+        flushes them, matching JsonArrayParser.finish(). This terminates
+        because every call-emitting pass either consumes the completed call
+        from the buffer or flips current_tool_name_sent.
         """
-        return StreamingParseResult()
+        normal_text = ""
+        calls: List[ToolCallItem] = []
+        while True:
+            result = self.parse_streaming_increment("", tools)
+            normal_text += result.normal_text
+            calls.extend(result.calls)
+            progress = [call for call in result.calls if call.name or call.parameters]
+            if not progress:
+                return StreamingParseResult(normal_text=normal_text, calls=calls)
 
     def supports_structural_tag(self) -> bool:
         """Return True if this detector supports structural tag format."""
