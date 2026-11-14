@@ -851,7 +851,13 @@ class GroupCoordinator:
                 )
             except Exception:
                 # Fall back to custom_fused_ar_rms path below.
-                pass
+                if not getattr(self, "_fused_ar_rms_failure_logged", False):
+                    self._fused_ar_rms_failure_logged = True
+                    logger.warning(
+                        "%s.fused_allreduce_rmsnorm failed, falling back",
+                        type(ca_comm).__name__,
+                        exc_info=True,
+                    )
 
         if not hasattr(ca_comm, "custom_fused_ar_rms"):
             return None
