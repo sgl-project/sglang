@@ -11,19 +11,28 @@ length finish. Drives the real `Req.update_finish_state`; pure CPU."""
 
 import unittest
 from array import array
+from types import SimpleNamespace
 from unittest import mock
+
+import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.managers.detokenizer_manager import DetokenizerManager
 from sglang.srt.managers.req_types import (
     FINISH_LENGTH,
     FINISH_MATCHED_STR,
     FINISH_MATCHED_TOKEN,
+    FINISHED_MATCHED_REGEX,
 )
 from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.scheduler_components.batch_result_processor import (
+    SchedulerBatchResultProcessor,
+)
+from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 
@@ -58,10 +67,11 @@ def _make_req(
     *,
     max_new_tokens,
     stop=None,
+    stop_regex=None,
     eos_token_ids=frozenset({EOS_ID}),
     vocab_size=10_000,
 ):
-    sp = SamplingParams(max_new_tokens=max_new_tokens, stop=stop)
+    sp = SamplingParams(max_new_tokens=max_new_tokens, stop=stop, stop_regex=stop_regex)
     sp.normalize(tokenizer=_MockTokenizerForNormalize())
     req = Req(
         rid="t",
@@ -143,6 +153,119 @@ class TestFinishLengthSpeculative(CustomTestCase):
         self.assertIsInstance(req.finished_reason, FINISH_MATCHED_TOKEN)
         self.assertEqual(req.finished_len, 2)
         self.assertEqual(list(req.output_ids_through_stop), [10, EOS_ID])
+
+
+class TestEarlierEosSpeculative(CustomTestCase):
+    def test_eos_before_text_stop_matches_sequential_decode(self):
+        for stop_kwargs in ({"stop": ["STOP"]}, {"stop_regex": ["STOP"]}):
+            for max_new_tokens in (2, 3, 100):
+                with self.subTest(stop_kwargs=stop_kwargs, cap=max_new_tokens):
+                    tokens = [10, EOS_ID, STOP_ID]
+                    sequential = _make_req(
+                        [], max_new_tokens=max_new_tokens, **stop_kwargs
+                    )
+                    for token in tokens:
+                        sequential.output_ids.append(token)
+                        sequential.update_finish_state()
+                        if sequential.finished():
+                            break
+                    speculative = _make_req(
+                        tokens, max_new_tokens=max_new_tokens, **stop_kwargs
+                    )
+                    speculative.update_finish_state(len(tokens))
+                    self.assertEqual(
+                        speculative.finished_reason.to_json(),
+                        sequential.finished_reason.to_json(),
+                    )
+                    self.assertEqual(
+                        list(speculative.output_ids_through_stop),
+                        list(sequential.output_ids_through_stop),
+                    )
+                    self.assertEqual(speculative.finished_len, 2)
+
+    def test_spec_resolver_preserves_eos_followed_by_bonus_stop(self):
+        # A verified EOS draft can be followed by the target's bonus token.
+        # The CPU resolver keeps both when no grammar truncates the run.
+        req = _make_req([], max_new_tokens=100, stop=["STOP"])
+        processor = SchedulerBatchResultProcessor.__new__(SchedulerBatchResultProcessor)
+        object.__setattr__(
+            processor,
+            "metrics_reporter",
+            SimpleNamespace(snapshot_spec_decode_metrics=lambda *args: None),
+        )
+        object.__setattr__(
+            processor,
+            "model_worker",
+            SimpleNamespace(on_verify_complete_cpu=lambda *args, **kwargs: None),
+        )
+        result = GenerationBatchResult(
+            next_token_ids=torch.tensor([10, EOS_ID, 20, STOP_ID]),
+            accept_lens=torch.tensor([4]),
+            speculative_num_draft_tokens=4,
+        )
+        tokens = processor._resolve_spec_v2_tokens(
+            result, SimpleNamespace(reqs=[req], has_grammar=False)
+        )[0]
+        self.assertEqual(tokens, [10, EOS_ID, 20, STOP_ID])
+        req.output_ids.extend(tokens)
+        req.update_finish_state(len(tokens))
+
+        # Exercise the native final-output trim as well as the finish metadata.
+        detokenizer = DetokenizerManager.__new__(DetokenizerManager)
+        detokenizer.is_tool_call_parser_gpt_oss = False
+        detokenizer.tool_close_token_ids = set()
+        ids = detokenizer.trim_matched_stop(
+            list(req.output_ids_through_stop), req.finished_reason.to_json(), False
+        )
+        text = detokenizer.trim_matched_stop(
+            req.tokenizer.decode(ids), req.finished_reason.to_json(), False
+        )
+        self.assertEqual(text, req.tokenizer.decode([10]))
+        self.assertEqual(ids, [10])
+        self.assertIsInstance(req.finished_reason, FINISH_MATCHED_TOKEN)
+
+    def test_text_stop_before_eos_still_wins(self):
+        for stop_kwargs, reason in (
+            ({"stop": ["STOP"]}, FINISH_MATCHED_STR),
+            ({"stop_regex": ["STOP"]}, FINISHED_MATCHED_REGEX),
+        ):
+            with self.subTest(stop_kwargs=stop_kwargs):
+                req = _make_req(
+                    [10, STOP_ID, EOS_ID], max_new_tokens=100, **stop_kwargs
+                )
+                req.update_finish_state(3)
+                self.assertIsInstance(req.finished_reason, reason)
+                self.assertEqual(req.finished_len, 2)
+
+    def test_earlier_custom_stop_token_beats_text_stop(self):
+        req = _make_req(
+            [10, EOS_ID, STOP_ID],
+            max_new_tokens=100,
+            stop=["STOP"],
+            eos_token_ids=frozenset(),
+        )
+        req.sampling_params.stop_token_ids = {EOS_ID}
+        req.update_finish_state(3)
+        self.assertIsInstance(req.finished_reason, FINISH_MATCHED_TOKEN)
+        self.assertEqual(req.finished_len, 2)
+
+    def test_text_stop_wins_at_same_token_as_eos(self):
+        req = _make_req(
+            [10, STOP_ID],
+            max_new_tokens=100,
+            stop=["STOP"],
+            eos_token_ids={STOP_ID},
+        )
+        req.update_finish_state(2)
+        self.assertIsInstance(req.finished_reason, FINISH_MATCHED_STR)
+        self.assertEqual(req.finished_len, 2)
+
+    def test_ignored_eos_does_not_beat_text_stop(self):
+        req = _make_req([10, EOS_ID, STOP_ID], max_new_tokens=100, stop=["STOP"])
+        req.sampling_params.ignore_eos = True
+        req.update_finish_state(3)
+        self.assertIsInstance(req.finished_reason, FINISH_MATCHED_STR)
+        self.assertEqual(req.finished_len, 3)
 
 
 # Incident replay with production token ids. Spec verification has no EOS
