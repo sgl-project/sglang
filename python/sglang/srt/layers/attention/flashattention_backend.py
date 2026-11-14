@@ -1903,6 +1903,11 @@ class FlashAttentionBackend(AttentionBackend):
                 )
             else:
                 q = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+                # Count sinks only in the suffix; the prefix can be empty.
+                prefix_kwargs = kwargs
+                if use_cascade_attn and "sinks" in kwargs:
+                    prefix_kwargs = kwargs.copy()
+                    prefix_kwargs.pop("sinks")
                 result = self.flash_attn_with_kvcache(
                     q=q,
                     k_cache=key_cache,
@@ -1919,7 +1924,7 @@ class FlashAttentionBackend(AttentionBackend):
                     return_softmax_lse=use_cascade_attn or return_lse,
                     num_splits=self.num_splits,
                     out=_fa_out,
-                    **kwargs,
+                    **prefix_kwargs,
                     ver=ver,
                 )
 
@@ -2399,6 +2404,11 @@ class FlashAttentionBackend(AttentionBackend):
                     sched_meta = metadata.scheduler_metadata
                 if self._decode_uses_static_max_seqlen_k:
                     kwargs["max_seqlen_k"] = metadata.max_seq_len_k
+                # Count sinks only in the suffix; the prefix can be empty.
+                prefix_kwargs = kwargs
+                if use_cascade_attn and "sinks" in kwargs:
+                    prefix_kwargs = kwargs.copy()
+                    prefix_kwargs.pop("sinks")
                 result = self.flash_attn_with_kvcache(
                     q=q_reshaped,
                     k_cache=key_cache,
@@ -2421,7 +2431,7 @@ class FlashAttentionBackend(AttentionBackend):
                     ),
                     out=_fa_out,
                     scheduler_metadata=sched_meta,
-                    **kwargs,
+                    **prefix_kwargs,
                     ver=ver,
                 )
                 if return_lse and not use_cascade_attn:
