@@ -1233,6 +1233,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Not set (uses <code>--page-size</code>)</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_HICACHE_WRITE_BACK_MIN_EVICT_TOKENS</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Opt-in, interim. With <code>--hicache-write-policy write_back</code>, the minimum Full KV tokens one allocation-driven eviction frees, so that fewer evictions each wait for the in-flight forward. It only acts when the shortfall is below the value and is capped by the evictable size. Larger values demote more reusable KV to host; the effective value depends on the workload. No effect outside write_back or with <code>--enable-unified-memory</code>. Must be the same on every rank.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>0</code> (off)</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_HICACHE_NIXL_USE_DIRECT_IO</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable <code>O_DIRECT</code> for any file-based NIXL backend (POSIX, GDS, GDS_MT, 3FS) when opening cache files (bypasses the OS page cache, reducing memory pressure and improving throughput on NVMe). Can also be disabled via <code>{'{"use_direct_io": false}'}</code> in <code>--hicache-storage-backend-extra-config</code>. Falls back to buffered I/O with a warning when <code>O_DIRECT</code> is unavailable on the current OS.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>

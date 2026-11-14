@@ -811,9 +811,19 @@ class UnifiedRadixCache(BasePrefixCache):
         short = {ct: n for ct, n in shortfall.items() if n > 0}
         if not short:
             return EvictResult()
+        demand_by_type = {ct: demand_by_type[ct] for ct in short}
+        token = self.slot_id(TREE_TOKEN)
+        token_short = short.get(token, 0)
+        min_evict = envs.SGLANG_HICACHE_WRITE_BACK_MIN_EVICT_TOKENS.get()
+        if 0 < token_short < min_evict and self.is_write_back:
+            # Each write_back walk waits once for its copies, so free at least
+            # `min_evict` tokens per walk. The walk stops once its pool can
+            # serve its demand, so the demand rises with the shortfall.
+            short[token] = min_evict
+            demand_by_type[token] += min_evict - token_short
         return self._evict(
             EvictParams(
-                num_tokens=short.get(self.slot_id(TREE_TOKEN), 0),
+                num_tokens=short.get(token, 0),
                 window_num_tokens={
                     name: short[ct]
                     for ct, name in self._window_sub_pools_by_slot().items()
@@ -821,7 +831,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 },
                 mamba_num=short.get(self.slot_id(TREE_STATE), 0),
             ),
-            demand={ct: demand_by_type[ct] for ct in short},
+            demand=demand_by_type,
         )
 
     def _demand_by_type(self, demand: KVDemand) -> dict[ComponentType, int]:
