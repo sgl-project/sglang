@@ -586,9 +586,13 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
         )
 
         if self.use_block_routing:
-            if get_moe_a2a_backend().is_deepep():
+            if (
+                get_moe_a2a_backend().is_deepep()
+                or get_moe_a2a_backend().is_ascend_ops()
+            ):
                 raise ValueError(
-                    "LLaDA2 block routing does not support --moe-a2a-backend deepep"
+                    "LLaDA2 block routing does not support --moe-a2a-backend "
+                    f"{get_moe_a2a_backend().value}"
                 )
             if self.correction_bias is None:
                 raise ValueError(
@@ -675,7 +679,10 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
                 reduce_results=False,
                 prefix=add_prefix("shared_experts", prefix),
                 parallel_group="replicated"
-                if get_moe_a2a_backend().is_deepep()
+                if (
+                    get_moe_a2a_backend().is_deepep()
+                    or get_moe_a2a_backend().is_ascend_ops()
+                )
                 else "tp",
             )
         # dispatcher
@@ -698,7 +705,10 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: Optional[ForwardBatch] = None,
     ) -> torch.Tensor:
-        if not get_moe_a2a_backend().is_deepep():
+        if (
+            not get_moe_a2a_backend().is_deepep()
+            and not get_moe_a2a_backend().is_ascend_ops()
+        ):
             return self.forward_normal(hidden_states)
         else:
             return self.forward_deepep(hidden_states, forward_batch)

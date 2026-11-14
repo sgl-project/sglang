@@ -404,6 +404,15 @@ class RunnerIds:
         request table holds: identity, or one gather through its ``read_v2p``."""
         return state_id_space(self._state_spaces, sub_pool)
 
+    def request_ids(self) -> IdSpace:
+        """How request-scoped payload indexes request rows: through the request
+        sub-pool's units under unified memory (one gather through its
+        ``read_v2p``), else as they are."""
+        alloc = self._token_to_kv_pool_allocator
+        spaces = {} if alloc is None else alloc.request_id_spaces()
+        assert len(spaces) <= 1, "request payload lives in one request sub-pool"
+        return next(iter(spaces.values()), IdSpace(key=("request", None)))
+
     @property
     def window_storage(self) -> str:
         """The sub-pool a one-rail backend's window layers read and write: the

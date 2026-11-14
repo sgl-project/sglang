@@ -116,6 +116,8 @@ class ErrorBody(msgspec.Struct, kw_only=True, frozen=True):
 
     message: str = ""
     code: int = 0
+    type: Optional[str] = None
+    retryable: Optional[bool] = None
 
     @classmethod
     def from_json_value(cls, value: Any) -> "ErrorBody":
@@ -1157,6 +1159,10 @@ def decode_ErrorBody(value: Any) -> ErrorBody:
             kw["message"] = _expect_str(x, expected="a string")
         elif key == "code":
             kw["code"] = _expect_uint(x, expected="u32")
+        elif key == "type":
+            kw["type"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "retryable":
+            kw["retryable"] = None if x is None else _expect_bool(x, expected="a boolean")
     return ErrorBody(**kw)
 
 
@@ -1164,6 +1170,10 @@ def encode_ErrorBody(v: ErrorBody) -> Dict[str, Any]:
     d: Dict[str, Any] = {}
     d["message"] = v.message
     d["code"] = v.code
+    if v.type is not None:
+        d["type"] = v.type
+    if v.retryable is not None:
+        d["retryable"] = v.retryable
     return d
 
 

@@ -59,6 +59,7 @@ class SchedulerDllmMixin:
             return None
 
         running_bs = len(running_batch.reqs)
+        self._ack_waiting_health_checks()
         self.waiting_queue.reorder(self.policy.calc_priority(self.waiting_queue))
 
         # Create prefill adder with resource constraints
