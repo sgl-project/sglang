@@ -568,8 +568,10 @@ def tpool_patch_merger(
         reshaped_seq = seq.view(
             t, new_height, kernel_height, new_width, kernel_width, d_model
         )
-        reshaped_seq = reshaped_seq.permute(0, 1, 3, 2, 4, 5).contiguous()
-        reshaped_seq = reshaped_seq.squeeze(0) if t == 1 else reshaped_seq.mean(dim=0)
+        if t != 1:
+            # Pool before copying spatial blocks so only one frame is reordered.
+            reshaped_seq = reshaped_seq.mean(dim=0, keepdim=True)
+        reshaped_seq = reshaped_seq.permute(0, 1, 3, 2, 4, 5).contiguous().squeeze(0)
         outputs.append(
             reshaped_seq.view(
                 new_height * new_width, kernel_height * kernel_width, d_model
