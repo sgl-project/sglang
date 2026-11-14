@@ -3791,6 +3791,38 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             self.assertEqual(ov["attention_backend"], "fa4")
             self.assertEqual(ov["page_size"], 128)
 
+    def test_m3_nvfp4_blackwell_defaults_mxfp8_gemm_to_cutlass(self):
+        from sglang.srt.arg_groups.model_overrides.minimax_m3 import (
+            _minimax_m3_overrides,
+        )
+
+        def _args(**kw):
+            defaults = dict(
+                quantization="minimax_m3_nvfp4",
+                _quantization_explicitly_unset=False,
+                speculative_algorithm=None,
+                attention_backend=None,
+                prefill_attention_backend=None,
+                decode_attention_backend=None,
+                page_size=None,
+                pp_size=1,
+                moe_runner_backend="flashinfer_trtllm_routed",
+                moe_a2a_backend="none",
+                kv_cache_dtype="auto",
+                fp8_gemm_runner_backend="auto",
+            )
+            defaults.update(kw)
+            return SimpleNamespace(**defaults)
+
+        hf = SimpleNamespace(architectures=["MiniMaxM3SparseForConditionalGeneration"])
+        with override_platform(is_hip=False), override_platform(is_blackwell=True):
+            ov = _minimax_m3_overrides(_args(), hf)
+            self.assertEqual(ov["fp8_gemm_runner_backend"], "flashinfer_cutlass")
+            ov = _minimax_m3_overrides(
+                _args(fp8_gemm_runner_backend="flashinfer_cutedsl"), hf
+            )
+            self.assertNotIn("fp8_gemm_runner_backend", ov)
+
     def test_page_constraint_passes_at_callable_level(self):
         from sglang.srt.arg_groups.model_override_base import ResolvedView
         from sglang.srt.arg_groups.overrides import (
