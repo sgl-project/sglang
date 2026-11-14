@@ -56,6 +56,13 @@ class IndexKeyCache:
         # they get a 0-row placeholder that keeps ``buffer`` layer-aligned.
         return 0 if self.pool.skip_topk_layers[layer_idx] else num_pages
 
+    def _check_has_index_k(self, layer_id: int) -> None:
+        # Fail loudly instead of reading or writing the 0-row placeholder.
+        if self.pool.skip_topk_layers[layer_id - self.pool.start_layer]:
+            raise RuntimeError(
+                f"Layer {layer_id} is a skip-topk layer and has no index-K buffer."
+            )
+
     def clear(self) -> None:
         del self.buffer
 
@@ -110,6 +117,7 @@ class IndexKeyCache:
         seq_len_sum: int,
         max_seq_len: int,
     ):
+        self._check_has_index_k(layer_id)
         buf = self.get_buffer(layer_id)
         return dsa_index_k_cache.GetKAndS.execute(
             self.pool,
@@ -127,6 +135,7 @@ class IndexKeyCache:
         index_k: torch.Tensor,
         index_k_scale: torch.Tensor,
     ) -> None:
+        self._check_has_index_k(layer_id)
         buf = self._kernel_view(self.buffer[layer_id - self.pool.start_layer])
         dsa_index_k_cache.SetKAndS.execute(
             pool=self.pool,

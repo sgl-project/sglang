@@ -104,6 +104,7 @@ class LayerSplitIndexKeyCache(IndexKeyCache):
         seq_len_sum: int,
         max_seq_len: int,
     ):
+        self._check_has_index_k(layer_id)
         buf = self.get_buffer(layer_id)
         self.pool.prefetch_kv_buffer(layer_id)
         return dsa_index_k_cache.GetKAndS.execute(
