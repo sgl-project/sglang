@@ -1209,11 +1209,11 @@ class ServerArgs(DisaggServerArgsMixin):
             and "text_encoder" not in self.component_attention_backends
             and "text_encoder" not in self.component_attention_backend_roles
         ):
-            # Laser attention targets the MiniMax-H3 transformer.
+            # Laser Attention is used only by the MiniMax-H3 transformer.
+            # SDPA is faster than Ascend FA for its Qwen3-VL text encoder.
             logger.info(
                 "Automatically set torch_sdpa backend for the MiniMax H3 text "
-                "encoder; %s applies to the transformer",
-                self.attention_backend,
+                "encoder; laser_attn applies to the transformer"
             )
             self.component_attention_backends["text_encoder"] = "torch_sdpa"
 
