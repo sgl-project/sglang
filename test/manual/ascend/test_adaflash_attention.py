@@ -4,14 +4,11 @@ from types import SimpleNamespace
 
 import torch
 import torch_npu  # noqa: F401
-
 from sglang.srt.hardware_backend.npu.attention.ascend_backend import AscendAttnBackend
+from sglang.srt.hardware_backend.npu.utils import init_npu_backend
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
-
-
-from sglang.srt.hardware_backend.npu.utils import init_npu_backend
 
 init_npu_backend()
 
@@ -68,16 +65,30 @@ class TestAdaFlashRaggedAttention(unittest.TestCase):
         )
         batch = SimpleNamespace(
             ragged_verify_layout=layout,
+            batch_size=3,
             global_num_token_non_padded_cpu=total,
             forward_mode=ForwardMode.TARGET_VERIFY,
         )
-        actual = AscendAttnBackend.forward_mtp(
-            backend, query.npu(), None, None, layer, batch, save_kv_cache=False
-        ).cpu().float().reshape(total, heads, head_dim)
+        actual = (
+            AscendAttnBackend.forward_mtp(
+                backend, query.npu(), None, None, layer, batch, save_kv_cache=False
+            )
+            .cpu()
+            .float()
+            .reshape(total, heads, head_dim)
+        )
         expected, offset = [], 0
         for row, (prefix, length) in enumerate(zip(prefixes, lengths)):
-            k = key[row * 3 : row * 3 + 3].reshape(-1, head_dim)[: prefix + length].float()
-            v = value[row * 3 : row * 3 + 3].reshape(-1, head_dim)[: prefix + length].float()
+            k = (
+                key[row * 3 : row * 3 + 3]
+                .reshape(-1, head_dim)[: prefix + length]
+                .float()
+            )
+            v = (
+                value[row * 3 : row * 3 + 3]
+                .reshape(-1, head_dim)[: prefix + length]
+                .float()
+            )
             q = query[offset : offset + length].float().transpose(0, 1)
             scores = (q @ k.T) * layer.scaling
             allowed = torch.arange(prefix + length)[None, :] <= (

@@ -205,7 +205,14 @@ class NPUCudaGraphBackend(BaseGraphBackend):
 
     def prepare_replay(self, forward_batch):
         runner = self._decode_runner
-        if runner is None or forward_batch.needs_forward_metadata_init():
+        if runner is None:
+            return False
+        if forward_batch.ragged_verify_layout is not None:
+            # Let the shared DSpark loader stage packed rows, its layout and
+            # token-keyed graph. The legacy NPU shortcut assumes uniform width.
+            forward_batch.forward_metadata_ready = False
+            return False
+        if forward_batch.needs_forward_metadata_init():
             return False
         if not runner.model_runner.spec_algorithm.is_dflash():
             # Preserve the NPU pre-planned path without refreshing metadata
@@ -514,6 +521,26 @@ class NPUCudaGraphBackend(BaseGraphBackend):
                     )
                     return self.replay_with_input_update(
                         shape_key, seq_lens=None, cpu_update_input=cpu_update_input
+                    )
+                layout = static_forward_batch.ragged_verify_layout
+                if layout is not None:
+                    lengths = layout.verify_lens_cpu
+                    if lengths is None:
+                        lengths = layout.verify_lens.cpu().tolist()
+                    query_ends = np.cumsum(
+                        list(lengths) + [0] * (runner.bs - len(lengths))
+                    ).tolist()
+                    return self.replay_with_input_update(
+                        shape_key,
+                        seq_lens=None,
+                        cpu_update_input=[
+                            {
+                                "actual_seq_lengths": query_ends,
+                                self.get_update_attr_name(): self._decode_update_lengths(
+                                    static_forward_batch
+                                ),
+                            }
+                        ],
                     )
                 return self.replay_with_input_update(
                     shape_key,

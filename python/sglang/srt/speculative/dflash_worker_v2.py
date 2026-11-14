@@ -2487,7 +2487,9 @@ class DFlashWorkerV2(BaseSpecWorker):
     def _validate_phase1_sampling_support(self, batch: ScheduleBatch) -> None:
         sampling_info = batch.sampling_info
         if self._adaflash_verify is not None and not _is_all_greedy(sampling_info):
-            raise ValueError("AdaFlash compact verification currently requires temperature=0.")
+            raise ValueError(
+                "AdaFlash compact verification currently requires temperature=0."
+            )
         if sampling_info is None or sampling_info.is_all_greedy:
             return
 
@@ -3265,12 +3267,6 @@ class DFlashWorkerV2(BaseSpecWorker):
             # The non-overlap (sync) scheduler path advances batch.seq_lens
             # from the result; overlap carries it via next_draft_input instead.
             new_seq_lens=new_seq_lens,
-            # The dynamic AdaFlash path's target_out is the slim
-            # TargetVerifyResult (logits_output, can_run_cuda_graph only);
-            # it carries no MoE/indexer/weight-version metadata, unlike the
-            # static path's richer target_worker.forward_batch_generation()
-            # result. GenerationBatchResult defaults all three to None, so
-            # fall back to that default instead of a hard AttributeError.
             routed_experts_output=getattr(target_out, "routed_experts_output", None),
             indexer_topk_output=getattr(target_out, "indexer_topk_output", None),
             kv_weight_version_record=getattr(

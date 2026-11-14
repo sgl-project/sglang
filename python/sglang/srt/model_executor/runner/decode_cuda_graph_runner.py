@@ -457,6 +457,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             and (self.capture_forward_mode == ForwardMode.TARGET_VERIFY)
             and not self.model_runner.is_draft_worker
         )
+        self.npu_ragged_verify_mode = (
+            self.ragged_verify_mode
+            and torch.device(self.model_runner.device).type == "npu"
+        )
         self.capture_num_tokens: Optional[list[int]] = (
             self._build_ragged_verify_token_buckets()
             if self.ragged_verify_mode
@@ -770,6 +774,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
     def _build_ragged_verify_token_buckets(self) -> list[int]:
         buckets = sorted({bs * self.captured_req_width for bs in self.capture_bs})
         assert buckets and buckets[0] > 0, f"{buckets=}"
+        if self.npu_ragged_verify_mode:
+            # Ascend FIA requires T == actual_seq_lengths[-1]; unlike CUDA
+            # ragged attention it cannot leave a padded tail unassigned.
+            return list(range(1, buckets[-1] + 1))
         return buckets
 
     def _autotune_buffers(self):
@@ -926,7 +934,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             cap_layout.qo_indptr_device.copy_(live.qo_indptr_device)
             cap_layout.extend_start_loc.copy_(live.extend_start_loc)
             return
-        PadVerifyLayout.execute(
+        pad = (
+            PadVerifyLayout.torch
+            if self.npu_ragged_verify_mode
+            else PadVerifyLayout.execute
+        )
+        pad(
             verify_lens=live.verify_lens,
             graph_num_tokens=live.graph_num_tokens,
             padded_bs=cap_layout.bs,
@@ -1364,10 +1377,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             empty_cache=False,
         )
         # Reverse so cuda graphs share memory better.
+        capture_sizes = (
+            self.capture_num_tokens if self.npu_ragged_verify_mode else self.capture_bs
+        )
         capture_range = (
-            tqdm.tqdm(list(reversed(self.capture_bs)))
+            tqdm.tqdm(list(reversed(capture_sizes)))
             if get_parallel().tp_rank == 0
-            else reversed(self.capture_bs)
+            else reversed(capture_sizes)
         )
         lora_variants = ("lora", "nolora") if self.record_nolora_graph else (None,)
         for bs in capture_range:
@@ -1402,7 +1418,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                                 self.backend.prepare_capture_forward(
                                     self.model_runner.model,
                                     enable_compile=bs in self.compile_bs,
-                                    num_tokens=bs * self.captured_req_width,
+                                    num_tokens=(
+                                        bs
+                                        if self.npu_ragged_verify_mode
+                                        else bs * self.captured_req_width
+                                    ),
                                     tp_group=get_parallel().tp_group,
                                 ) as forward,
                             ):
@@ -1421,7 +1441,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         variant_label: Optional[str] = None,
         attention_variant: Optional[str] = None,
     ):
-        num_tokens = size * self.captured_req_width
+        num_tokens = (
+            size if self.npu_ragged_verify_mode else size * self.captured_req_width
+        )
         bs = self._ragged_capture_slots(num_tokens) if self.ragged_verify_mode else size
 
         # Sanity-check: --debug-cuda-graph requires breakable backend.

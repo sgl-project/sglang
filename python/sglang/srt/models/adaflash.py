@@ -1,11 +1,10 @@
 """Official AdaFlash checkpoints on the upstream DFlash backbone."""
 
-from typing import Iterable, Tuple
+from collections.abc import Iterable
 
 import torch
-from torch import nn
-
 from sglang.srt.models.dflash import DFlashDraftModel
+from torch import nn
 
 
 class ThreshHeadTwoModel(nn.Module):
@@ -35,7 +34,7 @@ class DFlashAdaFlashDraftModel(DFlashDraftModel):
             int(head_config.get("thresh_head_bottleneck_dim", 256)),
         )
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         loaded_head = set()
 
         def checked_weights():
@@ -51,7 +50,9 @@ class DFlashAdaFlashDraftModel(DFlashDraftModel):
             for name, _ in self.thresh_head_two_model.named_parameters()
         }
         if missing := required - loaded_head:
-            raise ValueError(f"AdaFlash checkpoint is missing length-head weights: {sorted(missing)}")
+            raise ValueError(
+                f"AdaFlash checkpoint is missing length-head weights: {sorted(missing)}"
+            )
         return result
 
 

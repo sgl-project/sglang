@@ -682,7 +682,11 @@ def parse_dflash_draft_config(*, draft_hf_config: Any) -> DFlashDraftConfig:
     )
     raw_num_target_layers = dflash_cfg.get(
         "num_target_layers",
-        _cfg_get(draft_hf_config, "num_target_layers", None),
+        _cfg_get(
+            draft_hf_config,
+            "target_num_hidden_layers",
+            _cfg_get(draft_hf_config, "num_target_layers", None),
+        ),
     )
     num_target_layers = _parse_optional_int(
         raw_num_target_layers,

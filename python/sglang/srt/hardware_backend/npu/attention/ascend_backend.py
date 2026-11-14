@@ -336,6 +336,15 @@ def _cp_allgather_and_save_kv_npu(
 
 
 class AscendAttnBackend(AttentionBackend):
+    @property
+    def supports_ragged_verify_graph(self) -> bool:
+        return not (
+            self.use_mla
+            or self.use_paged_mtp
+            or self.use_quant_flash_attn
+            or self.is_hybrid_swa
+        )
+
     def __init__(self, model_runner: ModelRunner, speculative_step_id: int = 0):
         super().__init__()
         self.forward_metadata = None
@@ -3162,10 +3171,10 @@ class AscendAttnBackend(AttentionBackend):
     ):
         ragged_layout = forward_batch.ragged_verify_layout
         if ragged_layout is not None and (
-            self.graph_mode or self.use_mla or self.use_paged_mtp or self.use_quant_flash_attn
+            self.use_mla or self.use_paged_mtp or self.use_quant_flash_attn
         ):
             raise ValueError(
-                "Ascend ragged verification currently requires eager, unquantized MHA "
+                "Ascend ragged verification currently requires unquantized MHA "
                 "with ASCEND_USE_PAGED_MTP=0."
             )
         if save_kv_cache:
@@ -3299,7 +3308,15 @@ class AscendAttnBackend(AttentionBackend):
             if ragged_layout is not None:
                 # FIA consumes cumulative query lengths for TND input. Each
                 # request contributes its own admitted verification prefix.
-                actual_seq_lengths = ragged_layout.qo_indptr_device[1:].cpu().tolist()
+                if ragged_layout.verify_lens_cpu is not None:
+                    actual_seq_lengths = np.cumsum(
+                        ragged_layout.verify_lens_cpu
+                        + [0] * (forward_batch.batch_size - ragged_layout.bs)
+                    ).tolist()
+                else:
+                    actual_seq_lengths = (
+                        ragged_layout.qo_indptr_device[1:].cpu().tolist()
+                    )
             elif forward_batch.forward_mode.is_draft_extend_v2():
                 extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
                 if not self.graph_mode:

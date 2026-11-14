@@ -35,7 +35,9 @@ _SPLIT_ACCEPT = (
 
 _is_npu = is_npu()
 
-if not _is_npu:
+if _is_npu:
+    from sgl_kernel_npu.sample import chain_speculative_sampling_triton
+else:
     from sglang.kernels.ops.speculative.reject_sampling import (
         chain_speculative_sampling_triton,
     )
@@ -197,11 +199,7 @@ def _accept_sampling_core(
         (bs, uniform_width), dtype=torch.float32, device=device
     )
     uniform_samples_final = torch.rand((bs,), dtype=torch.float32, device=device)
-    if _is_npu:
-        # Greedy acceptance does not require this optional sampling kernel.
-        from sgl_kernel_npu.sample import chain_speculative_sampling_triton as sampling_fn
-    else:
-        sampling_fn = chain_speculative_sampling_triton
+    sampling_fn = chain_speculative_sampling_triton
     if block_verification:
         # Startup validation rejects NPU, whose sampler has no block mode.
         sampling_fn = partial(sampling_fn, block_verification=True)
