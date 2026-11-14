@@ -1144,6 +1144,7 @@
                   {
                     "group": "Model Deployment",
                     "pages": [
+                      "docs/hardware-platforms/ascend-npus/model-deployment/knowledge_base",
                       {
                         "group": "Model Tutorials",
                         "pages": [
