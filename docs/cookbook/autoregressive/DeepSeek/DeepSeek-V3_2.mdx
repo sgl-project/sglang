@@ -43,6 +43,9 @@ docker pull lmsysorg/sglang:v0.5.8-rocm700-mi30x
 # Ascend NPU (A2/A3 Series)
 docker pull lmsysorg/sglang:dsv32-a2
 docker pull lmsysorg/sglang:dsv32-a3
+
+# Ascend NPU A3 Series, 4-node PD disaggregation (validated image, see Section 3.3)
+docker pull quay.io/ascend/sglang:v0.5.18-cann9.0.0-a3
 ```
 
 ## 3. Model Deployment
@@ -51,7 +54,7 @@ This section provides a progressive guide from quick deployment to performance o
 
 ### 3.1 Basic Configuration
 
-**Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform, model variant, deployment strategy, and thinking capabilities. SGLang supports serving DeepSeek V3.2 on NVIDIA H200, B200, and AMD MI300X/MI355X GPUs.
+**Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform, model variant, deployment strategy, and thinking capabilities. SGLang supports serving DeepSeek V3.2 on NVIDIA H200, B200, AMD MI300X/MI355X GPUs, and Ascend A3 NPUs. For Ascend A3, select the node role and node rank to get the command for each node in the 4-node PD disaggregated deployment described in [Section 3.3](#3-3-ascend-npu-deployment).
 
 import { DeepSeekV32Deployment } from "/src/snippets/autoregressive/deepseek-v32-deployment.jsx";
 
@@ -74,6 +77,87 @@ import { DeepSeekV32Deployment } from "/src/snippets/autoregressive/deepseek-v32
     --tool-call-parser deepseekv32 --reasoning-parser deepseek-v3
   ```
 - **NCCL timeout:** Slow model loading → add `--dist-timeout 3600`.
+
+### 3.3 Ascend NPU Deployment
+
+DeepSeek-V3.2 runs on Ascend A3 Series NPUs with the W8A8 quantized weights. The recommended scenario is a 4-node prefill/decode (PD) disaggregated deployment (1P1D): one prefill instance spans two A3 nodes and one decode instance spans another two, for 32 cards (64 dies) in total.
+
+<Warning>
+This scenario is validated with the image `quay.io/ascend/sglang:v0.5.18-cann9.0.0-a3`. Later images are not covered and may need different flags.
+</Warning>
+
+#### 3.3.1 Topology
+
+| Role | Nodes | Cards / dies | Parallelism | Key features |
+| --- | --- | --- | --- | --- |
+| Prefill | 2 | 16 / 32 | TP 32, CP 32 (zigzag) | DeepEP normal mode, INT8 dispatch, MTP (1 step) |
+| Decode | 2 | 16 / 32 | TP 32, DP attention 8, EP 32 | DeepEP low-latency mode, NPU graph, MTP (3 steps) |
+| Router | any host | — | — | `sglang_router` in PD mode, `cache_aware` policy |
+
+On A3, each card has two dies, so `--tp 32` uses all 16 cards of a two-node instance. See the [Ascend NPU glossary](../../../docs/hardware-platforms/ascend-npus/reference/glossary#hardware) for details.
+
+#### 3.3.2 Prerequisites
+
+1. Set up each of the four nodes as described in the [Ascend NPU quick start](../../../docs/hardware-platforms/ascend-npus/getting-started/quick_start), then start the container with all 16 `davinci` devices mounted, as shown in the [DeepSeek-V3.2 Ascend tutorial](../../../docs/hardware-platforms/ascend-npus/model-deployment/tutorials/deepseek_v3_2#installation). The launch script tunes kernel parameters with `sysctl`, so the container must run with `--privileged=true --net=host`.
+2. Download [DeepSeek-V3.2-W8A8](https://www.modelscope.cn/models/sgl-npu/DeepSeek-V3.2-W8A8) (about 695 GB) to a directory that all four nodes can read, and mount it into each container.
+
+#### 3.3.3 Launch
+
+In the [Interactive Command Generator](#3-1-basic-configuration), select **Ascend A3** as the hardware platform, then:
+
+1. For each prefill node, select **Prefill** and its **Node Rank**, replace the `<...>` placeholders and the model path, and run the command. Do the same for each decode node with **Decode**.
+2. Wait until the logs of both prefill and decode node 0 print `The server is fired up and ready to roll!`.
+3. Select **Router** and run the router command. It listens on port `6688`.
+
+Node 0 of each instance is its head node: `--dist-init-addr` points to it, and the router connects to it. `ASCEND_MF_STORE_URL` must point to prefill node 0 on all four nodes.
+
+The prefill and decode servers listen on port `30000`, the port used throughout the Cookbook, instead of the best practice's `8000` and `8001`. Every other flag and environment variable matches the best practice.
+
+#### 3.3.4 Verification
+
+Send a request through the router:
+
+```bash Command
+curl http://127.0.0.1:6688/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "messages": [{"role": "user", "content": "What is the capital of France?"}],
+    "max_tokens": 64,
+    "temperature": 0
+  }'
+```
+
+An HTTP 200 response whose content mentions "Paris" confirms that the prefill, decode, and KV transfer paths all work.
+
+To check accuracy, run [sgl-eval](https://github.com/sgl-project/sgl-eval) against the router with DeepSeek's recommended sampling settings:
+
+```bash Command
+sgl-eval run gsm8k \
+  --base-url http://127.0.0.1:6688/v1 \
+  --num-examples 200 \
+  --temperature 1.0 \
+  --top-p 0.95
+```
+
+#### 3.3.5 Performance
+
+This deployment targets long-context workloads (128K input, 1K output). Benchmark it through the router:
+
+```bash Command
+python -m sglang.benchmark.serving \
+  --dataset-name random \
+  --backend sglang \
+  --host 127.0.0.1 \
+  --port 6688 \
+  --max-concurrency 8 \
+  --num-prompts 8 \
+  --random-input-len 131072 \
+  --random-output-len 1024 \
+  --random-range-ratio 1 \
+  --seed 1
+```
+
+At concurrency 8, the reference TPOT is about 26 ms. At concurrency 16 (`--max-concurrency 16 --num-prompts 16`), the reference TPOT is about 107 ms. For the original scripts and results, see the [DeepSeek-V3.2 Ascend best practice](../../../docs/hardware-platforms/ascend-npus/model-deployment/best-practices/deepseek_v3_2). For tuning and troubleshooting, see [Optimization on Ascend NPU](../../../docs/hardware-platforms/ascend-npus/optimization/parameter_tuning) and the [Ascend NPU FAQ](../../../docs/hardware-platforms/ascend-npus/faq).
 
 ## 4. Model Invocation
 
