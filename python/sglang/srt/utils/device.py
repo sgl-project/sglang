@@ -88,6 +88,7 @@ __all__ = [
     "device_stream_context",
     "is_device_stream_capturing",
     "create_device_event",
+    "current_device_stream",
     "get_amdgpu_memory_capacity",
     "get_device_sm",
     "get_nvgpu_memory_capacity",
@@ -721,6 +722,13 @@ def create_device_event(device):
     if not isinstance(device, torch.device):
         device = torch.device(device)
     return torch.get_device_module(device).Event()
+
+
+def current_device_stream(device):
+    """The calling thread's current stream on ``device``."""
+    if not isinstance(device, torch.device):
+        device = torch.device(device)
+    return torch.get_device_module(device).current_stream(device)
 
 
 def get_amdgpu_memory_capacity():
