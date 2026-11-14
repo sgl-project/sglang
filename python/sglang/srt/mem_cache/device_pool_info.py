@@ -199,10 +199,12 @@ class KVBuffers(msgspec.Struct, frozen=True, kw_only=True):
 class KVScaleLayout(Enum):
     TOKEN = "token"
     MXFP8_INTERLEAVED = "mxfp8_interleaved"
+    MXFP8_MODELSLIM_K_DYNAMIC_V_PER_CHANNEL = "mxfp8_modelslim_k_dynamic_v_per_channel"
 
 
 class KVScaleBuffers(msgspec.Struct, frozen=True, kw_only=True):
-    k: tuple[torch.Tensor, ...]
+    # A single K scale tensor holds all layers on axis 0.
+    k: tuple[torch.Tensor, ...] | torch.Tensor
     v: tuple[torch.Tensor, ...]
     layout: KVScaleLayout
 

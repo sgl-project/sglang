@@ -304,6 +304,7 @@ def reserve_mla_split_host_memory(
     k_width: int,
     v_width: int,
     dtype: torch.dtype,
+    v_dtype: torch.dtype,
     buffers: MLASplitBuffers,
 ) -> None:
     """Reserve the split MLA host buffers before allocating them."""
@@ -315,7 +316,7 @@ def reserve_mla_split_host_memory(
     num_kv_rows = num_tokens * num_layers
     total_bytes = num_kv_rows * k_width * dtype.itemsize
     if v_width > 0:
-        total_bytes += num_kv_rows * v_width * dtype.itemsize
+        total_bytes += num_kv_rows * v_width * v_dtype.itemsize
 
     num_indexer_rows = num_tokens * len(buffers.index_layer_indices)
     if buffers.index_k is not None:

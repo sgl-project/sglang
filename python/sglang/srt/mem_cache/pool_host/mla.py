@@ -206,6 +206,20 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 self._native_buffers = buffer_info.buffers
                 self._native_infos = infos
                 native = self._native_buffers
+                self._v_dtype = self.dtype
+                if (
+                    layout in ("page_first_kv_split", "layer_first_kv_split")
+                    and self.dtype == torch.float8_e4m3fn
+                    and not self.dsa_kv_cache_store_fp8
+                    and native.v is not None
+                    and native.v.dtype == torch.bfloat16
+                ):
+                    # ModelSlim MLA stores FP8 latent and BF16 RoPE separately.
+                    self._v_dtype = native.v.dtype
+                    self._size_per_token = self.layer_num * (
+                        self.kv_lora_rank * self.dtype.itemsize
+                        + self.qk_rope_head_dim * self._v_dtype.itemsize
+                    )
                 index_layers = len(native.index_layer_indices)
                 if (
                     layout in ("page_first_kv_split", "layer_first_kv_split")
@@ -340,7 +354,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         k_width = native.k_width if self.dsa_kv_cache_store_fp8 else self.kv_lora_rank
         per_row_widths = [
             self.layer_num * k_width * self.dtype.itemsize,
-            self.layer_num * self.qk_rope_head_dim * self.dtype.itemsize,
+            self.layer_num * self.qk_rope_head_dim * self._v_dtype.itemsize,
         ]
         index_layers = len(native.index_layer_indices)
         if native.index_k is not None:
@@ -458,6 +472,9 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         alloc_func = ALLOC_MEMORY_FUNCS[self._transfer_device.type]
         k_width = native.k_width if self.dsa_kv_cache_store_fp8 else self.kv_lora_rank
         v_width = 0 if self.dsa_kv_cache_store_fp8 else native.v_width
+        v_dtype = self.dtype
+        if v_width and native.v.dtype != native.k.dtype:
+            v_dtype = native.v.dtype
 
         reserve_mla_split_host_memory(
             num_pages=self.page_num,
@@ -466,6 +483,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             k_width=k_width,
             v_width=v_width,
             dtype=self.dtype,
+            v_dtype=v_dtype,
             buffers=native,
         )
         self.k_buffer = alloc_func(
@@ -485,7 +503,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         else:
             self.v_buffer = alloc_func(
                 (*base_dims, v_width),
-                dtype=self.dtype,
+                dtype=v_dtype,
                 device=self.device,
                 pin_memory=self.pin_memory,
                 allocator=self.allocator,

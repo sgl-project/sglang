@@ -206,13 +206,18 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
                 pages = self.size // self.page_size + 1
                 shape = (self.layer_num, pages, self.page_size, self.head_num)
                 # QFA uses PA_BBND, with pairs of per-32 UE8M0 scales.
-                self.k_scale_buffer = list(
-                    torch.full(
-                        (*shape, self.head_dim // 64, 2),
-                        127,
-                        dtype=torch.uint8,
-                        device=self.device,
-                    ).unbind(0)
+                self._hicache_k_scale_buffer = torch.full(
+                    (*shape, self.head_dim // 64, 2),
+                    127,
+                    dtype=torch.uint8,
+                    device=self.device,
+                )
+                self.k_scale_buffer = list(self._hicache_k_scale_buffer.unbind(0))
+                # HiCache mirrors dynamic K scales. Static V scales stay on the NPU.
+                self.host_capacity_bytes = (
+                    self._hicache_k_buffer.nbytes
+                    + self._hicache_v_buffer.nbytes
+                    + self._hicache_k_scale_buffer.nbytes
                 )
                 self.v_scale_buffer = list(
                     torch.empty(
@@ -237,9 +242,18 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
         from sglang.srt.mem_cache.device_pool_info import (
             KVBufferLayout,
             KVBuffers,
+            KVScaleBuffers,
+            KVScaleLayout,
             MHABufferInfo,
         )
 
+        scales = None
+        if self.is_modelslim_mxfp8:
+            scales = KVScaleBuffers(
+                k=self._hicache_k_scale_buffer,
+                v=tuple(self.v_scale_buffer),
+                layout=KVScaleLayout.MXFP8_MODELSLIM_K_DYNAMIC_V_PER_CHANNEL,
+            )
         return MHABufferInfo(
             buffers=KVBuffers(
                 k=tuple(self.k_buffer),
@@ -257,6 +271,7 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
             dtype=self.store_dtype,
             # self.device is the bare backend name; tensors carry the rank index.
             device=self._hicache_k_buffer.device,
+            scales=scales,
             transfer_buffers=self.get_hicache_transfer_buffers,
         )
 
